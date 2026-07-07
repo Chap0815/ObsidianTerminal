@@ -1,8 +1,8 @@
 {
-  "build_id": "e5076d80c6da162d",
-  "created_at": "2026-07-07 13:08:12",
+  "build_id": "05e940420e410d58",
+  "created_at": "2026-07-07 13:09:59",
   "source": "update_deploy_manifest.py",
-  "file_count": 132,
+  "file_count": 133,
   "files": [
     {
       "path": "bot_config.default.json",
@@ -583,6 +583,11 @@
       "path": "tools\\update_from_git.py",
       "sha256": "0222176e8fdcf4621a2374822e6b7fff32fef8e3dc01c7b982cc24dae7694814",
       "bytes": 20173
+    },
+    {
+      "path": "tools\\update_launcher.py",
+      "sha256": "6f00b4c98243d624eb5d6fa04bfc4829e38fc59cbb2d27f390318eaf84ceb872",
+      "bytes": 7104
     },
     {
       "path": "tools\\warm_cache.py",
