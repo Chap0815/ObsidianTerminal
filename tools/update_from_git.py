@@ -3,7 +3,7 @@
 The updater never contains credentials. Users configure a private repository in
 ``config/update_config.json`` or via environment variables:
 
-  OBSIDIAN_UPDATE_REPO_URL=git@github-obsidian:owner/private-repo.git
+  OBSIDIAN_UPDATE_REPO_URL=ssh://git@ssh.github.com:443/owner/private-repo.git
   OBSIDIAN_UPDATE_BRANCH=main
 
 It refuses to update while bot processes are still alive and preserves local
@@ -83,9 +83,18 @@ def _rmtree(path: Path) -> None:
     shutil.rmtree(path, onerror=_make_writable)
 
 
+def _ssh_command() -> str:
+    key = Path.home() / ".ssh" / "obsidian_update_ed25519"
+    base = "ssh -o StrictHostKeyChecking=accept-new"
+    if key.exists():
+        base += f' -i "{key}" -o IdentitiesOnly=yes'
+    return base
+
+
 def _run(cmd: list[str], *, cwd: Path = ROOT, check: bool = True) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = env.get("GIT_TERMINAL_PROMPT", "1")
+    env["GIT_SSH_COMMAND"] = env.get("GIT_SSH_COMMAND") or _ssh_command()
     r = subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True, env=env)
     if check and r.returncode != 0:
         out = (r.stdout or "").strip()
@@ -125,7 +134,12 @@ def _load_update_config() -> tuple[str, str]:
             "Kein privates Update-Repo konfiguriert. Lege config/update_config.json "
             "aus config/update_config.example.json an oder setze OBSIDIAN_UPDATE_REPO_URL."
         )
-    if "github.com:Chap0815/ObsidianTerminal.git" not in repo and "github-obsidian:Chap0815/ObsidianTerminal.git" not in repo:
+    allowed = (
+        "github.com:Chap0815/ObsidianTerminal.git",
+        "github-obsidian:Chap0815/ObsidianTerminal.git",
+        "ssh.github.com:443/Chap0815/ObsidianTerminal.git",
+    )
+    if not any(token in repo for token in allowed):
         raise RuntimeError(
             "Update-Repo nicht erlaubt. Erwartet wird das private ObsidianTerminal-Repo "
             "ueber einen read-only Deploy Key."
@@ -133,12 +147,12 @@ def _load_update_config() -> tuple[str, str]:
     if repo.startswith("http://"):
         raise RuntimeError(
             "Unsichere Update-URL. Kein HTTP verwenden. "
-            "Nutze SSH Deploy Key, z.B. git@github-obsidian:Chap0815/ObsidianTerminal.git."
+            "Nutze SSH Deploy Key, z.B. ssh://git@ssh.github.com:443/Chap0815/ObsidianTerminal.git."
         )
     if repo.startswith("https://"):
         raise RuntimeError(
             "HTTPS-Update-URLs sind fuer Releases deaktiviert. "
-            "Nutze SSH Deploy Key, z.B. git@github-obsidian:Chap0815/ObsidianTerminal.git."
+            "Nutze SSH Deploy Key, z.B. ssh://git@ssh.github.com:443/Chap0815/ObsidianTerminal.git."
         )
     return repo, branch or "main"
 

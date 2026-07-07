@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -36,7 +37,16 @@ def _repo_config() -> tuple[str, str]:
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=str(ROOT), text=True, capture_output=True, timeout=12)
+    env = os.environ.copy()
+    key = Path.home() / ".ssh" / "obsidian_update_ed25519"
+    ssh_cmd = "ssh -o StrictHostKeyChecking=accept-new"
+    if key.exists():
+        ssh_cmd += f' -i "{key}" -o IdentitiesOnly=yes'
+    env["GIT_SSH_COMMAND"] = env.get("GIT_SSH_COMMAND") or ssh_cmd
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return subprocess.run(
+        cmd, cwd=str(ROOT), text=True, capture_output=True, timeout=12, env=env
+    )
 
 
 def check_update() -> dict:

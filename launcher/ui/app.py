@@ -1208,7 +1208,7 @@ class ObsidianApp(ctk.CTk):
             width=72, height=22, corner_radius=5,
             font=ctk.CTkFont(FONT_BODY, 9, "bold"),
             fg_color="transparent", hover_color=COLORS["panel_hover"],
-            text_color=accent, border_width=1, border_color=accent,
+            text_color=accent, border_width=2, border_color=accent,
             command=lambda n=name: self._save_params(n)
         )
         save_btn.pack(side="right")
@@ -1345,8 +1345,8 @@ class ObsidianApp(ctk.CTk):
             fg_color=COLORS["success"],
             hover_color="#0d9b6c",
             text_color="#ffffff",
-            border_width=1,
-            border_color=COLORS["success"],
+            border_width=2,
+            border_color="#a7f3d0",
             command=lambda n=name: self._start_bot(n)
         )
         start_btn.pack(side="left", fill="both", expand=True, padx=(0, 3))
@@ -1357,7 +1357,7 @@ class ObsidianApp(ctk.CTk):
             fg_color="transparent",
             hover_color="#3a2a10",
             text_color=COLORS["warning"],
-            border_width=1, border_color=COLORS["warning"],
+            border_width=2, border_color=COLORS["warning"],
             command=lambda n=name: self._restart_bot(n)
         )
         restart_btn.pack(side="left", fill="both", expand=True, padx=3)
@@ -1368,7 +1368,7 @@ class ObsidianApp(ctk.CTk):
             fg_color="transparent",
             hover_color="#3a1820",
             text_color=COLORS["danger"],
-            border_width=1, border_color=COLORS["danger"],
+            border_width=2, border_color=COLORS["danger"],
             command=lambda n=name: self._stop_bot(n)
         )
         stop_btn.pack(side="left", fill="both", expand=True, padx=(3, 0))
@@ -1744,9 +1744,12 @@ class ObsidianApp(ctk.CTk):
         self._log_to_card(card, "system", "Parameters saved to bot_config.json")
         accent = card["accent"]
         card["save_btn"].configure(text=" Saved", fg_color=COLORS["success"],
-                                   text_color=COLORS["bg"])
+                                   text_color=COLORS["bg"],
+                                   border_width=2,
+                                   border_color=COLORS["success"])
         self.after(1200, lambda: card["save_btn"].configure(
-            text=" Save", fg_color="transparent", text_color=accent
+            text=" Save", fg_color="transparent", text_color=accent,
+            border_width=2, border_color=accent
         ) if card["save_btn"].winfo_exists() else None)
 
     def _reset_params(self, bot_name):
@@ -2081,8 +2084,23 @@ class ObsidianApp(ctk.CTk):
         try:
             if not data.get("ok"):
                 reason = str(data.get("reason") or "")
-                if reason in {"git_missing", "repo_missing", "remote_unreachable"}:
-                    self.status_text.set("Update check skipped")
+                if reason == "git_missing":
+                    msg = "Update-System nicht bereit: Git for Windows fehlt."
+                elif reason == "repo_missing":
+                    msg = "Update-System nicht konfiguriert."
+                elif reason == "remote_unreachable":
+                    msg = "Update-Check nicht erreichbar. Pruefe SSH-Key/GitHub-Zugriff."
+                else:
+                    msg = ""
+                if msg:
+                    self.status_text.set(msg)
+                    if not getattr(self, "_update_notice_shown", False):
+                        self._update_notice_shown = True
+                        try:
+                            from tkinter import messagebox
+                            messagebox.showwarning("Obsidian Update", msg)
+                        except Exception:
+                            pass
                 return
             if not data.get("update_available"):
                 return
@@ -2824,7 +2842,8 @@ class ObsidianApp(ctk.CTk):
                     pass
                 card["start_btn"].configure(state="disabled",
                                               fg_color=COLORS["border"],
-                                              border_color=COLORS["border"],
+                                              border_width=2,
+                                              border_color="#4b4664",
                                               text_color=COLORS["text_muted"])
                 card["stop_btn"].configure(state="normal")
             else:
@@ -2836,7 +2855,8 @@ class ObsidianApp(ctk.CTk):
                 card["start_btn"].configure(state="normal",
                                               fg_color=COLORS["success"],
                                               hover_color="#1ea350",
-                                              border_color=COLORS["success"],
+                                              border_width=2,
+                                              border_color="#a7f3d0",
                                               text_color="#ffffff")
                 card["stop_btn"].configure(state="normal")
 
