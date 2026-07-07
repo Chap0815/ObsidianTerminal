@@ -42,6 +42,7 @@ except ModuleNotFoundError:
 CONFIG_PATH = ROOT / "config" / "update_config.json"
 CONFIG_EXAMPLE_PATH = ROOT / "config" / "update_config.example.json"
 PINNED_KNOWN_HOSTS_PATH = ROOT / "config" / "github_known_hosts"
+RUNTIME_KNOWN_HOSTS_PATH = Path.home() / ".ssh" / "obsidian_github_known_hosts"
 BACKUP_ROOT = ROOT / "backups"
 BACKUP_KEEP = 5
 PROTECTED_FILES = [
@@ -238,15 +239,46 @@ def _rmtree(path: Path) -> None:
     shutil.rmtree(path, onerror=_make_writable)
 
 
+def _ssh_path(path: Path) -> str:
+    return path.resolve().as_posix()
+
+
+def _quote_ssh_value(value: str) -> str:
+    return f'"{value}"' if any(ch.isspace() for ch in value) else value
+
+
+def _runtime_known_hosts() -> Path:
+    """Copy pinned GitHub host keys to a user path without app-dir spaces."""
+    fallback = (
+        "github.com ssh-ed25519 "
+        "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
+        "[ssh.github.com]:443 ssh-ed25519 "
+        "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
+    )
+    try:
+        text = PINNED_KNOWN_HOSTS_PATH.read_text(encoding="utf-8-sig")
+    except Exception:
+        text = fallback
+    if "[ssh.github.com]:443" not in text:
+        text = text.rstrip() + "\n" + fallback
+    RUNTIME_KNOWN_HOSTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RUNTIME_KNOWN_HOSTS_PATH.write_text(
+        text.replace("\r\n", "\n").replace("\r", "\n"),
+        encoding="utf-8",
+        newline="\n",
+    )
+    return RUNTIME_KNOWN_HOSTS_PATH
+
+
 def _ssh_command() -> str:
     key = Path.home() / ".ssh" / "obsidian_update_ed25519"
-    known_hosts = PINNED_KNOWN_HOSTS_PATH
+    known_hosts = _runtime_known_hosts()
     base = (
         "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "
-        f'-o UserKnownHostsFile="{known_hosts}"'
+        f"-o UserKnownHostsFile={_quote_ssh_value(_ssh_path(known_hosts))}"
     )
     if key.exists():
-        base += f' -i "{key}" -o IdentitiesOnly=yes'
+        base += f" -i {_quote_ssh_value(_ssh_path(key))} -o IdentitiesOnly=yes"
     return base
 
 
