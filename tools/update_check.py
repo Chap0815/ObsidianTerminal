@@ -4,10 +4,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+from tools.ensure_git import find_git
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -15,10 +16,6 @@ UPDATE_STATUS_PATH = ROOT / "logs" / "update_status.json"
 CONFIG_PATHS = [
     ROOT / "config" / "update_config.json",
     ROOT / "config" / "update_config.example.json",
-]
-COMMON_GIT_PATHS = [
-    Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "cmd" / "git.exe",
-    Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Git" / "cmd" / "git.exe",
 ]
 
 
@@ -42,13 +39,7 @@ def _repo_config() -> tuple[str, str]:
 
 
 def _find_git() -> str:
-    git = shutil.which("git")
-    if git:
-        return git
-    for path in COMMON_GIT_PATHS:
-        if path.exists():
-            return str(path)
-    return ""
+    return find_git()
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:

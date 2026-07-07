@@ -1,8 +1,8 @@
 {
-  "build_id": "412f26b6a9685ccc",
-  "created_at": "2026-07-07 13:45:44",
+  "build_id": "463897daaf85f001",
+  "created_at": "2026-07-07 13:50:32",
   "source": "update_deploy_manifest.py",
-  "file_count": 133,
+  "file_count": 134,
   "files": [
     {
       "path": "bot_config.default.json",
@@ -530,6 +530,11 @@
       "bytes": 84851
     },
     {
+      "path": "tools\\ensure_git.py",
+      "sha256": "1e41426683854e683e58bde1c6bcd5f227a2ea1f78220f742299d1456537d73a",
+      "bytes": 2354
+    },
+    {
       "path": "tools\\health_check.bat",
       "sha256": "578d3125e26230cbfef443ea86e264b23d3f4941dae9e6237d9c3d5774c86636",
       "bytes": 1054
@@ -576,13 +581,13 @@
     },
     {
       "path": "tools\\update_check.py",
-      "sha256": "f5be68cb45abdbe02937a630454bc8a24d3b0b42c296918a5f72c70271041445",
-      "bytes": 5108
+      "sha256": "f01d03bb16518b92bcdb9970c8639af71b706a290b0d97daf3e93067a55bd407",
+      "bytes": 4775
     },
     {
       "path": "tools\\update_from_git.py",
-      "sha256": "22f67563f0d0b49d6f31c3c4cdce4783ca01bbc06dd6651ec05d8414d8325134",
-      "bytes": 22248
+      "sha256": "967e7401aeffb55064fae8095a8a2ec1bb1d3b53c358361ceeaa146af3c2d6ed",
+      "bytes": 21973
     },
     {
       "path": "tools\\update_launcher.py",

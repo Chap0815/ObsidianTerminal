@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from tools.ensure_git import find_git
+
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "config" / "update_config.json"
@@ -53,10 +55,6 @@ SMOKE_FILES = [
     "launcher/ui/app.py",
     "tools/update_check.py",
     "tools/update_from_git.py",
-]
-COMMON_GIT_PATHS = [
-    Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "cmd" / "git.exe",
-    Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Git" / "cmd" / "git.exe",
 ]
 BLOCKED_TRACKED_PREFIXES = ("data/", "logs/", "backups/")
 
@@ -167,12 +165,9 @@ def _run(
 
 
 def _git() -> str:
-    exe = shutil.which("git")
+    exe = find_git()
     if exe:
         return exe
-    for path in COMMON_GIT_PATHS:
-        if path.exists():
-            return str(path)
     raise RuntimeError("Git wurde nicht gefunden. Bitte Git for Windows installieren.")
 
 
