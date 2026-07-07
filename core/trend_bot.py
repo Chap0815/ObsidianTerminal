@@ -1,0 +1,357 @@
+"""
+core/trend_bot.py  Majors trend-following bot (the repurposed "Trend" slot).
+
+Validated 2026-06-13 (tools/trend_check.py, 720d MEXC majors): a long/flat
+ENSEMBLE trend rule on BTC/ETH/BNB/XRP/SOL beat buy-and-hold on BOTH return
+AND drawdown, robustly across SMA lengths (7/7) and coins (4/5). SPOT, NO
+LEVERAGE  the edge is risk-adjusted; leverage would re-inflate the very
+drawdown the strategy removes.
+
+Design: reuse the whole SpotBot lifecycle (state, SIM accounting, killswitch,
+shutdown, reconcile, UI state) and ONLY swap the two decision loops:
+
+  SCAN loop  buy each major that has turned IN-trend and isn't held
+  MONITOR loop sell each held major that has fallen OUT of trend, + a simple
+                  daily-loss killswitch
+
+Both decisions come from trading.trend_signal (pure, unit-tested). The buy path
+reuses ScanMixin._place_buy_order; the sell path reuses
+ExitsMixin._execute_full_exit  so order placement, fills, fees, PnL, SIM and
+state removal are exactly the proven spot machinery.
+
+Cadence is daily-ish (TREND_CHECK_HOURS, default 12h)  the signal only changes
+on new daily candles, so there is nothing to gain from scanning faster.
+"""
+from __future__ import annotations
+
+import time as _time
+from typing import Optional, Tuple, Dict, List
+
+from core.spot_bot import SpotBot
+from trading.trend_signal import (is_in_trend, params_from_cfg, TrendParams,
+                                   has_full_history, bars_required)
+from trading.vol_target import (realized_vol, vol_target_multiplier,
+                                basket_median_vol)
+
+
+class TrendBot(SpotBot):
+    """Long/flat ensemble trend-following over a fixed basket of majors."""
+
+    # Purely mechanical strategy  no news, no LLM. USES_LLM=False makes
+    # run() skip the eager news-module import entirely (see SpotBot.run).
+    USES_LLM = False
+
+    DAILY_CACHE_TTL_SEC = 3600        # re-fetch daily candles at most hourly
+
+    #  Config helpers 
+
+    def _trend_universe(self) -> List[str]:
+        raw = str(self.C("TREND_UNIVERSE", "BTC,ETH,BNB,XRP,SOL"))
+        return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
+    def _trend_params(self) -> TrendParams:
+        return params_from_cfg(self.C)
+
+    def _check_interval_sec(self) -> int:
+        try:
+            hours = float(self.C("TREND_CHECK_HOURS", 12))
+        except (TypeError, ValueError):
+            hours = 12.0
+        return max(300, int(hours * 3600))            # floor at 5 min
+
+    #  Market data 
+
+    def _get_daily_closes(self, sym: str, need: int) -> List[float]:
+        """Daily closes for `sym`, cached ~1h (signal only moves on new bars)."""
+        now = _time.time()
+        cache = getattr(self, "_dc_cache", None)
+        if cache is None:
+            cache = self._dc_cache = {}
+        ent = cache.get(sym)
+        if ent and (now - ent[0]) < self.DAILY_CACHE_TTL_SEC and len(ent[1]) >= need:
+            return ent[1]
+        try:
+            bars = self.ex.fetch_ohlcv(f"{sym}/USDT", "1d", limit=need + 6)
+            # Drop the still-FORMING current-day candle so the signal is based
+            # on COMPLETED daily closes  exactly like the validated backtest
+            # (which acted on closed candles). Without this the live bot reacts
+            # to an intraday partial close and whipsaws more than tested.
+            if bars:
+                day_ms = 86_400_000
+                # Exchange-anchored now for the UTC day boundary, compared
+                # against the exchange candle timestamp bars[-1][0].
+                try:
+                    from core.clock import now_ms as _clock_now_ms
+                    now_ms = int(_clock_now_ms())
+                except Exception:
+                    now_ms = int(now * 1000)
+                cur_day_start = now_ms - (now_ms % day_ms)
+                if bars[-1][0] >= cur_day_start:
+                    bars = bars[:-1]
+            closes = [float(b[4]) for b in bars if b and b[4]]
+        except Exception as e:
+            self._log_error(f"trend fetch_ohlcv {sym}", e)
+            return ent[1] if ent else []
+        cache[sym] = (now, closes)
+        return closes
+
+    def _current_price(self, sym: str) -> float:
+        try:
+            t = self.ex.fetch_ticker(f"{sym}/USDT")
+            return float(t.get("last") or t.get("close") or 0)
+        except Exception:
+            return 0.0
+
+    def _evaluate(self, sym: str, held: bool,
+                  p: Optional[TrendParams] = None) -> Tuple[bool, int, Dict[str, bool]]:
+        """Return (in_trend, votes, detail). On insufficient data, do NOT act:
+        keep a held position held and a flat coin flat."""
+        if p is None:
+            p = self._trend_params()
+        need = bars_required(p)
+        closes = self._get_daily_closes(sym, need)
+        if not has_full_history(closes, p):
+            self._warn_short_history(sym, len(closes), need)
+            return held, 0, {}
+        return is_in_trend(closes, p, currently_held=held)
+
+    def _warn_short_history(self, sym: str, got: int, need: int) -> None:
+        from core.logger import log_event
+        seen = getattr(self, "_short_hist_warned", None)
+        if seen is None:
+            seen = self._short_hist_warned = set()
+        if sym in seen:
+            return
+        seen.add(sym)
+        log_event(f"Trend {sym}: insufficient daily history "
+                  f"({got}/{need} closed bars); symbol skipped", "INFO")
+
+    #  SCAN loop: enter coins that turned in-trend 
+
+    def _scan_loop(self):
+        from core.logger import log_event
+        interval = self._check_interval_sec()
+        log_event(f"Trend scan-loop started (every {interval/3600:.1f}h)", "INFO")
+        while not self._shutdown_event.is_set():
+            try:
+                self._trend_buy_pass()
+            except Exception as e:
+                log_event(f"Trend scan error: {e}", "WARN")
+                self._log_error("trend scan", e)
+            if self._shutdown_event.wait(timeout=interval):
+                return
+
+    def _trend_buy_pass(self):
+        from core.logger import log_event
+        if self.safe_mode is not None and self.safe_mode.is_active():
+            return
+        p = self._trend_params()
+        size = float(self.C("POSITION_SIZE", 20.0))
+        try:
+            max_trades = int(float(self.C("MAX_OPEN_TRADES", 5)))
+        except (TypeError, ValueError):
+            max_trades = 5
+
+        # Inverse-vol sizing (opt-in): scale each coin's size by the basket's
+        # median vol / its own  calm coins bigger, wild coins smaller, total
+        # ~unchanged. Vols come from the daily closes already cached for the
+        # signal, so no extra fetches.
+        vt_on = str(self.C("TREND_VOL_TARGET", 0)).strip().lower() in (
+            "1", "true", "yes", "on")
+        vols, med = {}, None
+        if vt_on:
+            _need = bars_required(p)
+            _lb = int(float(self.C("TREND_VOL_TARGET_LOOKBACK", 30)))
+            for _s in self._trend_universe():
+                _v = realized_vol(self._get_daily_closes(_s, _need), _lb)
+                if _v:
+                    vols[_s] = _v
+            med = basket_median_vol(list(vols.values()))
+
+        free = None
+        if not self.simulation:
+            try:
+                from bot_utils import safe_fetch_balance_usdt
+                free = safe_fetch_balance_usdt(self.ex)
+            except Exception:
+                free = None
+
+        opened = 0
+        parts = []                                        # per-coin vote summary
+        for sym in self._trend_universe():
+            if self._shutdown_event.is_set():
+                return
+            held = self.state.has(sym)
+            in_trend, votes, detail = self._evaluate(sym, held=held, p=p)
+            # Leeres detail = _evaluate hat den Insufficient-Data-Guard getroffen
+            # (zu wenige Kerzen) und sich enthalten  NICHT dasselbe wie ein
+            # echtes 0/3 "kein Aufwrtstrend". Als 'n/a' ausweisen, damit eine
+            # Datenlcke nicht wie ein klares No-Trend aussieht.
+            vote_str = "n/a" if not detail else f"{votes}/3"
+            parts.append(f"{sym} {vote_str}" + ("(held)" if held else ""))
+            if held:
+                continue                                  # already long this coin
+            if not in_trend:
+                continue  # not in an uptrend  stay flat
+            # COEXISTENCE: skip a coin another bot on this account already holds.
+            try:
+                from core.database import is_claimed_by_other
+                if is_claimed_by_other(sym, self.BOT_NAME, is_futures=False):
+                    continue
+            except Exception:
+                pass
+            if self.state.count() >= max_trades:
+                continue                                  # at Max Open Trades
+            coin_size = size * (vol_target_multiplier(vols.get(sym), med)
+                                if vt_on else 1.0)
+            try:
+                size_cap = float(self.C("POSITION_SIZE_MAX", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                size_cap = 0.0
+            if size_cap > 0:
+                coin_size = min(coin_size, size_cap)
+            if not self.simulation and free is not None and free < coin_size:
+                log_event(f"Trend: skip {sym}  need {coin_size:.0f} USDT, "
+                          f"have {free:.0f}", "INFO")
+                continue
+            price = self._current_price(sym)
+            if price <= 0:
+                continue
+            # Defense-in-depth: re-check we still don't hold this coin right
+            # before committing capital  closes any has()->add() window.
+            if self.state.has(sym):
+                continue
+            if not self.simulation:
+                from core.database import claim_symbol_for_entry
+                if not claim_symbol_for_entry(self.BOT_NAME, sym, "SPOT"):
+                    from core.logger import log_event as _lev
+                    _lev(f"Trend: {sym} claimed by another bot  skip "
+                         f"(coexistence)", "WAIT")
+                    continue
+            _trend_claimed = not self.simulation
+            try:
+                entry = self._place_buy_order(sym, {"price": price}, coin_size)
+            except Exception as _buy_exc:
+                if _trend_claimed:
+                    from core.database import remove_open_position
+                    remove_open_position(self.BOT_NAME, sym)
+                raise _buy_exc
+            if entry is None:
+                if _trend_claimed:
+                    from core.database import remove_open_position
+                    remove_open_position(self.BOT_NAME, sym)
+                continue
+            amount, fill_price, gross_amount, entry_fee = entry
+            self._add_trend_state(sym, fill_price, amount, gross_amount,
+                                   entry_fee, votes)
+            if free is not None:
+                free = max(0.0, free - coin_size)
+            opened += 1
+            log_event(f" Trend BUY {sym} @ {fill_price:.6f}  "
+                      f"({votes}/3 votes, {coin_size:.0f} USDT)", "INFO")
+
+        # Visibility: ALWAYS report what the bot saw, so a 'no trade' scan is
+        # clearly 'working, just no uptrend' rather than looking dead.
+        log_event(f"Trend scan: {'  '.join(parts)}  opened {opened}, "
+                  f"holding {self.state.count()}/{max_trades}", "SCAN")
+
+    def _add_trend_state(self, sym, fill_price, amount, gross_amount,
+                         entry_fee, votes):
+        # _place_buy_order already wrote a PROVISIONAL row (zombie protection);
+        # patch it in place with the corrected NET amount + fees instead of a
+        # second full add. Fall back to add() if the provisional didn't land.
+        from core.logger import _date as _utc_now_str
+        fields = {
+            "buy": fill_price,
+            "highest": fill_price,
+            "invested_usdt": gross_amount * fill_price,
+            "amount": amount,
+            "original_amount": amount,
+            "partial_sold": False,
+            "be_active": False,
+            "break_even": False,
+            "initial_entry_fee": entry_fee,
+            "fees_paid": entry_fee,
+            "strategy": "trend",
+            "entry_votes": votes,
+            "provisional": False,
+        }
+        if self.state.has(sym):
+            self.state.update_many(sym, fields)
+        else:
+            fields["buy_time"] = _utc_now_str()
+            self.state.add(sym, fields)
+
+    #  MONITOR loop: exit coins that fell out of trend, + killswitch 
+
+    def _monitor_loop(self):
+        from core.logger import log_event
+        interval = self._check_interval_sec()
+        log_event(f"Trend monitor-loop started (every {interval/3600:.1f}h)",
+                  "INFO")
+        while not self._shutdown_event.is_set():
+            try:
+                self._trend_exit_pass()
+                self._trend_killswitch()
+            except Exception as e:
+                log_event(f"Trend monitor error: {e}", "WARN")
+                self._log_error("trend monitor", e)
+            if self._shutdown_event.wait(timeout=interval):
+                return
+
+    def _trend_exit_pass(self):
+        from core.logger import log_event
+        p = self._trend_params()
+        try:
+            disaster = float(self.C("INITIAL_STOP_LOSS", -30.0))
+        except (TypeError, ValueError):
+            disaster = -30.0
+        for sym in list(self.state.keys()):
+            if self._shutdown_event.is_set():
+                return
+            d = self.state.get(sym)
+            if not d:
+                continue
+            curr = self._current_price(sym)
+            buy = float(d.get("buy", 0) or 0)
+
+            # Disaster brake: hard stop far below entry (flash-crash / gap
+            # protection). The trend exit normally fires well before this; pure
+            # last-resort safety so an overnight gap can't run unbounded.
+            if curr > 0 and buy > 0 and (curr / buy - 1.0) * 100.0 <= disaster:
+                log_event(f" Trend disaster-stop {sym}: "
+                          f"{(curr/buy-1)*100:.1f}% <= {disaster:.0f}%", "WARN")
+                self._execute_full_exit(sym, d, curr, "Disaster stop")
+                continue
+
+            in_trend, votes, _ = self._evaluate(sym, held=True, p=p)
+            if in_trend:
+                continue
+            if curr <= 0:
+                continue
+            log_event(f" Trend EXIT {sym}  out of trend ({votes}/3 votes)",
+                      "INFO")
+            self._execute_full_exit(sym, d, curr,
+                                     f"Trend exit ({votes}/3 votes)")
+
+    def _trend_killswitch(self):
+        """Simple daily-loss killswitch (spot, no leverage  no liquidation, so
+        a soft SAFE_MODE stop on new buys is sufficient)."""
+        try:
+            from core.database import get_today_pnl
+            from core.logger import log_event
+            if self.safe_mode is None or self.safe_mode.is_active():
+                return
+            info = get_today_pnl(self.BOT_NAME)
+            today = info.get("total_profit", 0.0)
+            try:
+                max_loss = float(self.C("MAX_DAILY_LOSS", -50.0))
+            except (TypeError, ValueError):
+                max_loss = -50.0
+            if today <= max_loss:
+                log_event(f" KILLSWITCH (Trend): daily {today:+.2f} USDT "
+                          f"<= {max_loss}  SAFE_MODE, no new buys", "WARN")
+                self.safe_mode.trigger(
+                    f"daily-loss killswitch ({today:+.2f} USDT)")
+        except Exception as e:
+            self._log_error("trend killswitch", e)

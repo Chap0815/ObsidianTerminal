@@ -1,0 +1,78 @@
+# Local/runtime data
+.env
+*.env
+logs/
+data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.jsonl
+
+# Development/test artifacts
+tests/
+docs/
+BOT ADDITIONAL/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.bak
+*.bak_*
+
+# Build/installer tooling is local-only, not part of the update repo
+installer/
+*.exe
+*.msi
+*.zip
+*.7z
+
+# Agent/editor scratch
+.agents/
+.claude/
+.codex/
+.vscode/
+.idea/
+
+# Research/output scratch
+optimizer_results/
+research_kitraining/
+research_run2/
+structured.jsonl
+
+# Research/backtest/test tooling is not part of the user update repo
+tools/analyze_strategies.py
+tools/backtester.py
+tools/bot_edge_audit.py
+tools/context_logger.py
+tools/decisive_test.py
+tools/fetch_fng_history.py
+tools/funding_carry_check.py
+tools/funding_check.py
+tools/futrend_exit_audit.py
+tools/llm_ab.py
+tools/mm_probe.py
+tools/multi_bot_audit.py
+tools/optimizer.py
+tools/pbo_cscv.py
+tools/regime_analysis.py
+tools/regime_lib.py
+tools/regime_majors_daily.py
+tools/regime_robustness.py
+tools/regime_robustness2.py
+tools/regime_sensitivity.py
+tools/regime_verdict.py
+tools/release_check.py
+tools/run_context_logger.bat
+tools/selftest.py
+tools/setup_logger_task.bat
+tools/signal_edge.py
+tools/test_indicator_fidelity.py
+tools/trend_check.py
+tools/trend_futures_check.py
+tools/trend_leverage_check.py
+tools/update_deploy_manifest.py
+tools/xsec_momentum.py
+tools/xsec_rebalance_check.py
+tools/xsec_trailing_check.py

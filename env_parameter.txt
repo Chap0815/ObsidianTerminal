@@ -1,0 +1,241 @@
+================================================================================
+  TRADINGBOT  -  .env PARAMETER REFERENCE
+================================================================================
+
+This file documents EVERY environment variable the bot reads from the `.env`
+file in the project root. Each entry lists the DEFAULT used when the variable
+is absent, the accepted values, and what it does.
+
+HOW TO USE
+   Put one `KEY=VALUE` per line in `.env` (no spaces around `=`, no quotes
+    needed). Lines starting with `#` are comments.
+   Booleans accept: 1/0, true/false, yes/no, on/off (case-insensitive).
+   Changes take effect on the NEXT START of the affected process. The bot
+    reads most values once at startup  -  restart the bot/launcher after editing.
+   Anything you DON'T set simply uses the default below  -  a minimal `.env`
+    only needs the exchange credentials.
+
+================================================================================
+  1. EXCHANGE & API CREDENTIALS
+================================================================================
+
+EXCHANGE                 default: bitget
+    Which exchange to trade on. Same value drives BOTH the live bot and the
+    backtester/optimizer (they read the same variable).
+    Supported: bitget, mexc, kucoin, okx, binance, bybit, gateio
+    (USDT-linear perps only. Kraken & Coinbase are NOT supported  -  their perps
+     are USD/multi-collateral margined and don't fit the USDT-settle scheme.)
+
+API_KEY                  default: (none)   [fallback: BITGET_API_KEY]
+API_SECRET               default: (none)   [fallback: BITGET_SECRET]
+API_PASSPHRASE           default: (none)   [fallback: BITGET_PASSWORD]
+    Your exchange API credentials. API_PASSPHRASE is REQUIRED for bitget, okx
+    and kucoin (they use a passphrase); ignored by exchanges that don't.
+    Public data (backtests) works without keys; live trading needs them.
+    NOTE: the *_KEY / *_SECRET / *_PASSWORD names are legacy fallbacks kept for
+    backward compatibility  -  prefer the generic API_* names.
+
+================================================================================
+  2. PROXY (optional  -  for restricted networks)
+================================================================================
+
+USE_PROXY                default: false
+    Set true to route exchange/HTTP traffic through a local SOCKS/HTTP proxy.
+PROXY_HOST               default: 127.0.0.1
+PROXY_PORT               default: 10808
+    Host/port of the proxy used when USE_PROXY=true.
+
+================================================================================
+  3. TELEGRAM ALERTS (optional)
+================================================================================
+
+TELEGRAM_TOKEN           default: (none)
+TELEGRAM_CHAT_ID         default: (none)
+    Bot token + chat id for Telegram notifications (circuit-breaker trips,
+    emergency closes, etc.). Leave empty to disable Telegram alerts.
+
+================================================================================
+  4. NEWS / EXTERNAL DATA APIs (optional)
+================================================================================
+
+CRYPTOPANIC_TOKEN        default: (none)
+    API token for CryptoPanic news headlines fed to the LLM sentiment step.
+CMC_API_KEY              default: (none)
+    CoinMarketCap API key (used for some market-data / Fear&Greed lookups).
+    Both are optional  -  the bot degrades gracefully without them.
+
+================================================================================
+  5. LLM / OLLAMA
+================================================================================
+
+OLLAMA_URL               default: http://localhost:11434
+OLLAMA_HOST              default: http://localhost:11434
+    Base URL/host of your local Ollama server (the LLM backend).
+OLLAMA_FORCE_JSON        default: 0
+    1 = force JSON-mode responses from the model (stricter parsing).
+BULL_BEAR_MODE           default: true
+    Enables the second, skeptical "bull/bear devil's-advocate" LLM check that
+    can veto a trade. false = skip that extra LLM call.
+BULL_BEAR_FAIL_CLOSED    default: false
+    true = if the devil's-advocate check ERRORS, treat it as a veto (skip the
+    trade). false = a failing check does not block the trade.
+LLM_FALLBACK_FAILCLOSED  default: false
+    true = if the main LLM analysis is unavailable, block the trade.
+    false = fall through (see FUT_LLM_VETO_ONLY for the futures path).
+STRIP_THINKING_MAX_LEN   default: 600
+    Max characters of model "thinking" text stripped/trimmed before parsing.
+
+================================================================================
+  6. FUTURES ENTRY SIGNAL  (the 2026-06-13 rework  -  all default ON, lenient)
+================================================================================
+These tune HOW the futures bot picks and confirms entries. Defaults are
+deliberately lenient so they refine quality WITHOUT choking trade frequency.
+Set any filter to 0 to disable it.
+
+FUT_LLM_VETO_ONLY        default: 1   (#1)
+    1 = PRICE ACTION (the screener) decides trade DIRECTION, and confidence is
+        computed from hard signals (multi-TF RSI, EMA-extension, volume,
+        relative-strength, funding). The LLM is demoted to a VETO ONLY: it can
+        force WAIT but cannot pick direction, and an LLM error no longer blocks
+        the trade. This removes the LLM's known LONG-bias and hard dependency.
+    0 = legacy behaviour (LLM leads direction + confidence).
+
+FUT_LLM_BUDGET_PER_SCAN  default: 12
+    Max LLM inferences per scan tick. A COMPUTE cap (not a trade filter) so a
+    30-candidate screener can't stall the scan loop. Comfortably above
+    MAX_OPEN_TRADES, so it never reduces real fills in normal operation.
+
+FUT_DIRECTION_CONFLICT   default: screener   (only used when VETO_ONLY=0)
+    What to do when the LLM direction disagrees with the screener:
+      screener = follow the screener's price-based direction (recommended)
+      skip     = sit out the trade entirely
+      llm      = trust the LLM (old behaviour; has a LONG-bias)
+
+FUT_REGIME_DIRECTION_GATE  default: 1
+    1 = in a CLEAR bear, only allow LONG on HIGH confidence (and vice-versa in
+        a clear bull for SHORT). NEUTRAL lets both through. 0 = disable.
+FUT_REGIME_BEAR_7D       default: -5.0
+FUT_REGIME_BULL_7D       default: 5.0
+    BTC 7-day % thresholds that define a "clear" bear/bull for the gate above.
+
+--- Entry-quality filters (#2 - #5) -------------------------------------------
+
+FUT_EXT_FILTER           default: 1   (#2  -  extension / pullback)
+FUT_MAX_EXT_PCT          default: 18
+    Blocks entries more than FUT_MAX_EXT_PCT above (LONG) / below (SHORT) the
+    50-EMA  -  i.e. refuses to chase a parabolic move. Entries near the EMA
+    (constructive continuation) get a confidence bonus. Raise to allow chasing
+    further; lower to be stricter.
+
+FUT_VOL_FILTER           default: 1   (#5  -  volume confirmation)
+FUT_MIN_VOL_SURGE        default: 1.0
+    Requires the entry impulse to have at least this volume-surge ratio
+    (current vs 20-bar average). Strong surge (>=1.8) adds confidence. The
+    screener already applies a base surge filter, so 1.0 rarely binds.
+
+FUT_RS_FILTER            default: 1   (#3  -  relative strength vs BTC)
+FUT_MIN_RS_PCT           default: -2.0
+    LONG must outperform BTC (SHORT underperform) by at least this % over 24h.
+    Lenient floor (-2) only blocks clearly counter-trend-vs-BTC entries.
+    Strong relative strength (>=3%) adds confidence. Uses the cached regime
+    BTC move  -  no extra API call.
+
+FUT_FUNDING_EDGE         default: 1   (#4  -  funding as an edge)
+    1 = soft tilt: favours setups where funding PAYS your side rather than
+        costs it (LONG when funding <= 0, SHORT when funding >= 0). A small
+        deadband ignores negligible funding. Hard crowding is still blocked by
+        the existing funding/OI filter. 0 = ignore funding direction.
+
+FUT_SHORT_VOL_SURGE      default: 1.0
+    Screener-side volume-surge threshold specifically for SHORT candidates
+    (falling coins in a quiet market). Lower = more SHORT candidates pass.
+
+================================================================================
+  7. FUTURES RISK / SIZING SAFETY
+================================================================================
+
+FUT_MAX_NOTIONAL_USDT    default: (derived)
+    Absolute ceiling for the post-open "oversized position" safety check.
+    When UNSET, it is DERIVED automatically as
+        POSITION_SIZE_MAX x LEVERAGE x 3
+    which auto-tracks your config. Set an explicit number ONLY to override.
+    WARNING: setting this too LOW will emergency-close perfectly-sized
+    positions. The detection is ratio-first (real-vs-intended), so a correctly
+    sized 1.0x position is never closed regardless  -  this is just a backstop.
+    (Note: MAX_DAILY_LOSS and MAX_DAILY_LOSS_HARD_MULT are set per-bot in
+     bot_config.json / the UI, not here.)
+
+================================================================================
+  8. API BUDGET / RATE LIMITING
+================================================================================
+
+API_BUDGET_PER_MINUTE    default: 300
+    Max exchange API calls per minute, shared across all bots on the same key/
+    IP, before the bot throttles itself. Lower it if the exchange rate-limits
+    you; values < 10 are ignored (fall back to default).
+API_EXPECTED_BOT_COUNT   default: 3
+    How many bot processes share the same API key/IP. The per-minute budget is
+    divided by this so the combined rate stays under the exchange's limit.
+
+BOT_NAME                 default: (set by launcher)
+BOT_ACCOUNT_ID           default: (set by launcher)
+    Normally set automatically per bot process by the launcher  -  only set
+    manually if running a bot standalone.
+
+================================================================================
+  9. STATE PERSISTENCE (advanced)
+================================================================================
+
+STATE_PERSIST_RETRIES        default: 8     (valid 1 - 100)
+    How many times to retry a state write before giving up (SQLite contention).
+STATE_PERSIST_RETRY_SLEEP    default: 0.05  (valid 0 - 5 seconds)
+    Sleep between those retries.
+
+================================================================================
+  10. TIMEZONE & DISPLAY
+================================================================================
+
+BOT_TIMEZONE             default: UTC
+    Local timezone for the daily-loss reset bucket and "bad hours" logic, e.g.
+    "Europe/Berlin", "Asia/Shanghai". Trade timestamps stay UTC; only the
+    day-boundary and bad-hour checks follow this zone.
+NO_COLOR                 default: (unset)
+    Set to any value to disable ANSI color in console logs.
+
+================================================================================
+  11. SIMULATION / BACKTEST / DEV
+================================================================================
+
+SIMULATION               default: (per bot_config.json SIMULATION flag)
+    Global override for paper-trading mode. Normally controlled per-bot in
+    bot_config.json / the UI; set here only to force all bots on/off.
+SIM_RANDOM_SEED          default: (none)
+    Fixed RNG seed for the trade simulator (reproducible SIM runs).
+OPTIMIZER_SEED           default: (none)
+    Fixed RNG seed for the optimizer's Monte-Carlo perturbation/sensitivity.
+BOT_LIVE_MODES           default: (none)
+    Used by the Streamlit dashboard to know which bots are live vs sim.
+
+================================================================================
+  MINIMAL EXAMPLE .env
+================================================================================
+# --- required for live trading ---
+EXCHANGE=mexc
+API_KEY=your_key_here
+API_SECRET=your_secret_here
+API_PASSPHRASE=your_passphrase_if_needed
+
+# --- optional ---
+BOT_TIMEZONE=Europe/Berlin
+TELEGRAM_TOKEN=...
+TELEGRAM_CHAT_ID=...
+
+# --- futures entry tuning (all optional; shown = defaults) ---
+FUT_LLM_VETO_ONLY=1
+FUT_EXT_FILTER=1
+FUT_MAX_EXT_PCT=18
+FUT_VOL_FILTER=1
+FUT_RS_FILTER=1
+FUT_MIN_RS_PCT=-2.0
+FUT_FUNDING_EDGE=1
+================================================================================

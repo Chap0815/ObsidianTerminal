@@ -1,0 +1,45 @@
+# 
+#  OBSIDIAN TRADING TERMINAL  -  Pinned dependencies for Python 3.12.x
+# 
+# Alle Versionen sind untereinander kompatibel und liefern fr cp312
+# vorgebaute Wheels (kein C-Compiler ntig).
+#
+# HINWEIS  -  Indikatoren:
+#   Die LIVE-Bots + Screener rechnen RSI/MACD/ATR/EMA NATIV (reines pandas,
+#   bot_utils/indicators.py)  -  dort ist pandas-ta NICHT ntig. NUR das
+#   Backtest-Tool (tools/backtester.py) nutzt noch den ``df.ta``-Accessor,
+#   deshalb ist pandas-ta-classic unten als Tool-Abhngigkeit gelistet.
+#   numpy 1.26.4 + pandas 2.2.2 ist die getestete, stabile cp312-Kombination;
+#   pandas-ta-classic (der gepflegte Fork) bleibt damit kompatibel.
+# 
+
+# --- Kern: Numerik / Daten (Reihenfolge = Auflsungs-Prioritt) ---
+numpy==1.26.4
+pandas==2.2.2
+
+# --- Backtest-Tool: Indikatoren via df.ta-Accessor (nur tools/backtester.py) ---
+pandas-ta-classic>=0.3.14b0   # gepflegter pandas-ta-Fork, kompatibel mit pandas 2.2.x
+
+# --- Exchange / Netzwerk ---
+ccxt>=4.3.0,<5.0.0
+requests>=2.31.0
+python-dotenv>=1.0.1
+
+# --- Cross-Process-Sicherheit ---
+portalocker>=2.8.2           # Cooldown-/DB-Locking ber Subprozesse (Pflicht)
+
+# --- LLM ---
+ollama>=0.3.0
+
+# --- UI / Dashboard ---
+customtkinter>=5.2.2
+streamlit>=1.36.0
+plotly>=5.22.0
+streamlit-autorefresh>=1.0.1   # non-blocking dashboard auto-refresh (UI stays responsive; dashboard falls back to a blocking sleep if absent)
+
+# --- System / Monitoring ---
+psutil>=5.9.8
+tzdata>=2024.1               # zoneinfo-Daten fr Windows (BOT_TIMEZONE)
+
+# --- Dev / Test (nur fr die Self-Test-Suite: Tools -> Run Self-Test) ---
+pytest>=8.0                  # `python -m tools.selftest` / tests/  -  nicht fr den Live-Betrieb ntig

@@ -1,0 +1,265 @@
+"""
+bot_utils/futures_math.py  Pure math helpers for futures trading.
+
+Extracted from main_bot_futures.py. No I/O, no state  easy to unit-test.
+
+Functions:
+  calc_liquidation_price(entry, leverage, position_type, mm_rate)
+  distance_to_liquidation_pct(current, liq_price, position_type)
+  calc_unrealized_pnl(entry, current, margin, leverage, position_type)  (usdt, pct_margin)
+  price_move_pct(entry, current, position_type)
+  liq_buffer_consumed_pct(initial_dist, current_dist)
+"""
+from __future__ import annotations
+
+import math
+from typing import Tuple
+
+
+#  Liquidation price (approximation) 
+
+def calc_liquidation_price(entry: float,
+                            leverage: float,
+                            position_type: str,
+                            maintenance_margin: float = 0.01) -> float:
+    """Approximate ISOLATED-MARGIN liquidation price for a single position.
+
+    ISOLATED ONLY. This is a per-position formula: it derives liquidation from
+    THIS position's entry/leverage/MM alone. It is NOT valid for cross-margin,
+    where liquidation is an account-level event (total equity < total
+    maintenance margin) and depends on every other leg's unrealised PnL  a
+    correlated drawdown liquidates each leg EARLIER than this per-leg estimate
+    suggests, so using it as a cross-margin safety trigger fires too late.
+    Cross-margin callers must prefer the exchange's own liq price
+    (get_exchange_liq_price, account-aware), or cross_liquidation_price() for a
+    self-computed equity-aware estimate (correct in SIM); use THIS isolated
+    formula only for isolated-margin positions, never as the cross panic trigger.
+
+    For accuracy on small-caps, pass the exchange's actual maintenance
+    margin rate (typically 0.005-0.05 depending on notional tier).
+
+    Default 0.01 (1.0%)  conservative.
+    """
+    # Guard against leverage=0 (would divide by zero). Fall back to a
+    # safe 1x assumption rather than crashing  caller should have a
+    # valid leverage, but state corruption shouldn't kill the monitor.
+    if leverage <= 0:
+        leverage = 1.0
+    if position_type == "LONG":
+        return entry * (1 - 1.0 / leverage + maintenance_margin)
+    else:
+        return entry * (1 + 1.0 / leverage - maintenance_margin)
+
+
+def cross_liquidation_price(entry: float, qty_signed: float, mm_rate: float,
+                            mark: float, others, collateral: float):
+    """CROSS-margin liquidation price for ONE leg of a shared-collateral book.
+
+    Unlike the isolated per-leg formula (calc_liquidation_price), cross margin
+    liquidates at the ACCOUNT level: when total equity falls to total
+    maintenance margin. So a leg's liq depends on every OTHER leg's unrealised
+    PnL  in a correlated drawdown the other legs drain the shared collateral
+    and this leg liquidates EARLIER than its isolated estimate suggests (CR-1).
+
+    Solves, holding the other legs fixed at their current mark (the convention
+    exchanges use to show a per-position liq price in cross mode):
+
+        collateral + _i uPnL_i  ==  _i mm_i|notional_i|
+
+    with only the target leg's price moving from `mark` to the unknown P:
+        collateral + _{it}(uPnL_i  MM_i)  qE  ==  P(mm|q|  q)
+
+    Args:
+      entry, qty_signed, mm_rate, mark : the TARGET leg (qty_signed: + long,  short).
+      others   : iterable of (entry_i, qty_signed_i, mm_i, mark_i) for the OTHER legs.
+      collateral : the book's wallet collateral (the bot's allocated capital).
+
+    Returns the liq price, or None when there is no position, or the result
+    lands on the wrong side of the mark (LONG liq must be < mark, SHORT > mark) 
+    i.e. the leg can't trigger an account liquidation on its own from here, so a
+    number would mislead. SINGLE leg + collateral==margin reduces to the EXACT
+    isolated equity-solve (slightly tighter than calc_liquidation_price's linear
+    approximation). NOTE: only this bot's legs are modelled; on a SHARED live
+    account the exchange's own liq price (account-wide) stays authoritative.
+    """
+    q = float(qty_signed)
+    if q == 0.0 or not math.isfinite(q):
+        return None
+    e = float(entry)
+    mm = float(mm_rate)
+    mk = float(mark)
+    # NaN fails every ordered comparison, so a NaN input would slip past the
+    # p<=0 / wrong-side guards and return NaN (poisoning the dashboard liq price).
+    # Reject non-finite inputs up front.
+    if not (math.isfinite(e) and math.isfinite(mm) and math.isfinite(mk)
+            and math.isfinite(float(collateral))):
+        return None
+    other_sum = 0.0
+    for (e_i, q_i, mm_i, mk_i) in others:
+        q_i = float(q_i); e_i = float(e_i); mm_i = float(mm_i); mk_i = float(mk_i)
+        other_sum += q_i * (mk_i - e_i) - mm_i * abs(q_i) * mk_i  # uPnL_i  MM_i
+    denom = mm * abs(q) - q
+    if denom == 0.0:
+        return None
+    p = (float(collateral) + other_sum - q * e) / denom
+    if not math.isfinite(p) or p <= 0.0:
+        return None
+    if (q > 0.0 and p >= mk) or (q < 0.0 and p <= mk):
+        return None                       # already past / unreachable from here
+    return p
+
+
+def distance_to_liquidation_pct(current_price: float,
+                                  liq_price: float,
+                                  position_type: str) -> float:
+    """% distance from current price to liquidation  always positive when
+    the position is alive, becomes negative if liquidation is breached."""
+    if current_price <= 0:
+        return 0.0
+    if position_type == "LONG":
+        return ((current_price - liq_price) / current_price) * 100
+    else:
+        return ((liq_price - current_price) / current_price) * 100
+
+
+def liq_buffer_consumed_pct(initial_dist: float, current_dist: float) -> float:
+    """How much of the initial liquidation buffer has been consumed (0100%).
+
+    Used by the panic-close trigger: when consumed_pct >= (100 - LIQ_SAFETY_PCT),
+    close the position before liquidation. Relative-to-initial makes the
+    trigger work across leverage levels.
+    """
+    if initial_dist <= 0:
+        return 0.0
+    return ((initial_dist - current_dist) / initial_dist) * 100
+
+
+#  PnL math 
+
+def calc_unrealized_pnl(entry: float,
+                          current: float,
+                          margin: float,
+                          leverage: float,
+                          position_type: str) -> Tuple[float, float]:
+    """Return (pnl_usdt, pnl_pct_on_margin).
+
+    pnl_pct_on_margin reflects the leveraged return  useful for stop-loss
+    decisions that consider how much of the margin is at risk.
+
+    Defensive: a non-positive entry (corrupted/early state) would otherwise
+    raise ZeroDivisionError and kill the calling thread. We return a neutral
+    (0.0, 0.0) instead so the function is safe regardless of whether the
+    caller pre-checks entry. Callers should still skip the tick, but this
+    guarantees the monitor can never crash here.
+    """
+    if entry <= 0:
+        return 0.0, 0.0
+    notional = margin * leverage
+    if position_type == "LONG":
+        price_pct = (current - entry) / entry
+    else:
+        price_pct = (entry - current) / entry
+    pnl_usdt = notional * price_pct
+    pct_on_margin = (pnl_usdt / margin) * 100 if margin > 0 else 0.0
+    return pnl_usdt, pct_on_margin
+
+
+def price_move_pct(entry: float, current: float, position_type: str) -> float:
+    """Pure directional price move in %  positive = favorable for the
+    position regardless of LONG/SHORT. NOT leveraged.
+
+    Defensive: returns 0.0 on a non-positive entry rather than raising
+    ZeroDivisionError (see calc_unrealized_pnl for rationale)."""
+    if entry <= 0:
+        return 0.0
+    if position_type == "LONG":
+        return ((current - entry) / entry) * 100
+    else:
+        return ((entry - current) / entry) * 100
+
+
+#  Side-aware comparisons 
+
+def is_new_high(curr: float, prev_high: float, position_type: str) -> bool:
+    """True if `curr` is a new favorable extreme for the position.
+
+    LONG: new high if curr > prev_high.
+    SHORT: new (favorable) low if curr < prev_high.
+    """
+    if position_type == "LONG":
+        return curr > prev_high
+    return curr < prev_high
+
+
+def trailing_stop_hit(curr: float,
+                       highest: float,
+                       trailing_distance_pct: float,
+                       position_type: str) -> bool:
+    """True if current price retraces by trailing_distance_pct% from highest."""
+    if position_type == "LONG":
+        return curr <= highest * (1 - trailing_distance_pct / 100)
+    else:
+        return curr >= highest * (1 + trailing_distance_pct / 100)
+
+
+def breakeven_stop_hit(curr: float,
+                        be_price: float,
+                        position_type: str) -> bool:
+    """True if BE stop is breached (price returned to entry-area)."""
+    if position_type == "LONG":
+        return curr <= be_price
+    else:
+        return curr >= be_price
+
+
+#  Funding / OI filter 
+
+def funding_oi_filter(direction: str,
+                       funding_pct: float,
+                       oi_change_pct: float,
+                       confidence: str) -> Tuple[bool, str]:
+    """Institutional-grade funding + OI filters as hard rules.
+
+    Returns (allowed, reason).
+
+    LONG:
+      Funding > +0.10%/8h  too crowded long, skip unless HIGH conf
+      OI change > +30%/24h  very late longs, skip unless HIGH conf
+    SHORT:
+      Funding < -0.10%/8h  too crowded short, squeeze risk  BLOCK
+    """
+    # Non-finite (NaN/Inf) funding/OI from a bad API read would make every
+    # comparison below False and silently fail-OPEN  and could leak NaN into
+    # stored entry params. Coerce to a neutral 0.0 (no crowding signal): the
+    # trade is still allowed (keep-trades-flowing), but explicitly, not by NaN.
+    def _finite(x: float) -> float:
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            return 0.0
+        return x if math.isfinite(x) else 0.0
+    funding_pct = _finite(funding_pct)
+    oi_change_pct = _finite(oi_change_pct)
+    if direction == "LONG":
+        if funding_pct > 0.10 and confidence != "HIGH":
+            return False, f"Funding too crowded long ({funding_pct:+.3f}%)"
+        if oi_change_pct > 30.0 and confidence != "HIGH":
+            return False, f"OI 24h change too high ({oi_change_pct:+.1f}%  late longs)"
+    elif direction == "SHORT":
+        if funding_pct < -0.10:
+            return False, f"Funding too crowded short ({funding_pct:+.3f}%  squeeze risk)"
+    return True, ""
+
+
+def fee_buffered_breakeven(entry: float,
+                             position_type: str,
+                             fee_buffer: float = 0.003) -> float:
+    """Compute BE stop price that covers 2 taker fee + slippage.
+
+    Bitget Taker ~0.06%  2 sides  leverage  0.3% buffer covers most
+    cases at moderate leverage.
+    """
+    if position_type == "LONG":
+        return round(entry * (1.0 + fee_buffer), 8)
+    else:
+        return round(entry * (1.0 - fee_buffer), 8)

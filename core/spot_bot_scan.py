@@ -1,0 +1,997 @@
+"""
+core/spot_bot_scan.py  Scan-thread + new-entry logic for SpotBot.
+
+ScanMixin runs at SCAN_INTERVAL (~150s) and handles ONLY new entries.
+Exits are handled by ExitsMixin's monitor thread (every ~20s).
+
+Flow per tick:
+  1. Risk gates (paused / bad-hour / max-trades / can_buy_now)
+  2. Screener fetch
+  3. Per-candidate:
+     cooldown / blacklist / correlation check
+     LLM analysis via self._news.analyze_sentiment
+     Quality filters (confidence, RSI, historical winrate, quality score)
+     Position-size scaling (regime + quality)
+     Balance pre-check
+     Place market buy with clientOrderId
+     Record fill price, deduct base-currency fee from recorded amount
+     Persist position
+"""
+from __future__ import annotations
+
+import os
+
+from bot_utils import (
+    safe_fetch_balance_usdt,
+    extract_fill_price,
+    budget_exhausted,
+)
+
+
+class ScanMixin:
+    """Scan thread + new-entry decision logic."""
+    @staticmethod
+    def _bool_cfg_value(value, default: bool = False) -> bool:
+        if value is None:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    def _release_entry_claim_if_untracked(self, sym: str) -> bool:
+        try:
+            if self.state.has(sym):
+                from core.logger import log_event
+                log_event(
+                    f"{sym}: provisional state exists after buy failure - "
+                    f"keeping claim for monitor/reconcile recovery",
+                    "WARN",
+                )
+                return False
+        except Exception:
+            pass
+        from core.database import remove_open_position
+        remove_open_position(self.BOT_NAME, sym)
+        return True
+
+    def _assess_spot_entry_signal(self, r, regime: dict):
+        rsi_15, rsi_h, rsi_4 = r["rsi_15m"], r["rsi_1h"], r["rsi_4h"]
+        tf_score = sum(1 for v in (rsi_15, rsi_h, rsi_4) if 50 <= v <= 75)
+        vol_ok = float(r.get("vol_surge", 1.0) or 1.0) >= 1.15
+        macd_ok = float(r.get("macd_hist", 0.0) or 0.0) >= 0.0
+        body_ok = float(r.get("body_ratio", 1.0) or 1.0) >= 0.35
+        pump_ok = float(r.get("change_percent", 0.0) or 0.0) > 0.0
+
+        score = tf_score + int(vol_ok) + int(macd_ok) + int(body_ok) + int(pump_ok)
+        if tf_score >= 2 and score >= 5:
+            return "HIGH"
+        if tf_score >= 2 and score >= 4:
+            return "MEDIUM"
+        return "LOW"
+
+    #  Scan-thread body 
+
+    def _scan_loop(self):
+        from core.logger import log_event, send_telegram
+        from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+
+        scan_interval = int(self.C("SCAN_INTERVAL"))
+        log_event(f"Scan-Loop started (interval: {scan_interval}s)", "INFO")
+
+        cb_failures = 0
+        cb_backoff = self.CB_INITIAL_BACKOFF
+
+        while not self._shutdown_event.is_set():
+            try:
+                self._scan_tick()
+                if cb_failures > 0:
+                    if cb_failures >= self.CB_FAILURE_THRESHOLD:
+                        log_event(" Circuit breaker reset after recovery", "INFO")
+                    cb_failures = 0
+                    cb_backoff = self.CB_INITIAL_BACKOFF
+            except Exception as e:
+                log_event(f"Scan tick error: {e}", "WARN")
+                self._log_error("Scan loop", e)
+                cb_failures += 1
+                if cb_failures >= self.CB_FAILURE_THRESHOLD:
+                    log_event(
+                        f" Circuit breaker: {cb_failures} consecutive failures  "
+                        f"backing off {cb_backoff:.0f}s",
+                        "WARN"
+                    )
+                    if cb_failures == self.CB_FAILURE_THRESHOLD:
+                        try:
+                            send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                                f" [{self.BOT_NAME}] Circuit breaker tripped\n"
+                                f"{cb_failures} consecutive errors. "
+                                f"Check error_log.txt."
+                            )
+                        except Exception:
+                            pass
+                    if self._shutdown_event.wait(timeout=cb_backoff):
+                        return
+                    cb_backoff = min(cb_backoff * 2, self.CB_MAX_BACKOFF)
+                    continue
+
+            if self._shutdown_event.wait(timeout=scan_interval):
+                return
+
+    #  One scan tick 
+
+    def _scan_tick(self) -> None:
+        from core.logger import log_event
+        from trading.market_filters import (can_buy_now, get_market_regime,
+                                              get_fear_greed, get_btc_change)
+        from trading.risk_manager import is_bot_paused, is_bad_hour
+        from trading.screener import get_top_momentum_coins
+
+        # API budget check  shared rate guard across all 3 bots so one bot
+        # can't burn the quota and earn a 429 IP-ban for all.
+        if budget_exhausted():
+            log_event("API budget exhausted  skipping scan cycle", "WAIT")
+            return
+
+        # SAFE_MODE check (daily-loss killswitch tripped)  skip buys but
+        # don't return error. Monitor still runs and closes existing
+        # positions normally.
+        if self.safe_mode is not None and self.safe_mode.is_active():
+            log_event(
+                f" SAFE_MODE active ({self.safe_mode.reason()})  "
+                f"no new entries this cycle",
+                "WAIT"
+            )
+            return
+
+        max_trades = int(self.C("MAX_OPEN_TRADES"))
+        min_pump = float(self.C("MIN_PUMP"))
+
+        # Dynamic min_pump adjustment for quiet markets: in NEUTRAL regime with
+        # sideways/mildly-trending BTC (3%), few coins reach the configured
+        # pump threshold, so lower the bar by 0.5% to surface legitimate setups
+        # for the LLM to assess.
+        _is_quiet = False
+        try:
+            from trading.market_filters import get_market_regime as _gmr
+            _early_regime = _gmr(self.ex)
+            _btc24 = float(_early_regime.get("btc_24h", 0.0))
+            _is_quiet = (_early_regime.get("regime") == "NEUTRAL"
+                          and -3.0 <= _btc24 <= 3.0)
+            if _is_quiet and min_pump >= 1.5:
+                adj_min_pump = max(1.0, min_pump - 0.5)
+                if adj_min_pump < min_pump:
+                    log_event(
+                        f"Quiet market (NEUTRAL, BTC 24h {_btc24:+.1f}%)  "
+                        f"min_pump adjusted {min_pump}% -> {adj_min_pump}% "
+                        f"to find more candidates", "INFO"
+                    )
+                    min_pump = adj_min_pump
+        except Exception:
+            pass
+
+        # Balance check (live only)
+        if self.simulation:
+            balance = 1000.0
+        else:
+            balance = safe_fetch_balance_usdt(
+                self.ex, error_logger=self._log_error
+            )
+            if balance is None:
+                log_event(
+                    "Balance unavailable  skipping buy-side this cycle",
+                    "WAIT"
+                )
+                return
+
+        # Risk gates
+        paused, pause_reason = is_bot_paused(self.BOT_NAME, exchange=self.ex)
+        if paused:
+            log_event(f"[{self.BOT_NAME}] Pausiert: {pause_reason}", "WAIT")
+            return
+        if self.state.count() >= max_trades:
+            log_event(f"Max. Trades erreicht ({max_trades})", "WAIT")
+            return
+        if is_bad_hour(self.BOT_NAME):
+            from trading.risk_manager import _get_local_hour
+            import os as _os
+            hour = _get_local_hour()
+            tz = _os.getenv("BOT_TIMEZONE", "UTC")
+            log_event(
+                f"[{self.BOT_NAME}] Bad hour ({hour}:xx {tz})", "WAIT"
+            )
+            return
+
+        open_syms = self.state.keys()
+        allowed, reason = can_buy_now(
+            self.ex, bot_name=self.BOT_NAME, open_symbols=open_syms
+        )
+        if not allowed:
+            log_event(f"[{self.BOT_NAME}] Markt-Filter: {reason}", "WAIT")
+            return
+
+        # Regime + screener
+        regime = get_market_regime(self.ex)
+        log_event(
+            f"Scanning | Pump {min_pump}% | "
+            f"Phase: {regime['regime']} | F&G: {regime['fear_greed']}",
+            "SCAN"
+        )
+        try:
+            cand = get_top_momentum_coins(
+                exchange=self.ex,
+                min_pump=min_pump,
+                limit=min(12, max(6, max_trades)),
+                bot_name=self.BOT_NAME,
+                quiet_market=_is_quiet,
+            )
+        except Exception as e:
+            log_event(f"Screener error: {e}", "WARN")
+            return
+
+        if cand is None or cand.empty:
+            return
+
+        from trading.risk_manager import get_rsi_max, check_blacklist
+        rsi_max = get_rsi_max(self.BOT_NAME)
+
+        for _, r in cand.iterrows():
+            if self._shutdown_event.is_set():
+                return
+            if self.state.count() >= max_trades:
+                break
+            # M-3: re-check the daily-loss / kill-switch per candidate, not just
+            # once per scan. An earlier fill THIS cycle can push realized PnL
+            # past the cap; without this the remaining candidates would still
+            # fire (overshoot). Cheap DB read  no exchange arg, so the
+            # per-cycle BTC-crash API call (pre-loop gate above) isn't repeated.
+            _paused, _pr = is_bot_paused(self.BOT_NAME)
+            if _paused:
+                log_event(f"[{self.BOT_NAME}] Kill-switch mid-scan ({_pr})  "
+                          f"stopping further entries this cycle", "WAIT")
+                break
+            sym = r["symbol"].split("/")[0]
+
+            # Quick pre-checks
+            if self._is_in_cooldown(sym):
+                continue
+            if check_blacklist(sym, self.BOT_NAME):
+                log_event(f"{sym} auf Blacklist", "WAIT")
+                continue
+            # COEXISTENCE: skip a coin another bot on this account already holds.
+            try:
+                from core.database import is_claimed_by_other
+                if is_claimed_by_other(sym, self.BOT_NAME, is_futures=False):
+                    log_event(f"{sym} held by another bot  skipping (coexistence)", "WAIT")
+                    continue
+            except Exception:
+                pass
+            if self.state.has(sym):
+                continue
+
+            # Per-candidate correlation + price check
+            try:
+                ok, reason = can_buy_now(
+                    self.ex, bot_name=self.BOT_NAME,
+                    open_symbols=self.state.keys(),
+                    candidate_symbol=f"{sym}/USDT",
+                    known_price=float(r.get("price") or 0) or None,  # skip refetch
+                )
+                if not ok:
+                    log_event(f"{sym} skipped  {reason}", "WAIT")
+                    continue
+            except Exception as _filt_err:
+                # Never block trading on a transient filter outage  but DO
+                # surface programming errors (TypeError/NameError) loudly so a
+                # silently-dead gate (e.g. a bad kwarg) can't masquerade as a
+                # working filter.
+                if isinstance(_filt_err, (TypeError, NameError, AttributeError)):
+                    log_event(f"{sym} filter check BUG "
+                              f"({type(_filt_err).__name__}: {_filt_err})  "
+                              f"gate skipped, not blocking", "WARN")
+
+            # Multi-RSI gate
+            rsi_values = [r["rsi_15m"], r["rsi_1h"], r["rsi_4h"]]
+            rsi_too_high = sum(1 for v in rsi_values if v > rsi_max)
+            if rsi_too_high >= 2:
+                log_event(
+                    f"{sym} skipped  {rsi_too_high}/3 RSIs > {rsi_max:.0f}",
+                    "WAIT"
+                )
+                continue
+
+            # Try the entry  encapsulates LLM, quality filters, order
+            try:
+                self._try_open_trade(r, regime, balance)
+            except Exception as e:
+                log_event(f"Open-trade {sym} failed: {e}", "WARN")
+                self._log_error(f"_try_open_trade {sym}", e)
+
+    #  Cooldown helpers 
+
+    def _is_in_cooldown(self, sym: str) -> bool:
+        """Read-only cooldown check (doesn't write to disk)."""
+        try:
+            from trading.cooldown_utils import check_in_cooldown
+            return check_in_cooldown(self.cool, sym)
+        except ImportError:
+            return False
+
+    #  Try opening one trade (per candidate) 
+
+    def _try_open_trade(self, r, regime: dict, balance: float) -> None:
+        """Run LLM analysis + quality filters + place order if everything
+        passes. Mutates self.state on success."""
+        from core.logger import log_event, log_buy, send_telegram
+        from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+
+        sym = r["symbol"].split("/")[0]
+
+        use_llm = self._bool_cfg_value(self.C("USE_LLM", False), False)
+        news = ""
+        ans = None
+        analysis_is_keyword = False
+        direction = "BUY"
+        if use_llm:
+            log_event(f"Analyzing {sym} ...", "INFO")
+            try:
+                news = self._news.get_latest_news(sym)
+                ans = self._news.analyze_sentiment(
+                    sym, r["change_percent"],
+                    r["rsi_15m"], r["rsi_1h"], r["rsi_4h"], news,
+                    market_regime=regime,
+                )
+            except Exception as e:
+                log_event(f"Analysis {sym} failed: {e}", "WARN")
+                return
+
+            analysis_is_keyword = "[keyword fallback" in str(ans or "").lower()
+            try:
+                direction, confidence = (
+                    self._news.parse_direction_and_confidence(ans))
+            except Exception as e:
+                log_event(f"parse_direction {sym} failed: {e}", "WARN")
+                return
+            if direction != "BUY":
+                source = "Keyword fallback" if analysis_is_keyword else "AI"
+                log_event(f"{sym}: {source} says {direction} - skipped", "WAIT")
+                return
+        else:
+            log_event(f"Signal check {sym} (Spot) ...", "INFO")
+            confidence = self._assess_spot_entry_signal(r, regime)
+
+        allow, size_mult, why = self._quality_filters(
+            sym, r, ans, regime,
+            confidence_override=None if use_llm else confidence)
+        if not allow:
+            log_event(f"{sym}: {why}", "WAIT")
+            return
+
+        # Bull/Bear devil's-advocate veto is handled inside
+        # news_brain.analyze_sentiment() when direction=="BUY" (it has full
+        # prompt context); if it vetoes, direction is "WAIT" and we already
+        # returned above. Nothing to do here.
+
+        # Position sizing
+        from trading.risk_manager import get_position_size
+        trade_usdt = get_position_size(self.BOT_NAME) * size_mult
+        if regime["regime"] == "BEAR":
+            trade_usdt = max(5.0, trade_usdt * 0.5)
+            log_event(f"BEAR phase: position halved to {trade_usdt} USDT", "INFO")
+        elif regime["regime"] == "NEUTRAL":
+            trade_usdt = max(5.0, trade_usdt * 0.75)
+            log_event(f"NEUTRAL phase: position reduced to {trade_usdt} USDT", "INFO")
+
+        # Balance pre-check (5% safety margin)
+        if not self.simulation and balance is not None:
+            required = trade_usdt * 1.05
+            if required > balance:
+                log_event(
+                    f"Skipping {sym}: need ~{required:.2f} USDT "
+                    f"(trade {trade_usdt:.2f} + 5% buffer) but "
+                    f"only {balance:.2f} USDT free.",
+                    "WARN"
+                )
+                return
+
+        log_buy(
+            self.BOT_NAME, sym, r["price"], trade_usdt,
+            (r["rsi_15m"], r["rsi_1h"], r["rsi_4h"]),
+            news, "" if analysis_is_keyword else ans
+        )
+
+        # Place the order (or simulate)
+        if not self.simulation:
+            from core.database import claim_symbol_for_entry
+            if not claim_symbol_for_entry(self.BOT_NAME, sym, "SPOT"):
+                log_event(f"{sym} claimed by another bot  skip "
+                          f"(coexistence)", "WAIT")
+                return
+        _claimed = not self.simulation
+        try:
+            entry = self._place_buy_order(sym, r, trade_usdt)
+        except Exception as _buy_exc:
+            if _claimed:
+                self._release_entry_claim_if_untracked(sym)
+            raise _buy_exc
+        if entry is None:
+            if _claimed:
+                self._release_entry_claim_if_untracked(sym)
+            return  # buy failed  already logged
+
+        amount, fill_price, gross_amount, entry_fee = entry
+
+        # Decrement balance for next candidate
+        if not self.simulation and balance is not None:
+            balance = max(0.0, balance - trade_usdt)
+
+        # Persist the final position. _place_buy_order already wrote a
+        # PROVISIONAL row (zombie protection) before the slow fee refetches, so
+        # patch that row in place with the corrected NET amount + fees +
+        # metadata instead of a second full add  one row identity, one claim
+        # refresh (now carrying the net amount). Fall back to add() only if the
+        # provisional write didn't land.
+        from trading.market_filters import get_btc_change, get_fear_greed
+        from core.logger import _date as _utc_now_str   # UTC timestamps
+        position_fields = {
+            "buy": fill_price,
+            "highest": fill_price,
+            "invested_usdt": gross_amount * fill_price,
+            "amount": amount,
+            "original_amount": amount,
+            "rsi_15m": r["rsi_15m"],
+            "rsi_1h": r["rsi_1h"],
+            "rsi_4h": r["rsi_4h"],
+            "change_pct": r["change_percent"],
+            "btc_trend": get_btc_change(self.ex, hours=1),
+            "fear_greed": get_fear_greed(),
+            "partial_sold": False,
+            "be_active": False,
+            "break_even": False,
+            "initial_entry_fee": entry_fee,
+            "fees_paid": entry_fee,
+            "provisional": False,
+        }
+        if self.state.has(sym):
+            # Keep the provisional buy_time (earliest, most accurate entry time).
+            self.state.update_many(sym, position_fields)
+        else:
+            position_fields["buy_time"] = _utc_now_str()
+            self.state.add(sym, position_fields)
+
+        try:
+            from core.logger import log_struct
+            from news.news_brain_core import parse_rationale
+            event_name = (
+                "keyword_decision" if analysis_is_keyword
+                else ("llm_decision" if use_llm else "signal_decision")
+            )
+            log_struct(
+                event_name,
+                bot=self.BOT_NAME, symbol=sym, action="BUY",
+                direction=direction, confidence=confidence,
+                source=("keyword" if analysis_is_keyword
+                        else ("llm" if use_llm else "signal")),
+                fallback=bool(analysis_is_keyword),
+                rationale=parse_rationale(ans) if ans is not None else "",
+                price=float(r["price"]), size_usdt=float(trade_usdt),
+                sim=bool(self.simulation),
+            )
+        except Exception:
+            pass
+
+        try:
+            send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                f" [{self.BOT_NAME}] KAUF {sym}\n"
+                f"Preis: {r['price']:.6f} USDT\n"
+                f"Einsatz: {trade_usdt:.2f} USDT (Kelly)\n"
+                f"RSI: 15m {r['rsi_15m']:.1f}|1h {r['rsi_1h']:.1f}|4h {r['rsi_4h']:.1f}\n"
+                f"Pump: {r['change_percent']:.1f}% | Phase: {regime['regime']}"
+            )
+        except Exception as e:
+            log_event(f"Telegram failed: {e}", "WARN")
+
+    #  Quality filters 
+
+    def _quality_filters(self, sym: str, r, ans: str, regime: dict,
+                         confidence_override: str = None):
+        """Run all quality gates. Returns (allow, size_mult, reason).
+
+        Subclasses can override this to plug in/out individual checks.
+        Default implementation matches balanced + aggressive (identical).
+        """
+        from core.logger import log_event
+
+        # 1. Confidence. With USE_LLM=false this is a mechanical signal score,
+        # not an AI verdict; do not touch self._news on that path.
+        if confidence_override is None:
+            confidence = self._news.parse_confidence(ans)
+            low_reason = "AI says BUY but LOW confidence - skipped"
+        else:
+            confidence = str(confidence_override).upper()
+            low_reason = "Signal confidence LOW - skipped"
+        if confidence == "LOW":
+            return False, 0.0, low_reason
+        rsi_15, rsi_h, rsi_4 = r["rsi_15m"], r["rsi_1h"], r["rsi_4h"]
+        tf_score = sum(1 for v in (rsi_15, rsi_h, rsi_4) if 50 <= v <= 75)
+
+        # 2. RSI overbought-on-all-TFs block
+        if rsi_15 > 80 and rsi_h > 75 and rsi_4 > 70:
+            return False, 0.0, (
+                f"BUY blocked  RSI overbought on all TFs "
+                f"(15m={rsi_15:.0f}, 1h={rsi_h:.0f}, 4h={rsi_4:.0f})"
+            )
+
+        # 3. Weak multi-TF + non-HIGH conf
+        if tf_score < 2 and confidence != "HIGH":
+            return False, 0.0, (
+                f"BUY blocked  weak multi-TF ({tf_score}/3) + "
+                f"{confidence} confidence"
+            )
+
+        # 4. Historical setup winrate
+        try:
+            from core.database import get_historical_winrate_for_setup
+            rsi_bucket = (0 if rsi_h < 40
+                          else 1 if rsi_h < 55
+                          else 2 if rsi_h < 70
+                          else 3 if rsi_h < 85
+                          else 4)
+            chg = r["change_percent"]
+            chg_bucket = (0 if chg < 3
+                          else 1 if chg < 8
+                          else 2 if chg < 15
+                          else 3 if chg < 25
+                          else 4)
+            hist = get_historical_winrate_for_setup(
+                self.BOT_NAME, rsi_bucket, chg_bucket, min_sample=8
+            )
+            if (hist["winrate"] is not None
+                    and hist["winrate"] < 0.30
+                    and confidence != "HIGH"):
+                return False, 0.0, (
+                    f"BUY blocked  historical winrate "
+                    f"{hist['winrate']*100:.0f}% over "
+                    f"{hist['trade_count']} trades"
+                )
+        except Exception as e:
+            self._log_error(f"historical winrate lookup {sym}", e)
+
+        # 5. Quality score
+        size_mult = 1.0
+        try:
+            from trading.risk_manager import score_trade_quality
+            q = score_trade_quality(
+                symbol=sym, bot_name=self.BOT_NAME,
+                rsi_1h=r["rsi_1h"],
+                atr_pct=r.get("atr_pct", 0),
+                vol_surge=r.get("vol_surge", 1.0),
+                body_ratio=r.get("body_ratio", 1.0),
+                macd_hist=r.get("macd_hist", 0),
+                change_pct=r["change_percent"],
+                fear_greed=regime.get("fear_greed", 50),
+                regime=regime.get("regime", "NEUTRAL"),
+                price=r["price"],
+            )
+            if q.get("verdict") == "SKIP":
+                return False, 0.0, (
+                    f"Quality-Score {q.get('score', 0):.0f}/100 (SKIP)  "
+                    f"{q.get('reason', '')}"
+                )
+            if q.get("verdict") == "WARN":
+                size_mult = float(q.get("size_multiplier", 0.5))
+                log_event(
+                    f"{sym}: Quality {q.get('score', 0):.0f}/100 (WARN)  "
+                    f"size  {size_mult:.2f}", "INFO"
+                )
+            else:
+                log_event(
+                    f"{sym}: Quality {q.get('score', 0):.0f}/100 (PASS)",
+                    "INFO"
+                )
+        except Exception as e:
+            self._log_error(f"score_trade_quality {sym}", e)
+
+        return True, size_mult, ""
+
+    #  Order placement 
+
+    def _find_order_by_cid(self, symbol_pair: str, cid: str):
+        """Locate an order by OUR clientOrderId (open orders first, then recent
+        history). Used to recover from a lost-response timeout so a retry doesn't
+        place a SECOND live buy. Returns the order dict or None.
+        """
+        try:
+            from bot_utils.futures_order import _order_client_id_matches
+        except Exception:
+            def _order_client_id_matches(o, c):
+                return o.get("clientOrderId") == c
+        try:
+            for o in (self.ex.fetch_open_orders(symbol_pair) or []):
+                if _order_client_id_matches(o, cid):
+                    return o
+        except Exception:
+            pass
+        has = getattr(self.ex, "has", {}) or {}
+        try:
+            if has.get("fetchOrders"):
+                for o in (self.ex.fetch_orders(symbol_pair, limit=20) or []):
+                    if _order_client_id_matches(o, cid):
+                        return o
+        except Exception:
+            pass
+        # A just-filled MARKET buy isn't "open", and several venues (bitget  the
+        # default  okx, bybit, kucoin, gate) lack unified fetchOrders; the fill
+        # shows in closed orders / my-trades. Consult those before giving up so a
+        # lost-response retry can't place a SECOND live buy.
+        try:
+            if has.get("fetchClosedOrders"):
+                for o in (self.ex.fetch_closed_orders(symbol_pair, limit=20) or []):
+                    if _order_client_id_matches(o, cid):
+                        return o
+        except Exception:
+            pass
+        try:
+            if has.get("fetchMyTrades"):
+                for t in (self.ex.fetch_my_trades(symbol_pair, limit=20) or []):
+                    if _order_client_id_matches(t, cid):
+                        return t
+        except Exception:
+            pass
+        return None
+
+    def _execution_quality_gate(self, sym: str, pair: str) -> bool:
+        """Pre-trade spread gate for SPOT entries.
+
+        A market buy into a blown-out or vacuum order book fills at the far side
+        of the spread. ``check_spread_ok`` aborts on an abnormal spread AND
+        records the bad reading against the shared SafeMode circuit breaker.
+
+        When the exchange returns a ticker WITHOUT bid/ask (common for thin
+        micro-caps on MEXC), we fall back to the ORDER BOOK for the real
+        top-of-book spread and fail CLOSED on a missing/illiquid book (live
+        only; SIM models slippage separately). A ticker-fetch error fails OPEN
+        so a transient glitch can't freeze all trading.
+        """
+        from core.logger import log_event
+        try:
+            from bot_utils import check_spread_ok
+        except Exception as e:
+            self._log_error("exec-quality import", e)
+            return True
+        try:
+            ticker = self.ex.fetch_ticker(pair)
+        except Exception as e:
+            log_event(f"{sym}: spread gate skipped  ticker fetch failed ({e})",
+                      "WARN")
+            return True
+        # Order-book fallback when the exchange didn't populate bid/ask. Without
+        # this, check_spread_ok returns True on missing quotes  illiquid coins
+        # slip ~5% on entry. Fail-CLOSED: no readable book = skip the trade.
+        ob_derived = False
+        if (not self.simulation
+                and (not isinstance(ticker, dict)
+                     or ticker.get("bid") is None or ticker.get("ask") is None)):
+            try:
+                ob = self.ex.fetch_order_book(pair, limit=5)
+                bids = (ob or {}).get("bids") or []
+                asks = (ob or {}).get("asks") or []
+                if not bids or not asks:
+                    log_event(f"{sym}: empty order book  blocking entry "
+                              f"(illiquid, fail-closed)", "WARN")
+                    return False
+                best_bid, best_ask = float(bids[0][0]), float(asks[0][0])
+                if best_bid <= 0 or best_ask <= 0:
+                    return False
+                ticker = dict(ticker if isinstance(ticker, dict) else {})
+                ticker["bid"], ticker["ask"] = best_bid, best_ask
+                ob_derived = True
+            except Exception as e:
+                log_event(f"{sym}: order-book spread check failed ({e})  "
+                          f"blocking entry (fail-closed)", "WARN")
+                return False
+        try:
+            # A chronically illiquid micro-cap (order-book-derived wide spread)
+            # must be SKIPPED quietly  it must NOT feed the flash-crash circuit
+            # breaker, else routine illiquid picks would trip SAFE_MODE and pause
+            # ALL entries. The breaker only fires on EXCHANGE-QUOTED spreads
+            # (a genuine flash-crash signal on a coin the venue actively quotes).
+            from core.constants import MAX_SPREAD_PCT_SPOT
+            return bool(check_spread_ok(
+                ticker, log_event=log_event, symbol=sym,
+                max_spread_pct=MAX_SPREAD_PCT_SPOT,
+                safe_mode_instance=(None if ob_derived else self.safe_mode)))
+        except Exception as e:
+            self._log_error(f"spread gate {sym}", e)
+            return True
+
+    def _record_entry_slippage(self, sym: str, expected_price: float,
+                               fill_price: float) -> None:
+        """Feed the slippage circuit breaker after a SPOT fill (recording, not
+        blocking  the buy already happened). Repeated abnormal fills trip
+        SAFE_MODE. Never raises  telemetry must not break the trade path."""
+        try:
+            if not getattr(self, "safe_mode", None):
+                return
+            if expected_price <= 0 or fill_price <= 0:
+                return
+            self.safe_mode.record_slippage(
+                expected_price=expected_price, actual_fill=fill_price,
+                symbol=sym, side="buy")
+        except Exception as e:
+            self._log_error(f"record entry slippage {sym}", e)
+
+    def _place_buy_order(self, sym: str, r, trade_usdt: float):
+        """Place a market buy. Returns (amount, fill_price, gross_amount,
+        entry_fee) on success, None on failure.
+
+        Validates r["price"] > 0 before division (illiquid coins sometimes
+        return price=0) and fill_price > 0 from the exchange (a malformed order
+        response would otherwise save buy=0 while the LIVE order is already on
+        the exchange  orphan position).
+        """
+        from core.logger import log_event
+
+        # defensive price validation
+        try:
+            price = float(r.get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0
+        if price <= 0:
+            log_event(f"Buy {sym}: invalid screener price {r.get('price')!r}  skip", "WARN")
+            return None
+
+        if self.simulation:
+            # Apply realistic adverse slippage in SIM too (same default as
+            # core.constants.BACKTEST_SLIPPAGE_PER_SIDE) so SIM fills aren't
+            # systematically better than LIVE.
+            try:
+                from core.constants import BACKTEST_SLIPPAGE_PER_SIDE as _SLP
+            except Exception:
+                _SLP = 0.001
+            sim_fill_price = price * (1.0 + _SLP)  # buy side  adverse = higher
+            amount = trade_usdt / sim_fill_price
+            try:
+                from core.constants import DEFAULT_TAKER_FEE as _TKR
+            except Exception:
+                _TKR = 0.001
+            entry_fee = amount * sim_fill_price * _TKR
+            return amount, sim_fill_price, amount, entry_fee
+
+        # Pre-trade spread gate: refuse a market buy into a blown-out/vacuum
+        # book; repeated abnormal spreads also trip SAFE_MODE.
+        if not self._execution_quality_gate(sym, f"{sym}/USDT"):
+            log_event(
+                f"Buy {sym}: ABORT  spread too wide / liquidity vacuum "
+                f"(execution-quality gate)  refusing naked market buy", "WARN")
+            return None
+
+        # Ask guard: the bot decides on the ticker 'last' price, but a naked
+        # market buy fills at the EXECUTABLE ASK. On a fast-pumping coin 'last'
+        # lags the book (stale-low) while the ask is already higher. Compare the
+        # signal price against the live ORDER-BOOK ASK and abort if the ask ran
+        # past SPOT_MAX_CHASE_PCT; otherwise adopt the ask as the buy basis so
+        # amount/slippage math reflect what we actually pay.
+        try:
+            _chase_max = float(os.getenv("SPOT_MAX_CHASE_PCT", "2.0"))
+        except (ValueError, TypeError):
+            _chase_max = 2.0
+        try:
+            _ob = self.ex.fetch_order_book(f"{sym}/USDT", limit=5)
+            _asks = (_ob or {}).get("asks") or []
+            _ask = float(_asks[0][0]) if _asks else 0.0
+            if _ask > 0 and price > 0:
+                _run_pct = (_ask / price - 1.0) * 100.0
+                if _run_pct > _chase_max:
+                    log_event(
+                        f"Buy {sym}: ABORT  ask ran +{_run_pct:.1f}% above signal "
+                        f"({price:.6f} -> ask {_ask:.6f}, max {_chase_max:g}%)  "
+                        f"not buying into a pumped/illiquid book", "WAIT")
+                    return None
+                price = _ask  # buy basis = executable ask  honest slippage math
+        except Exception:
+            pass  # best-effort  an order-book glitch must not freeze all entries
+
+        try:
+            # CRITICAL: CCXT amount is BASE currency, NOT quote.
+            amount_coins = trade_usdt / price
+            try:
+                amount_coins = float(self.ex.amount_to_precision(
+                    f"{sym}/USDT", amount_coins))
+            except Exception:
+                pass
+            if amount_coins <= 0:
+                log_event(f"Buy {sym}: computed amount is 0  skip", "WARN")
+                return None
+
+            # Stable per-intent clientOrderId derived from bot+symbol+30s-bucket
+            # so a lost-response retry of the SAME intent collides (the exchange
+            # dedupes it) while the BOT_NAME component keeps it unique across the
+            # three bots.
+            import hashlib as _hashlib
+            import time as _time
+            _bucket = int(_time.time() // 30)   # 30s idempotency window
+            cid = (f"{self.BUY_PREFIX}-{sym}-"
+                   + _hashlib.sha256(
+                       f"{self.BOT_NAME}:{sym}:{_bucket}".encode()
+                   ).hexdigest()[:10])
+
+            # On MEXC/Binance spot, CCXT interprets the `amount` arg of a market
+            # buy as USDT COST (quote), not COIN QUANTITY (base). Detect via
+            # ex.id and pass the USDT cost (with createMarketBuyOrderRequiresPrice
+            # disabled). Other exchanges (Bitget/Kraken/Kucoin) use standard
+            # coin-amount semantics.
+            ex_id = (getattr(self.ex, "id", "") or "").lower()
+            quote_first_buy = ex_id in ("mexc", "binance", "binanceusdm",
+                                          "binancecoinm")
+            try:
+                if quote_first_buy:
+                    # Disable the price-requirement check so we can pass
+                    # cost directly. Some ccxt versions need this opt-in.
+                    try:
+                        self.ex.options["createMarketBuyOrderRequiresPrice"] = False
+                    except Exception:
+                        pass
+                    # On MEXC/Binance: the FIRST positional arg becomes
+                    # the USDT cost when this option is False. We also
+                    # send 'cost' in params as belt-and-suspenders for
+                    # ccxt versions that read it from params.
+                    order = self.ex.create_market_buy_order(
+                        f"{sym}/USDT", trade_usdt,
+                        params={"clientOrderId": cid, "cost": trade_usdt}
+                    )
+                else:
+                    # Bitget/Kraken/etc: standard coin-amount semantics
+                    order = self.ex.create_market_buy_order(
+                        f"{sym}/USDT", amount_coins,
+                        params={"clientOrderId": cid}
+                    )
+            except Exception as _place_err:
+                # A placement exception does NOT prove the order never reached
+                # the exchange  it may be a lost-response timeout AFTER a fill.
+                # Reconcile by our stable clientOrderId first; only re-fire when
+                # we can prove no order exists AND the failure was the exchange
+                # rejecting the param itself (avoids a double-buy).
+                recovered = self._find_order_by_cid(f"{sym}/USDT", cid)
+                if recovered is not None:
+                    # An order carrying our clientOrderId EXISTS on the exchange
+                    # (filled OR still resting)  adopt it; NEVER re-fire, that
+                    # would double-buy. The fill guard below books only what
+                    # actually filled. (Previously this required filled>0, so an
+                    # accepted-but-not-yet-filled order fell through to a re-fire.)
+                    order = recovered
+                elif "clientorderid" in str(_place_err).lower():
+                    # Param rejected  first call never placed an order; safe
+                    # to retry once WITHOUT the clientOrderId param.
+                    if quote_first_buy:
+                        order = self.ex.create_market_buy_order(
+                            f"{sym}/USDT", trade_usdt,
+                            params={"cost": trade_usdt}
+                        )
+                    else:
+                        order = self.ex.create_market_buy_order(
+                            f"{sym}/USDT", amount_coins
+                        )
+                else:
+                    # Unknown failure and no confirmable fill. Do NOT re-fire
+                    # (double-buy risk). Skip; if an order DID land, the
+                    # exchange-reconcile path will flag it as an orphan.
+                    log_event(
+                        f"Buy {sym}: placement failed ({_place_err}) and no "
+                        f"order found for cid={cid}  skipping (no blind "
+                        f"retry, to avoid a duplicate position)", "WARN")
+                    return None
+
+            # Symmetric to the sell path's order_was_filled guard: never book an
+            # unfilled buy as an open position. An accepted order with no
+            # fill/cost data is MEXC's normal minimal response and DID execute
+            # (treated as filled); a truly empty response (no id, no fill, no
+            # cost) or an explicit rejection is a phantom  skip it so a later
+            # sell can't loop on 30005 oversold. min_fill_ratio0 keeps real
+            # partial fills (handled just below), rejecting only nothing-filled.
+            from bot_utils.order_utils import order_was_filled
+            if not order_was_filled(order, amount_coins, min_fill_ratio=1e-9):
+                log_event(
+                    f"Buy {sym}: order returned but NOT filled "
+                    f"(order={order!r})  skipping, no position booked", "WARN")
+                return None
+
+            amount = float(order.get("filled") or amount_coins)
+            # detect partial fill
+            if amount < amount_coins * 0.95:
+                log_event(
+                    f"Buy {sym}: PARTIAL FILL "
+                    f"{amount:.6f}/{amount_coins:.6f} "
+                    f"({100*amount/amount_coins:.1f}%)  using filled amount",
+                    "WARN"
+                )
+
+            fill_price = extract_fill_price(order, price)
+
+            # Record realized entry slippage so repeated bad fills trip
+            # SAFE_MODE (no-op when fill_price<=0; handled by the screener-price
+            # recovery just below).
+            self._record_entry_slippage(sym, expected_price=price,
+                                        fill_price=fill_price)
+
+            # fill_price validation
+            if fill_price <= 0:
+                # Rather than leave an orphan on the exchange, persist a
+                # provisional state with the screener price as the entry
+                # estimate so the monitor tracks the position from the next
+                # tick (slight PnL-accounting drift, but never an untracked
+                # position).
+                log_event(
+                    f"Buy {sym}: fill_price=0 returned by exchange  "
+                    f"recovering by using screener price ({price:.6f}) "
+                    f"as entry estimate so monitor tracks the position",
+                    "WARN"
+                )
+                self._log_error(
+                    f"recovered orphan candidate {sym}",
+                    Exception(f"clientOrderId={cid}, order={order!r}")
+                )
+                fill_price = price
+
+            # Zombie protection  write a PROVISIONAL state row immediately
+            # after the order returns, BEFORE the slow fee refetches (~1.8s). If
+            # the bot is SIGKILLed in that window, the position would otherwise
+            # be on the exchange with no state-tracking  no SL/TP  orphan.
+            # Final fees + amount adjustment happen further down (the final
+            # state.add corrects the provisional values).
+            try:
+                from core.logger import _date as _utc_now_str_inner
+                self.state.add(sym, {
+                    "buy": fill_price,
+                    "highest": fill_price,
+                    "buy_time": _utc_now_str_inner(),
+                    "invested_usdt": amount * fill_price,
+                    "amount": amount,
+                    "original_amount": amount,
+                    "partial_sold": False,
+                    "be_active": False,
+                    "break_even": False,
+                    "initial_entry_fee": 0.0,
+                    "fees_paid": 0.0,
+                    "provisional": True,
+                })
+            except Exception as _prov_e:
+                # State write failure is non-fatal here  the final state.add
+                # below will retry. We just log.
+                log_event(
+                    f"Buy {sym}: provisional state-write failed "
+                    f"({_prov_e})  relying on final write", "INFO"
+                )
+
+            # Entry fee
+            try:
+                from trading.fee_utils import extract_or_estimate_with_refetch
+                entry_fee = extract_or_estimate_with_refetch(
+                    self.ex, order, f"{sym}/USDT", fill_price,
+                    base_override=sym
+                )
+            except Exception:
+                from bot_utils.order_utils import extract_order_fee as _eof
+                entry_fee = _eof(order)
+
+            # Async-aware base-fee resolution: the fee-in-base may not be
+            # settled in the initial order response (200-500ms async delay on
+            # Bitget/Binance). If unaccounted, the recorded amount would exceed
+            # the real wallet balance and the later sell would hit
+            # InsufficientBalance. This helper refetches up to 3 and falls back
+            # to a taker-rate estimate.
+            from bot_utils.spot_fee_settle import extract_or_estimate_base_fee
+            base_fee = extract_or_estimate_base_fee(
+                self.ex, order, f"{sym}/USDT", sym,
+                max_attempts=3,
+                retry_delay=0.3,
+                log_event=log_event,
+                shutdown_event=getattr(self, "_shutdown_event", None),
+            )
+            gross_amount = amount
+            if base_fee > 0:
+                amount = max(0.0, amount - base_fee)
+
+            return amount, fill_price, gross_amount, entry_fee
+
+        except Exception as e:
+            log_event(f"Buy order {sym} failed: {e}", "WARN")
+            return None

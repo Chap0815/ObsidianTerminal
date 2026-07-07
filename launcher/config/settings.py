@@ -1,0 +1,844 @@
+"""
+Central configuration: design tokens, paths, bot metadata, parameter
+definitions, and the load/save helpers for ``bot_config.json``.
+
+This module owns all values that used to live as globals at the top of
+``launcher.pyw`` so the rest of the package can import them from a single
+authoritative place.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import subprocess
+import threading       # tmp filename uses get_ident()
+import time            # retry sleep between os.replace attempts
+from tkinter import font as tkfont
+
+
+#  Path anchors 
+#
+# This module sits two levels deep (``launcher/config/settings.py``), so a
+# naive ``dirname(__file__)`` would resolve to ``launcher/config/`` and break
+# subprocess ``cwd=``, DB lookups, prompt loading, etc. ``PROJECT_ROOT`` is
+# pinned here once and imported by everything else.
+
+_THIS_DIR  = os.path.dirname(os.path.abspath(__file__))  # /launcher/config
+LAUNCHER_DIR = os.path.dirname(_THIS_DIR)  # /launcher
+PROJECT_ROOT = os.path.dirname(LAUNCHER_DIR)  # /  (project root)
+
+DB_PATH      = os.path.join(PROJECT_ROOT, "data", "trading_bot.db")
+CONFIG_FILE  = os.path.join(PROJECT_ROOT, "bot_config.json")
+
+OLLAMA_URL   = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+if not OLLAMA_URL.startswith(("http://", "https://")):
+    OLLAMA_URL = "http://" + OLLAMA_URL
+
+
+#  Design tokens 
+
+COLORS = {
+    #  Obsidian (logo-true) 
+    # Derived from launcher/ui/components/obsidian.ico: a deep purple-black
+    # volcanic-glass stone with a neon CYANVIOLET trending-up arrow. Base =
+    # faceted obsidian; the SIGNATURE accent is the arrow's electric cyan,
+    # with violet as a sparing secondary. Semantic green/red P&L stays.
+    "bg":  "#0a0810",  # obsidian  deep purple-black
+    "bg_alt":       "#0d0b14",
+    "panel":        "#16131f",   # faceted stone surface
+    "panel_hover":  "#201c2b",
+    "panel_alt":    "#121019",
+    "border":       "#2b2740",   # purple-slate hairline
+    "border_soft":  "#1d1a2b",
+
+    "text":         "#e9e7f2",   # cool white
+    "text_dim":     "#9d9ab6",
+    "text_muted":   "#6b6788",
+    "text_subtle":  "#46425f",
+
+    # These keys feed the system-monitor bars + Available Capital (referenced
+    # directly); the BOT accents are overridden to the cyan signature below.
+    "balanced":  "#4fbe8e",  # green  profit / Available Capital
+    "balanced_dim":  "#235a43",
+    "aggressive":  "#c98be0",  # violet  system bar
+    "aggressive_dim":"#5e3a72",
+    "futures":  "#5aa6e6",  # blue  system bar
+    "futures_dim":   "#274a6b",
+    "cross":  "#5a82b0",  # steel  system bar
+    "cross_dim":     "#2c3e58",
+    "futrend":  "#b07ae0",  # violet  system bar
+    "futrend_dim":   "#4f2f6b",
+
+    "purple":       "#6a5cc0",   # SIGNATURE = indigo-violet (logo arrowhead)
+    "purple_dim":   "#322a5e",
+    "violet":  "#b07ae0",  # secondary neon (arrowhead)  sparing
+    "violet_dim":   "#4f2f6b",
+    "success":      "#4fbe8e",
+    "warning":      "#e0a23d",
+    "danger":       "#e35349",
+    "info":         "#6a5cc0",
+
+    "bar_bg":       "#1d1a2b",
+}
+
+FONT_BODY = "Segoe UI"
+
+
+#  Bot metadata 
+
+# Order matters for layout  list + dict lookup.
+BOT_ORDER = ["TREND", "SPOT", "FUTURES", "CROSS", "FUTREND"]
+
+BOT_META = {
+    "TREND": {
+        # Display-only rename  "Trend" (the validated majors trend-following
+        # bot). Internal key stays "TREND" so DB / state / config plumbing
+        # and historical trades remain intact.
+        "label":   "Trend",
+        "subtitle":"Spot  Trend-Following",
+        "accent":  COLORS["balanced"],
+        "accent_dim": COLORS["balanced_dim"],
+        "icon":  "",
+        # Bots live in the bots/ subpackage and are started via
+        # ``python -m bots.main_bot_balanced`` so their relative imports
+        # (``from core.X import ``) resolve correctly. The ``script`` field
+        # is kept for human reference; ``module`` is what BotProcess uses.
+        "module":  "bots.main_bot_balanced",
+        "script":  "bots/main_bot_balanced.py",
+        "log_dir": "logs/Trend",
+        # Mechanical strategy  no LLM, hence no editable prompt.
+        "uses_llm": False,
+        "is_futures": False,
+    },
+    "SPOT": {
+        # Display-only rename  "Spot" (the momentum spot bot). Internal key
+        # stays "SPOT".
+        "label":   "Spot",
+        "subtitle":"Spot  Momentum",
+        "accent":  COLORS["aggressive"],
+        "accent_dim": COLORS["aggressive_dim"],
+        "icon":  "",
+        "module":  "bots.main_bot_aggressive",
+        "script":  "bots/main_bot_aggressive.py",
+        "log_dir": "logs/Spot",
+        "prompt":  "prompts/spot.txt",
+        "prompt_default": "prompts/spot_default.txt",
+        "is_futures": False,
+    },
+    "FUTURES": {
+        "label":   "FUTURES",
+        "subtitle":"Perpetuals  Long/Short",
+        "accent":  COLORS["futures"],
+        "accent_dim": COLORS["futures_dim"],
+        "icon":  "",
+        "module":  "bots.main_bot_futures",
+        "script":  "bots/main_bot_futures.py",
+        "log_dir": "logs/Futures",
+        "prompt":  "prompts/futures.txt",
+        "prompt_default": "prompts/futures_default.txt",
+        "is_futures": True,
+    },
+    # Cross-sectional momentum (market-neutral, cross-margin). No LLM
+    # (mechanical ranking)  no editable prompt. Trades futures perps.
+    "CROSS": {
+        "label":   "Cross",
+        "subtitle":"Perps  Market-Neutral",
+        "accent":  COLORS["cross"],
+        "accent_dim": COLORS["cross_dim"],
+        "icon":  "",
+        "module":  "bots.main_bot_cross",
+        "script":  "bots/main_bot_cross.py",
+        "log_dir": "logs/Cross",
+        "uses_llm": False,
+        "is_futures": True,
+    },
+    # Leveraged trend-following futures (per-coin, directional long/flat). No LLM
+    # (mechanical SMA-ensemble)  no editable prompt. Trades futures perps.
+    "FUTREND": {
+        "label":   "Future Trend",
+        "subtitle":"Perps  Trend-Following",
+        "accent":  COLORS["futrend"],
+        "accent_dim": COLORS["futrend_dim"],
+        "icon":  "",
+        "module":  "bots.main_bot_trendfut",
+        "script":  "bots/main_bot_trendfut.py",
+        "log_dir": "logs/FuTrend",
+        "uses_llm": False,
+        "is_futures": True,
+    },
+}
+
+# Obsidian  ONE signature accent (the logo's cyan) for all bots (no rainbow).
+# Bot identity is carried by the name (display font) + icon, not a colour, for a
+# monochrome-premium terminal. Semantic colour (green/red P&L, LIVE/SIM) is
+# untouched. Remove this loop to restore the per-bot colours.
+for _meta in BOT_META.values():
+    _meta["accent"] = COLORS["purple"]
+    _meta["accent_dim"] = COLORS["purple_dim"]
+
+
+#  Default parameter values per bot 
+
+DEFAULT_CONFIG = {
+    # "Trend" bot (internal key TREND): large-cap trend-following over a
+    # 12 large-cap universe, unleveraged spot.
+    "TREND": {
+        "POSITION_SIZE":  20.0,  # USDT per coin when in-trend (1220 = 240 max)
+        "MAX_OPEN_TRADES":   12,     # one per coin in the universe
+        "TREND_UNIVERSE":    "BTC,ETH,BNB,XRP,SOL,ADA,AVAX,LINK,DOT,LTC,DOGE,TRX",
+        "TREND_SMA_FAST":    50,
+        "TREND_SMA_SLOW":    100,
+        "TREND_CROSS_FAST":  50,     # slowed from 20/50 (drag-opt 2026-06-20): the
+        "TREND_CROSS_SLOW":  150,    # fast cross was the whipsaw/turnover source
+        "TREND_VOTE_MIN":  2,  # of 3 rules  in trend (1=aggressive, 3=strict)
+        "TREND_EXIT_VOTE":   2,      # set 1 for hysteresis (less whipsaw)
+        "TREND_CHECK_HOURS": 12,     # re-evaluate twice a day
+        "POSITION_SIZE_MAX": 2500.0,
+        "INITIAL_STOP_LOSS": -30.0,  # disaster stop (gap protection)
+        "MAX_DAILY_LOSS":    -50.0,
+        "LEARNING_DISABLED": True,   # skip Kelly/RSI/blacklist learning
+        "TREND_VOL_TARGET":          0,   # 0=flat sizing, 1=inverse-vol (risk-parity)
+        "TREND_VOL_TARGET_LOOKBACK": 30,
+        "SIMULATION":        True,
+    },
+    "SPOT": {
+        "MIN_PUMP":          6.0,
+        "ACTIVATION_PROFIT": 9.0,
+        "TRAILING_DISTANCE": 3.0,
+        "POST_PARTIAL_TRAILING_DISTANCE": 1.0,
+        "INITIAL_STOP_LOSS": -6.0,
+        "PARTIAL_SELL_PCT":  0.60,
+        "RSI_MAX":           65.0,
+        "POSITION_SIZE":     10.0,
+        "POSITION_SIZE_MAX": 25.0,
+        "MAX_OPEN_TRADES":   5,
+        "SCAN_INTERVAL":  150,  # 2.5 min  fast for momentum
+        "MONITOR_INTERVAL":  20,     # V2: open positions checked every 20s (dual-loop)
+        "BREAKEVEN_TRIGGER": 0.0,
+        "USE_TREND_FILTER":  0,
+        "USE_LLM":           False,
+        "COOLDOWN_AFTER_SL": 60,
+        "MAX_DAILY_LOSS":    -50.0,
+        "OWN_MOMENTUM_FILTER": True,
+        "OWN_MOMENTUM_WINDOW": 8,
+        "OWN_MOMENTUM_MIN_LOSS_PCT": 20.0,
+        "SIMULATION":        True,
+    },
+    "FUTURES": {
+        # Enter when momentum STARTS, not when it's already over.
+        "MIN_PUMP":          2.0,    # earlier entry
+        "ACTIVATION_PROFIT": 4.5,    # realistic hit-rate
+        "TRAILING_DISTANCE": 2.5,    # gives the market room
+        "POST_PARTIAL_TRAILING_DISTANCE": 1.0,
+        "INITIAL_STOP_LOSS": -3.5,   # above the noise floor
+        "PARTIAL_SELL_PCT":  0.40,
+        "RSI_MAX":           70.0,
+        "POSITION_SIZE":     10.0,
+        "POSITION_SIZE_MAX": 25.0,
+        "MAX_OPEN_TRADES":   3,      # less cluster risk
+        "LEVERAGE":          3,
+        "LIQ_SAFETY_PCT":    15.0,
+        "SCAN_INTERVAL":     150,    # 5min would be too long for futures
+        "MONITOR_INTERVAL":  20,     # open positions checked every 20s
+        "BREAKEVEN_TRIGGER": 2.0,    # Move SL to BE at +2% price move
+        "USE_TREND_FILTER":  0,      # EMA200 filter off (toggle)
+        "USE_LLM":           False,
+        "COOLDOWN_AFTER_SL": 120,    # 2h cooldown after SL
+        "MAX_DAILY_LOSS":    -30.0,  # Killswitch at -30 USDT
+        "MAX_DAILY_LOSS_HARD_MULT": 1.5,
+        "OWN_MOMENTUM_FILTER": True,
+        "OWN_MOMENTUM_WINDOW": 5,
+        "OWN_MOMENTUM_MIN_LOSS_PCT": 20.0,
+        "SIMULATION":        True,
+    },
+    # Cross-sectional momentum  market-neutral, cross-margin, experimental.
+    # Keep SIMULATION=True until it proves out over weeks of paper trading.
+    "CROSS": {
+        "XSEC_LOOKBACK_HOURS":   24,
+        "XSEC_REBALANCE_HOURS":  72,
+        "XSEC_K":  6,  # per side  12 positions
+        "XSEC_UNIVERSE_SIZE":    40,
+        "CRASH_FILTER":          1,
+        "CRASH_WINDOW":          4,
+        "PER_LEG_DISASTER_STOP": -8.0,
+        "CROSS_DISASTER_BLACKLIST_HOURS": 72,
+        "MIN_VOLUME":            10000000.0,
+        "XSEC_MAX_SPREAD_PCT":   0.5,
+        "BASE_CAPITAL_USDT":     1000.0,
+        "LEVERAGE":  1.0,  # cross-margin  keep low (max ~1.5)
+        "MAX_GROSS_EXPOSURE_PCT": 100.0,   # cap deployed notional vs equity
+        "MAX_DAILY_LOSS":        -50.0,
+        "MONITOR_INTERVAL":      30,
+        # required by validate_config_or_die / shared banner
+        "POSITION_SIZE":         10.0,
+        "MAX_OPEN_TRADES":       12,
+        "INITIAL_STOP_LOSS":     -25.0,
+        "SIMULATION":            True,
+    },
+    # Leveraged trend-following futures (per-coin, long/flat). SIM-first.
+    # Conservative 4h setup; risk thresholds are raw price %, not leverage-scaled.
+    "FUTREND": {
+        "TREND_TIMEFRAME":       "4h",
+        "TREND_CHECK_MINUTES":   60,
+        "TREND_SMA_FAST":        300,
+        "TREND_SMA_SLOW":        600,
+        "TREND_CROSS_FAST":      120,
+        "TREND_CROSS_SLOW":      300,
+        "TREND_VOTE_MIN":        2,
+        "TREND_EXIT_VOTE":       2,
+        "TREND_UNIVERSE_SIZE":   30,
+        "MIN_VOLUME":            10000000.0,
+        "LEVERAGE":              1.0,
+        "POSITION_SIZE":         50.0,
+        "POSITION_SIZE_MAX":     50.0,
+        "MAX_OPEN_TRADES":       6,
+        "MAX_NEW_TRADES_PER_TICK": 1,
+        "INITIAL_STOP_LOSS":     -6.0,
+        "FAILED_ENTRY_STOP_ENABLED": True,
+        "FAILED_ENTRY_MAX_AGE_MIN": 120,
+        "FAILED_ENTRY_MIN_MFE_PCT": 0.5,
+        "FAILED_ENTRY_LOSS_PCT": -2.5,
+        "PRE_ACTIVATION_GIVEBACK_STOP_ENABLED": True,
+        "PRE_ACTIVATION_MIN_MFE_PCT": 0.8,
+        "PRE_ACTIVATION_GIVEBACK_PCT": 2.75,
+        "LIQ_SAFETY_PCT":        20.0,
+        "MAX_DAILY_LOSS":        -50.0,
+        "MAX_DAILY_LOSS_HARD_MULT": 1.5,
+        "MONITOR_INTERVAL":      20,
+        "ACTIVATION_PROFIT":     2.25,
+        "TRAILING_DISTANCE":     1.5,
+        "POST_PARTIAL_TRAILING_DISTANCE": 1.0,
+        "BREAKEVEN_TRIGGER":     1.8,
+        "PARTIAL_SELL_PCT":      0.5,
+        "TREND_EXIT_STALE_LIMIT": 3,
+        "TREND_VOL_TARGET":          0,
+        "TREND_VOL_TARGET_LOOKBACK": 30,
+        "COOLDOWN_AFTER_SL": 240,
+        "BAD_SYMBOL_FILTER": True,
+        "SINGLE_STOP_MIN_LOSS_PCT": 5.0,
+        "SINGLE_STOP_BLACKLIST_HOURS": 4,
+        "BAD_SYMBOL_LOSS_COUNT": 2,
+        "BAD_SYMBOL_MIN_TOTAL_LOSS_USDT": 6.0,
+        "BAD_SYMBOL_BLACKLIST_HOURS": 24,
+        "BAD_SYMBOL_LOOKBACK_DAYS": 1,
+        "SIMULATION":            True,
+    },
+    "UI": {
+        "VISIBLE_BOTS":   ["TREND", "SPOT", "FUTURES", "CROSS", "FUTREND"],
+        "COLLAPSED_BOTS": [],
+    },
+}
+
+
+#  Parameter editor definitions 
+# (key, label, step, min, max, format, suffix, tooltip)
+# Suffix with USDT moved into the label so the input value stays compact.
+
+PARAM_DEFS_SPOT = [
+    ("MIN_PUMP",          "Min. Pump",            0.5,   0.5,  20.0,  ".1f", "%",
+     "Minimum 24h price change a coin must show to be scanned. Lower = more candidates, more noise."),
+    ("ACTIVATION_PROFIT", "Activation TP",        0.5,   1.0,  20.0,  ".1f", "%",
+     "Profit % at which the partial take-profit triggers and the stop is moved to break-even."),
+    ("TRAILING_DISTANCE", "Trailing Distance",    0.25,  0.25, 10.0,  ".2f", "%",
+     "How far the trailing stop sits below the highest seen price (in %)."),
+    ("POST_PARTIAL_TRAILING_DISTANCE", "Post-Partial Trail", 0.25, 0.25, 10.0, ".2f", "%",
+     "Trailing distance after the partial take-profit fired. Lower locks in runners faster."),
+    ("INITIAL_STOP_LOSS", "Stop Loss",            0.5, -15.0, -0.5,  ".1f", "%",
+     "Initial stop-loss level. Tighter (closer to 0) = quicker exit on bad trades."),
+    ("BREAKEVEN_TRIGGER", "Breakeven At",         0.25,  0.0,  10.0,  ".2f", "%",
+     "Move stop-loss to entry price when profit reaches this %. 0 = disabled. "
+     "Makes trades risk-free once the move starts working."),
+    ("PARTIAL_SELL_PCT",  "Partial Sell",         0.05,  0.05, 1.00,  ".2f", "",
+     "Fraction of position sold at Activation TP. 0.30 = sell 30%, keep 70% for trailing."),
+    ("RSI_MAX",           "RSI Max",              1.0,  40.0, 90.0,  ".0f", "",
+     "Maximum RSI on entry. Coins with 2+ timeframes above this RSI are skipped."),
+    ("POSITION_SIZE",     "Pos. Size (USDT)",     1.0,   1.0, 500.0, ".0f", "",
+     "Base USDT amount per trade. Risk-Manager may scale this via Kelly criterion."),
+    ("POSITION_SIZE_MAX", "Kelly Cap (USDT)",     5.0,   5.0, 500.0, ".0f", "",
+     "Upper cap for the dynamically scaled position size."),
+    ("MAX_OPEN_TRADES",   "Max Open Trades",      1.0,   1.0,  30.0, ".0f", "",
+     "How many parallel positions the bot may run. 1-30."),
+    ("SCAN_INTERVAL",     "Scan Interval",        15.0,  30.0, 600.0, ".0f", "s",
+     "Seconds between scan cycles. Shorter = faster reaction, more API calls."),
+    ("MONITOR_INTERVAL",  "Monitor Interval",     5.0,   5.0,  120.0, ".0f", "s",
+     "V2 DUAL-LOOP: seconds between exit checks on OPEN positions. "
+     "Shorter = tighter trailing stops + faster SL/TP reaction, but more API calls. "
+     "20s is a good middle ground."),
+    ("COOLDOWN_AFTER_SL", "SL Cooldown",          15.0,  0.0, 1440.0, ".0f", "m",
+     "Minutes a coin is blacklisted after hitting stop-loss. Prevents revenge trading."),
+    ("MAX_DAILY_LOSS",    "Daily Loss Limit",     5.0, -500.0, -5.0, ".0f", "$",
+     "Bot pauses for the day if accumulated daily loss exceeds this USDT amount (negative)."),
+    ("OWN_MOMENTUM_WINDOW", "Momentum Window",     1.0,   3.0,  50.0, ".0f", "",
+     "Number of recent own trades used by the self-momentum pause filter."),
+    ("OWN_MOMENTUM_MIN_LOSS_PCT", "Momentum Loss", 1.0,   1.0,  50.0, ".0f", "%",
+     "Self-momentum pause threshold as loss % of invested capital in the recent window."),
+]
+
+PARAM_DEFS_FUTURES = [
+    ("MIN_PUMP",          "Min. Move",            0.5,   0.5,  20.0,  ".1f", "%",
+     "Minimum 24h price move (absolute) to qualify as a candidate. "
+     "Applies in BOTH directions: +X% for LONG candidates, -X% for SHORT candidates. "
+     "1.0% scans more coins with weaker signals; 2-3% filters for stronger momentum."),
+    ("ACTIVATION_PROFIT", "Activation TP",        0.5,   1.0,  20.0,  ".1f", "%",
+     "Raw price-move % that triggers partial close. 4.5% is realistic for hit-rate."),
+    ("TRAILING_DISTANCE", "Trailing Distance",    0.25,  0.25, 10.0,  ".2f", "%",
+     "Trailing stop distance. 2.5% gives crypto room to breathe before stop-out."),
+    ("POST_PARTIAL_TRAILING_DISTANCE", "Post-Partial Trail", 0.25, 0.25, 10.0, ".2f", "%",
+     "Trailing distance after partial close. Lower locks in remaining profit faster."),
+    ("INITIAL_STOP_LOSS", "Stop Loss",            0.5, -15.0, -0.5,  ".1f", "%",
+     "Initial stop in raw price terms. -3.5% sits above normal coin noise."),
+    ("BREAKEVEN_TRIGGER", "Breakeven At",         0.25,  0.0,  10.0,  ".2f", "%",
+     "Move SL to entry when profit reaches this %. 0 = disabled. Risk-free trades once moving."),
+    ("PARTIAL_SELL_PCT",  "Partial Close",        0.05,  0.05, 1.00,  ".2f", "",
+     "Fraction closed at Activation TP. Rest moves to break-even with trailing."),
+    ("RSI_MAX",           "RSI Max",              1.0,  40.0, 90.0,  ".0f", "",
+     "RSI ceiling for LONG entries. SHORTs look for RSI ABOVE this value."),
+    ("POSITION_SIZE",     "Margin (USDT)",        1.0,   1.0, 500.0, ".0f", "",
+     "Margin per position. Notional exposure = margin  leverage."),
+    ("POSITION_SIZE_MAX", "Kelly Cap (USDT)",     5.0,   5.0, 500.0, ".0f", "",
+     "Cap for dynamically scaled margin amount."),
+    ("MAX_OPEN_TRADES",   "Max Open Trades",      1.0,   1.0,  30.0, ".0f", "",
+     "Number of simultaneous futures positions. 3 is safer; more = cluster risk."),
+    ("LEVERAGE",          "Leverage",             1.0,   1.0,  10.0, ".0f", "x",
+     "Leverage 1-10x. 3x default = total loss at ~33% price move against."),
+    ("LIQ_SAFETY_PCT",    "Liq Safety Buffer",    1.0,   5.0,  50.0, ".0f", "%",
+     "Auto-close when distance to liquidation drops below this %."),
+    ("SCAN_INTERVAL",     "Scan Interval",        15.0,  30.0, 600.0, ".0f", "s",
+     "Seconds between scans for NEW trades. Open positions are monitored more often."),
+    ("MONITOR_INTERVAL",  "Monitor Interval",     5.0,   5.0, 120.0, ".0f", "s",
+     "Seconds between liquidation/SL checks on OPEN positions. Tighter = faster reaction."),
+    ("COOLDOWN_AFTER_SL", "SL Cooldown",          15.0,  0.0, 1440.0, ".0f", "m",
+     "Minutes a coin is blacklisted after stop-loss/liquidation."),
+    ("MAX_DAILY_LOSS",    "Daily Loss Limit",     5.0, -500.0, -5.0, ".0f", "$",
+     "Bot pauses for the day if accumulated daily loss exceeds this USDT amount."),
+    ("MAX_DAILY_LOSS_HARD_MULT", "Hard Loss Mult", 0.25,  1.0,   5.0, ".2f", "x",
+     "Hard daily-loss multiplier used as an emergency extension over the normal bot limit."),
+    ("OWN_MOMENTUM_WINDOW", "Momentum Window",     1.0,   3.0,  50.0, ".0f", "",
+     "Number of recent own trades used by the self-momentum pause filter."),
+    ("OWN_MOMENTUM_MIN_LOSS_PCT", "Momentum Loss", 1.0,   1.0,  50.0, ".0f", "%",
+     "Self-momentum pause threshold as loss % of invested capital in the recent window."),
+]
+
+# "Trend" bot (TREND slot)  majors trend-following (spot, no leverage).
+# Edit the coin universe (TREND_UNIVERSE) directly in bot_config.json; the
+# slider editor below covers the numeric knobs.
+PARAM_DEFS_TREND = [
+    ("POSITION_SIZE",     "Pos. Size (USDT/coin)", 1.0,   1.0, 500.0, ".0f", "",
+     "USDT bought per coin when it is in an uptrend. With N coins held, max "
+     "deployed = N  this. Spot, no leverage."),
+    ("POSITION_SIZE_MAX", "Kelly Cap (USDT)",      5.0,   5.0, 2500.0, ".0f", "",
+     "Hard cap for dynamically scaled per-coin size. Keep >= Pos. Size."),
+    ("MAX_OPEN_TRADES",   "Max Open Trades",       1.0,   1.0,  20.0, ".0f", "",
+     "Maximum number of coins held at once. With the 12-major universe, 12 "
+     "means all of them when in trend."),
+    ("TREND_VOTE_MIN",    "Trend Sensitivity",     1.0,   1.0,   3.0, ".0f", "",
+     "How many of the 3 trend rules (P>SMA50, P>SMA100, SMA20>50) must agree to "
+     "go long. 1 = aggressive (more time in market), 2 = balanced, 3 = strict."),
+    ("TREND_EXIT_VOTE",   "Exit Threshold",        1.0,   1.0,   3.0, ".0f", "",
+     "Sell when votes fall BELOW this. Set lower than Sensitivity for hysteresis "
+     "(fewer whipsaw round-trips at the edge)."),
+    ("TREND_CHECK_HOURS", "Check Interval",        1.0,   1.0,  24.0, ".0f", "h",
+     "How often the daily trend signal is re-evaluated. 12 = twice a day. The "
+     "signal only changes on new daily candles, so faster gains little."),
+    ("MAX_DAILY_LOSS",    "Daily Loss Limit",      5.0, -500.0, -5.0, ".0f", "$",
+     "Killswitch: stop opening new positions for the day past this USDT loss."),
+    ("INITIAL_STOP_LOSS", "Disaster Stop",         5.0, -90.0, -10.0, ".0f", "%",
+     "Hard safety stop per coin for gap/flash-crash protection. The trend exit "
+     "normally fires long before this  it's a last-resort brake, not the main "
+     "exit. -30% is a sane default."),
+    ("TREND_SMA_FAST",    "SMA Fast",              5.0,  10.0, 200.0, ".0f", "d",
+     "Fast price moving-average length in days (rule: price > SMA). Default 50. "
+     "Validated robust across 30120  rarely needs changing."),
+    ("TREND_SMA_SLOW",    "SMA Slow",              5.0,  20.0, 300.0, ".0f", "d",
+     "Slow price moving-average length in days. Default 100."),
+    ("TREND_CROSS_FAST",  "Cross Fast",            5.0,   5.0, 100.0, ".0f", "d",
+     "Fast MA for the cross rule (SMA_fast > SMA_slow). Default 20."),
+    ("TREND_CROSS_SLOW",  "Cross Slow",            5.0,  10.0, 200.0, ".0f", "d",
+     "Slow MA for the cross rule. Default 50."),
+    ("TREND_VOL_TARGET",  "Vol-Targeting (0/1)",   1.0,   0.0,   1.0, ".0f", "",
+     "0 = flat sizing (same USDT per coin). 1 = inverse-volatility sizing: calm "
+     "coins get a bigger slot, wild coins a smaller one, so each contributes "
+     "similar risk. Backtests: higher return AND lower drawdown; total exposure "
+     "stays ~the same."),
+    ("TREND_VOL_TARGET_LOOKBACK", "Vol Lookback",  5.0,  10.0, 120.0, ".0f", "d",
+     "Days of returns used to gauge each coin's volatility for vol-targeting."),
+]
+
+PARAM_DEFS_CROSS = [
+    ("XSEC_K",               "Coins per side",     1.0,   2.0,    15.0, ".0f", "",
+     "Coins held LONG and SHORT each (market-neutral). 6 = 12 positions total. "
+     "More = more diversified, needs more capital."),
+    ("XSEC_LOOKBACK_HOURS",  "Lookback",           6.0,   6.0,   336.0, ".0f", "h",
+     "Ranking window  coins ranked by their return over the last N hours. "
+     "24h was the best in research."),
+    ("XSEC_REBALANCE_HOURS", "Rebalance every",    6.0,   6.0,   336.0, ".0f", "h",
+     "How often the long/short basket is rebuilt. 72h keeps fees/funding low "
+     "while capturing the multi-day drift."),
+    ("XSEC_UNIVERSE_SIZE",   "Universe size",      5.0,  10.0,   100.0, ".0f", "",
+     "How many of the most-liquid perps to rank across."),
+    ("MIN_VOLUME",           "Min Volume",   1000000.0, 1000000.0, 100000000.0, ".0f", "$",
+     "Minimum 24h quote volume for a perp to enter the ranked CROSS universe."),
+    ("LEVERAGE",             "Leverage",           0.5,   1.0,     3.0, ".1f", "x",
+     "Cross-margin leverage. Keep LOW (11.5x): cross margin means one bad "
+     "position can draw down the WHOLE account."),
+    ("MAX_GROSS_EXPOSURE_PCT","Max Gross Exposure",10.0,  20.0,   200.0, ".0f", "%",
+     "Hard cap on deployed notional vs equity, regardless of leverage. 100 = "
+     "long+short notional sums to your equity. Backstop against a mis-set lever."),
+    ("CRASH_FILTER",         "Crash Filter",       1.0,   0.0,     1.0, ".0f", "",
+     "1 = on. Goes flat after the strategy's own recent rebalances turn "
+     "net-negative (halves drawdowns). 0 = off."),
+    ("PER_LEG_DISASTER_STOP","Per-Leg Stop",       1.0, -90.0,    -5.0, ".0f", "%",
+     "A single coin moving this far against its leg is closed early (doesn't "
+     "wait for the next rebalance). Idiosyncratic tail protection."),
+    ("XSEC_MAX_SPREAD_PCT",  "Max Spread",         0.1,   0.1,     3.0, ".1f", "%",
+     "Skip a coin whose order-book spread is wider than this  keeps the bot on "
+     "LIQUID perps (illiquid junk would bleed on slippage). Also makes SIM "
+     "realistic: it fills at the real ask/bid, not the mid."),
+    ("MAX_DAILY_LOSS",       "Daily Loss Limit",   5.0,-500.0,    -5.0, ".0f", "$",
+     "Account killswitch: stop opening new positions past this USDT loss/day."),
+    ("BASE_CAPITAL_USDT",    "Base Capital",      50.0,  50.0,100000.0, ".0f", "$",
+     "Equity used for sizing (SIM) / fallback when the live balance read fails. "
+     "Gross exposure = this  leverage."),
+]
+
+
+PARAM_DEFS_FUTREND = [
+    ("LEVERAGE",             "Leverage",           0.5,   1.0,     6.0, ".1f", "x",
+     "EFFECTIVE leverage (fractional ok). Notional = margin  this; the exchange "
+     "gets ceil() as the integer cap. WARNING: trend-following has large "
+     "drawdowns  backtests show 3 is account-ruinous. 11.5 is sane."),
+    ("POSITION_SIZE",        "Margin / Trade",     1.0,   5.0,   500.0, ".0f", "$",
+     "Margin (USDT) posted per position. Notional = this  leverage."),
+    ("POSITION_SIZE_MAX",    "Kelly Cap (USDT)",   5.0,   5.0,  2500.0, ".0f", "$",
+     "Cap for dynamically scaled margin amount. Keep >= Margin / Trade."),
+    ("MAX_OPEN_TRADES",      "Max Positions",      1.0,   1.0,    20.0, ".0f", "",
+     "How many trending coins to hold at once."),
+    ("MAX_NEW_TRADES_PER_TICK", "New / Scan",      1.0,   0.0,    10.0, ".0f", "",
+     "Entry ramp limiter per signal scan. 0 freezes new entries while monitoring stays active."),
+    ("INITIAL_STOP_LOSS",    "Hard Stop",          0.5, -30.0,    -2.0, ".1f", "%",
+     "Fast price stop between candle checks (the primary exit is trend-off). "
+     "Must be > -90/leverage or the bot refuses to start (would sit past liq)."),
+    ("FAILED_ENTRY_STOP_ENABLED", "Failed Entry Stop", 1.0, 0.0, 1.0, ".0f", "",
+     "1 = close fresh trades that never moved into profit and quickly fail."),
+    ("FAILED_ENTRY_MAX_AGE_MIN", "Failed Entry Age", 5.0, 15.0, 360.0, ".0f", "m",
+     "Only evaluate the failed-entry stop during this many minutes after entry."),
+    ("FAILED_ENTRY_MIN_MFE_PCT", "Failed Entry MFE", 0.25, 0.0, 5.0, ".2f", "%",
+     "Minimum favorable move required to avoid failed-entry classification."),
+    ("FAILED_ENTRY_LOSS_PCT", "Failed Entry Loss", 0.25, -10.0, -0.5, ".2f", "%",
+     "Close a fresh unproven entry once price moves this far against it."),
+    ("PRE_ACTIVATION_GIVEBACK_STOP_ENABLED", "Pre-Act Stop", 1.0, 0.0, 1.0, ".0f", "",
+     "1 = close trades that made a small favorable move but gave it back before Activation TP."),
+    ("PRE_ACTIVATION_MIN_MFE_PCT", "Pre-Act MFE", 0.25, 0.0, 5.0, ".2f", "%",
+     "Minimum favorable move before the pre-activation giveback stop can fire."),
+    ("PRE_ACTIVATION_GIVEBACK_PCT", "Giveback %", 0.25, 0.25, 10.0, ".2f", "%",
+     "Close before Activation TP after this much giveback from the best seen move."),
+    ("ACTIVATION_PROFIT",    "Activation TP",      0.5,   1.0,    20.0, ".1f", "%",
+     "Raw price move that arms partial take-profit and pre-partial trailing."),
+    ("TRAILING_DISTANCE",    "Trailing Distance",  0.25,  0.25,   10.0, ".2f", "%",
+     "Retrace from the highest price that closes the remaining trend position."),
+    ("POST_PARTIAL_TRAILING_DISTANCE", "Post-Partial Trail", 0.25, 0.25, 10.0, ".2f", "%",
+     "Retrace after partial TP. Lower values lock in trend runners faster."),
+    ("BREAKEVEN_TRIGGER",    "Breakeven At",       0.25,  0.0,    10.0, ".2f", "%",
+     "Move the protective stop to fee-buffered breakeven at this raw price move."),
+    ("PARTIAL_SELL_PCT",     "Partial Close",      0.05,  0.05,   1.00, ".2f", "",
+     "Fraction closed at Activation TP. 0.50 = close half, trail the rest."),
+    ("LIQ_SAFETY_PCT",       "Liq Safety",         1.0,   5.0,    50.0, ".0f", "%",
+     "Force-close when this much of the liquidation buffer remains  last-resort "
+     "catastrophe guard."),
+    ("TREND_CHECK_MINUTES",  "Signal Check",       5.0,   5.0,   240.0, ".0f", "m",
+     "How often the trend signal is recomputed (one candle is natural)."),
+    ("TREND_UNIVERSE_SIZE",  "Universe size",      5.0,  10.0,   100.0, ".0f", "",
+     "How many of the most-liquid perps to scan for trends."),
+    ("TREND_SMA_FAST",       "SMA Fast",          10.0,  20.0,  1000.0, ".0f", "",
+     "Fast SMA length (bars). For 1h candles, 300  the validated daily SMA50."),
+    ("TREND_SMA_SLOW",       "SMA Slow",          10.0,  40.0,  2000.0, ".0f", "",
+     "Slow SMA length (bars). For 1h candles, 600  the validated daily SMA100."),
+    ("TREND_VOTE_MIN",       "Vote to Enter",      1.0,   1.0,     3.0, ".0f", "",
+     "How many of the 3 trend rules must agree to OPEN (2 = robust default)."),
+    ("MAX_DAILY_LOSS",       "Daily Loss Limit",   5.0,-500.0,    -5.0, ".0f", "$",
+     "Account killswitch: stop opening new positions past this USDT loss/day."),
+    ("TREND_VOL_TARGET",     "Vol-Targeting (0/1)", 1.0,   0.0,    1.0, ".0f", "",
+     "0 = flat margin per coin. 1 = inverse-volatility sizing (risk-parity): "
+     "calm coins bigger, wild smaller, same total. Backtests: better return/DD."),
+    ("TREND_VOL_TARGET_LOOKBACK", "Vol Lookback",  5.0,  10.0,  200.0, ".0f", "bars",
+     "Bars of returns used to gauge each coin's volatility for vol-targeting."),
+    ("TREND_EXIT_STALE_LIMIT", "Stale Exit Limit", 1.0,   1.0,    10.0, ".0f", "",
+     "Consecutive failed trend-data checks on a held coin before defensive exit."),
+]
+
+
+#  Python interpreter resolution 
+
+def _get_python_exe() -> str:
+    """Path to the python executable used to launch bot subprocesses.
+
+    Prefers an embedded ``python/python.exe`` next to the project root (for
+    portable / self-contained installs), falls back to whatever
+    ``sys.executable`` is.
+    """
+    local_python = os.path.join(PROJECT_ROOT, "python", "python.exe")
+    if os.path.exists(local_python):
+        return local_python
+    return sys.executable
+
+
+def _get_pythonw_exe() -> str:
+    """Windowless variant of :func:`_get_python_exe` for GUI subprocesses."""
+    local = os.path.join(PROJECT_ROOT, "python", "pythonw.exe")
+    if os.path.exists(local):
+        return local
+    py = sys.executable
+    return py.replace("python.exe", "pythonw.exe") if py.endswith("python.exe") else py
+
+
+#  Font helper 
+
+def _safe_mono_font() -> str:
+    """First installed monospaced font from a small preference list."""
+    try:
+        avail = set(tkfont.families())
+        for f in ("Cascadia Mono", "JetBrains Mono", "Consolas", "Courier New"):
+            if f in avail:
+                return f
+    except Exception:
+        pass
+    return "Consolas"
+
+
+def _safe_display_font() -> str:
+    """First installed display/heading face from a small preference list.
+    Bahnschrift (a technical DIN-style grotesk that ships with Windows 10/11)
+    gives the terminal its 'instrument' character for titles + eyebrows; falls
+    back gracefully to Segoe UI so the launcher never renders a missing font."""
+    try:
+        avail = set(tkfont.families())
+        for f in ("Bahnschrift", "Bahnschrift SemiBold", "Segoe UI Semibold",
+                  "Segoe UI"):
+            if f in avail:
+                return f
+    except Exception:
+        pass
+    return "Segoe UI"
+
+
+#  Config IO 
+
+def load_config() -> dict:
+    """Load ``bot_config.json``, filling in any missing keys from
+    :data:`DEFAULT_CONFIG`. Creates the file on first run."""
+    if not os.path.exists(CONFIG_FILE):
+        save_config(DEFAULT_CONFIG)
+        return json.loads(json.dumps(DEFAULT_CONFIG))
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception as e:
+        raise RuntimeError(
+            f"bot_config.json corrupt or unreadable: {e}. "
+            "Refusing to replace it with defaults."
+        ) from e
+    # Fill missing keys from defaults
+    for bot, defaults in DEFAULT_CONFIG.items():
+        if bot not in cfg:
+            cfg[bot] = dict(defaults)
+        else:
+            for k, v in defaults.items():
+                cfg[bot].setdefault(k, v)
+    # UI defaults
+    if "UI" not in cfg:
+        cfg["UI"] = dict(DEFAULT_CONFIG["UI"])
+    else:
+        cfg["UI"].setdefault("VISIBLE_BOTS", list(BOT_ORDER))
+        cfg["UI"].setdefault("COLLAPSED_BOTS", [])
+    return cfg
+
+
+def _audit_log_path() -> str:
+    """Append-only config audit trail. Resolved via core.paths if available."""
+    try:
+        from core.paths import LOGS_DIR
+        return os.path.join(str(LOGS_DIR), "config_audit.jsonl")
+    except Exception:
+        return os.path.join(PROJECT_ROOT, "logs", "config_audit.jsonl")
+
+
+def _config_diff(old: dict, new: dict) -> dict:
+    """Per-bot {key: [old, new]} for changed/added/removed keys. Best-effort."""
+    diff: dict = {}
+    keys = set(old or {}) | set(new or {})
+    for bot in keys:
+        o = (old or {}).get(bot, {})
+        n = (new or {}).get(bot, {})
+        if not isinstance(o, dict) or not isinstance(n, dict):
+            if o != n:
+                diff[bot] = {"_value": [o, n]}
+            continue
+        sub: dict = {}
+        for k in set(o) | set(n):
+            ov = o.get(k, "__absent__")
+            nv = n.get(k, "__absent__")
+            if ov != nv:
+                sub[k] = [ov, nv]
+        if sub:
+            diff[bot] = sub
+    return diff
+
+
+def _write_config_audit(new_cfg: dict) -> None:
+    """Append a compact record of what changed vs the previous on-disk config.
+
+    Best-effort and append-only  never raises, never blocks save_config.
+    Secret-looking values are redacted before writing.
+    """
+    try:
+        prev: dict = {}
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, encoding="utf-8") as f:
+                    prev = json.load(f)
+            except Exception:
+                prev = {}
+        diff = _config_diff(prev, new_cfg)
+        if not diff:
+            return
+        try:
+            from core.clock import now_utc
+            ts = now_utc().strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        try:
+            from core.logger import redact
+            diff = json.loads(redact(json.dumps(diff, ensure_ascii=False)))
+        except Exception:
+            pass
+        record = {"ts": ts, "source": "save_config", "changes": diff}
+        path = _audit_log_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def audit_event(source: str, **fields) -> None:
+    """Append a non-diff audit record (e.g. a restart applying new params).
+
+    Best-effort, append-only, redacted; never raises.
+    """
+    try:
+        try:
+            from core.clock import now_utc
+            ts = now_utc().strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        try:
+            from core.logger import redact
+            fields = json.loads(redact(json.dumps(fields, ensure_ascii=False)))
+        except Exception:
+            pass
+        record = {"ts": ts, "source": source, **fields}
+        path = _audit_log_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+_CONFIG_WRITE_LOCK = threading.RLock()
+
+
+def save_config(cfg: dict) -> None:
+    """Atomically save ``cfg`` to ``bot_config.json``.
+
+    The tmp filename includes pid + thread-id so two concurrent
+    save_config() calls (UI double-click, racing restart paths) can't
+    clobber each other's tmp file before ``os.replace``. Failure is
+    logged (rate-limited) rather than silently dropped. A compact diff
+    vs the previous on-disk config is appended to logs/config_audit.jsonl
+    (best-effort, before the overwrite so the diff is accurate).
+    """
+    with _CONFIG_WRITE_LOCK:
+        _save_config_unlocked(cfg)
+
+
+def _save_config_unlocked(cfg: dict) -> None:
+    _write_config_audit(cfg)
+    try:
+        tmp = f"{CONFIG_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        # Windows retries: target may be open by the launcher poller.
+        last_err = None
+        for _ in range(8):
+            try:
+                os.replace(tmp, CONFIG_FILE)
+                last_err = None
+                break
+            except PermissionError as pe:
+                last_err = pe
+                time.sleep(0.05)
+        if last_err is not None:
+            # Clean up the leftover tmp before propagating
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise last_err
+    except Exception as e:
+        try:
+            from bot_utils.silent_log import silent_log
+            silent_log("save_config", e)
+        except Exception:
+            sys.stderr.write(f"[save_config] {type(e).__name__}: {e}\n")
+        # Final cleanup attempt for the per-writer tmp
+        try:
+            if 'tmp' in locals() and os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def save_config_merge(section_updates: dict | None = None,
+                      section_replacements: dict | None = None) -> dict:
+    """Merge selected config sections into the latest on-disk config.
+
+    Use this from the launcher UI when saving a bot's parameter edits or UI
+    preferences. It avoids writing a stale full-memory snapshot over newer
+    values changed by hotfixes, another UI action, or a running bot.
+    """
+    section_updates = section_updates or {}
+    section_replacements = section_replacements or {}
+    with _CONFIG_WRITE_LOCK:
+        cfg = load_config()
+        for section, value in section_replacements.items():
+            cfg[section] = dict(value) if isinstance(value, dict) else value
+        for section, values in section_updates.items():
+            if isinstance(values, dict):
+                cur = cfg.get(section)
+                if not isinstance(cur, dict):
+                    cur = {}
+                cur.update(values)
+                cfg[section] = cur
+            else:
+                cfg[section] = values
+        _save_config_unlocked(cfg)
+        return cfg
+
+
+#  Misc shared subprocess kwargs 
+
+def subprocess_no_window_kwargs() -> dict:
+    """Return ``creationflags`` kwargs so a child process opens no console
+    window on Windows. Empty dict on other platforms."""
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
