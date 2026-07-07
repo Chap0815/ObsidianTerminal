@@ -1,8 +1,8 @@
 {
-  "build_id": "db5e8d3662ba1664",
-  "created_at": "2026-07-08 07:55:42",
+  "build_id": "ed639776bd094220",
+  "created_at": "2026-07-08 07:59:24",
   "source": "update_deploy_manifest.py",
-  "file_count": 142,
+  "file_count": 143,
   "files": [
     {
       "path": "bot_config.default.json",
@@ -183,6 +183,11 @@
       "path": "bots/main_bot_trendfut.py",
       "sha256": "9ac57b86755bc54d4efa79ff29f3a335a02c1c0672d249186152c190cbcdaf49",
       "bytes": 4511
+    },
+    {
+      "path": "CHANGELOG.md",
+      "sha256": "620b07590a8b4444bc8a9b035cf8f14c9a509b0c35f6633bf6f51e01f58aca26",
+      "bytes": 403
     },
     {
       "path": "config/__init__.py",
@@ -616,8 +621,8 @@
     },
     {
       "path": "tools/update_check.py",
-      "sha256": "90c88181b011840cc8e120ef99d4e019ecc568d9a00858a14d095a016b32e15a",
-      "bytes": 5756
+      "sha256": "c7171f1f3c323fd9aeaaf089c2c4cecaf08ac6b0032087f521c91ad697194cdd",
+      "bytes": 6315
     },
     {
       "path": "tools/update_deploy_manifest.py",

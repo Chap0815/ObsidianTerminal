@@ -87,6 +87,19 @@ def _last_update_status() -> dict:
     return {k: data.get(k) for k in allowed if k in data}
 
 
+def _effective_last_update_status(*, local_hash: str, remote_hash: str,
+                                  branch: str) -> dict:
+    if local_hash and remote_hash and local_hash == remote_hash:
+        return {
+            "status": "current",
+            "message": "Lokaler Stand ist aktuell.",
+            "returncode": 0,
+            "remote": remote_hash,
+            "branch": branch,
+        }
+    return _last_update_status()
+
+
 def check_update() -> dict:
     git = _find_git()
     if not git:
@@ -151,16 +164,18 @@ def check_update() -> dict:
             ahead = _run([git, "merge-base", "--is-ancestor", remote_hash, "HEAD"], timeout=15)
             local_ahead = ahead.returncode == 0
 
+    update_available = ((not local_hash) or local_hash != remote_hash) and not local_ahead
     return {
         "ok": True,
         "repo": _redact_repo_url(repo),
         "branch": branch,
         "remote": remote_hash,
         "local": local_hash,
-        "update_available": ((not local_hash) or local_hash != remote_hash) and not local_ahead,
+        "update_available": update_available,
         "bootstrap_required": not bool(local_hash),
         "local_ahead": local_ahead,
-        "last_update": _last_update_status(),
+        "last_update": _effective_last_update_status(
+            local_hash=local_hash, remote_hash=remote_hash, branch=branch),
     }
 
 
