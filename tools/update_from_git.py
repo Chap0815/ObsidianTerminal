@@ -496,6 +496,22 @@ def _restore_app_snapshot(snapshot: Path) -> None:
             shutil.copy2(item, target)
 
 
+def _is_shallow_repo(git: str) -> bool:
+    result = _run([git, "rev-parse", "--is-shallow-repository"], check=False)
+    return result.returncode == 0 and (result.stdout or "").strip().lower() == "true"
+
+
+def _is_ancestor(git: str, ancestor: str, descendant: str) -> bool:
+    return _run([git, "merge-base", "--is-ancestor", ancestor, descendant], check=False).returncode == 0
+
+
+def _discard_self_bootstrap_edit(git: str) -> None:
+    result = _run([git, "status", "--porcelain", "--", "tools/update_from_git.py"], check=False)
+    if result.returncode == 0 and (result.stdout or "").strip():
+        _print("Updater bootstrap file changed locally; replacing it with the remote version.")
+        _run([git, "checkout", "--", "tools/update_from_git.py"], check=False)
+
+
 def _update_existing_repo(repo_url: str, branch: str) -> None:
     git = _git()
     _run([git, "remote", "set-url", "origin", repo_url])
@@ -519,15 +535,20 @@ def _update_existing_repo(repo_url: str, branch: str) -> None:
     _write_update_marker("existing")
     try:
         _run([git, "fetch", "origin", branch], timeout=300)
-        if _run([git, "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD"], check=False).returncode == 0:
+        if _is_ancestor(git, "FETCH_HEAD", "HEAD"):
             _restore_user_files(backup)
             _verify_protected_files(protected_hashes)
             _print("Lokaler Stand ist neuer oder identisch zum Remote; kein Downgrade ausgefuehrt.")
             return
-        if _run([git, "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"], check=False).returncode != 0:
+        if not _is_ancestor(git, "HEAD", "FETCH_HEAD") and _is_shallow_repo(git):
+            _print("Shallow Git history detected; deepening history before ancestry check.")
+            _run([git, "fetch", "--deepen", "100", "origin", branch], timeout=300, check=False)
+            _run([git, "fetch", "origin", branch], timeout=300)
+        if not _is_ancestor(git, "HEAD", "FETCH_HEAD"):
             raise RuntimeError(
                 "Lokaler Stand und Remote sind divergiert. Update abgebrochen, um keinen lokalen Fix zu verlieren."
             )
+        _discard_self_bootstrap_edit(git)
         _run([git, "checkout", "-B", branch, "FETCH_HEAD"])
         _run([git, "reset", "--hard", "FETCH_HEAD"])
         _verify_no_tracked_runtime_files(ROOT)

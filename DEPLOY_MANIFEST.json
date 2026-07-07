@@ -1,6 +1,6 @@
 {
-  "build_id": "19e90c675f1e7440",
-  "created_at": "2026-07-07 14:10:29",
+  "build_id": "912b5cb67d09ae7e",
+  "created_at": "2026-07-07 14:13:40",
   "source": "update_deploy_manifest.py",
   "file_count": 134,
   "files": [
@@ -586,8 +586,8 @@
     },
     {
       "path": "tools\\update_from_git.py",
-      "sha256": "693bbbfc25d7c6bf47e036d80d3e399c76780e2d0048eddb4f8511cfd3bcd0ff",
-      "bytes": 22022
+      "sha256": "60de35cac2efe9ebdd9027f32eaf41573f75ce91da43b64778c42d3e218de394",
+      "bytes": 23067
     },
     {
       "path": "tools\\update_launcher.py",
