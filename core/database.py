@@ -1769,6 +1769,17 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
     """opened_at wird bei UPDATE NICHT berschrieben."""
     conn = get_connection()
     try:
+        state_norm = str(state or "OPEN").upper()
+        if state_norm not in {"CLOSED", "FLAT"}:
+            is_futures = str(position_type or "").upper() != "SPOT"
+            if is_claimed_by_other(symbol, bot_name, is_futures=is_futures):
+                from core.logger import log_event, log_struct
+                log_event(
+                    f"[DB] upsert_open_position blocked: {symbol} "
+                    f"already owned by another bot", "WARN")
+                log_struct("db_upsert_position_blocked", bot_name=bot_name,
+                           symbol=symbol, position_type=position_type)
+                return
         conn.execute("""
         INSERT INTO bot_open_positions
             (bot_name, symbol, buy_price, buy_time, amount, invested_usdt,

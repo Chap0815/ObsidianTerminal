@@ -1,6 +1,6 @@
 {
-  "build_id": "ae974f5884d55bd8",
-  "created_at": "2026-07-07 14:40:57",
+  "build_id": "6906ecbcbea10633",
+  "created_at": "2026-07-07 14:48:32",
   "source": "update_deploy_manifest.py",
   "file_count": 134,
   "files": [
@@ -216,8 +216,8 @@
     },
     {
       "path": "core\\database.py",
-      "sha256": "534fc2899363d693081e74ea50ca093f920760ab68d0edaa6570b852dda0b2d9",
-      "bytes": 81786
+      "sha256": "707de59132b1e560886464ece2dad831f869aab719f86b1e51eaa4b44ead673e",
+      "bytes": 82418
     },
     {
       "path": "core\\event_bus.py",
