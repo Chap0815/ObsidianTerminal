@@ -3,6 +3,11 @@
 *.env
 .venv/
 python/
+config/update_config.json
+.update_in_progress
+bot_config.json
+prompts/spot.txt
+prompts/futures.txt
 logs/
 data/
 *.db
@@ -25,6 +30,11 @@ __pycache__/
 
 # Build/installer tooling is local-only, not part of the update repo
 installer/
+install.bat
+install.py
+requirements.txt
+README.md
+RELEASE.md
 *.exe
 *.msi
 *.zip

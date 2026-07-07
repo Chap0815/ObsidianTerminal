@@ -226,6 +226,7 @@ class ObsidianApp(ctk.CTk):
         self._set_content_minsize()
         self._refresh_tick()
         self._pulse()
+        self.after(2500, self._check_for_updates_async)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _set_content_minsize(self) -> None:
@@ -1339,18 +1340,19 @@ class ObsidianApp(ctk.CTk):
         btn_row.pack(fill="both", expand=True)
 
         start_btn = ctk.CTkButton(
-            btn_row, text=" Start", height=30, corner_radius=6,
-           font=ctk.CTkFont(FONT_BODY, 11, "bold"),
-           # Hier sicherstellen, dass COLORS["success"] steht:
-           fg_color=COLORS["success"], 
+            btn_row, text="Start", height=32, corner_radius=6,
+            font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+            fg_color=COLORS["success"],
             hover_color="#0d9b6c",
-            text_color="#ffffff", border_width=0,
+            text_color="#ffffff",
+            border_width=1,
+            border_color=COLORS["success"],
             command=lambda n=name: self._start_bot(n)
         )
         start_btn.pack(side="left", fill="both", expand=True, padx=(0, 3))
 
         restart_btn = ctk.CTkButton(
-            btn_row, text=" Restart", height=30, corner_radius=6,
+            btn_row, text="Restart", height=32, corner_radius=6,
             font=ctk.CTkFont(FONT_BODY, 11, "bold"),
             fg_color="transparent",
             hover_color="#3a2a10",
@@ -1361,7 +1363,7 @@ class ObsidianApp(ctk.CTk):
         restart_btn.pack(side="left", fill="both", expand=True, padx=3)
 
         stop_btn = ctk.CTkButton(
-            btn_row, text=" Stop", height=30, corner_radius=6,
+            btn_row, text="Stop", height=32, corner_radius=6,
             font=ctk.CTkFont(FONT_BODY, 11, "bold"),
             fg_color="transparent",
             hover_color="#3a1820",
@@ -2050,6 +2052,55 @@ class ObsidianApp(ctk.CTk):
             self.after(2500, lambda: webbrowser.open("http://localhost:8501"))
         else:
             webbrowser.open("http://localhost:8501")
+
+    def _check_for_updates_async(self) -> None:
+        """Check private Git updates without blocking the launcher startup."""
+        if getattr(self, "_update_check_started", False):
+            return
+        self._update_check_started = True
+
+        def _worker() -> None:
+            try:
+                r = subprocess.run(
+                    [_get_python_exe(), "-m", "tools.update_check", "--json"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    **subprocess_no_window_kwargs(),
+                )
+                raw = (r.stdout or "").strip()
+                data = json.loads(raw) if raw else {}
+            except Exception as exc:
+                data = {"ok": False, "reason": "check_failed", "message": str(exc)}
+            self.after(0, lambda d=data: self._apply_update_check_result(d))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_update_check_result(self, data: dict) -> None:
+        try:
+            if not data.get("ok"):
+                reason = str(data.get("reason") or "")
+                if reason in {"git_missing", "repo_missing", "remote_unreachable"}:
+                    self.status_text.set("Update check skipped")
+                return
+            if not data.get("update_available"):
+                return
+            remote = str(data.get("remote") or "")[:8]
+            if data.get("bootstrap_required"):
+                msg = ("Update-Zugriff ist eingerichtet. Fuehre vor dem ersten "
+                       "Update update.bat aus, damit der private Git-Stand "
+                       "initialisiert wird.")
+            else:
+                msg = f"Update verfuegbar ({remote}). Stoppe Bots und starte update.bat."
+            self.status_text.set(msg)
+            try:
+                from tkinter import messagebox
+                messagebox.showinfo("Obsidian Update", msg)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _clear_card_log(self, name):
         card = self.cards[name]
@@ -2773,6 +2824,7 @@ class ObsidianApp(ctk.CTk):
                     pass
                 card["start_btn"].configure(state="disabled",
                                               fg_color=COLORS["border"],
+                                              border_color=COLORS["border"],
                                               text_color=COLORS["text_muted"])
                 card["stop_btn"].configure(state="normal")
             else:
@@ -2784,6 +2836,7 @@ class ObsidianApp(ctk.CTk):
                 card["start_btn"].configure(state="normal",
                                               fg_color=COLORS["success"],
                                               hover_color="#1ea350",
+                                              border_color=COLORS["success"],
                                               text_color="#ffffff")
                 card["stop_btn"].configure(state="normal")
 

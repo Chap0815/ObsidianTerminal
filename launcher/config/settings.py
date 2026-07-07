@@ -31,6 +31,7 @@ PROJECT_ROOT = os.path.dirname(LAUNCHER_DIR)  # /  (project root)
 
 DB_PATH      = os.path.join(PROJECT_ROOT, "data", "trading_bot.db")
 CONFIG_FILE  = os.path.join(PROJECT_ROOT, "bot_config.json")
+DEFAULT_CONFIG_FILE = os.path.join(PROJECT_ROOT, "bot_config.default.json")
 
 OLLAMA_URL   = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 if not OLLAMA_URL.startswith(("http://", "https://")):
@@ -629,8 +630,17 @@ def load_config() -> dict:
     """Load ``bot_config.json``, filling in any missing keys from
     :data:`DEFAULT_CONFIG`. Creates the file on first run."""
     if not os.path.exists(CONFIG_FILE):
-        save_config(DEFAULT_CONFIG)
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+        cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+        if os.path.exists(DEFAULT_CONFIG_FILE):
+            try:
+                with open(DEFAULT_CONFIG_FILE, encoding="utf-8-sig") as f:
+                    candidate = json.load(f)
+                if isinstance(candidate, dict):
+                    cfg = candidate
+            except Exception:
+                cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+        save_config(cfg)
+        return json.loads(json.dumps(cfg))
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
             cfg = json.load(f)
