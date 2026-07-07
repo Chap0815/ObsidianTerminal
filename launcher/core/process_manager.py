@@ -32,7 +32,7 @@ import sys
 import threading
 import uuid
 
-from launcher.config.settings import PROJECT_ROOT, _get_python_exe
+from launcher.config.settings import PROJECT_ROOT, _get_python_exe, subprocess_no_window_kwargs
 
 
 class BotProcess:
@@ -76,9 +76,9 @@ class BotProcess:
             if self.is_running():
                 return
 
-            kw: dict = {}
+            kw: dict = subprocess_no_window_kwargs()
             if sys.platform == "win32":
-                flags = subprocess.CREATE_NO_WINDOW
+                flags = kw.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
                 if self.supports_graceful:
                     # Required so CTRL_BREAK_EVENT can be sent later
                     flags |= subprocess.CREATE_NEW_PROCESS_GROUP

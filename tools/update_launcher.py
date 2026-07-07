@@ -50,6 +50,18 @@ def _write_status(status: str, message: str = "", returncode: int | None = None)
     os.replace(tmp, STATUS_PATH)
 
 
+def _hidden_kwargs() -> dict:
+    if sys.platform != "win32":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
+
+
 def _python_console() -> str:
     venv = ROOT / ".venv" / "Scripts" / "python.exe"
     if venv.exists():
@@ -77,7 +89,7 @@ def _pid_alive(pid: int) -> bool:
             ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
             text=True,
             capture_output=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            **_hidden_kwargs(),
         )
         return str(pid) in (result.stdout or "")
 
@@ -122,7 +134,7 @@ def _launcher_processes_via_cim() -> list[str]:
             text=True,
             capture_output=True,
             timeout=8,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            **_hidden_kwargs(),
         )
     except Exception:
         return []
@@ -145,14 +157,13 @@ def _wait_for_launcher_exit(parent_pid: int, timeout: float = 45.0) -> None:
 def _restart_launcher() -> None:
     vbs = ROOT / "OBSIDIAN.vbs"
     bat = ROOT / "start_launcher.bat"
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     if vbs.exists():
-        subprocess.Popen(["wscript.exe", str(vbs)], cwd=str(ROOT), creationflags=flags)
+        subprocess.Popen(["wscript.exe", str(vbs)], cwd=str(ROOT), **_hidden_kwargs())
         return
     if bat.exists():
-        subprocess.Popen(["cmd.exe", "/c", str(bat)], cwd=str(ROOT), creationflags=flags)
+        subprocess.Popen(["cmd.exe", "/c", str(bat)], cwd=str(ROOT), **_hidden_kwargs())
         return
-    subprocess.Popen([sys.executable, str(ROOT / "launcher.pyw")], cwd=str(ROOT), creationflags=flags)
+    subprocess.Popen([sys.executable, str(ROOT / "launcher.pyw")], cwd=str(ROOT), **_hidden_kwargs())
 
 
 def _run_update() -> int:
@@ -164,7 +175,7 @@ def _run_update() -> int:
         text=True,
         capture_output=True,
         timeout=1800,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        **_hidden_kwargs(),
     )
     if proc.stdout:
         _append_log("STDOUT:\n" + proc.stdout.rstrip())

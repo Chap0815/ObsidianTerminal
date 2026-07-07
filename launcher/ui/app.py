@@ -800,10 +800,12 @@ class ObsidianApp(ctk.CTk):
             main.grid_rowconfigure(i, weight=0)
         self.main_frame = main
         main.bind("<Configure>", self._on_main_resize)
+        main.bind("<Configure>", lambda _e: self.after_idle(self._refresh_main_scrollregion), add="+")
         self._bind_card_area_mousewheel(main)
 
         for col, bot in enumerate(BOT_ORDER):
             self.cards[bot] = self._build_bot_card(main, bot, col)
+        self.after_idle(self._refresh_main_scrollregion)
 
     def _bind_card_area_mousewheel(self, frame) -> None:
         """Make mouse-wheel scrolling work over child widgets in bot cards."""
@@ -824,7 +826,7 @@ class ObsidianApp(ctk.CTk):
                 return None
             if _is_log_text(getattr(event, "widget", None)):
                 return None
-            speed = 6
+            speed = 9
             if getattr(event, "num", None) == 4:
                 units = -speed
             elif getattr(event, "num", None) == 5:
@@ -836,6 +838,7 @@ class ObsidianApp(ctk.CTk):
                 steps = max(1, abs(delta) // 120) * speed
                 units = -steps if delta > 0 else steps
             canvas.yview_scroll(units, "units")
+            self.after_idle(self._refresh_main_scrollregion)
             return "break"
 
         def _enter(_event=None):
@@ -852,11 +855,29 @@ class ObsidianApp(ctk.CTk):
         frame.bind("<Enter>", _enter)
         frame.bind("<Leave>", _leave)
 
+    def _refresh_main_scrollregion(self) -> None:
+        """Force CTk's canvas to know the full dynamic card grid height."""
+        frame = getattr(self, "main_frame", None)
+        if frame is None:
+            return
+        canvas = getattr(frame, "_parent_canvas", None)
+        if canvas is None:
+            return
+        try:
+            frame.update_idletasks()
+            bbox = canvas.bbox("all")
+            if bbox:
+                canvas.configure(scrollregion=bbox)
+        except Exception:
+            pass
+
     def _on_main_resize(self, event):
         cols = self._card_columns_for_width(getattr(event, "width", 0))
         if cols != getattr(self, "_current_card_columns", None):
             self._current_card_columns = cols
             self._refresh_visibility_layout()
+        else:
+            self.after_idle(self._refresh_main_scrollregion)
 
     def _build_bot_card(self, parent, name: str, col: int):
         meta = BOT_META[name]
@@ -1615,6 +1636,7 @@ class ObsidianApp(ctk.CTk):
         # Force redraw  wichtig bei manchen tk-Versionen
         try:
             self.main_frame.update_idletasks()
+            self._refresh_main_scrollregion()
         except Exception:
             pass
 
@@ -2061,9 +2083,7 @@ class ObsidianApp(ctk.CTk):
         to the project root, not to this module's directory.
         """
         if self.streamlit is None or self.streamlit.poll() is not None:
-            kw = {}
-            if sys.platform == "win32":
-                kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+            kw = subprocess_no_window_kwargs()
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"

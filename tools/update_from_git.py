@@ -130,6 +130,18 @@ def _ssh_command() -> str:
     return base
 
 
+def _hidden_kwargs() -> dict:
+    if sys.platform != "win32":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
+
+
 def _run(
     cmd: list[str],
     *,
@@ -140,18 +152,9 @@ def _run(
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_SSH_COMMAND"] = env.get("GIT_SSH_COMMAND") or _ssh_command()
-    kwargs = {}
-    if sys.platform == "win32":
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = subprocess.SW_HIDE
-        kwargs = {
-            "creationflags": subprocess.CREATE_NO_WINDOW,
-            "startupinfo": startupinfo,
-        }
     r = subprocess.run(
         cmd, cwd=str(cwd), text=True, capture_output=True, env=env,
-        timeout=timeout, **kwargs
+        timeout=timeout, **_hidden_kwargs()
     )
     if check and r.returncode != 0:
         out = (r.stdout or "").strip()
@@ -296,12 +299,12 @@ def _running_launchers_via_cim() -> list[str]:
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command", script],
-            cwd=str(ROOT),
-            text=True,
-            capture_output=True,
-            timeout=8,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        timeout=8,
+        **_hidden_kwargs(),
+    )
     except Exception:
         return []
     if r.returncode != 0:
@@ -379,7 +382,7 @@ def _install_dependencies_if_present() -> None:
         cwd=str(ROOT),
         text=True,
         timeout=900,
-        **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+        **_hidden_kwargs(),
     )
     if r.returncode != 0:
         raise RuntimeError("Dependency-Update fehlgeschlagen. Update wurde nicht vollstaendig abgeschlossen.")

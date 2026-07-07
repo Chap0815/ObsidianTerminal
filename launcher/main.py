@@ -19,7 +19,7 @@ import os
 import subprocess
 import sys
 
-from launcher.config.settings import PROJECT_ROOT, _get_python_exe
+from launcher.config.settings import PROJECT_ROOT, _get_python_exe, subprocess_no_window_kwargs
 
 
 def _ensure_std_streams() -> None:
@@ -103,8 +103,9 @@ def _relaunch_windowless() -> bool:
     try:
         subprocess.Popen(
             [pythonw, entry], cwd=PROJECT_ROOT,
-            creationflags=subprocess.CREATE_NO_WINDOW, close_fds=True,
-            env=dict(os.environ, OBSIDIAN_NO_REEXEC="1"))
+            close_fds=True,
+            env=dict(os.environ, OBSIDIAN_NO_REEXEC="1"),
+            **subprocess_no_window_kwargs())
         return True
     except Exception:
         return False
@@ -128,13 +129,10 @@ def main() -> None:
     wizard_path = os.path.join(PROJECT_ROOT, "setup_wizard.pyw")
 
     if not os.path.exists(env_path) and os.path.exists(wizard_path):
-        kw = {}
-        if sys.platform == "win32":
-            kw["creationflags"] = subprocess.CREATE_NO_WINDOW
         subprocess.Popen(
             [_get_python_exe(), wizard_path],
             cwd=PROJECT_ROOT,
-            **kw,
+            **subprocess_no_window_kwargs(),
         )
         sys.exit(0)
 

@@ -1,6 +1,6 @@
 {
-  "build_id": "463897daaf85f001",
-  "created_at": "2026-07-07 13:50:32",
+  "build_id": "998e72ba7dbbd221",
+  "created_at": "2026-07-07 14:02:49",
   "source": "update_deploy_manifest.py",
   "file_count": 134,
   "files": [
@@ -351,8 +351,8 @@
     },
     {
       "path": "launcher\\core\\process_manager.py",
-      "sha256": "03c4e4fac7d8aedc1f5cc40fb70b6481d921eec4eeb68814da31987a4f3944f5",
-      "bytes": 11555
+      "sha256": "a67fbea34fbc8b241c1bf9af601bd93dcc9b0250aae36e7a13570a7b205447f1",
+      "bytes": 11640
     },
     {
       "path": "launcher\\core\\system_monitor.py",
@@ -361,8 +361,8 @@
     },
     {
       "path": "launcher\\main.py",
-      "sha256": "8505f0e33a7a9e48242ca771aefd6250d3ee17a8cbdff5bda6c7a156fa012fd5",
-      "bytes": 5983
+      "sha256": "7e89fd76cd6bed502b33c716c14716b993646028afd62b3b1caaf697aee3780e",
+      "bytes": 5927
     },
     {
       "path": "launcher\\state\\__init__.py",
@@ -381,8 +381,8 @@
     },
     {
       "path": "launcher\\ui\\app.py",
-      "sha256": "398fd38f3e45553e6b06270b97b44b5491330f02a3e35eff730943e678fde792",
-      "bytes": 159397
+      "sha256": "b064d99f29ae8a22a457763d6bfa27a29a69b924b944ab3443779cf516de6e12",
+      "bytes": 160188
     },
     {
       "path": "launcher\\ui\\components\\__init__.py",
@@ -586,13 +586,13 @@
     },
     {
       "path": "tools\\update_from_git.py",
-      "sha256": "967e7401aeffb55064fae8095a8a2ec1bb1d3b53c358361ceeaa146af3c2d6ed",
-      "bytes": 21973
+      "sha256": "c3ffccc550eaca6f9e1ab086e677cd81d0e9e1a3eb7a2cfb3a1f94170f85714e",
+      "bytes": 21858
     },
     {
       "path": "tools\\update_launcher.py",
-      "sha256": "6f00b4c98243d624eb5d6fa04bfc4829e38fc59cbb2d27f390318eaf84ceb872",
-      "bytes": 7104
+      "sha256": "0a58e54ce2ba067413fd1c188cc5c02a44c93cdcb6ae1e800794d0bf1356dca3",
+      "bytes": 7274
     },
     {
       "path": "tools\\warm_cache.py",
