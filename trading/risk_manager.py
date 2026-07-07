@@ -57,6 +57,19 @@ MAX_POSITION_USDT        = C.MAX_POSITION_USDT
 DEFAULT_POSITION_USDT    = C.DEFAULT_POSITION_USDT
 DEFAULT_BASE_CAPITAL     = C.BASE_CAPITAL_USDT
 
+POSITION_LIMIT_BY_BOT = {
+    "SPOT": 500.0,
+    "FUTURES": 500.0,
+    "TREND": 2500.0,
+    "FUTREND": 2500.0,
+}
+
+LEVERAGE_LIMIT_BY_BOT = {
+    "FUTURES": (1.0, 10.0),
+    "FUTREND": (1.0, 6.0),
+    "CROSS": (1.0, 3.0),
+}
+
 RSI_STEP_DOWN  = C.RSI_STEP_DOWN
 RSI_STEP_UP    = C.RSI_STEP_UP
 RSI_MIN_LIMIT  = C.RSI_MIN_LIMIT
@@ -147,6 +160,14 @@ def get_base_capital(bot_name: str) -> float:
     return DEFAULT_BASE_CAPITAL
 
 
+def _max_position_limit(bot_name: str) -> float:
+    return max(MAX_POSITION_USDT * 2, POSITION_LIMIT_BY_BOT.get(bot_name.upper(), MAX_POSITION_USDT * 2))
+
+
+def _leverage_limits(bot_name: str) -> tuple[float, float] | None:
+    return LEVERAGE_LIMIT_BY_BOT.get(bot_name.upper())
+
+
 def validate_config_or_die(bot_name: str) -> dict:
     cfg = _load_bot_config(bot_name)
     required = ["MAX_DAILY_LOSS", "POSITION_SIZE", "MAX_OPEN_TRADES",
@@ -163,15 +184,32 @@ def validate_config_or_die(bot_name: str) -> dict:
             log_event(f"[{bot_name}] FATAL: MAX_DAILY_LOSS={mdl} out of safe range", "WARN")
             _fatal_exit(1)
         ps = float(cfg["POSITION_SIZE"])
-        if ps <= 0 or ps > MAX_POSITION_USDT * 2:
-            log_event(f"[{bot_name}] FATAL: POSITION_SIZE={ps} out of safe range", "WARN")
+        max_position_limit = _max_position_limit(bot_name)
+        if ps <= 0 or ps > max_position_limit:
+            log_event(
+                f"[{bot_name}] FATAL: POSITION_SIZE={ps} out of safe range "
+                f"(max {max_position_limit})", "WARN")
             _fatal_exit(1)
         if "POSITION_SIZE_MAX" in cfg:
             ps_max = float(cfg["POSITION_SIZE_MAX"])
-            if ps_max <= 0 or ps_max > MAX_POSITION_USDT * 2:
+            if ps_max <= 0 or ps_max > max_position_limit:
                 log_event(
                     f"[{bot_name}] FATAL: POSITION_SIZE_MAX={ps_max} "
-                    f"out of safe range", "WARN")
+                    f"out of safe range (max {max_position_limit})", "WARN")
+                _fatal_exit(1)
+            if ps > ps_max:
+                log_event(
+                    f"[{bot_name}] FATAL: POSITION_SIZE={ps} exceeds "
+                    f"POSITION_SIZE_MAX={ps_max}", "WARN")
+                _fatal_exit(1)
+        lev_limits = _leverage_limits(bot_name)
+        if lev_limits and "LEVERAGE" in cfg:
+            lev = float(cfg["LEVERAGE"])
+            lo, hi = lev_limits
+            if not (lo <= lev <= hi):
+                log_event(
+                    f"[{bot_name}] FATAL: LEVERAGE={lev} out of safe range "
+                    f"({lo}-{hi})", "WARN")
                 _fatal_exit(1)
         # INITIAL_STOP_LOSS must be strictly negative and in a sane range. A
         # positive value (e.g. user types 3.5 instead of -3.5) makes the exit

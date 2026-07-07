@@ -1,6 +1,6 @@
 {
-  "build_id": "912b5cb67d09ae7e",
-  "created_at": "2026-07-07 14:13:40",
+  "build_id": "ae974f5884d55bd8",
+  "created_at": "2026-07-07 14:40:57",
   "source": "update_deploy_manifest.py",
   "file_count": 134,
   "files": [
@@ -171,8 +171,8 @@
     },
     {
       "path": "bots\\main_bot_trendfut.py",
-      "sha256": "e890d4ee1ae5109b27f8fddfcbc5b9a6ea8cd926dd3e80555d7626011bf263f8",
-      "bytes": 4092
+      "sha256": "101fdde3f3f41bfd8fd52a10bb9d335a0fb18d235845469341762843023a640f",
+      "bytes": 4094
     },
     {
       "path": "config\\__init__.py",
@@ -246,8 +246,8 @@
     },
     {
       "path": "core\\logger.py",
-      "sha256": "200127e1f13257d1e20374268d9d7dc8593e8680a4a19600bfb117ab222febf7",
-      "bytes": 30059
+      "sha256": "5ef6e598a5bbc6fe10a52e068733f0e706029a5bf8b881201030aff4b57446fe",
+      "bytes": 30248
     },
     {
       "path": "core\\models.py",
@@ -261,8 +261,8 @@
     },
     {
       "path": "core\\pre_start_check.py",
-      "sha256": "c4a61702cb9851222df9f102371c0152a1927610de8ea5fa87185febe8bf27f6",
-      "bytes": 14632
+      "sha256": "6e0ec2125ba84777fa40503f269d4acf3ad9b3ffdc93c2f9cf9c2931ceba7cc4",
+      "bytes": 16486
     },
     {
       "path": "core\\runtime_status.py",
@@ -306,8 +306,8 @@
     },
     {
       "path": "core\\trend_futures_bot.py",
-      "sha256": "f4e4cb857f6d7c509cc3a52822b18464c6aa2657319f2564656b87c8e04b4c04",
-      "bytes": 59942
+      "sha256": "b1e95a0108a6a5850022eb67dc7fc0f6bf6c992ca13cea63bfa4c21a901ce75c",
+      "bytes": 59948
     },
     {
       "path": "env_parameter.txt",
@@ -326,8 +326,8 @@
     },
     {
       "path": "launcher\\config\\settings.py",
-      "sha256": "7ddfa4cda41d81f09eeef99c06ce86541f15c8604d4916da3cd923af9caa47df",
-      "bytes": 40750
+      "sha256": "7b85a7d6c2791667548efe754fb1a2032cc81a004766567ec44d1402cab155e6",
+      "bytes": 40771
     },
     {
       "path": "launcher\\core\\__init__.py",
@@ -351,8 +351,8 @@
     },
     {
       "path": "launcher\\core\\process_manager.py",
-      "sha256": "a67fbea34fbc8b241c1bf9af601bd93dcc9b0250aae36e7a13570a7b205447f1",
-      "bytes": 11640
+      "sha256": "20b727dc8c815d6546bf7208a78bab1aa3ab7e7242ac30e15ace3b769db81b36",
+      "bytes": 12271
     },
     {
       "path": "launcher\\core\\system_monitor.py",
@@ -381,8 +381,8 @@
     },
     {
       "path": "launcher\\ui\\app.py",
-      "sha256": "b064d99f29ae8a22a457763d6bfa27a29a69b924b944ab3443779cf516de6e12",
-      "bytes": 160188
+      "sha256": "7e3a4866b65ddb308dc817a5c8f9df50b6cef3d81376313814888e48f1766abf",
+      "bytes": 159490
     },
     {
       "path": "launcher\\ui\\components\\__init__.py",
@@ -526,8 +526,8 @@
     },
     {
       "path": "tools\\dashboard.py",
-      "sha256": "741ffafdeaa23466a6d489dd7ca982a039835c159f356955b1209202aa24af33",
-      "bytes": 84851
+      "sha256": "94ade9d34e4460dc81ad49ad79334f89756eb573d25df5095ec8b0719cb079f9",
+      "bytes": 85048
     },
     {
       "path": "tools\\ensure_git.py",
@@ -586,8 +586,8 @@
     },
     {
       "path": "tools\\update_from_git.py",
-      "sha256": "60de35cac2efe9ebdd9027f32eaf41573f75ce91da43b64778c42d3e218de394",
-      "bytes": 23067
+      "sha256": "6947560361e00b8350d877fce44c905593c01124f1f55446d77a7d0793fd741f",
+      "bytes": 24107
     },
     {
       "path": "tools\\update_launcher.py",
@@ -626,8 +626,8 @@
     },
     {
       "path": "trading\\risk_manager.py",
-      "sha256": "10bf9e0189711b268e84fa89af8ca236b0d3c41b62fea22d145191f07c493db2",
-      "bytes": 45240
+      "sha256": "7f94faf73d474497bc1c764383ad5879fa9a74626e88cded8b705974cb18190e",
+      "bytes": 46487
     },
     {
       "path": "trading\\screener.py",

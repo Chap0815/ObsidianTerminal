@@ -63,6 +63,7 @@ SMOKE_FILES = [
     "tools/update_from_git.py",
 ]
 BLOCKED_TRACKED_PREFIXES = ("data/", "logs/", "backups/")
+SNAPSHOT_COMPLETE = ".snapshot_complete"
 
 
 def _print(msg: str) -> None:
@@ -425,10 +426,27 @@ def _verify_no_tracked_runtime_files(cwd: Path) -> None:
     bad = [
         rel for rel in _tracked_files(cwd)
         if rel.replace("\\", "/").startswith(BLOCKED_TRACKED_PREFIXES)
+        or rel.replace("\\", "/") in PROTECTED_FILE_SET
     ]
     if bad:
         raise RuntimeError(
-            "Update-Repo enthaelt Runtime-Dateien, Update abgebrochen: "
+            "Update-Repo enthaelt Runtime/User-Dateien, Update abgebrochen: "
+            + ", ".join(bad[:20])
+        )
+
+
+def _verify_ref_has_no_runtime_files(git: str, ref: str) -> None:
+    r = _run([git, "ls-tree", "-r", "--name-only", ref], check=False)
+    if r.returncode != 0:
+        raise RuntimeError(f"Update-Tree {ref} konnte nicht geprueft werden.")
+    bad = []
+    for line in r.stdout.splitlines():
+        rel = line.strip().replace("\\", "/")
+        if rel.startswith(BLOCKED_TRACKED_PREFIXES) or rel in PROTECTED_FILE_SET:
+            bad.append(rel)
+    if bad:
+        raise RuntimeError(
+            "Update-Repo enthaelt Runtime/User-Dateien, Update abgebrochen: "
             + ", ".join(bad[:20])
         )
 
@@ -481,11 +499,17 @@ def _snapshot_current_app(dst: Path) -> None:
             shutil.copytree(item, target)
         elif item.is_file():
             shutil.copy2(item, target)
+    (dst / SNAPSHOT_COMPLETE).write_text("ok", encoding="ascii")
 
 
 def _restore_app_snapshot(snapshot: Path) -> None:
+    if not (snapshot / SNAPSHOT_COMPLETE).exists():
+        _print("Rollback skipped: no complete app snapshot exists.")
+        return
     _clean_nonprotected_code()
     for item in snapshot.iterdir():
+        if item.name == SNAPSHOT_COMPLETE:
+            continue
         target = ROOT / item.name
         if item.is_dir():
             if target.exists():
@@ -535,6 +559,7 @@ def _update_existing_repo(repo_url: str, branch: str) -> None:
     _write_update_marker("existing")
     try:
         _run([git, "fetch", "origin", branch], timeout=300)
+        _verify_ref_has_no_runtime_files(git, "FETCH_HEAD")
         if _is_ancestor(git, "FETCH_HEAD", "HEAD"):
             _restore_user_files(backup)
             _verify_protected_files(protected_hashes)

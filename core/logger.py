@@ -873,9 +873,15 @@ def send_telegram(token, chat_id, msg) -> None:
                     pass
             try:
                 _rotate_overflow_if_needed()
+                safe_cid = str(cid)
+                if len(safe_cid) > 4:
+                    safe_cid = "***" + safe_cid[-4:]
                 with open(_TG_OVERFLOW_LOG, "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps({"ts": _date(), "chat_id": str(cid),
-                                         "msg": msg[:500]}) + "\n")
+                    fh.write(json.dumps({
+                        "ts": _date(),
+                        "chat_id": safe_cid,
+                        "msg": redact(msg)[:500],
+                    }) + "\n")
             except Exception:
                 pass
 

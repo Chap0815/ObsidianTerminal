@@ -603,7 +603,8 @@ def load_all_trades() -> pd.DataFrame:
         else:
             df["mode"] = df.apply(_mode_for_historical_row, axis=1)
         return df
-    except Exception:
+    except Exception as exc:
+        st.warning(f"Trades konnten nicht geladen werden: {type(exc).__name__}: {exc}")
         return pd.DataFrame()
 
 
@@ -619,7 +620,8 @@ def load_futures_live() -> pd.DataFrame:
             df["base_bot"] = df["bot_name"].map(_base_bot_name)
             df["mode"] = df["bot_name"].map(_mode_for_current_row)
         return df
-    except Exception:
+    except Exception as exc:
+        st.warning(f"Futures-Status konnte nicht geladen werden: {type(exc).__name__}: {exc}")
         return pd.DataFrame()
 
 

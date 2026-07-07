@@ -135,6 +135,17 @@ class BotProcess:
             if not log_dir:
                 return
             last = read_runtime_status(log_dir)
+            expected_run_id = self.run_id or ""
+            expected_pid = self.proc.pid if self.proc else None
+            last_run_id = str(last.get("run_id") or "")
+            try:
+                last_pid = int(last.get("pid") or 0)
+            except (TypeError, ValueError):
+                last_pid = 0
+            if expected_run_id and last_run_id and last_run_id != expected_run_id:
+                return
+            if expected_pid and last_pid and last_pid != expected_pid:
+                return
             write_runtime_status(
                 log_dir,
                 self.bot_name,
@@ -146,6 +157,8 @@ class BotProcess:
                     "previous_status": str(last.get("status") or ""),
                     "stopped_by": "launcher",
                     "returncode": returncode,
+                    "pid": expected_pid or last_pid or 0,
+                    "run_id": expected_run_id or last_run_id,
                 },
             )
         except Exception as e:

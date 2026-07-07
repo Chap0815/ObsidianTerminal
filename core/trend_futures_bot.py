@@ -633,9 +633,9 @@ class TrendFuturesBot(FuturesBot):
         fees = 0.0
         amount = contracts
         exch_oid = None
+        margin_mode = str(self.C("MARGIN_MODE", "isolated") or "isolated").lower()
 
         if not self.simulation:
-            margin_mode = str(self.C("MARGIN_MODE", "isolated") or "isolated").lower()
             try:
                 must_set_leverage(self.ex, lev_cap, full, direction="LONG",
                                   margin_mode=margin_mode)
@@ -695,13 +695,13 @@ class TrendFuturesBot(FuturesBot):
                     if landed and float(landed.get("filled") or 0) > 0:
                         amount = float(landed.get("filled") or 0) or contracts
                         self._record_open(base, price, margin, eff_lev, amount,
-                                          0.0, provisional=True,
+                                          0.0, provisional=False,
                                           lev_cap=lev_cap, mm_rate=mm,
                                           entry_shadow=shadow,
                                           margin_mode=margin_mode)
                         _landed = True
                         log_event(f"[{self.BOT_NAME}]  {base}: landed despite "
-                                  f"error  tracked provisionally", "WARN")
+                                  f"error  tracked and monitoring enabled", "WARN")
                 except Exception:
                     pass
                 if not _landed:

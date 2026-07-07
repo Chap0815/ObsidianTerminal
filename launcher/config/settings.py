@@ -293,7 +293,7 @@ DEFAULT_CONFIG = {
         "MIN_VOLUME":            10000000.0,
         "LEVERAGE":              1.0,
         "POSITION_SIZE":         50.0,
-        "POSITION_SIZE_MAX":     50.0,
+        "POSITION_SIZE_MAX":     2500.0,
         "MAX_OPEN_TRADES":       6,
         "MAX_NEW_TRADES_PER_TICK": 1,
         "INITIAL_STOP_LOSS":     -6.0,
@@ -426,11 +426,11 @@ PARAM_DEFS_FUTURES = [
 # Edit the coin universe (TREND_UNIVERSE) directly in bot_config.json; the
 # slider editor below covers the numeric knobs.
 PARAM_DEFS_TREND = [
-    ("POSITION_SIZE",     "Pos. Size (USDT/coin)", 1.0,   1.0, 500.0, ".0f", "",
+    ("POSITION_SIZE",     "Pos. Size (USDT/coin)", 1.0,   1.0, 2500.0, ".0f", "",
      "USDT bought per coin when it is in an uptrend. With N coins held, max "
      "deployed = N  this. Spot, no leverage."),
-    ("POSITION_SIZE_MAX", "Kelly Cap (USDT)",      5.0,   5.0, 2500.0, ".0f", "",
-     "Hard cap for dynamically scaled per-coin size. Keep >= Pos. Size."),
+    ("POSITION_SIZE_MAX", "Hard Cap (USDT)",       5.0,   5.0, 2500.0, ".0f", "",
+     "Hard cap for per-coin size after optional vol-targeting. Keep >= Pos. Size."),
     ("MAX_OPEN_TRADES",   "Max Open Trades",       1.0,   1.0,  20.0, ".0f", "",
      "Maximum number of coins held at once. With the 12-major universe, 12 "
      "means all of them when in trend."),
@@ -510,10 +510,10 @@ PARAM_DEFS_FUTREND = [
      "EFFECTIVE leverage (fractional ok). Notional = margin  this; the exchange "
      "gets ceil() as the integer cap. WARNING: trend-following has large "
      "drawdowns  backtests show 3 is account-ruinous. 11.5 is sane."),
-    ("POSITION_SIZE",        "Margin / Trade",     1.0,   5.0,   500.0, ".0f", "$",
+    ("POSITION_SIZE",        "Margin / Trade",     1.0,   5.0,  2500.0, ".0f", "$",
      "Margin (USDT) posted per position. Notional = this  leverage."),
-    ("POSITION_SIZE_MAX",    "Kelly Cap (USDT)",   5.0,   5.0,  2500.0, ".0f", "$",
-     "Cap for dynamically scaled margin amount. Keep >= Margin / Trade."),
+    ("POSITION_SIZE_MAX",    "Hard Cap (USDT)",    5.0,   5.0,  2500.0, ".0f", "$",
+     "Hard cap for margin after optional vol-targeting. Keep >= Margin / Trade."),
     ("MAX_OPEN_TRADES",      "Max Positions",      1.0,   1.0,    20.0, ".0f", "",
      "How many trending coins to hold at once."),
     ("MAX_NEW_TRADES_PER_TICK", "New / Scan",      1.0,   0.0,    10.0, ".0f", "",

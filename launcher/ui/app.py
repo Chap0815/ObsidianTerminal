@@ -1809,8 +1809,12 @@ class ObsidianApp(ctk.CTk):
 
     def _reset_params(self, bot_name):
         defaults = DEFAULT_CONFIG.get(bot_name, {})
-        updates = {k: v for k, v in defaults.items() if k != "SIMULATION"}
         rows = self.param_rows.get(bot_name, {})
+        updates = {
+            k: defaults[k]
+            for k in rows
+            if k != "SIMULATION" and k in defaults
+        }
         for key in updates:
             self.config[bot_name][key] = updates[key]
         for key, row in rows.items():
@@ -2148,7 +2152,7 @@ class ObsidianApp(ctk.CTk):
                     msg = ""
                 if msg:
                     self.status_text.set(msg)
-                    if not getattr(self, "_update_notice_shown", False):
+                    if reason not in {"repo_missing", "git_missing"} and not getattr(self, "_update_notice_shown", False):
                         self._update_notice_shown = True
                         try:
                             from tkinter import messagebox
@@ -2397,22 +2401,8 @@ class ObsidianApp(ctk.CTk):
             save_failed_reason = None
             cfg_written = None
             try:
-                cfg = {}
-                if os.path.exists(CONFIG_FILE):
-                    with open(CONFIG_FILE, encoding="utf-8") as f:
-                        cfg = json.load(f)
-                cfg["LLM_MODEL"] = new_model
-                # Atomic write: tmp + os.replace so a half-written
-                # bot_config.json can't kill all 3 bots on next start.
-                tmp = CONFIG_FILE + f".tmp.{os.getpid()}"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(cfg, f, indent=2)
-                os.replace(tmp, CONFIG_FILE)
-                # Sanity-readback: confirm what's on disk matches what we wrote.
-                # If a permission glitch or AV blocks the write, ``os.replace``
-                # might not raise but the file content could be unchanged.
-                with open(CONFIG_FILE, encoding="utf-8") as f:
-                    cfg_written = json.load(f).get("LLM_MODEL")
+                self.config = save_config_merge({"LLM_MODEL": new_model})
+                cfg_written = self.config.get("LLM_MODEL")
             except Exception as e:
                 save_failed_reason = f"{type(e).__name__}: {e}"
 

@@ -16,6 +16,19 @@ from core.paths import BOT_CONFIG, DB_PATH, PROJECT_ROOT
 from core.runtime_status import get_build_info, read_runtime_status
 
 
+POSITION_LIMIT_BY_BOT = {
+    "SPOT": 500.0,
+    "FUTURES": 500.0,
+    "TREND": 2500.0,
+    "FUTREND": 2500.0,
+}
+LEVERAGE_LIMIT_BY_BOT = {
+    "FUTURES": (1.0, 10.0),
+    "FUTREND": (1.0, 6.0),
+    "CROSS": (1.0, 3.0),
+}
+
+
 @dataclass(frozen=True)
 class CheckIssue:
     severity: str
@@ -211,6 +224,38 @@ def _check_config(bot_name: str | None,
             except Exception:
                 issues.append(_issue("error", "config_numeric",
                                      f"{name}: {key} is not numeric/finite"))
+        try:
+            pos = float(section.get("POSITION_SIZE"))
+            pos_max_raw = section.get("POSITION_SIZE_MAX", pos)
+            pos_max = float(pos_max_raw)
+            limit = POSITION_LIMIT_BY_BOT.get(name, 150.0)
+            if pos <= 0 or pos > limit:
+                issues.append(_issue(
+                    "error", "position_size_invalid",
+                    f"{name}: POSITION_SIZE={pos} outside 0-{limit}"))
+            if pos_max <= 0 or pos_max > limit:
+                issues.append(_issue(
+                    "error", "position_size_max_invalid",
+                    f"{name}: POSITION_SIZE_MAX={pos_max} outside 0-{limit}"))
+            if pos > pos_max:
+                issues.append(_issue(
+                    "error", "position_size_gt_cap",
+                    f"{name}: POSITION_SIZE={pos} exceeds POSITION_SIZE_MAX={pos_max}"))
+        except Exception:
+            issues.append(_issue("error", "position_size_numeric",
+                                 f"{name}: POSITION_SIZE/POSITION_SIZE_MAX invalid"))
+        lev_limits = LEVERAGE_LIMIT_BY_BOT.get(name)
+        if lev_limits and "LEVERAGE" in section:
+            try:
+                lev = float(section.get("LEVERAGE"))
+                lo, hi = lev_limits
+                if not (lo <= lev <= hi):
+                    issues.append(_issue(
+                        "error", "leverage_invalid",
+                        f"{name}: LEVERAGE={lev} outside {lo}-{hi}"))
+            except Exception:
+                issues.append(_issue("error", "leverage_numeric",
+                                     f"{name}: LEVERAGE is not numeric"))
         if "TRAILING_DISTANCE" in section and "ACTIVATION_PROFIT" in section:
             try:
                 td = float(section.get("TRAILING_DISTANCE"))

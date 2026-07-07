@@ -62,7 +62,7 @@ class TrendFuturesLauncher(TrendFuturesBot):
         # -- Risk / sizing --
         "LEVERAGE":             1.0,     # EFFECTIVE leverage, fractional, hard range 1 - 6x
         "POSITION_SIZE":        50.0,    # margin (USDT) per position
-        "POSITION_SIZE_MAX":    50.0,
+        "POSITION_SIZE_MAX":    2500.0,
         "MAX_OPEN_TRADES":      6,
         "INITIAL_STOP_LOSS":    -6.0,    # hard price stop (price %, not leverage-scaled)
         "LIQ_SAFETY_PCT":       20.0,
