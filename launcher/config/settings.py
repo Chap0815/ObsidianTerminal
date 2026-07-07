@@ -855,5 +855,11 @@ def subprocess_no_window_kwargs() -> dict:
     """Return ``creationflags`` kwargs so a child process opens no console
     window on Windows. Empty dict on other platforms."""
     if sys.platform == "win32":
-        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        return {
+            "creationflags": subprocess.CREATE_NO_WINDOW,
+            "startupinfo": startupinfo,
+        }
     return {}

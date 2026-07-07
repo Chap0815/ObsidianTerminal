@@ -142,7 +142,19 @@ def _run(
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_SSH_COMMAND"] = env.get("GIT_SSH_COMMAND") or _ssh_command()
-    r = subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True, env=env, timeout=timeout)
+    kwargs = {}
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        kwargs = {
+            "creationflags": subprocess.CREATE_NO_WINDOW,
+            "startupinfo": startupinfo,
+        }
+    r = subprocess.run(
+        cmd, cwd=str(cwd), text=True, capture_output=True, env=env,
+        timeout=timeout, **kwargs
+    )
     if check and r.returncode != 0:
         out = (r.stdout or "").strip()
         err = (r.stderr or "").strip()
@@ -372,6 +384,7 @@ def _install_dependencies_if_present() -> None:
         cwd=str(ROOT),
         text=True,
         timeout=900,
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
     )
     if r.returncode != 0:
         raise RuntimeError("Dependency-Update fehlgeschlagen. Update wurde nicht vollstaendig abgeschlossen.")

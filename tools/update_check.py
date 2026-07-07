@@ -59,8 +59,17 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
         ssh_cmd += f' -i "{key}" -o IdentitiesOnly=yes'
     env["GIT_SSH_COMMAND"] = env.get("GIT_SSH_COMMAND") or ssh_cmd
     env["GIT_TERMINAL_PROMPT"] = "0"
+    kwargs = {}
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        kwargs = {
+            "creationflags": subprocess.CREATE_NO_WINDOW,
+            "startupinfo": startupinfo,
+        }
     return subprocess.run(
-        cmd, cwd=str(ROOT), text=True, capture_output=True, timeout=12, env=env
+        cmd, cwd=str(ROOT), text=True, capture_output=True, timeout=12, env=env, **kwargs
     )
 
 
