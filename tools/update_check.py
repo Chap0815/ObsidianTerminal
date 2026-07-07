@@ -110,10 +110,14 @@ def check_update() -> dict:
         }
 
     local_hash = ""
+    local_ahead = False
     if (ROOT / ".git").exists():
         local = _run([git, "rev-parse", "HEAD"])
         if local.returncode == 0:
             local_hash = local.stdout.strip()
+        if local_hash and local_hash != remote_hash:
+            ahead = _run([git, "merge-base", "--is-ancestor", remote_hash, "HEAD"])
+            local_ahead = ahead.returncode == 0
 
     return {
         "ok": True,
@@ -121,8 +125,9 @@ def check_update() -> dict:
         "branch": branch,
         "remote": remote_hash,
         "local": local_hash,
-        "update_available": (not local_hash) or local_hash != remote_hash,
+        "update_available": ((not local_hash) or local_hash != remote_hash) and not local_ahead,
         "bootstrap_required": not bool(local_hash),
+        "local_ahead": local_ahead,
         "last_update": _last_update_status(),
     }
 

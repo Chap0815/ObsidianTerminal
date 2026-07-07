@@ -208,6 +208,7 @@ class ObsidianApp(ctk.CTk):
         self._dirty_param_keys = {bot: set() for bot in BOT_ORDER}
         self.bad_hours_rows = {}  # bot_name  BadHoursRow widget
         self._collapsed = {bot: False for bot in BOT_ORDER}
+        self._pending_update_data = None
         # Visibility aus Config laden
         ui_cfg = self.config.get("UI", {})
         self._visible = {bot: (bot in ui_cfg.get("VISIBLE_BOTS", list(BOT_ORDER)))
@@ -1668,12 +1669,30 @@ class ObsidianApp(ctk.CTk):
                       text_color=COLORS["text_muted"]
                       ).pack(side="left", padx=(14, 0))
 
-        # Rechte Seite: Version Info
-        ctk.CTkLabel(bar,
+        # Rechte Seite: Update-CTA + Version Info
+        right = ctk.CTkFrame(bar, fg_color="transparent")
+        right.pack(side="right", padx=22, pady=6)
+
+        self.update_button = ctk.CTkButton(
+            right,
+            text="Update",
+            width=82,
+            height=26,
+            corner_radius=6,
+            border_width=2,
+            border_color="#fbbf24",
+            fg_color="#2b2110",
+            hover_color="#3a2a10",
+            text_color="#fbbf24",
+            font=ctk.CTkFont(FONT_BODY, 10, "bold"),
+            command=self._show_pending_update_prompt,
+        )
+
+        ctk.CTkLabel(right,
                       text="v5.0  Trend  Spot  Futures  Cross  Future Trend  Local-AI  SIM/LIVE",
                       font=ctk.CTkFont(FONT_BODY, 10, "bold"),
                       text_color=COLORS["text_subtle"]
-                      ).pack(side="right", padx=22)
+                      ).pack(side="right")
 
     def _update_statusbar_state(self):
         """
@@ -1713,6 +1732,20 @@ class ObsidianApp(ctk.CTk):
 
                 bot_names = ", ".join(running)
                 self.status_text.set(f"{len(running)} bot(s) running: {bot_names}")
+            if getattr(self, "_pending_update_data", None):
+                self._set_update_cta_visible(True)
+        except Exception:
+            pass
+
+    def _set_update_cta_visible(self, visible: bool) -> None:
+        try:
+            if not hasattr(self, "update_button"):
+                return
+            packed = bool(self.update_button.winfo_manager())
+            if visible and not packed:
+                self.update_button.pack(side="left", padx=(0, 12))
+            elif not visible and packed:
+                self.update_button.pack_forget()
         except Exception:
             pass
 
@@ -2104,6 +2137,10 @@ class ObsidianApp(ctk.CTk):
                             pass
                 return
             if not data.get("update_available"):
+                self._pending_update_data = None
+                self._set_update_cta_visible(False)
+                if last_update.get("status") == "failed":
+                    self.status_text.set(f"Letztes Update fehlgeschlagen: {last_update.get('message', '')}")
                 return
             remote = str(data.get("remote") or "")[:8]
             failed_note = ""
@@ -2118,10 +2155,35 @@ class ObsidianApp(ctk.CTk):
                 msg = (f"Update verfuegbar ({remote}). Der Launcher wird geschlossen, "
                        "das Update installiert und danach automatisch neu gestartet."
                        + failed_note)
+            self._pending_update_data = data
+            self._set_update_cta_visible(True)
             self.status_text.set(msg)
             if getattr(self, "_update_notice_shown", False):
                 return
             self._update_notice_shown = True
+            self._show_pending_update_prompt()
+        except Exception:
+            pass
+
+    def _show_pending_update_prompt(self) -> None:
+        try:
+            data = getattr(self, "_pending_update_data", None)
+            if not data:
+                return
+            remote = str(data.get("remote") or "")[:8]
+            last_update = data.get("last_update") if isinstance(data.get("last_update"), dict) else {}
+            failed_note = ""
+            if last_update.get("status") == "failed":
+                failed_note = f"\n\nLetzter Update-Versuch: {last_update.get('message', '')}"
+            if data.get("bootstrap_required"):
+                msg = ("Einmalige Update-Einrichtung ist verfuegbar. "
+                       "Der Launcher wird geschlossen, der private Git-Stand "
+                       "initialisiert und danach automatisch neu gestartet."
+                       + failed_note)
+            else:
+                msg = (f"Update verfuegbar ({remote}). Der Launcher wird geschlossen, "
+                       "das Update installiert und danach automatisch neu gestartet."
+                       + failed_note)
             try:
                 from tkinter import messagebox
                 if messagebox.askyesno("Obsidian Update", msg + "\n\nJetzt installieren?"):
@@ -2144,8 +2206,10 @@ class ObsidianApp(ctk.CTk):
                 messagebox.showwarning(
                     "Obsidian Update",
                     "Update nicht gestartet. Stoppe zuerst alle laufenden Bots: "
-                    + ", ".join(running),
+                    + ", ".join(running)
+                    + "\n\nDanach kannst du das Update ueber den gelben Update-Button starten.",
                 )
+                self._set_update_cta_visible(True)
                 return
             runner = os.path.join(PROJECT_ROOT, "tools", "update_launcher.py")
             if not os.path.exists(runner):
@@ -2159,6 +2223,7 @@ class ObsidianApp(ctk.CTk):
                 cwd=PROJECT_ROOT,
                 **subprocess_no_window_kwargs(),
             )
+            self._set_update_cta_visible(False)
             self.status_text.set("Update startet, Launcher wird geschlossen ...")
             self.after(250, self._shutdown_clean)
         except Exception as exc:

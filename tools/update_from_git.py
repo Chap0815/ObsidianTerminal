@@ -24,6 +24,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -57,6 +58,7 @@ COMMON_GIT_PATHS = [
     Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "cmd" / "git.exe",
     Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Git" / "cmd" / "git.exe",
 ]
+BLOCKED_TRACKED_PREFIXES = ("data/", "logs/", "backups/")
 
 
 def _print(msg: str) -> None:
@@ -182,12 +184,7 @@ def _load_update_config() -> tuple[str, str]:
             "Kein privates Update-Repo konfiguriert. Lege config/update_config.json "
             "aus config/update_config.example.json an oder setze OBSIDIAN_UPDATE_REPO_URL."
         )
-    allowed = (
-        "github.com:Chap0815/ObsidianTerminal.git",
-        "github-obsidian:Chap0815/ObsidianTerminal.git",
-        "ssh.github.com:443/Chap0815/ObsidianTerminal.git",
-    )
-    if not any(token in repo for token in allowed):
+    if not _is_allowed_repo_url(repo):
         raise RuntimeError(
             "Update-Repo nicht erlaubt. Erwartet wird das private ObsidianTerminal-Repo "
             "ueber einen read-only Deploy Key."
@@ -203,6 +200,25 @@ def _load_update_config() -> tuple[str, str]:
             "Nutze SSH Deploy Key, z.B. ssh://git@ssh.github.com:443/Chap0815/ObsidianTerminal.git."
         )
     return repo, branch or "main"
+
+
+def _is_allowed_repo_url(repo: str) -> bool:
+    text = repo.strip()
+    if text in {
+        "git@github.com:Chap0815/ObsidianTerminal.git",
+        "github-obsidian:Chap0815/ObsidianTerminal.git",
+    }:
+        return True
+    if text.startswith("ssh://"):
+        parsed = urlparse(text)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+        path = parsed.path.strip("/")
+        if host == "ssh.github.com" and port == 443 and path == "Chap0815/ObsidianTerminal.git":
+            return True
+        if host == "github.com" and path == "Chap0815/ObsidianTerminal.git":
+            return True
+    return False
 
 
 def _pid_alive(pid: int) -> bool:
@@ -388,6 +404,18 @@ def _tracked_files(cwd: Path) -> list[str]:
     return [line.strip() for line in r.stdout.splitlines() if line.strip()]
 
 
+def _verify_no_tracked_runtime_files(cwd: Path) -> None:
+    bad = [
+        rel for rel in _tracked_files(cwd)
+        if rel.replace("\\", "/").startswith(BLOCKED_TRACKED_PREFIXES)
+    ]
+    if bad:
+        raise RuntimeError(
+            "Update-Repo enthaelt Runtime-Dateien, Update abgebrochen: "
+            + ", ".join(bad[:20])
+        )
+
+
 def _tracked_protected_files() -> list[str]:
     r = _run([_git(), "ls-files", "--", *PROTECTED_FILES], check=False)
     if r.returncode != 0:
@@ -474,8 +502,18 @@ def _update_existing_repo(repo_url: str, branch: str) -> None:
     _write_update_marker("existing")
     try:
         _run([git, "fetch", "origin", branch], timeout=300)
+        if _run([git, "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD"], check=False).returncode == 0:
+            _restore_user_files(backup)
+            _verify_protected_files(protected_hashes)
+            _print("Lokaler Stand ist neuer oder identisch zum Remote; kein Downgrade ausgefuehrt.")
+            return
+        if _run([git, "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"], check=False).returncode != 0:
+            raise RuntimeError(
+                "Lokaler Stand und Remote sind divergiert. Update abgebrochen, um keinen lokalen Fix zu verlieren."
+            )
         _run([git, "checkout", "-B", branch, "FETCH_HEAD"])
         _run([git, "reset", "--hard", "FETCH_HEAD"])
+        _verify_no_tracked_runtime_files(ROOT)
         _restore_user_files(backup)
         _verify_protected_files(protected_hashes)
         _install_dependencies_if_present()
@@ -508,10 +546,11 @@ def _bootstrap_from_private_repo(repo_url: str, branch: str) -> None:
     with tempfile.TemporaryDirectory(prefix="obsidian_update_") as tmp:
         clone_dir = Path(tmp) / "repo"
         snapshot_dir = Path(tmp) / "rollback"
-        _run([git, "clone", "--branch", branch, "--depth", "1", repo_url, str(clone_dir)], cwd=ROOT, timeout=300)
-        _snapshot_current_app(snapshot_dir)
-        _write_update_marker("bootstrap")
         try:
+            _run([git, "clone", "--branch", branch, "--depth", "1", repo_url, str(clone_dir)], cwd=ROOT, timeout=300)
+            _verify_no_tracked_runtime_files(clone_dir)
+            _snapshot_current_app(snapshot_dir)
+            _write_update_marker("bootstrap")
             _clean_nonprotected_code()
             _copy_tracked_tree(clone_dir)
             _restore_user_files(backup)
@@ -550,14 +589,14 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(
                 "Ein vorheriges Update wurde nicht sauber beendet (.update_in_progress vorhanden). "
                 "Pruefe den Installationsordner oder installiere die aktuelle Version erneut. "
-                "Nur wenn der Zustand bewusst akzeptiert ist: update.bat mit --force starten."
+                "Nur fuer Support/Debugging den Updater manuell mit --force starten."
             )
         running = _running_bots()
         launchers = _running_launchers()
         if launchers and not args.force:
             raise RuntimeError(
                 "Update abgebrochen: Launcher ist noch geoeffnet. "
-                "Schliesse den Launcher und starte update.bat erneut:\n  "
+                "Schliesse alle Launcher-Fenster und starte das Update danach wieder ueber den Launcher:\n  "
                 + "\n  ".join(launchers)
             )
         if running and not args.force:
