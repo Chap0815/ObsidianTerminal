@@ -26,10 +26,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from tools.ensure_git import find_git
-
-
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from tools.ensure_git import find_git
+except ModuleNotFoundError:
+    from ensure_git import find_git
+
 CONFIG_PATH = ROOT / "config" / "update_config.json"
 CONFIG_EXAMPLE_PATH = ROOT / "config" / "update_config.example.json"
 BACKUP_ROOT = ROOT / "backups"
@@ -53,6 +58,7 @@ UPDATE_STATUS_PATH = ROOT / "logs" / "update_status.json"
 SMOKE_FILES = [
     "launcher/config/settings.py",
     "launcher/ui/app.py",
+    "tools/ensure_git.py",
     "tools/update_check.py",
     "tools/update_from_git.py",
 ]
