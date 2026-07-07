@@ -2082,6 +2082,7 @@ class ObsidianApp(ctk.CTk):
 
     def _apply_update_check_result(self, data: dict) -> None:
         try:
+            last_update = data.get("last_update") if isinstance(data.get("last_update"), dict) else {}
             if not data.get("ok"):
                 reason = str(data.get("reason") or "")
                 if reason == "git_missing":
@@ -2105,20 +2106,67 @@ class ObsidianApp(ctk.CTk):
             if not data.get("update_available"):
                 return
             remote = str(data.get("remote") or "")[:8]
+            failed_note = ""
+            if last_update.get("status") == "failed":
+                failed_note = f"\n\nLetzter Update-Versuch: {last_update.get('message', '')}"
             if data.get("bootstrap_required"):
-                msg = ("Update-Zugriff ist eingerichtet. Fuehre vor dem ersten "
-                       "Update update.bat aus, damit der private Git-Stand "
-                       "initialisiert wird.")
+                msg = ("Einmalige Update-Einrichtung ist verfuegbar. "
+                       "Der Launcher wird geschlossen, der private Git-Stand "
+                       "initialisiert und danach automatisch neu gestartet."
+                       + failed_note)
             else:
-                msg = f"Update verfuegbar ({remote}). Stoppe Bots und starte update.bat."
+                msg = (f"Update verfuegbar ({remote}). Der Launcher wird geschlossen, "
+                       "das Update installiert und danach automatisch neu gestartet."
+                       + failed_note)
             self.status_text.set(msg)
+            if getattr(self, "_update_notice_shown", False):
+                return
+            self._update_notice_shown = True
             try:
                 from tkinter import messagebox
-                messagebox.showinfo("Obsidian Update", msg)
+                if messagebox.askyesno("Obsidian Update", msg + "\n\nJetzt installieren?"):
+                    self._start_external_update_and_exit()
             except Exception:
                 pass
         except Exception:
             pass
+
+    def _start_external_update_and_exit(self) -> None:
+        """Start the out-of-process updater and close the GUI.
+
+        The updater waits for this process to disappear before touching files,
+        so the user does not have to run update.bat manually.
+        """
+        try:
+            running = [name for name, bot in self.bots.items() if bot.is_running()]
+            if running:
+                from tkinter import messagebox
+                messagebox.showwarning(
+                    "Obsidian Update",
+                    "Update nicht gestartet. Stoppe zuerst alle laufenden Bots: "
+                    + ", ".join(running),
+                )
+                return
+            runner = os.path.join(PROJECT_ROOT, "tools", "update_launcher.py")
+            if not os.path.exists(runner):
+                from tkinter import messagebox
+                messagebox.showerror("Obsidian Update", "Update-Runner fehlt: tools/update_launcher.py")
+                return
+            pyw = _get_pythonw_exe()
+            exe = pyw if pyw and os.path.exists(str(pyw)) else _get_python_exe()
+            subprocess.Popen(
+                [exe, runner, "--parent-pid", str(os.getpid()), "--restart"],
+                cwd=PROJECT_ROOT,
+                **subprocess_no_window_kwargs(),
+            )
+            self.status_text.set("Update startet, Launcher wird geschlossen ...")
+            self.after(250, self._shutdown_clean)
+        except Exception as exc:
+            try:
+                from tkinter import messagebox
+                messagebox.showerror("Obsidian Update", f"Update konnte nicht gestartet werden:\n{exc}")
+            except Exception:
+                pass
 
     def _clear_card_log(self, name):
         card = self.cards[name]

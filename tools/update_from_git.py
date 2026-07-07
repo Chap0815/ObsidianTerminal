@@ -45,11 +45,17 @@ CODE_DIRS = {
 }
 LIVE_STATUSES = {"starting", "started", "ready", "running"}
 UPDATE_MARKER = ROOT / ".update_in_progress"
+UPDATE_SYNC_PATH = ROOT / ".update_synced.json"
+UPDATE_STATUS_PATH = ROOT / "logs" / "update_status.json"
 SMOKE_FILES = [
     "launcher/config/settings.py",
     "launcher/ui/app.py",
     "tools/update_check.py",
     "tools/update_from_git.py",
+]
+COMMON_GIT_PATHS = [
+    Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "cmd" / "git.exe",
+    Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Git" / "cmd" / "git.exe",
 ]
 
 
@@ -70,6 +76,39 @@ def _atomic_write_text(path: Path, text: str) -> None:
             pass
 
 
+def _write_update_status(status: str, message: str = "", *, returncode: int | None = None) -> None:
+    payload: dict[str, Any] = {
+        "status": status,
+        "message": message[:1200],
+    }
+    if status == "running":
+        payload["started_at"] = datetime.now().isoformat(timespec="seconds")
+    else:
+        payload["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    if returncode is not None:
+        payload["returncode"] = returncode
+    try:
+        _atomic_write_text(UPDATE_STATUS_PATH, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    except Exception:
+        pass
+
+
+def _write_sync_marker(repo_url: str, branch: str) -> None:
+    try:
+        git = _git()
+        local = _run([git, "rev-parse", "HEAD"], check=False)
+        commit = (local.stdout or "").strip() if local.returncode == 0 else ""
+        payload = {
+            "repo": repo_url,
+            "branch": branch,
+            "commit": commit,
+            "synced_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        _atomic_write_text(UPDATE_SYNC_PATH, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    except Exception:
+        pass
+
+
 def _rmtree(path: Path) -> None:
     def _make_writable(func, target, exc_info):
         try:
@@ -85,17 +124,23 @@ def _rmtree(path: Path) -> None:
 
 def _ssh_command() -> str:
     key = Path.home() / ".ssh" / "obsidian_update_ed25519"
-    base = "ssh -o StrictHostKeyChecking=accept-new"
+    base = "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
     if key.exists():
         base += f' -i "{key}" -o IdentitiesOnly=yes'
     return base
 
 
-def _run(cmd: list[str], *, cwd: Path = ROOT, check: bool = True) -> subprocess.CompletedProcess:
+def _run(
+    cmd: list[str],
+    *,
+    cwd: Path = ROOT,
+    check: bool = True,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess:
     env = os.environ.copy()
-    env["GIT_TERMINAL_PROMPT"] = env.get("GIT_TERMINAL_PROMPT", "1")
+    env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_SSH_COMMAND"] = env.get("GIT_SSH_COMMAND") or _ssh_command()
-    r = subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True, env=env)
+    r = subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True, env=env, timeout=timeout)
     if check and r.returncode != 0:
         out = (r.stdout or "").strip()
         err = (r.stderr or "").strip()
@@ -109,9 +154,12 @@ def _run(cmd: list[str], *, cwd: Path = ROOT, check: bool = True) -> subprocess.
 
 def _git() -> str:
     exe = shutil.which("git")
-    if not exe:
-        raise RuntimeError("Git wurde nicht gefunden. Bitte Git for Windows installieren.")
-    return exe
+    if exe:
+        return exe
+    for path in COMMON_GIT_PATHS:
+        if path.exists():
+            return str(path)
+    raise RuntimeError("Git wurde nicht gefunden. Bitte Git for Windows installieren.")
 
 
 def _load_update_config() -> tuple[str, str]:
@@ -194,7 +242,7 @@ def _running_launchers() -> list[str]:
     try:
         import psutil  # type: ignore
     except Exception:
-        return []
+        return _running_launchers_via_cim()
     current = os.getpid()
     out: list[str] = []
     for proc in psutil.process_iter(["pid", "cmdline"]):
@@ -209,6 +257,33 @@ def _running_launchers() -> list[str]:
         if "launcher.pyw" in low and str(ROOT).lower() in low:
             out.append(f"launcher pid {pid}")
     return out
+
+
+def _running_launchers_via_cim() -> list[str]:
+    root = str(ROOT).lower().replace("'", "''")
+    script = (
+        f"$root='{root}'; "
+        f"$current={os.getpid()}; "
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.ProcessId -ne $current -and $_.CommandLine -and "
+        "$_.CommandLine.ToLower().Contains('launcher.pyw') -and "
+        "$_.CommandLine.ToLower().Contains($root) } | "
+        "ForEach-Object { 'launcher pid ' + $_.ProcessId }"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    return [line.strip() for line in (r.stdout or "").splitlines() if line.strip()]
 
 
 def _copy_file(src: Path, dst: Path) -> None:
@@ -280,12 +355,14 @@ def _install_dependencies_if_present() -> None:
         [sys.executable, "-m", "pip", "install", "-r", str(req)],
         cwd=str(ROOT),
         text=True,
+        timeout=900,
     )
     if r.returncode != 0:
         raise RuntimeError("Dependency-Update fehlgeschlagen. Update wurde nicht vollstaendig abgeschlossen.")
 
 
 def _write_update_marker(kind: str) -> None:
+    _write_update_status("running", f"Update laeuft ({kind})")
     _atomic_write_text(
         UPDATE_MARKER,
         json.dumps({"kind": kind, "started_at": datetime.now().isoformat(timespec="seconds")}) + "\n",
@@ -396,9 +473,9 @@ def _update_existing_repo(repo_url: str, branch: str) -> None:
     protected_hashes = _stash_protected_files(backup)
     _write_update_marker("existing")
     try:
-        _run([git, "fetch", "origin", branch])
-        _run([git, "checkout", branch])
-        _run([git, "pull", "--ff-only", "origin", branch])
+        _run([git, "fetch", "origin", branch], timeout=300)
+        _run([git, "checkout", "-B", branch, "FETCH_HEAD"])
+        _run([git, "reset", "--hard", "FETCH_HEAD"])
         _restore_user_files(backup)
         _verify_protected_files(protected_hashes)
         _install_dependencies_if_present()
@@ -431,7 +508,7 @@ def _bootstrap_from_private_repo(repo_url: str, branch: str) -> None:
     with tempfile.TemporaryDirectory(prefix="obsidian_update_") as tmp:
         clone_dir = Path(tmp) / "repo"
         snapshot_dir = Path(tmp) / "rollback"
-        _run([git, "clone", "--branch", branch, "--depth", "1", repo_url, str(clone_dir)], cwd=ROOT)
+        _run([git, "clone", "--branch", branch, "--depth", "1", repo_url, str(clone_dir)], cwd=ROOT, timeout=300)
         _snapshot_current_app(snapshot_dir)
         _write_update_marker("bootstrap")
         try:
@@ -496,8 +573,11 @@ def main(argv: list[str] | None = None) -> int:
             _update_existing_repo(repo_url, branch)
         else:
             _bootstrap_from_private_repo(repo_url, branch)
+        _write_sync_marker(repo_url, branch)
+        _write_update_status("success", "Update abgeschlossen", returncode=0)
         return 0
     except Exception as exc:
+        _write_update_status("failed", str(exc), returncode=1)
         print(f"FEHLER: {exc}", file=sys.stderr)
         return 1
 

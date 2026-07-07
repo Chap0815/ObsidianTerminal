@@ -575,10 +575,12 @@ PARAM_DEFS_FUTREND = [
 def _get_python_exe() -> str:
     """Path to the python executable used to launch bot subprocesses.
 
-    Prefers an embedded ``python/python.exe`` next to the project root (for
-    portable / self-contained installs), falls back to whatever
-    ``sys.executable`` is.
+    Keep the same interpreter order as the launcher start scripts: install
+    venv first, then portable python, then the current interpreter.
     """
+    venv_python = os.path.join(PROJECT_ROOT, ".venv", "Scripts", "python.exe")
+    if os.path.exists(venv_python):
+        return venv_python
     local_python = os.path.join(PROJECT_ROOT, "python", "python.exe")
     if os.path.exists(local_python):
         return local_python
@@ -587,6 +589,9 @@ def _get_python_exe() -> str:
 
 def _get_pythonw_exe() -> str:
     """Windowless variant of :func:`_get_python_exe` for GUI subprocesses."""
+    venv = os.path.join(PROJECT_ROOT, ".venv", "Scripts", "pythonw.exe")
+    if os.path.exists(venv):
+        return venv
     local = os.path.join(PROJECT_ROOT, "python", "pythonw.exe")
     if os.path.exists(local):
         return local

@@ -11,9 +11,14 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+UPDATE_STATUS_PATH = ROOT / "logs" / "update_status.json"
 CONFIG_PATHS = [
     ROOT / "config" / "update_config.json",
     ROOT / "config" / "update_config.example.json",
+]
+COMMON_GIT_PATHS = [
+    Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "cmd" / "git.exe",
+    Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Git" / "cmd" / "git.exe",
 ]
 
 
@@ -36,10 +41,20 @@ def _repo_config() -> tuple[str, str]:
     return "", "main"
 
 
+def _find_git() -> str:
+    git = shutil.which("git")
+    if git:
+        return git
+    for path in COMMON_GIT_PATHS:
+        if path.exists():
+            return str(path)
+    return ""
+
+
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     key = Path.home() / ".ssh" / "obsidian_update_ed25519"
-    ssh_cmd = "ssh -o StrictHostKeyChecking=accept-new"
+    ssh_cmd = "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
     if key.exists():
         ssh_cmd += f' -i "{key}" -o IdentitiesOnly=yes'
     env["GIT_SSH_COMMAND"] = env.get("GIT_SSH_COMMAND") or ssh_cmd
@@ -49,13 +64,33 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     )
 
 
+def _last_update_status() -> dict:
+    if not UPDATE_STATUS_PATH.exists():
+        return {}
+    data = _read_json(UPDATE_STATUS_PATH)
+    if not isinstance(data, dict):
+        return {}
+    allowed = {"status", "message", "started_at", "finished_at", "returncode"}
+    return {k: data.get(k) for k in allowed if k in data}
+
+
 def check_update() -> dict:
-    git = shutil.which("git")
+    git = _find_git()
     if not git:
-        return {"ok": False, "reason": "git_missing", "message": "Git nicht gefunden"}
+        return {
+            "ok": False,
+            "reason": "git_missing",
+            "message": "Git nicht gefunden",
+            "last_update": _last_update_status(),
+        }
     repo, branch = _repo_config()
     if not repo:
-        return {"ok": False, "reason": "repo_missing", "message": "Update-Repo nicht konfiguriert"}
+        return {
+            "ok": False,
+            "reason": "repo_missing",
+            "message": "Update-Repo nicht konfiguriert",
+            "last_update": _last_update_status(),
+        }
 
     remote = _run([git, "ls-remote", repo, f"refs/heads/{branch}"])
     if remote.returncode != 0:
@@ -63,10 +98,16 @@ def check_update() -> dict:
             "ok": False,
             "reason": "remote_unreachable",
             "message": (remote.stderr or remote.stdout or "Remote nicht erreichbar").strip()[:300],
+            "last_update": _last_update_status(),
         }
     remote_hash = (remote.stdout.split() or [""])[0]
     if not remote_hash:
-        return {"ok": False, "reason": "branch_missing", "message": f"Branch {branch} nicht gefunden"}
+        return {
+            "ok": False,
+            "reason": "branch_missing",
+            "message": f"Branch {branch} nicht gefunden",
+            "last_update": _last_update_status(),
+        }
 
     local_hash = ""
     if (ROOT / ".git").exists():
@@ -82,6 +123,7 @@ def check_update() -> dict:
         "local": local_hash,
         "update_available": (not local_hash) or local_hash != remote_hash,
         "bootstrap_required": not bool(local_hash),
+        "last_update": _last_update_status(),
     }
 
 
