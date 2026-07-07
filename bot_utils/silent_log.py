@@ -111,6 +111,8 @@ def _silent_log_path() -> Optional[str]:
 def _persist(msg: str) -> None:
     """Append a timestamped notice to the persistent log. Never raises."""
     try:
+        if os.getenv("TRADINGBOT_DISABLE_SILENT_LOG_PERSIST"):
+            return
         path = _silent_log_path()
         if not path:
             return

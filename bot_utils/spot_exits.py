@@ -143,13 +143,54 @@ def _apply_state_updates(state, sym: str, updates: dict) -> None:
             state.update(sym, key, value)
 
 
+def _remove_accounted_state(state, sym: str, restore_fields: dict) -> bool:
+    try:
+        from bot_utils.trade_state import remove_with_restore_fields
+        ok = bool(remove_with_restore_fields(state, sym, restore_fields))
+    except Exception:
+        if not hasattr(state, "remove"):
+            raise
+        try:
+            result = state.remove(sym, restore_fields)
+        except TypeError:
+            result = state.remove(sym)
+        ok = True if result is None else bool(result)
+    if not ok:
+        try:
+            _apply_state_updates(state, sym, restore_fields)
+        except Exception:
+            pass
+    return ok
+
+
+def _order_has_open_remainder(order) -> bool:
+    if not isinstance(order, dict):
+        return False
+    status = str(order.get("status") or "").strip().lower()
+    if status in ("closed", "canceled", "cancelled", "expired", "rejected"):
+        return False
+    if status in ("open", "new", "partially_filled", "partiallyfilled"):
+        return True
+    if status:
+        return False
+    try:
+        return float(order.get("remaining") or 0.0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _emergency_residual_amount(ex, symbol_pair: str, requested_amount: float,
-                               sold_amount: float, fill_price: float) -> float:
+                               sold_amount: float, fill_price: float,
+                               order=None) -> float:
     requested = max(0.0, float(requested_amount or 0.0))
     sold = max(0.0, float(sold_amount or 0.0))
     by_fill = max(0.0, requested - sold)
     if by_fill <= 0 or fill_price <= 0:
         return 0.0
+    if _order_has_open_remainder(order):
+        if by_fill * fill_price <= _EMERGENCY_RESIDUAL_DUST_USDT:
+            return 0.0
+        return min(by_fill, requested)
     try:
         free = _free_base_balance(ex, symbol_pair)
     except Exception:
@@ -326,9 +367,15 @@ def emergency_close_all_spot(*,
         from contextlib import ExitStack
         with ExitStack() as stack:
             if close_lock_factory:
-                lock_ctx = close_lock_factory(sym, timeout=2.0, bot_name=bot_name)
+                try:
+                    lock_ctx = close_lock_factory(
+                        sym, timeout=2.0, bot_name=bot_name, fail_open=True)
+                except TypeError:
+                    lock_ctx = close_lock_factory(
+                        sym, timeout=2.0, bot_name=bot_name)
                 got = stack.enter_context(lock_ctx)
                 if not got:
+                    failed.append(f"{sym}: close lock not acquired")
                     log_event(
                         f"Emergency: could not acquire lock for {sym} in 2s "
                         f"(main loop may already be closing it)", "WARN"
@@ -373,6 +420,7 @@ def emergency_close_all_spot(*,
                 close_fee = 0.0
                 fill_price = curr
                 exch_oid = None
+                order = None
                 if simulation and amount > 0 and fill_price > 0:
                     close_fee = sold_amount * fill_price * 0.001
                     profit_usdt = round(
@@ -412,7 +460,8 @@ def emergency_close_all_spot(*,
                         # order object that never executed (status new/open,
                         # filled=0, e.g. remaining size below min-notional);
                         # booking it as sold would write a phantom closed trade.
-                        if not order_was_filled(order, _sold):
+                        if not order_was_filled(order, _sold,
+                                                min_fill_ratio=1e-9):
                             failed.append(f"{sym}: order not filled "
                                           f"(status={order.get('status') if isinstance(order, dict) else '?'})")
                             log_event(
@@ -457,7 +506,9 @@ def emergency_close_all_spot(*,
                 fees_for_booked_slice = proportional_entry_fee + close_fee
                 try:
                     accounting_ok = bool(save_trade_db(
-                        bot_name=bot_name, symbol=sym,
+                        bot_name=bot_name,
+                        mode_is_sim=simulation,
+                        symbol=sym,
                         buy_price=buy_price, sell_price=fill_price,
                         buy_time=buy_time, sell_time=sell_time,
                         profit_pct=profit_pct, profit_usdt=profit_usdt,
@@ -487,7 +538,7 @@ def emergency_close_all_spot(*,
                         residual_amount = (
                             _emergency_residual_amount(
                                 ex, symbol_pair, amount, sold_amount,
-                                fill_price)
+                                fill_price, order=order)
                             if not simulation and amount > 0 else 0.0
                         )
                         if residual_amount > 0:
@@ -546,7 +597,8 @@ def emergency_close_all_spot(*,
                 # meaningful remainder in state with its original cost basis.
                 if not simulation and amount > 0:
                     residual_amount = _emergency_residual_amount(
-                        ex, symbol_pair, amount, sold_amount, fill_price)
+                        ex, symbol_pair, amount, sold_amount, fill_price,
+                        order=order)
                     if residual_amount > 0:
                         updates = _emergency_residual_updates(
                             amount, residual_amount, margin,
@@ -571,7 +623,20 @@ def emergency_close_all_spot(*,
                         total_pnl += profit_usdt
                         continue
 
-                state.remove(sym)
+                removed = _remove_accounted_state(state, sym, {
+                    "accounting_already_booked": True,
+                    "accounting_booked_sell_time": sell_time,
+                    "accounting_booked_exchange_order_id": exch_oid,
+                    "accounting_booked_reason": f"Emergency Close ({reason})",
+                })
+                if not removed:
+                    failed.append(f"{sym}: cleanup failed after booked close")
+                    log_event(
+                        f"  {sym}: close already booked, but claim/state "
+                        f"cleanup failed; state kept for retry",
+                        "WARN")
+                    total_pnl += profit_usdt
+                    continue
                 closed_count += 1
                 total_pnl += profit_usdt
 

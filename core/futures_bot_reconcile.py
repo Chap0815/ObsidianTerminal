@@ -14,6 +14,338 @@ import time
 from core.clock import now_utc
 
 
+def _is_reduce_only_trade(t: dict) -> bool:
+    info = t.get("info", {}) or {}
+    raw_reduce_only = (
+        info.get("reduceOnly")
+        if "reduceOnly" in info else info.get("reduce_only")
+    )
+    return raw_reduce_only is True or (
+        isinstance(raw_reduce_only, str)
+        and raw_reduce_only.strip().lower() in ("1", "true", "yes")
+    )
+
+
+def _trade_side(t: dict) -> str:
+    info = t.get("info", {}) or {}
+    return str(t.get("side") or info.get("side") or "").strip().lower()
+
+
+def _is_close_trade_for_position(t: dict, pos_type: str | None) -> bool:
+    if _is_reduce_only_trade(t):
+        return True
+    side = _trade_side(t)
+    ptype = str(pos_type or "").upper()
+    if ptype == "LONG":
+        return side in {"sell", "short"}
+    if ptype == "SHORT":
+        return side in {"buy", "long"}
+    return False
+
+
+def _trade_amount(t: dict) -> float:
+    try:
+        return abs(float(t.get("amount", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _trade_fee_usdt(t: dict) -> float:
+    fee = t.get("fee") or {}
+    try:
+        cost = abs(float(fee.get("cost", 0) or 0))
+    except (TypeError, ValueError, AttributeError):
+        cost = 0.0
+    currency = str(fee.get("currency", "") if isinstance(fee, dict) else "").upper()
+    return cost if currency in {"USDT", "USD"} else 0.0
+
+
+def _aggregate_futures_reduce_trades(bot, symbol_full: str,
+                                     target_contracts: float,
+                                     pos_type: str | None = None) -> tuple[float, float, str]:
+    try:
+        target = max(0.0, float(target_contracts or 0.0))
+    except (TypeError, ValueError):
+        target = 0.0
+    if target <= 0 or not hasattr(bot.ex, "fetch_my_trades"):
+        return 0.0, 0.0, "unavailable"
+    try:
+        trades = bot.ex.fetch_my_trades(symbol_full, limit=50) or []
+    except Exception:
+        return 0.0, 0.0, "unavailable"
+    qty = 0.0
+    notional = 0.0
+    fee_usdt = 0.0
+    used_side_fallback = False
+    for t in reversed(trades):
+        is_reduce = _is_reduce_only_trade(t)
+        if not is_reduce and not _is_close_trade_for_position(t, pos_type):
+            continue
+        used_side_fallback = used_side_fallback or not is_reduce
+        amt = _trade_amount(t)
+        price = float(t.get("price", 0) or 0)
+        if amt <= 0 or price <= 0:
+            continue
+        take = min(amt, max(0.0, target - qty))
+        if take <= 0:
+            break
+        qty += take
+        notional += take * price
+        fee_usdt += _trade_fee_usdt(t) * (take / amt)
+        if qty + 1e-12 >= target:
+            break
+    if qty + 1e-12 < target or qty <= 0:
+        return 0.0, 0.0, "unavailable"
+    source = "fetch_my_trades_side_vwap" if used_side_fallback else "fetch_my_trades_vwap"
+    return notional / qty, fee_usdt, source
+
+
+def _find_futures_external_close_price(bot, symbol_full: str,
+                                       contracts: float = 0.0,
+                                       allow_ticker: bool = True,
+                                       pos_type: str | None = None) -> tuple[float, float, str]:
+    price, fee, source = _aggregate_futures_reduce_trades(
+        bot, symbol_full, contracts, pos_type)
+    if price > 0:
+        return price, fee, source
+    if not allow_ticker:
+        return 0.0, 0.0, "unavailable"
+    try:
+        ticker = bot.ex.fetch_ticker(symbol_full)
+        price = float(ticker.get("last", 0) or 0)
+        if price > 0:
+            return price, 0.0, "current_ticker"
+    except Exception:
+        pass
+    return 0.0, 0.0, "unavailable"
+
+
+def _append_pending_partial(row: dict, item: dict) -> list:
+    pending = list(row.get("accounting_pending_partials") or [])
+    pending.append(dict(item))
+    return pending
+
+
+def _append_unpriced_partial(row: dict, item: dict) -> list:
+    pending = list(row.get("unpriced_external_partials") or [])
+    pending.append(dict(item))
+    return pending
+
+
+def _is_fresh_position(state_row: dict, max_age_s: float) -> bool:
+    bt = state_row.get("buy_time", "")
+    if not bt:
+        return False
+    from datetime import datetime, timezone
+    try:
+        opened = datetime.strptime(str(bt), "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    return (datetime.now(timezone.utc) - opened).total_seconds() < max_age_s
+
+
+def _fetch_futures_contracts(bot, sym: str) -> float | None:
+    """Return confirmed open contracts, or None when the exchange is unclear."""
+    full = f"{sym}/USDT:USDT"
+    try:
+        from config.exchange_config import safe_fetch_positions
+        poss = safe_fetch_positions(bot.ex, [full])
+        scoped_has_symbol = False
+        if poss is not None:
+            try:
+                scoped_has_symbol = any((p.get("symbol") or "") == full for p in poss)
+            except Exception:
+                scoped_has_symbol = False
+        if poss is None or not scoped_has_symbol:
+            poss = safe_fetch_positions(bot.ex)
+            if poss is None:
+                return None
+    except Exception:
+        return None
+    for p in poss or []:
+        if (p.get("symbol") or "") != full:
+            continue
+        try:
+            return abs(float(p.get("contracts") or p.get("size") or 0))
+        except (TypeError, ValueError):
+            return None
+    return 0.0
+
+
+def _record_futures_external_partial(bot, sym: str, state_row: dict,
+                                     remaining_contracts: float) -> tuple[bool, dict]:
+    """Book a futures position shrink caused outside the bot.
+
+    The state is still shrunk when DB booking fails, but the partial event is
+    stored under ``accounting_pending_partials`` so the monitor retry path can
+    flush realized PnL later without sending another close order.
+    """
+    from core.database import save_trade_db
+    from core.logger import log_event
+    from bot_utils import safe_proportional_fee, safe_funding_scale
+    from bot_utils.futures_order import FUTURES_DEFAULT_TAKER_FEE
+
+    entry = float(state_row.get("buy", 0) or 0)
+    local_amt = abs(float(state_row.get("amount", 0) or 0))
+    remaining_contracts = max(0.0, abs(float(remaining_contracts or 0.0)))
+    sold_contracts = max(0.0, local_amt - remaining_contracts)
+    pos_type = str(state_row.get("position_type") or "LONG").upper()
+    lev = float(state_row.get("leverage", 1) or 1)
+    margin = float(state_row.get("invested_usdt", 0) or 0)
+    if entry <= 0 or local_amt <= 0 or sold_contracts <= 0 or remaining_contracts <= 0:
+        return False, {}
+
+    symbol_full = f"{sym}/USDT:USDT"
+    try:
+        contract_size = bot._get_contract_size(symbol_full)
+    except Exception:
+        contract_size = 1.0
+    ratio_sold = min(1.0, sold_contracts / local_amt)
+    margin_sold = round(margin * ratio_sold, 8)
+    margin_remaining = max(0.0, margin - margin_sold)
+    close_price, close_fee_actual, source = _find_futures_external_close_price(
+        bot, symbol_full, sold_contracts, allow_ticker=False,
+        pos_type=pos_type)
+    if close_price <= 0:
+        fields = {
+            "amount": remaining_contracts,
+            "invested_usdt": margin_remaining,
+            "partial_sold": True,
+        }
+        if "original_amount" not in state_row:
+            fields["original_amount"] = local_amt
+        fields["unpriced_external_partials"] = _append_unpriced_partial(
+            state_row,
+            {
+                "symbol": sym,
+                "sold_contracts": sold_contracts,
+                "remaining_contracts": remaining_contracts,
+                "position_type": pos_type,
+                "buy_price": entry,
+                "buy_time": state_row.get("buy_time", ""),
+                "invested_usdt": margin_sold,
+                "leverage": lev,
+                "detected_at": now_utc().strftime("%Y-%m-%d %H:%M:%S"),
+                "reason": "External futures partial close (price unavailable)",
+                "is_futures": True,
+                "is_partial": True,
+            },
+        )
+        log_event(
+            f" Reconciliation: {sym} external futures partial detected "
+            f"but close price unavailable; state shrunk without PnL booking",
+            "WARN")
+        return False, fields
+
+    if pos_type == "SHORT":
+        move_pct = ((entry - close_price) / entry) * 100
+    else:
+        move_pct = ((close_price - entry) / entry) * 100
+    gross_pnl = margin_sold * (move_pct * lev) / 100.0
+    original_amount = float(state_row.get("original_amount") or local_amt)
+    entry_fee = safe_proportional_fee(
+        float(state_row.get("initial_entry_fee",
+                            state_row.get("fees_paid", 0)) or 0),
+        sold_contracts, original_amount,
+        partial_sold=bool(state_row.get("partial_sold")),
+    )
+    funding_partial = safe_funding_scale(
+        float(state_row.get("funding_paid", 0) or 0),
+        sold_contracts, original_amount,
+        partial_sold=bool(state_row.get("partial_sold")),
+    )
+    close_fee = (
+        close_fee_actual
+        if close_fee_actual > 0
+        else sold_contracts * contract_size * close_price * FUTURES_DEFAULT_TAKER_FEE
+    )
+    profit_usdt = round(gross_pnl - entry_fee - close_fee - funding_partial, 4)
+    item = {
+        "bot_name": bot.BOT_NAME,
+        "mode_is_sim": getattr(bot, "simulation", None),
+        "symbol": sym,
+        "buy_price": entry,
+        "sell_price": close_price,
+        "buy_time": state_row.get("buy_time", ""),
+        "sell_time": now_utc().strftime("%Y-%m-%d %H:%M:%S"),
+        "profit_pct": move_pct,
+        "profit_usdt": profit_usdt,
+        "invested_usdt": margin_sold,
+        "reason": f"External partial close ({source})",
+        "is_futures": True,
+        "position_type": pos_type,
+        "leverage": lev,
+        "liquidation_price": state_row.get("liquidation_price"),
+        "funding_paid": funding_partial,
+        "fees_usdt": entry_fee + close_fee,
+        "is_partial": True,
+        "exchange_order_id": (
+            f"external-partial:{bot.BOT_NAME}:{sym}:"
+            f"{state_row.get('buy_time', '')}:"
+            f"{local_amt:.12g}->{remaining_contracts:.12g}"
+        ),
+    }
+    saved = bool(save_trade_db(**item))
+    prev_realized = float(state_row.get("partial_profit_realized", 0.0) or 0.0)
+    prev_funding = float(state_row.get("funding_booked_on_partials", 0.0) or 0.0)
+    fields = {
+        "amount": remaining_contracts,
+        "invested_usdt": margin_remaining,
+        "partial_sold": True,
+        "partial_profit_realized": prev_realized + profit_usdt,
+        "funding_booked_on_partials": prev_funding + funding_partial,
+    }
+    if "original_amount" not in state_row:
+        fields["original_amount"] = local_amt
+    if not saved:
+        fields["accounting_pending_partials"] = _append_pending_partial(
+            state_row, item)
+    else:
+        log_event(
+            f" Reconciliation: {sym} external futures partial recorded "
+            f"({sold_contracts:.6f} contracts, PnL={profit_usdt:+.2f} USDT)",
+            "WARN")
+    return saved, fields
+
+
+def _row_with_unpriced_futures_partials(state_row: dict) -> dict:
+    """Rebuild the not-yet-booked slice for a later full offline close.
+
+    Unpriced external partials intentionally do not create fake PnL at drift
+    detection time. If the whole exchange position is later gone, this combines
+    those unbooked partial slices with the remaining state slice so one offline
+    close can book the full not-yet-accounted exposure and then release state.
+    """
+    row = dict(state_row)
+    pending = list(row.get("unpriced_external_partials") or [])
+    if not pending:
+        return row
+    try:
+        amount = abs(float(row.get("amount", 0) or 0))
+    except (TypeError, ValueError):
+        amount = 0.0
+    try:
+        invested = float(row.get("invested_usdt", 0) or 0)
+    except (TypeError, ValueError):
+        invested = 0.0
+    for item in pending:
+        try:
+            amount += abs(float(item.get("sold_contracts", 0) or 0))
+        except (TypeError, ValueError, AttributeError):
+            pass
+        try:
+            invested += float(item.get("invested_usdt", 0) or 0)
+        except (TypeError, ValueError, AttributeError):
+            pass
+    if amount > 0:
+        row["amount"] = amount
+    if invested > 0:
+        row["invested_usdt"] = invested
+    row["unpriced_external_partials"] = []
+    return row
+
+
 class FuturesReconcileMixin:
 
     def _startup_reconciliation(self) -> None:
@@ -93,6 +425,42 @@ class FuturesReconcileMixin:
             for sym in list(local_state.keys()):
                 if sym in exchange_open:
                     strikes.pop(sym, None)
+                    try:
+                        local_row = local_state[sym]
+                        local_amt = abs(float(local_row.get("amount", 0) or 0))
+                        p = exchange_open.get(sym) or {}
+                        exch_amt = abs(float(p.get("contracts") or p.get("size") or 0))
+                        if (local_amt > 0 and exch_amt > 0
+                                and exch_amt < local_amt * 0.95
+                                and not _is_fresh_position(
+                                    local_row, self.RECONCILE_INTERVAL_SEC)):
+                            with close_lock(sym, bot_name=self.BOT_NAME) as got:
+                                if not got or not self.state.has(sym):
+                                    continue
+                                live_row = self.state.get(sym) or local_row
+                                live_amt = abs(float(live_row.get("amount", 0) or 0))
+                                refetched_amt = _fetch_futures_contracts(self, sym)
+                                if refetched_amt is None:
+                                    log_event(
+                                        f" Reconciliation: {sym} partial shrink "
+                                        f"not confirmed  skipping this cycle",
+                                        "WARN")
+                                    continue
+                                if (live_amt <= 0 or refetched_amt <= 0
+                                        or refetched_amt >= live_amt * 0.95
+                                        or _is_fresh_position(
+                                            live_row, self.RECONCILE_INTERVAL_SEC)):
+                                    continue
+                                fields = _record_futures_external_partial(
+                                    self, sym, dict(live_row), refetched_amt)[1]
+                            if fields:
+                                if not self.state.update_many(sym, fields):
+                                    log_event(
+                                        f" Reconciliation: {sym} partial state "
+                                        f"update was not durably persisted",
+                                        "WARN")
+                    except (TypeError, ValueError):
+                        pass
                     continue
                 # Require 2 consecutive cycles absent before booking an offline
                 # close  a transient fetch_positions glitch (a real position
@@ -122,8 +490,36 @@ class FuturesReconcileMixin:
                             f"re-fetch  NOT booking a close (transient "
                             f"snapshot glitch)", "WARN")
                         continue
-                    recorded = self._record_offline_close(
-                        sym, self.state.get(sym) or local_state[sym])
+                    live_row = self.state.get(sym) or local_state[sym]
+                    if bool(live_row.get("accounting_already_booked")):
+                        log_event(
+                            f" Reconciliation: {sym} already has close "
+                            f"accounting booked; removing stale state only",
+                            "WARN",
+                        )
+                        try:
+                            removed_state = self.state.remove(sym)
+                            if removed_state:
+                                remove_futures_state(
+                                    sym, self.BOT_NAME,
+                                    mode_is_sim=getattr(self, "simulation", None))
+                                strikes.pop(sym, None)
+                        except Exception as e:
+                            self._log_error(f"reconcile-remove booked {sym}", e)
+                        continue
+                    if live_row.get("accounting_pending_partials"):
+                        log_event(
+                            f" Reconciliation: {sym} absent on exchange but "
+                            f"partial accounting is pending  state kept "
+                            f"for retry",
+                            "WARN")
+                        continue
+                    close_row = (
+                        _row_with_unpriced_futures_partials(live_row)
+                        if live_row.get("unpriced_external_partials")
+                        else live_row
+                    )
+                    recorded = self._record_offline_close(sym, close_row)
                     if not recorded:
                         log_event(
                             f" Reconciliation: {sym} is absent on exchange "
@@ -139,13 +535,24 @@ class FuturesReconcileMixin:
                         "WARN"
                     )
                     try:
-                        self.state.remove(sym)
-                        # Scope by bot: FUTURES + CROSS share futures_state;
-                        # unscoped would wipe the other bot's dashboard row.
-                        remove_futures_state(sym, self.BOT_NAME)
+                        from bot_utils.trade_state import remove_with_restore_fields
+                        removed_state = remove_with_restore_fields(
+                            self.state,
+                            sym,
+                            {
+                                "accounting_already_booked": True,
+                                "accounting_booked_reason": "Offline reconcile",
+                            },
+                        )
+                        if removed_state:
+                            # Scope by bot: FUTURES + CROSS share futures_state;
+                            # unscoped would wipe the other bot's dashboard row.
+                            remove_futures_state(
+                                sym, self.BOT_NAME,
+                                mode_is_sim=getattr(self, "simulation", None))
+                            strikes.pop(sym, None)
                     except Exception as e:
                         self._log_error(f"reconcile-remove {sym}", e)
-                    strikes.pop(sym, None)
 
             # Exchange-only positions. COEXISTENCE: a coin held by ANOTHER bot
             # (shared claims registry) is NOT our orphan  subtract those.
@@ -238,7 +645,7 @@ class FuturesReconcileMixin:
                 if initial_liq_distance <= 0:
                     initial_liq_distance = max(1.0, 100.0 / max(1.0, lev))
                 try:
-                    self.state.add(base, {
+                    added = self.state.add(base, {
                         "position_type": pos_type, "buy": entry, "highest": entry,
                         "last_price": entry,
                         "buy_time": now_utc().strftime("%Y-%m-%d %H:%M:%S"),
@@ -251,6 +658,8 @@ class FuturesReconcileMixin:
                         "be_active": False, "adopted": True,
                         "margin_mode": mm_mode or self.C("MARGIN_MODE", "isolated"),
                     })
+                    if added is False:
+                        raise RuntimeError("state.add returned False")
                     adopted.append(base)
                 except Exception as _ae:
                     remove_open_position(self.BOT_NAME, base)  # release on failure
@@ -384,6 +793,7 @@ class FuturesReconcileMixin:
 
             # Try to find the actual close price from order history
             close_price = 0.0
+            close_fee_actual = 0.0
             close_source = "estimate"
             pending_accounting = bool(state_row.get("accounting_pending"))
             if pending_accounting:
@@ -394,26 +804,11 @@ class FuturesReconcileMixin:
                         close_source = "accounting_pending"
                 except (TypeError, ValueError):
                     close_price = 0.0
-            try:
-                if close_price <= 0 and hasattr(self.ex, "fetch_my_trades"):
-                    trades = self.ex.fetch_my_trades(symbol_full, limit=20) or []
-                    # Most recent reduceOnly trade = the close
-                    for t in reversed(trades):
-                        info = t.get("info", {}) or {}
-                        raw_reduce_only = (
-                            info.get("reduceOnly")
-                            if "reduceOnly" in info else info.get("reduce_only")
-                        )
-                        reduce_only = raw_reduce_only is True or (
-                            isinstance(raw_reduce_only, str)
-                            and raw_reduce_only.strip().lower() in ("1", "true", "yes")
-                        )
-                        if reduce_only:
-                            close_price = float(t.get("price", 0) or 0)
-                            close_source = "fetch_my_trades"
-                            break
-            except Exception:
-                pass
+            if close_price <= 0:
+                close_price, close_fee_actual, close_source = (
+                    _find_futures_external_close_price(
+                        self, symbol_full, amount, pos_type=pos_type)
+                )
 
             # Fallback: current market price
             if close_price <= 0:
@@ -455,7 +850,11 @@ class FuturesReconcileMixin:
                 _cs = self._get_contract_size(symbol_full)
             except Exception:
                 _cs = 1.0
-            close_fee = amount * _cs * close_price * FUTURES_DEFAULT_TAKER_FEE
+            close_fee = (
+                close_fee_actual
+                if close_fee_actual > 0
+                else amount * _cs * close_price * FUTURES_DEFAULT_TAKER_FEE
+            )
             entry_fee = safe_proportional_fee(
                 initial_entry_fee, amount, original_amount,
                 partial_sold=partial_sold,
@@ -507,7 +906,11 @@ class FuturesReconcileMixin:
                     else "LIQUIDATED (offline)"))
 
             saved = save_trade_db(
-                bot_name=self.BOT_NAME, symbol=sym,
+                bot_name=self.BOT_NAME,
+                mode_is_sim=state_row.get(
+                    "accounting_pending_mode_is_sim",
+                    getattr(self, "simulation", None)),
+                symbol=sym,
                 buy_price=entry, sell_price=close_price,
                 buy_time=buy_time, sell_time=sell_time,
                 profit_pct=price_move_pct, profit_usdt=net_pnl,

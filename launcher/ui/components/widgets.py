@@ -13,6 +13,7 @@ from __future__ import annotations
 import customtkinter as ctk
 import tkinter as tk
 import tkinter.font as tkfont
+from contextlib import suppress
 
 from launcher.config.settings import COLORS, FONT_BODY, _safe_mono_font
 from launcher.core.metrics_service import query_db
@@ -258,8 +259,8 @@ class Tooltip:
     def _show(self):
         # Close any previous tooltip
         if Tooltip._active_tip is not None and Tooltip._active_tip is not self:
-            try: Tooltip._active_tip._hide()
-            except Exception: pass
+            with suppress(Exception):
+                Tooltip._active_tip._hide()
 
         if self.tipwin or not self.text:
             return
@@ -310,8 +311,8 @@ class Tooltip:
     def _hide(self, _evt=None):
         self._cancel()
         if self.tipwin is not None:
-            try: self.tipwin.destroy()
-            except Exception: pass
+            with suppress(Exception):
+                self.tipwin.destroy()
             self.tipwin = None
         if Tooltip._active_tip is self:
             Tooltip._active_tip = None

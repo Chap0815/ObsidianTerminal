@@ -19,7 +19,7 @@ import threading
 import time
 from typing import Tuple, Optional
 
-from bot_utils.api_budget import record_api_call
+from bot_utils.api_budget import record_api_call, try_consume_api_call
 
 
 def _utc_now_str() -> str:
@@ -130,7 +130,6 @@ _PERMANENT_PATTERN_STRINGS = (
     r"position\s+not\s+exist",
     r"position\s+is\s+nonexistent",
     r"nonexistent\s+or\s+closed",
-    r"\b2009\b",
     r"no\s+open\s+position",
   # MEXC 8823  pair being DELISTED, "new positions cannot be opened".
     # Retrying never helps (exchange-side block); fail fast and skip the leg.
@@ -154,8 +153,7 @@ _NO_POSITION_PATTERN_RE = re.compile(
     r"|position\s+is\s+nonexistent"
     r"|nonexistent\s+or\s+closed"
     r"|no\s+(?:open\s+)?position"
-    r"|zero\s+position"
-    r"|\b2009\b",
+    r"|zero\s+position",
     re.IGNORECASE,
 )
 
@@ -241,8 +239,17 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
     verified, so the caller falls back to clientOrderId server-side dedup."""
     if not cid:
         return None
+    def _budgeted(endpoint: str, fn):
+        try:
+            from bot_utils.api_budget import try_consume_api_call
+            try_consume_api_call(endpoint, critical=True)
+        except Exception:
+            pass
+        return fn()
     try:
-        for o in (ex.fetch_open_orders(symbol_full) or []):
+        for o in (_budgeted(
+                "order_recovery_fetch_open_orders",
+                lambda: ex.fetch_open_orders(symbol_full)) or []):
             if _order_client_id_matches(o, cid):
                 return o
     except Exception as e:
@@ -253,7 +260,9 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
     has = getattr(ex, "has", {}) or {}
     try:
         if has.get("fetchOrders"):
-            for o in (ex.fetch_orders(symbol_full, limit=20) or []):
+            for o in (_budgeted(
+                    "order_recovery_fetch_orders",
+                    lambda: ex.fetch_orders(symbol_full, limit=20)) or []):
                 if _order_client_id_matches(o, cid):
                     return o
     except Exception as e:
@@ -267,7 +276,9 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
     # SECOND entry in exactly the fill-but-no-ack window this guard exists for.
     try:
         if has.get("fetchClosedOrders"):
-            for o in (ex.fetch_closed_orders(symbol_full, limit=20) or []):
+            for o in (_budgeted(
+                    "order_recovery_fetch_closed_orders",
+                    lambda: ex.fetch_closed_orders(symbol_full, limit=20)) or []):
                 if _order_client_id_matches(o, cid):
                     return o
     except Exception as e:
@@ -276,7 +287,9 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
                       f"{symbol_full}: {type(e).__name__}", "WARN")
     try:
         if has.get("fetchMyTrades"):
-            for t in (ex.fetch_my_trades(symbol_full, limit=20) or []):
+            for t in (_budgeted(
+                    "order_recovery_fetch_my_trades",
+                    lambda: ex.fetch_my_trades(symbol_full, limit=20)) or []):
                 if _order_client_id_matches(t, cid):
                     return t
     except Exception as e:
@@ -310,10 +323,19 @@ def create_order_with_retry(ex,
         import uuid as _uuid
         params = dict(params)
         params["clientOrderId"] = "obx-" + _uuid.uuid4().hex[:20]
+    reduce_only = False
+    if isinstance(params, dict):
+        raw_reduce = params.get("reduceOnly")
+        reduce_only = (
+            raw_reduce is True
+            or str(raw_reduce).strip().lower() in ("1", "true", "yes")
+        )
+    endpoint = f"create_order:{action_label or 'order'}"
     for attempt in range(1, max_attempts + 1):
+        if not try_consume_api_call(endpoint, critical=reduce_only):
+            raise RuntimeError(f"API budget exhausted before {action_label}")
         try:
             order = ex.create_order(symbol_full, "market", side, amount, params=params)
-            record_api_call()
             order_state = classify_order_state(order)
             if isinstance(order, dict):
                 order["_bot_state"] = order_state

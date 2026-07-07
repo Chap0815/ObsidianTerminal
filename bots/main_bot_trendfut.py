@@ -16,9 +16,9 @@ Start:  python -m bots.main_bot_trendfut
 from __future__ import annotations
 
 try:
-    from bots._bootstrap import prepare_entrypoint, require_portalocker
+    from bots._bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
 except ModuleNotFoundError:
-    from _bootstrap import prepare_entrypoint, require_portalocker
+    from _bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
 
 prepare_entrypoint(__file__, __name__)
 
@@ -78,12 +78,21 @@ class TrendFuturesLauncher(TrendFuturesBot):
         "PRE_ACTIVATION_GIVEBACK_PCT": 2.75,
         "ACTIVATION_PROFIT":    2.25,    # raw price move that arms partial/trailing
         "TRAILING_DISTANCE":    1.5,     # retrace from high-water mark
+        "POST_PARTIAL_TRAILING_DISTANCE": 1.0,
         "BREAKEVEN_TRIGGER":    1.8,     # move stop to fee-buffered breakeven
         "PARTIAL_SELL_PCT":     0.5,
         "TREND_EXIT_STALE_LIMIT": 3,
-        "COOLDOWN_AFTER_SL":    0,
+        "COOLDOWN_AFTER_SL":    240,
+        "BAD_SYMBOL_FILTER": True,
+        "SINGLE_STOP_MIN_LOSS_PCT": 5.0,
+        "SINGLE_STOP_BLACKLIST_HOURS": 4,
+        "BAD_SYMBOL_LOSS_COUNT": 2,
+        "BAD_SYMBOL_MIN_TOTAL_LOSS_USDT": 6.0,
+        "BAD_SYMBOL_BLACKLIST_HOURS": 24,
+        "BAD_SYMBOL_LOOKBACK_DAYS": 1,
         "SCAN_INTERVAL":        300,     # banner only (engine uses TREND_CHECK_MINUTES)
-        "SIMULATION":           True,    # paper first
+        "MAX_NEW_TRADES_PER_TICK": 1,
+        "SIMULATION":           True,
     }
 
     @staticmethod
@@ -92,6 +101,7 @@ class TrendFuturesLauncher(TrendFuturesBot):
 
 
 def run_bot():
+    guard_pre_start("FUTREND")
     TrendFuturesLauncher(simulation=read_simulation_flag("FUTREND")).run()
 
 

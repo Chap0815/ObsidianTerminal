@@ -126,7 +126,8 @@ class FuturesScanMixin:
         min_pump = float(self.C("MIN_PUMP"))
 
         # Risk gates
-        paused, pause_reason = is_bot_paused(self.BOT_NAME, exchange=self.ex)
+        paused, pause_reason = is_bot_paused(
+            self.BOT_NAME, exchange=self.ex, simulation=self.simulation)
         if paused:
             log_event(f"[{self.BOT_NAME}] Pausiert: {pause_reason}", "WAIT")
             return
@@ -206,7 +207,8 @@ class FuturesScanMixin:
             # the cap; without this the remaining candidates would still fire.
             # No exchange arg  cheap DB read, doesn't repeat the per-cycle
             # BTC-crash API call from the pre-loop gate.
-            _paused, _pr = is_bot_paused(self.BOT_NAME)
+            _paused, _pr = is_bot_paused(
+                self.BOT_NAME, simulation=self.simulation)
             if _paused:
                 log_event(f"[{self.BOT_NAME}] Kill-switch mid-scan ({_pr})  "
                           f"stopping further entries this cycle", "WAIT")
@@ -370,10 +372,19 @@ class FuturesScanMixin:
                 llm_dir, llm_conf = "", "LOW"
         if veto_only:
             # LLM = veto only: it can force a skip (WAIT), not choose direction.
-            if use_llm and str(llm_dir).upper() == "WAIT":
+            if use_llm:
+                llm_vote = str(llm_dir or "").upper()
                 source = "Keyword fallback" if analysis_is_keyword else "LLM veto"
-                log_event(f"{sym}: {source} (WAIT) - skipped", "WAIT")
-                return
+                if llm_vote == "WAIT":
+                    log_event(f"{sym}: {source} (WAIT) - skipped", "WAIT")
+                    return
+                if (llm_vote in ("LONG", "SHORT")
+                        and screener_dir in ("LONG", "SHORT")
+                        and llm_vote != screener_dir):
+                    log_event(
+                        f"{sym}: {source} ({llm_vote}) conflicts with "
+                        f"screener ({screener_dir}) - skipped", "WAIT")
+                    return
             direction = screener_dir
             ok_sig, confidence, sig_why = self._assess_entry_signal(
                 r, direction, funding_rate, btc_chg)
@@ -891,7 +902,7 @@ class FuturesScanMixin:
                         # the rest)  otherwise a leveraged position runs
                         # completely unmanaged.
                         try:
-                            self.state.add(sym, {
+                            added_residual = self.state.add(sym, {
                                 "position_type": direction,
                                 "buy": entry_price,
                                 "highest": entry_price,
@@ -910,9 +921,15 @@ class FuturesScanMixin:
                                 "be_active": False,
                                 "provisional": True,
                             })
-                            log_event(
-                                f"{sym}: failed/partial close handed to "
-                                f"monitor for managed exit", "WARN")
+                            if added_residual is False:
+                                log_event(
+                                    f" {sym}: residual state registration "
+                                    f"returned False; claim kept, manual "
+                                    f"recovery required", "ERROR")
+                            else:
+                                log_event(
+                                    f"{sym}: failed/partial close handed to "
+                                    f"monitor for managed exit", "WARN")
                         except Exception as _se:
                             log_event(
                                 f" {sym}: could not register orphan for "
@@ -951,7 +968,7 @@ class FuturesScanMixin:
                     return
 
                 #  Zombie protection: write provisional state IMMEDIATELY 
-                self.state.add(sym, {
+                provisional_ok = self.state.add(sym, {
                     "position_type": direction,
                     "buy": entry_price,
                     "highest": entry_price,
@@ -972,6 +989,11 @@ class FuturesScanMixin:
                     "be_active": False,
                     "provisional": True,
                 })
+                if provisional_ok is False:
+                    log_event(
+                        f"{sym}: provisional state-write returned False; "
+                        f"final state write must recover before claim release",
+                        "WARN")
 
                 # Real fill price for accurate PnL
                 for k in ("average", "price"):
@@ -1028,7 +1050,7 @@ class FuturesScanMixin:
                     landed = _find_order_by_client_id(self.ex, symbol_full, _cid)
                     if landed is not None and float(landed.get("filled") or 0) > 0:
                         _amt = float(landed.get("filled") or 0) or float(amount_contracts)
-                        self.state.add(sym, {
+                        added = self.state.add(sym, {
                             "position_type": direction, "buy": entry_price,
                             "highest": entry_price, "buy_time": _utc_now_str(),
                             "invested_usdt": margin_usdt, "leverage": leverage,
@@ -1042,9 +1064,50 @@ class FuturesScanMixin:
                             "break_even": False, "be_active": False,
                             "provisional": True,
                         })
-                        _landed = True
-                        log_event(f" {sym}: order landed despite error  "
-                                  f"tracked provisionally", "WARN")
+                        if added is False:
+                            try:
+                                from config.exchange_config import reduce_only_params
+                                params = reduce_only_params(
+                                    ex_name=getattr(self.ex, "id", None),
+                                    position_side=("long" if direction == "LONG" else "short"),
+                                    margin_mode=margin_mode,
+                                    leverage=int(leverage),
+                                    hedge_mode=bool(self.C("HEDGE_MODE", False)),
+                                )
+                                create_order_with_retry(
+                                    self.ex, symbol_full,
+                                    "sell" if direction == "LONG" else "buy",
+                                    _amt, params, self._shutdown_event,
+                                    action_label=f"rollback close {sym}",
+                                    log_event=log_event,
+                                )
+                                from bot_utils import verify_position_closed
+                                closed, remaining = verify_position_closed(
+                                    self.ex, symbol_full)
+                                if closed:
+                                    remove_open_position(self.BOT_NAME, sym)
+                                    log_event(
+                                        f" {sym}: landed order rolled back "
+                                        f"after state-write failure", "WARN")
+                                else:
+                                    _landed = True
+                                    log_event(
+                                        f" {sym}: rollback close not verified "
+                                        f"({remaining:.6f} left); claim kept",
+                                        "ERROR")
+                            except Exception as rb_exc:
+                                _landed = True
+                                log_event(
+                                    f" {sym}: CRITICAL untracked live futures "
+                                    f"position risk; rollback failed ({rb_exc})",
+                                    "WARN")
+                                self._log_error(
+                                    f"futures landed rollback after state failure {sym}",
+                                    rb_exc)
+                        else:
+                            _landed = True
+                            log_event(f" {sym}: order landed despite error  "
+                                      f"tracked provisionally", "WARN")
                 except Exception:
                     pass
                 if not _landed:
@@ -1108,10 +1171,47 @@ class FuturesScanMixin:
         # the Monitor-Thread may have written between the provisional add and
         # this point (a plain state.add would wipe them).
         if self.state.has(sym):
-            self.state.update_many(sym, trade_data)
+            state_ok = self.state.update_many(sym, trade_data)
         else:
             # First-write path (SIM mode never wrote provisional)
-            self.state.add(sym, trade_data)
+            state_ok = self.state.add(sym, trade_data)
+        if state_ok is False and not self.simulation:
+            log_event(
+                f"{sym}: state write failed after LIVE entry  attempting "
+                f"immediate reduce-only rollback", "WARN")
+            try:
+                from config.exchange_config import reduce_only_params
+                params = reduce_only_params(
+                    ex_name=getattr(self.ex, "id", None),
+                    position_side=("long" if direction == "LONG" else "short"),
+                    margin_mode=margin_mode,
+                    leverage=int(leverage),
+                    hedge_mode=bool(self.C("HEDGE_MODE", False)),
+                )
+                create_order_with_retry(
+                    self.ex, symbol_full,
+                    "sell" if direction == "LONG" else "buy",
+                    amount, params, self._shutdown_event,
+                    action_label=f"rollback close {sym}",
+                    log_event=log_event,
+                )
+                from bot_utils import verify_position_closed
+                closed, remaining = verify_position_closed(self.ex, symbol_full)
+                if closed:
+                    remove_open_position(self.BOT_NAME, sym)
+                    log_event(
+                        f"{sym}: rollback close verified after state failure",
+                        "WARN")
+                else:
+                    log_event(
+                        f"{sym}: CRITICAL rollback close not verified "
+                        f"({remaining:.6f} left); claim kept", "ERROR")
+            except Exception as rb_exc:
+                log_event(
+                    f"{sym}: CRITICAL untracked live futures position risk "
+                    f"after state failure; rollback failed ({rb_exc})", "WARN")
+                self._log_error(f"futures rollback after state failure {sym}", rb_exc)
+            return
 
         try:
             from core.logger import log_struct

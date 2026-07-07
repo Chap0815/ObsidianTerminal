@@ -110,7 +110,9 @@ class ExitsMixin:
         remaining = []
         for item in pending:
             try:
-                saved = bool(save_trade_db(**dict(item)))
+                retry_item = dict(item)
+                retry_item.setdefault("mode_is_sim", self.simulation)
+                saved = bool(save_trade_db(**retry_item))
             except Exception as exc:
                 saved = False
                 self._log_error(f"spot partial accounting retry {sym}", exc)
@@ -123,6 +125,36 @@ class ExitsMixin:
                 f"still pending", "WARN")
         else:
             log_event(f"{sym}: pending partial accounting flushed", "INFO")
+
+    def _cleanup_accounted_close_state(self, sym: str, d: dict) -> bool:
+        """Remove local/claim state after realized PnL was already booked."""
+        from core.logger import log_event
+        from bot_utils.trade_state import remove_with_restore_fields
+
+        restore = {
+            "accounting_already_booked": True,
+            "accounting_booked_sell_time": d.get("accounting_booked_sell_time")
+                                      or d.get("sell_time"),
+            "accounting_booked_exchange_order_id": (
+                d.get("accounting_booked_exchange_order_id")
+                or d.get("exchange_order_id")
+            ),
+            "accounting_booked_reason": (
+                d.get("accounting_booked_reason")
+                or d.get("accounting_pending_reason")
+                or d.get("reason")
+                or "Close"
+            ),
+        }
+        ok = remove_with_restore_fields(self.state, sym, restore)
+        if not ok:
+            log_event(
+                f" {sym}: close already booked, but claim/state cleanup "
+                f"failed; state kept for retry",
+                "WARN",
+            )
+            return False
+        return True
 
     #  Monitor-thread body 
 
@@ -259,7 +291,7 @@ class ExitsMixin:
         double-count.
         """
         from core.database import get_today_pnl, opened_today_local
-        pnl_info = get_today_pnl(self.BOT_NAME)
+        pnl_info = get_today_pnl(self.BOT_NAME, mode_is_sim=self.simulation)
         today_realized = float(pnl_info.get("total_profit", 0.0))
 
         unrealized = 0.0
@@ -316,22 +348,24 @@ class ExitsMixin:
 
         On a chunk failure the missing symbols are simply absent from the
         result  _get_current_price then does a per-symbol fetch for them.
-        record_api_call() instruments this for the cross-process budget tracker.
+        The atomic API budget gate runs before each exchange call.
         """
         if not symbols:
             return {}
         out: dict = {}
         try:
-            from bot_utils import record_api_call, record_api_error
+            from bot_utils.api_budget import record_api_error, try_consume_api_call
         except ImportError:
-            record_api_call = record_api_error = lambda **kw: None
+            record_api_error = lambda **kw: None
+            try_consume_api_call = lambda *a, **kw: True
 
         pairs = [f"{s}/USDT" for s in symbols]
         for i in range(0, len(pairs), TICKER_BATCH_SIZE):
             chunk = pairs[i:i + TICKER_BATCH_SIZE]
             try:
+                if not try_consume_api_call("fetch_tickers", critical=True):
+                    continue
                 result = self.ex.fetch_tickers(chunk) or {}
-                record_api_call(endpoint="fetch_tickers")
                 out.update(result)
             except Exception as e:
                 try:
@@ -413,27 +447,21 @@ class ExitsMixin:
             except (TypeError, ValueError):
                 pass
         if self._ticker_backoff_active():
-            try:
-                return float((position or {}).get("last_price") or 0.0)
-            except (TypeError, ValueError):
-                return 0.0
+            return 0.0
         try:
-            from bot_utils import record_api_call
+            from bot_utils.api_budget import try_consume_api_call
+            if not try_consume_api_call("fetch_ticker", critical=True):
+                return 0.0
             result = float(self.ex.fetch_ticker(pair).get("last") or 0)
-            record_api_call(endpoint="fetch_ticker")
             return result
         except Exception as e:
             try:
-                from bot_utils import record_api_error
+                from bot_utils.api_budget import record_api_error
                 record_api_error(endpoint="fetch_ticker")
             except Exception:
                 pass
             if self._is_rate_limited(e):
                 self._set_ticker_backoff()
-                try:
-                    return float((position or {}).get("last_price") or 0.0)
-                except (TypeError, ValueError):
-                    return 0.0
             return 0.0
 
     def _btc_stress_override(self, trades: dict) -> None:
@@ -485,15 +513,9 @@ class ExitsMixin:
 
             for sym, d in candidates:
                 try:
-                    t = batch.get(f"{sym}/USDT") or {}
-                    curr = float(t.get("last") or t.get("close") or 0)
+                    curr = self._get_current_price(sym, batch, d)
                     if curr <= 0:
-                        # Fallback per-symbol if batch missed it
-                        try:
-                            curr = float(self.ex.fetch_ticker(
-                                f"{sym}/USDT").get("last") or 0)
-                        except Exception:
-                            continue
+                        continue
                     if curr > d.get("buy", 0):
                         self.state.update(sym, "break_even", True)
                         log_event(
@@ -518,11 +540,25 @@ class ExitsMixin:
         """
         from core.logger import log_event
 
+        if d.get("accounting_already_booked"):
+            ExitsMixin._cleanup_accounted_close_state(self, sym, d)
+            return
         if d.get("accounting_pending"):
             try:
                 from core.spot_bot_reconcile import _record_spot_offline_close
                 if _record_spot_offline_close(self, sym, d):
-                    self.state.remove(sym)
+                    booked = dict(d)
+                    booked.update({
+                        "accounting_already_booked": True,
+                        "accounting_booked_sell_time": (
+                            d.get("accounting_pending_sell_time")),
+                        "accounting_booked_exchange_order_id": (
+                            d.get("accounting_pending_exchange_order_id")),
+                        "accounting_booked_reason": (
+                            d.get("accounting_pending_reason")
+                            or "Offline close"),
+                    })
+                    ExitsMixin._cleanup_accounted_close_state(self, sym, booked)
             except Exception as exc:
                 self._log_error(f"spot pending accounting retry {sym}", exc)
             return
@@ -833,7 +869,9 @@ class ExitsMixin:
         slice_fees_total = prop_entry_fee + partial_fee
 
         partial_trade = dict(
-            bot_name=self.BOT_NAME, symbol=sym,
+            bot_name=self.BOT_NAME,
+            mode_is_sim=self.simulation,
+            symbol=sym,
             buy_price=buy, sell_price=fill_price,
             buy_time=d.get("buy_time", ""),
             sell_time=_utc_now_str(),
@@ -1034,7 +1072,12 @@ class ExitsMixin:
                         )
                 except Exception:
                     pass
-                self.state.remove(sym)
+                cleanup_row = dict(d)
+                cleanup_row.update({
+                    "accounting_already_booked": True,
+                    "accounting_booked_reason": "Offline orphan close",
+                })
+                ExitsMixin._cleanup_accounted_close_state(self, sym, cleanup_row)
                 return
             except Exception as e:
                 log_event(f"Sell order {sym} failed: {e}", "WARN")
@@ -1071,8 +1114,12 @@ class ExitsMixin:
             booked_reason = reason
 
         sell_time = _utc_now_str()
+        accounting_mode_is_sim = d.get("accounting_pending_mode_is_sim",
+                                       self.simulation)
         trade_row = dict(
-            bot_name=self.BOT_NAME, symbol=sym,
+            bot_name=self.BOT_NAME,
+            mode_is_sim=accounting_mode_is_sim,
+            symbol=sym,
             buy_price=buy, sell_price=fill_price,
             buy_time=d.get("buy_time", ""),
             sell_time=sell_time,
@@ -1121,6 +1168,7 @@ class ExitsMixin:
                     "accounting_pending_sell_time": sell_time,
                     "accounting_pending_profit_pct": real_prof_pct,
                     "accounting_pending_profit_usdt": profit_usdt,
+                    "accounting_pending_mode_is_sim": self.simulation,
                     "accounting_pending_fees_usdt": proportional_entry_fee + close_fee,
                     "accounting_pending_exchange_order_id": exch_oid,
                 })
@@ -1146,7 +1194,14 @@ class ExitsMixin:
                 f"({remaining_amount:.8f}/{requested_amount:.8f}); "
                 f"residual kept in state", "WARN")
             return
-        self.state.remove(sym)
+        cleanup_row = dict(d)
+        cleanup_row.update({
+            "accounting_already_booked": True,
+            "accounting_booked_sell_time": sell_time,
+            "accounting_booked_exchange_order_id": exch_oid,
+            "accounting_booked_reason": reason,
+        })
+        ExitsMixin._cleanup_accounted_close_state(self, sym, cleanup_row)
         try:
             save_trade(
                 log_dir=self.LOG_DIR, symbol=sym,

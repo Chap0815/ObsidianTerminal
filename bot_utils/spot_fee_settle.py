@@ -30,6 +30,7 @@ def extract_or_estimate_base_fee(ex,
                                     max_attempts: int = 3,
                                     retry_delay: float = 0.3,
                                     taker_rate: float = SPOT_DEFAULT_TAKER_FEE,
+                                    fallback_filled: float = 0.0,
                                     log_event=None,
                                     shutdown_event=None,
                                     ) -> float:
@@ -85,7 +86,12 @@ def extract_or_estimate_base_fee(ex,
     # can't read it yet. Assuming the standard taker rate is FAR safer
     # than recording the gross amount (which leads to InsufficientBalance).
     try:
-        filled = float(order.get("filled") or order.get("amount") or 0)
+        filled = float(
+            order.get("filled")
+            or order.get("amount")
+            or fallback_filled
+            or 0
+        )
     except (TypeError, ValueError):
         filled = 0.0
     if filled <= 0:

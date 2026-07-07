@@ -65,7 +65,7 @@
                     "MAX_DAILY_LOSS_HARD_MULT":  1.5,
                     "OWN_MOMENTUM_FILTER":  true,
                     "OWN_MOMENTUM_WINDOW":  5,
-                    "SIMULATION":  false,
+                    "SIMULATION":  true,
                     "OWN_MOMENTUM_MIN_LOSS_PCT":  20.0
                 },
     "CROSS":  {
@@ -115,7 +115,7 @@
                     "BREAKEVEN_TRIGGER":  1.8,
                     "PARTIAL_SELL_PCT":  0.5,
                     "TREND_EXIT_STALE_LIMIT":  3,
-                    "SIMULATION":  false,
+                    "SIMULATION":  true,
                     "TREND_VOL_TARGET":  0,
                     "TREND_VOL_TARGET_LOOKBACK":  30,
                     "MAX_NEW_TRADES_PER_TICK":  1,

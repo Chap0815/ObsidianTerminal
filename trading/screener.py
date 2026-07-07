@@ -992,9 +992,10 @@ def get_top_momentum_coins(
     _GATHER_TIMEOUT_SEC = max(60.0, _PER_FUTURE_TIMEOUT_SEC * 3)
 
     results: dict = {}
-    with ThreadPoolExecutor(
+    pool = ThreadPoolExecutor(
         max_workers=n_workers, thread_name_prefix="screener-worker"
-    ) as pool:
+    )
+    try:
         future_map = {
             pool.submit(_fetch_with_clone, sym, tf): (sym, tf)
             for sym, tf in tasks
@@ -1031,6 +1032,15 @@ def get_top_momentum_coins(
                             fut.cancel()
                         except Exception:
                             pass
+            try:
+                _shutdown_clone_pool()
+            except Exception:
+                pass
+    finally:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            pool.shutdown(wait=False)
 
     # Force flush failure cache
     with _fail_cache_lock:

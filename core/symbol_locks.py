@@ -32,7 +32,9 @@ _ADVISORY_TIMEOUT   = 2.0
 
 
 def _advisory_lock_name(bot_name: str, base: str) -> str:
-    return f"close:{base}"
+    bot = (bot_name or "").upper()
+    market = "spot" if bot in {"SPOT", "TREND"} else "fut"
+    return f"close:{market}:{base}"
 
 
 def _acquire_or_create(sym: str) -> threading.Lock:
@@ -100,6 +102,14 @@ def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
                             _adv_acquired = True
                             break
                     except Exception:
+                        try:
+                            from bot_utils.silent_log import silent_log
+                            silent_log(
+                                f"close_lock advisory acquire({_adv_lock_name})",
+                                RuntimeError("advisory lock backend unavailable"),
+                            )
+                        except Exception:
+                            pass
                         break
                     _time.sleep(0.05)
                 if _adv_acquired:
@@ -107,15 +117,37 @@ def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
                     _interval = max(0.05, min(30.0, _ADVISORY_TTL_SEC / 3.0))
 
                     def _renew_loop():
+                        warned = False
                         while not _renew_stop.wait(_interval):
                             try:
                                 from core.database import renew_advisory_lock
                                 if not renew_advisory_lock(
                                         _adv_lock_name, _adv_holder_id,
                                         ttl_sec=_ADVISORY_TTL_SEC):
-                                    return
-                            except Exception:
-                                return
+                                    if not warned:
+                                        warned = True
+                                        try:
+                                            from bot_utils.silent_log import silent_log
+                                            silent_log(
+                                                f"close_lock advisory renew({_adv_lock_name})",
+                                                RuntimeError("advisory lock renewal failed"),
+                                            )
+                                        except Exception:
+                                            pass
+                                    continue
+                                warned = False
+                            except Exception as exc:
+                                if not warned:
+                                    warned = True
+                                    try:
+                                        from bot_utils.silent_log import silent_log
+                                        silent_log(
+                                            f"close_lock advisory renew({_adv_lock_name})",
+                                            exc,
+                                        )
+                                    except Exception:
+                                        pass
+                                continue
 
                     _renew_thread = threading.Thread(
                         target=_renew_loop, name=f"renew-{_adv_lock_name}",
@@ -142,9 +174,24 @@ def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
         if _adv_acquired and _adv_lock_name and _adv_holder_id:
             try:
                 from core.database import release_advisory_lock
-                release_advisory_lock(_adv_lock_name, _adv_holder_id)
+                if not release_advisory_lock(_adv_lock_name, _adv_holder_id):
+                    try:
+                        from bot_utils.silent_log import silent_log
+                        silent_log(
+                            f"close_lock advisory release({_adv_lock_name})",
+                            RuntimeError("advisory lock release failed"),
+                        )
+                    except Exception:
+                        pass
             except Exception:
-                pass
+                try:
+                    from bot_utils.silent_log import silent_log
+                    silent_log(
+                        f"close_lock advisory release({_adv_lock_name})",
+                        RuntimeError("advisory lock release raised"),
+                    )
+                except Exception:
+                    pass
         if got:
             try:
                 lock.release()

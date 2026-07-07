@@ -25,6 +25,7 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
+from contextlib import suppress
 from datetime import datetime, timedelta
 from tkinter import font as tkfont
 
@@ -92,7 +93,7 @@ from launcher.core.metrics_service import (
 from launcher.core.process_manager import BotProcess
 from core.runtime_status import read_runtime_status
 from launcher.core.system_monitor import HAS_PSUTIL, get_system_stats
-from launcher.state.poller import DataPoller
+from launcher.state.poller import DataPoller, _runtime_status_is_fresh
 from launcher.ui.components.widgets import (
     BadHoursRow,
     MiniBar,
@@ -220,8 +221,8 @@ class ObsidianApp(ctk.CTk):
         # Collapse support was removed; old COLLAPSED_BOTS config is ignored.
 
         if HAS_PSUTIL:
-            try: psutil.cpu_percent(interval=None)
-            except Exception: pass
+            with suppress(Exception):
+                psutil.cpu_percent(interval=None)
 
         self.poller = DataPoller()
 
@@ -809,7 +810,7 @@ class ObsidianApp(ctk.CTk):
         canvas = getattr(frame, "_parent_canvas", None)
         if canvas is None:
             return
-        state = {"inside": False, "bound": False}
+        state = {"inside": False}
 
         def _is_log_text(widget) -> bool:
             while widget is not None:
@@ -818,12 +819,24 @@ class ObsidianApp(ctk.CTk):
                 widget = getattr(widget, "master", None)
             return False
 
+        def _pointer_over_canvas(event) -> bool:
+            try:
+                x_root = int(getattr(event, "x_root", canvas.winfo_pointerx()))
+                y_root = int(getattr(event, "y_root", canvas.winfo_pointery()))
+                left = int(canvas.winfo_rootx())
+                top = int(canvas.winfo_rooty())
+                right = left + int(canvas.winfo_width())
+                bottom = top + int(canvas.winfo_height())
+                return left <= x_root <= right and top <= y_root <= bottom
+            except Exception:
+                return bool(state["inside"])
+
         def _wheel(event):
-            if not state["inside"]:
+            if not state["inside"] and not _pointer_over_canvas(event):
                 return None
             if _is_log_text(getattr(event, "widget", None)):
                 return None
-            speed = 18
+            speed = 36
             if getattr(event, "num", None) == 4:
                 units = -speed
             elif getattr(event, "num", None) == 5:
@@ -840,15 +853,15 @@ class ObsidianApp(ctk.CTk):
 
         def _enter(_event=None):
             state["inside"] = True
-            if not state["bound"]:
-                state["bound"] = True
-                self.bind_all("<MouseWheel>", _wheel, add="+")
-                self.bind_all("<Button-4>", _wheel, add="+")
-                self.bind_all("<Button-5>", _wheel, add="+")
 
         def _leave(_event=None):
             state["inside"] = False
 
+        # Bind immediately: users often start the wheel over a child widget,
+        # where the scroll frame itself may never receive the first Enter event.
+        self.bind_all("<MouseWheel>", _wheel, add="+")
+        self.bind_all("<Button-4>", _wheel, add="+")
+        self.bind_all("<Button-5>", _wheel, add="+")
         frame.bind("<Enter>", _enter)
         frame.bind("<Leave>", _leave)
 
@@ -863,8 +876,19 @@ class ObsidianApp(ctk.CTk):
         try:
             frame.update_idletasks()
             bbox = canvas.bbox("all")
+            req_w = max(canvas.winfo_width(), frame.winfo_reqwidth())
+            req_h = max(canvas.winfo_height(), frame.winfo_reqheight()) + 24
             if bbox:
-                canvas.configure(scrollregion=bbox)
+                canvas.configure(
+                    scrollregion=(
+                        min(0, int(bbox[0])),
+                        min(0, int(bbox[1])),
+                        max(req_w, int(bbox[2])),
+                        max(req_h, int(bbox[3]) + 24),
+                    )
+                )
+            else:
+                canvas.configure(scrollregion=(0, 0, req_w, req_h))
         except Exception:
             pass
 
@@ -1053,7 +1077,8 @@ class ObsidianApp(ctk.CTk):
 
         pnl_block = ctk.CTkFrame(hero, fg_color="transparent")
         pnl_block.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(pnl_block, text="REALIZED PROFIT",
+        pnl_title_var = ctk.StringVar(value="REALIZED")
+        ctk.CTkLabel(pnl_block, textvariable=pnl_title_var,
                       font=ctk.CTkFont(self.display_font, 10, "bold"),
                       text_color=COLORS["text_dim"], anchor="w"
                       ).pack(fill="x", pady=(0, 3))
@@ -1512,7 +1537,7 @@ class ObsidianApp(ctk.CTk):
         log_box.config(state="disabled")
 
         self._write_log_to_box(log_box, auto_var, "system",
-                                 f"{meta['label']} bot ready. Click  Start to begin.")
+                                 f"{meta['label']} bot ready. Click Start to begin.")
 
         body_widgets = [hero_wrap, spark_row, param_wrap, restart_hint,
                          sep_6, actions, sep_8, log_outer]
@@ -1521,6 +1546,7 @@ class ObsidianApp(ctk.CTk):
             "led":          led,
             "status":       status_var,
             "sparkline":    sparkline,
+            "pnl_title_var": pnl_title_var,
             "pnl_var":      pnl_var,
             "pnl_lbl":      pnl_lbl,
             "unr_var":      unr_var,
@@ -1544,6 +1570,7 @@ class ObsidianApp(ctk.CTk):
             "save_btn":     save_btn,
             "unsaved_lbl":  unsaved_lbl,
             "prompt_btn":   prompt_btn,
+            "rebalance_btn": reb if name == "CROSS" else None,
             "ai_badge":     ai_badge,
             "ai_badge_var": ai_badge_var,
             "ai_mode":      "unknown",   # 'llm', 'keyword', 'unknown'
@@ -1627,7 +1654,7 @@ class ObsidianApp(ctk.CTk):
             self.main_frame.grid_columnconfigure(
                 i, weight=1 if i < cols else 0, minsize=0)
         max_rows = max(1, (visible_count + cols - 1) // cols)
-        for i in range((len(BOT_ORDER) + self.MAX_CARD_COLUMNS - 1) // self.MAX_CARD_COLUMNS):
+        for i in range(len(BOT_ORDER)):
             self.main_frame.grid_rowconfigure(i, weight=0, minsize=0)
 
         # Force redraw  wichtig bei manchen tk-Versionen
@@ -1664,7 +1691,7 @@ class ObsidianApp(ctk.CTk):
 
         # Linke Seite: Status-Badge + Bot-Status-Text
         left = ctk.CTkFrame(bar, fg_color="transparent")
-        left.pack(side="left", padx=20, pady=8)
+        left.pack(side="left", fill="x", expand=True, padx=20, pady=8)
 
         # "Ready" Pill mit grnem Punkt
         self.status_badge = ctk.CTkFrame(left, fg_color="#0b3a25",
@@ -1685,8 +1712,10 @@ class ObsidianApp(ctk.CTk):
         self.status_text = ctk.StringVar(value="No bots active")
         ctk.CTkLabel(left, textvariable=self.status_text,
                       font=ctk.CTkFont(FONT_BODY, 11, "bold"),
-                      text_color=COLORS["text_muted"]
-                      ).pack(side="left", padx=(14, 0))
+                      text_color=COLORS["text_muted"],
+                      width=520,
+                      anchor="w"
+                      ).pack(side="left", fill="x", expand=True, padx=(14, 0))
 
         # Rechte Seite: Update-CTA + Version Info
         right = ctk.CTkFrame(bar, fg_color="transparent")
@@ -1720,7 +1749,9 @@ class ObsidianApp(ctk.CTk):
         """
         try:
             running = [b for b in BOT_ORDER if self.bots[b].is_running()]
-            if not running:
+            external = self._externally_active_bots()
+            active = running + [b for b in external if b not in running]
+            if not active:
                 self.status_badge_text.set("Ready")
                 self.status_badge.configure(fg_color="#0b3a25",
                                               border_color="#1a4d35")
@@ -1729,8 +1760,22 @@ class ObsidianApp(ctk.CTk):
                         lbl.configure(text_color="#2ecc8b")
                 self.status_text.set("No bots active")
             else:
+                mode_cache = {}
+                try:
+                    mode_cache = (self.poller.get_all() or {}).get("mode_is_sim") or {}
+                except Exception:
+                    mode_cache = {}
+
+                def _running_bot_is_sim(bot: str) -> bool:
+                    rs = external.get(bot)
+                    if rs is not None and "simulation" in rs:
+                        return bool(rs.get("simulation"))
+                    if bot in mode_cache:
+                        return bool(mode_cache[bot])
+                    return bool(self.config.get(bot, {}).get("SIMULATION", True))
+
                 # Prfen, ob IRGENDEIN laufender Bot im LIVE-Modus ist
-                any_live = any(not self.config[b].get("SIMULATION", True) for b in running)
+                any_live = any(not _running_bot_is_sim(b) for b in active)
 
                 if any_live:
                     # Mindestens einer ist Live  orange Warnung
@@ -1749,8 +1794,10 @@ class ObsidianApp(ctk.CTk):
                         if isinstance(lbl, ctk.CTkLabel):
                             lbl.configure(text_color="#22d3ee")
 
-                bot_names = ", ".join(running)
-                self.status_text.set(f"{len(running)} bot(s) running: {bot_names}")
+                bot_names = ", ".join(active)
+                suffix = f" ({len(external)} external)" if external else ""
+                self.status_text.set(
+                    f"{len(active)} bot(s) active: {bot_names}{suffix}")
             override = self._active_update_status_override()
             if override:
                 self.status_text.set(override)
@@ -1760,13 +1807,20 @@ class ObsidianApp(ctk.CTk):
             pass
 
     def _set_update_status_override(self, message: str, *, ttl_sec: float | None = None) -> None:
-        self._update_status_override = str(message or "")
+        self._update_status_override = self._compact_statusbar_message(message)
         if ttl_sec is None or not self._update_status_override:
             self._update_status_override_until = 0.0
         else:
             self._update_status_override_until = time.monotonic() + max(0.0, float(ttl_sec))
         if self._update_status_override:
             self.status_text.set(self._update_status_override)
+
+    @staticmethod
+    def _compact_statusbar_message(message: str, limit: int = 145) -> str:
+        text = " ".join(str(message or "").split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)].rstrip() + "..."
 
     def _clear_update_status_override(self) -> None:
         self._update_status_override = ""
@@ -1972,22 +2026,23 @@ class ObsidianApp(ctk.CTk):
         seeds the token on start, so a press while stopped won't fire later)."""
         card = self.cards.get("CROSS")
         try:
-            import time as _t
-            from core.database import set_param
-            set_param("CROSS", "FORCE_REBALANCE", _t.time(),
-                      reason="manual UI rebalance button")
             running = False
             try:
                 running = self.bots["CROSS"].is_running()
             except Exception:
                 pass
-            if card and running:
+            if not running:
+                if card:
+                    self._log_to_card(card, "warn",
+                        "Rebalance ignored  CROSS is not running.")
+                return
+            import time as _t
+            from core.database import set_param
+            set_param("CROSS", "FORCE_REBALANCE", _t.time(),
+                      reason="manual UI rebalance button")
+            if card:
                 self._log_to_card(card, "system",
                     " Rebalance requested  CROSS rebuilds its book within ~60s.")
-            elif card:
-                self._log_to_card(card, "warn",
-                    " Rebalance requested, but CROSS isn't running  "
-                    "start it to take effect.")
         except Exception as e:
             if card:
                 self._log_to_card(card, "warn", f"Rebalance request failed: {e}")
@@ -2005,8 +2060,8 @@ class ObsidianApp(ctk.CTk):
         stop_bot(self, name)
 
     def _get_open_spot_positions(self, bot_name):
-        from launcher.core.positions import get_open_spot_positions
-        return get_open_spot_positions(bot_name)
+        from launcher.core.bot_controller import open_positions_for_stop
+        return open_positions_for_stop(bot_name)
 
     def _refresh_spot_positions_with_live_prices(self, bot_name, positions):
         from launcher.core.positions import refresh_spot_positions_with_live_prices
@@ -2025,8 +2080,11 @@ class ObsidianApp(ctk.CTk):
         async_simple_stop(self, name, card, update)
 
     def _get_open_futures_positions(self, bot_name: str = None):
-        from launcher.core.positions import get_open_futures_positions
-        return get_open_futures_positions(bot_name)
+        if bot_name is None:
+            from launcher.core.positions import get_open_futures_positions
+            return get_open_futures_positions(None)
+        from launcher.core.bot_controller import open_positions_for_stop
+        return open_positions_for_stop(bot_name)
 
     def _refresh_positions_with_live_prices(self, positions):
         from launcher.core.positions import refresh_positions_with_live_prices
@@ -2260,7 +2318,7 @@ class ObsidianApp(ctk.CTk):
                     msg = ""
                 if msg:
                     self._set_update_status_override(msg, ttl_sec=30.0)
-                    if reason not in {"repo_missing", "git_missing"} and not getattr(self, "_update_notice_shown", False):
+                    if reason not in {"repo_missing", "git_missing", "remote_unreachable"} and not getattr(self, "_update_notice_shown", False):
                         self._update_notice_shown = True
                         try:
                             from tkinter import messagebox
@@ -2287,6 +2345,17 @@ class ObsidianApp(ctk.CTk):
             )
             if last_update.get("status") == "failed":
                 failed_note = f"\n\nLetzter Update-Versuch: {last_update.get('message', '')}"
+            if same_failed_remote:
+                self._pending_update_data = data
+                self._set_update_cta_visible(True)
+                detail = str(last_update.get("message") or "").strip()
+                msg = (
+                    f"Update {remote} ist verfuegbar, letzter Versuch fuer diesen Stand ist fehlgeschlagen."
+                    + (f" Grund: {detail[:180]}" if detail else "")
+                    + " Nach Behebung erneut per Update-Button starten."
+                )
+                self._set_update_status_override(msg, ttl_sec=60.0)
+                return
             if data.get("bootstrap_required"):
                 msg = ("Einmalige Update-Einrichtung ist verfuegbar. "
                        "Der Launcher wird geschlossen, der private Git-Stand "
@@ -2299,8 +2368,6 @@ class ObsidianApp(ctk.CTk):
             self._pending_update_data = data
             self._set_update_status_override(msg)
             self._set_update_cta_visible(True)
-            if same_failed_remote:
-                return
             if getattr(self, "_update_notice_shown", False):
                 return
             self._update_notice_shown = True
@@ -2344,12 +2411,14 @@ class ObsidianApp(ctk.CTk):
         """
         try:
             running = [name for name, bot in self.bots.items() if bot.is_running()]
-            if running:
+            external = self._externally_active_bots()
+            blockers = running + [b for b in external if b not in running]
+            if blockers:
                 from tkinter import messagebox
                 messagebox.showwarning(
                     "Obsidian Update",
                     "Update nicht gestartet. Stoppe zuerst alle laufenden Bots: "
-                    + ", ".join(running)
+                    + ", ".join(blockers)
                     + "\n\nDanach kannst du das Update ueber den gelben Update-Button starten.",
                 )
                 self._set_update_cta_visible(True)
@@ -2361,8 +2430,17 @@ class ObsidianApp(ctk.CTk):
                 return
             pyw = _get_pythonw_exe()
             exe = pyw if pyw and os.path.exists(str(pyw)) else _get_python_exe()
+            cmd = [exe, runner, "--parent-pid", str(os.getpid()), "--restart"]
+            pending = getattr(self, "_pending_update_data", None)
+            if isinstance(pending, dict):
+                remote = str(pending.get("remote") or "").strip()
+                branch = str(pending.get("branch") or "").strip()
+                if remote:
+                    cmd.extend(["--remote", remote])
+                if branch:
+                    cmd.extend(["--branch", branch])
             subprocess.Popen(
-                [exe, runner, "--parent-pid", str(os.getpid()), "--restart"],
+                cmd,
                 cwd=PROJECT_ROOT,
                 **subprocess_no_window_kwargs(),
             )
@@ -2989,6 +3067,34 @@ class ObsidianApp(ctk.CTk):
             return None
         return None
 
+    def _external_runtime_status(self, bot: str) -> dict | None:
+        """Fresh runtime_status from a bot process not owned by this launcher."""
+        try:
+            if self.bots[bot].is_running():
+                return None
+            rs = read_runtime_status(BOT_META[bot]["log_dir"])
+            if not _runtime_status_is_fresh(rs):
+                return None
+            try:
+                pid = int(rs.get("pid") or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            from core.process_identity import pid_matches_bot
+            if not pid_matches_bot(pid, bot):
+                return None
+            return rs
+        except Exception:
+            return None
+
+    def _externally_active_bots(self) -> dict[str, dict]:
+        """Fresh runtime_status rows for bot processes owned elsewhere."""
+        out: dict[str, dict] = {}
+        for bot in BOT_ORDER:
+            rs = self._external_runtime_status(bot)
+            if rs is not None:
+                out[bot] = rs
+        return out
+
     def _sync_sim_state(self):
         """Keep the in-memory SIMULATION flags AND the per-card SIM/LIVE badge in
         sync with bot_config.json on disk. The flag can change OUTSIDE the launcher
@@ -3013,6 +3119,13 @@ class ObsidianApp(ctk.CTk):
                     self._apply_sim_badge(bot, runtime_sim)
                 continue
             if self.bots[bot].is_running():
+                continue
+            external_rs = self._external_runtime_status(bot)
+            if external_rs is not None and "simulation" in external_rs:
+                external_sim = bool(external_rs.get("simulation"))
+                if bool(self.config.get(bot, {}).get("SIMULATION", True)) != external_sim:
+                    self.config.setdefault(bot, {})["SIMULATION"] = external_sim
+                    self._apply_sim_badge(bot, external_sim)
                 continue
             try:
                 # raise_on_corrupt=False: a transiently locked/half-written config
@@ -3081,6 +3194,8 @@ class ObsidianApp(ctk.CTk):
         for bot in BOT_ORDER:
             card = self.cards[bot]
             running = self.bots[bot].is_running()
+            external_rs = None if running else self._external_runtime_status(bot)
+            external_running = external_rs is not None
             _is_sim = bool(self.config.get(bot, {}).get("SIMULATION", True))
             if running:
                 status_label = "Active"
@@ -3125,6 +3240,31 @@ class ObsidianApp(ctk.CTk):
                                            text_color=COLORS["danger"],
                                            border_width=2,
                                            border_color=COLORS["danger"])
+            elif external_running:
+                try:
+                    if "simulation" in external_rs:
+                        _is_sim = bool(external_rs.get("simulation"))
+                    status_label = str(external_rs.get("status") or "running").title()
+                    build = str(external_rs.get("build_id") or "")
+                    if build and build != "unknown":
+                        status_label += f" - {build[:8]}"
+                    card["status"].set(
+                        f"External {status_label} - "
+                        f"{'SIM' if _is_sim else 'LIVE'}")
+                    card["led"].configure(text_color=COLORS["warning"])
+                except Exception:
+                    card["status"].set("External Active")
+                card["start_btn"].configure(state="disabled",
+                                              fg_color=COLORS["border"],
+                                              border_width=2,
+                                              border_color="#4b4664",
+                                              text_color=COLORS["text_muted"])
+                card["stop_btn"].configure(state="disabled",
+                                           fg_color="transparent",
+                                           hover_color=COLORS["panel_hover"],
+                                           text_color=COLORS["text_muted"],
+                                           border_width=2,
+                                           border_color=COLORS["border"])
             else:
                 card["status"].set("Stopped")
                 try:
@@ -3147,8 +3287,33 @@ class ObsidianApp(ctk.CTk):
             uses_llm = bool(BOT_META[bot].get("uses_llm", True)
                             and self.config.get(bot, {}).get("USE_LLM", False))
             # AI-Mode Badge updaten
-            self._update_ai_badge(card, running, global_llm_online, now_ts,
+            self._update_ai_badge(card, running or external_running,
+                                  global_llm_online, now_ts,
                                   uses_llm=uses_llm)
+            try:
+                card["pnl_title_var"].set(
+                    "REALIZED (SIM)" if _is_sim else "REALIZED (LIVE)")
+            except Exception:
+                pass
+            rebalance_btn = card.get("rebalance_btn")
+            if rebalance_btn is not None:
+                if running:
+                    rebalance_btn.configure(
+                        state="normal",
+                        fg_color="#6D28D9",
+                        hover_color="#5b21b6",
+                        text_color="#ffffff",
+                        border_width=0,
+                    )
+                else:
+                    rebalance_btn.configure(
+                        state="disabled",
+                        fg_color="transparent",
+                        hover_color=COLORS["panel_hover"],
+                        text_color=COLORS["text_muted"],
+                        border_width=1,
+                        border_color=COLORS["border"],
+                    )
 
             restart_reason = self._config_restart_required_reason(bot)
             if restart_reason:
@@ -3163,7 +3328,8 @@ class ObsidianApp(ctk.CTk):
             color = COLORS["success"] if stats["pnl"] > 0 else COLORS["danger"] if stats["pnl"] < 0 else COLORS["text_dim"]
             card["pnl_lbl"].configure(text_color=color)
             card["total_var"].set(str(stats["total"]))
-            card["today_var"].set(f"{stats['today_cnt']}")
+            today_pnl = float(stats.get("today_pnl", 0.0) or 0.0)
+            card["today_var"].set(f"{today_pnl:+.2f}")
             if stats["total"] > 0:
                 card["wr_var"].set(f"{stats['wr']:.0f}%")
             else:
@@ -3252,8 +3418,15 @@ class ObsidianApp(ctk.CTk):
         live_bal = cache.get("balance_live",  "")
         sim_bal  = cache.get("balance_paper", "")
 
-        any_live = any(not self.config[b].get("SIMULATION", True) for b in BOT_ORDER)
-        any_sim  = any(self.config[b].get("SIMULATION", True)     for b in BOT_ORDER)
+        mode_cache = cache.get("mode_is_sim") or {}
+
+        def _cache_sim(bot: str) -> bool:
+            if bot in mode_cache:
+                return bool(mode_cache[bot])
+            return bool(self.config.get(bot, {}).get("SIMULATION", True))
+
+        any_live = any(not _cache_sim(b) for b in BOT_ORDER)
+        any_sim  = any(_cache_sim(b) for b in BOT_ORDER)
 
         # Live-Guthaben Sektion
         if any_live:
@@ -3359,7 +3532,7 @@ class ObsidianApp(ctk.CTk):
             # bot's realized PnL must not leak into it (separate worlds).
             all_stats = cache.get("stats", {})
             raw_pnl   = sum(s["pnl"] for b, s in all_stats.items()
-                            if self.config.get(b, {}).get("SIMULATION", True))
+                            if _cache_sim(b))
             vc_value  = 1000.0 + raw_pnl - self._vc_offset
             self.sb_balance_sim.set(f"{vc_value:.2f} USDT")
         else:
@@ -3372,7 +3545,7 @@ class ObsidianApp(ctk.CTk):
         money_scope_live = any_live
         scoped_stats = [
             s for b, s in all_stats.items()
-            if bool(self.config.get(b, {}).get("SIMULATION", True)) != money_scope_live
+            if _cache_sim(b) != money_scope_live
         ]
         total       = sum(float(s.get("pnl", 0.0) or 0.0) for s in scoped_stats)
         total_today = sum(float(s.get("today_pnl", 0.0) or 0.0) for s in scoped_stats)
@@ -3411,13 +3584,13 @@ class ObsidianApp(ctk.CTk):
         total_open = sum(
             int(open_cache.get(b, 0) or 0)
             for b in BOT_ORDER
-            if bool(self.config.get(b, {}).get("SIMULATION", True)) != money_scope_live
+            if _cache_sim(b) != money_scope_live
         )
         if total_open > 0:
             total_unr = sum(
                 float(unr_cache.get(b, 0.0) or 0.0)
                 for b in BOT_ORDER
-                if bool(self.config.get(b, {}).get("SIMULATION", True)) != money_scope_live
+                if _cache_sim(b) != money_scope_live
             )
             sign_u = "+" if total_unr >= 0 else ""
             self.sb_unr_total.set(f"{sign_u}{total_unr:.2f} USDT")
@@ -3442,7 +3615,7 @@ class ObsidianApp(ctk.CTk):
                     text_color=_hl if _n > 0 else COLORS["text"])
             except Exception:
                 pass
-        fut_open = cache.get("futures_positions", 0)
+        fut_open = open_cache.get("FUTURES", 0)
         self.sb_fut_pos.set(str(fut_open))
         if fut_open > 0:
             self.sb_fut_pos._lbl.configure(text_color=COLORS["futures"])
@@ -3626,13 +3799,28 @@ class ObsidianApp(ctk.CTk):
           2. If bots running but no positions  ask Stop & Quit or Background
           3. If nothing running  close immediately
         """
-        any_running = any(b.is_running() for b in self.bots.values())
-        if not any_running:
+        running = [name for name, bot in self.bots.items() if bot.is_running()]
+        external = self._externally_active_bots()
+        if not running and not external:
             self._shutdown_clean()
             return
 
+        if external:
+            from tkinter import messagebox
+            names = ", ".join(external.keys())
+            messagebox.showwarning(
+                "External bots running",
+                "Der Launcher sieht laufende Bot-Prozesse, die nicht von "
+                f"diesem Fenster gestartet wurden: {names}.\n\n"
+                "Bitte diese Session zuerst sauber stoppen. Der Launcher "
+                "schliesst jetzt nicht, damit kein Live-Prozess unbeaufsichtigt "
+                "weiterlaeuft."
+            )
+            return
+
         # Check if any bot has open positions
-        open_summary = {}  # bot_name  count
+        open_summary = {}  # bot_name  {"count": int, "modes": set[str]}
+        state_read_errors = []
         # Count per bot using the SAME source the close path uses: futures-type
         # bots (FUTURES, CROSS) from their scoped futures_state, spot bots from
         # their trades.json. Keeps the quit summary consistent with what each
@@ -3641,13 +3829,25 @@ class ObsidianApp(ctk.CTk):
         for _bot in _ORDER:
             try:
                 if _BM[_bot].get("is_futures"):
-                    n_open = len(self._get_open_futures_positions(_bot))
+                    positions = self._get_open_futures_positions(_bot)
                 else:
-                    n_open = len(self._get_open_spot_positions(_bot))
+                    positions = self._get_open_spot_positions(_bot)
+                n_open = len(positions)
                 if n_open > 0:
-                    open_summary[_bot] = n_open
-            except Exception:
-                pass
+                    modes = {
+                        str(p.get("mode") or "").upper()
+                        for p in positions
+                        if isinstance(p, dict) and p.get("mode")
+                    }
+                    open_summary[_bot] = {"count": n_open, "modes": modes}
+            except Exception as exc:
+                state_read_errors.append(f"{_bot}: {exc}")
+
+        if state_read_errors:
+            from launcher.ui.dialogs.shutdown import show_state_read_error_dialog
+            show_state_read_error_dialog(
+                self, "Quit Application", "\n".join(state_read_errors))
+            return
 
         if open_summary:
             self._show_quit_with_positions_dialog(open_summary)

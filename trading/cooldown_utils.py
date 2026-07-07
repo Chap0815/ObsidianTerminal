@@ -171,6 +171,8 @@ def _file_lock(path: str, timeout: float = 5.0):
             time.sleep(0.05)
 
     try:
+        if not acquired:
+            raise TimeoutError(f"cooldown lock timeout: {lock_path}")
         yield
     finally:
         if acquired:
@@ -183,17 +185,17 @@ def _file_lock(path: str, timeout: float = 5.0):
 #  Public API 
 
 def set_cooldown(cool: dict, symbol: str, minutes: int,
-                 cooldown_file: str) -> None:
+                 cooldown_file: str) -> bool:
     """Set a cooldown for ``minutes`` minutes from now."""
     minutes = max(0, int(minutes))
     if minutes == 0:
-        return
+        return True
     expiry_iso = (_utcnow() + timedelta(minutes=minutes)).isoformat()
     snapshot = None
     with _COOLDOWN_LOCK:
         cool[symbol] = expiry_iso
         snapshot = dict(cool)
-    _persist(cooldown_file, snapshot)
+    return _persist(cooldown_file, snapshot)
 
 
 def check_in_cooldown(cool: dict, symbol: str) -> bool:
@@ -265,25 +267,27 @@ def purge_expired(cool: dict, cooldown_file: str) -> int:
 
 #  Persistence 
 
-def _persist(path: str, data: dict) -> None:
+def _persist(path: str, data: dict) -> bool:
     if not path:
-        return
+        return False
     try:
         with _file_lock(path):
             _atomic_write_json(path, data)
+        return True
     except Exception:
         try:
             from core.logger import log_event
             log_event(f"[cooldown] persist failed: {path}", "WARN")
         except Exception:
             pass
+        return False
 
 
 def _atomic_write_json(path: str, data: dict) -> None:
     """Retry budget for Windows AV scan interference."""
     import json
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)

@@ -56,6 +56,8 @@ def maybe_send_hourly_status(*, bot_name: str, is_futures: bool,
 
     Default cadence is every 3h (10800s) for all bots."""
     now = time.time()
+    if simulation:
+        return now
     if now - last_sent < interval_sec:
         return last_sent
 
@@ -75,7 +77,8 @@ def maybe_send_hourly_status(*, bot_name: str, is_futures: bool,
 
         realized = 0.0
         try:
-            realized = float(get_today_pnl(bot_name).get("total_profit", 0.0) or 0.0)
+            realized = float(get_today_pnl(
+                bot_name, mode_is_sim=simulation).get("total_profit", 0.0) or 0.0)
         except Exception:
             pass
 

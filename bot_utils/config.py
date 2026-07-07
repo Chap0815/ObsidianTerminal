@@ -33,9 +33,9 @@ _INT_FIELDS = frozenset((
     "FAILED_ENTRY_MAX_AGE_MIN",
 ))
 # LEVERAGE is kept as a FLOAT so a bot can run a fractional EFFECTIVE leverage
-# (e.g. 1.5: size notional = margin1.5, send ceil()=2 to the exchange as the
-# integer cap). The legacy futures/cross bots int() it at the point of use, so
-# this is a no-op for them; only a float-aware bot benefits.
+# (e.g. 1.5: size notional = margin*1.5, send ceil()=2 to the exchange as the
+# integer cap). Legacy FUTURES deliberately validates integer leverage; FUTREND
+# and CROSS are float-aware at their own runtime boundaries.
 
 
 _CLAMPS = {
@@ -58,7 +58,7 @@ _CLAMPS = {
     "COOLDOWN_AFTER_SL": (0, 1440, int),
     "MONITOR_INTERVAL":  (5, 600, int),
     "MAX_OPEN_TRADES":   (1, 50, int),
-    "MAX_NEW_TRADES_PER_TICK": (0, 10, int),
+    "MAX_NEW_TRADES_PER_TICK": (0, 50, int),
     "LEVERAGE":          (1.0, 25.0, float),
     "LIQ_SAFETY_PCT":    (0.01, 100.0, float),
     "MAX_DAILY_LOSS_HARD_MULT": (1.0, 5.0, float),
@@ -71,9 +71,17 @@ _CLAMPS = {
     "TREND_EXIT_VOTE":   (1, 3, int),
     "TREND_SMA_FAST":    (1, 5000, int),
     "TREND_SMA_SLOW":    (1, 5000, int),
+    "TREND_CROSS_FAST":  (1, 5000, int),
+    "TREND_CROSS_SLOW":  (1, 5000, int),
     "TREND_VOL_TARGET":  (0, 1, int),
-    "TREND_VOL_TARGET_LOOKBACK": (5, 300, int),
-    "TREND_EXIT_STALE_LIMIT": (1, 10, int),
+    "TREND_VOL_TARGET_LOOKBACK": (2, 500, int),
+    "TREND_EXIT_STALE_LIMIT": (1, 50, int),
+    "XSEC_K":            (1, 15, int),
+    "XSEC_LOOKBACK_HOURS":   (6, 336, int),
+    "XSEC_REBALANCE_HOURS":  (6, 336, int),
+    "XSEC_UNIVERSE_SIZE":    (10, 100, int),
+    "CRASH_WINDOW":      (1, 50, int),
+    "XSEC_MAX_SPREAD_PCT":   (0.01, 10.0, float),
 }
 
 _CLAMP_DEFAULTS = {
@@ -109,9 +117,17 @@ _CLAMP_DEFAULTS = {
     "TREND_EXIT_VOTE": 2,
     "TREND_SMA_FAST": 50,
     "TREND_SMA_SLOW": 100,
+    "TREND_CROSS_FAST": 20,
+    "TREND_CROSS_SLOW": 50,
     "TREND_VOL_TARGET": 0,
     "TREND_VOL_TARGET_LOOKBACK": 30,
     "TREND_EXIT_STALE_LIMIT": 3,
+    "XSEC_K": 2,
+    "XSEC_LOOKBACK_HOURS": 24,
+    "XSEC_REBALANCE_HOURS": 48,
+    "XSEC_UNIVERSE_SIZE": 30,
+    "CRASH_WINDOW": 4,
+    "XSEC_MAX_SPREAD_PCT": 0.5,
 }
 
 _POSITION_LIMIT_BY_BOT = {
@@ -360,7 +376,7 @@ def get_live_value(bot_name: str, key: str, default: Any = None,
             fv = float(raw)
             if fv >= 0.0:
                 return fallback_cfg.get(key, default)
-            return fv
+            return _clamp(key, fv)
         if key in _INT_FIELDS:
             return _clamp(key, int(raw))
         fb = fallback_cfg.get(key, default)
@@ -372,7 +388,7 @@ def get_live_value(bot_name: str, key: str, default: Any = None,
                     bot_name, key, raw, section, fallback_cfg, default
                 )
             val = _clamp(key, float(raw))
-            if key == "TRAILING_DISTANCE":
+            if key in {"TRAILING_DISTANCE", "POST_PARTIAL_TRAILING_DISTANCE"}:
                 try:
                     activation = float(section.get(
                         "ACTIVATION_PROFIT",

@@ -48,7 +48,9 @@ class FuturesExitsMixin:
         remaining = []
         for item in pending:
             try:
-                saved = bool(save_trade_db(**dict(item)))
+                retry_item = dict(item)
+                retry_item.setdefault("mode_is_sim", self.simulation)
+                saved = bool(save_trade_db(**retry_item))
             except Exception as exc:
                 saved = False
                 self._log_error(f"futures partial accounting retry {sym}", exc)
@@ -61,6 +63,60 @@ class FuturesExitsMixin:
                 f"event(s) still pending", "WARN")
         else:
             log_event(f"{sym}: pending futures partial accounting flushed", "INFO")
+
+    def _cleanup_accounted_close_state(self, sym: str, d: dict) -> bool:
+        """Remove dashboard/local state after PnL was already booked.
+
+        If cleanup fails, keep a marked local row so the next monitor/reconcile
+        pass retries cleanup instead of sending another reduce-only close.
+        """
+        from core.logger import log_event
+        from core.database import remove_futures_state
+        from bot_utils.trade_state import remove_with_restore_fields
+
+        restore = {
+            "accounting_already_booked": True,
+            "accounting_booked_sell_time": d.get("accounting_booked_sell_time")
+                                      or d.get("sell_time"),
+            "accounting_booked_exchange_order_id": (
+                d.get("accounting_booked_exchange_order_id")
+                or d.get("exchange_order_id")
+            ),
+            "accounting_booked_reason": (
+                d.get("accounting_booked_reason")
+                or d.get("accounting_pending_reason")
+                or d.get("reason")
+                or "Close"
+            ),
+        }
+        try:
+            remove_futures_state(
+                sym, self.BOT_NAME,
+                mode_is_sim=getattr(self, "simulation", None))
+        except Exception as exc:
+            self._log_error(f"remove_futures_state accounted {sym}", exc)
+            try:
+                keep = dict(restore)
+                keep["futures_state_cleanup_pending"] = True
+                self.state.update_many(sym, keep)
+            except Exception as state_exc:
+                self._log_error(f"mark futures cleanup pending {sym}", state_exc)
+            log_event(
+                f"{sym}: close already booked, but futures_state cleanup "
+                f"failed; state kept for retry",
+                "WARN",
+            )
+            return False
+
+        ok = remove_with_restore_fields(self.state, sym, restore)
+        if not ok:
+            log_event(
+                f"{sym}: close already booked, but claim/state cleanup "
+                f"failed; state kept for retry",
+                "WARN",
+            )
+            return False
+        return True
 
     def _monitor_loop(self):
         """Thread body - runs forever until shutdown_event is set."""
@@ -176,7 +232,7 @@ class FuturesExitsMixin:
             from core.logger import log_event
             if not getattr(self, "safe_mode", None):
                 return  # bot not fully initialized yet
-            pnl_info = get_today_pnl(self.BOT_NAME)
+            pnl_info = get_today_pnl(self.BOT_NAME, mode_is_sim=self.simulation)
             today_realized = pnl_info.get("total_profit", 0.0)
             # Add unrealized from open positions (best-effort). Track two totals:
   #  unrealized_all  every open position (genuine current risk)
@@ -477,15 +533,25 @@ class FuturesExitsMixin:
         from core.logger import log_event
         from core.database import upsert_futures_state
 
+        if d.get("accounting_already_booked"):
+            FuturesExitsMixin._cleanup_accounted_close_state(self, sym, d)
+            return
         if d.get("accounting_pending"):
             try:
-                from core.database import remove_futures_state
                 if self._record_offline_close(sym, d):
-                    try:
-                        remove_futures_state(sym, self.BOT_NAME)
-                    except Exception:
-                        pass
-                    self.state.remove(sym)
+                    booked = dict(d)
+                    booked.update({
+                        "accounting_already_booked": True,
+                        "accounting_booked_sell_time": (
+                            d.get("accounting_pending_sell_time")),
+                        "accounting_booked_exchange_order_id": (
+                            d.get("accounting_pending_exchange_order_id")),
+                        "accounting_booked_reason": (
+                            d.get("accounting_pending_reason")
+                            or "Offline close"),
+                    })
+                    FuturesExitsMixin._cleanup_accounted_close_state(
+                        self, sym, booked)
             except Exception as exc:
                 self._log_error(f"futures pending accounting retry {sym}", exc)
             return
@@ -639,7 +705,7 @@ class FuturesExitsMixin:
         # Dashboard state
         try:
             upsert_futures_state(
-                symbol=sym, bot_name=self.BOT_NAME,
+                symbol=sym, bot_name=self.BOT_NAME, mode_is_sim=self.simulation,
                 position_type=pos_type,
                 entry_price=entry, current_price=curr,
                 leverage=lev, margin_usdt=margin,
@@ -984,7 +1050,9 @@ class FuturesExitsMixin:
         # DB row
         sell_time = _utc_now_str()
         partial_trade = dict(
-            bot_name=self.BOT_NAME, symbol=sym,
+            bot_name=self.BOT_NAME,
+            mode_is_sim=self.simulation,
+            symbol=sym,
             buy_price=entry, sell_price=fill_price,
             buy_time=d.get("buy_time", ""),
             sell_time=sell_time,
@@ -1063,7 +1131,7 @@ class FuturesExitsMixin:
         positions on the exchange.
         """
         from core.logger import log_event, log_sell, send_telegram, save_trade, log_struct
-        from core.database import save_trade_db, remove_futures_state
+        from core.database import save_trade_db
         from config.exchange_config import reduce_only_params
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
         from trading.risk_manager import analyze_and_adapt
@@ -1075,6 +1143,13 @@ class FuturesExitsMixin:
                                  verify_position_closed)
 
         symbol_full = f"{sym}/USDT:USDT"
+        if d.get("verified_flat_pending_accounting"):
+            log_event(
+                f"{sym}: position already verified flat; waiting for "
+                f"reconcile/offline accounting",
+                "WARN",
+            )
+            return
         fill_price = curr
         close_fee = 0.0
         raw_amount = abs(float(d.get("amount", 0)))
@@ -1089,6 +1164,9 @@ class FuturesExitsMixin:
                              * taker_fee_rate(self.ex, symbol_full, 0.0006))
 
         if not self.simulation:
+            order = None
+            close_amount = raw_amount
+            order_filled = 0.0
             try:
                 close_side = "sell" if pos_type == "LONG" else "buy"
                 try:
@@ -1114,6 +1192,10 @@ class FuturesExitsMixin:
                 )
                 exch_oid = order.get("id") or order.get("orderId")
                 try:
+                    order_filled = max(0.0, float(order.get("filled") or 0.0))
+                except (TypeError, ValueError):
+                    order_filled = 0.0
+                try:
                     from bot_utils.futures_exits import _resolve_fill_price
                     fill_price, _fill_src = _resolve_fill_price(
                         self.ex, symbol_full, order, fill_price, log_event)
@@ -1128,40 +1210,70 @@ class FuturesExitsMixin:
                                     break
                             except (TypeError, ValueError):
                                 continue
-                close_fee = extract_order_fee_futures(order)
-                # Refetch + estimate fallback. Bitget often returns fee=0 on the
-                # first close-order response and settles the fee ~300-500ms
-                # later.
-                if close_fee <= 0 and order.get("id"):
-                    try:
-                        close_fee = extract_or_estimate_futures_fee(
-                            self.ex, order, symbol_full, fill_price,
-                            amount=close_amount, contract_size=contract_size,
-                        )
-                    except Exception as fe:
-                        log_event(f"fee refetch+estimate for {sym} failed: {fe}", "INFO")
-                try:
-                    self.state.update_many(sym, {
-                        "pending_close_price": fill_price,
-                        "pending_close_fee": close_fee,
-                        "pending_close_order_id": exch_oid,
-                    })
-                except Exception:
-                    pass
+                close_fee = 0.0
             except Exception as e:
                 if is_no_position_error(e):
+                    pending_oid = d.get("pending_close_order_id")
+                    if not pending_oid:
+                        try:
+                            closed, remaining = verify_position_closed(self.ex, symbol_full)
+                        except Exception as ve:
+                            self._log_error(f"verify-flat-after-no-position {sym}", ve)
+                            log_event(
+                                f"{sym}: close error looked already-flat but "
+                                f"verification failed - keeping state for reconcile",
+                                "WARN",
+                            )
+                            return
+                        if closed:
+                            try:
+                                self.state.update_many(sym, {
+                                    "verified_flat_pending_accounting": True,
+                                    "verified_flat_reason": reason,
+                                    "verified_flat_at": _utc_now_str(),
+                                })
+                            except Exception as state_err:
+                                log_event(
+                                    f"{sym}: failed to mark verified-flat "
+                                    f"state: {state_err}",
+                                    "WARN",
+                                )
+                            log_event(
+                                f"{sym}: position already flat on exchange "
+                                f"({str(e)[:80]}) - keeping state for "
+                                f"reconcile/offline accounting",
+                                "WARN",
+                            )
+                            return
+                        log_event(
+                            f"{sym}: close error looked already-flat but "
+                            f"{remaining:.6f} contracts remain - keeping state "
+                            f"for retry",
+                            "WARN",
+                        )
+                        return
                     try:
-                        fill_price = float(d.get("pending_close_price") or fill_price)
-                    except (TypeError, ValueError):
-                        pass
-                    try:
-                        close_fee = float(d.get("pending_close_fee") or close_fee)
-                    except (TypeError, ValueError):
-                        pass
-                    exch_oid = d.get("pending_close_order_id") or exch_oid
+                        from bot_utils.close_fragments import pending_close_values
+                        _amt, _px, _fee, _oid = pending_close_values(d)
+                        if _px > 0:
+                            fill_price = _px
+                        close_fee = _fee
+                        if _oid:
+                            pending_oid = _oid
+                    except Exception:
+                        try:
+                            fill_price = float(d.get("pending_close_price") or fill_price)
+                        except (TypeError, ValueError):
+                            pass
+                        try:
+                            close_fee = float(d.get("pending_close_fee") or close_fee)
+                        except (TypeError, ValueError):
+                            pass
+                    exch_oid = pending_oid or exch_oid
                     log_event(
                         f"{sym}: position no longer exists on exchange "
-                        f"({str(e)[:80]}). Cleaning up local state.",
+                        f"({str(e)[:80]}) after our close order - "
+                        f"booking pending close.",
                         "WARN"
                     )
                 else:
@@ -1174,16 +1286,27 @@ class FuturesExitsMixin:
 
   #  VERIFY BEFORE BOOKING 
         # Confirm the position is flat (verify_position_closed) BEFORE writing
-  # PnL  DB  Telegram. On a partial OR unverifiable close, keep the FULL
-  # state untouched and retry next tick  the reduce-only retry caps to
-        # the real remaining size, so the eventual confirmed full-close books
-        # the correct total exactly once. We deliberately do NOT book the
-        # partial slice here, which makes double-counting structurally
-        # impossible.
+        # PnL  DB  Telegram. On a partial OR unverifiable close, keep the state
+        # open and retry next tick. Verified partial fill fragments are stored
+        # as weighted pending close data so the eventual confirmed full-close
+        # books the correct total exactly once.
         if not self.simulation:
             try:
                 closed, remaining = verify_position_closed(self.ex, symbol_full)
             except Exception as e:
+                if order_filled > 0 and fill_price > 0:
+                    try:
+                        from bot_utils.close_fragments import add_close_fragment_update
+                        frag_fee = extract_or_estimate_futures_fee(
+                            self.ex, order or {}, symbol_full, fill_price,
+                            amount=order_filled, contract_size=contract_size,
+                        )
+                        self.state.update_many(sym, add_close_fragment_update(
+                            d, amount=order_filled, price=fill_price,
+                            fee=frag_fee, order_id=exch_oid,
+                        ))
+                    except Exception:
+                        pass
                 self._log_error(f"verify-close {sym}", e)
                 log_event(
                     f"{sym}: close verification raised - keeping state, "
@@ -1191,15 +1314,68 @@ class FuturesExitsMixin:
                 return
             if not closed:
                 if remaining > 0:
+                    try:
+                        from bot_utils.close_fragments import (
+                            add_close_fragment_update, pending_close_values)
+                        prev_amount, _px, _fee, _oid = pending_close_values(d)
+                        total_filled = max(0.0, raw_amount - float(remaining))
+                        fragment = max(0.0, total_filled - prev_amount)
+                        if fragment > 0 and fill_price > 0:
+                            frag_fee = extract_or_estimate_futures_fee(
+                                self.ex, order or {}, symbol_full, fill_price,
+                                amount=fragment, contract_size=contract_size,
+                            )
+                            self.state.update_many(sym, add_close_fragment_update(
+                                d, amount=fragment, price=fill_price,
+                                fee=frag_fee, order_id=exch_oid,
+                            ))
+                    except Exception:
+                        pass
                     log_event(
                         f"{sym}: close incomplete - {remaining:.6f} contracts "
                         f"still open. Keeping full state, retry next tick "
-                        f"(NOT booking partial - prevents double-count).", "WARN")
+                        f"(partial fill accounted pending).", "WARN")
                 else:
                     log_event(
                         f"{sym}: close could not be verified (API glitch). "
                         f"Keeping state, retry next tick.", "WARN")
                 return
+            try:
+                from bot_utils.close_fragments import (
+                    add_close_fragment_update, pending_close_values)
+                prev_amount, _px, _fee, _oid = pending_close_values(d)
+                fragment = max(0.0, raw_amount - prev_amount)
+                if fragment > 0 and fill_price > 0:
+                    frag_fee = extract_or_estimate_futures_fee(
+                        self.ex, order or {}, symbol_full, fill_price,
+                        amount=fragment, contract_size=contract_size,
+                    )
+                    pending_view = dict(d)
+                    pending_view.update(add_close_fragment_update(
+                        d, amount=fragment, price=fill_price,
+                        fee=frag_fee, order_id=exch_oid,
+                    ))
+                    _amt, _price, _fee, _oid = pending_close_values(pending_view)
+                    if _amt > 0 and _price > 0:
+                        fill_price = _price
+                        close_fee = _fee
+                        exch_oid = _oid or exch_oid
+                else:
+                    _amt, _price, _fee, _oid = pending_close_values(d)
+                    if _amt > 0 and _price > 0:
+                        fill_price = _price
+                        close_fee = _fee
+                        exch_oid = _oid or exch_oid
+            except Exception:
+                close_fee = extract_order_fee_futures(order or {})
+                if close_fee <= 0:
+                    try:
+                        close_fee = extract_or_estimate_futures_fee(
+                            self.ex, order or {}, symbol_full, fill_price,
+                            amount=raw_amount, contract_size=contract_size,
+                        )
+                    except Exception:
+                        close_fee = 0.0
 
         # PnL with real fill + funding + proportional entry fee
         move_pct_real = price_move_pct(entry, fill_price, pos_type) if entry > 0 else move_pct
@@ -1267,7 +1443,7 @@ class FuturesExitsMixin:
         accounting_error = None
         try:
             accounting_ok = bool(save_trade_db(
-                bot_name=self.BOT_NAME, symbol=sym,
+                bot_name=self.BOT_NAME, mode_is_sim=self.simulation, symbol=sym,
                 buy_price=entry, sell_price=fill_price,
                 buy_time=buy_time, sell_time=sell_time,
                 profit_pct=move_pct_real, profit_usdt=profit_usdt,
@@ -1301,6 +1477,7 @@ class FuturesExitsMixin:
                     "accounting_pending_sell_time": sell_time,
                     "accounting_pending_profit_pct": move_pct_real,
                     "accounting_pending_profit_usdt": profit_usdt,
+                    "accounting_pending_mode_is_sim": self.simulation,
                     "accounting_pending_fees_usdt": slice_fees,
                     "accounting_pending_funding_paid": funding_pd,
                     "accounting_pending_exchange_order_id": exch_oid,
@@ -1368,11 +1545,14 @@ class FuturesExitsMixin:
         # this method, so booking + removal here are unconditional.
         # Scope by bot: FUTURES + CROSS share futures_state; an unscoped delete
         # would wipe the OTHER bot's dashboard row for the same base coin.
-        try:
-            remove_futures_state(sym, self.BOT_NAME)
-        except Exception:
-            pass
-        self.state.remove(sym)
+        cleanup_row = dict(d)
+        cleanup_row.update({
+            "accounting_already_booked": True,
+            "accounting_booked_sell_time": sell_time,
+            "accounting_booked_exchange_order_id": exch_oid,
+            "accounting_booked_reason": reason,
+        })
+        FuturesExitsMixin._cleanup_accounted_close_state(self, sym, cleanup_row)
         try:
             analyze_and_adapt(self.BOT_NAME)
         except Exception as e:

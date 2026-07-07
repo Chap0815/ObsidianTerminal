@@ -37,6 +37,14 @@ from launcher.core.system_monitor import get_system_stats
 _RUNTIME_MODE_MAX_AGE_SEC = 180.0
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        from core.process_identity import pid_alive
+        return pid_alive(pid)
+    except Exception:
+        return False
+
+
 def _runtime_status_is_fresh(rs: dict, *, now: float | None = None) -> bool:
     """Runtime mode is authoritative only while its heartbeat is recent."""
     if not isinstance(rs, dict):
@@ -44,6 +52,13 @@ def _runtime_status_is_fresh(rs: dict, *, now: float | None = None) -> bool:
     status = str(rs.get("status") or "").lower()
     if status not in {"starting", "started", "ready", "running", "degraded"}:
         return False
+    try:
+        wall_ts = float(rs.get("wall_ts") or rs.get("epoch_ts") or 0.0)
+    except (TypeError, ValueError):
+        wall_ts = 0.0
+    if wall_ts > 0:
+        age = time.time() - wall_ts
+        return -5.0 <= age <= _RUNTIME_MODE_MAX_AGE_SEC
     try:
         mono = float(rs.get("monotonic_ts") or 0.0)
     except (TypeError, ValueError):
@@ -59,8 +74,24 @@ def _runtime_or_config_sim(bot: str, cfg: dict | None = None) -> bool:
     try:
         from core.runtime_status import read_runtime_status
         rs = read_runtime_status(BOT_META[bot]["log_dir"])
+        try:
+            pid = int(rs.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
         if _runtime_status_is_fresh(rs) and "simulation" in rs:
+            try:
+                from core.process_identity import pid_matches_bot
+                if not pid_matches_bot(pid, bot):
+                    raise RuntimeError("runtime pid does not match bot")
+            except Exception:
+                raise
             return bool(rs.get("simulation"))
+    except Exception:
+        pass
+    try:
+        from bot_utils.sim_flag import read_simulation_flag
+        return bool(read_simulation_flag(
+            bot, raise_on_corrupt=False, default=True))
     except Exception:
         pass
     try:
@@ -227,6 +258,7 @@ class DataPoller:
                     bot: _runtime_or_config_sim(bot, cfg_snapshot)
                     for bot in BOT_ORDER
                 }
+                new_data["mode_is_sim"] = dict(mode_is_sim)
 
                 stats: dict = {}
                 opens: dict = {}
@@ -236,7 +268,7 @@ class DataPoller:
                         # Futures-type bots (FUTURES, CROSS) use futures_state as
                         # the authoritative source  SCOPED PER BOT so they don't
                         # sum each other's positions (both share the table).
-                        opens[bot] = get_futures_state_count(bot)
+                        opens[bot] = get_futures_state_count(bot, mode_is_sim=mode_is_sim[bot])
                     else:
                         opens[bot] = len(get_open_trades(
                             BOT_META[bot]["log_dir"], bot,
@@ -277,7 +309,8 @@ class DataPoller:
                     # gets its own unrealized shown).
                     for fut_bot in BOT_ORDER:
                         if BOT_META[fut_bot].get("is_futures"):
-                            unr[fut_bot] = get_unrealized_pnl_futures(fut_bot)
+                            unr[fut_bot] = get_unrealized_pnl_futures(
+                                fut_bot, mode_is_sim=mode_is_sim[fut_bot])
                     # SPOT bots: live ticker prices (one batch call per bot)
                     for spot_bot in ("TREND", "SPOT"):
                         try:
@@ -321,19 +354,10 @@ class DataPoller:
                         # Read each bot's SIMULATION flag and include only those
                         # in paper mode (SIM and LIVE are separate worlds).
                         stats = new_data.get("stats", self.cache["stats"])
-                        _sim_bots = set()
-                        _vcfg = None
-                        try:
-                            if os.path.exists(CONFIG_FILE):
-                                with open(CONFIG_FILE, "r", encoding="utf-8-sig") as _vf:
-                                    _vcfg = json.load(_vf)
-                                for _vb in BOT_ORDER:
-                                    if _runtime_or_config_sim(_vb, _vcfg):
-                                        _sim_bots.add(_vb)
-                            else:
-                                _sim_bots = set(stats.keys())
-                        except Exception:
-                            _sim_bots = set(stats.keys())
+                        _sim_bots = {
+                            _vb for _vb in BOT_ORDER
+                            if mode_is_sim.get(_vb, True)
+                        }
                         paper_pnl = sum(s["pnl"] for _b, s in stats.items()
                                         if _b in _sim_bots)
                         new_data["balance_paper"] = f"{1000.0 + paper_pnl:.2f} USDT"

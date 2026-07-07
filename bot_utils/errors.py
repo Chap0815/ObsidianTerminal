@@ -10,6 +10,7 @@ back to stderr so a critical error is never silently lost.
 from __future__ import annotations
 
 import sys
+import re
 import threading
 import time
 import traceback as _traceback
@@ -26,6 +27,20 @@ _WRITE_LOCK = threading.Lock()
 # enough for practical contention.
 _RETRY_ATTEMPTS = 5
 _RETRY_BASE_SLEEP = 0.05
+
+
+def _fallback_redact(text: str) -> str:
+    """Small local redactor used if core.logger cannot be imported yet."""
+    s = str(text)
+    s = re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b", "[REDACTED_TELEGRAM]", s)
+    s = re.sub(
+        r"(?i)\b(api[_-]?key|secret|passphrase|password|token)"
+        r"([\"'\s:=]+)([^\"'\s,;}]{6,})",
+        r"\1\2[REDACTED]",
+        s,
+    )
+    s = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}", r"\1[REDACTED]", s)
+    return s
 
 
 def _stderr_fallback(line: str) -> None:
@@ -58,7 +73,7 @@ def log_error(bot_name: str, context: str, exc: Exception) -> None:
         from core.logger import redact, _rotate_if_needed
         from core.constants import ERROR_LOG_MAX_BYTES, ERROR_LOG_BACKUPS
     except ImportError:
-        def redact(s): return s
+        redact = _fallback_redact
         def _rotate_if_needed(*a, **kw): pass
         ERROR_LOG_MAX_BYTES = 10 * 1024 * 1024
         ERROR_LOG_BACKUPS = 3

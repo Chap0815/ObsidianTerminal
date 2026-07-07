@@ -197,7 +197,12 @@ class WebSocketFeed:
             try:
                 self._loop.run_until_complete(self._ws_main(symbols))
             except Exception as e:
-                print(f"[WSFeed] WS failed: {e}  falling back to REST pool")
+                try:
+                    from core.logger import log_event
+                    log_event(f"[WSFeed] WS failed: {e}  falling back to "
+                              f"REST pool", "WARN")
+                except Exception:
+                    print(f"[WSFeed] WS failed: {e}  falling back to REST pool")
                 # Clear cache on fallback to avoid trading on stale data
                 with self._cache_lock:
                     self._cache.clear()
@@ -249,7 +254,13 @@ class WebSocketFeed:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"[WSFeed] WS error: {e}  reconnecting in {backoff:.0f}s")
+                try:
+                    from core.logger import log_event
+                    log_event(f"[WSFeed] WS error: {e}  reconnecting in "
+                              f"{backoff:.0f}s", "WARN")
+                except Exception:
+                    print(f"[WSFeed] WS error: {e}  reconnecting in "
+                          f"{backoff:.0f}s")
             finally:
                 with self._async_ex_lock:
                     if self._async_ex is async_ex:

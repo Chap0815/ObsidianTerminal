@@ -73,6 +73,65 @@ def runtime_status_path(log_dir: str | os.PathLike[str]) -> Path:
     return PROJECT_ROOT / str(log_dir) / "runtime_status.json"
 
 
+def runtime_status_fallback_path(log_dir: str | os.PathLike[str]) -> Path:
+    return runtime_status_path(log_dir).with_name("runtime_status.fallback.json")
+
+
+def cleanup_runtime_status_temps(logs_root: str | os.PathLike[str] | None = None,
+                                 *,
+                                 min_age_sec: float = 3600.0) -> int:
+    """Remove stale runtime_status temp files left by crashes/file locks."""
+    root = Path(logs_root) if logs_root is not None else PROJECT_ROOT / "logs"
+    cutoff = time.time() - max(0.0, float(min_age_sec))
+    removed = 0
+    try:
+        candidates = list(root.glob("*/runtime_status*.tmp"))
+    except Exception:
+        return 0
+    for path in candidates:
+        try:
+            if path.stat().st_mtime > cutoff:
+                continue
+            path.unlink()
+            removed += 1
+        except Exception as exc:
+            _log_status_write_failure(f"cleanup_runtime_status_temps({path})", exc)
+    return removed
+
+
+def _status_freshness(data: Mapping[str, Any]) -> float:
+    for key in ("wall_ts", "epoch_ts"):
+        try:
+            value = float(data.get(key) or 0.0)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    try:
+        raw = str(data.get("updated_at") or "").strip()
+        if raw:
+            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc)
+            return dt.timestamp()
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(data.get("monotonic_ts") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _write_fallback_status(path: Path, payload: Mapping[str, Any]) -> None:
+    try:
+        fallback = path.with_name("runtime_status.fallback.json")
+        fallback.write_text(
+            json.dumps(dict(payload), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        _log_status_write_failure(f"write_runtime_status fallback({path})", exc)
+
+
 def write_runtime_status(log_dir: str | os.PathLike[str],
                          bot_name: str,
                          status: str,
@@ -91,6 +150,7 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
             "pid": os.getpid(),
             "run_id": os.getenv("BOT_RUN_ID", ""),
             "updated_at": _utc_now(),
+            "wall_ts": time.time(),
             "monotonic_ts": time.monotonic(),
             "build_id": build.get("build_id", "unknown"),
             "build_source": build.get("source", "fallback"),
@@ -115,14 +175,22 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
                 try:
                     os.replace(tmp_name, path)
                     last_err = None
+                    try:
+                        path.with_name("runtime_status.fallback.json").unlink()
+                    except FileNotFoundError:
+                        pass
+                    except Exception as exc:
+                        _log_status_write_failure(
+                            f"write_runtime_status cleanup_fallback({path})", exc)
                     break
-                except PermissionError as exc:
+                except OSError as exc:
                     last_err = exc
                     time.sleep(
                         _STATUS_REPLACE_SLEEP_SEC
                         * (1.0 + (attempt % 3) * 0.25)
                     )
             if last_err is not None:
+                _write_fallback_status(path, payload)
                 _log_status_write_failure(f"write_runtime_status({path})",
                                           last_err)
         finally:
@@ -136,4 +204,21 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
 
 
 def read_runtime_status(log_dir: str | os.PathLike[str]) -> dict:
-    return _read_json(runtime_status_path(log_dir))
+    status, _path = read_runtime_status_with_path(log_dir)
+    return status
+
+
+def read_runtime_status_with_path(
+    log_dir: str | os.PathLike[str],
+) -> tuple[dict, Path | None]:
+    primary_path = runtime_status_path(log_dir)
+    fallback_path = runtime_status_fallback_path(log_dir)
+    primary = _read_json(primary_path)
+    fallback = _read_json(fallback_path)
+    if not fallback:
+        return primary, primary_path if primary else None
+    if not primary:
+        return fallback, fallback_path
+    if _status_freshness(fallback) > _status_freshness(primary):
+        return fallback, fallback_path
+    return primary, primary_path

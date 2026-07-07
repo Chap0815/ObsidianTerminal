@@ -11,9 +11,9 @@ Start:  python -m bots.main_bot_cross
 from __future__ import annotations
 
 try:
-    from bots._bootstrap import prepare_entrypoint, require_portalocker
+    from bots._bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
 except ModuleNotFoundError:
-    from _bootstrap import prepare_entrypoint, require_portalocker
+    from _bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
 
 prepare_entrypoint(__file__, __name__)
 
@@ -42,16 +42,17 @@ class CrossMomentumBot(CrossBot):
     DEFAULTS = {
         # -- Cross-sectional strategy --
         "XSEC_LOOKBACK_HOURS":   24,
-        "XSEC_REBALANCE_HOURS":  72,
-        "XSEC_K":                6,      # per side -> 12 positions
-        "XSEC_UNIVERSE_SIZE":    40,
+        "XSEC_REBALANCE_HOURS":  48.0,
+        "XSEC_K":                2.0,
+        "XSEC_UNIVERSE_SIZE":    30.0,
         "CRASH_FILTER":          1,
         "CRASH_WINDOW":          4,
         "CROSS_NEUTRALITY_TOL_PCT": 15.0,  # trim book if |net|/gross notional > this
-        "PER_LEG_DISASTER_STOP": -25.0,  # single-coin gap protection
+        "PER_LEG_DISASTER_STOP": -8.0,
+        "CROSS_DISASTER_BLACKLIST_HOURS": 72,
         "MIN_VOLUME":            10_000_000.0,  # liquid perps only
         "XSEC_MAX_SPREAD_PCT":   0.5,    # skip a leg if its book spread is wider
-        "BASE_CAPITAL_USDT":     1000.0, # SIM equity / live sizing fallback
+        "BASE_CAPITAL_USDT":     150.0,
         # -- Risk / margin --
         "LEVERAGE":              1.0,    # cross-margin -> keep low (max ~1.5)
         "MARGIN_MODE":           "cross",
@@ -68,7 +69,7 @@ class CrossMomentumBot(CrossBot):
         "BREAKEVEN_TRIGGER":     0.0,
         "COOLDOWN_AFTER_SL":     0,
         "SCAN_INTERVAL":         300,    # banner only (rebalance uses XSEC_*)
-        "SIMULATION":            True,   # paper first
+        "SIMULATION":            True,
     }
 
     @staticmethod
@@ -77,6 +78,7 @@ class CrossMomentumBot(CrossBot):
 
 
 def run_bot():
+    guard_pre_start("CROSS")
     CrossMomentumBot(simulation=read_simulation_flag("CROSS")).run()
 
 

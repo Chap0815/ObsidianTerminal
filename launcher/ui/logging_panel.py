@@ -297,14 +297,14 @@ def update_ai_badge(card: dict, running: bool, global_llm_online: bool,
     """
     var = card["ai_badge_var"]
     lbl = card["ai_badge"]
-    if not uses_llm:
-        var.set("Signal")
-        lbl.configure(text_color=COLORS["text_muted"])
-        return
-
     if not running:
         var.set("AI: -")
         lbl.configure(text_color=COLORS["text_subtle"])
+        return
+
+    if not uses_llm:
+        var.set("Signal")
+        lbl.configure(text_color=COLORS["text_muted"])
         return
 
     mode = card.get("ai_mode", "unknown")

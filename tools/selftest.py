@@ -13,8 +13,10 @@ offline against a throwaway temp DB  it never touches data/trading_bot.db.
 from __future__ import annotations
 
 import os
-import py_compile
 import sys
+import tokenize
+
+sys.dont_write_bytecode = True
 
 # Windows consoles default to cp1252  the / banner would crash on encode.
 for _s in (sys.stdout, sys.stderr):
@@ -71,7 +73,9 @@ def _smoke_without_tests() -> int:
                     continue
                 path = os.path.join(base, name)
                 try:
-                    py_compile.compile(path, doraise=True)
+                    with tokenize.open(path) as fh:
+                        source = fh.read()
+                    compile(source, path, "exec")
                 except Exception as exc:
                     failed.append(f"{os.path.relpath(path, PROJECT_ROOT)}: {exc}")
     if failed:

@@ -23,6 +23,48 @@ from launcher.ui.logging_panel import log_to_card
 from launcher.ui.theme import force_dark_titlebar
 
 
+def show_state_read_error_dialog(app, title: str, detail: str) -> None:
+    """Fail-closed dialog when position state cannot be read."""
+    dlg = ctk.CTkToplevel(app)
+    dlg.title(title)
+    dlg.configure(fg_color=COLORS["panel"])
+    dlg.grab_set()
+    dlg.transient(app)
+    force_dark_titlebar(dlg)
+    safe_geometry(dlg, 500, 220, parent=app)
+
+    ctk.CTkLabel(
+        dlg, text=" Position State Check Failed",
+        font=ctk.CTkFont(FONT_BODY, 16, "bold"),
+        text_color=COLORS["danger"],
+    ).pack(pady=(22, 8), padx=24, anchor="w")
+    ctk.CTkLabel(
+        dlg,
+        text=(
+            "The launcher could not prove that positions are flat.\n"
+            "Stop/quit was aborted to avoid orphaning a live position."
+        ),
+        font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+        text_color=COLORS["text"],
+        justify="left",
+    ).pack(padx=24, pady=(0, 10), anchor="w")
+    ctk.CTkLabel(
+        dlg, text=str(detail)[:300],
+        font=ctk.CTkFont(app.mono_font, 10),
+        text_color=COLORS["text_muted"],
+        justify="left",
+        wraplength=440,
+    ).pack(padx=24, pady=(0, 16), anchor="w")
+    ctk.CTkButton(
+        dlg, text="OK", height=34, width=100,
+        font=ctk.CTkFont(FONT_BODY, 12, "bold"),
+        fg_color=COLORS["danger"],
+        hover_color="#b91c1c",
+        text_color="#ffffff",
+        command=dlg.destroy,
+    ).pack(side="bottom", pady=18)
+
+
 #  Generic busy dialog 
 
 def show_busy_dialog(app, title: str, intro: str, worker, **worker_kwargs) -> None:
@@ -132,9 +174,22 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
                   text_color=COLORS["warning"]
                   ).pack(pady=(20, 4), padx=24, anchor="w")
 
-    sim_mode = app.config[name].get("SIMULATION", True)
-    mode_lbl = "SIMULATION" if sim_mode else "LIVE"
-    mode_color = COLORS["warning"] if sim_mode else COLORS["danger"]
+    modes = sorted({str(p.get("mode") or "").upper() for p in positions
+                    if isinstance(p, dict) and p.get("mode")})
+    if modes == ["LIVE"]:
+        mode_lbl = "LIVE"
+        mode_color = COLORS["danger"]
+    elif modes == ["SIM"]:
+        mode_lbl = "SIMULATION"
+        mode_color = COLORS["warning"]
+    elif modes:
+        mode_lbl = "/".join(modes)
+        mode_color = COLORS["danger"]
+    else:
+        sim_mode = app.config[name].get("SIMULATION", True)
+        mode_lbl = "SIMULATION" if sim_mode else "LIVE"
+        mode_color = COLORS["warning"] if sim_mode else COLORS["danger"]
+    sim_mode = (modes == ["SIM"]) if modes else bool(app.config[name].get("SIMULATION", True))
 
     ctk.CTkLabel(
         dlg,
@@ -391,9 +446,24 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
                   text_color=COLORS["warning"]
                   ).pack(pady=(20, 4), padx=24, anchor="w")
 
-    sim_mode = app.config.get(name, {}).get("SIMULATION", True)
-    mode_lbl = "SIMULATION" if sim_mode else "LIVE"
-    mode_color = COLORS["warning"] if sim_mode else COLORS["danger"]
+    modes = sorted({str(p.get("mode") or "").upper() for p in positions
+                    if isinstance(p, dict) and p.get("mode")})
+    if modes == ["LIVE"]:
+        sim_mode = False
+        mode_lbl = "LIVE"
+        mode_color = COLORS["danger"]
+    elif modes == ["SIM"]:
+        sim_mode = True
+        mode_lbl = "SIMULATION"
+        mode_color = COLORS["warning"]
+    elif modes:
+        sim_mode = False
+        mode_lbl = "/".join(modes)
+        mode_color = COLORS["danger"]
+    else:
+        sim_mode = bool(app.config.get(name, {}).get("SIMULATION", True))
+        mode_lbl = "SIMULATION" if sim_mode else "LIVE"
+        mode_color = COLORS["warning"] if sim_mode else COLORS["danger"]
 
     ctk.CTkLabel(
         dlg,
@@ -498,9 +568,12 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
 
     def _stop_only():
         dlg.destroy()
-        app.bots[name].stop(graceful_close=False)
-        log_to_card(app.cards[name], "system",
-            "Stopped  positions left OPEN (will be picked up on next start)")
+        show_busy_dialog(
+            app,
+            f"Stopping {label}",
+            "Stopping bot  positions stay open",
+            lambda update: app._async_simple_stop(name, app.cards[name], update),
+        )
 
     def _cancel():
         dlg.destroy()
@@ -641,7 +714,7 @@ def emergency_close_futures_and_stop(app, name: str) -> None:
     card = app.cards[name]
     show_busy_dialog(
         app,
-        "Stopping FUTURES",
+        f"Stopping {name}",
         "Closing positions and shutting down",
         lambda update: async_close_and_stop_futures(
             app, name, card, update, reason="Manual Close & Stop"),
@@ -752,17 +825,43 @@ def show_quit_with_positions_dialog(app, open_summary: dict) -> None:
                   text_color=COLORS["warning"]
                   ).pack(pady=(20, 6), padx=24, anchor="w")
 
+    def _summary_count(value) -> int:
+        if isinstance(value, dict):
+            try:
+                return int(value.get("count", 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _summary_modes(value) -> set[str]:
+        if not isinstance(value, dict):
+            return set()
+        raw = value.get("modes") or set()
+        try:
+            return {str(v).upper() for v in raw if str(v).strip()}
+        except TypeError:
+            return set()
+
     summary_text = "\n".join(
-        f"  {bot}: {cnt} open position(s)" for bot, cnt in open_summary.items()
+        f"  {bot}: {_summary_count(data)} open position(s)"
+        for bot, data in open_summary.items()
     )
     ctk.CTkLabel(dlg, text=summary_text,
                   font=ctk.CTkFont(app.mono_font, 11, "bold"),
                   text_color=COLORS["text"], justify="left"
                   ).pack(padx=24, pady=(0, 12), anchor="w")
 
-    any_live = any(
-        not app.config[b].get("SIMULATION", True) for b in open_summary
-    )
+    any_live = any("LIVE" in _summary_modes(data)
+                   for data in open_summary.values())
+    if not any_live:
+        any_live = any(
+            not app.config[b].get("SIMULATION", True)
+            for b, data in open_summary.items()
+            if not _summary_modes(data)
+        )
     warn_text = (
         " LIVE MODE detected. 'Close All' will place real market orders\n"
         "    on the exchange. Slippage applies."
@@ -893,11 +992,14 @@ def async_stop_all_and_quit(app, update, close_positions: bool) -> None:
     if close_positions:
         update("Verifying and closing remaining positions")
         close_threads: list[threading.Thread] = []
+        close_errors: list[str] = []
+        close_errors_lock = threading.Lock()
 
         def _close_worker(bot_name: str):
             try:
                 card = app.cards[bot_name]
-                sim_only = app.config[bot_name].get("SIMULATION", True)
+                from launcher.core.bot_controller import close_modes_for_stop
+                close_modes = close_modes_for_stop(bot_name)
 
                 def _log(severity, msg, _c=card):
                     app.after(0, lambda: log_to_card(_c, severity, msg))
@@ -905,13 +1007,22 @@ def async_stop_all_and_quit(app, update, close_positions: bool) -> None:
                 # CROSS is futures-type (is_futures=True)  use the futures
                 # close path so realized PnL is booked and futures_state cleared.
                 from launcher.config.settings import BOT_META as _BM
-                if _BM[bot_name].get("is_futures"):
-                    direct_close_remaining_futures(
-                        _log, sim_only, reason="Application Quit", bot_name=bot_name)
-                else:
-                    direct_close_remaining_spot(
-                        bot_name, _log, sim_only, reason="Application Quit")
+                for sim_only in close_modes:
+                    if _BM[bot_name].get("is_futures"):
+                        result = direct_close_remaining_futures(
+                            _log, sim_only, reason="Application Quit", bot_name=bot_name)
+                    else:
+                        result = direct_close_remaining_spot(
+                            bot_name, _log, sim_only, reason="Application Quit")
+                    failed = []
+                    if isinstance(result, dict):
+                        failed = list(result.get("failed") or [])
+                    if failed:
+                        raise RuntimeError(
+                            f"fallback close failed for {', '.join(map(str, failed))}")
             except Exception as e:
+                with close_errors_lock:
+                    close_errors.append(f"{bot_name}: {e}")
                 import sys as _sys
                 stderr = _sys.stderr
                 if stderr is not None:
@@ -929,6 +1040,19 @@ def async_stop_all_and_quit(app, update, close_positions: bool) -> None:
 
         for t in close_threads:
             t.join()
+        if close_errors:
+            update("Close verification failed  application left open")
+            try:
+                from tkinter import messagebox
+                app.after(0, lambda: messagebox.showerror(
+                    "Close verification failed",
+                    "Some positions could not be verified/closed:\n"
+                    + "\n".join(close_errors[:8])
+                    + "\n\nApplication was not closed."
+                ))
+            except Exception:
+                pass
+            return
 
     msg = ("All bots stopped  positions preserved." if not close_positions
             else "All bots stopped and positions closed.")

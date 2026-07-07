@@ -1,5 +1,5 @@
 """
-setup_wizard.pyw — Obsidian Trading Terminal — First-Time Setup
+setup_wizard.pyw - Obsidian Trading Terminal - First-Time Setup
 
 Auto-launched by the launcher when no .env exists.
 
@@ -12,17 +12,18 @@ Auto-launched by the launcher when no .env exists.
 
 import sys
 import os
+import json
 import customtkinter as ctk
 import tkinter as tk
 import threading
 import requests
 from tkinter import font as tkfont
 
-# ── Design (matches launcher.pyw) ─────────────────────────────────────────────
+# -- Design (matches launcher.pyw) ---------------------------------------------
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
-# FIX: FONT_BODY was missing — caused NameError crash preventing wizard from opening
+# FIX: FONT_BODY was missing - caused NameError crash preventing wizard from opening
 FONT_BODY = "Segoe UI"
 
 COLORS = {
@@ -56,7 +57,9 @@ def _get_pythonw_exe() -> str:
     if os.path.exists(local):
         return local
     py = sys.executable
-    return py.replace("python.exe", "pythonw.exe") if py.endswith("python.exe") else py
+    if os.path.basename(py).lower() == "python.exe":
+        return os.path.join(os.path.dirname(py), "pythonw.exe")
+    return py
 
 def _safe_mono_font():
     try:
@@ -69,7 +72,7 @@ def _safe_mono_font():
     return "Consolas"
 
 
-# ── Exchange Definitions ──────────────────────────────────────────────────────
+# -- Exchange Definitions ------------------------------------------------------
 # USDT-linear-perp exchanges supported by ccxt. Kraken & Coinbase are excluded:
 # their perps are USD/multi-collateral margined, which the bot's hardcoded
 # USDT-settle symbol scheme doesn't resolve.
@@ -120,16 +123,20 @@ EXCHANGES = {
 }
 
 
-# ── Wizard App ────────────────────────────────────────────────────────────────
+# -- Wizard App ----------------------------------------------------------------
 
 class SetupWizard(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Obsidian — First-Time Setup")
-        self.geometry("780x680")
-        self.minsize(760, 660)
-        self.resizable(False, False)
+        self.title("Obsidian - First-Time Setup")
+        screen_w = max(640, self.winfo_screenwidth())
+        screen_h = max(560, self.winfo_screenheight())
+        win_w = min(780, max(640, screen_w - 80))
+        win_h = min(680, max(560, screen_h - 120))
+        self.geometry(f"{win_w}x{win_h}")
+        self.minsize(min(760, win_w), min(620, win_h))
+        self.resizable(True, True)
         self.configure(fg_color=COLORS["bg"])
 
         self.mono_font = _safe_mono_font()
@@ -163,7 +170,7 @@ class SetupWizard(ctk.CTk):
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"+{x}+{y}")
 
-    # ── UI ────────────────────────────────────────────────────────────────────
+    # -- UI --------------------------------------------------------------------
 
     def _build_ui(self):
         top = ctk.CTkFrame(self, fg_color=COLORS["panel"], height=62, corner_radius=0)
@@ -176,7 +183,7 @@ class SetupWizard(ctk.CTk):
         logo.pack(side="left", padx=26, pady=14)
 
         ctk.CTkLabel(
-            logo, text="◆",
+            logo, text="*",
             font=ctk.CTkFont(self.mono_font, 24, "bold"),
             text_color=COLORS["purple"]
         ).pack(side="left", padx=(0, 12))
@@ -222,7 +229,7 @@ class SetupWizard(ctk.CTk):
         btn_box.pack(fill="x", padx=26, pady=18)
 
         self.btn_back = ctk.CTkButton(
-            btn_box, text="◀  Back",
+            btn_box, text="<  Back",
             width=120, height=36, corner_radius=8,
             font=ctk.CTkFont(FONT_BODY, 13, "bold"),
             fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -233,7 +240,7 @@ class SetupWizard(ctk.CTk):
         self.btn_back.pack(side="left")
 
         self.btn_next = ctk.CTkButton(
-            btn_box, text="Next  ▶",
+            btn_box, text="Next  >",
             width=140, height=36, corner_radius=8,
             font=ctk.CTkFont(FONT_BODY, 13, "bold"),
             fg_color=COLORS["purple"], hover_color=COLORS["purple_dim"],
@@ -264,11 +271,11 @@ class SetupWizard(ctk.CTk):
 
         self.btn_back.configure(state="disabled" if n == 1 else "normal")
         if n == self.total_steps:
-            self.btn_next.configure(text="✓  Complete Setup",
+            self.btn_next.configure(text="OK  Complete Setup",
                                      fg_color=COLORS["success"],
                                      hover_color="#16a34a")
         else:
-            self.btn_next.configure(text="Next  ▶",
+            self.btn_next.configure(text="Next  >",
                                      fg_color=COLORS["purple"],
                                      hover_color=COLORS["purple_dim"])
 
@@ -284,13 +291,13 @@ class SetupWizard(ctk.CTk):
         if self.current_step > 1:
             self._show_step(self.current_step - 1)
 
-    # ── STEP 1: Exchange Selection ────────────────────────────────────────────
+    # -- STEP 1: Exchange Selection --------------------------------------------
 
     def _build_step1_exchange(self):
         self._heading(self.content, "Select Your Exchange",
                        "Which crypto exchange would you like to connect to?")
 
-        # Scrollable container — supports 9+ exchanges nicely
+        # Scrollable container - supports 9+ exchanges nicely
         scroll = ctk.CTkScrollableFrame(
             self.content, fg_color="transparent",
             scrollbar_button_color=COLORS["border"], height=320
@@ -319,7 +326,7 @@ class SetupWizard(ctk.CTk):
 
         self.exchange_info_lbl = ctk.CTkLabel(
             info_box,
-            text="ℹ  This strategy was optimized against Bitget data",
+            text="i  This strategy was optimized against Bitget data",
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
             text_color=COLORS["text_dim"], anchor="w", justify="left",
             wraplength=640
@@ -350,7 +357,7 @@ class SetupWizard(ctk.CTk):
         self.data["exchange"] = key
         self._highlight_exchange(key)
         self.exchange_info_lbl.configure(
-            text=f"ℹ  {EXCHANGES[key]['tested_with']}"
+            text=f"i  {EXCHANGES[key]['tested_with']}"
         )
 
     def _highlight_exchange(self, key):
@@ -360,11 +367,11 @@ class SetupWizard(ctk.CTk):
             else:
                 btn.configure(border_color=COLORS["border"], border_width=1)
 
-    # ── STEP 2: API Credentials ───────────────────────────────────────────────
+    # -- STEP 2: API Credentials -----------------------------------------------
 
     def _build_step2_credentials(self):
         ex = EXCHANGES[self.data["exchange"]]
-        self._heading(self.content, f"API Access — {ex['label']}",
+        self._heading(self.content, f"API Access - {ex['label']}",
                        f"Create an API key in your {ex['label']} account and paste it here.")
 
         info = ctk.CTkFrame(self.content, fg_color=COLORS["panel"], corner_radius=8,
@@ -372,7 +379,7 @@ class SetupWizard(ctk.CTk):
         info.pack(fill="x", pady=(10, 20))
         ctk.CTkLabel(
             info,
-            text="🔒  Enable 'Trade' permission  ·  DO NOT enable Withdraw permission!",
+            text="[secure]  Enable 'Trade' permission  -  DO NOT enable Withdraw permission!",
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
             text_color=COLORS["warning"], wraplength=640
         ).pack(padx=16, pady=12)
@@ -390,7 +397,7 @@ class SetupWizard(ctk.CTk):
 
         self.skip_lbl.configure(text="")
 
-    # ── STEP 3: Proxy ─────────────────────────────────────────────────────────
+    # -- STEP 3: Proxy ---------------------------------------------------------
 
     def _build_step3_proxy(self):
         self._heading(self.content, "Proxy Settings",
@@ -443,7 +450,7 @@ class SetupWizard(ctk.CTk):
         else:
             self.proxy_fields_box.pack_forget()
 
-    # ── STEP 4: Telegram + CryptoPanic + Test ─────────────────────────────────
+    # -- STEP 4: Telegram + CryptoPanic + Test ---------------------------------
 
     def _build_step4_optional(self):
         self._heading(self.content, "Optional Services",
@@ -460,13 +467,13 @@ class SetupWizard(ctk.CTk):
                               border_width=1, border_color=COLORS["border"])
         tz_box.pack(fill="x", pady=(0, 14))
         ctk.CTkLabel(
-            tz_box, text="🌍  Deine Zeitzone / Your Timezone",
+            tz_box, text="[tz]  Deine Zeitzone / Your Timezone",
             font=ctk.CTkFont(FONT_BODY, 14, "bold"),
             text_color=COLORS["text"], anchor="w"
         ).pack(fill="x", padx=20, pady=(14, 2))
         ctk.CTkLabel(
             tz_box,
-            text="Wird für die Lernanalyse genutzt: schlechte Handelszeiten\n"
+            text="Wird fuer die Lernanalyse genutzt: schlechte Handelszeiten\n"
                  "werden in deiner Lokalzeit erkannt, nicht UTC.",
             font=ctk.CTkFont(FONT_BODY, 11, "bold"),
             text_color=COLORS["text_muted"], anchor="w", wraplength=640
@@ -477,7 +484,7 @@ class SetupWizard(ctk.CTk):
                      font=ctk.CTkFont(FONT_BODY, 11),
                      text_color=COLORS["text_muted"], width=120, anchor="w"
                      ).pack(side="left")
-        # Common timezones — sorted by UTC offset, with friendly labels
+        # Common timezones - sorted by UTC offset, with friendly labels
         TZ_OPTIONS = [
             "UTC",
             "Asia/Shanghai      (UTC+8, China)",
@@ -525,7 +532,7 @@ class SetupWizard(ctk.CTk):
         tg_head.pack(fill="x", padx=20, pady=(14, 4))
 
         ctk.CTkLabel(
-            tg_head, text="📱  Telegram Notifications",
+            tg_head, text="[telegram]  Telegram Notifications",
             font=ctk.CTkFont(FONT_BODY, 14, "bold"),
             text_color=COLORS["text"]
         ).pack(side="left")
@@ -560,7 +567,7 @@ class SetupWizard(ctk.CTk):
         cp_head.pack(fill="x", padx=20, pady=(14, 4))
 
         ctk.CTkLabel(
-            cp_head, text="📰  CryptoPanic API",
+            cp_head, text="[news]  CryptoPanic API",
             font=ctk.CTkFont(FONT_BODY, 14, "bold"),
             text_color=COLORS["text"]
         ).pack(side="left")
@@ -575,7 +582,7 @@ class SetupWizard(ctk.CTk):
 
         ctk.CTkLabel(
             cp_box,
-            text="Free API key at cryptopanic.com → Account → API. Better news quality than RSS feeds.",
+            text="Free API key at cryptopanic.com -> Account -> API. Better news quality than RSS feeds.",
             font=ctk.CTkFont(FONT_BODY, 11, "bold"),
             text_color=COLORS["text_muted"], anchor="w", wraplength=640
         ).pack(fill="x", padx=20, pady=(0, 10))
@@ -592,13 +599,13 @@ class SetupWizard(ctk.CTk):
         cmc_head = ctk.CTkFrame(cmc_box, fg_color="transparent")
         cmc_head.pack(fill="x", padx=20, pady=(14, 4))
         ctk.CTkLabel(
-            cmc_head, text="📊  CoinMarketCap API (Fear & Greed)",
+            cmc_head, text="[data]  CoinMarketCap API (Fear & Greed)",
             font=ctk.CTkFont(FONT_BODY, 14, "bold"),
             text_color=COLORS["text"]
         ).pack(side="left")
         ctk.CTkLabel(
             cmc_box,
-            text="Free API key at coinmarketcap.com/api/ — used as the primary\n"
+            text="Free API key at coinmarketcap.com/api/ - used as the primary\n"
                  "source for Fear & Greed Index. Without a key, the bot falls\n"
                  "back to the unofficial endpoint (works but less reliable).",
             font=ctk.CTkFont(FONT_BODY, 11, "bold"),
@@ -620,7 +627,7 @@ class SetupWizard(ctk.CTk):
         test_head.pack(fill="x", padx=20, pady=(14, 6))
 
         ctk.CTkLabel(
-            test_head, text="🔗  Connection Test",
+            test_head, text="[link]  Connection Test",
             font=ctk.CTkFont(FONT_BODY, 14, "bold"),
             text_color=COLORS["text"]
         ).pack(side="left")
@@ -657,7 +664,7 @@ class SetupWizard(ctk.CTk):
         else:
             self.cp_fields_box.pack_forget()
 
-    # ── Helper Widgets ────────────────────────────────────────────────────────
+    # -- Helper Widgets --------------------------------------------------------
 
     def _heading(self, parent, title, subtitle):
         ctk.CTkLabel(
@@ -686,13 +693,13 @@ class SetupWizard(ctk.CTk):
             font=ctk.CTkFont(self.mono_font, 13),
             fg_color=COLORS["input_bg"],
             border_color=COLORS["border"], border_width=1,
-            text_color=COLORS["text"], show="•" if hide else ""
+            text_color=COLORS["text"], show="*" if hide else ""
         )
         entry.pack(fill="x", pady=(4, 0))
         entry.insert(0, value or "")
         return entry
 
-    # ── Validation ────────────────────────────────────────────────────────────
+    # -- Validation ------------------------------------------------------------
 
     def _validate_step(self, n):
         if n == 1:
@@ -735,7 +742,7 @@ class SetupWizard(ctk.CTk):
             cmc = getattr(self, "entry_cmc_key", None)
             self.data["cmc_api_key"] = cmc.get().strip() if cmc else ""
             # Timezone: dropdown label looks like "Asia/Shanghai      (UTC+8, China)"
-            # — strip everything after first whitespace to get the IANA name.
+            # - strip everything after first whitespace to get the IANA name.
             tz_label = self.tz_var.get().strip() if hasattr(self, "tz_var") else "UTC"
             self.data["timezone"] = tz_label.split()[0] if tz_label else "UTC"
             return True
@@ -746,7 +753,7 @@ class SetupWizard(ctk.CTk):
         if hasattr(self, "_toast") and self._toast.winfo_exists():
             self._toast.destroy()
         self._toast = ctk.CTkLabel(
-            self, text=f"⚠  {msg}",
+            self, text=f"WARN  {msg}",
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
             text_color=COLORS["danger"], fg_color="#1a0e10",
             corner_radius=6
@@ -754,11 +761,11 @@ class SetupWizard(ctk.CTk):
         self._toast.place(relx=0.5, rely=0.85, anchor="center", relwidth=0.7, height=32)
         self.after(3000, lambda: self._toast.destroy() if self._toast.winfo_exists() else None)
 
-    # ── Connection Test ───────────────────────────────────────────────────────
+    # -- Connection Test -------------------------------------------------------
 
     def _run_connection_test(self):
         self.test_result.configure(
-            text="⏳  Testing connection...",
+            text="...  Testing connection...",
             text_color=COLORS["text_dim"]
         )
         self.update()
@@ -767,7 +774,7 @@ class SetupWizard(ctk.CTk):
             try:
                 if not self.data["api_key"] or not self.data["api_secret"]:
                     self.after(0, lambda: self.test_result.configure(
-                        text="✗  API key or secret missing — check Step 2",
+                        text="X  API key or secret missing - check Step 2",
                         text_color=COLORS["danger"]
                     ))
                     return
@@ -775,7 +782,7 @@ class SetupWizard(ctk.CTk):
                 ex_info = EXCHANGES[self.data["exchange"]]
                 if ex_info["passphrase"] and not self.data["passphrase"]:
                     self.after(0, lambda: self.test_result.configure(
-                        text="✗  Passphrase missing — check Step 2",
+                        text="X  Passphrase missing - check Step 2",
                         text_color=COLORS["danger"]
                     ))
                     return
@@ -784,7 +791,7 @@ class SetupWizard(ctk.CTk):
                     import ccxt
                 except ImportError:
                     self.after(0, lambda: self.test_result.configure(
-                        text="⚠  ccxt not installed. Run: pip install -r requirements.txt",
+                        text="WARN  ccxt not installed. Run: pip install -r requirements.txt",
                         text_color=COLORS["warning"]
                     ))
                     return
@@ -808,8 +815,8 @@ class SetupWizard(ctk.CTk):
                 bal = ex.fetch_balance()
 
                 usdt = bal.get("USDT", {}).get("free", 0)
-                msg = (f"✓  Connection successful  ·  "
-                       f"USDT balance: {usdt:.2f}  ·  "
+                msg = (f"OK  Connection successful  -  "
+                       f"USDT balance: {usdt:.2f}  -  "
                        f"{len(ex.markets)} markets available")
                 self.after(0, lambda m=msg: self.test_result.configure(
                     text=m, text_color=COLORS["success"]
@@ -818,13 +825,13 @@ class SetupWizard(ctk.CTk):
             except Exception as e:
                 err_msg = str(e)[:200]
                 self.after(0, lambda em=err_msg: self.test_result.configure(
-                    text=f"✗  Test failed: {em}",
+                    text=f"X  Test failed: {em}",
                     text_color=COLORS["danger"]
                 ))
 
         threading.Thread(target=_test, daemon=True).start()
 
-    # ── Finish ────────────────────────────────────────────────────────────────
+    # -- Finish ----------------------------------------------------------------
 
     def _finish(self):
         try:
@@ -836,13 +843,13 @@ class SetupWizard(ctk.CTk):
     def _write_env_file(self):
         def _env_line(key: str, value) -> str:
             clean = str(value or "").strip().replace("\r", "").replace("\n", "")
-            return f"{key}={clean}"
+            return f"{key}={json.dumps(clean)}"
 
         lines = [
             "# Auto-generated by Obsidian Setup Wizard",
             f"# Created: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "",
-            "# ── Exchange ───────────────────────────────────────",
+            "# -- Exchange ---------------------------------------",
             _env_line("EXCHANGE", self.data["exchange"]),
             _env_line("API_KEY", self.data["api_key"]),
             _env_line("API_SECRET", self.data["api_secret"]),
@@ -851,26 +858,26 @@ class SetupWizard(ctk.CTk):
         if EXCHANGES[self.data["exchange"]]["passphrase"]:
             lines.append(_env_line("API_PASSPHRASE", self.data["passphrase"]))
 
-        lines += ["", "# ── Proxy ──────────────────────────────────────────"]
+        lines += ["", "# -- Proxy ------------------------------------------"]
         lines.append(_env_line("USE_PROXY", "true" if self.data["use_proxy"] else "false"))
         if self.data["use_proxy"]:
             lines.append(_env_line("PROXY_HOST", self.data["proxy_host"]))
             lines.append(_env_line("PROXY_PORT", self.data["proxy_port"]))
 
         if self.data["use_telegram"]:
-            lines += ["", "# ── Telegram ────────────────────────────────────────"]
+            lines += ["", "# -- Telegram ----------------------------------------"]
             lines.append(_env_line("TELEGRAM_TOKEN", self.data["telegram_token"]))
             lines.append(_env_line("TELEGRAM_CHAT_ID", self.data["telegram_chat_id"]))
 
         if self.data["use_cryptopanic"]:
-            lines += ["", "# ── CryptoPanic API ─────────────────────────────────"]
+            lines += ["", "# -- CryptoPanic API ---------------------------------"]
             lines.append(_env_line("CRYPTOPANIC_TOKEN", self.data["cryptopanic_token"]))
 
         if self.data.get("cmc_api_key"):
-            lines += ["", "# ── CoinMarketCap API (Fear & Greed) ────────────────"]
+            lines += ["", "# -- CoinMarketCap API (Fear & Greed) ----------------"]
             lines.append(_env_line("CMC_API_KEY", self.data["cmc_api_key"]))
 
-        # Performance defaults — written unconditionally so the bot
+        # Performance defaults - written unconditionally so the bot
         # starts with a sane budget out-of-the-box without the user
         # needing to know this env-var exists.
         # 600 = Bitget's practical public-endpoint rate limit.
@@ -878,7 +885,7 @@ class SetupWizard(ctk.CTk):
         # Bitget VIP status and see "API budget exhausted" in logs.
         lines += [
             "",
-            "# ── Performance ─────────────────────────────────────",
+            "# -- Performance -------------------------------------",
             "API_BUDGET_PER_MINUTE=600",
             _env_line("BOT_TIMEZONE", self.data.get("timezone", "UTC")),
         ]
@@ -898,13 +905,13 @@ class SetupWizard(ctk.CTk):
         # by the owning user. Without this, default umask (typically
         # 022) leaves the file world-readable, which means any other
         # local user can ``cat`` your exchange credentials. Windows
-        # silently ignores chmod — fine, the file lives inside the
+        # silently ignores chmod - fine, the file lives inside the
         # user's profile directory which has its own ACL.
         try:
             import stat as _stat
             os.chmod(env_path, _stat.S_IRUSR | _stat.S_IWUSR)   # 0600
         except (OSError, AttributeError):
-            # Windows or filesystem without POSIX bits — fail silently.
+            # Windows or filesystem without POSIX bits - fail silently.
             pass
 
     def _show_success_dialog(self):
@@ -915,7 +922,7 @@ class SetupWizard(ctk.CTk):
         success_box.pack(fill="both", expand=True)
 
         ctk.CTkLabel(
-            success_box, text="✓",
+            success_box, text="OK",
             font=ctk.CTkFont(self.mono_font, 64, "bold"),
             text_color=COLORS["success"]
         ).pack(pady=(60, 16))
@@ -960,11 +967,14 @@ class SetupWizard(ctk.CTk):
     def _launch_terminal_and_close(self):
         import subprocess
         try:
+            root = os.path.dirname(os.path.abspath(__file__))
+            launcher = os.path.join(root, "launcher.pyw")
             kw = {}
             if sys.platform == "win32":
                 kw["creationflags"] = subprocess.CREATE_NO_WINDOW
             subprocess.Popen(
-                [_get_pythonw_exe(), "launcher.pyw"],
+                [_get_pythonw_exe(), launcher],
+                cwd=root,
                 **kw
             )
         except Exception:

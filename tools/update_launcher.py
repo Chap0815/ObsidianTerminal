@@ -3,7 +3,7 @@
 The GUI cannot safely update files that it is currently importing from. This
 small runner is started by the launcher, waits until the launcher process has
 exited, runs the real updater, writes a user-readable log, and starts the
-launcher again.
+launcher again after a successful update.
 """
 from __future__ import annotations
 
@@ -27,18 +27,50 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _redact_text(value: object) -> str:
+    try:
+        from core.logger import redact
+        return redact(str(value))
+    except Exception:
+        import re
+        text = str(value)
+        text = re.sub(
+            r"((?:authorization|proxy-authorization)\s*[:=]\s*bearer\s+)"
+            r"([A-Za-z0-9._~+/=\-]{8,})",
+            r"\1***REDACTED***", text, flags=re.IGNORECASE)
+        text = re.sub(
+            r"(api[_-]?key|secret|passphrase|password|token)"
+            r"(['\"]?\s*[:=]\s*['\"]?)([^\s'\"&,}]{6,})",
+            r"\1\2***REDACTED***", text, flags=re.IGNORECASE)
+        text = re.sub(r"(://[^:/\s]+:)([^@/\s]{3,})(@)",
+                      r"\1***REDACTED***\3", text)
+        return text
+
+
 def _append_log(message: str) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as fh:
-        fh.write(f"[{_now()}] {message}\n")
+        fh.write(f"[{_now()}] {_redact_text(message)}\n")
 
 
-def _write_status(status: str, message: str = "", returncode: int | None = None) -> None:
+def _write_status(
+    status: str,
+    message: str = "",
+    returncode: int | None = None,
+    *,
+    remote: str = "",
+    branch: str = "",
+) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    previous = _read_status()
     payload = {
         "status": status,
-        "message": message[:1200],
+        "message": _redact_text(message)[:1200],
     }
+    for key, value in (("remote", remote), ("branch", branch)):
+        value = _redact_text(value or previous.get(key) or "").strip()
+        if value:
+            payload[key] = value
     if status == "running":
         payload["started_at"] = _now()
     else:
@@ -174,7 +206,7 @@ def _run_update() -> int:
         cwd=str(ROOT),
         text=True,
         capture_output=True,
-        timeout=1800,
+        timeout=7200,
         **_hidden_kwargs(),
     )
     if proc.stdout:
@@ -197,16 +229,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Obsidian update outside the launcher process.")
     parser.add_argument("--parent-pid", type=int, required=True)
     parser.add_argument("--restart", action="store_true")
+    parser.add_argument("--remote", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--branch", default="", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
+    restart_after_update = False
     try:
-        _write_status("running", "Update wird vorbereitet")
+        _write_status(
+            "running",
+            "Update wird vorbereitet",
+            remote=args.remote,
+            branch=args.branch,
+        )
         _append_log("=" * 72)
         _append_log(f"Runner gestartet, parent pid={args.parent_pid}")
         _wait_for_launcher_exit(args.parent_pid)
         rc = _run_update()
         if rc == 0:
             _write_status("success", "Update abgeschlossen", rc)
+            restart_after_update = True
         else:
             current = _read_status()
             if current.get("status") != "failed" or not current.get("message"):
@@ -221,7 +262,13 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 time.sleep(0.8)
                 _restart_launcher()
-                _append_log("Launcher neu gestartet")
+                if restart_after_update:
+                    _append_log("Launcher neu gestartet")
+                else:
+                    _append_log(
+                        "Launcher nach fehlgeschlagenem Update neu gestartet, "
+                        "damit der Fehlerstatus sichtbar bleibt."
+                    )
             except Exception as exc:
                 _append_log(f"Launcher-Neustart fehlgeschlagen: {exc}")
 

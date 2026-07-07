@@ -34,13 +34,12 @@ _PERMANENT_PATTERN_STRINGS = (
     r"market\s+not\s+(?:found|exist)",
     r"order\s+does\s+not\s+exist",
     r"position\s+(?:does\s+not\s+exist|not\s+exist|not\s+found)",
-    # MEXC code 2009 "Position is nonexistent or closed" (one word "nonexistent",
-    # not matched above). When the user closes a position manually, treat as
-    # permanent so reconciliation removes it from local state instead of
-    # retrying the close forever.
+    # MEXC "Position is nonexistent or closed" (one word "nonexistent", not
+    # matched above). Do not match a bare numeric code here; if an exchange
+    # reuses that code for another message, close accounting must not assume
+    # the position is flat.
     r"position\s+is\s+nonexistent",
     r"nonexistent\s+or\s+closed",
-    r"\b2009\b",
     r"no\s+(?:open\s+)?position",
     r"reduce[-_\s]?only",
     # Narrow to genuine API-credential/permission failures (permanent); a bare

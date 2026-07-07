@@ -187,8 +187,8 @@ DEFAULT_CONFIG = {
     # "Trend" bot (internal key TREND): large-cap trend-following over a
     # 12 large-cap universe, unleveraged spot.
     "TREND": {
-        "POSITION_SIZE":  20.0,  # USDT per coin when in-trend (1220 = 240 max)
-        "MAX_OPEN_TRADES":   12,     # one per coin in the universe
+        "POSITION_SIZE":  20.0,
+        "MAX_OPEN_TRADES":   3,
         "TREND_UNIVERSE":    "BTC,ETH,BNB,XRP,SOL,ADA,AVAX,LINK,DOT,LTC,DOGE,TRX",
         "TREND_SMA_FAST":    50,
         "TREND_SMA_SLOW":    100,
@@ -206,16 +206,16 @@ DEFAULT_CONFIG = {
         "SIMULATION":        True,
     },
     "SPOT": {
-        "MIN_PUMP":          6.0,
-        "ACTIVATION_PROFIT": 9.0,
-        "TRAILING_DISTANCE": 3.0,
+        "MIN_PUMP":          5.0,
+        "ACTIVATION_PROFIT": 4.0,
+        "TRAILING_DISTANCE": 1.5,
         "POST_PARTIAL_TRAILING_DISTANCE": 1.0,
-        "INITIAL_STOP_LOSS": -6.0,
+        "INITIAL_STOP_LOSS": -10.0,
         "PARTIAL_SELL_PCT":  0.60,
-        "RSI_MAX":           65.0,
+        "RSI_MAX":           85.0,
         "POSITION_SIZE":     10.0,
         "POSITION_SIZE_MAX": 25.0,
-        "MAX_OPEN_TRADES":   5,
+        "MAX_OPEN_TRADES":   3,
         "SCAN_INTERVAL":  150,  # 2.5 min  fast for momentum
         "MONITOR_INTERVAL":  20,     # V2: open positions checked every 20s (dual-loop)
         "BREAKEVEN_TRIGGER": 0.0,
@@ -230,25 +230,25 @@ DEFAULT_CONFIG = {
     },
     "FUTURES": {
         # Enter when momentum STARTS, not when it's already over.
-        "MIN_PUMP":          2.0,    # earlier entry
-        "ACTIVATION_PROFIT": 4.5,    # realistic hit-rate
-        "TRAILING_DISTANCE": 2.5,    # gives the market room
+        "MIN_PUMP":          1.0,
+        "ACTIVATION_PROFIT": 4.0,
+        "TRAILING_DISTANCE": 1.5,
         "POST_PARTIAL_TRAILING_DISTANCE": 1.0,
-        "INITIAL_STOP_LOSS": -3.5,   # above the noise floor
-        "PARTIAL_SELL_PCT":  0.40,
-        "RSI_MAX":           70.0,
-        "POSITION_SIZE":     10.0,
-        "POSITION_SIZE_MAX": 25.0,
+        "INITIAL_STOP_LOSS": -4.0,
+        "PARTIAL_SELL_PCT":  0.50,
+        "RSI_MAX":           60.0,
+        "POSITION_SIZE":     40.0,
+        "POSITION_SIZE_MAX": 80.0,
         "MAX_OPEN_TRADES":   3,      # less cluster risk
-        "LEVERAGE":          3,
+        "LEVERAGE":          1.0,
         "LIQ_SAFETY_PCT":    15.0,
         "SCAN_INTERVAL":     150,    # 5min would be too long for futures
-        "MONITOR_INTERVAL":  20,     # open positions checked every 20s
+        "MONITOR_INTERVAL":  18.0,
         "BREAKEVEN_TRIGGER": 2.0,    # Move SL to BE at +2% price move
         "USE_TREND_FILTER":  0,      # EMA200 filter off (toggle)
         "USE_LLM":           False,
-        "COOLDOWN_AFTER_SL": 120,    # 2h cooldown after SL
-        "MAX_DAILY_LOSS":    -30.0,  # Killswitch at -30 USDT
+        "COOLDOWN_AFTER_SL": 240,
+        "MAX_DAILY_LOSS":    -20.0,
         "MAX_DAILY_LOSS_HARD_MULT": 1.5,
         "OWN_MOMENTUM_FILTER": True,
         "OWN_MOMENTUM_WINDOW": 5,
@@ -259,16 +259,16 @@ DEFAULT_CONFIG = {
     # Keep SIMULATION=True until it proves out over weeks of paper trading.
     "CROSS": {
         "XSEC_LOOKBACK_HOURS":   24,
-        "XSEC_REBALANCE_HOURS":  72,
-        "XSEC_K":  6,  # per side  12 positions
-        "XSEC_UNIVERSE_SIZE":    40,
+        "XSEC_REBALANCE_HOURS":  48.0,
+        "XSEC_K":  2.0,
+        "XSEC_UNIVERSE_SIZE":    30.0,
         "CRASH_FILTER":          1,
         "CRASH_WINDOW":          4,
         "PER_LEG_DISASTER_STOP": -8.0,
         "CROSS_DISASTER_BLACKLIST_HOURS": 72,
         "MIN_VOLUME":            10000000.0,
         "XSEC_MAX_SPREAD_PCT":   0.5,
-        "BASE_CAPITAL_USDT":     1000.0,
+        "BASE_CAPITAL_USDT":     150.0,
         "LEVERAGE":  1.0,  # cross-margin  keep low (max ~1.5)
         "MAX_GROSS_EXPOSURE_PCT": 100.0,   # cap deployed notional vs equity
         "MAX_DAILY_LOSS":        -50.0,
@@ -330,6 +330,13 @@ DEFAULT_CONFIG = {
     "UI": {
         "VISIBLE_BOTS":   ["TREND", "SPOT", "FUTURES", "CROSS", "FUTREND"],
         "COLLAPSED_BOTS": [],
+        "params_collapsed": {
+            "FUTREND": True,
+            "FUTURES": True,
+            "CROSS": True,
+            "SPOT": True,
+            "TREND": True,
+        },
     },
 }
 
@@ -597,7 +604,9 @@ def _get_pythonw_exe() -> str:
     if os.path.exists(local):
         return local
     py = sys.executable
-    return py.replace("python.exe", "pythonw.exe") if py.endswith("python.exe") else py
+    if os.path.basename(py).lower() == "python.exe":
+        return os.path.join(os.path.dirname(py), "pythonw.exe")
+    return py
 
 
 #  Font helper 

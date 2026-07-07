@@ -94,6 +94,7 @@ class BotProcess:
             # (reconcile, monitor running fetch_funding_rate, etc).
             if self.bot_name:
                 env["BOT_NAME"] = self.bot_name
+                env["OBSIDIAN_LAUNCHER_PRESTART_OK"] = "1"
             self.run_id = uuid.uuid4().hex
             env["BOT_RUN_ID"] = self.run_id
 
@@ -172,7 +173,7 @@ class BotProcess:
                 except Exception:
                     pass
 
-    def stop(self, graceful_close: bool = False) -> None:
+    def stop(self, graceful_close: bool = False) -> int | None:
         """Stop the bot subprocess.
 
         ``graceful_close``
@@ -195,7 +196,7 @@ class BotProcess:
         already_exited: tuple[int | None, str, int] | None = None
         with self._lifecycle_lock:
             if self.proc is None:
-                return
+                return None
             if self.proc.poll() is not None:
                 proc_to_mark = self.proc
                 run_id_to_mark = self.run_id or ""
@@ -218,7 +219,7 @@ class BotProcess:
                 expected_run_id=run_id_to_mark,
                 expected_pid=pid_to_mark,
             )
-            return
+            return pid_to_mark
 
         #  Send the signal OUTSIDE the lock 
         signal_ok = False
@@ -274,10 +275,13 @@ class BotProcess:
             except subprocess.TimeoutExpired:
                 try:
                     proc_to_stop.kill()
+                    proc_to_stop.wait(timeout=self._FORCE_KILL_TIMEOUT_SEC)
                 except Exception:
                     pass
 
         #  Mark dead under the lock 
+        if proc_to_stop.poll() is None:
+            return pid_to_stop
         with self._lifecycle_lock:
             # Only clear if we're still pointing at the proc we just stopped
             #  a concurrent start() shouldn't be clobbered.
@@ -288,6 +292,7 @@ class BotProcess:
             expected_run_id=run_id_to_stop,
             expected_pid=pid_to_stop,
         )
+        return pid_to_stop
 
     def is_running(self) -> bool:
         # Lock-free read by design  Python's GIL makes the attribute load

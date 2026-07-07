@@ -93,7 +93,8 @@ class TickerCache:
                 return cached[1]
 
         if pre_now < self._rate_limited_until:
-            stale = self._stale(symbol_full, pre_now, self.rate_limit_stale_max)
+            max_age = self.stale_max if critical else self.rate_limit_stale_max
+            stale = self._stale(symbol_full, pre_now, max_age)
             if stale is not None:
                 return stale
             raise TickerOverloaded(
@@ -155,8 +156,8 @@ class TickerCache:
                     self._rate_limited_until = (
                         time.monotonic() + self.rate_limit_backoff
                     )
-                    stale = self._stale(
-                        symbol_full, pre_now, self.rate_limit_stale_max)
+                    max_age = self.stale_max if critical else self.rate_limit_stale_max
+                    stale = self._stale(symbol_full, pre_now, max_age)
                     if stale is not None:
                         return stale
                 raise

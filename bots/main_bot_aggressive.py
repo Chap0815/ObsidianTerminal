@@ -14,9 +14,9 @@ Strategy parameters from optimizer-validated 60-day run:
 from __future__ import annotations
 
 try:
-    from bots._bootstrap import prepare_entrypoint, require_portalocker
+    from bots._bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
 except ModuleNotFoundError:
-    from _bootstrap import prepare_entrypoint, require_portalocker
+    from _bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
 
 prepare_entrypoint(__file__, __name__)
 
@@ -43,20 +43,27 @@ class AggressiveBot(SpotBot):
     )
 
     DEFAULTS = {
-        "MIN_PUMP":          6.0,
-        "ACTIVATION_PROFIT": 9.0,
-        "TRAILING_DISTANCE": 3.0,
-        "BREAKEVEN_TRIGGER": 2.5,
-        "INITIAL_STOP_LOSS": -6.0,
+        "MIN_PUMP":          5.0,
+        "ACTIVATION_PROFIT": 4.0,
+        "TRAILING_DISTANCE": 1.5,
+        "POST_PARTIAL_TRAILING_DISTANCE": 1.0,
+        "BREAKEVEN_TRIGGER": 0.0,
+        "INITIAL_STOP_LOSS": -10.0,
         "PARTIAL_SELL_PCT":  0.60,
         "POSITION_SIZE":     10.0,
         "POSITION_SIZE_MAX": 25.0,
         "MAX_OPEN_TRADES":   3,    # konservativer Starter (hohe Varianz)
         "SCAN_INTERVAL":     150,
         "MONITOR_INTERVAL":  20,
+        "USE_TREND_FILTER":  0,
+        "USE_LLM":           False,
         "COOLDOWN_AFTER_SL": 60,
-        "MAX_DAILY_LOSS":    -15.0,  # konservativer Starter
-        "RSI_MAX":           65.0,
+        "MAX_DAILY_LOSS":    -50.0,
+        "OWN_MOMENTUM_FILTER": True,
+        "OWN_MOMENTUM_WINDOW": 8,
+        "OWN_MOMENTUM_MIN_LOSS_PCT": 20.0,
+        "SIMULATION":        True,
+        "RSI_MAX":           85.0,
     }
 
     @staticmethod
@@ -66,6 +73,7 @@ class AggressiveBot(SpotBot):
 
 def run_bot():
     """Entry point  -  kept for backward compat with launcher scripts."""
+    guard_pre_start("SPOT")
     AggressiveBot(simulation=read_simulation_flag("SPOT")).run()
 
 

@@ -184,7 +184,8 @@ class ScanMixin:
                 return
 
         # Risk gates
-        paused, pause_reason = is_bot_paused(self.BOT_NAME, exchange=self.ex)
+        paused, pause_reason = is_bot_paused(
+            self.BOT_NAME, exchange=self.ex, simulation=self.simulation)
         if paused:
             log_event(f"[{self.BOT_NAME}] Pausiert: {pause_reason}", "WAIT")
             return
@@ -244,7 +245,8 @@ class ScanMixin:
             # past the cap; without this the remaining candidates would still
             # fire (overshoot). Cheap DB read  no exchange arg, so the
             # per-cycle BTC-crash API call (pre-loop gate above) isn't repeated.
-            _paused, _pr = is_bot_paused(self.BOT_NAME)
+            _paused, _pr = is_bot_paused(
+                self.BOT_NAME, simulation=self.simulation)
             if _paused:
                 log_event(f"[{self.BOT_NAME}] Kill-switch mid-scan ({_pr})  "
                           f"stopping further entries this cycle", "WAIT")
@@ -287,7 +289,8 @@ class ScanMixin:
                 if isinstance(_filt_err, (TypeError, NameError, AttributeError)):
                     log_event(f"{sym} filter check BUG "
                               f"({type(_filt_err).__name__}: {_filt_err})  "
-                              f"gate skipped, not blocking", "WARN")
+                              f"entry skipped fail-closed", "WARN")
+                    continue
 
             # Multi-RSI gate
             rsi_values = [r["rsi_15m"], r["rsi_1h"], r["rsi_4h"]]
@@ -301,7 +304,9 @@ class ScanMixin:
 
             # Try the entry  encapsulates LLM, quality filters, order
             try:
-                self._try_open_trade(r, regime, balance)
+                opened_usdt = self._try_open_trade(r, regime, balance)
+                if opened_usdt is not None and not self.simulation and balance is not None:
+                    balance = max(0.0, balance - float(opened_usdt))
             except Exception as e:
                 log_event(f"Open-trade {sym} failed: {e}", "WARN")
                 self._log_error(f"_try_open_trade {sym}", e)
@@ -318,9 +323,9 @@ class ScanMixin:
 
     #  Try opening one trade (per candidate) 
 
-    def _try_open_trade(self, r, regime: dict, balance: float) -> None:
+    def _try_open_trade(self, r, regime: dict, balance: float) -> float | None:
         """Run LLM analysis + quality filters + place order if everything
-        passes. Mutates self.state on success."""
+        passes. Mutates self.state on success and returns reserved USDT."""
         from core.logger import log_event, log_buy, send_telegram
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
@@ -342,7 +347,7 @@ class ScanMixin:
                 )
             except Exception as e:
                 log_event(f"Analysis {sym} failed: {e}", "WARN")
-                return
+                return None
 
             analysis_is_keyword = "[keyword fallback" in str(ans or "").lower()
             try:
@@ -350,11 +355,11 @@ class ScanMixin:
                     self._news.parse_direction_and_confidence(ans))
             except Exception as e:
                 log_event(f"parse_direction {sym} failed: {e}", "WARN")
-                return
+                return None
             if direction != "BUY":
                 source = "Keyword fallback" if analysis_is_keyword else "AI"
                 log_event(f"{sym}: {source} says {direction} - skipped", "WAIT")
-                return
+                return None
         else:
             log_event(f"Signal check {sym} (Spot) ...", "INFO")
             confidence = self._assess_spot_entry_signal(r, regime)
@@ -364,7 +369,7 @@ class ScanMixin:
             confidence_override=None if use_llm else confidence)
         if not allow:
             log_event(f"{sym}: {why}", "WAIT")
-            return
+            return None
 
         # Bull/Bear devil's-advocate veto is handled inside
         # news_brain.analyze_sentiment() when direction=="BUY" (it has full
@@ -391,7 +396,7 @@ class ScanMixin:
                     f"only {balance:.2f} USDT free.",
                     "WARN"
                 )
-                return
+                return None
 
         log_buy(
             self.BOT_NAME, sym, r["price"], trade_usdt,
@@ -405,7 +410,7 @@ class ScanMixin:
             if not claim_symbol_for_entry(self.BOT_NAME, sym, "SPOT"):
                 log_event(f"{sym} claimed by another bot  skip "
                           f"(coexistence)", "WAIT")
-                return
+                return None
         _claimed = not self.simulation
         try:
             entry = self._place_buy_order(sym, r, trade_usdt)
@@ -416,13 +421,9 @@ class ScanMixin:
         if entry is None:
             if _claimed:
                 self._release_entry_claim_if_untracked(sym)
-            return  # buy failed  already logged
+            return None  # buy failed  already logged
 
         amount, fill_price, gross_amount, entry_fee = entry
-
-        # Decrement balance for next candidate
-        if not self.simulation and balance is not None:
-            balance = max(0.0, balance - trade_usdt)
 
         # Persist the final position. _place_buy_order already wrote a
         # PROVISIONAL row (zombie protection) before the slow fee refetches, so
@@ -453,10 +454,35 @@ class ScanMixin:
         }
         if self.state.has(sym):
             # Keep the provisional buy_time (earliest, most accurate entry time).
-            self.state.update_many(sym, position_fields)
+            state_ok = self.state.update_many(sym, position_fields)
         else:
             position_fields["buy_time"] = _utc_now_str()
-            self.state.add(sym, position_fields)
+            state_ok = self.state.add(sym, position_fields)
+        if state_ok is False and not self.simulation:
+            log_event(
+                f"Buy {sym}: state write failed after LIVE fill  "
+                f"attempting immediate rollback sell", "WARN")
+            try:
+                from bot_utils.spot_exits import spot_market_sell_safe
+                from bot_utils.order_utils import order_was_filled
+                order, sold_amount = spot_market_sell_safe(
+                    self.ex, f"{sym}/USDT", amount)
+                if order_was_filled(order, sold_amount, min_fill_ratio=1e-9):
+                    remove_open_position(self.BOT_NAME, sym)
+                    log_event(
+                        f"Buy {sym}: rollback sell filled after state failure",
+                        "WARN")
+                else:
+                    log_event(
+                        f"Buy {sym}: CRITICAL rollback sell not verified "
+                        f"after state failure; claim kept for manual recovery",
+                        "ERROR")
+            except Exception as rb_exc:
+                log_event(
+                    f"Buy {sym}: CRITICAL untracked live position risk after "
+                    f"state failure; rollback sell failed ({rb_exc})", "WARN")
+                self._log_error(f"spot rollback after state failure {sym}", rb_exc)
+            return
 
         try:
             from core.logger import log_struct
@@ -490,6 +516,7 @@ class ScanMixin:
                 )
         except Exception as e:
             log_event(f"Telegram failed: {e}", "WARN")
+        return float(trade_usdt)
 
     #  Quality filters 
 
@@ -649,9 +676,10 @@ class ScanMixin:
 
         When the exchange returns a ticker WITHOUT bid/ask (common for thin
         micro-caps on MEXC), we fall back to the ORDER BOOK for the real
-        top-of-book spread and fail CLOSED on a missing/illiquid book (live
-        only; SIM models slippage separately). A ticker-fetch error fails OPEN
-        so a transient glitch can't freeze all trading.
+        top-of-book spread and fail CLOSED on a missing/illiquid book. A
+        ticker-fetch error fails CLOSED in LIVE so we never place a naked
+        market buy without a verified executable quote; SIM stays tolerant
+        so paper data collection can continue through transient quote gaps.
         """
         from core.logger import log_event
         try:
@@ -664,7 +692,7 @@ class ScanMixin:
         except Exception as e:
             log_event(f"{sym}: spread gate skipped  ticker fetch failed ({e})",
                       "WARN")
-            return True
+            return bool(self.simulation)
         # Order-book fallback when the exchange didn't populate bid/ask. Without
         # this, check_spread_ok returns True on missing quotes  illiquid coins
         # slip ~5% on entry. Fail-CLOSED: no readable book = skip the trade.
@@ -703,7 +731,7 @@ class ScanMixin:
                 safe_mode_instance=(None if ob_derived else self.safe_mode)))
         except Exception as e:
             self._log_error(f"spread gate {sym}", e)
-            return True
+            return bool(self.simulation)
 
     def _record_entry_slippage(self, sym: str, expected_price: float,
                                fill_price: float) -> None:
@@ -789,8 +817,11 @@ class ScanMixin:
                         f"not buying into a pumped/illiquid book", "WAIT")
                     return None
                 price = _ask  # buy basis = executable ask  honest slippage math
-        except Exception:
-            pass  # best-effort  an order-book glitch must not freeze all entries
+        except Exception as e:
+            log_event(
+                f"Buy {sym}: ABORT  order-book ask unavailable ({e}) "
+                f"(execution-quality gate)", "WARN")
+            return None
 
         try:
             # CRITICAL: CCXT amount is BASE currency, NOT quote.
@@ -941,7 +972,7 @@ class ScanMixin:
             # state.add corrects the provisional values).
             try:
                 from core.logger import _date as _utc_now_str_inner
-                self.state.add(sym, {
+                provisional_ok = self.state.add(sym, {
                     "buy": fill_price,
                     "highest": fill_price,
                     "buy_time": _utc_now_str_inner(),
@@ -955,6 +986,11 @@ class ScanMixin:
                     "fees_paid": 0.0,
                     "provisional": True,
                 })
+                if provisional_ok is False:
+                    log_event(
+                        f"Buy {sym}: provisional state-write returned False; "
+                        f"final state write must recover before claim release",
+                        "WARN")
             except Exception as _prov_e:
                 # State write failure is non-fatal here  the final state.add
                 # below will retry. We just log.
@@ -985,6 +1021,7 @@ class ScanMixin:
                 self.ex, order, f"{sym}/USDT", sym,
                 max_attempts=3,
                 retry_delay=0.3,
+                fallback_filled=gross_amount,
                 log_event=log_event,
                 shutdown_event=getattr(self, "_shutdown_event", None),
             )

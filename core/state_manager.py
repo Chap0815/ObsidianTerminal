@@ -280,12 +280,18 @@ class StateManager:
         if migrated:
             self._warn(f"One-time migration JSONSQLite: {migrated}")
 
+        if migrated and not self._write_sqlite_bulk(merged):
+            migrated_set = set(migrated)
+            for sym in migrated_set:
+                merged.pop(sym, None)
+            self._warn(
+                f"JSONSQLite migration failed; ignored unclaimed JSON-only "
+                f"position(s): {sorted(migrated_set)}")
+
         with self.lock:
             self._positions = merged
             self._persist_rev += 1
 
-        if migrated:
-            self._write_sqlite_bulk(merged)
         if self.write_json and self._json_writer:
             self._json_writer.submit(
                 {s: p.to_dict() for s, p in merged.items()},
@@ -592,10 +598,7 @@ class StateManager:
                 conn.execute("ROLLBACK")
             except Exception:
                 pass
-            # Keep the in-memory state on transient DB failures so a live
-            # exchange position is still monitored. Only confirmed owner
-            # conflicts return False and roll back the local add.
-            return True
+            return False
         finally:
             try:
                 conn.close()
@@ -631,7 +634,7 @@ class StateManager:
                 conn.execute("ROLLBACK")
             except Exception:
                 pass
-            return True
+            return False
         finally:
             try:
                 conn.close()
@@ -666,7 +669,7 @@ class StateManager:
         if not os.path.exists(self.json_path):
             return {}
         try:
-            with open(self.json_path, "r", encoding="utf-8") as fh:
+            with open(self.json_path, "r", encoding="utf-8-sig") as fh:
                 data = json.load(fh)
             return data if isinstance(data, dict) else {}
         except json.JSONDecodeError as e:

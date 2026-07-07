@@ -1,9 +1,14 @@
 """Shared required release files for smoke checks and updater validation."""
 from __future__ import annotations
 
+from pathlib import Path
+
 
 REQUIRED_RELEASE_ITEMS = [
     "launcher.pyw",
+    "OBSIDIAN.vbs",
+    "start_launcher.bat",
+    "requirements.lock.txt",
     "bot_config.default.json",
     "DEPLOY_MANIFEST.json",
     "core",
@@ -30,6 +35,13 @@ REQUIRED_RELEASE_ITEMS = [
 
 
 UPDATE_SMOKE_FILES = [
+    "launcher.pyw",
+    "OBSIDIAN.vbs",
+    "start_launcher.bat",
+    "requirements.lock.txt",
+    "bot_config.default.json",
+    "config/github_known_hosts",
+    "config/update_config.example.json",
     "launcher/config/settings.py",
     "launcher/ui/app.py",
     "tools/dashboard.py",
@@ -40,6 +52,49 @@ UPDATE_SMOKE_FILES = [
     "tools/release_check.py",
     "tools/selftest.py",
 ]
+
+
+RELEASE_TOOL_FILES = {
+    "tools/__init__.py",
+    "tools/backtester.py",
+    "tools/check_connection.py",
+    "tools/dashboard.py",
+    "tools/ensure_git.py",
+    "tools/ohlcv_cache.py",
+    "tools/optimizer.py",
+    "tools/release_check.py",
+    "tools/release_requirements.py",
+    "tools/selftest.py",
+    "tools/trend_check.py",
+    "tools/trend_leverage_check.py",
+    "tools/update_check.py",
+    "tools/update_deploy_manifest.py",
+    "tools/update_from_git.py",
+    "tools/update_launcher.py",
+    "tools/xsec_momentum.py",
+}
+
+
+def inno_tool_exclude_patterns(tool_files: list[str] | None = None) -> list[str]:
+    """Return Inno exclude patterns for every non-release file under tools/."""
+    root = Path(__file__).resolve().parents[1]
+    tools_dir = root / "tools"
+    if tool_files is None:
+        if tools_dir.exists():
+            tool_files = [
+                path.relative_to(root).as_posix()
+                for path in tools_dir.iterdir()
+                if path.is_file()
+            ]
+        else:
+            tool_files = []
+    patterns: list[str] = []
+    for rel in sorted(set(tool_files)):
+        rel_norm = str(rel).replace("\\", "/")
+        if not rel_norm.startswith("tools/") or rel_norm in RELEASE_TOOL_FILES:
+            continue
+        patterns.append("\\" + rel_norm.replace("/", "\\"))
+    return patterns
 
 
 REQUIRED_MANIFEST_FILES = [

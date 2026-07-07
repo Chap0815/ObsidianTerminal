@@ -71,6 +71,12 @@ class TrendBot(SpotBot):
         if ent and (now - ent[0]) < self.DAILY_CACHE_TTL_SEC and len(ent[1]) >= need:
             return ent[1]
         try:
+            from bot_utils.api_budget import try_consume_api_call
+            if not try_consume_api_call("trend_fetch_ohlcv"):
+                return ent[1] if ent else []
+        except Exception:
+            pass
+        try:
             bars = self.ex.fetch_ohlcv(f"{sym}/USDT", "1d", limit=need + 6)
             # Drop the still-FORMING current-day candle so the signal is based
             # on COMPLETED daily closes  exactly like the validated backtest
@@ -97,10 +103,61 @@ class TrendBot(SpotBot):
 
     def _current_price(self, sym: str) -> float:
         try:
+            from bot_utils.api_budget import try_consume_api_call
+            if not try_consume_api_call("trend_fetch_ticker"):
+                return 0.0
+        except Exception:
+            pass
+        try:
             t = self.ex.fetch_ticker(f"{sym}/USDT")
             return float(t.get("last") or t.get("close") or 0)
         except Exception:
             return 0.0
+
+    def _handle_exit_recovery_gate(self, sym: str, d: dict) -> bool:
+        """Handle pending accounting/conflict state before TREND exits."""
+        if d.get("accounting_already_booked"):
+            from core.spot_bot_exits import ExitsMixin
+            ExitsMixin._cleanup_accounted_close_state(self, sym, d)
+            return True
+        if d.get("accounting_pending"):
+            try:
+                from core.spot_bot_reconcile import _record_spot_offline_close
+                if _record_spot_offline_close(self, sym, d):
+                    booked = dict(d)
+                    booked.update({
+                        "accounting_already_booked": True,
+                        "accounting_booked_sell_time": (
+                            d.get("accounting_pending_sell_time")),
+                        "accounting_booked_exchange_order_id": (
+                            d.get("accounting_pending_exchange_order_id")),
+                        "accounting_booked_reason": (
+                            d.get("accounting_pending_reason")
+                            or "Trend offline close"),
+                    })
+                    from core.spot_bot_exits import ExitsMixin
+                    ExitsMixin._cleanup_accounted_close_state(self, sym, booked)
+            except Exception as exc:
+                self._log_error(f"trend pending accounting retry {sym}", exc)
+            return True
+        if d.get("claim_conflict"):
+            try:
+                from core.logger import log_event
+                warned = getattr(self, "_claim_conflict_warned", set())
+                if sym not in warned:
+                    log_event(
+                        f"[{self.BOT_NAME}] {sym}: registry claim conflict - "
+                        f"monitor skipped fail-closed; run claim/state repair",
+                        "ERROR",
+                    )
+                    warned.add(sym)
+                    self._claim_conflict_warned = warned
+            except Exception:
+                pass
+            return True
+        self._retry_pending_partial_accounting(sym, d)
+        d_live = self.state.get(sym) or d
+        return bool(d_live.get("accounting_pending_partials"))
 
     def _evaluate(self, sym: str, held: bool,
                   p: Optional[TrendParams] = None) -> Tuple[bool, int, Dict[str, bool]]:
@@ -145,6 +202,18 @@ class TrendBot(SpotBot):
         from core.logger import log_event
         if self.safe_mode is not None and self.safe_mode.is_active():
             return
+        try:
+            from trading.risk_manager import is_bot_paused
+            paused, why = is_bot_paused(
+                self.BOT_NAME, exchange=self.ex, simulation=self.simulation)
+        except Exception as e:
+            log_event(f"Trend pause check failed ({type(e).__name__}) - "
+                      f"blocking new entries", "WARN")
+            self._log_error("trend pause check", e)
+            return
+        if paused:
+            log_event(f"Trend paused: {why}", "WAIT")
+            return
         p = self._trend_params()
         size = float(self.C("POSITION_SIZE", 20.0))
         try:
@@ -160,13 +229,20 @@ class TrendBot(SpotBot):
             "1", "true", "yes", "on")
         vols, med = {}, None
         if vt_on:
-            _need = bars_required(p)
             _lb = int(float(self.C("TREND_VOL_TARGET_LOOKBACK", 30)))
+            _need = max(bars_required(p), _lb + 1)
             for _s in self._trend_universe():
                 _v = realized_vol(self._get_daily_closes(_s, _need), _lb)
                 if _v:
                     vols[_s] = _v
             med = basket_median_vol(list(vols.values()))
+            if med is None:
+                seen = getattr(self, "_vol_target_warned", False)
+                if not seen:
+                    self._vol_target_warned = True
+                    log_event("Trend vol-targeting unavailable "
+                              "(insufficient volatility history); using flat "
+                              "position size", "INFO")
 
         free = None
         if not self.simulation:
@@ -217,6 +293,17 @@ class TrendBot(SpotBot):
             price = self._current_price(sym)
             if price <= 0:
                 continue
+            try:
+                paused, why = is_bot_paused(
+                    self.BOT_NAME, simulation=self.simulation)
+            except Exception as e:
+                log_event(f"Trend pause recheck failed ({type(e).__name__}) - "
+                          f"blocking new entries", "WARN")
+                self._log_error("trend pause recheck", e)
+                return
+            if paused:
+                log_event(f"Trend paused before {sym}: {why}", "WAIT")
+                return
             # Defense-in-depth: re-check we still don't hold this coin right
             # before committing capital  closes any has()->add() window.
             if self.state.has(sym):
@@ -233,13 +320,11 @@ class TrendBot(SpotBot):
                 entry = self._place_buy_order(sym, {"price": price}, coin_size)
             except Exception as _buy_exc:
                 if _trend_claimed:
-                    from core.database import remove_open_position
-                    remove_open_position(self.BOT_NAME, sym)
+                    self._release_entry_claim_if_untracked(sym)
                 raise _buy_exc
             if entry is None:
                 if _trend_claimed:
-                    from core.database import remove_open_position
-                    remove_open_position(self.BOT_NAME, sym)
+                    self._release_entry_claim_if_untracked(sym)
                 continue
             amount, fill_price, gross_amount, entry_fee = entry
             self._add_trend_state(sym, fill_price, amount, gross_amount,
@@ -312,6 +397,8 @@ class TrendBot(SpotBot):
             d = self.state.get(sym)
             if not d:
                 continue
+            if self._handle_exit_recovery_gate(sym, d):
+                continue
             curr = self._current_price(sym)
             buy = float(d.get("buy", 0) or 0)
 
@@ -342,7 +429,7 @@ class TrendBot(SpotBot):
             from core.logger import log_event
             if self.safe_mode is None or self.safe_mode.is_active():
                 return
-            info = get_today_pnl(self.BOT_NAME)
+            info = get_today_pnl(self.BOT_NAME, mode_is_sim=self.simulation)
             today = info.get("total_profit", 0.0)
             try:
                 max_loss = float(self.C("MAX_DAILY_LOSS", -50.0))

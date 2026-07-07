@@ -13,8 +13,9 @@ Margin model (consistent for LONG and SHORT):
     margin == notional, so spot accounting is plain notional.
   - At close: capital += margin + PnL_after_exit_fee. Net capital change
     openclose == PnL - entry_fee - exit_fee, for ANY leverage.
-  - On force-liquidation: margin was already removed at open, so the trade
-    just records pnl = -margin (full margin loss); no further capital change.
+  - On force-liquidation: margin and entry fee were already removed at open;
+    liquidation records the full margin loss plus entry/exit fees so reports
+    match the actual capital path.
   - _free_usdt() returns _capital directly  the margin already left _capital
     at open, so there is no separate "used" portion to subtract.
 """
@@ -292,15 +293,15 @@ class SimulatedExchange:
     def _force_liquidate(self, symbol: str, pos: SimPosition) -> dict:
         """Mark position liquidated, settle loss = full margin.
 
-        Margin was already removed from _capital at open (via the margin model
-        in _execute_buy / _execute_short_open), so it is NOT subtracted again
-        here  the trade just records pnl == -margin.
+        Margin and entry fee were already removed from _capital at open. The
+        exit/liquidation fee still reduces capital here, and the trade PnL is
+        net of margin loss plus both fees so reports are not optimistic.
         """
         liq_price = pos.liquidation_price(self._maint_margin)
         margin    = pos.margin_locked
-        pnl       = -margin
         exit_fee  = pos.amount * liq_price * self._taker_for(symbol)
-        # NB: NO change to _capital here  margin already left at open.
+        pnl       = -(margin + pos.fee_usdt + exit_fee)
+        self._capital -= exit_fee
         self._total_fees += exit_fee
         self._liquidations += 1
 
@@ -435,9 +436,11 @@ class SimulatedExchange:
         if sell_amount <= 0:
             return {"filled": 0, "average": fill_price, "status": "rejected"}
 
-        # Pro-rata margin share for partial closes.
-        if pos.original_amount > 0:
-            share        = sell_amount / pos.original_amount
+        # Pro-rata margin share for partial closes. Use the current remaining
+        # amount, not original_amount, otherwise a multi-step close leaks margin.
+        current_amount = float(pos.amount or 0.0)
+        if current_amount > 0:
+            share        = sell_amount / current_amount
             margin_share = pos.margin_locked * share
             entry_fee_share = pos.fee_usdt * share
         else:
@@ -448,14 +451,15 @@ class SimulatedExchange:
         exit_fee = revenue * self._taker_for(symbol)
 
         if pos.side == "buy":
-            pnl = (fill_price - pos.entry_price) * sell_amount - entry_fee_share - exit_fee
+            gross_pnl = (fill_price - pos.entry_price) * sell_amount
         else:
-            pnl = (pos.entry_price - fill_price) * sell_amount - entry_fee_share - exit_fee
+            gross_pnl = (pos.entry_price - fill_price) * sell_amount
+        pnl = gross_pnl - entry_fee_share - exit_fee
 
-        # Capital recovers locked margin + PnL. PnL already nets
-        # entry_fee_share and exit_fee out, so they aren't subtracted again.
-        # _total_fees is still bumped by the actual exit fee paid.
-        self._capital    += (margin_share + pnl)
+        # Entry fee was already paid when the position opened. Capital therefore
+        # recovers margin + gross PnL minus the exit fee; the trade row still
+        # reports net PnL including the proportional entry fee.
+        self._capital    += (margin_share + gross_pnl - exit_fee)
         self._total_fees += exit_fee
 
         is_partial = sell_amount < pos.amount

@@ -19,9 +19,9 @@ Strategy parameters from the optimizer's validated futures run:
 from __future__ import annotations
 
 try:
-    from bots._bootstrap import prepare_entrypoint, require_portalocker
+    from bots._bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
 except ModuleNotFoundError:
-    from _bootstrap import prepare_entrypoint, require_portalocker
+    from _bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
 
 prepare_entrypoint(__file__, __name__)
 
@@ -47,22 +47,30 @@ class FuturesExchangeBot(FuturesBot):
     )
 
     DEFAULTS = {
-        "MIN_PUMP":          2.0,
-        "ACTIVATION_PROFIT": 4.5,
-        "TRAILING_DISTANCE": 2.5,
-        "INITIAL_STOP_LOSS": -3.5,
-        "PARTIAL_SELL_PCT":  0.40,
-        "POSITION_SIZE":     10.0,
-        "POSITION_SIZE_MAX": 25.0,
+        "MIN_PUMP":          1.0,
+        "ACTIVATION_PROFIT": 4.0,
+        "TRAILING_DISTANCE": 1.5,
+        "POST_PARTIAL_TRAILING_DISTANCE": 1.0,
+        "INITIAL_STOP_LOSS": -4.0,
+        "PARTIAL_SELL_PCT":  0.50,
+        "RSI_MAX":           60.0,
+        "POSITION_SIZE":     40.0,
+        "POSITION_SIZE_MAX": 80.0,
         "MAX_OPEN_TRADES":   3,
-        "LEVERAGE":          3,
-        "LIQ_SAFETY_PCT":    25.0,
+        "LEVERAGE":          1.0,
+        "LIQ_SAFETY_PCT":    15.0,
         "SCAN_INTERVAL":     150,
-        "MONITOR_INTERVAL":  20,
+        "MONITOR_INTERVAL":  18.0,
         "BREAKEVEN_TRIGGER": 2.0,
         "USE_TREND_FILTER":  0,
-        "COOLDOWN_AFTER_SL": 120,
-        "MAX_DAILY_LOSS":    -10.0,  # konservativer Starter (Hebel verstrkt)
+        "USE_LLM":           False,
+        "COOLDOWN_AFTER_SL": 240,
+        "MAX_DAILY_LOSS":    -20.0,
+        "MAX_DAILY_LOSS_HARD_MULT": 1.5,
+        "OWN_MOMENTUM_FILTER": True,
+        "OWN_MOMENTUM_WINDOW": 5,
+        "OWN_MOMENTUM_MIN_LOSS_PCT": 20.0,
+        "SIMULATION":        True,
     }
 
     @staticmethod
@@ -72,6 +80,7 @@ class FuturesExchangeBot(FuturesBot):
 
 def run_bot():
     """Entry point  -  kept for backward compat with launcher scripts."""
+    guard_pre_start("FUTURES")
     FuturesExchangeBot(simulation=read_simulation_flag("FUTURES")).run()
 
 

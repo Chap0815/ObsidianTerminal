@@ -140,7 +140,11 @@ class BaseBot(ABC):
                     full = json.load(f)
                     return full.get(self.BOT_NAME, {})
         except Exception as e:
-            print(f"[{self.BOT_NAME}] Config load error: {e}")
+            try:
+                from core.logger import log_event
+                log_event(f"[{self.BOT_NAME}] Config load error: {e}", "WARN")
+            except Exception:
+                print(f"[{self.BOT_NAME}] Config load error: {e}")
         return {}
 
     def cfg(self, key: str, default=None):
@@ -182,10 +186,23 @@ class BaseBot(ABC):
             except Exception as e:
                 if attempt < 2:
                     wait = 2 ** attempt * 5
-                    print(f"[{self.BOT_NAME}] Connection attempt {attempt+1} failed: {e}  retry in {wait}s")
+                    try:
+                        from core.logger import log_event
+                        log_event(f"[{self.BOT_NAME}] Connection attempt "
+                                  f"{attempt+1} failed: {e}  retry in "
+                                  f"{wait}s", "WARN")
+                    except Exception:
+                        print(f"[{self.BOT_NAME}] Connection attempt "
+                              f"{attempt+1} failed: {e}  retry in {wait}s")
                     time.sleep(wait)
                 else:
-                    print(f"[{self.BOT_NAME}] Fatal: could not connect after 3 attempts")
+                    try:
+                        from core.logger import log_event
+                        log_event(f"[{self.BOT_NAME}] Fatal: could not "
+                                  f"connect after 3 attempts", "ERROR")
+                    except Exception:
+                        print(f"[{self.BOT_NAME}] Fatal: could not connect "
+                              f"after 3 attempts")
                     raise RuntimeError(f"[{self.BOT_NAME}] Fatal: could not connect to exchange after 3 attempts")
 
     #  State management 
@@ -214,7 +231,8 @@ class BaseBot(ABC):
         from trading.risk_manager import is_bot_paused, is_bad_hour
         from trading.market_filters import can_buy_now
 
-        paused, reason = is_bot_paused(self.BOT_NAME)
+        paused, reason = is_bot_paused(
+            self.BOT_NAME, simulation=self.simulation)
         if paused:
             return False, f"Bot paused: {reason}"
 

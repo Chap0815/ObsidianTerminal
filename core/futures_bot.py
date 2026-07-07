@@ -317,10 +317,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         # other bot's symbols aren't in this bot's state. Only clean our own.
         try:
             actual = set(self.state.keys())
-            for entry in get_futures_state(self.BOT_NAME):
+            for entry in get_futures_state(
+                    self.BOT_NAME, mode_is_sim=self.simulation):
                 sym = entry.get("symbol")
                 if sym and sym not in actual:
-                    remove_futures_state(sym, self.BOT_NAME)
+                    remove_futures_state(
+                        sym, self.BOT_NAME, mode_is_sim=self.simulation)
                     log_event(f"Stale futures_state entry cleaned: {sym}", "INFO")
         except Exception as e:
             self._log_error("startup-cleanup", e)

@@ -203,7 +203,9 @@ def mode_switch_blockers(bot_name: str) -> list[str]:
 
 #  Spot  read open positions 
 
-def get_open_spot_positions(bot_name: str) -> list:
+def get_open_spot_positions(bot_name: str,
+                            mode_is_sim: bool | None = None,
+                            strict: bool = False) -> list:
     """Read open spot positions from ``{log_dir}/trades.json``.
 
     Returns a list of dicts with ``symbol``, ``buy_price``,
@@ -219,12 +221,21 @@ def get_open_spot_positions(bot_name: str) -> list:
        ``state``, ``leverage``, 
     """
     try:
-        path = _state_path_for(bot_name)
+        effective_sim = mode_is_sim
+        if effective_sim is None:
+            try:
+                from bot_utils.sim_flag import read_simulation_flag
+                effective_sim = bool(read_simulation_flag(bot_name))
+            except Exception:
+                effective_sim = True
+        path = _state_path_for(bot_name, effective_sim)
         if not os.path.exists(path):
             return []
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f) or {}
     except Exception:
+        if strict:
+            raise
         return []
 
     positions: list = []
@@ -259,6 +270,7 @@ def get_open_spot_positions(bot_name: str) -> list:
                       if buy_price > 0 else 0.0)
         positions.append({
             "symbol":         sym,
+            "mode":           "SIM" if bool(effective_sim) else "LIVE",
             "buy_price":      buy_price,
             "current_price":  current_price,
             "amount":         amount,
@@ -343,7 +355,9 @@ def refresh_spot_positions_with_live_prices(positions: list) -> list:
 
 #  Futures  read open positions 
 
-def get_open_futures_positions(bot_name: str = None) -> list:
+def get_open_futures_positions(bot_name: str = None,
+                               mode_is_sim: bool | None = None,
+                               strict: bool = False) -> list:
     """Read open futures positions from the ``futures_state`` table.
 
     Pass ``bot_name`` to scope to ONE bot  FUTURES and CROSS share this
@@ -351,7 +365,7 @@ def get_open_futures_positions(bot_name: str = None) -> list:
     """
     try:
         from core.database import get_futures_state  # type: ignore
-        return get_futures_state(bot_name)
+        return get_futures_state(bot_name, mode_is_sim=mode_is_sim)
     except Exception as e:
         # silent_log = rate-limited stderr
         try:
@@ -360,6 +374,8 @@ def get_open_futures_positions(bot_name: str = None) -> list:
         except Exception:
             import sys as _sys
             _sys.stderr.write(f"[Launcher] Couldn't load futures state: {e}\n")
+        if strict:
+            raise
         return []
 
 
@@ -464,7 +480,7 @@ def direct_close_remaining_futures(
     sim_only: bool,
     reason: str = "Manual Stop",
     bot_name: str = "FUTURES",
-) -> None:
+) -> dict:
     """Close anything still in ``futures_state`` / ``trades.json`` directly.
 
     SCOPED to ``bot_name`` (default FUTURES). futures_state is shared with the
@@ -488,7 +504,7 @@ def direct_close_remaining_futures(
                                    remove_open_position)
     except Exception as e:
         log("error", f"DB-Import fehlgeschlagen: {e}")
-        return
+        return {"closed": 0, "failed": ["db_import"], "total_pnl": 0.0}
 
     # Per-bot margin mode (CROSS=cross, FUTURES=isolated). CROSS reduce-only
     # closes are rejected by MEXC if sent with the wrong margin mode.
@@ -504,15 +520,17 @@ def direct_close_remaining_futures(
         state_bot_name = f"{bot_name} (SIM)" if sim_only else bot_name
         positions = _get_futures_state_for_mode(
             get_futures_state, bot_name, sim_only)
+        state_read_failed = False
     except Exception as e:
         log("error", f"futures_state nicht lesbar: {e}")
         positions = []
+        state_read_failed = True
 
     try:
         trades_file = _state_path_for_mode(bot_name, sim_only)
     except Exception as e:
         log("error", str(e))
-        return
+        return {"closed": 0, "failed": ["state_path"], "total_pnl": 0.0}
     json_trades: dict = {}
     try:
         if os.path.exists(trades_file):
@@ -564,6 +582,7 @@ def direct_close_remaining_futures(
             "accounting_pending_mfe_pct": jt.get("accounting_pending_mfe_pct"),
             "accounting_pending_mae_pct": jt.get("accounting_pending_mae_pct"),
             "accounting_pending_giveback_pct": jt.get("accounting_pending_giveback_pct"),
+            "accounting_pending_partials": jt.get("accounting_pending_partials"),
             "_state_source": "futures_state",
         }
 
@@ -606,11 +625,13 @@ def direct_close_remaining_futures(
                 "accounting_pending_mfe_pct": j.get("accounting_pending_mfe_pct"),
                 "accounting_pending_mae_pct": j.get("accounting_pending_mae_pct"),
                 "accounting_pending_giveback_pct": j.get("accounting_pending_giveback_pct"),
+                "accounting_pending_partials": j.get("accounting_pending_partials"),
                 "_state_source": "json",
             }
 
     if not symbols_to_close:
-        return  # nothing to close  bot handled everything
+        failed = ["futures_state"] if state_read_failed else []
+        return {"closed": 0, "failed": failed, "total_pnl": 0.0}
 
     # Exchange connection for current prices (same for SIM and LIVE)
     ex = None
@@ -656,7 +677,8 @@ def direct_close_remaining_futures(
             "closing_retry_reason": reason,
         }
         for key in ("initial_entry_fee", "fees_paid",
-                    "funding_booked_on_partials"):
+                    "funding_booked_on_partials",
+                    "accounting_pending_partials"):
             if row.get(key) is not None:
                 out[key] = row.get(key)
         return out
@@ -713,8 +735,13 @@ def direct_close_remaining_futures(
                     continue
                 try:
                     remove_futures_state(sym, bot_name, sim_only)
-                except Exception:
-                    pass
+                except Exception as e:
+                    retry_state = _json_state_from_futures_row(p)
+                    retry_state["accounting_already_booked"] = True
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = retry_state
+                    log("error", f"{sym}: futures_state cleanup failed: {e}")
+                    continue
                 closed += 1
                 log("win", f"{sym}: claim cleanup completed")
                 continue
@@ -771,8 +798,13 @@ def direct_close_remaining_futures(
                         continue
                 try:
                     remove_futures_state(sym, bot_name, sim_only)
-                except Exception:
-                    pass
+                except Exception as e:
+                    retry_state = _json_state_from_futures_row(p)
+                    retry_state["accounting_already_booked"] = True
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = retry_state
+                    log("error", f"{sym}: futures_state cleanup failed: {e}")
+                    continue
                 closed += 1
                 total_pnl += pending_kwargs["profit_usdt"]
                 log("win",
@@ -788,6 +820,32 @@ def direct_close_remaining_futures(
             original_amount = float(p.get("original_amount") or amount or 0.0)
             partial_sold = bool(p.get("partial_sold"))
             symbol_full = f"{sym}/USDT:USDT"
+
+            pending_partials = list(p.get("accounting_pending_partials") or [])
+            if pending_partials:
+                remaining_pending = []
+                for item in pending_partials:
+                    retry_item = dict(item)
+                    retry_item.setdefault("mode_is_sim", sim_only)
+                    retry_item.setdefault("is_futures", True)
+                    try:
+                        ok = bool(save_trade_db(**retry_item))
+                    except Exception as e:
+                        ok = False
+                        log("error", f"{sym}: pending futures partial DB retry raised: {e}")
+                    if not ok:
+                        remaining_pending.append(item)
+                if remaining_pending:
+                    keep = _json_state_from_futures_row(p)
+                    keep["accounting_pending_partials"] = remaining_pending
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = keep
+                    log("error",
+                        f"{sym}: pending futures partial accounting still failed - "
+                        f"state kept, full close deferred")
+                    continue
+                p = dict(p)
+                p["accounting_pending_partials"] = []
 
             if _trade_already_booked(sym, p):
                 if not sim_only:
@@ -829,8 +887,13 @@ def direct_close_remaining_futures(
                         continue
                 try:
                     remove_futures_state(sym, bot_name, sim_only)
-                except Exception:
-                    pass
+                except Exception as e:
+                    retry_state = _json_state_from_futures_row(p)
+                    retry_state["accounting_already_booked"] = True
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = retry_state
+                    log("error", f"{sym}: futures_state cleanup failed: {e}")
+                    continue
                 log("win", f"{sym}: stale state cleaned (trade already booked)")
                 closed += 1
                 continue
@@ -961,6 +1024,7 @@ def direct_close_remaining_futures(
                     # propagate to the outer 'except' as before.
                     order = None
                     _last_rate_err: Exception | None = None
+                    _already_flat_verified = False
                     for _rl_attempt in range(3):  # 3 tries total
                         try:
                             order = ex.create_order(
@@ -978,11 +1042,31 @@ def direct_close_remaining_futures(
                                 or "too many requests" in _msg
                             )
                             if not _is_rate:
+                                try:
+                                    from bot_utils.futures_order import (
+                                        is_no_position_error,
+                                        verify_position_closed,
+                                    )
+                                    if is_no_position_error(_e):
+                                        _closed, _remaining = verify_position_closed(
+                                            ex, symbol_full, timeout=5.0)
+                                        if _closed:
+                                            _already_flat_verified = True
+                                            log("warn",
+                                                f"[LIVE] {sym}: exchange already flat "
+                                                f"({str(_e)[:120]})  booking offline close")
+                                            break
+                                        log("error",
+                                            f"[LIVE] {sym}: close said no position, "
+                                            f"but exchange still reports {_remaining} contracts")
+                                        raise
+                                except Exception:
+                                    raise
                                 raise  # non-rate-limit  outer handler
                             _last_rate_err = _e
                             # Exponential backoff: 1s, 2s, 4s
                             _close_time.sleep(2 ** _rl_attempt)
-                    if order is None:
+                    if order is None and not _already_flat_verified:
                         # All 3 attempts hit rate-limit  give up cleanly
                         raise _last_rate_err or RuntimeError("rate-limit retry exhausted")
                     _last_close_at = _close_time.monotonic()
@@ -1023,14 +1107,17 @@ def direct_close_remaining_futures(
                     # A partial fill (routine on thin alt books) would otherwise
                     # leave an ORPHAN on the exchange while the bot believes it
                     # closed.
-                    try:
-                        from bot_utils.futures_order import verify_position_closed
-                        _closed, _remaining = verify_position_closed(
-                            ex, symbol_full, timeout=5.0)
-                    except Exception as _ve:
-                        _closed, _remaining = False, -1.0
-                        log("warn", f"[LIVE] {sym}: close unverified ({_ve})  "
-                                    f"keeping in state")
+                    if _already_flat_verified:
+                        _closed, _remaining = True, 0.0
+                    else:
+                        try:
+                            from bot_utils.futures_order import verify_position_closed
+                            _closed, _remaining = verify_position_closed(
+                                ex, symbol_full, timeout=5.0)
+                        except Exception as _ve:
+                            _closed, _remaining = False, -1.0
+                            log("warn", f"[LIVE] {sym}: close unverified ({_ve})  "
+                                        f"keeping in state")
                     if not _closed:
                         log("error",
                             f"[LIVE] {sym}: close NOT confirmed "
@@ -1076,8 +1163,11 @@ def direct_close_remaining_futures(
                         continue
                     try:
                         remove_futures_state(sym, bot_name, sim_only)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        failed_syms.append(sym)
+                        failed_position_updates[sym] = _json_state_from_futures_row(p)
+                        log("error", f"{sym}: futures_state cleanup failed: {e}")
+                        continue
                     closed += 1
                     log("win", f"{sym}: stale amount=0 state cleaned (flat)")
                     continue
@@ -1149,8 +1239,13 @@ def direct_close_remaining_futures(
                 # unscoped delete would wipe the other bot's dashboard row
                 # for the same base coin.
                 remove_futures_state(sym, bot_name, sim_only)
-            except Exception:
-                pass
+            except Exception as e:
+                failed_syms.append(sym)
+                retry_state = _json_state_from_futures_row(p)
+                retry_state["accounting_already_booked"] = True
+                failed_position_updates[sym] = retry_state
+                log("error", f"{sym}: futures_state cleanup failed: {e}")
+                continue
 
             closed += 1
             total_pnl += pnl_usdt
@@ -1201,6 +1296,7 @@ def direct_close_remaining_futures(
     sev = "warn" if "Emergency" in reason else "system"
     log(sev,
         f" {closed} position(s) closed  Total realized: {total_pnl:+.2f} USDT")
+    return {"closed": closed, "failed": list(failed_syms), "total_pnl": total_pnl}
 
 
 #  Spot  direct close (fallback when bot's own handler couldn't) 
@@ -1210,7 +1306,7 @@ def direct_close_remaining_spot(
     log,
     sim_only: bool,
     reason: str = "Manual Stop",
-) -> None:
+) -> dict:
     """Spot equivalent of :func:`direct_close_remaining_futures`.
 
     Anything still in ``{log_dir}/trades.json`` after a graceful shutdown
@@ -1220,13 +1316,13 @@ def direct_close_remaining_spot(
         trades_file = _state_path_for_mode(bot_name, sim_only)
     except Exception as e:
         log("error", str(e))
-        return
+        return {"closed": 0, "failed": ["state_path"], "total_pnl": 0.0}
     state_bot_name = f"{bot_name} (SIM)" if sim_only else bot_name
     try:
         from core.database import save_trade_db, remove_open_position  # type: ignore
     except Exception as e:
         log("error", f"DB import failed: {e}")
-        return
+        return {"closed": 0, "failed": ["db_import"], "total_pnl": 0.0}
 
     json_trades: dict = {}
     try:
@@ -1237,7 +1333,7 @@ def direct_close_remaining_spot(
         pass
 
     if not json_trades:
-        return  # nothing to clean up
+        return {"closed": 0, "failed": [], "total_pnl": 0.0}
 
     ex = None
     if not sim_only:
@@ -1484,10 +1580,34 @@ def direct_close_remaining_spot(
                         f"[LIVE] Sold {sym} @ {fill_price:.6f} "
                         f"(fee {close_fee:.4f})  {profit_usdt:+.2f} USDT")
                 except Exception as e:
-                    log("error",
-                        f"[LIVE] {sym}: sell FAILED: {e}  sell manually!")
-                    failed_syms.append(sym)
-                    continue
+                    try:
+                        from bot_utils.spot_exits import InsufficientSellBalance
+                    except Exception:
+                        InsufficientSellBalance = ()  # type: ignore
+                    if InsufficientSellBalance and isinstance(e, InsufficientSellBalance):
+                        free_base = float(getattr(e, "free", 0.0) or 0.0)
+                        if free_base <= 0:
+                            log("warn",
+                                f"[LIVE] {sym}: exchange balance already sold/empty "
+                                f"({e})  booking offline close")
+                            fill_price = curr
+                            close_fee = 0.0
+                            real_pct = ((fill_price - buy_price) / buy_price * 100
+                                        if buy_price > 0 else 0.0)
+                            profit_pct = real_pct
+                            profit_usdt = round(
+                                margin * (real_pct / 100) - entry_fee, 2
+                            ) if margin > 0 else 0.0
+                        else:
+                            log("error",
+                                f"[LIVE] {sym}: sell FAILED: {e}  sell manually!")
+                            failed_syms.append(sym)
+                            continue
+                    else:
+                        log("error",
+                            f"[LIVE] {sym}: sell FAILED: {e}  sell manually!")
+                        failed_syms.append(sym)
+                        continue
 
             buy_time = d.get("buy_time") or _utc_now_str()
             sell_time = _utc_now_str()
@@ -1609,3 +1729,4 @@ def direct_close_remaining_spot(
     sev = "warn" if "Emergency" in reason else "system"
     log(sev,
         f" {closed} position(s) closed  Total realized: {total_pnl:+.2f} USDT")
+    return {"closed": closed, "failed": list(failed_syms), "total_pnl": total_pnl}

@@ -114,8 +114,7 @@ def atomic_save_json(path: str, data) -> bool:
         # Fallback  better non-atomic than nothing
         try:
             from core.logger import save_j
-            save_j(path, data)
-            return True
+            return bool(save_j(path, data))
         except Exception:
             return False
     finally:

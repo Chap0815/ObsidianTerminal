@@ -212,6 +212,12 @@ def validate_config_or_die(bot_name: str) -> dict:
                     f"[{bot_name}] FATAL: LEVERAGE={lev} out of safe range "
                     f"({lo}-{hi})", "WARN")
                 _fatal_exit(1)
+            if bot_name.upper() == "FUTURES" and abs(lev - round(lev)) > 1e-9:
+                log_event(
+                    f"[{bot_name}] FATAL: LEVERAGE={lev} must be a whole "
+                    f"number for the regular futures bot. Use FUTREND for "
+                    f"fractional effective leverage.", "WARN")
+                _fatal_exit(1)
         # INITIAL_STOP_LOSS must be strictly negative and in a sane range. A
         # positive value (e.g. user types 3.5 instead of -3.5) makes the exit
         # check `profit_pct <= initial_sl` true immediately  every trade stops
@@ -286,6 +292,17 @@ def validate_config_or_die(bot_name: str) -> dict:
             ("TREND_EXIT_VOTE", 1, 3),
             ("TREND_SMA_FAST", 1, 5000),
             ("TREND_SMA_SLOW", 1, 5000),
+            ("TREND_CROSS_FAST", 1, 5000),
+            ("TREND_CROSS_SLOW", 1, 5000),
+            ("TREND_VOL_TARGET_LOOKBACK", 2, 500),
+            ("TREND_EXIT_STALE_LIMIT", 1, 50),
+            ("MAX_NEW_TRADES_PER_TICK", 0, 50),
+            ("XSEC_K", 1, 15),
+            ("XSEC_LOOKBACK_HOURS", 6, 336),
+            ("XSEC_REBALANCE_HOURS", 6, 336),
+            ("XSEC_UNIVERSE_SIZE", 10, 100),
+            ("CRASH_WINDOW", 1, 50),
+            ("XSEC_MAX_SPREAD_PCT", 0.01, 10.0),
         )
         for _key, _lo, _hi in _checks:
             if _key in cfg:
@@ -449,9 +466,10 @@ def own_momentum_blocked(bot_name: str) -> tuple:
         return False, ""   # never block on an error
 
 
-def is_bot_paused(bot_name: str, exchange=None) -> tuple:
+def is_bot_paused(bot_name: str, exchange=None, simulation: bool = True) -> tuple:
     try:
-        killed, reason = check_kill_switches(bot_name, exchange=exchange)
+        killed, reason = check_kill_switches(
+            bot_name, exchange=exchange, simulation=simulation)
         if killed:
             return True, reason
     except Exception:
@@ -470,7 +488,8 @@ def is_bot_paused(bot_name: str, exchange=None) -> tuple:
         # Alert on the daily-loss transition too. pause_bot_today persists the
         # pause and the is_paused fast-path above short-circuits subsequent
         # calls, so this fires once per day.
-        _alert_kill_switch(bot_name, f"STOP: {_reason}")
+        _alert_kill_switch(
+            bot_name, f"STOP: {_reason}", telegram_enabled=not simulation)
         return True, f"Drawdown limit reached ({pnl['total_profit']:.2f} USDT)"
 
     blocked, om_reason = own_momentum_blocked(bot_name)
@@ -613,7 +632,8 @@ def _adapt_position_size(bot_name: str, trades: list):
     kelly_frac  = kelly_full * KELLY_FRACTION
 
     if kelly_full <= 0:
-        _, min_size, _ = _read_position_config(bot_name)
+        _, _, max_size = _read_position_config(bot_name)
+        min_size = min(MIN_POSITION_USDT, max_size) if max_size > 0 else MIN_POSITION_USDT
         old_size = get_param(bot_name, "position_size", DEFAULT_POSITION_USDT)
         reason = f"Kelly={kelly_full:.3f} <= 0  throttling to min_size={min_size}"
         log_event(f"[{bot_name}] Kelly negative  forcing min size ({min_size} USDT)", "WARN")
@@ -977,7 +997,8 @@ def score_trade_quality(
     }
 
 
-def _alert_kill_switch(bot_name: str, reason: str) -> None:
+def _alert_kill_switch(bot_name: str, reason: str,
+                       telegram_enabled: bool = False) -> None:
     """Cross-process alert when a HARD kill condition trips.
 
     Bots run as SEPARATE processes, so the in-process event bus cannot reach
@@ -992,17 +1013,18 @@ def _alert_kill_switch(bot_name: str, reason: str) -> None:
     cache BEFORE its return, and the cached fast-path returns earlier without
     re-entering the branch, so this fires once per kill window (no spam).
     """
-    try:
-        from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-        from core.logger import send_telegram
-        send_telegram(
-            TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-            f" [{bot_name}] KILL-SWITCH\n{reason}\n"
-            f"New entries are PAUSED. Open positions are still managed by their "
-            f"own stops  review and CLOSE MANUALLY if you want out of the move."
-        )
-    except Exception:
-        pass
+    if telegram_enabled:
+        try:
+            from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+            from core.logger import send_telegram
+            send_telegram(
+                TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                f" [{bot_name}] KILL-SWITCH\n{reason}\n"
+                f"New entries are PAUSED. Open positions are still managed by their "
+                f"own stops  review and CLOSE MANUALLY if you want out of the move."
+            )
+        except Exception:
+            pass
     try:
         from core.event_bus import get_bus
         get_bus().emit("KILL_SWITCH_TRIPPED",
@@ -1011,7 +1033,8 @@ def _alert_kill_switch(bot_name: str, reason: str) -> None:
         pass
 
 
-def check_kill_switches(bot_name: str, exchange=None) -> tuple:
+def check_kill_switches(bot_name: str, exchange=None,
+                        simulation: bool = True) -> tuple:
     now = _time.monotonic()
     with _KILL_SWITCH_LOCK:
         cached = _KILL_SWITCH_CACHE.get(bot_name)
@@ -1058,7 +1081,8 @@ def check_kill_switches(bot_name: str, exchange=None) -> tuple:
             with _KILL_SWITCH_LOCK:
                 _KILL_SWITCH_CACHE[bot_name] = {"until": now + 14400, "reason": reason}
             log_event(f"[{bot_name}] {reason}  pausing 4 hours", "WARN")
-            _alert_kill_switch(bot_name, reason)
+            _alert_kill_switch(
+                bot_name, reason, telegram_enabled=not simulation)
             return True, reason
     except Exception:
         pass
@@ -1088,7 +1112,8 @@ def check_kill_switches(bot_name: str, exchange=None) -> tuple:
                 with _KILL_SWITCH_LOCK:
                     _KILL_SWITCH_CACHE[bot_name] = {"until": now + 1800, "reason": reason}
                 log_event(f"[{bot_name}] {reason}  pausing 30 min", "WARN")
-                _alert_kill_switch(bot_name, reason)
+                _alert_kill_switch(
+                    bot_name, reason, telegram_enabled=not simulation)
                 return True, reason
     except Exception:
         pass
@@ -1104,14 +1129,16 @@ def check_kill_switches(bot_name: str, exchange=None) -> tuple:
                 with _KILL_SWITCH_LOCK:
                     _KILL_SWITCH_CACHE[bot_name] = {"until": now + 600, "reason": reason}
                 log_event(f"[{bot_name}] {reason}  pausing 10 min", "WARN")
-                _alert_kill_switch(bot_name, reason)
+                _alert_kill_switch(
+                    bot_name, reason, telegram_enabled=not simulation)
                 return True, reason
             if btc_4h <= -8.0:
                 reason = f"STOP: Kill-Switch: BTC crashed {btc_4h:.1f}% in 4h"
                 with _KILL_SWITCH_LOCK:
                     _KILL_SWITCH_CACHE[bot_name] = {"until": now + 7200, "reason": reason}
                 log_event(f"[{bot_name}] {reason}  pausing 2 hours", "WARN")
-                _alert_kill_switch(bot_name, reason)
+                _alert_kill_switch(
+                    bot_name, reason, telegram_enabled=not simulation)
                 return True, reason
         except Exception:
             pass

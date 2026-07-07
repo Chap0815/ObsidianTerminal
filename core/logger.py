@@ -259,14 +259,20 @@ def redact(s: str) -> str:
             r"|signature|sign)"
             r"(['\"]?\s*[:=]\s*['\"]?)([^\s'\"&,}]{6,})",
             r"\1\2***REDACTED***", out, flags=re.IGNORECASE)
+        out = re.sub(
+            r"((?:authorization|proxy-authorization)\s*[:=]\s*bearer\s+)"
+            r"([A-Za-z0-9._~+/=\-]{8,})",
+            r"\1***REDACTED***", out, flags=re.IGNORECASE)
+        out = re.sub(
+            r"((?:x[-_])?(?:api[-_]?key|auth[-_]?token)"
+            r"\s*[:=]\s*['\"]?)([A-Za-z0-9._~+/=\-]{8,})",
+            r"\1***REDACTED***", out, flags=re.IGNORECASE)
         # URL userinfo credentials (proxy URLs: scheme://user:pass@host):
         out = re.sub(r"(://[^:/\s]+:)([^@/\s]{3,})(@)",
                      r"\1***REDACTED***\3", out)
         return out
     except Exception:
-        # In doubt, prefer logging the (possibly unredacted) line over
-        # crashing the error-logger entirely  but this path should be rare.
-        return s
+        return "[REDACTION_FAILED]"
 
 
 def _redact_value(v):
@@ -404,7 +410,19 @@ def log_struct(event: str, **fields) -> None:
             record[k] = _redact_value(str(v))
 
     path = _struct_log_path()
-    line = json.dumps(record, ensure_ascii=False)
+    try:
+        line = json.dumps(record, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        safe_record = {"ts": record.get("ts"), "event": record.get("event")}
+        for k, v in record.items():
+            if k in safe_record:
+                continue
+            try:
+                json.dumps(v, allow_nan=False)
+                safe_record[k] = v
+            except (TypeError, ValueError):
+                safe_record[k] = _redact_value(str(v))
+        line = json.dumps(safe_record, ensure_ascii=False, allow_nan=False)
     try:
         _STRUCT_LOG_QUEUE.put_nowait((line, path))
     except queue.Full:
@@ -553,7 +571,7 @@ def load_j(f, default=None):
         default = {}
     if os.path.exists(f):
         try:
-            with open(f, "r", encoding="utf-8") as fh:
+            with open(f, "r", encoding="utf-8-sig") as fh:
                 return json.load(fh)
         except Exception as e:
             log_event(f"Read error ({f}): {e}", "WARN")
@@ -577,7 +595,7 @@ def save_j(f, d):
         for _attempt in range(8):
             try:
                 os.replace(tmp, f)
-                return
+                return True
             except PermissionError:
                 if _attempt < 7:
                     time.sleep(0.05)
@@ -590,6 +608,7 @@ def save_j(f, d):
                 os.remove(tmp)
             except OSError:
                 pass
+    return False
 
 
 # 

@@ -13,6 +13,7 @@ Design contract:
 from __future__ import annotations
 
 import copy
+import inspect
 import threading
 from typing import Optional, Dict, Any, List
 
@@ -35,7 +36,25 @@ _CLAIM_EXTRA_FIELDS = frozenset((
     "funding_booked_on_partials", "partial_sold", "break_even", "be_active",
     "be_price", "highest", "last_price", "liquidation_price",
     "initial_liq_distance", "margin_mode", "accounting_pending_partials",
+    "unpriced_external_partials",
 ))
+
+
+def remove_with_restore_fields(state, sym: str, fields: Dict[str, Any]) -> bool:
+    """Remove state while supporting older/fake state objects in tests/tools."""
+    remove = state.remove
+    try:
+        params = inspect.signature(remove).parameters
+    except (TypeError, ValueError):
+        params = {}
+    supports_restore = any(
+        p.kind == inspect.Parameter.VAR_POSITIONAL for p in params.values()
+    ) or len(params) >= 2
+    if not supports_restore:
+        result = state.remove(sym)
+        return True if result is None else bool(result)
+    result = remove(sym, fields)
+    return True if result is None else bool(result)
 
 
 class TradeState:
@@ -60,7 +79,11 @@ class TradeState:
                  bot_name: Optional[str] = None):
         self._db_file = db_file
         self._lock = threading.Lock()
+        self._persist_lock = threading.Lock()
+        self._rev = 0
+        self._persisted_rev = 0
         self._is_futures = is_futures
+        self._registry_retry_pending: Dict[str, Dict[str, Any]] = {}
         # bot_name drives the SHARED multi-bot ownership registry
         # (bot_open_positions). When set, add()/remove() mirror the claim so
         # is_claimed_by_other() actually works (see _registry_* below).
@@ -156,6 +179,7 @@ class TradeState:
         if not self._bot_name:
             return
         conflicted = []
+        pending = []
         for sym, data in clean.items():
             if self._registry_upsert(sym, data):
                 continue
@@ -169,8 +193,10 @@ class TradeState:
                 if claimed is None:
                     self._log_registry_warning(
                         f"startup resync kept {self._bot_name}:{sym}; "
-                        f"registry unavailable"
+                        f"registry unavailable; retry pending"
                     )
+                    pending.append(sym)
+                    self._registry_retry_pending[sym] = copy.deepcopy(data)
                     continue
                 claimed_elsewhere = _base_symbol(sym) in claimed
             except Exception:
@@ -181,7 +207,7 @@ class TradeState:
                     f"startup resync kept {self._bot_name}:{sym} fail-closed; "
                     f"registry says another bot owns it"
                 )
-        if conflicted:
+        if conflicted or pending:
             with self._lock:
                 for sym in conflicted:
                     if sym in self._trades:
@@ -189,38 +215,114 @@ class TradeState:
                         self._trades[sym]["claim_conflict_reason"] = (
                             "registry_owner_conflict_on_startup"
                         )
+                for sym in pending:
+                    if sym in self._trades:
+                        self._trades[sym]["claim_registry_pending"] = True
+                        self._trades[sym]["claim_registry_pending_reason"] = (
+                            "registry_unavailable_on_startup"
+                        )
                 snapshot = copy.deepcopy(self._trades)
-            atomic_save_json(self._db_file, snapshot)
+                self._rev += 1
+                rev = self._rev
+            self._persist_snapshot(rev, snapshot)
+
+    def retry_registry_pending(self) -> int:
+        """Best-effort repair for claim rows that failed during startup."""
+        if not self._bot_name:
+            return 0
+        with self._lock:
+            pending = {
+                sym: copy.deepcopy(self._trades.get(sym, data))
+                for sym, data in self._registry_retry_pending.items()
+                if sym in self._trades
+            }
+        if not pending:
+            return 0
+        repaired = []
+        conflicted = []
+        for sym, data in pending.items():
+            if self._registry_upsert(sym, data):
+                repaired.append(sym)
+                continue
+            try:
+                from core.database import get_all_claimed_bases, _base_symbol
+                claimed = get_all_claimed_bases(
+                    exclude_bot=self._bot_name,
+                    is_futures=self._is_futures,
+                    fail_closed=True,
+                )
+                if claimed is not None and _base_symbol(sym) in claimed:
+                    conflicted.append(sym)
+            except Exception:
+                pass
+        if not repaired and not conflicted:
+            return 0
+        with self._lock:
+            for sym in repaired:
+                self._registry_retry_pending.pop(sym, None)
+                if sym in self._trades:
+                    self._trades[sym].pop("claim_registry_pending", None)
+                    self._trades[sym].pop("claim_registry_pending_reason", None)
+            for sym in conflicted:
+                self._registry_retry_pending.pop(sym, None)
+                if sym in self._trades:
+                    self._trades[sym]["claim_conflict"] = True
+                    self._trades[sym]["claim_conflict_reason"] = (
+                        "registry_owner_conflict_after_retry"
+                    )
+                    self._trades[sym].pop("claim_registry_pending", None)
+                    self._trades[sym].pop("claim_registry_pending_reason", None)
+            rev, snapshot = self._snapshot_locked()
+        self._persist_snapshot(rev, snapshot)
+        return len(repaired)
 
     #  Reads (always return deep copies) 
 
+    def _snapshot_locked(self) -> tuple[int, dict]:
+        self._rev += 1
+        return self._rev, copy.deepcopy(self._trades)
+
+    def _persist_snapshot(self, rev: int, snapshot: dict) -> str:
+        with self._persist_lock:
+            if rev < self._persisted_rev:
+                return "stale"
+            if atomic_save_json(self._db_file, snapshot):
+                self._persisted_rev = rev
+                return "persisted"
+            return "failed"
+
     def get_all(self) -> dict:
         """Deep-copy snapshot of all trades  safe to iterate without lock."""
+        self.retry_registry_pending()
         with self._lock:
             return copy.deepcopy(self._trades)
 
     def get(self, sym: str) -> Optional[dict]:
         """Deep-copy of one trade, or None."""
+        self.retry_registry_pending()
         with self._lock:
             if sym not in self._trades:
                 return None
             return copy.deepcopy(self._trades[sym])
 
     def count(self) -> int:
+        self.retry_registry_pending()
         with self._lock:
             return len(self._trades)
 
     def has(self, sym: str) -> bool:
+        self.retry_registry_pending()
         with self._lock:
             return sym in self._trades
 
     def keys(self) -> List[str]:
+        self.retry_registry_pending()
         with self._lock:
             return list(self._trades.keys())
 
     #  Writes (snapshot under lock, save outside) 
 
-    def add(self, sym: str, data: dict) -> None:
+    def add(self, sym: str, data: dict) -> bool:
         """Insert a new trade (or overwrite existing).
 
         DEFENSIVE: rejects entries with invalid buy/amount. If a bot's screener
@@ -263,66 +365,103 @@ class TradeState:
                 })
             except Exception:
                 pass
-            return
+            return False
 
         with self._lock:
             self._trades[sym] = data
-            snapshot = copy.deepcopy(self._trades)  # true deep-copy
-        atomic_save_json(self._db_file, snapshot)
+            rev, snapshot = self._snapshot_locked()
+        status = self._persist_snapshot(rev, snapshot)
         # Claim the coin in the shared multi-bot registry (outside the lock,
         # like the JSON write). This is what makes is_claimed_by_other() work
         # so another bot won't open the SAME perp and net against us.
-        self._registry_upsert(sym, data)
+        registry_ok = self._registry_upsert(sym, data)
+        return status in ("persisted", "stale") and registry_ok
 
-    def update(self, sym: str, key: str, value) -> None:
-        """Set one field on an existing trade. No-op if symbol missing."""
+    def update(self, sym: str, key: str, value) -> bool:
+        """Set one field on an existing trade. Returns False if not durable."""
         snapshot = None
         claim_row = None
         with self._lock:
             if sym in self._trades:
                 self._trades[sym][key] = value
-                snapshot = copy.deepcopy(self._trades)  # true deep-copy
+                rev, snapshot = self._snapshot_locked()
                 if key in _CLAIM_FIELDS:
                     claim_row = copy.deepcopy(self._trades[sym])
         if snapshot is not None:
-            atomic_save_json(self._db_file, snapshot)
+            status = self._persist_snapshot(rev, snapshot)
             # Keep the shared claim row in sync when a claim-relevant field
             # changed (e.g. amount/invested after a partial sell). Skipping the
             # frequent last_price/highest updates avoids hammering the DB.
+            registry_ok = True
             if claim_row is not None:
-                self._registry_upsert(sym, claim_row)
+                registry_ok = self._registry_upsert(sym, claim_row)
+            return status in ("persisted", "stale") and registry_ok
+        return False
 
-    def update_many(self, sym: str, fields: dict) -> None:
-        """Set multiple fields atomically  single persist instead of N."""
+    def update_many(self, sym: str, fields: dict) -> bool:
+        """Set multiple fields atomically; returns False if not durable."""
         snapshot = None
         claim_row = None
         with self._lock:
             if sym in self._trades:
                 self._trades[sym].update(fields)
-                snapshot = copy.deepcopy(self._trades)  # true deep-copy
+                rev, snapshot = self._snapshot_locked()
                 if _CLAIM_FIELDS.intersection(fields):
                     claim_row = copy.deepcopy(self._trades[sym])
         if snapshot is not None:
-            atomic_save_json(self._db_file, snapshot)
+            status = self._persist_snapshot(rev, snapshot)
+            registry_ok = True
             if claim_row is not None:
-                self._registry_upsert(sym, claim_row)
+                registry_ok = self._registry_upsert(sym, claim_row)
+            return status in ("persisted", "stale") and registry_ok
+        return False
 
-    def remove(self, sym: str) -> None:
-        """Remove a trade. No-op if symbol missing."""
+    def remove(self, sym: str, restore_fields: Optional[Dict[str, Any]] = None) -> bool:
+        """Remove a trade and return whether removal was persisted.
+
+        If JSON persistence fails, the in-memory row is restored and the shared
+        claim is intentionally kept. ``restore_fields`` lets money paths mark
+        a verified-flat row as already accounted so reconcile will not book it
+        a second time while the state file is still locked.
+        """
         snapshot = None
         removed = None
         with self._lock:
             if sym in self._trades:
                 removed = self._trades.pop(sym)
-                snapshot = copy.deepcopy(self._trades)  # true deep-copy
+                rev, snapshot = self._snapshot_locked()
         if snapshot is not None:
-            persisted = atomic_save_json(self._db_file, snapshot)
-            if persisted:
+            status = self._persist_snapshot(rev, snapshot)
+            if status == "persisted":
                 # Release the claim so other bots can trade this coin again.
-                self._registry_remove(sym)
-            else:
+                if self._registry_remove(sym):
+                    return True
+                with self._lock:
+                    restore_snapshot = None
+                    if sym not in self._trades and removed is not None:
+                        restored = copy.deepcopy(removed)
+                        if restore_fields:
+                            restored.update(restore_fields)
+                        restored["claim_release_pending"] = True
+                        self._trades[sym] = restored
+                        restore_rev, restore_snapshot = self._snapshot_locked()
+                if restore_snapshot is not None:
+                    self._persist_snapshot(restore_rev, restore_snapshot)
+                try:
+                    from bot_utils.silent_log import silent_log
+                    silent_log(
+                        f"TradeState.remove({self._bot_name or '-'}:{sym})",
+                        RuntimeError("claim release failed; state restored"),
+                    )
+                except Exception:
+                    pass
+                return False
+            elif status == "failed":
                 with self._lock:
                     if sym not in self._trades and removed is not None:
+                        if restore_fields:
+                            removed = copy.deepcopy(removed)
+                            removed.update(restore_fields)
                         self._trades[sym] = removed
                 try:
                     from bot_utils.silent_log import silent_log
@@ -332,10 +471,12 @@ class TradeState:
                     )
                 except Exception:
                     pass
+                return False
+        return True
 
     def save_now(self) -> None:
         """Force a persist of the current state (used by emergency-close paths
         that mutated trades via direct refs without going through update())."""
         with self._lock:
-            snapshot = copy.deepcopy(self._trades)  # true deep-copy
-        atomic_save_json(self._db_file, snapshot)
+            rev, snapshot = self._snapshot_locked()
+        self._persist_snapshot(rev, snapshot)

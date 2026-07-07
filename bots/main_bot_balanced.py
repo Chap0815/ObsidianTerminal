@@ -11,9 +11,9 @@ Strategy parameters from optimizer-validated 60-day run:
 from __future__ import annotations
 
 try:
-    from bots._bootstrap import prepare_entrypoint, require_portalocker
+    from bots._bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
 except ModuleNotFoundError:
-    from _bootstrap import prepare_entrypoint, require_portalocker
+    from _bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
 
 prepare_entrypoint(__file__, __name__)
 
@@ -43,7 +43,8 @@ class BalancedBot(TrendBot):
     DEFAULTS = {
         # Sizing
         "POSITION_SIZE":     20.0,   # USDT per coin when in-trend
-        "MAX_OPEN_TRADES":   12,
+        "POSITION_SIZE_MAX": 2500.0,
+        "MAX_OPEN_TRADES":   3,
         # Trend universe + signal
         "TREND_UNIVERSE":    "BTC,ETH,BNB,XRP,SOL,ADA,AVAX,LINK,DOT,LTC,DOGE,TRX",
         "TREND_SMA_FAST":    50,
@@ -71,6 +72,7 @@ class BalancedBot(TrendBot):
 
 def run_bot():
     """Entry point  -  kept for backward compat with launcher scripts."""
+    guard_pre_start("TREND")
     BalancedBot(simulation=read_simulation_flag("TREND")).run()
 
 

@@ -3,16 +3,20 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.release_requirements import (
+    RELEASE_TOOL_FILES,
     REQUIRED_MANIFEST_FILES,
     REQUIRED_RELEASE_ITEMS,
 )
@@ -22,7 +26,9 @@ from tools.update_deploy_manifest import build_manifest
 FORBIDDEN_DIRS = {
     ".git",
     ".pytest_cache",
+    ".pytest_tmp_review",
     "__pycache__",
+    "backups",
     "data",
     "logs",
     "optimizer_results",
@@ -30,6 +36,7 @@ FORBIDDEN_DIRS = {
     "research_run2",
     "staging",
     "Output",
+    "installer",
     "tests",
     "docs",
     "BOT ADDITIONAL",
@@ -38,14 +45,26 @@ FORBIDDEN_SUFFIXES = {
     ".db",
     ".db-shm",
     ".db-wal",
+    ".db3",
+    ".db3-shm",
+    ".db3-wal",
     ".exe",
+    ".key",
     ".log",
     ".jsonl",
+    ".pem",
     ".pyc",
     ".pyo",
+    ".sqlite",
+    ".sqlite-shm",
+    ".sqlite-wal",
+    ".sqlite3",
+    ".sqlite3-shm",
+    ".sqlite3-wal",
 }
 FORBIDDEN_NAMES = {
     ".env",
+    ".gitignore",
     "TODO.md",
     "README_GITHUB.md",
     "pytest.ini",
@@ -53,6 +72,7 @@ FORBIDDEN_NAMES = {
 }
 FORBIDDEN_REL_PATHS = {
     "bot_config.json",
+    "bot_config.json.lock",
     "config/update_config.json",
     "prompts/spot.txt",
     "prompts/futures.txt",
@@ -81,6 +101,58 @@ def _has_mojibake(text: str) -> bool:
     return any(marker in text for marker in markers)
 
 
+_TELEGRAM_TOKEN_RE = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b")
+_GENERIC_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)\b(api[_-]?key|api[_-]?secret|secret|token|password|passphrase)"
+    r"\b['\"]?\s*[:=]\s*['\"]?([A-Za-z0-9._~+/=\-]{12,})"
+)
+_BEARER_RE = re.compile(
+    r"(?i)\b(?:authorization|proxy-authorization)\s*[:=]\s*bearer\s+"
+    r"[A-Za-z0-9._~+/=\-]{16,}"
+)
+_PROVIDER_TOKEN_RE = re.compile(
+    r"\b(?:ghp|github_pat|glpat|sk|xoxb|xoxp)-[A-Za-z0-9._~+/=\-]{16,}\b"
+)
+_PRIVATE_KEY_MARKERS = (
+    "BEGIN " + "OPENSSH " + "PRIVATE KEY",
+    "BEGIN " + "PRIVATE KEY",
+)
+_PLACEHOLDER_VALUES = {
+    "changeme",
+    "example",
+    "exampletoken",
+    "placeholder",
+    "your_api_key",
+    "your_token",
+    "your_secret",
+}
+
+
+def _embedded_secret_reason(text: str) -> str | None:
+    upper = text.upper()
+    if any(marker in upper for marker in _PRIVATE_KEY_MARKERS):
+        return "embedded private key"
+    if _TELEGRAM_TOKEN_RE.search(text):
+        return "embedded Telegram bot token"
+    if _BEARER_RE.search(text):
+        return "embedded bearer token"
+    if _PROVIDER_TOKEN_RE.search(text):
+        return "embedded provider token"
+    for match in _GENERIC_SECRET_ASSIGN_RE.finditer(text):
+        value = (match.group(2) or "").strip().strip("'\"")
+        lower = value.lower()
+        if lower in _PLACEHOLDER_VALUES:
+            continue
+        if lower.startswith(("example", "your_", "dummy", "test_")):
+            continue
+        if lower.startswith(("self.", "exchange.", "getattr", "os.getenv", "config.")):
+            continue
+        if "***" in value:
+            continue
+        return f"embedded {match.group(1)}"
+    return None
+
+
 def _tracked_files(root: Path) -> list[Path] | None:
     """Return git-tracked files, or None when source is not a git worktree."""
     if not (root / ".git").exists():
@@ -99,8 +171,9 @@ def _tracked_files(root: Path) -> list[Path] | None:
     files = []
     for line in (result.stdout or "").splitlines():
         rel = line.strip()
-        if rel:
-            files.append(root / rel)
+        path = root / rel if rel else None
+        if path is not None and path.exists():
+            files.append(path)
     return files
 
 
@@ -113,18 +186,35 @@ def _is_backup_temp_artifact(path: Path) -> bool:
     )
 
 
+def _is_secret_artifact(path: Path) -> bool:
+    name_lower = path.name.lower()
+    stem_lower = path.stem.lower()
+    if name_lower.startswith(("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")):
+        return True
+    return any(marker in stem_lower for marker in ("secret", "token", "private"))
+
+
 def _is_forbidden_release_artifact(path: Path, root: Path) -> str | None:
     rel = path.relative_to(root)
     parts = set(rel.parts)
-    if parts & {".git", "__pycache__"}:
+    parts_lower = {part.lower() for part in rel.parts}
+    forbidden_dirs_lower = {part.lower() for part in FORBIDDEN_DIRS}
+    forbidden_rel_lower = {part.lower() for part in FORBIDDEN_REL_PATHS}
+    forbidden_names_lower = {part.lower() for part in FORBIDDEN_NAMES}
+    if ".git" in parts_lower:
         return None
     rel_posix = rel.as_posix()
-    if parts & FORBIDDEN_DIRS:
+    rel_posix_lower = rel_posix.lower()
+    if rel.parts and rel.parts[0].lower() == "tools" and rel_posix not in RELEASE_TOOL_FILES:
+        return f"forbidden non-release tool in release: {rel}"
+    if parts_lower & forbidden_dirs_lower:
         return f"forbidden file under runtime/test directory: {rel}"
-    if rel_posix in FORBIDDEN_REL_PATHS:
+    if rel_posix_lower in forbidden_rel_lower:
         return f"forbidden user/update config in release: {rel}"
-    if path.name in FORBIDDEN_NAMES or path.suffix.lower() in FORBIDDEN_SUFFIXES:
+    if path.name.lower() in forbidden_names_lower or path.suffix.lower() in FORBIDDEN_SUFFIXES:
         return f"forbidden runtime/secret artifact in release: {rel}"
+    if _is_secret_artifact(path):
+        return f"forbidden secret artifact in release: {rel}"
     if _is_backup_temp_artifact(path):
         return f"forbidden backup/temp artifact in release: {rel}"
     return None
@@ -218,9 +308,12 @@ def check_release(source: Path, strict_release_name: bool = False) -> tuple[list
             errors.append(f"DEPLOY_MANIFEST.json unreadable: {exc}")
 
     tracked = _tracked_files(root)
-    paths = tracked if tracked is not None else list(root.rglob("*"))
+    paths = [
+        p for p in root.rglob("*")
+        if ".git" not in p.relative_to(root).parts
+    ]
     if tracked is not None:
-        warnings.append("checking git-tracked release files plus local forbidden artifacts")
+        warnings.append("checking all release files, including untracked files")
         for path in root.rglob("*"):
             if path.is_file():
                 artifact_error = _is_forbidden_release_artifact(path, root)
@@ -230,19 +323,30 @@ def check_release(source: Path, strict_release_name: bool = False) -> tuple[list
     for path in paths:
         rel = path.relative_to(root)
         parts = set(rel.parts)
+        parts_lower = {part.lower() for part in rel.parts}
+        forbidden_dirs_lower = {part.lower() for part in FORBIDDEN_DIRS}
+        forbidden_rel_lower = {part.lower() for part in FORBIDDEN_REL_PATHS}
+        forbidden_names_lower = {part.lower() for part in FORBIDDEN_NAMES}
         if path.is_dir():
-            if path.name in FORBIDDEN_DIRS:
+            if path.name.lower() in forbidden_dirs_lower:
                 errors.append(f"forbidden runtime/test directory in release: {rel}")
             continue
-        if parts & FORBIDDEN_DIRS:
+        artifact_error = _is_forbidden_release_artifact(path, root)
+        if artifact_error:
+            errors.append(artifact_error)
+            continue
+        if parts_lower & forbidden_dirs_lower:
             errors.append(f"forbidden file under runtime/test directory: {rel}")
             continue
         rel_posix = rel.as_posix()
-        if rel_posix in FORBIDDEN_REL_PATHS:
+        if rel_posix.lower() in forbidden_rel_lower:
             errors.append(f"forbidden user/update config in release: {rel}")
             continue
-        if path.name in FORBIDDEN_NAMES or path.suffix.lower() in FORBIDDEN_SUFFIXES:
+        if path.name.lower() in forbidden_names_lower or path.suffix.lower() in FORBIDDEN_SUFFIXES:
             errors.append(f"forbidden runtime/secret artifact in release: {rel}")
+            continue
+        if _is_secret_artifact(path):
+            errors.append(f"forbidden secret artifact in release: {rel}")
             continue
         if _is_backup_temp_artifact(path):
             errors.append(f"forbidden backup/temp artifact in release: {rel}")
@@ -254,6 +358,9 @@ def check_release(source: Path, strict_release_name: bool = False) -> tuple[list
                 continue
             if _has_mojibake(text):
                 errors.append(f"mojibake marker found in release text file: {rel}")
+            secret_reason = _embedded_secret_reason(text)
+            if secret_reason:
+                errors.append(f"{secret_reason} found in release text file: {rel}")
 
     return errors, warnings
 
@@ -276,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
                 ignore=shutil.ignore_patterns(
                     ".git", ".pytest_cache", "__pycache__", "data", "logs",
                     "optimizer_results", "research_kitraining", "research_run2",
-                    "staging", "Output", "tests",
+                    "staging", "Output", "tests", "backups",
                 ),
             )
             copied_errors, copied_warnings = check_release(dst, strict_release_name=False)

@@ -764,6 +764,11 @@ def reduce_only_params(ex_name: str = None, position_side: str = None,
     if name == "okx":
         # tdMode: "isolated" or "cross"
         base["tdMode"] = (margin_mode or "isolated").lower()
+    else:
+        # Mirror entry_params: venues like MEXC/Bitget expect the close order
+        # to carry the same margin mode as the entry. Binance one-way issues
+        # are about positionSide, not marginMode.
+        base["marginMode"] = (margin_mode or "isolated").lower()
     if position_side and (name != "binance" or hedge_mode):
         # Binance hedge-mode expects UPPERCASE positionSide; others lowercase.
         if name == "binance":

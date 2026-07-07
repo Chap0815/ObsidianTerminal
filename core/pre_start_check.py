@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Iterable
 
 from core.paths import BOT_CONFIG, DB_PATH, PROJECT_ROOT
-from core.runtime_status import get_build_info, read_runtime_status, write_runtime_status
+from core.runtime_status import (
+    get_build_info,
+    read_runtime_status_with_path,
+    write_runtime_status,
+)
 
 
 POSITION_LIMIT_BY_BOT = {
@@ -28,6 +32,8 @@ LEVERAGE_LIMIT_BY_BOT = {
     "FUTREND": (1.0, 6.0),
     "CROSS": (1.0, 3.0),
 }
+MAX_DAILY_LOSS_LIMIT = 100_000.0
+MAX_DAILY_LOSS_MIN_ABS = 0.01
 
 
 @dataclass(frozen=True)
@@ -168,8 +174,8 @@ def _check_manifest() -> list[CheckIssue]:
     return issues
 
 
-def _check_runtime(bot_name: str, meta: dict) -> list[CheckIssue]:
-    status = read_runtime_status(meta.get("log_dir", ""))
+def _check_runtime(bot_name: str, meta: dict, *, cleanup: bool = False) -> list[CheckIssue]:
+    status, status_path = read_runtime_status_with_path(meta.get("log_dir", ""))
     if not status:
         return []
     pid = int(status.get("pid") or 0)
@@ -179,11 +185,16 @@ def _check_runtime(bot_name: str, meta: dict) -> list[CheckIssue]:
     active_states = {"starting", "started", "ready", "running", "degraded"}
     if pid > 0 and state in active_states and _pid_alive(pid):
         try:
-            path = PROJECT_ROOT / str(meta.get("log_dir", "")) / "runtime_status.json"
+            path = status_path or PROJECT_ROOT / str(meta.get("log_dir", "")) / "runtime_status.json"
             age_sec = time.time() - path.stat().st_mtime
         except Exception:
             age_sec = 0.0
-        if expected_module and expected_module in cmdline:
+        try:
+            from core.process_identity import cmdline_matches_bot
+            matches_expected = cmdline_matches_bot(bot_name, cmdline)
+        except Exception:
+            matches_expected = bool(expected_module and expected_module in cmdline)
+        if matches_expected:
             return [_issue("error", "bot_already_running",
                            f"{bot_name}: runtime_status reports live pid {pid}")]
         if age_sec < 300:
@@ -198,30 +209,34 @@ def _check_runtime(bot_name: str, meta: dict) -> list[CheckIssue]:
         )]
     if state in active_states:
         try:
-            path = PROJECT_ROOT / str(meta.get("log_dir", "")) / "runtime_status.json"
+            path = status_path or PROJECT_ROOT / str(meta.get("log_dir", "")) / "runtime_status.json"
             age_sec = time.time() - path.stat().st_mtime
         except Exception:
             age_sec = 0.0
         if age_sec >= 300:
-            try:
-                write_runtime_status(
-                    meta.get("log_dir", ""),
-                    bot_name,
-                    "stopped",
-                    bool(status.get("simulation", True)),
-                    threads={"monitor": False, "scan": False, "reconcile": False},
-                    extra={
-                        "previous_status": state,
-                        "stopped_by": "pre_start_stale_cleanup",
-                        "pid": pid,
-                        "run_id": str(status.get("run_id") or ""),
-                    },
-                )
-            except Exception:
-                pass
+            if cleanup:
+                try:
+                    write_runtime_status(
+                        meta.get("log_dir", ""),
+                        bot_name,
+                        "stopped",
+                        bool(status.get("simulation", True)),
+                        threads={"monitor": False, "scan": False, "reconcile": False},
+                        extra={
+                            "previous_status": state,
+                            "stopped_by": "pre_start_stale_cleanup",
+                            "stale_pid": pid,
+                            "stale_run_id": str(status.get("run_id") or ""),
+                        },
+                    )
+                except Exception:
+                    pass
+                msg = "marked stopped"
+            else:
+                msg = "left unchanged"
             return [_issue(
                 "warn", "runtime_status_stale",
-                f"{bot_name}: stale runtime_status said {state} but pid {pid} is not alive; marked stopped"
+                f"{bot_name}: stale runtime_status said {state} but pid {pid} is not alive; {msg}"
             )]
     return []
 
@@ -256,10 +271,13 @@ def _check_config(bot_name: str | None,
                     issues.append(_issue(
                         "error", "max_open_trades_invalid",
                         f"{name}: MAX_OPEN_TRADES={val} outside 1-50"))
-                if key == "MAX_DAILY_LOSS" and (val > 0.0 or val < -1000.0):
+                if key == "MAX_DAILY_LOSS" and not (
+                    -MAX_DAILY_LOSS_LIMIT <= val <= -MAX_DAILY_LOSS_MIN_ABS
+                ):
                     issues.append(_issue(
                         "error", "max_daily_loss_invalid",
-                        f"{name}: MAX_DAILY_LOSS={val} outside -1000-0"))
+                        f"{name}: MAX_DAILY_LOSS={val} outside "
+                        f"-{MAX_DAILY_LOSS_LIMIT:g}--{MAX_DAILY_LOSS_MIN_ABS:g}"))
             except Exception:
                 issues.append(_issue("error", "config_numeric",
                                      f"{name}: {key} is not numeric/finite"))
@@ -292,6 +310,10 @@ def _check_config(bot_name: str | None,
                     issues.append(_issue(
                         "error", "leverage_invalid",
                         f"{name}: LEVERAGE={lev} outside {lo}-{hi}"))
+                if name == "FUTURES" and abs(lev - round(lev)) > 1e-9:
+                    issues.append(_issue(
+                        "error", "leverage_integer_required",
+                        f"{name}: LEVERAGE={lev} must be a whole number"))
             except Exception:
                 issues.append(_issue("error", "leverage_numeric",
                                      f"{name}: LEVERAGE is not numeric"))
@@ -337,6 +359,36 @@ def _check_config(bot_name: str | None,
             except Exception:
                 issues.append(_issue("error", "trailing_numeric",
                                      f"{name}: trailing/activation not numeric"))
+        bounded_numeric = (
+            ("TREND_VOTE_MIN", 1.0, 3.0),
+            ("TREND_EXIT_VOTE", 1.0, 3.0),
+            ("TREND_SMA_FAST", 1.0, 5000.0),
+            ("TREND_SMA_SLOW", 1.0, 5000.0),
+            ("TREND_CROSS_FAST", 1.0, 5000.0),
+            ("TREND_CROSS_SLOW", 1.0, 5000.0),
+            ("TREND_VOL_TARGET_LOOKBACK", 2.0, 500.0),
+            ("TREND_EXIT_STALE_LIMIT", 1.0, 50.0),
+            ("MAX_NEW_TRADES_PER_TICK", 0.0, 50.0),
+            ("XSEC_K", 1.0, 15.0),
+            ("XSEC_LOOKBACK_HOURS", 6.0, 336.0),
+            ("XSEC_REBALANCE_HOURS", 6.0, 336.0),
+            ("XSEC_UNIVERSE_SIZE", 10.0, 100.0),
+            ("CRASH_WINDOW", 1.0, 50.0),
+            ("XSEC_MAX_SPREAD_PCT", 0.01, 10.0),
+        )
+        for key, lo, hi in bounded_numeric:
+            if key not in section:
+                continue
+            try:
+                val = float(section.get(key))
+                if not math.isfinite(val) or not (lo <= val <= hi):
+                    issues.append(_issue(
+                        "error", "config_range_invalid",
+                        f"{name}: {key}={section.get(key)} outside {lo:g}-{hi:g}"))
+            except Exception:
+                issues.append(_issue(
+                    "error", "config_numeric",
+                    f"{name}: {key} is not numeric/finite"))
     return issues
 
 
@@ -434,7 +486,9 @@ def _check_state_and_claims(bot_name: str | None,
     return issues
 
 
-def run_pre_start_checks(bot_name: str | None = None) -> list[CheckIssue]:
+def run_pre_start_checks(bot_name: str | None = None,
+                         *,
+                         cleanup: bool = False) -> list[CheckIssue]:
     from launcher.config.settings import BOT_META
 
     issues: list[CheckIssue] = []
@@ -451,7 +505,7 @@ def run_pre_start_checks(bot_name: str | None = None) -> list[CheckIssue]:
         if name:
             meta = BOT_META[name]
             issues.extend(_check_module(name, meta))
-            issues.extend(_check_runtime(name, meta))
+            issues.extend(_check_runtime(name, meta, cleanup=cleanup))
     return issues
 
 

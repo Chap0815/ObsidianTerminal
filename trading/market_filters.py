@@ -14,6 +14,7 @@ import requests
 from collections import OrderedDict
 from typing import Optional
 from dotenv import load_dotenv
+from core.constants import NONCRYPTO_BASES, STOCK_TOKEN_BASES
 
 load_dotenv()
 
@@ -30,6 +31,14 @@ _HTTP_PROXIES = (
 
 def _http_get(url, timeout=15, **kwargs):
     return requests.get(url, timeout=timeout, proxies=_HTTP_PROXIES, **kwargs)
+
+
+def _filter_log(msg: str, level: str = "INFO") -> None:
+    try:
+        from core.logger import log_event
+        log_event(msg, level)
+    except Exception:
+        print(msg, flush=True)
 
 
 #  Bounded LRU Cache 
@@ -66,6 +75,37 @@ class _LRUCache:
 
 _lru          = _LRUCache(maxsize=_CACHE_MAXSIZE)
 _spread_cache = _LRUCache(maxsize=128)
+
+
+def check_tradability(exchange, symbol_full: str) -> tuple[bool, str]:
+    """Fast per-symbol tradability gate for concrete candidates.
+
+    This is deliberately conservative for futures entries: skip tokenized
+    stocks, commodities, forex/index products, inactive markets and symbols the
+    venue does not expose. Crypto bases pass through to the strategy filters.
+    """
+    symbol = str(symbol_full or "").strip()
+    base = symbol.split("/")[0].upper()
+    if not base:
+        return False, "invalid symbol"
+    if base in STOCK_TOKEN_BASES or "STOCK" in base:
+        return False, "tokenized stock skipped"
+    if base in NONCRYPTO_BASES:
+        return False, "non-crypto market skipped"
+    try:
+        markets = getattr(exchange, "markets", None) or {}
+        if markets:
+            if symbol in markets:
+                market = markets.get(symbol) or {}
+            elif f"{base}/USDT" in markets:
+                market = markets.get(f"{base}/USDT") or {}
+            else:
+                return False, "market not available"
+            if market.get("active") is False:
+                return False, "market inactive"
+    except Exception as exc:
+        return False, f"market metadata error ({type(exc).__name__})"
+    return True, ""
 
 # Progressive backoff state per cache key
 _STALE_BACKOFF: dict = {}
@@ -285,10 +325,10 @@ def _fetch_fg_from_cmc() -> Optional[int]:
                         except (TypeError, ValueError):
                             pass
         except Exception as e:
-            print(
+            _filter_log(
                 f"[Filter] CMC official API failed: {type(e).__name__}: {e} "
                 f" falling back to data-api endpoint",
-                flush=True,
+                "WARN",
             )
 
     #  Path 2: Unofficial data-api (no key needed) 
@@ -325,7 +365,8 @@ def _fetch_fg_from_cmc() -> Optional[int]:
             except (TypeError, ValueError):
                 continue
     except Exception as e:
-        print(f"[Filter] CMC data-api failed: {type(e).__name__}: {e}", flush=True)
+        _filter_log(f"[Filter] CMC data-api failed: {type(e).__name__}: {e}",
+                    "WARN")
     return None
 
 
@@ -400,7 +441,7 @@ def get_fear_greed() -> int:
             with _FG_CIRCUIT_LOCK:
                 _FG_CIRCUIT["failures"]   = 0
                 _FG_CIRCUIT["last_value"] = value
-            print(f"[Filter] F&G from {source_name}: {value}", flush=True)
+            _filter_log(f"[Filter] F&G from {source_name}: {value}", "INFO")
             return value
 
         # 4th fallback: DB-cached value even if older than the 290s TTL.
@@ -409,7 +450,8 @@ def get_fear_greed() -> int:
             from core.database import get_cached_fear_greed
             stale = get_cached_fear_greed(max_age_sec=24*3600)  # 24h tolerance
             if stale is not None:
-                print(f"[Filter] using stale cached F&G value: {stale}")
+                _filter_log(f"[Filter] using stale cached F&G value: {stale}",
+                            "INFO")
                 with _FG_CIRCUIT_LOCK:
                     _FG_CIRCUIT["last_value"] = stale
                 return stale
@@ -420,8 +462,8 @@ def get_fear_greed() -> int:
             _FG_CIRCUIT["failures"] += 1
             if _FG_CIRCUIT["failures"] >= _FG_FAILURE_THRESHOLD:
                 _FG_CIRCUIT["open_until"] = time.time() + _FG_OPEN_DURATION_SEC
-                print(f"[Filter] F&G circuit breaker OPEN for "
-                      f"{_FG_OPEN_DURATION_SEC}s")
+                _filter_log(f"[Filter] F&G circuit breaker OPEN for "
+                            f"{_FG_OPEN_DURATION_SEC}s", "WARN")
             last = _FG_CIRCUIT["last_value"]
         return last
 
@@ -527,10 +569,10 @@ def get_market_regime(exchange) -> dict:
                 regime = "NEUTRAL"
 
             # Audit log so the user can see WHY the regime was chosen.
-            print(
+            _filter_log(
                 f"[Regime] BTC24h={btc_24h:+.2f}% BTC7d={btc_7d:+.2f}% "
                 f"F&G={fg}  vote={vote:+d}  {regime}",
-                flush=True
+                "INFO",
             )
 
             result = {"regime": regime, "btc_24h": round(btc_24h, 2),
@@ -538,7 +580,8 @@ def get_market_regime(exchange) -> dict:
             log_market_regime(regime, btc_24h, btc_7d, fg)
             return result
         except Exception as e:
-            print(f"[Filter] Market phase analysis failed: {e}")
+            _filter_log(f"[Filter] Market phase analysis failed: {e}",
+                        "WARN")
             return {"regime": "NEUTRAL", "btc_24h": 0.0, "btc_7d": 0.0,
                     "fear_greed": 50}
 

@@ -13,7 +13,6 @@ import json
 import queue
 import threading
 import time
-import traceback
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -33,6 +32,14 @@ _SUPPRESS_FROM_HISTORY  = frozenset({"TICKER_UPDATED"})
 _CRITICAL_PUT_TIMEOUT = 2.0
 # cap stored payload size in history (chars in JSON-dumped form)
 _HISTORY_PAYLOAD_MAX_CHARS = 2048
+
+
+def _log_handler_error(context: str, exc: Exception) -> None:
+    try:
+        from bot_utils.silent_log import silent_log
+        silent_log(context, exc)
+    except Exception:
+        pass
 
 
 class Event:
@@ -211,8 +218,8 @@ class EventBus:
         for handler in handlers:
             try:
                 handler(event.event_type, event.payload)
-            except Exception:
-                traceback.print_exc()
+            except Exception as exc:
+                _log_handler_error(f"event_bus emit_sync {event.event_type}", exc)
 
     def get_history(self, event_type: str = None, limit: int = 100) -> List[dict]:
         with self._history_lock:
@@ -236,15 +243,15 @@ class EventBus:
                     continue
                 try:
                     handler(event.event_type, event.payload)
-                except Exception:
-                    traceback.print_exc()
+                except Exception as exc:
+                    _log_handler_error(f"event_bus worker {event.event_type}", exc)
                 finally:
                     try:
                         self._work_queue.task_done()
                     except Exception:
                         pass
-            except Exception:
-                traceback.print_exc()
+            except Exception as exc:
+                _log_handler_error("event_bus worker loop", exc)
                 time.sleep(0.1)
 
     def _watchdog_loop(self) -> None:

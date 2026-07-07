@@ -1,14 +1,14 @@
 """
-launcher.pyw — thin bootstrap for the Obsidian Trading Terminal.
+launcher.pyw - thin bootstrap for the Obsidian Trading Terminal.
 
-The real code lives under the ``launcher/`` package. This file exists
-only so existing Windows shortcuts and ``.lnk`` icons that point at
-``launcher.pyw`` keep working after the refactor — Windows treats
-``.pyw`` as "run with pythonw.exe, no console window".
+The real code lives under the ``launcher/`` package. This file exists only so
+existing Windows shortcuts and ``.lnk`` icons that point at ``launcher.pyw``
+keep working after the refactor. Windows treats ``.pyw`` as "run with
+pythonw.exe, no console window".
 
-It also adds the project root to ``sys.path`` (defensively, in case
-``launcher.pyw`` is double-clicked from a shortcut whose working
-directory was not set to the project root).
+It also adds the project root to ``sys.path`` defensively, in case
+``launcher.pyw`` is double-clicked from a shortcut whose working directory was
+not set to the project root.
 """
 
 import os

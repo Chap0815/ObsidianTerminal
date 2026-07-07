@@ -19,7 +19,7 @@ import os
 import subprocess
 import sys
 
-from launcher.config.settings import PROJECT_ROOT, _get_python_exe, subprocess_no_window_kwargs
+from launcher.config.settings import PROJECT_ROOT, _get_python_exe
 
 
 def _ensure_std_streams() -> None:
@@ -103,9 +103,8 @@ def _relaunch_windowless() -> bool:
     try:
         subprocess.Popen(
             [pythonw, entry], cwd=PROJECT_ROOT,
-            close_fds=True,
-            env=dict(os.environ, OBSIDIAN_NO_REEXEC="1"),
-            **subprocess_no_window_kwargs())
+            creationflags=subprocess.CREATE_NO_WINDOW, close_fds=True,
+            env=dict(os.environ, OBSIDIAN_NO_REEXEC="1"))
         return True
     except Exception:
         return False
@@ -129,10 +128,13 @@ def main() -> None:
     wizard_path = os.path.join(PROJECT_ROOT, "setup_wizard.pyw")
 
     if not os.path.exists(env_path) and os.path.exists(wizard_path):
+        kw = {}
+        if sys.platform == "win32":
+            kw["creationflags"] = subprocess.CREATE_NO_WINDOW
         subprocess.Popen(
             [_get_python_exe(), wizard_path],
             cwd=PROJECT_ROOT,
-            **subprocess_no_window_kwargs(),
+            **kw,
         )
         sys.exit(0)
 
@@ -143,6 +145,8 @@ def main() -> None:
     try:
         from core.database import init_db as _init_db  # type: ignore
         _init_db()
+        from core.runtime_status import cleanup_runtime_status_temps
+        cleanup_runtime_status_temps()
     except Exception as _e:
         # Non-fatal  launcher can still show the UI, individual bot
         # starts will re-trigger init_db() and may succeed there.

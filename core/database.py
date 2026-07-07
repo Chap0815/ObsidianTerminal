@@ -165,9 +165,9 @@ _CANONICAL_BOTS = ("TREND", "SPOT", "FUTURES", "CROSS", "FUTREND")
 _METRICS_MODE_CUTOVER = "2026-06-18 00:00:00"
 
 
-def set_metrics_sim_mode(is_sim: bool) -> None:
+def set_metrics_sim_mode(is_sim: bool | None) -> None:
     global _METRICS_SIM_OVERRIDE
-    _METRICS_SIM_OVERRIDE = bool(is_sim)
+    _METRICS_SIM_OVERRIDE = None if is_sim is None else bool(is_sim)
 
 
 def _is_sim_for(bot_name: str) -> bool:
@@ -330,7 +330,8 @@ _VACUUM_LOCK_NAME = "vacuum_coordinator"
 
 
 def _try_advisory_lock(conn, lock_name: str, holder_id: str,
-                        ttl_sec: int = 60) -> bool:
+                        ttl_sec: int = 60,
+                        raise_operational: bool = False) -> bool:
     """Try to acquire a named cross-process advisory lock backed by the
     ``advisory_locks`` table. Returns True if we got the lock, False if
     another holder has it.
@@ -362,6 +363,8 @@ def _try_advisory_lock(conn, lock_name: str, holder_id: str,
             conn.execute("ROLLBACK")
         except Exception:
             pass
+        if raise_operational:
+            raise
         return False
 
 
@@ -437,10 +440,11 @@ def init_db() -> None:
             break
         _time.sleep(0.5)
     if not got_lock:
-        with _INIT_DB_LOCK:
-            _INIT_DB_DONE = True
-        _start_maintenance_thread()
-        return
+        raise RuntimeError(
+            "Database schema lock timeout; migrations were not run. "
+            "Stop other bot processes or remove a stale schema lock after "
+            "verifying no migration is active."
+        )
     try:
         _run_migrations(conn)
         _purge_junk_claims(conn)
@@ -1037,19 +1041,55 @@ def save_trade_db(
 
     conn = get_connection()
     try:
-        if not is_partial:
-            existing_final = conn.execute("""
+        if is_partial and exchange_order_id is not None:
+            existing_partial = conn.execute("""
             SELECT 1 FROM trades
              WHERE bot_name = ?
                AND symbol = ?
                AND buy_time = ?
-               AND COALESCE(is_partial, 0) = 0
+               AND COALESCE(is_partial, 0) = 1
                AND COALESCE(is_futures, 0) = ?
+               AND COALESCE(exchange_order_id, '') = COALESCE(?, '')
              LIMIT 1
             """, (
                 bot_name, symbol, buy_time,
                 1 if is_futures else 0,
+                str(exchange_order_id),
             )).fetchone()
+            if existing_partial:
+                conn.commit()
+                return True
+        if not is_partial:
+            if exchange_order_id is not None:
+                existing_final = conn.execute("""
+                SELECT 1 FROM trades
+                 WHERE bot_name = ?
+                   AND symbol = ?
+                   AND buy_time = ?
+                   AND sell_time = ?
+                   AND COALESCE(is_partial, 0) = 0
+                   AND COALESCE(is_futures, 0) = ?
+                   AND COALESCE(exchange_order_id, '') = COALESCE(?, '')
+                 LIMIT 1
+                """, (
+                    bot_name, symbol, buy_time, sell_time,
+                    1 if is_futures else 0,
+                    str(exchange_order_id),
+                )).fetchone()
+            else:
+                existing_final = conn.execute("""
+                SELECT 1 FROM trades
+                 WHERE bot_name = ?
+                   AND symbol = ?
+                   AND buy_time = ?
+                   AND COALESCE(is_partial, 0) = 0
+                   AND COALESCE(is_futures, 0) = ?
+                   AND COALESCE(exchange_order_id, '') = ''
+                 LIMIT 1
+                """, (
+                    bot_name, symbol, buy_time,
+                    1 if is_futures else 0,
+                )).fetchone()
             if existing_final:
                 conn.commit()
                 return True
@@ -1166,8 +1206,8 @@ def upsert_futures_state(symbol, bot_name, position_type, entry_price,
                           current_price, leverage, margin_usdt,
                           position_size_usdt, unrealized_pnl, unrealized_pct,
                           liquidation_price, liq_distance_pct, funding_paid,
-                          opened_at) -> None:
-    bot_name = _metric_bot(bot_name)
+                          opened_at, mode_is_sim=None) -> None:
+    bot_name = _metric_bot_for_mode(bot_name, mode_is_sim)
     conn = get_connection()
     now = _utcnow_str()
     conn.execute("""
@@ -1248,7 +1288,7 @@ def get_futures_state(bot_name: str = None, mode_is_sim=None) -> list:
 
 #  Drawdown 
 
-def get_today_pnl(bot_name: str) -> dict:
+def get_today_pnl(bot_name: str, mode_is_sim=None) -> dict:
     """Returns today's realized PnL for `bot_name`.
 
     "Today" is anchored to the user's BOT_TIMEZONE via ``_local_today_str()``,
@@ -1258,7 +1298,7 @@ def get_today_pnl(bot_name: str) -> dict:
     hour_of_day/day_of_week learning fields follow local time. TZ resolution
     failure falls back to UTC.
     """
-    bot_name = _metric_bot(bot_name)
+    bot_name = _metric_bot_for_mode(bot_name, mode_is_sim)
     today = _local_today_str()   # lokal-konsistent mit Bad-Hours
     conn = get_connection()
     row = conn.execute("""
@@ -1627,40 +1667,50 @@ def get_winloss_heatmap(bot_name: str = None, days: int = 30) -> dict:
 
 def acquire_advisory_lock(lock_name: str, holder_id: str,
                           ttl_sec: int = 30) -> bool:
-    conn = get_connection()
-    now = _utcnow()
-    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    expires_at = (now + timedelta(seconds=ttl_sec)).strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        conn.execute("DELETE FROM advisory_locks WHERE expires_at < ?", (now_str,))
-        conn.execute("""
-        INSERT INTO advisory_locks (lock_name, holder_id, acquired_at, expires_at)
-        VALUES (?, ?, ?, ?)""", (lock_name, holder_id, now_str, expires_at))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return False
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        raise
+    return _try_advisory_lock(
+        get_connection(), lock_name, holder_id, ttl_sec,
+        raise_operational=True,
+    )
 
 
-def release_advisory_lock(lock_name: str, holder_id: str) -> None:
+def release_advisory_lock(lock_name: str, holder_id: str) -> bool:
+    conn = None
     try:
         conn = get_connection()
-        conn.execute(
+        cur = conn.execute(
             "DELETE FROM advisory_locks WHERE lock_name=? AND holder_id=?",
             (lock_name, holder_id))
         conn.commit()
+        return int(cur.rowcount or 0) > 0
     except Exception:
-        pass
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def release_advisory_locks_for_dead_pid(pid: int, lock_prefix: str = "close:") -> int:
+    """Release close advisory locks owned by an already stopped process."""
+    if not pid or pid <= 0:
+        return 0
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.execute(
+            "DELETE FROM advisory_locks WHERE lock_name LIKE ? AND holder_id LIKE ?",
+            (f"{lock_prefix}%", f"{int(pid)}-%"),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+    except Exception:
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
+        return 0
 
 
 #  Global API rate limiter 
@@ -1760,20 +1810,20 @@ def check_and_consume_global_api(bot_name: str, endpoint: str = "",
                 pass
             return False
         except Exception as _e:
-            # Non-lock errors: keep fail-open so an unrelated glitch doesn't
-            # freeze all trading (or block a close)  but surface it (M-2), a
-            # silent fail-open hides a persistently broken cap until an IP-ban.
+            # Non-lock errors still mean the cross-process budget is not
+            # trustworthy. This gate protects scanners/entry plumbing, not
+            # emergency closes, so fail closed instead of firing uncounted calls.
             try:
                 conn.execute("ROLLBACK")
             except Exception:
                 pass
             _log_api_gate_error(_e)
-            return True
+            return False
         finally:
             conn.close()
     except Exception as _e:
         _log_api_gate_error(_e)
-        return True
+        return False
 
 
 #  Open positions 
@@ -1915,8 +1965,17 @@ def get_open_positions_db(bot_name: str) -> list:
             "SELECT * FROM bot_open_positions WHERE bot_name=?",
             (bot_name,)).fetchall()
         return [dict(r) for r in rows]
-    except Exception:
-        return []
+    except Exception as e:
+        try:
+            from core.logger import log_event, log_struct
+            log_event(
+                f"[DB] get_open_positions_db FAILED for {bot_name}: {e}",
+                "WARN")
+            log_struct("db_open_positions_read_error",
+                       bot_name=bot_name, error=str(e))
+        except Exception:
+            print(f"[DB] get_open_positions_db {bot_name}: {e}", flush=True)
+        raise
 
 
 #  Cross-bot ownership registry 
@@ -2043,6 +2102,8 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
                     else "position_type = 'SPOT'")
     try:
         conn = get_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        now_str = _utcnow_str()
         if allow_existing_owner:
             rows = conn.execute(
                 f"""SELECT bot_name FROM bot_open_positions
@@ -2056,11 +2117,13 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
                         """UPDATE bot_open_positions
                               SET state=?, opened_at=?
                             WHERE bot_name=?
+                              AND (state IN ('CLAIMING','ADOPTING') OR amount <= 0)
                               AND (symbol = ? OR symbol LIKE ? OR symbol LIKE ?)""",
-                        (claim_state, _utcnow_str(), bot_name,
+                        (claim_state, now_str, bot_name,
                          base, f"{base}/%", f"{base}:%"))
                     conn.commit()
                     return True
+                conn.rollback()
                 return False
         cur = conn.execute(
             f"""INSERT INTO bot_open_positions
@@ -2071,11 +2134,16 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
                    SELECT 1 FROM bot_open_positions
                    WHERE (symbol = ? OR symbol LIKE ? OR symbol LIKE ?)
                      AND {class_clause})""",
-            (bot_name, base, position_type, claim_state, _utcnow_str(),
+            (bot_name, base, position_type, claim_state, now_str,
              base, f"{base}/%", f"{base}:%"))
         conn.commit()
         return cur.rowcount > 0
     except Exception:
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
         return False
 
 

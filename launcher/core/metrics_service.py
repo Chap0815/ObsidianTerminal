@@ -25,6 +25,11 @@ from datetime import datetime, timedelta, timezone
 
 import requests as _req
 
+from bot_utils.pnl_view import (
+    futures_unrealized_from_row,
+    is_futures_state_fresh,
+    spot_unrealized_pnl,
+)
 from launcher.config.settings import DB_PATH, OLLAMA_URL
 
 
@@ -60,6 +65,20 @@ def query_db(sql: str, params: tuple = ()) -> list:
         return []
 
 
+def query_db_dict(sql: str, params: tuple = ()) -> list[dict]:
+    if not os.path.exists(DB_PATH):
+        return []
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=20000")
+        rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+
 #  Per-bot aggregates 
 
 def _metrics_bot_key(bot: str, mode_is_sim: bool | None = None) -> str:
@@ -77,6 +96,34 @@ def _metrics_bot_keys(bot: str, mode_is_sim: bool | None = None) -> tuple[str, .
         metrics_bot_name_for_mode(bot, False),
         metrics_bot_name_for_mode(bot, True),
     )
+
+
+def _get_today_pnl_for_metrics_key(bot_key: str) -> dict:
+    """Read today's PnL for an already SIM/LIVE-namespaced bot key.
+
+    ``core.database.get_today_pnl()`` intentionally resolves a raw bot name
+    through the current config. The launcher can know a bot's effective runtime
+    mode from ``runtime_status.json``; remapping that key again would mix LIVE
+    and SIM daily rows when config and runtime briefly disagree.
+    """
+    try:
+        from core.database import get_local_today_str
+        today = get_local_today_str()
+    except Exception:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    rows = query_db(
+        "SELECT total_profit, trade_count, is_paused "
+        "FROM daily_pnl WHERE bot_name=? AND trade_date=?",
+        (bot_key, today),
+    )
+    if rows:
+        total_profit, trade_count, is_paused = rows[0]
+        return {
+            "total_profit": float(total_profit or 0.0),
+            "trade_count": int(trade_count or 0),
+            "is_paused": int(is_paused or 0),
+        }
+    return {"total_profit": 0.0, "trade_count": 0, "is_paused": 0}
 
 
 def get_bot_stats(bot: str, mode_is_sim: bool | None = None) -> dict:
@@ -103,8 +150,8 @@ def get_bot_stats(bot: str, mode_is_sim: bool | None = None) -> dict:
         (bot,)
     )
     try:
-        from core.database import get_today_pnl, local_day_utc_bounds
-        today_info = get_today_pnl(bot)
+        from core.database import local_day_utc_bounds
+        today_info = _get_today_pnl_for_metrics_key(bot)
         start_utc, end_utc = local_day_utc_bounds()
     except Exception:
         today_info = {"total_profit": 0.0, "trade_count": 0}
@@ -242,13 +289,13 @@ def get_futures_state_count(bot_name: str = None,
     if bot_name:
         keys = _metrics_bot_keys(bot_name, mode_is_sim)
         placeholders = ",".join("?" for _ in keys)
-        rows = query_db(
-            f"SELECT COUNT(*) FROM futures_state WHERE bot_name IN ({placeholders})",
+        rows = query_db_dict(
+            f"SELECT * FROM futures_state WHERE bot_name IN ({placeholders})",
             keys,
         )
     else:
-        rows = query_db("SELECT COUNT(*) FROM futures_state")
-    return int(rows[0][0]) if rows else 0
+        rows = query_db_dict("SELECT * FROM futures_state")
+    return sum(1 for row in rows if is_futures_state_fresh(row))
 
 
 #  LLM (Ollama) availability 
@@ -416,36 +463,19 @@ def get_unrealized_pnl_futures(bot_name: str = None,
          ``unrealized_pnl`` is still 0 (e.g. right after a position open,
          before the first monitor tick).
     """
-    rows = query_db("""
-        SELECT
-            COALESCE(SUM(
-                CASE
-                    -- Pre-computed by the bot, already in DB
-                    WHEN unrealized_pnl IS NOT NULL AND unrealized_pnl != 0.0
-                        THEN unrealized_pnl
-                    -- Fallback: compute PnL from raw fields
-                    WHEN entry_price > 0 AND current_price > 0 AND margin_usdt > 0
-                        THEN CASE UPPER(position_type)
-                                WHEN 'LONG'
-                                    THEN margin_usdt * leverage
-                                         * (current_price - entry_price) / entry_price
-                                WHEN 'SHORT'
-                                    THEN margin_usdt * leverage
-                                         * (entry_price - current_price) / entry_price
-                                ELSE 0.0
-                             END
-                    ELSE 0.0
-                END
-            ), 0.0)
-        FROM futures_state
-        {where}
-    """.format(where=(
-        "WHERE bot_name IN ({})".format(",".join(
-            "?" for _ in _metrics_bot_keys(bot_name, mode_is_sim)))
-        if bot_name else ""
-    )),
-        (_metrics_bot_keys(bot_name, mode_is_sim) if bot_name else ()))
-    return float(rows[0][0]) if rows else 0.0
+    where = ""
+    params: tuple = ()
+    if bot_name:
+        params = _metrics_bot_keys(bot_name, mode_is_sim)
+        where = "WHERE bot_name IN ({})".format(",".join("?" for _ in params))
+    rows = query_db_dict(f"SELECT * FROM futures_state {where}", params)
+    total = 0.0
+    for row in rows:
+        if not is_futures_state_fresh(row):
+            continue
+        pnl, _pct = futures_unrealized_from_row(row)
+        total += pnl
+    return float(total)
 
 
 def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
@@ -469,13 +499,14 @@ def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
     price_map: dict = {}  # sym  current price (float)
     pairs = [f"{sym}/USDT" for sym in trades]
     try:
+        try:
+            from bot_utils.api_budget import try_consume_api_call
+            if not try_consume_api_call("launcher_fetch_tickers"):
+                raise RuntimeError("launcher API budget exhausted")
+        except ImportError:
+            pass
         batch = exchange.fetch_tickers(pairs) or {}
         # Instrument the launcher's own API consumption
-        try:
-            from bot_utils import record_api_call
-            record_api_call(endpoint="launcher_fetch_tickers")
-        except Exception:
-            pass
         for sym in trades:
             t = batch.get(f"{sym}/USDT") or {}
             p = float(t.get("last") or t.get("close") or 0)
@@ -492,12 +523,13 @@ def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
         if sym in price_map:
             continue
         try:
-            t = exchange.fetch_ticker(f"{sym}/USDT") or {}
             try:
-                from bot_utils import record_api_call
-                record_api_call(endpoint="launcher_fetch_ticker")
-            except Exception:
+                from bot_utils.api_budget import try_consume_api_call
+                if not try_consume_api_call("launcher_fetch_ticker"):
+                    continue
+            except ImportError:
                 pass
+            t = exchange.fetch_ticker(f"{sym}/USDT") or {}
             p = float(t.get("last") or t.get("close") or 0)
             if p > 0:
                 price_map[sym] = p
@@ -516,7 +548,7 @@ def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
                 continue
             curr = price_map.get(sym, 0.0)
             if curr > 0:
-                total += amount * (curr - buy)
+                total += spot_unrealized_pnl(buy, curr, amount)
         except Exception:
             pass
 

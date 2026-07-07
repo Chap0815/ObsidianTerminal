@@ -17,6 +17,57 @@ from __future__ import annotations
 import time
 
 
+def _trade_amount(t: dict) -> float:
+    try:
+        return abs(float(t.get("amount", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _trade_fee_usdt(t: dict) -> float:
+    fee = t.get("fee") or {}
+    try:
+        cost = abs(float(fee.get("cost", 0) or 0))
+    except (TypeError, ValueError, AttributeError):
+        cost = 0.0
+    currency = str(fee.get("currency", "") if isinstance(fee, dict) else "").upper()
+    return cost if currency in {"USDT", "USD"} else 0.0
+
+
+def _aggregate_spot_sell_trades(bot, pair: str, target_amount: float) -> tuple[float, float, str]:
+    try:
+        target = max(0.0, float(target_amount or 0.0))
+    except (TypeError, ValueError):
+        target = 0.0
+    if target <= 0 or not hasattr(bot.ex, "fetch_my_trades"):
+        return 0.0, 0.0, "unavailable"
+    try:
+        trades = bot.ex.fetch_my_trades(pair, limit=50) or []
+    except Exception:
+        return 0.0, 0.0, "unavailable"
+    qty = 0.0
+    notional = 0.0
+    fee_usdt = 0.0
+    for t in reversed(trades):
+        if str(t.get("side", "")).lower() != "sell":
+            continue
+        amt = _trade_amount(t)
+        price = float(t.get("price", 0) or 0)
+        if amt <= 0 or price <= 0:
+            continue
+        take = min(amt, max(0.0, target - qty))
+        if take <= 0:
+            break
+        qty += take
+        notional += take * price
+        fee_usdt += _trade_fee_usdt(t) * (take / amt)
+        if qty + 1e-12 >= target:
+            break
+    if qty + 1e-12 < target or qty <= 0:
+        return 0.0, 0.0, "unavailable"
+    return notional / qty, fee_usdt, "fetch_my_trades_vwap"
+
+
 def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
     """Spot equivalent of FuturesReconcileMixin._record_offline_close.
 
@@ -54,6 +105,7 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
         pair = f"{sym}/USDT"
 
         close_price = 0.0
+        close_fee_actual = 0.0
         close_source = "estimate"
         pending_accounting = bool(state_row.get("accounting_pending"))
         if pending_accounting:
@@ -65,18 +117,9 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
             except (TypeError, ValueError):
                 close_price = 0.0
 
-        # Try to find the actual sell price from order history
-        try:
-            if close_price <= 0 and hasattr(bot.ex, "fetch_my_trades"):
-                trades = bot.ex.fetch_my_trades(pair, limit=20) or []
-                for t in reversed(trades):
-                    side = t.get("side", "").lower()
-                    if side == "sell":
-                        close_price = float(t.get("price", 0) or 0)
-                        close_source = "fetch_my_trades"
-                        break
-        except Exception:
-            pass
+        if close_price <= 0:
+            close_price, close_fee_actual, close_source = _aggregate_spot_sell_trades(
+                bot, pair, amount)
 
         if close_price <= 0:
             try:
@@ -97,7 +140,11 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
         # Spot taker fee  0.1% on Bitget
         from bot_utils import safe_proportional_fee
         SPOT_TAKER_FEE = 0.001
-        close_fee = amount * close_price * SPOT_TAKER_FEE
+        close_fee = (
+            close_fee_actual
+            if close_fee_actual > 0
+            else amount * close_price * SPOT_TAKER_FEE
+        )
         initial_entry_fee = float(state_row.get(
             "initial_entry_fee", state_row.get("fees_paid", 0)) or 0)
         original_amount = float(state_row.get(
@@ -134,7 +181,11 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
                 pass
 
         saved = save_trade_db(
-            bot_name=bot.BOT_NAME, symbol=sym,
+            bot_name=bot.BOT_NAME,
+            mode_is_sim=state_row.get(
+                "accounting_pending_mode_is_sim",
+                getattr(bot, "simulation", None)),
+            symbol=sym,
             buy_price=buy, sell_price=close_price,
             buy_time=buy_time, sell_time=sell_time,
             profit_pct=profit_pct, profit_usdt=net_pnl,
@@ -173,6 +224,217 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
         except Exception:
             pass
         return False
+
+
+def _find_spot_external_close_price(bot, sym: str, amount: float = 0.0,
+                                    allow_ticker: bool = True) -> tuple[float, float, str]:
+    pair = f"{sym}/USDT"
+    price, fee, source = _aggregate_spot_sell_trades(bot, pair, amount)
+    if price > 0:
+        return price, fee, source
+    if not allow_ticker:
+        return 0.0, 0.0, "unavailable"
+    try:
+        ticker = bot.ex.fetch_ticker(pair)
+        price = float(ticker.get("last", 0) or 0)
+        if price > 0:
+            return price, 0.0, "current_ticker"
+    except Exception:
+        pass
+    return 0.0, 0.0, "unavailable"
+
+
+def _append_pending_partial(row: dict, item: dict) -> list:
+    pending = list(row.get("accounting_pending_partials") or [])
+    pending.append(dict(item))
+    return pending
+
+
+def _append_unpriced_partial(row: dict, item: dict) -> list:
+    pending = list(row.get("unpriced_external_partials") or [])
+    pending.append(dict(item))
+    return pending
+
+
+def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict:
+    import json as _json
+
+    try:
+        extra = _json.loads(pos.get("extra_json") or "{}")
+    except Exception:
+        extra = {}
+    db_amount = float(pos["amount"])
+    adopted_amount = min(float(exch_amt), db_amount)
+    if db_amount > 0:
+        invested_usdt = float(pos["invested_usdt"]) * (adopted_amount / db_amount)
+    else:
+        invested_usdt = float(pos["invested_usdt"])
+    original_amount = float(
+        extra.get("original_amount")
+        or pos.get("original_amount")
+        or db_amount
+    )
+    return {
+        "buy": float(pos["buy_price"]),
+        "buy_time": pos["buy_time"],
+        "amount": adopted_amount,
+        "invested_usdt": invested_usdt,
+        "original_amount": original_amount,
+        "rsi_15m": pos.get("rsi_15m"),
+        "rsi_1h": pos.get("rsi_1h"),
+        "rsi_4h": pos.get("rsi_4h"),
+        "change_pct": pos.get("change_pct"),
+        "partial_sold": extra.get("partial_sold", False),
+        "break_even": extra.get("break_even", False),
+        "be_active": extra.get("be_active", False),
+        "highest": float(pos.get("highest_price") or pos["buy_price"]),
+        "initial_entry_fee": float(extra.get("initial_entry_fee", 0.0)),
+        "fees_paid": float(extra.get("fees_paid", 0.0)),
+    }
+
+
+def _record_spot_external_partial(bot, sym: str, state_row: dict,
+                                  remaining_amount: float) -> tuple[bool, dict]:
+    """Book a spot position shrink caused outside the bot.
+
+    Returns ``(accounting_saved, fields_to_persist)``. The caller should apply
+    the fields even when booking failed; that prevents later monitor ticks from
+    trying to sell more coins than the wallet still holds, while the pending
+    item preserves realized-PnL accounting for retry.
+    """
+    from core.database import save_trade_db
+    from core.logger import log_event
+    from bot_utils import safe_proportional_fee
+
+    local_amt = float(state_row.get("amount", 0) or 0)
+    buy = float(state_row.get("buy_price") or state_row.get("buy") or 0)
+    invested = float(state_row.get("invested_usdt", buy * local_amt) or 0)
+    remaining_amount = max(0.0, float(remaining_amount or 0.0))
+    sold_amount = max(0.0, local_amt - remaining_amount)
+    if buy <= 0 or local_amt <= 0 or sold_amount <= 0 or remaining_amount <= 0:
+        return False, {}
+
+    ratio_sold = min(1.0, sold_amount / local_amt)
+    invested_sold = round(invested * ratio_sold, 8)
+    invested_remaining = max(0.0, invested - invested_sold)
+    original_amount = float(state_row.get("original_amount") or local_amt)
+    close_price, close_fee_actual, source = _find_spot_external_close_price(
+        bot, sym, sold_amount, allow_ticker=False)
+    if close_price <= 0:
+        from core.clock import now_utc
+
+        fields = {
+            "amount": remaining_amount,
+            "invested_usdt": invested_remaining,
+            "partial_sold": True,
+        }
+        if "original_amount" not in state_row:
+            fields["original_amount"] = local_amt
+        fields["unpriced_external_partials"] = _append_unpriced_partial(
+            state_row,
+            {
+                "symbol": sym,
+                "sold_amount": sold_amount,
+                "remaining_amount": remaining_amount,
+                "buy_price": buy,
+                "buy_time": state_row.get("buy_time", ""),
+                "invested_usdt": invested_sold,
+                "detected_at": now_utc().strftime("%Y-%m-%d %H:%M:%S"),
+                "reason": "External partial close (price unavailable)",
+                "is_futures": False,
+                "is_partial": True,
+            },
+        )
+        log_event(
+            f" Spot reconciliation: {sym} partial drift detected but "
+            f"close price unavailable; state shrunk without PnL booking",
+            "WARN")
+        return False, fields
+
+    close_fee = (
+        close_fee_actual
+        if close_fee_actual > 0
+        else sold_amount * close_price * 0.001
+    )
+    initial_entry_fee = float(state_row.get(
+        "initial_entry_fee", state_row.get("fees_paid", 0)) or 0)
+    entry_fee = safe_proportional_fee(
+        initial_entry_fee, sold_amount, original_amount,
+        partial_sold=bool(state_row.get("partial_sold")),
+    )
+    gross = sold_amount * (close_price - buy)
+    profit_usdt = round(gross - entry_fee - close_fee, 4)
+    profit_pct = ((close_price - buy) / buy) * 100 if buy > 0 else 0.0
+    from core.clock import now_utc
+    item = {
+        "bot_name": bot.BOT_NAME,
+        "mode_is_sim": getattr(bot, "simulation", None),
+        "symbol": sym,
+        "buy_price": buy,
+        "sell_price": close_price,
+        "buy_time": state_row.get("buy_time", ""),
+        "sell_time": now_utc().strftime("%Y-%m-%d %H:%M:%S"),
+        "profit_pct": profit_pct,
+        "profit_usdt": profit_usdt,
+        "invested_usdt": invested_sold,
+        "reason": f"External partial close ({source})",
+        "is_futures": False,
+        "fees_usdt": entry_fee + close_fee,
+        "is_partial": True,
+        "exchange_order_id": (
+            f"external-partial:{bot.BOT_NAME}:{sym}:"
+            f"{state_row.get('buy_time', '')}:"
+            f"{local_amt:.12g}->{remaining_amount:.12g}"
+        ),
+    }
+    saved = bool(save_trade_db(**item))
+    fields = {
+        "amount": remaining_amount,
+        "invested_usdt": invested_remaining,
+        "partial_sold": True,
+    }
+    if "original_amount" not in state_row:
+        fields["original_amount"] = local_amt
+    if not saved:
+        fields["accounting_pending_partials"] = _append_pending_partial(
+            state_row, item)
+    else:
+        log_event(
+            f" Spot reconciliation: {sym} external partial recorded "
+            f"({sold_amount:.6f} sold, PnL={profit_usdt:+.2f} USDT)",
+            "WARN")
+    return saved, fields
+
+
+def _row_with_unpriced_spot_partials(state_row: dict) -> dict:
+    """Rebuild the not-yet-booked spot slice for a later full offline close."""
+    row = dict(state_row)
+    pending = list(row.get("unpriced_external_partials") or [])
+    if not pending:
+        return row
+    try:
+        amount = float(row.get("amount", 0) or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    try:
+        invested = float(row.get("invested_usdt", 0) or 0)
+    except (TypeError, ValueError):
+        invested = 0.0
+    for item in pending:
+        try:
+            amount += float(item.get("sold_amount", 0) or 0)
+        except (TypeError, ValueError, AttributeError):
+            pass
+        try:
+            invested += float(item.get("invested_usdt", 0) or 0)
+        except (TypeError, ValueError, AttributeError):
+            pass
+    if amount > 0:
+        row["amount"] = amount
+    if invested > 0:
+        row["invested_usdt"] = invested
+    row["unpriced_external_partials"] = []
+    return row
 
 
 def _is_fresh_position(state_row, max_age_s: float) -> bool:
@@ -218,6 +480,50 @@ def _still_held_on_spot_exchange(bot, sym: str, dust_usdt: float = 1.0) -> bool:
     return True
 
 
+def _fetch_spot_total(bot, sym: str) -> float | None:
+    """Return confirmed wallet total for a coin, or None on unclear fetch."""
+    try:
+        bal = bot.ex.fetch_balance()
+        return float((bal.get(sym) or {}).get("total", 0) or 0)
+    except Exception:
+        return None
+
+
+def _apply_spot_external_partial_if_confirmed(bot, sym: str, state_row: dict,
+                                              observed_amount: float) -> bool:
+    """Lock, re-read and re-fetch before booking an external spot shrink."""
+    from core.logger import log_event
+    from core.symbol_locks import close_lock
+
+    with close_lock(sym, bot_name=bot.BOT_NAME) as got:
+        if not got or not bot.state.has(sym):
+            return False
+        live_row = bot.state.get(sym) or state_row
+        try:
+            live_amt = float(live_row.get("amount", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        refetched_amt = _fetch_spot_total(bot, sym)
+        if refetched_amt is None:
+            log_event(
+                f" Spot reconciliation: {sym} partial shrink not confirmed  "
+                f"skipping this cycle",
+                "WARN")
+            return False
+        remaining = min(float(observed_amount or refetched_amt or 0), refetched_amt)
+        if (live_amt <= 0 or remaining <= 0 or remaining >= live_amt * 0.95
+                or _is_fresh_position(live_row, bot.RECONCILE_INTERVAL_SEC)):
+            return False
+        _saved, fields = _record_spot_external_partial(
+            bot, sym, dict(live_row), remaining)
+        if fields and not bot.state.update_many(sym, fields):
+            log_event(
+                f" Spot reconciliation: {sym} partial state update was not "
+                f"durably persisted",
+                "WARN")
+        return bool(fields)
+
+
 def _gate_missing_for_removal(bot, sym, state_row, strikes, threshold: int = 2) -> bool:
     """Strike-gated 'coin missing from exchange' decision, shared by BOTH the
     startup and the periodic spot reconcile so neither can drop a live position
@@ -244,6 +550,26 @@ def _gate_missing_for_removal(bot, sym, state_row, strikes, threshold: int = 2) 
         if not bot.state.has(sym):
             strikes.pop(sym, None)
             return False                      # monitor already booked + removed it
+        try:
+            live_row = bot.state.get(sym) or state_row
+        except AttributeError:
+            live_row = state_row
+        if bool(live_row.get("accounting_already_booked")):
+            removed = bot.state.remove(sym)
+            if removed:
+                strikes.pop(sym, None)
+                return True
+            try:
+                bot.state.update_many(sym, {"accounting_already_booked": True})
+            except Exception:
+                pass
+            return False
+        if live_row.get("accounting_pending_partials"):
+            log_event(
+                f" Spot reconciliation: {sym} missing on exchange but "
+                f"partial accounting is still pending  state kept for retry",
+                "WARN")
+            return False
         if _still_held_on_spot_exchange(bot, sym):
             strikes.pop(sym, None)
             log_event(
@@ -252,14 +578,43 @@ def _gate_missing_for_removal(bot, sym, state_row, strikes, threshold: int = 2) 
                 "WARN")
             return False
         strikes.pop(sym, None)
-        if not _record_spot_offline_close(bot, sym, state_row):
+        close_row = (
+            _row_with_unpriced_spot_partials(live_row)
+            if live_row.get("unpriced_external_partials")
+            else live_row
+        )
+        if not _record_spot_offline_close(bot, sym, close_row):
             log_event(
                 f" Spot reconciliation: {sym} missing on exchange but "
                 f"offline-close accounting failed  state kept for retry",
                 "WARN")
             return False
-        bot.state.remove(sym)
-        return True
+        try:
+            from bot_utils.trade_state import remove_with_restore_fields
+            removed = remove_with_restore_fields(
+                bot.state,
+                sym,
+                {
+                    "accounting_already_booked": True,
+                    "accounting_booked_reason": "Spot offline reconcile",
+                },
+            )
+        except Exception:
+            removed = False
+        if removed:
+            return True
+        try:
+            bot.state.update_many(sym, {
+                "accounting_already_booked": True,
+                "accounting_booked_reason": "Spot offline reconcile",
+            })
+        except Exception:
+            pass
+        log_event(
+            f" Spot reconciliation: {sym} close accounting booked but "
+            f"state remove failed  keeping booked marker to prevent double-book",
+            "WARN")
+        return False
 
 
 def _adopt_spot_orphans(bot, bal_data: dict) -> None:
@@ -325,7 +680,7 @@ def _adopt_spot_orphans(bot, bal_data: dict) -> None:
                 continue
             try:
                 from core.clock import now_utc as _now_utc
-                bot.state.add(base, {
+                added = bot.state.add(base, {
                     "buy": price,
                     "buy_time": _now_utc().strftime("%Y-%m-%d %H:%M:%S"),
                     "amount": exch_amt,
@@ -339,6 +694,8 @@ def _adopt_spot_orphans(bot, bal_data: dict) -> None:
                     "be_active": False,
                     "adopted": True,
                 })
+                if added is False:
+                    raise RuntimeError("state.add returned False")
                 current_syms.add(base)
                 adopted.append(base)
             except Exception as exc:
@@ -434,8 +791,9 @@ def startup_reconciliation(bot) -> None:
                       and not _is_fresh_position(d, bot.RECONCILE_INTERVAL_SEC)):
                     # Skip shrinking a just-opened position whose balance may
                     # not have propagated yet (M-7).
-                    adjusted.append(f"{sym}: {local_amt:.6f}{exch_amt:.6f}")
-                    bot.state.update(sym, "amount", exch_amt)
+                    if _apply_spot_external_partial_if_confirmed(
+                            bot, sym, dict(d), exch_amt):
+                        adjusted.append(f"{sym}: {local_amt:.6f}{exch_amt:.6f}")
             except (TypeError, ValueError):
                 continue
 
@@ -471,31 +829,9 @@ def startup_reconciliation(bot) -> None:
             exch_amt = float(exch_check.get("total", 0) or 0)
             if exch_amt <= 1e-8:
                 continue
-            try:
-                extra = _json.loads(pos.get("extra_json") or "{}")
-            except Exception:
-                extra = {}
-            bot.state.add(sym, {
-                "buy": float(pos["buy_price"]),
-                "buy_time": pos["buy_time"],
-                "amount": min(exch_amt, float(pos["amount"])),
-                "invested_usdt": float(pos["invested_usdt"]),
-                "original_amount": float(pos.get("original_amount") or pos["amount"]),
-                "rsi_15m": pos.get("rsi_15m"),
-                "rsi_1h": pos.get("rsi_1h"),
-                "rsi_4h": pos.get("rsi_4h"),
-                "change_pct": pos.get("change_pct"),
-                "partial_sold": extra.get("partial_sold", False),
-                "break_even": extra.get("break_even", False),
-                "be_active": extra.get("be_active", False),
-                # Preserve trailing-stop high-water-mark (resetting to
-                # buy_price would discard a running position's trailing progress).
-                "highest": float(pos.get("highest_price") or pos["buy_price"]),
-                # Restore fee accounting so partial/full close doesn't
-                # double-charge the entry fee.
-                "initial_entry_fee": float(extra.get("initial_entry_fee", 0.0)),
-                "fees_paid": float(extra.get("fees_paid", 0.0)),
-            })
+            added = bot.state.add(sym, _state_from_spot_db_position(pos, exch_amt))
+            if added is False:
+                raise RuntimeError(f"state.add returned False for {sym}")
             rehydrated.append(sym)
         if rehydrated:
             log_event(
@@ -597,14 +933,9 @@ class ReconcileMixin:
                               and not _is_fresh_position(d, self.RECONCILE_INTERVAL_SEC)):
                             # Skip shrinking a just-opened position whose balance
                             # may not have propagated yet (M-7).
-                            # original_amount stays IMMUTABLE
-                            ratio = exch_amt / local_amt
-                            adjusted.append(f"{sym}: {local_amt:.6f}{exch_amt:.6f}")
-                            new_invested = float(d.get("invested_usdt", 0)) * ratio
-                            fields = {"amount": exch_amt, "invested_usdt": new_invested}
-                            if "original_amount" not in d:
-                                fields["original_amount"] = local_amt
-                            self.state.update_many(sym, fields)
+                            if _apply_spot_external_partial_if_confirmed(
+                                    self, sym, dict(d), exch_amt):
+                                adjusted.append(f"{sym}: {local_amt:.6f}{exch_amt:.6f}")
                     except (TypeError, ValueError):
                         continue
                 if phantoms:

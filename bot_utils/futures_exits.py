@@ -538,7 +538,9 @@ def _close_single_position_impl(*,
         accounting_error = None
         try:
             accounting_ok = bool(save_trade_db(
-                bot_name=bot_name, symbol=sym,
+                bot_name=bot_name,
+                mode_is_sim=simulation,
+                symbol=sym,
                 buy_price=entry, sell_price=fill_price,
                 buy_time=buy_time, sell_time=sell_time,
                 profit_pct=move_pct, profit_usdt=profit_usdt,
@@ -571,6 +573,7 @@ def _close_single_position_impl(*,
                     "accounting_pending_sell_time": sell_time,
                     "accounting_pending_profit_pct": move_pct,
                     "accounting_pending_profit_usdt": profit_usdt,
+                    "accounting_pending_mode_is_sim": simulation,
                     "accounting_pending_fees_usdt": slice_fees,
                     "accounting_pending_funding_paid": funding_pd,
                     "accounting_pending_exchange_order_id": exch_oid,
@@ -604,11 +607,17 @@ def _close_single_position_impl(*,
         try:
             # Scope by bot: FUTURES + CROSS share futures_state; unscoped would
             # delete the other bot's dashboard row for the same base coin.
-            remove_futures_state(sym, bot_name)
+            remove_futures_state(sym, bot_name, mode_is_sim=simulation)
         except Exception:
             pass
         try:
-            state.remove(sym)
+            from bot_utils.trade_state import remove_with_restore_fields
+            remove_with_restore_fields(state, sym, {
+                "accounting_already_booked": True,
+                "accounting_booked_sell_time": sell_time,
+                "accounting_booked_exchange_order_id": exch_oid,
+                "accounting_booked_reason": f"Emergency Close ({reason})",
+            })
         except KeyError:
             pass
         except Exception:

@@ -30,6 +30,7 @@ from launcher.core.positions import (
     get_open_spot_positions,
     mode_switch_blockers,
 )
+from launcher.state.poller import _runtime_or_config_sim
 from launcher.ui.logging_panel import log_to_card
 from core.pre_start_check import (
     format_issues,
@@ -53,6 +54,16 @@ def _fmt_int(value, default=0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return int(default)
+
+
+def _release_dead_process_close_locks(pid: int | None) -> None:
+    if not pid:
+        return
+    try:
+        from core.database import release_advisory_locks_for_dead_pid
+        release_advisory_locks_for_dead_pid(int(pid), "close:")
+    except Exception:
+        pass
 
 
 def format_start_params(name: str, snapshot: dict) -> str:
@@ -217,6 +228,76 @@ def start_bot(app, name: str) -> None:
 
 #  Stop 
 
+def _position_modes_for_stop(name: str) -> list[bool]:
+    try:
+        primary = bool(_runtime_or_config_sim(name))
+    except Exception:
+        primary = True
+    return [primary, not primary]
+
+
+def open_positions_for_stop(name: str) -> list:
+    """Read both SIM/LIVE state buckets for Stop/Quit fail-closed checks.
+
+    Runtime mode is probed first, but stale config must never make an open LIVE
+    position invisible and route Stop into the instant hard-terminate path.
+    """
+    out: list = []
+    seen: set[tuple] = set()
+    read_errors: list[Exception] = []
+    for is_sim in _position_modes_for_stop(name):
+        try:
+            if BOT_META[name].get("is_futures"):
+                rows = get_open_futures_positions(
+                    name, mode_is_sim=is_sim, strict=True)
+            else:
+                rows = get_open_spot_positions(
+                    name, mode_is_sim=is_sim, strict=True)
+        except Exception as exc:
+            read_errors.append(exc)
+            rows = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or row.get("base") or "")
+            key = (symbol, bool(is_sim))
+            if key in seen:
+                continue
+            seen.add(key)
+            item = dict(row)
+            item.setdefault("mode", "SIM" if is_sim else "LIVE")
+            out.append(item)
+    if read_errors:
+        raise RuntimeError(
+            f"{name}: position state read failed; stop/quit cannot prove flat"
+        ) from read_errors[0]
+    return out
+
+
+def close_modes_for_stop(name: str) -> list[bool]:
+    """Return SIM/LIVE buckets that currently contain positions for ``name``.
+
+    Falls back to the runtime/config mode only when no state rows are visible.
+    This keeps the direct close fallback aligned with the fail-closed position
+    search and avoids stale config hiding a LIVE book.
+    """
+    modes: list[bool] = []
+    rows = open_positions_for_stop(name)
+    for row in rows or []:
+        mode = str(row.get("mode") or "").upper()
+        if mode == "LIVE":
+            val = False
+        elif mode == "SIM":
+            val = True
+        else:
+            continue
+        if val not in modes:
+            modes.append(val)
+    if modes:
+        return modes
+    return _position_modes_for_stop(name)[:1]
+
+
 def stop_bot(app, name: str) -> None:
     """Stop ``name``'s subprocess.
 
@@ -229,6 +310,7 @@ def stop_bot(app, name: str) -> None:
     so the other bot cards stay responsive.
     """
     from launcher.ui.dialogs.shutdown import (
+        show_state_read_error_dialog,
         show_futures_stop_dialog,
         show_spot_stop_dialog,
     )
@@ -246,13 +328,23 @@ def stop_bot(app, name: str) -> None:
     # so the CROSS stop/close goes through the FUTURES path that books realized
     # PnL and clears futures_state, rather than trying to spot-sell perps.
     if BOT_META[name].get("is_futures"):
-        open_positions = get_open_futures_positions(name)
+        try:
+            open_positions = open_positions_for_stop(name)
+        except Exception as exc:
+            log_to_card(card, "error", f"Stop aborted: {exc}")
+            show_state_read_error_dialog(app, f"Stop {name}", str(exc))
+            return
         if open_positions:
             # Has positions  confirm dialog blocks until user decides
             show_futures_stop_dialog(app, name, open_positions)
             return
     else:
-        open_spot = get_open_spot_positions(name)
+        try:
+            open_spot = open_positions_for_stop(name)
+        except Exception as exc:
+            log_to_card(card, "error", f"Stop aborted: {exc}")
+            show_state_read_error_dialog(app, f"Stop {name}", str(exc))
+            return
         if open_spot:
             show_spot_stop_dialog(app, name, open_spot)
             return
@@ -462,7 +554,8 @@ def async_simple_stop(app, name: str, card: dict, update) -> None:
     update("Hard-stopping bot  positions stay OPEN on exchange")
     try:
         # HARD STOP. No graceful close, no bot signal handler.
-        app.bots[name].stop(graceful_close=False)
+        stopped_pid = app.bots[name].stop(graceful_close=False)
+        _release_dead_process_close_locks(stopped_pid)
     except Exception as e:
         stderr = sys.stderr
         if stderr is not None:
@@ -479,39 +572,58 @@ def async_close_and_stop_spot(app, name: str, update) -> None:
     """Graceful shutdown of a spot bot (its own handler closes positions),
     then verify + cleanup."""
     card = app.cards[name]
+    close_modes = close_modes_for_stop(name)
     update("Sending shutdown signal to bot")
     try:
-        app.bots[name].stop(graceful_close=True)
+        stopped_pid = app.bots[name].stop(graceful_close=True)
+        _release_dead_process_close_locks(stopped_pid)
     except Exception as e:
         sys.stderr.write(f"[Stop] graceful stop failed: {e}" + "\n")
     update("Verifying positions closed")
-    # Fallback: if the bot's handler couldn't close everything, do it here.
-    sim_only = app.config[name].get("SIMULATION", True)
-
     def _log(severity, msg):
         app.after(0, lambda: log_to_card(card, severity, msg))
 
-    direct_close_remaining_spot(name, _log, sim_only, reason="Manual Close & Stop")
+    # Fallback: if the bot's handler couldn't close everything, do it here in
+    # the same SIM/LIVE buckets the pre-stop position scan found.
+    failed: list[str] = []
+    for sim_only in close_modes:
+        result = direct_close_remaining_spot(
+            name, _log, sim_only, reason="Manual Close & Stop")
+        failed.extend(str(sym) for sym in result.get("failed", []) if sym)
+    if failed:
+        msg = "Fallback close failed for: " + ", ".join(sorted(set(failed)))
+        _log("error", msg)
+        update("Close failed - manual review needed")
+        return
     update("Done.")
 
 
 def async_close_and_stop_futures(app, name: str, card: dict, update,
                                   reason: str = "Manual Close & Stop") -> None:
     """Graceful shutdown + fallback close for FUTURES."""
+    close_modes = close_modes_for_stop(name)
     update("Sending shutdown signal to bot")
     try:
-        app.bots[name].stop(graceful_close=True)
+        stopped_pid = app.bots[name].stop(graceful_close=True)
+        _release_dead_process_close_locks(stopped_pid)
     except Exception as e:
         sys.stderr.write(f"[Stop] graceful stop failed: {e}" + "\n")
     update("Verifying all positions closed")
-    sim_only = app.config[name].get("SIMULATION", True)
-
     def _log(severity, msg):
         app.after(0, lambda: log_to_card(card, severity, msg))
 
     # Pass bot_name=name so a CROSS "Close & Stop" closes the CROSS book
     # (it defaults to "FUTURES" otherwise).
-    direct_close_remaining_futures(_log, sim_only, reason=reason, bot_name=name)
+    failed: list[str] = []
+    for sim_only in close_modes:
+        result = direct_close_remaining_futures(
+            _log, sim_only, reason=reason, bot_name=name)
+        failed.extend(str(sym) for sym in result.get("failed", []) if sym)
+    if failed:
+        msg = "Fallback close failed for: " + ", ".join(sorted(set(failed)))
+        _log("error", msg)
+        update("Close failed - manual review needed")
+        return
     update("Done.")
 
 
@@ -536,6 +648,18 @@ def async_emergency_close(app, card: dict, bot_was_running: bool, update) -> Non
     """
     futures_bots = [name for name, meta in BOT_META.items()
                     if meta.get("is_futures")]
+    close_modes_by_bot: dict[str, list[bool]] = {}
+    mode_errors: dict[str, str] = {}
+
+    for bot_name in futures_bots:
+        try:
+            close_modes_by_bot[bot_name] = close_modes_for_stop(bot_name)
+        except Exception as exc:
+            # Emergency close is explicitly a last-resort action. If we cannot
+            # prove the active namespace, try both buckets after killing the bot
+            # and make the degraded path visible.
+            close_modes_by_bot[bot_name] = [False, True]
+            mode_errors[bot_name] = str(exc)
 
     # Step 1: kill futures subprocesses immediately. We don't want them to
     # race with the launcher by trying to close the same positions.
@@ -544,7 +668,8 @@ def async_emergency_close(app, card: dict, bot_was_running: bool, update) -> Non
         try:
             bot = app.bots.get(bot_name)
             if bot is not None and bot.is_running():
-                bot.stop(graceful_close=False)
+                stopped_pid = bot.stop(graceful_close=False)
+                _release_dead_process_close_locks(stopped_pid)
         except Exception as e:
             sys.stderr.write(f"[Emergency] terminate {bot_name} failed: {e}\n")
 
@@ -556,7 +681,23 @@ def async_emergency_close(app, card: dict, bot_was_running: bool, update) -> Non
         app.after(0, lambda: log_to_card(card, severity, msg))
 
     for bot_name in futures_bots:
-        sim_only = app.config.get(bot_name, {}).get("SIMULATION", True)
-        direct_close_remaining_futures(
-            _log, sim_only, reason="Emergency Close", bot_name=bot_name)
+        if bot_name in mode_errors:
+            _log("warn",
+                 f"{bot_name}: mode detection failed before emergency close; "
+                 f"trying LIVE and SIM buckets ({mode_errors[bot_name]})")
+        failed: list[str] = []
+        for sim_only in close_modes_by_bot.get(bot_name, [False, True]):
+            try:
+                result = direct_close_remaining_futures(
+                    _log, sim_only, reason="Emergency Close", bot_name=bot_name)
+                failed.extend(str(sym) for sym in result.get("failed", []) if sym)
+            except Exception as exc:
+                failed.append(f"{bot_name}:{type(exc).__name__}")
+                _log("error", f"{bot_name}: emergency close fallback failed: {exc}")
+        if failed:
+            _log("error",
+                 f"{bot_name}: emergency close incomplete for "
+                 + ", ".join(sorted(set(failed))))
+            update("Emergency close incomplete - manual review needed")
+            return
     update("Done.")
