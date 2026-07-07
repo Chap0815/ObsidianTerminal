@@ -1,8 +1,8 @@
 @echo off
-REM ═══════════════════════════════════════════════════════════════════
-REM   OBSIDIAN TRADING TERMINAL — One-Click Installer (Doppelklick)
+REM ================================================================
+REM   OBSIDIAN TRADING TERMINAL - One-Click Installer (Doppelklick)
 REM   Stellt bei Bedarf Python 3.12 bereit und installiert dann alles.
-REM ═══════════════════════════════════════════════════════════════════
+REM ================================================================
 setlocal enableextensions
 title Obsidian Trading Terminal - Installer
 cd /d "%~dp0"
@@ -11,7 +11,7 @@ echo.
 echo   Starte Installation...
 echo.
 
-REM ── 1) Python 3.12 bevorzugt via py-Launcher ───────────────────────
+REM 1) Python 3.12 bevorzugt via py-Launcher
 py -3.12 --version >nul 2>nul
 if %errorlevel%==0 (
     echo   [OK] Python 3.12 gefunden ^(py -3.12^).
@@ -19,7 +19,7 @@ if %errorlevel%==0 (
     goto :end
 )
 
-REM ── 2) Irgendein python im PATH? (Version wird in install.py geprueft)
+REM 2) Irgendein python im PATH? Version wird in install.py geprueft.
 where python >nul 2>nul
 if %errorlevel%==0 (
     echo   [OK] python im PATH gefunden.
@@ -27,7 +27,7 @@ if %errorlevel%==0 (
     goto :end
 )
 
-REM ── 3) Kein Python → versuche Auto-Installation via winget ─────────
+REM 3) Kein Python: versuche Auto-Installation via winget.
 echo   [INFO] Kein Python gefunden. Versuche Auto-Installation...
 where winget >nul 2>nul
 if %errorlevel%==0 (
@@ -41,7 +41,7 @@ if %errorlevel%==0 (
     goto :end
 )
 
-REM ── 4) Kein winget → manueller Hinweis ─────────────────────────────
+REM 4) Kein winget: manueller Hinweis.
 echo.
 echo   [FEHLER] Weder Python noch winget gefunden.
 echo   Bitte Python 3.12.10 manuell installieren:

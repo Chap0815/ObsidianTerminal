@@ -1,24 +1,23 @@
-' OBSIDIAN.vbs — Startet Trading Terminal ohne CMD-Fenster
-' Nutzt lokales python/pythonw.exe (embedded) wenn vorhanden,
-' sonst System-Python als Fallback.
+' OBSIDIAN.vbs - startet das Trading Terminal ohne CMD-Fenster.
+' Bevorzugt das lokale .venv, danach portable python/, danach System-Python.
 
-Set WshShell   = CreateObject("WScript.Shell")
-Set FSO        = CreateObject("Scripting.FileSystemObject")
+Set WshShell = CreateObject("WScript.Shell")
+Set FSO = CreateObject("Scripting.FileSystemObject")
 
-strScriptDir   = FSO.GetParentFolderName(WScript.ScriptFullName)
-
-' Python-Pfad bestimmen: lokal zuerst, dann System
+strScriptDir = FSO.GetParentFolderName(WScript.ScriptFullName)
+strVenvPython = strScriptDir & "\.venv\Scripts\pythonw.exe"
 strLocalPython = strScriptDir & "\python\pythonw.exe"
-If FSO.FileExists(strLocalPython) Then
+
+If FSO.FileExists(strVenvPython) Then
+    strPython = strVenvPython
+ElseIf FSO.FileExists(strLocalPython) Then
     strPython = strLocalPython
 Else
-    strPython = "pythonw"   ' System-Python (muss im PATH sein)
+    strPython = "pythonw"
 End If
 
 strLauncher = strScriptDir & "\launcher.pyw"
-
-' Launcher starten, kein Fenster (0 = versteckt, False = nicht warten)
 WshShell.Run """" & strPython & """ """ & strLauncher & """", 0, False
 
-Set FSO      = Nothing
+Set FSO = Nothing
 Set WshShell = Nothing

@@ -1,6 +1,8 @@
 # Local/runtime data
 .env
 *.env
+.venv/
+python/
 logs/
 data/
 *.db

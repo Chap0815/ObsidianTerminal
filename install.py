@@ -3,24 +3,25 @@
   OBSIDIAN TRADING TERMINAL  -  One-Click Installer (Python 3.12.10)
 
 
-Einmal ausfhren -> installiert ALLES was der Bot braucht:
+Einmal ausfuehren -> installiert ALLES was der Bot braucht:
 
   python install.py
 
 Was es macht:
-  1. Prft Python-Version (empfohlen: 3.12.10; erlaubt 3.10 - 3.12)
-  2. Aktualisiert pip/setuptools/wheel
-  3. Installiert alle Pflicht-Pakete aus requirements.txt
+  1. Prueft Python-Version (empfohlen: 3.12.10; erlaubt 3.10 - 3.12)
+  2. Erstellt/benutzt .venv im Projektordner
+  3. Aktualisiert pip/setuptools/wheel im .venv
+  4. Installiert alle Pflicht-Pakete aus requirements.txt im .venv
      (gepinnte, kompatible Versionen; Indikatoren laufen nativ)
-  4. VERIFIZIERT jeden Pflicht-Import in einem frischen Subprozess
+  5. VERIFIZIERT jeden Pflicht-Import in einem frischen Subprozess
      (alle Pflicht-Module importierbar)
-  5. Prft Ollama; bietet optional Auto-Installation an
+  6. Prueft Ollama; bietet optional Auto-Installation an
      (Windows: winget - macOS: brew/Script - Linux: curl-Script)
-  6. Ldt das LLM-Modell (Name aus bot_config.json -> LLM_MODEL)
-  7. Legt Ordnerstruktur an (data/, logs/, prompts/)
-  8. Prft .env (sonst Hinweis auf setup_wizard.pyw)
+  7. Laedt das LLM-Modell (Name aus bot_config.json -> LLM_MODEL)
+  8. Legt Ordnerstruktur an (data/, logs/, prompts/)
+  9. Prueft .env (sonst Hinweis auf setup_wizard.pyw)
 
-Mehrfach ausfhrbar  -  berspringt bereits Erledigtes.
+Mehrfach ausfuehrbar  -  ueberspringt bereits Erledigtes.
 
 """
 from __future__ import annotations
@@ -53,6 +54,7 @@ def head(m): print(f"\n{C.BOLD}{C.B}{m}{C.END}")
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
 REQ_FILE = PROJECT_ROOT / "requirements.txt"
+VENV_DIR = PROJECT_ROOT / ".venv"
 
 # Empfohlene Zielversion
 TARGET_PY = (3, 12, 10)
@@ -81,12 +83,48 @@ DEFAULT_MODEL = "qwen2.5:14b"
 # Schritte
 # 
 
+def _venv_python() -> Path:
+    if platform.system() == "Windows":
+        return VENV_DIR / "Scripts" / "python.exe"
+    return VENV_DIR / "bin" / "python"
+
+
+def _running_in_project_venv() -> bool:
+    try:
+        return VENV_DIR.resolve() in Path(sys.executable).resolve().parents
+    except Exception:
+        return False
+
+
+def ensure_project_venv() -> None:
+    head("[2/9] Lokales .venv vorbereiten")
+    if _running_in_project_venv():
+        ok(f"nutze .venv: {sys.executable}")
+        return
+
+    py = _venv_python()
+    if not py.exists():
+        info(f"erstelle .venv in {VENV_DIR}")
+        r = subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)])
+        if r.returncode != 0 or not py.exists():
+            err(".venv konnte nicht erstellt werden.")
+            sys.exit(1)
+    else:
+        ok(".venv existiert bereits")
+
+    info("starte Installer im .venv neu ...")
+    env = os.environ.copy()
+    env["OBSIDIAN_INSTALL_VENV"] = "1"
+    r = subprocess.run([str(py), str(Path(__file__).resolve())], env=env)
+    sys.exit(r.returncode)
+
+
 def check_python() -> bool:
-    head("[1/8] Python-Version prfen")
+    head("[1/9] Python-Version pruefen")
     v = sys.version_info
     cur = f"{v.major}.{v.minor}.{v.micro}"
     if v.major != 3 or v.minor < 10:
-        err(f"Python {cur} ist zu alt  -  bentigt 3.10+, empfohlen 3.12.10.")
+        err(f"Python {cur} ist zu alt  -  benoetigt 3.10+, empfohlen 3.12.10.")
         err("Installiere Python 3.12.10 von https://www.python.org/downloads/")
         return False
     if (v.major, v.minor) == (3, 12):
@@ -112,18 +150,18 @@ def _can_import(module_name: str) -> tuple[bool, str]:
 
 
 def upgrade_pip() -> bool:
-    head("[2/8] pip / setuptools / wheel aktualisieren")
+    head("[3/9] pip / setuptools / wheel aktualisieren")
     info("aktualisiere Build-Tooling (still) ...")
     r = _pip("install", "--upgrade", "pip", "setuptools", "wheel", "--quiet")
     if r.returncode == 0:
         ok("pip/setuptools/wheel aktuell")
         return True
-    warn("pip-Upgrade nicht vollstndig  -  fahre trotzdem fort.")
+    warn("pip-Upgrade nicht vollstaendig  -  fahre trotzdem fort.")
     return True
 
 
 def install_packages() -> bool:
-    head("[3/8] Pflicht-Pakete installieren")
+    head("[4/9] Pflicht-Pakete installieren")
     if REQ_FILE.exists():
         info(f"installiere aus {REQ_FILE.name} (gepinnte, kompatible Versionen) ...")
         r = _pip("install", "-r", str(REQ_FILE), capture=False)
@@ -152,7 +190,7 @@ def install_packages() -> bool:
 
 
 def verify_imports() -> bool:
-    head("[4/8] Pflicht-Importe verifizieren (frischer Subprozess)")
+    head("[5/9] Pflicht-Importe verifizieren (frischer Subprozess)")
     all_ok = True
     for _, import_name in REQUIRED:
         good, errtxt = _can_import(import_name)
@@ -160,11 +198,11 @@ def verify_imports() -> bool:
             ok(f"import {import_name}")
         else:
             all_ok = False
-            err(f"import {import_name} schlgt fehl")
+            err(f"import {import_name} schlaegt fehl")
             if errtxt:
                 print(f"      {errtxt.splitlines()[-1][:200]}")
     if not all_ok:
-        err("Mindestens ein Pflicht-Import scheitert  -  der Bot wrde NICHT "
+        err("Mindestens ein Pflicht-Import scheitert  -  der Bot wuerde NICHT "
             "korrekt laufen. Bitte Hinweise oben befolgen und erneut starten.")
     return all_ok
 
@@ -185,7 +223,7 @@ def offer_desktop_shortcut() -> None:
     Windows and only when the user says yes  -  nothing is created uninvited."""
     if platform.system() != "Windows":
         return
-    if not _confirm("Desktop-Verknpfung mit Obsidian-Icon anlegen"):
+    if not _confirm("Desktop-Verknuepfung mit Obsidian-Icon anlegen"):
         return
     lnk = os.path.join(os.path.expanduser("~"), "Desktop",
                        "Obsidian Trading Terminal.lnk")
@@ -200,13 +238,13 @@ def offer_desktop_shortcut() -> None:
     try:
         subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
                         "-Command", ps], check=True, capture_output=True)
-        ok(f"Verknpfung angelegt: {lnk}")
+        ok(f"Verknuepfung angelegt: {lnk}")
     except Exception as e:
-        warn(f"Verknpfung konnte nicht angelegt werden: {e}")
+        warn(f"Verknuepfung konnte nicht angelegt werden: {e}")
 
 
 def _install_ollama() -> bool:
-    """Versucht Ollama plattformabhngig zu installieren (mit Rckfrage)."""
+    """Versucht Ollama plattformabhaengig zu installieren (mit Rueckfrage)."""
     system = platform.system()
     if not _confirm("Ollama ist nicht installiert. Jetzt automatisch installieren"):
         warn("uebersprungen. Manuell: https://ollama.com/download")
@@ -242,7 +280,7 @@ def _install_ollama() -> bool:
 
 
 def check_ollama() -> bool:
-    head("[5/8] Ollama prfen")
+    head("[6/9] Ollama pruefen")
     if not shutil.which("ollama"):
         if _install_ollama():
             ok("Ollama installiert")
@@ -257,7 +295,7 @@ def check_ollama() -> bool:
             ok("Ollama-Daemon antwortet")
             return True
         warn("Ollama installiert, aber Daemon antwortet nicht  -  starte die "
-             "Ollama-App bzw. 'ollama serve' und fhre install.py erneut aus.")
+             "Ollama-App bzw. 'ollama serve' und fuehre install.py erneut aus.")
         return False
     except Exception as e:
         warn(f"Ollama-Check fehlgeschlagen: {e}")
@@ -279,7 +317,7 @@ def _model_from_config() -> str:
 
 
 def pull_model(ollama_ready: bool) -> bool:
-    head("[6/8] LLM-Modell laden")
+    head("[7/9] LLM-Modell laden")
     if not ollama_ready:
         warn("uebersprungen (Ollama nicht bereit).")
         return False
@@ -308,7 +346,7 @@ def pull_model(ollama_ready: bool) -> bool:
 
 
 def create_folders() -> bool:
-    head("[7/8] Ordnerstruktur anlegen")
+    head("[8/9] Ordnerstruktur anlegen")
     folders = ["data", "logs", "logs/Spot", "logs/Trend", "logs/Futures", "prompts"]
     for f in folders:
         p = PROJECT_ROOT / f
@@ -321,11 +359,11 @@ def create_folders() -> bool:
 
 
 def check_env() -> bool:
-    head("[8/8] Konfiguration prfen")
+    head("[9/9] Konfiguration pruefen")
     env = PROJECT_ROOT / ".env"
     if not env.exists():
         warn(".env existiert noch NICHT.")
-        warn("Setup-Wizard ausfhren:  python setup_wizard.pyw")
+        warn("Setup-Wizard ausfuehren:  python setup_wizard.pyw")
         return True
     ok(".env gefunden")
     content = env.read_text(encoding="utf-8", errors="ignore")
@@ -354,6 +392,7 @@ def main() -> None:
         err("\nAbbruch  -  inkompatible Python-Version.")
         input("\nEnter zum Beenden ...")
         return
+    ensure_project_venv()
 
     steps: list[tuple[str, bool]] = []
     upgrade_pip()
@@ -382,7 +421,7 @@ def main() -> None:
               f"(oder launcher.pyw){C.END}")
     else:
         print(f"{C.Y}{C.BOLD}  ! Kern installiert; einzelne optionale Schritte "
-              f"offen (z. B. Ollama/Modell). Bot ist startfhig.{C.END}")
+              f"offen (z. B. Ollama/Modell). Bot ist startfaehig.{C.END}")
         print(f"{C.Y}    Start:  Doppelklick auf OBSIDIAN.vbs (oder launcher.pyw){C.END}")
 
     if not hard_fail:
