@@ -49,7 +49,7 @@ def load_trades(conn: sqlite3.Connection, hours: float | None) -> pd.DataFrame:
         return df
     df["sell_time"] = pd.to_datetime(df["sell_time"], errors="coerce", utc=True)
     df["buy_time"] = pd.to_datetime(df["buy_time"], errors="coerce", utc=True)
-    if hours:
+    if hours is not None:
         cutoff = pd.Timestamp.utcnow() - pd.Timedelta(hours=float(hours))
         df = df[df["sell_time"] >= cutoff]
     df["base_bot"] = df["bot_name"].map(_base_bot_name)
@@ -137,24 +137,30 @@ def print_report(trades: pd.DataFrame, open_fut: pd.DataFrame) -> None:
             f"{'inf' if math.isinf(m['payoff']) else f'{m['payoff']:.2f}'}"
         )
 
-    print("\nBY BOT")
+    print("\nBY BOT / MODE")
     print("-" * 78)
-    for bot in ALL_BOTS:
-        t = trades[trades["base_bot"] == bot] if not trades.empty else trades
-        p = pos[pos["base_bot"] == bot] if not pos.empty else pos
-        o = open_fut[open_fut["base_bot"] == bot] if not open_fut.empty else open_fut
-        realized = float(t["profit_usdt"].sum()) if not t.empty else 0.0
-        unrealized = float(o["unrealized_pnl"].fillna(0).sum()) if not o.empty else 0.0
-        m = _metrics(p)
-        partial_pnl = float(t[pd.to_numeric(t.get("is_partial", 0), errors="coerce").fillna(0).astype(int) == 1]["profit_usdt"].sum()) if not t.empty else 0.0
-        stop_pnl = float(t[t["reason"].fillna("").str.contains("stop", case=False, na=False)]["profit_usdt"].sum()) if not t.empty and "reason" in t else 0.0
-        print(
-            f"{bot:8} net={_fmt(realized + unrealized)} realized={_fmt(realized)} "
-            f"open={_fmt(unrealized)}/{len(o)} pos={m['positions']:2d} "
-            f"fills={len(t):2d} wr={m['wr']:5.1f}% payoff="
-            f"{'inf' if math.isinf(m['payoff']) else f'{m['payoff']:.2f}'} "
-            f"partial={_fmt(partial_pnl)} stop={_fmt(stop_pnl)}"
-        )
+    for mode in ("LIVE", "SIM", "LEGACY"):
+        for bot in ALL_BOTS:
+            t = (trades[(trades["base_bot"] == bot) & (trades["mode"] == mode)]
+                 if not trades.empty else trades)
+            p = (pos[(pos["base_bot"] == bot) & (pos["mode"] == mode)]
+                 if not pos.empty else pos)
+            o = (open_fut[(open_fut["base_bot"] == bot) & (open_fut["mode"] == mode)]
+                 if not open_fut.empty else open_fut)
+            if t.empty and o.empty:
+                continue
+            realized = float(t["profit_usdt"].sum()) if not t.empty else 0.0
+            unrealized = float(o["unrealized_pnl"].fillna(0).sum()) if not o.empty else 0.0
+            m = _metrics(p)
+            partial_pnl = float(t[pd.to_numeric(t.get("is_partial", 0), errors="coerce").fillna(0).astype(int) == 1]["profit_usdt"].sum()) if not t.empty else 0.0
+            stop_pnl = float(t[t["reason"].fillna("").str.contains("stop", case=False, na=False)]["profit_usdt"].sum()) if not t.empty and "reason" in t else 0.0
+            print(
+                f"{mode:6} {bot:8} net={_fmt(realized + unrealized)} realized={_fmt(realized)} "
+                f"open={_fmt(unrealized)}/{len(o)} pos={m['positions']:2d} "
+                f"fills={len(t):2d} wr={m['wr']:5.1f}% payoff="
+                f"{'inf' if math.isinf(m['payoff']) else f'{m['payoff']:.2f}'} "
+                f"partial={_fmt(partial_pnl)} stop={_fmt(stop_pnl)}"
+            )
 
     if not pos.empty:
         print("\nTOP SYMBOL CONTRIBUTION")

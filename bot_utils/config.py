@@ -114,6 +114,18 @@ _CLAMP_DEFAULTS = {
     "TREND_EXIT_STALE_LIMIT": 3,
 }
 
+_POSITION_LIMIT_BY_BOT = {
+    "SPOT": 500.0,
+    "FUTURES": 500.0,
+    "CROSS": 500.0,
+    "TREND": 2500.0,
+    "FUTREND": 2500.0,
+}
+
+
+def _position_limit(bot_name: str) -> float:
+    return _POSITION_LIMIT_BY_BOT.get(str(bot_name or "").upper(), 500.0)
+
 
 def _clamp(key, value):
     spec = _CLAMPS.get(key)
@@ -138,6 +150,39 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
         if text in ("0", "false", "no", "off"):
             return False
     return bool(default)
+
+
+def _live_position_cap(bot_name: str,
+                       section: Dict[str, Any],
+                       fallback_cfg: Dict[str, Any],
+                       default: Any) -> float:
+    hard_limit = _position_limit(bot_name)
+    fallback_cap = fallback_cfg.get("POSITION_SIZE_MAX", hard_limit)
+    raw_cap = section.get("POSITION_SIZE_MAX", fallback_cap)
+    cap = _clamp("POSITION_SIZE_MAX", raw_cap)
+    try:
+        cap = float(cap)
+    except (TypeError, ValueError):
+        cap = float(fallback_cap or hard_limit)
+    return max(0.01, min(hard_limit, cap))
+
+
+def _clamp_live_sizing(bot_name: str,
+                       key: str,
+                       raw: Any,
+                       section: Dict[str, Any],
+                       fallback_cfg: Dict[str, Any],
+                       default: Any) -> float:
+    hard_limit = _position_limit(bot_name)
+    val = _clamp(key, raw)
+    try:
+        val = float(val)
+    except (TypeError, ValueError):
+        val = float(fallback_cfg.get(key, default) or 0.0)
+    val = max(0.01, min(hard_limit, val))
+    if key == "POSITION_SIZE":
+        val = min(val, _live_position_cap(bot_name, section, fallback_cfg, default))
+    return val
 
 
 def _enforce_invariants(cfg: Dict[str, Any]) -> None:
@@ -322,6 +367,10 @@ def get_live_value(bot_name: str, key: str, default: Any = None,
         if isinstance(fb, bool):
             return _coerce_bool(raw, fb)
         if isinstance(fb, (int, float)):
+            if key in {"POSITION_SIZE", "POSITION_SIZE_MAX"}:
+                return _clamp_live_sizing(
+                    bot_name, key, raw, section, fallback_cfg, default
+                )
             val = _clamp(key, float(raw))
             if key == "TRAILING_DISTANCE":
                 try:

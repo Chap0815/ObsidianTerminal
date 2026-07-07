@@ -34,16 +34,8 @@ if %errorlevel%==0 (
     goto :eof
 )
 
-REM 5) Letzter Fallback: py-Launcher (kann kurz ein Fenster zeigen)
-where py >nul 2>nul
-if %errorlevel%==0 (
-    start "" py "%~dp0launcher.pyw"
-    goto :eof
-)
-
 echo.
 echo   [FEHLER] pythonw.exe wurde nicht gefunden.
-echo   Pruefe deine Python-Installation oder starte launcher.pyw
-echo   per Doppelklick im Explorer.
+echo   Pruefe die Installation oder starte OBSIDIAN.vbs.
 echo.
 pause

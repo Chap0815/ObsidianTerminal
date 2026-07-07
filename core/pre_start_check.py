@@ -13,12 +13,13 @@ from pathlib import Path
 from typing import Iterable
 
 from core.paths import BOT_CONFIG, DB_PATH, PROJECT_ROOT
-from core.runtime_status import get_build_info, read_runtime_status
+from core.runtime_status import get_build_info, read_runtime_status, write_runtime_status
 
 
 POSITION_LIMIT_BY_BOT = {
     "SPOT": 500.0,
     "FUTURES": 500.0,
+    "CROSS": 500.0,
     "TREND": 2500.0,
     "FUTREND": 2500.0,
 }
@@ -172,25 +173,55 @@ def _check_runtime(bot_name: str, meta: dict) -> list[CheckIssue]:
     if not status:
         return []
     pid = int(status.get("pid") or 0)
-    state = str(status.get("status") or "")
+    state = str(status.get("status") or "").lower()
     cmdline = _pid_cmdline(pid) if pid > 0 else ""
     expected_module = str(meta.get("module") or "")
-    if pid > 0 and state in {"starting", "ready"} and _pid_alive(pid):
+    active_states = {"starting", "started", "ready", "running", "degraded"}
+    if pid > 0 and state in active_states and _pid_alive(pid):
+        try:
+            path = PROJECT_ROOT / str(meta.get("log_dir", "")) / "runtime_status.json"
+            age_sec = time.time() - path.stat().st_mtime
+        except Exception:
+            age_sec = 0.0
         if expected_module and expected_module in cmdline:
             return [_issue("error", "bot_already_running",
                            f"{bot_name}: runtime_status reports live pid {pid}")]
-        return [_issue("warn", "runtime_pid_reused",
-                       f"{bot_name}: runtime_status pid {pid} is alive but cmdline did not match bot")]
-    if state in {"starting", "ready"}:
+        if age_sec < 300:
+            return [_issue(
+                "error", "bot_runtime_pid_alive",
+                f"{bot_name}: runtime_status is fresh/live with pid {pid} "
+                f"but cmdline did not match expected module"
+            )]
+        return [_issue(
+            "warn", "runtime_pid_reused",
+            f"{bot_name}: runtime_status pid {pid} is alive but stale/cmdline did not match bot"
+        )]
+    if state in active_states:
         try:
             path = PROJECT_ROOT / str(meta.get("log_dir", "")) / "runtime_status.json"
             age_sec = time.time() - path.stat().st_mtime
         except Exception:
             age_sec = 0.0
         if age_sec >= 300:
+            try:
+                write_runtime_status(
+                    meta.get("log_dir", ""),
+                    bot_name,
+                    "stopped",
+                    bool(status.get("simulation", True)),
+                    threads={"monitor": False, "scan": False, "reconcile": False},
+                    extra={
+                        "previous_status": state,
+                        "stopped_by": "pre_start_stale_cleanup",
+                        "pid": pid,
+                        "run_id": str(status.get("run_id") or ""),
+                    },
+                )
+            except Exception:
+                pass
             return [_issue(
                 "warn", "runtime_status_stale",
-                f"{bot_name}: stale runtime_status says {state} but pid {pid} is not alive"
+                f"{bot_name}: stale runtime_status said {state} but pid {pid} is not alive; marked stopped"
             )]
     return []
 
@@ -221,6 +252,14 @@ def _check_config(bot_name: str | None,
                 val = float(section.get(key))
                 if not math.isfinite(val):
                     raise ValueError("not finite")
+                if key == "MAX_OPEN_TRADES" and not (1.0 <= val <= 50.0):
+                    issues.append(_issue(
+                        "error", "max_open_trades_invalid",
+                        f"{name}: MAX_OPEN_TRADES={val} outside 1-50"))
+                if key == "MAX_DAILY_LOSS" and (val > 0.0 or val < -1000.0):
+                    issues.append(_issue(
+                        "error", "max_daily_loss_invalid",
+                        f"{name}: MAX_DAILY_LOSS={val} outside -1000-0"))
             except Exception:
                 issues.append(_issue("error", "config_numeric",
                                      f"{name}: {key} is not numeric/finite"))
@@ -256,6 +295,30 @@ def _check_config(bot_name: str | None,
             except Exception:
                 issues.append(_issue("error", "leverage_numeric",
                                      f"{name}: LEVERAGE is not numeric"))
+        try:
+            initial_sl = float(section.get("INITIAL_STOP_LOSS"))
+            if not (-100.0 < initial_sl < 0.0):
+                issues.append(_issue(
+                    "error", "initial_stop_loss_invalid",
+                    f"{name}: INITIAL_STOP_LOSS={initial_sl} must be negative and > -100"))
+            lev = float(section.get("LEVERAGE", 1) or 1)
+            if lev > 1.0 and initial_sl <= -((100.0 / lev) * 0.9):
+                issues.append(_issue(
+                    "error", "initial_stop_loss_beyond_liq",
+                    f"{name}: INITIAL_STOP_LOSS={initial_sl} sits at/beyond liquidation at {lev:g}x"))
+        except Exception:
+            issues.append(_issue("error", "initial_stop_loss_numeric",
+                                 f"{name}: INITIAL_STOP_LOSS is not numeric"))
+        if "PER_LEG_DISASTER_STOP" in section:
+            try:
+                pds = float(section.get("PER_LEG_DISASTER_STOP"))
+                if pds >= 0.0:
+                    issues.append(_issue(
+                        "error", "per_leg_disaster_stop_invalid",
+                        f"{name}: PER_LEG_DISASTER_STOP={pds} must be negative"))
+            except Exception:
+                issues.append(_issue("error", "per_leg_disaster_stop_numeric",
+                                     f"{name}: PER_LEG_DISASTER_STOP is not numeric"))
         if "TRAILING_DISTANCE" in section and "ACTIVATION_PROFIT" in section:
             try:
                 td = float(section.get("TRAILING_DISTANCE"))

@@ -553,9 +553,12 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         """
         from core.logger import log_event
         with self._shutdown_lock:
-            if self._shutdown_event.is_set():
+            if getattr(self, "_emergency_closed", False):
                 return
             self._shutdown_event.set()
+            if getattr(self, "_emergency_in_progress", False):
+                return
+            self._emergency_in_progress = True
 
         # FAST-PATH: nothing to close  no emergency close
         try:
@@ -570,6 +573,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                 "INFO"
             )
             self._emergency_closed = True   # prevent atexit re-entry
+            self._emergency_in_progress = False
             return
 
         log_event(
@@ -578,19 +582,20 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             "WARN"
         )
 
-        # guard against double-execution
-        if getattr(self, "_emergency_closed", False):
-            return
-        self._emergency_closed = True
-
-        result = {"done": False, "error": None}
+        result = {"done": False, "error": None, "failed_count": 0}
 
         def _close_runner():
             try:
-                self._emergency_close_all(reason=f"Shutdown signal {signum}")
+                res = self._emergency_close_all(reason=f"Shutdown signal {signum}")
+                result["failed_count"] = int((res or {}).get("failed_count", 0))
                 result["done"] = True
             except Exception as e:
                 result["error"] = e
+            finally:
+                with self._shutdown_lock:
+                    if result["done"] and result["failed_count"] == 0:
+                        self._emergency_closed = True
+                    self._emergency_in_progress = False
 
         runner = threading.Thread(target=_close_runner,
                                     daemon=True,
@@ -598,15 +603,27 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         runner.start()
         runner.join(timeout=self.SHUTDOWN_DEADLINE_SEC)
 
-        if not result["done"]:
+        self._emergency_in_progress = runner.is_alive()
+        if result["done"] and result["failed_count"] == 0:
+            self._emergency_closed = True
+            self._emergency_in_progress = False
+        else:
             if runner.is_alive():
                 log_event(
                     f" Emergency close exceeded {self.SHUTDOWN_DEADLINE_SEC}s "
-                    f"deadline. Open positions may remain  close MANUALLY.",
+                    f"deadline. Open positions may remain  a repeat shutdown "
+                    f"signal will retry; close MANUALLY if exiting now.",
                     "WARN"
                 )
             elif result["error"]:
                 self._log_error("Shutdown handler", result["error"])
+            elif result["failed_count"]:
+                log_event(
+                    f" Emergency close incomplete  {result['failed_count']} "
+                    f"position(s) failed. A repeat shutdown signal will retry "
+                    f"them; close MANUALLY if exiting now.",
+                    "WARN"
+                )
 
     def _emergency_close_all(self, reason: str = "Shutdown") -> None:
         from core.logger import log_event, log_sell, send_telegram, save_trade
@@ -617,7 +634,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         except ImportError:
             close_lock = None
             release_lock = None
-        emergency_close_all_spot(
+        return emergency_close_all_spot(
             ex=self.ex,
             state=self.state,
             bot_name=self.BOT_NAME,

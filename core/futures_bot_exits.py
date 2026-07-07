@@ -189,7 +189,7 @@ class FuturesExitsMixin:
                     margin = float(d.get("invested_usdt", 0))
                     lev = float(d.get("leverage", self.C("LEVERAGE", 3)))
                     pt = d.get("position_type", "LONG")
-                    last = float(d.get("last_price", entry))
+                    last = self._killswitch_price(sym, d, entry)
                     if entry > 0 and margin > 0 and last > 0:
                         u, _ = calc_unrealized_pnl(entry, last, margin, lev, pt)
                         unrealized_all += u
@@ -291,6 +291,34 @@ class FuturesExitsMixin:
                             self._log_error("BTC-crash flatten", _ce)
         except Exception as e:
             self._log_error("killswitch check", e)
+
+    def _killswitch_price(self, sym: str, d: dict, entry: float) -> float:
+        """Best-effort fresh price for daily-loss killswitch accounting.
+
+        The killswitch runs before per-position monitor updates on some ticks.
+        Reading only the previous ``last_price`` can delay a hard flatten after
+        a gap. Use the existing ticker cache with a short timeout, then the
+        mark-price fallback, and only then fall back to stale state.
+        """
+        symbol_full = f"{sym}/USDT:USDT"
+        try:
+            tk = self.ticker_cache.get(self.ex, symbol_full, timeout=1.5,
+                                       critical=True)
+            px = float(tk.get("last") or tk.get("close") or 0)
+            if px > 0:
+                return px
+        except Exception:
+            pass
+        try:
+            px = float(self._fallback_mark_price(symbol_full) or 0.0)
+            if px > 0:
+                return px
+        except Exception:
+            pass
+        try:
+            return float(d.get("last_price", entry) or entry)
+        except (TypeError, ValueError):
+            return float(entry or 0.0)
 
   #  Periodic funding-paid persistence 
 
@@ -420,11 +448,12 @@ class FuturesExitsMixin:
                 f"position. Check the symbol on the exchange / close manually.",
                 "WARN")
             try:
-                from core.logger import send_telegram
-                from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-                send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                    f"[{self.BOT_NAME}] {sym}: no price (ticker+mark) - "
-                    f"liq protection blind. Check/close manually.")
+                if not self.simulation:
+                    from core.logger import send_telegram
+                    from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+                    send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                        f"[{self.BOT_NAME}] {sym}: no price (ticker+mark) - "
+                        f"liq protection blind. Check/close manually.")
             except Exception:
                 pass
 
@@ -448,7 +477,33 @@ class FuturesExitsMixin:
         from core.logger import log_event
         from core.database import upsert_futures_state
 
+        if d.get("accounting_pending"):
+            try:
+                from core.database import remove_futures_state
+                if self._record_offline_close(sym, d):
+                    try:
+                        remove_futures_state(sym, self.BOT_NAME)
+                    except Exception:
+                        pass
+                    self.state.remove(sym)
+            except Exception as exc:
+                self._log_error(f"futures pending accounting retry {sym}", exc)
+            return
+        if d.get("claim_conflict"):
+            warned = getattr(self, "_claim_conflict_warned", set())
+            if sym not in warned:
+                log_event(
+                    f"[{self.BOT_NAME}] {sym}: registry claim conflict - "
+                    f"monitor skipped fail-closed; run claim/state repair",
+                    "ERROR",
+                )
+                warned.add(sym)
+                self._claim_conflict_warned = warned
+            return
         self._retry_pending_partial_accounting(sym, d)
+        d = self.state.get(sym) or d
+        if d.get("accounting_pending_partials"):
+            return
 
         symbol_full = f"{sym}/USDT:USDT"
 
@@ -985,12 +1040,13 @@ class FuturesExitsMixin:
             "WIN"
         )
         try:
-            send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                f"[{self.BOT_NAME}] PARTIAL {pos_type} {sym}\n"
-                f"{int(partial_pct*100)}% @ {fill_price:.6f} "
-                f"(+{move_pct:.2f}%, +{profit_partial:.2f} USDT)\n"
-                f"Stop: Break-Even"
-            )
+            if not self.simulation:
+                send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                    f"[{self.BOT_NAME}] PARTIAL {pos_type} {sym}\n"
+                    f"{int(partial_pct*100)}% @ {fill_price:.6f} "
+                    f"(+{move_pct:.2f}%, +{profit_partial:.2f} USDT)\n"
+                    f"Stop: Break-Even"
+                )
         except Exception as e:
             log_event(f"Telegram failed: {e}", "WARN")
         return True
@@ -1015,6 +1071,7 @@ class FuturesExitsMixin:
                                  extract_order_fee_futures,
                                  extract_or_estimate_futures_fee,
                                  fetch_or_estimate_funding,
+                                 is_no_position_error,
                                  verify_position_closed)
 
         symbol_full = f"{sym}/USDT:USDT"
@@ -1092,21 +1149,7 @@ class FuturesExitsMixin:
                 except Exception:
                     pass
             except Exception as e:
-                err_str = str(e).lower()
-                permanent_markers = (
-                    "reduce-only", "reduce only", "reduceonly",
-                    "not exist", "not found", "no position",
-                    "no open position", "zero position",
-                    "order does not exist", "nonexistent or closed",
-                    "position is nonexistent", '"code":2009',
-                    "code 2009",
-                )
-                precision_markers = (
-                    "precision", "min notional", "lot size", "below",
-                    "step size", "tick size", "minimum",
-                )
-                is_precision = any(m in err_str for m in precision_markers)
-                if any(m in err_str for m in permanent_markers) and not is_precision:
+                if is_no_position_error(e):
                     try:
                         fill_price = float(d.get("pending_close_price") or fill_price)
                     except (TypeError, ValueError):
@@ -1293,15 +1336,16 @@ class FuturesExitsMixin:
                               f"(partial {partial_realized:+.2f} + final {profit_usdt:+.2f})\n")
             else:
                 total_line = ""
-            send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                f"[{self.BOT_NAME}] "
-                f"{pos_type} CLOSE {sym}\n"
-                f"Move: {move_pct_real:+.2f}% ({profit_usdt:+.2f} USDT auf "
-                f"{margin:.0f} Margin @ {lev}x)\n"
-                f"{total_line}"
-                f"Fees: {lifetime_fees:.4f} | Funding: {funding_pd:+.3f}\n"
-                f"Reason: {reason}"
-            )
+            if not self.simulation:
+                send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                    f"[{self.BOT_NAME}] "
+                    f"{pos_type} CLOSE {sym}\n"
+                    f"Move: {move_pct_real:+.2f}% ({profit_usdt:+.2f} USDT auf "
+                    f"{margin:.0f} Margin @ {lev}x)\n"
+                    f"{total_line}"
+                    f"Fees: {lifetime_fees:.4f} | Funding: {funding_pd:+.3f}\n"
+                    f"Reason: {reason}"
+                )
         except Exception as e:
             log_event(f"telegram send for {sym} failed: {e}", "WARN")
 

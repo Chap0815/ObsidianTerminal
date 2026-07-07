@@ -69,11 +69,12 @@ class FuturesReconcileMixin:
                     "WARN"
                 )
                 try:
-                    send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                        f" [{self.BOT_NAME}] Reconcile aborted!\n"
-                        f"{len(local_state)} local position(s) but "
-                        f"exchange shows 0. Check the exchange manually."
-                    )
+                    if not bool(getattr(self, "simulation", True)):
+                        send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                            f" [{self.BOT_NAME}] Reconcile aborted!\n"
+                            f"{len(local_state)} local position(s) but "
+                            f"exchange shows 0. Check the exchange manually."
+                        )
                 except Exception:
                     pass
                 # Continue into the per-symbol 2-strike + authoritative
@@ -153,11 +154,20 @@ class FuturesReconcileMixin:
                 try:
                     from core.database import get_all_claimed_bases, _base_symbol
                     _other = get_all_claimed_bases(exclude_bot=self.BOT_NAME,
-                                                   is_futures=True)
-                    orphan_syms = {s for s in orphan_syms
-                                   if _base_symbol(s) not in _other}
+                                                   is_futures=True,
+                                                   fail_closed=True)
+                    if _other is None:
+                        log_event(
+                            " Reconciliation: claim registry unavailable; "
+                            "skipping exchange-only adoption this cycle",
+                            "WARN",
+                        )
+                        orphan_syms = set()
+                    else:
+                        orphan_syms = {s for s in orphan_syms
+                                       if _base_symbol(s) not in _other}
                 except Exception:
-                    pass
+                    orphan_syms = set()
 
             # ADOPT: a LIVE trading bot must NEVER leave a leveraged exchange
             # position unmanaged. On ANY stateexchange desync (SIM/LIVE toggle,
@@ -169,7 +179,7 @@ class FuturesReconcileMixin:
             try:
                 from core.database import try_claim_orphan, remove_open_position
             except Exception:
-                def try_claim_orphan(*a, **k): return True
+                def try_claim_orphan(*a, **k): return False
                 def remove_open_position(*a, **k): return None
             for base in sorted(orphan_syms):
                 # ATOMIC claim: SQLite serialises INSERTWHERE NOT EXISTS, so when
@@ -253,10 +263,11 @@ class FuturesReconcileMixin:
                     f"position(s)  now MANAGED (SL/Liq/Trailing) + claimed: "
                     f"{', '.join(sorted(adopted))}", "WARN")
                 try:
-                    send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                        f" [{self.BOT_NAME}] Adopted {len(adopted)} untracked "
-                        f"position(s):\n{', '.join(sorted(adopted))}\n"
-                        f"Now managed (stop-loss + liquidation protection).")
+                    if not bool(getattr(self, "simulation", True)):
+                        send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                            f" [{self.BOT_NAME}] Adopted {len(adopted)} untracked "
+                            f"position(s):\n{', '.join(sorted(adopted))}\n"
+                            f"Now managed (stop-loss + liquidation protection).")
                 except Exception as e:
                     log_event(f"Telegram failed: {e}", "WARN")
             if unadoptable:
@@ -265,10 +276,11 @@ class FuturesReconcileMixin:
                     f"could NOT be adopted (no entry/size/side)  CLOSE MANUALLY: "
                     f"{', '.join(sorted(unadoptable))}", "WARN")
                 try:
-                    send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                        f" [{self.BOT_NAME}] {len(unadoptable)} position(s) could "
-                        f"not be adopted:\n{', '.join(sorted(unadoptable))}\n"
-                        f"Close manually on the exchange.")
+                    if not bool(getattr(self, "simulation", True)):
+                        send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                            f" [{self.BOT_NAME}] {len(unadoptable)} position(s) could "
+                            f"not be adopted:\n{', '.join(sorted(unadoptable))}\n"
+                            f"Close manually on the exchange.")
                 except Exception as e:
                     log_event(f"Telegram failed: {e}", "WARN")
             if not orphan_syms:
@@ -525,12 +537,13 @@ class FuturesReconcileMixin:
                 "WARN"
             )
             try:
-                send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                    f" [{self.BOT_NAME}] Offline close detected\n"
-                    f"{sym} {pos_type}: {entry:.4f}  {close_price:.4f}\n"
-                    f"PnL: {net_pnl:+.2f} USDT\n"
-                    f"Reason: {reason}"
-                )
+                if not bool(getattr(self, "simulation", True)):
+                    send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                        f" [{self.BOT_NAME}] Offline close detected\n"
+                        f"{sym} {pos_type}: {entry:.4f}  {close_price:.4f}\n"
+                        f"PnL: {net_pnl:+.2f} USDT\n"
+                        f"Reason: {reason}"
+                    )
             except Exception:
                 pass
             return True

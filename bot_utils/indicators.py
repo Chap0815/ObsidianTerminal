@@ -5,22 +5,22 @@ WARUM nativ statt pandas_ta:
   pandas-ta 0.3.14b0 wurde von PyPI ENTFERNT. Die einzige verbleibende
   Version (0.4.71b0) zieht numpy 2.x + pandas 3.0 + numba nach  pandas 3.0
   bringt Breaking Changes, gegen die der restliche Bot nicht getestet ist.
-  Eine externe Lib, die jederzeit von PyPI verschwinden kann, ist fr einen
+  Eine externe Lib, die jederzeit von PyPI verschwinden kann, ist fuer einen
   Trading-Bot eine echte Schwachstelle.
 
 Diese vier Funktionen decken ALLES ab, was Screener + Backtester brauchen,
 in reinem pandas (vektorisiert, schnell, numpy-1.x UND 2.x, pandas-2 UND 3).
 
-FIDELITT (gegen pandas_ta verifiziert, identische Eingaben):
+FIDELITAET (gegen pandas_ta verifiziert, identische Eingaben):
   rsi  Wilder-RMA  EXAKT identisch zu df.ta.rsi(length=14)
   atr  Wilder-RMA  EXAKT identisch zu df.ta.atr(length=14)
   ema  Standard-EWM  praktisch identisch (0.1% durch Seeding)
-  macd_signal  gibt die SIGNALLINIE (MACDs) zurck. Das ist BEWUSST:
+  macd_signal  gibt die SIGNALLINIE (MACDs) zurueck. Das ist BEWUSST:
     der Altcode nahm ``df.ta.macd(...).iloc[:, -1]``  und die letzte Spalte
     von pandas_ta ist ``MACDs`` (Signallinie), NICHT das Histogramm. Die
-    Variable hie zwar "macd_hist", gefiltert wurde aber stets auf der
+    Variable hiess zwar "macd_hist", gefiltert wurde aber stets auf der
     Signallinie. Wir replizieren das 1:1, um das (validierte) Live-Verhalten
-    NICHT zu ndern. ``macd_hist()`` steht separat bereit, falls spter auf
+    NICHT zu aendern. ``macd_hist()`` steht separat bereit, falls spaeter auf
     das echte Histogramm umgestellt werden soll.
 """
 from __future__ import annotations
@@ -78,8 +78,11 @@ def macd_signal(close: pd.Series, fast: int = 12, slow: int = 26,
 
 def macd_hist(close: pd.Series, fast: int = 12, slow: int = 26,
               signal: int = 9) -> pd.Series:
-    """Echtes MACD-Histogramm (MACD  Signal). Aktuell NICHT vom Screener
-    genutzt (siehe macd_signal)  bereitgestellt fr knftige Umstellung."""
+    """True MACD histogram (MACD - signal).
+
+    Currently not used by the screener; kept for a future migration away from
+    the legacy signal-line behavior.
+    """
     macd_line, sig = _macd_lines(close, fast, slow, signal)
     return macd_line - sig
 

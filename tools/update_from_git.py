@@ -32,11 +32,14 @@ if str(ROOT) not in sys.path:
 
 try:
     from tools.ensure_git import find_git
+    from tools.release_requirements import UPDATE_SMOKE_FILES
 except ModuleNotFoundError:
     from ensure_git import find_git
+    from release_requirements import UPDATE_SMOKE_FILES
 
 CONFIG_PATH = ROOT / "config" / "update_config.json"
 CONFIG_EXAMPLE_PATH = ROOT / "config" / "update_config.example.json"
+PINNED_KNOWN_HOSTS_PATH = ROOT / "config" / "github_known_hosts"
 BACKUP_ROOT = ROOT / "backups"
 PROTECTED_FILES = [
     ".env",
@@ -51,17 +54,11 @@ CODE_DIRS = {
     "bots", "bot_utils", "config", "core", "launcher", "llm_slots",
     "news", "prompts", "tools", "trading",
 }
-LIVE_STATUSES = {"starting", "started", "ready", "running"}
+LIVE_STATUSES = {"starting", "started", "ready", "running", "degraded"}
 UPDATE_MARKER = ROOT / ".update_in_progress"
 UPDATE_SYNC_PATH = ROOT / ".update_synced.json"
 UPDATE_STATUS_PATH = ROOT / "logs" / "update_status.json"
-SMOKE_FILES = [
-    "launcher/config/settings.py",
-    "launcher/ui/app.py",
-    "tools/ensure_git.py",
-    "tools/update_check.py",
-    "tools/update_from_git.py",
-]
+SMOKE_FILES = UPDATE_SMOKE_FILES
 BLOCKED_TRACKED_PREFIXES = ("data/", "logs/", "backups/")
 SNAPSHOT_COMPLETE = ".snapshot_complete"
 
@@ -83,11 +80,18 @@ def _atomic_write_text(path: Path, text: str) -> None:
             pass
 
 
-def _write_update_status(status: str, message: str = "", *, returncode: int | None = None) -> None:
+def _write_update_status(
+    status: str,
+    message: str = "",
+    *,
+    returncode: int | None = None,
+    **fields: Any,
+) -> None:
     payload: dict[str, Any] = {
         "status": status,
         "message": message[:1200],
     }
+    payload.update({k: v for k, v in fields.items() if v is not None})
     if status == "running":
         payload["started_at"] = datetime.now().isoformat(timespec="seconds")
     else:
@@ -106,7 +110,7 @@ def _write_sync_marker(repo_url: str, branch: str) -> None:
         local = _run([git, "rev-parse", "HEAD"], check=False)
         commit = (local.stdout or "").strip() if local.returncode == 0 else ""
         payload = {
-            "repo": repo_url,
+            "repo": _redact_repo_url(repo_url),
             "branch": branch,
             "commit": commit,
             "synced_at": datetime.now().isoformat(timespec="seconds"),
@@ -131,10 +135,29 @@ def _rmtree(path: Path) -> None:
 
 def _ssh_command() -> str:
     key = Path.home() / ".ssh" / "obsidian_update_ed25519"
-    base = "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+    known_hosts = PINNED_KNOWN_HOSTS_PATH
+    base = (
+        "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "
+        f'-o UserKnownHostsFile="{known_hosts}"'
+    )
     if key.exists():
         base += f' -i "{key}" -o IdentitiesOnly=yes'
     return base
+
+
+def _redact_repo_url(repo: str) -> str:
+    text = str(repo or "").strip()
+    if "://" not in text:
+        return text
+    try:
+        parsed = urlparse(text)
+        if parsed.username or parsed.password:
+            host = parsed.hostname or ""
+            port = f":{parsed.port}" if parsed.port else ""
+            return f"{parsed.scheme}://***@{host}{port}{parsed.path}"
+    except Exception:
+        pass
+    return text
 
 
 def _hidden_kwargs() -> dict:
@@ -219,6 +242,17 @@ def _load_update_config() -> tuple[str, str]:
     return repo, branch or "main"
 
 
+def _remote_head(repo_url: str, branch: str) -> str:
+    try:
+        r = _run([_git(), "ls-remote", repo_url, f"refs/heads/{branch}"],
+                 check=False, timeout=30)
+        if r.returncode == 0:
+            return (r.stdout.split() or [""])[0]
+    except Exception:
+        pass
+    return ""
+
+
 def _is_allowed_repo_url(repo: str) -> bool:
     text = repo.strip()
     if text in {
@@ -228,6 +262,10 @@ def _is_allowed_repo_url(repo: str) -> bool:
         return True
     if text.startswith("ssh://"):
         parsed = urlparse(text)
+        if parsed.password:
+            return False
+        if parsed.username != "git":
+            return False
         host = (parsed.hostname or "").lower()
         port = parsed.port
         path = parsed.path.strip("/")
@@ -334,7 +372,7 @@ def _sha256(path: Path) -> str:
 
 
 def _backup_user_files() -> Path:
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backup = BACKUP_ROOT / f"update_{stamp}"
     for rel in PROTECTED_FILES:
         _copy_file(ROOT / rel, backup / rel)
@@ -348,7 +386,6 @@ def _stash_protected_files(backup: Path) -> dict[str, str]:
         if path.exists():
             hashes[rel] = _sha256(path)
             _copy_file(path, backup / rel)
-            path.unlink()
     return hashes
 
 
@@ -388,11 +425,18 @@ def _install_dependencies_if_present() -> None:
         [sys.executable, "-m", "pip", "install", "-r", str(req)],
         cwd=str(ROOT),
         text=True,
+        capture_output=True,
         timeout=900,
         **_hidden_kwargs(),
     )
     if r.returncode != 0:
-        raise RuntimeError("Dependency-Update fehlgeschlagen. Update wurde nicht vollstaendig abgeschlossen.")
+        out = "\n".join((r.stdout or "").splitlines()[-20:])
+        err = "\n".join((r.stderr or "").splitlines()[-20:])
+        detail = (err or out or "pip returned no output").strip()
+        raise RuntimeError(
+            "Dependency-Update fehlgeschlagen. Update wurde nicht vollstaendig abgeschlossen."
+            f"\n{detail}"
+        )
 
 
 def _write_update_marker(kind: str) -> None:
@@ -458,15 +502,58 @@ def _tracked_protected_files() -> list[str]:
     return [line.strip() for line in r.stdout.splitlines() if line.strip()]
 
 
+def _rel_posix(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(ROOT.resolve()).as_posix()
+    except ValueError:
+        return ""
+
+
+def _is_protected_file(path: Path) -> bool:
+    return _rel_posix(path) in PROTECTED_FILE_SET
+
+
+def _dir_contains_protected_file(path: Path) -> bool:
+    prefix = _rel_posix(path).rstrip("/")
+    if not prefix:
+        return False
+    return any(rel.startswith(prefix + "/") for rel in PROTECTED_FILE_SET)
+
+
+def _remove_path_preserving_protected(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_file() or path.is_symlink():
+        if _is_protected_file(path):
+            return
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    if not path.is_dir():
+        return
+    for child in list(path.iterdir()):
+        _remove_path_preserving_protected(child)
+    if not _dir_contains_protected_file(path):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+
+
 def _clean_nonprotected_code() -> None:
     for name in CODE_DIRS:
         path = ROOT / name
         if path.exists():
-            _rmtree(path)
+            _remove_path_preserving_protected(path)
     for path in ROOT.iterdir():
         if path.name in PROTECTED_DIRS or path.name == ".git":
             continue
-        if path.is_file() and path.name not in {".env", "bot_config.json"}:
+        if path.is_dir():
+            _remove_path_preserving_protected(path)
+            continue
+        if path.is_file() and not _is_protected_file(path):
             try:
                 path.unlink()
             except OSError:
@@ -646,6 +733,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true", help="Update trotz laufender Runtime-Status-Dateien versuchen.")
     parser.add_argument("--quiet", action="store_true", help="Weniger Ausgabe fuer Batch-Aufruf.")
     args = parser.parse_args(argv)
+    target_remote = ""
+    target_branch = ""
 
     try:
         if UPDATE_MARKER.exists() and not args.force:
@@ -669,17 +758,25 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         repo_url, branch = _load_update_config()
-        _print(f"Repo: {repo_url}")
+        target_branch = branch
+        target_remote = _remote_head(repo_url, branch)
+        _print(f"Repo: {_redact_repo_url(repo_url)}")
         _print(f"Branch: {branch}")
         if (ROOT / ".git").exists():
             _update_existing_repo(repo_url, branch)
         else:
             _bootstrap_from_private_repo(repo_url, branch)
         _write_sync_marker(repo_url, branch)
-        _write_update_status("success", "Update abgeschlossen", returncode=0)
+        _write_update_status(
+            "success", "Update abgeschlossen", returncode=0,
+            remote=target_remote, branch=target_branch,
+        )
         return 0
     except Exception as exc:
-        _write_update_status("failed", str(exc), returncode=1)
+        _write_update_status(
+            "failed", str(exc), returncode=1,
+            remote=target_remote or None, branch=target_branch or None,
+        )
         print(f"FEHLER: {exc}", file=sys.stderr)
         return 1
 

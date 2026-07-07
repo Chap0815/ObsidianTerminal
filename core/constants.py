@@ -29,10 +29,8 @@ LIMIT_OFFSET_PCT        = 0.05
 #  Slippage Circuit Breaker 
 MAX_SLIPPAGE_PCT        = 0.5
 MAX_SPREAD_PCT  = 0.3  # FUTURES gate  tight (Activation ~1%, eng)
-# SPOT gate: weiter als Futures  Spot-Ziele sind gro (Activation ~9%) und ein
-# pumpender Alt weitet seinen Spread genau beim Entry; 0.6% lsst legitime
-# Pump-Entries durch, hlt aber Abstand zum illiquiden Junk. Tunebar via
-# MAX_SPREAD_PCT_SPOT env.
+# SPOT gate: wider than futures. Spot targets are larger and pump entries can
+# widen spreads at exactly the entry moment. 0.6% still filters illiquid junk.
 try:
     MAX_SPREAD_PCT_SPOT = float(_os.getenv("MAX_SPREAD_PCT_SPOT", "0.6"))
 except (ValueError, TypeError):
@@ -139,16 +137,16 @@ DEFAULT_MAINT_MARGIN    = 0.01
 MIN_NOTIONAL_BUFFER     = MIN_NOTIONAL_USDT
 
 #  Reconciliation 
-# Kurzes Fenster fr das Orphan-Adoption-Sicherheitsnetz (untracked LIVE-Position).
+# Short orphan-adoption safety-net cadence for untracked live positions.
 RECONCILE_INTERVAL_SEC  = 300
 
 #  Shutdown 
 SHUTDOWN_DEADLINE_SEC   = 45.0
 
 #  Volume Thresholds 
-# Liquiditts-Untergrenze frs handelbare Universum: lsst mittelgroe Coins zu,
-# hlt aber Mikro-Cap-Schrott (dnne Bcher  hohe Slippage/Manipulation) drauen.
-# Backtest-Schwelle bewusst separat, damit Optimizer-Ergebnisse vergleichbar bleiben.
+# Liquidity floor for live universes. Keeps mid-cap coins, filters thin books
+# and micro-cap manipulation risk. Backtest threshold stays separate so
+# optimizer results remain comparable.
 MIN_VOLUME_USDT_SPOT_LIVE     = 1_250_000
 MIN_VOLUME_USDT_FUTURES_LIVE  = 400_000
 MIN_VOLUME_USDT_BACKTEST      = 750_000

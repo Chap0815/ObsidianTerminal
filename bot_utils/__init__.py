@@ -53,6 +53,8 @@ from bot_utils.futures_order import (create_order_with_retry,
                                        extract_order_fee_futures,
                                        extract_or_estimate_futures_fee,
                                        futures_contract_size,
+                                       filled_margin_usdt,
+                                       is_no_position_error,
                                        verify_position_closed,
                                        get_maintenance_margin_rate,
                                        get_exchange_liq_price)
@@ -95,7 +97,7 @@ __all__ = [
     "create_order_with_retry", "classify_order_state",
     "is_terminal_order_state", "convert_fee_to_usdt_futures",
     "extract_order_fee_futures", "extract_or_estimate_futures_fee",
-    "futures_contract_size",
+    "futures_contract_size", "filled_margin_usdt", "is_no_position_error",
     "verify_position_closed",
     "get_maintenance_margin_rate", "get_exchange_liq_price",
     # Futures funding

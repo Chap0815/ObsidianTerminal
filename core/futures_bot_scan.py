@@ -37,6 +37,7 @@ from bot_utils import (
     record_slippage,
     create_order_with_retry,
     extract_or_estimate_futures_fee,
+    filled_margin_usdt,
     get_maintenance_margin_rate,
 )
 
@@ -80,11 +81,12 @@ class FuturesScanMixin:
                     )
                     if cb_failures == self.CB_FAILURE_THRESHOLD:
                         try:
-                            send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                                f" [{self.BOT_NAME}] Circuit breaker tripped\n"
-                                f"{cb_failures} consecutive errors. "
-                                f"Check error_log.txt."
-                            )
+                            if not self.simulation:
+                                send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                                    f" [{self.BOT_NAME}] Circuit breaker tripped\n"
+                                    f"{cb_failures} consecutive errors. "
+                                    f"Check error_log.txt."
+                                )
                         except Exception:
                             pass
                     if self._shutdown_event.wait(timeout=cb_backoff):
@@ -712,6 +714,7 @@ class FuturesScanMixin:
                 # size instead of the requested one.
                 filled_raw = order.get("filled")
                 amount = float(filled_raw) if filled_raw else 0.0
+                entry_verified = amount > 0
                 if amount <= 0:
                     oid = order.get("id") or order.get("orderId")
                     if oid:
@@ -723,6 +726,7 @@ class FuturesScanMixin:
                                 rf = float((refreshed or {}).get("filled") or 0)
                                 if rf > 0:
                                     amount = rf
+                                    entry_verified = True
                                     # Realen Fill-Preis gleich mitnehmen
                                     for _k in ("average", "price"):
                                         _v = (refreshed or {}).get(_k)
@@ -775,13 +779,15 @@ class FuturesScanMixin:
                         remove_open_position(self.BOT_NAME, sym)
                         return
                     if amount > 0 and positions_verified:
+                        entry_verified = True
                         log_event(f"{sym}: entry amount verified from exchange "
                                   f"position ({amount:g} contracts)", "INFO")
                 if amount <= 0:
-                    # Nichts nachladbar  angeforderte Menge als letzter
-                    # Rckfall bei Positions-API-Ausfall: managed provisional
-                    # state is safer than an untracked live orphan.
+                    # Nothing could be reloaded. If the positions API is
+                    # unavailable, track the requested amount provisionally so a
+                    # possible live position is not left unmanaged.
                     amount = float(amount_contracts)
+                    entry_verified = False
 
                 #  POST-OPEN VERIFICATION 
                 # Check against REALITY: after the fill, compute the true
@@ -1053,26 +1059,24 @@ class FuturesScanMixin:
             news, ans
         )
 
-        # Actual margin. PRIMARY source = margin_usdt (the intended margin we
-        # actually sized the order from). Re-deriving margin via
-        # (amount * fill_price)/leverage ignores contractSize and produces
-        # wrong values for contract_size != 1 coins; the real exchange order is
-        # sized from margin_usdt, so trust it.
+        # Actual margin from the filled position. A partial entry fill must not
+        # keep the intended margin, otherwise open PnL and risk gates scale too
+        # high. ContractSize matters for MEXC-style swap contracts.
         _csize = self._get_contract_size(symbol_full)
-        # contract_size-aware notional, only used as a sanity cross-check
-        raw_margin = (amount * _csize * fill_price) / max(leverage, 1)
-        if margin_usdt and margin_usdt > 0:
-            actual_margin = round(float(margin_usdt), 4)
-            # If the recompute wildly disagrees, log it  signals a sizing or
-            # contract_size problem rather than silently storing a bad number.
-            if raw_margin > 0 and (raw_margin > margin_usdt * 3
-                                   or raw_margin < margin_usdt / 3):
-                log_event(
-                    f"{sym}: margin mismatch  intended {margin_usdt:.2f} vs "
-                    f"recomputed {raw_margin:.2f} (contract_size={_csize}); "
-                    f"storing intended", "WARN")
-        else:
-            actual_margin = round(raw_margin, 6)
+        raw_margin, margin_from_fill = filled_margin_usdt(
+            amount, _csize, fill_price, leverage, margin_usdt)
+        actual_margin = round(float(raw_margin), 6)
+        try:
+            if margin_from_fill and margin_usdt and margin_usdt > 0:
+                fill_ratio = actual_margin / max(float(margin_usdt), 1e-9)
+                if fill_ratio < 0.90 or fill_ratio > 1.10:
+                    log_event(
+                        f"{sym}: entry margin adjusted from fill "
+                        f"{margin_usdt:.2f} -> {actual_margin:.2f} USDT "
+                        f"(filled={amount:g}, contract_size={_csize})",
+                        "INFO")
+        except Exception:
+            pass
 
         trade_data = {
             "position_type": direction,
@@ -1098,7 +1102,7 @@ class FuturesScanMixin:
             "partial_sold": False,
             "break_even": False,
             "be_active": False,
-            "provisional": False,  # explicit clear
+            "provisional": not entry_verified,
         }
         # Merge instead of replace: update_many keeps monitor-set fields that
         # the Monitor-Thread may have written between the provisional add and
@@ -1127,20 +1131,24 @@ class FuturesScanMixin:
                 fallback=bool(analysis_is_keyword or (veto_only and ans is None)),
                 rationale=parse_rationale(ans) if ans is not None else "",
                 leverage=int(leverage), entry=float(fill_price),
-                margin_usdt=float(margin_usdt), sim=bool(self.simulation),
+                margin_usdt=float(actual_margin),
+                intended_margin_usdt=float(margin_usdt),
+                sim=bool(self.simulation),
             )
         except Exception:
             pass
 
         try:
-            send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                f"[{self.BOT_NAME}] {direction} {sym} @ {leverage}x\n"
-                f"Entry: {fill_price:.6f} USDT\n"
-                f"Margin: {margin_usdt:.2f} USDT (Notional: {margin_usdt*leverage:.2f})\n"
-                f"Liq: {liq_price:.6f} (Buffer: {self.C('LIQ_SAFETY_PCT')}%)\n"
-                f"BE-Trigger: +{self.C('BREAKEVEN_TRIGGER')}% | "
-                f"RSI: 15m {r['rsi_15m']:.1f}|1h {r['rsi_1h']:.1f}|4h {r['rsi_4h']:.1f}"
-            )
+            if not self.simulation:
+                send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                    f"[{self.BOT_NAME}] {direction} {sym} @ {leverage}x\n"
+                    f"Entry: {fill_price:.6f} USDT\n"
+                    f"Margin: {actual_margin:.2f} USDT "
+                    f"(Notional: {actual_margin*leverage:.2f})\n"
+                    f"Liq: {liq_price:.6f} (Buffer: {self.C('LIQ_SAFETY_PCT')}%)\n"
+                    f"BE-Trigger: +{self.C('BREAKEVEN_TRIGGER')}% | "
+                    f"RSI: 15m {r['rsi_15m']:.1f}|1h {r['rsi_1h']:.1f}|4h {r['rsi_4h']:.1f}"
+                )
         except Exception as e:
             log_event(f"Telegram failed: {e}", "WARN")
 

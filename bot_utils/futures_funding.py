@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import threading
 import time
+import os
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
@@ -18,9 +19,11 @@ from bot_utils.api_budget import record_api_call
 
 
 def _budget_ok(endpoint: str) -> bool:
-    """Atomares, prozessbergreifendes Budget-Gate (prft UND zhlt in einer
-    SQLite-Transaktion). True = Call darf erfolgen. Fllt das Budget-Modul aus,
-    wird nicht blockiert (best-effort record + True)."""
+    """Atomic process-wide API budget gate.
+
+    True means the call is allowed. If the budget module fails, do not block;
+    record best-effort and allow the call.
+    """
     try:
         from bot_utils.api_budget import try_consume_api_call
         return bool(try_consume_api_call(endpoint))
@@ -125,17 +128,58 @@ def fetch_realized_funding(ex,
         if not callable(fn):
             return None
 
-    # Atomares Budget-Gate. Bei erschpftem Budget: None  Caller fllt auf
-    # Schtzung/State zurck.
-    if not _budget_ok("fetch_funding_history"):
-        return None
     try:
-        history = fn(symbol_full, since=since_ms, limit=50) or []
-    except Exception:
-        return None
+        max_pages = int(os.getenv("FUNDING_HISTORY_MAX_PAGES", "10"))
+        max_pages = min(max(max_pages, 1), 50)
+    except (TypeError, ValueError):
+        max_pages = 10
 
-    if not isinstance(history, list):
-        return None
+    history: list = []
+    next_since = since_ms
+    seen_keys = set()
+    for _page in range(max_pages):
+        # Atomic budget gate. If exhausted, return None and let the caller fall
+        # back to state/estimates instead of returning a partial sum.
+        if not _budget_ok("fetch_funding_history"):
+            return None
+        try:
+            page = fn(symbol_full, since=next_since, limit=50) or []
+        except Exception:
+            return None
+        if not isinstance(page, list):
+            return None
+        if not page:
+            break
+
+        added = 0
+        max_ts = next_since
+        for h in page:
+            if not isinstance(h, dict):
+                continue
+            ts = h.get("timestamp")
+            try:
+                ts_i = int(ts) if ts is not None else None
+            except (TypeError, ValueError):
+                ts_i = None
+            info = h.get("info") if isinstance(h.get("info"), dict) else {}
+            key = h.get("id") or info.get("id")
+            dedupe = key or (
+                ts_i,
+                h.get("amount"),
+                h.get("symbol") or symbol_full,
+            )
+            if dedupe in seen_keys:
+                continue
+            seen_keys.add(dedupe)
+            history.append(h)
+            added += 1
+            if ts_i is not None:
+                max_ts = max(max_ts, ts_i)
+
+        if added == 0 or len(page) < 50 or max_ts <= next_since:
+            break
+        next_since = max_ts + 1
+
     total = 0.0
     for h in history:
         try:

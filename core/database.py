@@ -50,13 +50,10 @@ def _utcnow_str() -> str:
 
 
 def _local_today_str() -> str:
-    """'Heute' fr den Tages-PnL/Killswitch-Bucket  in derselben Zeitzone wie
-    die Bad-Hour-Logik (``BOT_TIMEZONE``), damit tglicher Verlust-Reset und
-    Bad-Hours denselben Kalendertag meinen.
+    """Local date key for daily PnL and kill-switch buckets.
 
-    Die buy_time/sell_time-Strings bleiben UTC; nur der daily_pnl-Schlssel und
-    die Lern-Felder hour_of_day/day_of_week (siehe ``_local_hour_dow``) folgen
-    der lokalen Zeit. TZ-Auflsung fehlgeschlagen  Fallback auf UTC.
+    buy_time/sell_time stay UTC. Only daily_pnl plus learning fields
+    hour_of_day/day_of_week follow BOT_TIMEZONE. Falls back to UTC.
     """
     tz_name = os.getenv("BOT_TIMEZONE", "UTC")
     try:
@@ -137,11 +134,10 @@ def opened_today_local(buy_time_utc_str) -> bool:
 
 
 def _local_hour_dow(utc_str: str):
-    """hour_of_day/day_of_week in LOKALER Zeit (BOT_TIMEZONE), konsistent mit
-    ``is_bad_hour()`` / ``_get_local_hour()`` im risk_manager: buy_time wird als
-    UTC interpretiert und in die lokale Zeit konvertiert, damit gelernte
-    'schlechte Stunden' und die Live-Sperr-Prfung denselben Bezug haben.
-    TZ-Auflsung fehlgeschlagen  UTC.
+    """hour_of_day/day_of_week in BOT_TIMEZONE.
+
+    buy_time is interpreted as UTC, then converted so learned bad hours and the
+    live bad-hour gate use the same calendar basis. Falls back to UTC.
     """
     dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(
         tzinfo=timezone.utc)
@@ -400,16 +396,20 @@ def _ensure_advisory_locks_table(conn) -> None:
     conn.commit()
 
 
+_AUTO_TRANSIENT_CLAIM_TTL_MINUTES = 30
+
+
 def _purge_junk_claims(conn) -> None:
     """One-shot startup cleanup of the claims registry:
       market-shaped bot_name ("X/USDT:USDT") = swapped-arg junk  delete
-      CLAIMING/ADOPTING placeholders older than 5 min = leaked transients
+      old empty CLAIMING/ADOPTING placeholders = leaked transients
         (a real open upgrades to state='OPEN' within seconds)."""
     try:
         conn.execute("DELETE FROM bot_open_positions "
                      "WHERE bot_name LIKE '%/%' OR bot_name LIKE '%:%'")
-        cutoff = (_utcnow() - timedelta(minutes=5)).strftime(
-            "%Y-%m-%d %H:%M:%S")
+        cutoff = (
+            _utcnow() - timedelta(minutes=_AUTO_TRANSIENT_CLAIM_TTL_MINUTES)
+        ).strftime("%Y-%m-%d %H:%M:%S")
         conn.execute("DELETE FROM bot_open_positions "
                      "WHERE state IN ('CLAIMING','ADOPTING') "
                      "AND COALESCE(amount, 0) <= 0 "
@@ -1037,6 +1037,23 @@ def save_trade_db(
 
     conn = get_connection()
     try:
+        if not is_partial:
+            existing_final = conn.execute("""
+            SELECT 1 FROM trades
+             WHERE bot_name = ?
+               AND symbol = ?
+               AND buy_time = ?
+               AND COALESCE(is_partial, 0) = 0
+               AND COALESCE(is_futures, 0) = ?
+             LIMIT 1
+            """, (
+                bot_name, symbol, buy_time,
+                1 if is_futures else 0,
+            )).fetchone()
+            if existing_final:
+                conn.commit()
+                return True
+
         cur = conn.execute("""
         INSERT OR IGNORE INTO trades
             (bot_name, symbol, buy_price, sell_price, buy_time, sell_time,
@@ -1765,21 +1782,48 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
                          invested_usdt, position_type="SPOT", leverage=1.0,
                          state="OPEN", rsi_15m=None, rsi_1h=None, rsi_4h=None,
                          change_pct=None, btc_trend=None, fear_greed=None,
-                         extra: dict = None) -> None:
-    """opened_at wird bei UPDATE NICHT berschrieben."""
+                         extra: dict = None) -> bool:
+    """Upsert one open-position mirror row.
+
+    Returns True when the row was written or updated. Returns False when a
+    same-base/same-market owner already exists or SQLite failed. New rows are
+    guarded under BEGIN IMMEDIATE so resync/direct mirror writes cannot race
+    another bot's claim check.
+    """
     conn = get_connection()
     try:
         state_norm = str(state or "OPEN").upper()
+        safe_buy = _sanitize_float(buy_price)
+        safe_amount = _sanitize_float(amount)
+        safe_invested = _sanitize_float(invested_usdt)
+        safe_leverage = _sanitize_float(leverage, 1.0)
+        opened_at = _utcnow_str()
+
+        conn.execute("BEGIN IMMEDIATE")
         if state_norm not in {"CLOSED", "FLAT"}:
-            is_futures = str(position_type or "").upper() != "SPOT"
-            if is_claimed_by_other(symbol, bot_name, is_futures=is_futures):
+            base = _base_symbol(symbol)
+            class_clause = (
+                "position_type != 'SPOT'"
+                if _is_futures_ptype(position_type)
+                else "position_type = 'SPOT'"
+            )
+            conflict = conn.execute(
+                f"""SELECT bot_name FROM bot_open_positions
+                    WHERE bot_name != ?
+                      AND (symbol = ? OR symbol LIKE ? OR symbol LIKE ?)
+                      AND {class_clause}
+                    LIMIT 1""",
+                (bot_name, base, f"{base}/%", f"{base}:%"),
+            ).fetchone()
+            if conflict is not None:
                 from core.logger import log_event, log_struct
                 log_event(
                     f"[DB] upsert_open_position blocked: {symbol} "
                     f"already owned by another bot", "WARN")
                 log_struct("db_upsert_position_blocked", bot_name=bot_name,
                            symbol=symbol, position_type=position_type)
-                return
+                conn.execute("ROLLBACK")
+                return False
         conn.execute("""
         INSERT INTO bot_open_positions
             (bot_name, symbol, buy_price, buy_time, amount, invested_usdt,
@@ -1793,7 +1837,8 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
             -- buy_price=0, leverage=1, buy_time='' BEFORE the order fills. Omitting
             -- them left the registry mirror permanently at buy_price=0/leverage=1,
             -- so crash-recovery rehydrate (reads buy_price from this table) got
-            -- buy=0  rejected  the live position ran unmanaged. CASE-guards keep
+            -- buy=0 and rejected the row; the live position ran unmanaged.
+            -- CASE-guards keep
             -- a later partial/reconcile upsert from clobbering a real value with 0.
             buy_price     = CASE WHEN excluded.buy_price > 0
                                  THEN excluded.buy_price ELSE buy_price END,
@@ -1805,15 +1850,16 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
             invested_usdt = excluded.invested_usdt,
             state         = excluded.state,
             extra_json    = excluded.extra_json
-            -- opened_at NICHT berschrieben
+            -- Keep opened_at stable.
             """, (
-            bot_name, symbol, _sanitize_float(buy_price), buy_time,
-            _sanitize_float(amount), _sanitize_float(invested_usdt),
-            position_type, _sanitize_float(leverage, 1.0), state,
+            bot_name, symbol, safe_buy, buy_time,
+            safe_amount, safe_invested,
+            position_type, safe_leverage, state,
             rsi_15m, rsi_1h, rsi_4h, change_pct, btc_trend, fear_greed,
-            json.dumps(extra or {}, allow_nan=False, default=str), _utcnow_str(),
+            json.dumps(extra or {}, allow_nan=False, default=str), opened_at,
         ))
         conn.commit()
+        return True
     except Exception as e:
         # This SQLite table is a MIRROR  the live position truth is the JSON
         # store (atomic_save_json), so a failure here does not strand the
@@ -1832,6 +1878,7 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
             conn.rollback()
         except Exception:
             pass
+        return False
 
 
 def remove_open_position(bot_name: str, symbol: str) -> bool:
@@ -1892,12 +1939,13 @@ def _is_futures_ptype(position_type) -> bool:
     return str(position_type or "SPOT").upper() != "SPOT"
 
 
-def get_all_claimed_bases(exclude_bot: str = None, is_futures=None) -> set:
+def get_all_claimed_bases(exclude_bot: str = None, is_futures=None,
+                          fail_closed: bool = False):
     """Set of base coins currently held by ANY bot (optionally excluding one).
     For reconcile: an exchange position in NO bot's claims is a TRUE orphan.
     Pass is_futures to count only same-class (spot/futures) claims."""
-    conn = get_connection()
     try:
+        conn = get_connection()
         if exclude_bot:
             rows = conn.execute(
                 "SELECT symbol, position_type FROM bot_open_positions WHERE bot_name != ?",
@@ -1905,7 +1953,14 @@ def get_all_claimed_bases(exclude_bot: str = None, is_futures=None) -> set:
         else:
             rows = conn.execute(
                 "SELECT symbol, position_type FROM bot_open_positions").fetchall()
-    except Exception:
+    except Exception as e:
+        if fail_closed:
+            try:
+                from core.logger import log_event
+                log_event(f"[claims] registry unavailable: {e}", "WARN")
+            except Exception:
+                pass
+            return None
         return set()
     out = set()
     for r in rows:
@@ -1924,13 +1979,19 @@ def is_claimed_by_other(symbol: str, bot_name: str, is_futures=None) -> bool:
     base = _base_symbol(symbol)
     if not base:
         return False
-    conn = get_connection()
     try:
+        conn = get_connection()
         rows = conn.execute(
             "SELECT symbol, position_type FROM bot_open_positions WHERE bot_name != ?",
             (bot_name,)).fetchall()
-    except Exception:
-        return False
+    except Exception as e:
+        try:
+            from core.logger import log_event
+            log_event(f"[claims] entry gate fail-closed for {symbol}: {e}",
+                      "WARN")
+        except Exception:
+            pass
+        return True
     for r in rows:
         d = dict(r)
         if _base_symbol(d.get("symbol")) != base:
@@ -1980,8 +2041,8 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
     # wallets, so a spot claim must not block a futures claim of the same base.
     class_clause = ("position_type != 'SPOT'" if _is_futures_ptype(position_type)
                     else "position_type = 'SPOT'")
-    conn = get_connection()
     try:
+        conn = get_connection()
         if allow_existing_owner:
             rows = conn.execute(
                 f"""SELECT bot_name FROM bot_open_positions

@@ -17,13 +17,33 @@ from __future__ import annotations
 import os
 import sys
 import time
-import traceback
 
 
 def _hdr(text: str) -> None:
-    print(f"\n{'' * 60}")
+    print(f"\n{'=' * 60}")
     print(f"  {text}")
-    print(f"{'' * 60}")
+    print(f"{'=' * 60}")
+
+
+def _redact_text(text: str) -> str:
+    try:
+        from core.logger import redact
+        return redact(text)
+    except Exception:
+        return text
+
+
+def _safe_exc(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {_redact_text(str(exc))}"
+
+
+def _mask_chat_ids(raw: str) -> str:
+    ids = str(raw or "").replace(";", " ").replace(",", " ").split()
+    masked = []
+    for cid in ids:
+        text = str(cid)
+        masked.append("***" + text[-4:] if len(text) > 4 else "***")
+    return ", ".join(masked)
 
 
 def _check_spot() -> int:
@@ -53,8 +73,7 @@ def _check_spot() -> int:
         print(f"  fetch_ohlcv: {len(bars)} bars in {int((time.time()-t0)*1000)} ms")
         return 0
     except Exception as e:
-        print(f"  Spot connection FAILED: {type(e).__name__}: {e}")
-        traceback.print_exc(limit=2)
+        print(f"  Spot connection FAILED: {_safe_exc(e)}")
         return 1
 
 
@@ -82,10 +101,10 @@ def _check_futures() -> int:
             pos = ex.fetch_positions(["BTC/USDT:USDT"])
             print(f"  fetch_positions: {len(pos)} entries")
         except Exception as e:
-            print(f"  fetch_positions: {type(e).__name__} (non-fatal)")
+            print(f"  fetch_positions: {_safe_exc(e)} (non-fatal)")
         return 0
     except Exception as e:
-        print(f"  Futures connection FAILED: {type(e).__name__}: {e}")
+        print(f"  Futures connection FAILED: {_safe_exc(e)}")
         return 1
 
 
@@ -104,7 +123,7 @@ def _check_market_data() -> int:
         print(f"  Fear & Greed:  {fg}")
         return 0
     except Exception as e:
-        print(f"  Market data FAILED: {type(e).__name__}: {e}")
+        print(f"  Market data FAILED: {_safe_exc(e)}")
         return 1
 
 
@@ -117,8 +136,7 @@ def _check_database() -> int:
         print(f"  Database initialised: {DB_PATH} ({size/1024:.1f} KB)")
         return 0
     except Exception as e:
-        print(f"  Database init FAILED: {type(e).__name__}: {e}")
-        traceback.print_exc(limit=2)
+        print(f"  Database init FAILED: {_safe_exc(e)}")
         return 1
 
 
@@ -142,7 +160,7 @@ def _check_llm() -> int:
         )
         return 0   # non-fatal
     except Exception as e:
-        print(f"  LLM check error: {type(e).__name__}: {e} (non-fatal)")
+        print(f"  LLM check error: {_safe_exc(e)} (non-fatal)")
         return 0
 
 
@@ -158,10 +176,10 @@ def _check_telegram() -> int:
             print("  TELEGRAM_TOKEN format unusual  expected `<id>:<secret>`")
         else:
             print(f"  TELEGRAM_TOKEN configured (id={TELEGRAM_TOKEN.split(':')[0]})")
-        print(f"  TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID}")
+        print(f"  TELEGRAM_CHAT_ID: {_mask_chat_ids(TELEGRAM_CHAT_ID)}")
         return 0
     except Exception as e:
-        print(f"  Telegram check error: {type(e).__name__}: {e}")
+        print(f"  Telegram check error: {_safe_exc(e)}")
         return 0
 
 
@@ -178,7 +196,7 @@ def main() -> int:
     failures += _check_llm()
     failures += _check_telegram()
 
-    print(f"\n{'' * 60}")
+    print(f"\n{'=' * 60}")
     if failures == 0:
         print("  ALL CRITICAL CHECKS PASSED")
     else:
@@ -188,7 +206,7 @@ def main() -> int:
         print("  API_KEY / API_SECRET wrong or expired")
         print("  API_PASSPHRASE missing (Bitget/OKX/KuCoin)")
         print("  Network connectivity issues")
-    print(f"{'' * 60}\n")
+    print(f"{'=' * 60}\n")
     return failures
 
 

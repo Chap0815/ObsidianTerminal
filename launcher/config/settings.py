@@ -15,6 +15,7 @@ import sys
 import subprocess
 import threading       # tmp filename uses get_ident()
 import time            # retry sleep between os.replace attempts
+from contextlib import contextmanager
 from tkinter import font as tkfont
 
 
@@ -631,23 +632,45 @@ def _safe_display_font() -> str:
 
 #  Config IO 
 
+def effective_default_config() -> dict:
+    """Return the user-facing default config.
+
+    ``DEFAULT_CONFIG`` is the in-code safety fallback used when the packaged
+    default file is missing or broken. ``bot_config.default.json`` is the
+    release/user default and must drive first-run creation and Reset buttons so
+    both paths restore the same values.
+    """
+    if not os.path.exists(DEFAULT_CONFIG_FILE):
+        return json.loads(json.dumps(DEFAULT_CONFIG))
+    try:
+        with open(DEFAULT_CONFIG_FILE, encoding="utf-8-sig") as f:
+            candidate = json.load(f)
+    except Exception:
+        return json.loads(json.dumps(DEFAULT_CONFIG))
+    if not isinstance(candidate, dict):
+        return json.loads(json.dumps(DEFAULT_CONFIG))
+    cfg = json.loads(json.dumps(candidate))
+    for section, defaults in DEFAULT_CONFIG.items():
+        value = candidate.get(section)
+        if isinstance(defaults, dict):
+            merged = dict(defaults)
+            if isinstance(value, dict):
+                merged.update(value)
+            cfg[section] = merged
+        elif section not in cfg:
+            cfg[section] = defaults
+    return cfg
+
 def load_config() -> dict:
     """Load ``bot_config.json``, filling in any missing keys from
     :data:`DEFAULT_CONFIG`. Creates the file on first run."""
+    defaults_cfg = effective_default_config()
     if not os.path.exists(CONFIG_FILE):
-        cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-        if os.path.exists(DEFAULT_CONFIG_FILE):
-            try:
-                with open(DEFAULT_CONFIG_FILE, encoding="utf-8-sig") as f:
-                    candidate = json.load(f)
-                if isinstance(candidate, dict):
-                    cfg = candidate
-            except Exception:
-                cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+        cfg = json.loads(json.dumps(defaults_cfg))
         save_config(cfg)
         return json.loads(json.dumps(cfg))
     try:
-        with open(CONFIG_FILE, encoding="utf-8") as f:
+        with open(CONFIG_FILE, encoding="utf-8-sig") as f:
             cfg = json.load(f)
     except Exception as e:
         raise RuntimeError(
@@ -655,7 +678,10 @@ def load_config() -> dict:
             "Refusing to replace it with defaults."
         ) from e
     # Fill missing keys from defaults
-    for bot, defaults in DEFAULT_CONFIG.items():
+    for bot, defaults in defaults_cfg.items():
+        if not isinstance(defaults, dict):
+            cfg.setdefault(bot, defaults)
+            continue
         if bot not in cfg:
             cfg[bot] = dict(defaults)
         else:
@@ -663,10 +689,10 @@ def load_config() -> dict:
                 cfg[bot].setdefault(k, v)
     # UI defaults
     if "UI" not in cfg:
-        cfg["UI"] = dict(DEFAULT_CONFIG["UI"])
+        cfg["UI"] = dict(defaults_cfg["UI"])
     else:
-        cfg["UI"].setdefault("VISIBLE_BOTS", list(BOT_ORDER))
-        cfg["UI"].setdefault("COLLAPSED_BOTS", [])
+        for k, v in defaults_cfg["UI"].items():
+            cfg["UI"].setdefault(k, v)
     return cfg
 
 
@@ -701,20 +727,25 @@ def _config_diff(old: dict, new: dict) -> dict:
     return diff
 
 
-def _write_config_audit(new_cfg: dict) -> None:
+def _read_config_for_audit() -> dict:
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, encoding="utf-8-sig") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _write_config_audit(new_cfg: dict, previous_cfg: dict | None = None) -> None:
     """Append a compact record of what changed vs the previous on-disk config.
 
     Best-effort and append-only  never raises, never blocks save_config.
     Secret-looking values are redacted before writing.
     """
     try:
-        prev: dict = {}
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, encoding="utf-8") as f:
-                    prev = json.load(f)
-            except Exception:
-                prev = {}
+        prev = previous_cfg if isinstance(previous_cfg, dict) else _read_config_for_audit()
         diff = _config_diff(prev, new_cfg)
         if not diff:
             return
@@ -763,6 +794,69 @@ def audit_event(source: str, **fields) -> None:
 
 
 _CONFIG_WRITE_LOCK = threading.RLock()
+_CONFIG_PROCESS_LOCK = CONFIG_FILE + ".lock"
+_CONFIG_PROCESS_LOCK_STATE = threading.local()
+
+
+@contextmanager
+def _config_process_lock(timeout_s: float = 10.0):
+    """Serialize config read-modify-write across launcher/tool processes."""
+    depth = getattr(_CONFIG_PROCESS_LOCK_STATE, "depth", 0)
+    if depth:
+        _CONFIG_PROCESS_LOCK_STATE.depth = depth + 1
+        try:
+            yield
+        finally:
+            _CONFIG_PROCESS_LOCK_STATE.depth = depth
+        return
+
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    fh = open(_CONFIG_PROCESS_LOCK, "a+b")
+    locked = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if fh.seek(0, os.SEEK_END) == 0:
+                fh.write(b"\0")
+                fh.flush()
+            deadline = time.monotonic() + timeout_s
+            while True:
+                try:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Timed out waiting for bot_config.json lock")
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            deadline = time.monotonic() + timeout_s
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Timed out waiting for bot_config.json lock")
+                    time.sleep(0.05)
+        _CONFIG_PROCESS_LOCK_STATE.depth = 1
+        yield
+    finally:
+        _CONFIG_PROCESS_LOCK_STATE.depth = 0
+        try:
+            if locked:
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
 
 
 def save_config(cfg: dict) -> None:
@@ -776,11 +870,12 @@ def save_config(cfg: dict) -> None:
     (best-effort, before the overwrite so the diff is accurate).
     """
     with _CONFIG_WRITE_LOCK:
-        _save_config_unlocked(cfg)
+        with _config_process_lock():
+            _save_config_unlocked(cfg)
 
 
 def _save_config_unlocked(cfg: dict) -> None:
-    _write_config_audit(cfg)
+    previous_cfg = _read_config_for_audit()
     try:
         tmp = f"{CONFIG_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -807,6 +902,7 @@ def _save_config_unlocked(cfg: dict) -> None:
             except OSError:
                 pass
             raise last_err
+        _write_config_audit(cfg, previous_cfg=previous_cfg)
     except Exception as e:
         try:
             from bot_utils.silent_log import silent_log
@@ -833,20 +929,21 @@ def save_config_merge(section_updates: dict | None = None,
     section_updates = section_updates or {}
     section_replacements = section_replacements or {}
     with _CONFIG_WRITE_LOCK:
-        cfg = load_config()
-        for section, value in section_replacements.items():
-            cfg[section] = dict(value) if isinstance(value, dict) else value
-        for section, values in section_updates.items():
-            if isinstance(values, dict):
-                cur = cfg.get(section)
-                if not isinstance(cur, dict):
-                    cur = {}
-                cur.update(values)
-                cfg[section] = cur
-            else:
-                cfg[section] = values
-        _save_config_unlocked(cfg)
-        return cfg
+        with _config_process_lock():
+            cfg = load_config()
+            for section, value in section_replacements.items():
+                cfg[section] = dict(value) if isinstance(value, dict) else value
+            for section, values in section_updates.items():
+                if isinstance(values, dict):
+                    cur = cfg.get(section)
+                    if not isinstance(cur, dict):
+                        cur = {}
+                    cur.update(values)
+                    cfg[section] = cur
+                else:
+                    cfg[section] = values
+            _save_config_unlocked(cfg)
+            return cfg
 
 
 #  Misc shared subprocess kwargs 

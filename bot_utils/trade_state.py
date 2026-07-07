@@ -30,6 +30,13 @@ _CLAIM_FIELDS = frozenset((
     "leverage", "position_type", "buy_time",
 ))
 
+_CLAIM_EXTRA_FIELDS = frozenset((
+    "original_amount", "initial_entry_fee", "fees_paid", "funding_paid",
+    "funding_booked_on_partials", "partial_sold", "break_even", "be_active",
+    "be_price", "highest", "last_price", "liquidation_price",
+    "initial_liq_distance", "margin_mode", "accounting_pending_partials",
+))
+
 
 class TradeState:
     """Thread-safe wrapper around the trades dict + persistence.
@@ -78,12 +85,14 @@ class TradeState:
     # full close, emergency close, reconcile removal  keeps the registry in
     # sync from ONE place (no per-call-site patchwork).
 
-    def _registry_upsert(self, sym: str, data: dict) -> None:
+    def _registry_upsert(self, sym: str, data: dict) -> bool:
         if not self._bot_name:
-            return
+            return True
         try:
             from core.database import upsert_open_position
-            upsert_open_position(
+            extra = {k: copy.deepcopy(data.get(k))
+                     for k in _CLAIM_EXTRA_FIELDS if k in data}
+            ok = upsert_open_position(
                 bot_name=self._bot_name, symbol=sym,
                 buy_price=float(data.get("buy_price") or data.get("buy") or 0),
                 buy_time=data.get("buy_time") or "",
@@ -93,20 +102,48 @@ class TradeState:
                                        "FUTURES" if self._is_futures else "SPOT"),
                 leverage=float(data.get("leverage") or 1),
                 state="OPEN",
+                extra=extra,
             )
+            if not ok:
+                self._log_registry_warning(
+                    f"upsert failed or blocked for {self._bot_name}:{sym}"
+                )
+            return bool(ok)
         except Exception:
             # Registry is a coordination mirror, never the position truth
             # (trades.json is). A failure here must never break a trade.
-            pass
+            self._log_registry_warning(
+                f"upsert raised for {self._bot_name}:{sym}"
+            )
+            return False
 
-    def _registry_remove(self, sym: str) -> None:
+    def _registry_remove(self, sym: str) -> bool:
         if not self._bot_name:
-            return
+            return True
         try:
             from core.database import remove_open_position
-            remove_open_position(self._bot_name, sym)
+            ok = remove_open_position(self._bot_name, sym)
+            if not ok:
+                self._log_registry_warning(
+                    f"remove failed for {self._bot_name}:{sym}"
+                )
+            return bool(ok)
         except Exception:
-            pass
+            self._log_registry_warning(
+                f"remove raised for {self._bot_name}:{sym}"
+            )
+            return False
+
+    def _log_registry_warning(self, msg: str) -> None:
+        try:
+            from core.logger import log_event
+            log_event(f"[TradeState] registry mirror warning: {msg}", "WARN")
+        except Exception:
+            try:
+                from bot_utils.silent_log import silent_log
+                silent_log("TradeState registry mirror", RuntimeError(msg))
+            except Exception:
+                pass
 
     def _resync_registry(self, clean: Dict[str, Dict[str, Any]]) -> None:
         """Re-claim locally loaded positions at startup.
@@ -118,8 +155,42 @@ class TradeState:
         """
         if not self._bot_name:
             return
+        conflicted = []
         for sym, data in clean.items():
-            self._registry_upsert(sym, data)
+            if self._registry_upsert(sym, data):
+                continue
+            try:
+                from core.database import get_all_claimed_bases, _base_symbol
+                claimed = get_all_claimed_bases(
+                    exclude_bot=self._bot_name,
+                    is_futures=self._is_futures,
+                    fail_closed=True,
+                )
+                if claimed is None:
+                    self._log_registry_warning(
+                        f"startup resync kept {self._bot_name}:{sym}; "
+                        f"registry unavailable"
+                    )
+                    continue
+                claimed_elsewhere = _base_symbol(sym) in claimed
+            except Exception:
+                claimed_elsewhere = False
+            if claimed_elsewhere:
+                conflicted.append(sym)
+                self._log_registry_warning(
+                    f"startup resync kept {self._bot_name}:{sym} fail-closed; "
+                    f"registry says another bot owns it"
+                )
+        if conflicted:
+            with self._lock:
+                for sym in conflicted:
+                    if sym in self._trades:
+                        self._trades[sym]["claim_conflict"] = True
+                        self._trades[sym]["claim_conflict_reason"] = (
+                            "registry_owner_conflict_on_startup"
+                        )
+                snapshot = copy.deepcopy(self._trades)
+            atomic_save_json(self._db_file, snapshot)
 
     #  Reads (always return deep copies) 
 
@@ -239,9 +310,10 @@ class TradeState:
     def remove(self, sym: str) -> None:
         """Remove a trade. No-op if symbol missing."""
         snapshot = None
+        removed = None
         with self._lock:
             if sym in self._trades:
-                del self._trades[sym]
+                removed = self._trades.pop(sym)
                 snapshot = copy.deepcopy(self._trades)  # true deep-copy
         if snapshot is not None:
             persisted = atomic_save_json(self._db_file, snapshot)
@@ -249,6 +321,9 @@ class TradeState:
                 # Release the claim so other bots can trade this coin again.
                 self._registry_remove(sym)
             else:
+                with self._lock:
+                    if sym not in self._trades and removed is not None:
+                        self._trades[sym] = removed
                 try:
                     from bot_utils.silent_log import silent_log
                     silent_log(

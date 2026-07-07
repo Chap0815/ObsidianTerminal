@@ -135,6 +135,55 @@ def _filled_base_amount(order, wrapper_sold, requested_amount: float) -> float:
     return 0.0
 
 
+def _apply_state_updates(state, sym: str, updates: dict) -> None:
+    if hasattr(state, "update_many"):
+        state.update_many(sym, updates)
+    else:
+        for key, value in updates.items():
+            state.update(sym, key, value)
+
+
+def _emergency_residual_amount(ex, symbol_pair: str, requested_amount: float,
+                               sold_amount: float, fill_price: float) -> float:
+    requested = max(0.0, float(requested_amount or 0.0))
+    sold = max(0.0, float(sold_amount or 0.0))
+    by_fill = max(0.0, requested - sold)
+    if by_fill <= 0 or fill_price <= 0:
+        return 0.0
+    try:
+        free = _free_base_balance(ex, symbol_pair)
+    except Exception:
+        free = None
+    residual = by_fill
+    if free is not None and free >= 0:
+        residual = min(residual, float(free))
+    if residual * fill_price <= _EMERGENCY_RESIDUAL_DUST_USDT:
+        return 0.0
+    return min(residual, requested)
+
+
+def _emergency_residual_updates(amount: float, residual_amount: float,
+                                margin: float, initial_entry_fee: float,
+                                proportional_entry_fee: float, exch_oid,
+                                reason: str) -> dict:
+    remaining_invested = (
+        margin * (residual_amount / amount)
+        if amount > 0 else 0.0
+    )
+    remaining_entry_fee = max(0.0, initial_entry_fee - proportional_entry_fee)
+    return {
+        "amount": residual_amount,
+        "original_amount": residual_amount,
+        "invested_usdt": remaining_invested,
+        "initial_entry_fee": remaining_entry_fee,
+        "fees_paid": remaining_entry_fee,
+        "partial_sold": False,
+        "closing_retry_pending": True,
+        "closing_retry_reason": reason,
+        "last_partial_fill_order_id": exch_oid,
+    }
+
+
 def spot_market_sell_safe(ex, symbol_pair: str, raw_amount: float
                           ) -> Tuple[dict, float]:
     """Wraps create_market_sell_order with precision rounding.
@@ -253,12 +302,16 @@ def emergency_close_all_spot(*,
                               error_logger: Optional[Callable] = None,
                               close_lock_factory: Optional[Callable] = None,
                               release_lock: Optional[Callable] = None,
-                              ) -> None:
-    """Close ALL open spot positions cleanly on shutdown."""
+                              ) -> dict:
+    """Close ALL open spot positions cleanly on shutdown.
+
+    Returns {"closed_count", "failed_count", "failed"} so shutdown handlers
+    latch only after a complete flatten and can retry failed legs.
+    """
     snapshot = state.get_all()
     if not snapshot:
         log_event("Emergency close: no open positions", "INFO")
-        return
+        return {"closed_count": 0, "failed_count": 0, "failed": []}
 
     log_event(
         f" EMERGENCY CLOSE ALL ({reason})  {len(snapshot)} positions",
@@ -431,21 +484,57 @@ def emergency_close_all_spot(*,
                         f"  DB accounting for {sym} failed after close: {e}. "
                         f"State kept for recovery.", "WARN")
                     try:
-                        updates = {
-                            "accounting_pending": True,
-                            "accounting_pending_reason": f"Emergency Close ({reason})",
-                            "accounting_pending_sell_price": fill_price,
-                            "accounting_pending_sell_time": sell_time,
-                            "accounting_pending_profit_pct": profit_pct,
-                            "accounting_pending_profit_usdt": profit_usdt,
-                            "accounting_pending_fees_usdt": fees_for_booked_slice,
-                            "accounting_pending_exchange_order_id": exch_oid,
-                        }
-                        if hasattr(state, "update_many"):
-                            state.update_many(sym, updates)
+                        residual_amount = (
+                            _emergency_residual_amount(
+                                ex, symbol_pair, amount, sold_amount,
+                                fill_price)
+                            if not simulation and amount > 0 else 0.0
+                        )
+                        if residual_amount > 0:
+                            pending_trade = dict(
+                                bot_name=bot_name, symbol=sym,
+                                buy_price=buy_price, sell_price=fill_price,
+                                buy_time=buy_time, sell_time=sell_time,
+                                profit_pct=profit_pct,
+                                profit_usdt=profit_usdt,
+                                invested_usdt=booked_invested,
+                                reason=f"Emergency Close ({reason})",
+                                rsi_15m=d.get("rsi_15m"),
+                                rsi_1h=d.get("rsi_1h"),
+                                rsi_4h=d.get("rsi_4h"),
+                                change_pct=d.get("change_pct"),
+                                btc_trend=d.get("btc_trend"),
+                                fear_greed=d.get("fear_greed"),
+                                is_futures=False,
+                                is_partial=True,
+                                fees_usdt=fees_for_booked_slice,
+                                exchange_order_id=exch_oid,
+                            )
+                            pending = list(
+                                d.get("accounting_pending_partials") or [])
+                            pending.append(pending_trade)
+                            updates = _emergency_residual_updates(
+                                amount, residual_amount, margin,
+                                initial_entry_fee, proportional_entry_fee,
+                                exch_oid, reason)
+                            updates["accounting_pending_partials"] = pending
+                            _apply_state_updates(state, sym, updates)
+                            log_event(
+                                f"  [LIVE] {sym}: sold slice accounting pending; "
+                                f"{residual_amount:.6f} kept in state for retry",
+                                "WARN")
                         else:
-                            for _k, _v in updates.items():
-                                state.update(sym, _k, _v)
+                            updates = {
+                                "accounting_pending": True,
+                                "accounting_pending_reason": f"Emergency Close ({reason})",
+                                "accounting_pending_sell_price": fill_price,
+                                "accounting_pending_sell_time": sell_time,
+                                "accounting_pending_profit_pct": profit_pct,
+                                "accounting_pending_profit_usdt": profit_usdt,
+                                "accounting_pending_fees_usdt": fees_for_booked_slice,
+                                "accounting_pending_exchange_order_id": exch_oid,
+                            }
+                            _apply_state_updates(state, sym, updates)
                     except Exception as se:
                         log_event(
                             f"  Could not mark {sym} accounting_pending: {se}",
@@ -456,40 +545,15 @@ def emergency_close_all_spot(*,
                 # A balance-capped emergency sell can partial-fill. Keep a
                 # meaningful remainder in state with its original cost basis.
                 if not simulation and amount > 0:
-                    try:
-                        _rem = _free_base_balance(ex, symbol_pair)
-                    except Exception:
-                        _rem = None
-                    residual_value = (
-                        float(_rem) * fill_price
-                        if _rem is not None and fill_price > 0 else 0.0
-                    )
-                    if (_rem is not None
-                            and residual_value > _EMERGENCY_RESIDUAL_DUST_USDT):
-                        residual_amount = min(float(_rem), amount)
-                        remaining_invested = (
-                            margin * (residual_amount / amount)
-                            if amount > 0 else 0.0
-                        )
-                        remaining_entry_fee = max(
-                            0.0, initial_entry_fee - proportional_entry_fee)
-                        updates = {
-                            "amount": residual_amount,
-                            "original_amount": residual_amount,
-                            "invested_usdt": remaining_invested,
-                            "initial_entry_fee": remaining_entry_fee,
-                            "fees_paid": remaining_entry_fee,
-                            "partial_sold": False,
-                            "closing_retry_pending": True,
-                            "closing_retry_reason": reason,
-                            "last_partial_fill_order_id": exch_oid,
-                        }
+                    residual_amount = _emergency_residual_amount(
+                        ex, symbol_pair, amount, sold_amount, fill_price)
+                    if residual_amount > 0:
+                        updates = _emergency_residual_updates(
+                            amount, residual_amount, margin,
+                            initial_entry_fee, proportional_entry_fee,
+                            exch_oid, reason)
                         try:
-                            if hasattr(state, "update_many"):
-                                state.update_many(sym, updates)
-                            else:
-                                for _k, _v in updates.items():
-                                    state.update(sym, _k, _v)
+                            _apply_state_updates(state, sym, updates)
                         except Exception as se:
                             failed.append(
                                 f"{sym}: residual state update failed: {se}")
@@ -498,12 +562,12 @@ def emergency_close_all_spot(*,
                                 f"({se}) - NOT removing state", "WARN")
                             continue
                         log_event(
-                            f"  [LIVE] {sym}: {_rem:.6f} still in wallet after "
+                            f"  [LIVE] {sym}: {residual_amount:.6f} still open after "
                             f"emergency sell (>5% of {amount:.6f}) - kept in "
                             f"state for retry/reconcile.",
                             "WARN")
                         failed.append(
-                            f"{sym}: residual kept in state ({_rem:.6f})")
+                            f"{sym}: residual kept in state ({residual_amount:.6f})")
                         total_pnl += profit_usdt
                         continue
 
@@ -535,3 +599,9 @@ def emergency_close_all_spot(*,
             )
         except Exception as e:
             log_event(f"Telegram failed: {e}", "WARN")
+
+    return {
+        "closed_count": closed_count,
+        "failed_count": len(failed),
+        "failed": failed,
+    }

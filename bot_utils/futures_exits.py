@@ -17,6 +17,7 @@ from bot_utils.futures_order import (
     extract_order_fee_futures,
     extract_or_estimate_futures_fee,
     futures_contract_size,
+    is_no_position_error,
     verify_position_closed,
 )
 from bot_utils.futures_math import calc_unrealized_pnl, price_move_pct
@@ -440,13 +441,43 @@ def _close_single_position_impl(*,
                         return (sym, "failed", 0.0, "verify failed")
 
             except Exception as e:
-                log_event(f"  [LIVE] Emergency close {sym} could not complete: {e}", "WARN")
-                if error_logger:
+                if is_no_position_error(e):
                     try:
-                        error_logger(f"emergency close {sym}", e)
-                    except Exception:
-                        pass
-                return (sym, "failed", 0.0, str(e))
+                        closed_ok, remaining = verify_position_closed(
+                            ex, symbol_full,
+                            timeout=_VERIFY_CLOSE_TIMEOUT_SEC,
+                        )
+                    except Exception as ve:
+                        closed_ok, remaining = False, -1.0
+                        log_event(
+                            f"  [LIVE] {sym}: close error looked flat but "
+                            f"verification failed: {ve}", "WARN"
+                        )
+                    if closed_ok:
+                        log_event(
+                            f"  [LIVE] {sym}: position already flat on "
+                            f"exchange ({str(e)[:80]}) - booking local close",
+                            "WARN",
+                        )
+                        fill_source = "already_flat"
+                    else:
+                        if remaining > 0:
+                            msg = f"{remaining:.6f} contracts remain"
+                        else:
+                            msg = "flat verification failed"
+                        log_event(
+                            f"  [LIVE] {sym}: no-position close error but "
+                            f"{msg}; state kept for retry", "WARN"
+                        )
+                        return (sym, "failed", 0.0, msg)
+                else:
+                    log_event(f"  [LIVE] Emergency close {sym} could not complete: {e}", "WARN")
+                    if error_logger:
+                        try:
+                            error_logger(f"emergency close {sym}", e)
+                        except Exception:
+                            pass
+                    return (sym, "failed", 0.0, str(e))
 
         if fill_price is None or fill_price <= 0:
             fill_price = curr

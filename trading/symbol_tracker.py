@@ -1,11 +1,9 @@
 """
 symbol_tracker.py  Persistent first-seen tracker.
 
-Lst das WARN-Spam-Problem: Brandneue Coins erscheinen in fetch_tickers()
-mit Volumen, haben aber noch keine Candle-Historie auf Bitget. Der
-Screener loggt fr jeden eine "Indicator error" WARN. Mit diesem Tracker
-werden Symbole in den ersten 24h nach erster Sichtung als "fresh" markiert
-und Failures bewusst still verworfen.
+New listings can appear in fetch_tickers() before they have enough candle
+history. Mark symbols as fresh for their first 24h and suppress expected
+indicator failures during that window.
 """
 from __future__ import annotations
 import json

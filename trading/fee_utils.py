@@ -118,14 +118,14 @@ def extract_or_estimate_with_refetch(ex, order: dict, symbol_full: str,
         ex: ccxt exchange
         order: das CCXT order dict aus create_order/create_market_*
         symbol_full: e.g. "BTC/USDT:USDT"
-        fill_price: actual fill price (fr estimate-Fallback)
+        fill_price: actual fill price for estimate fallback
         taker_rate: optional override
         base_override: e.g. "BTC"
         max_attempts: re-fetches versucht
         retry_delay: Sekunden zwischen Re-Fetches
 
     Returns:
-        Fee in USDT (real wenn extrahierbar, sonst geschtzt).
+        Fee in USDT (real when extractable, otherwise estimated).
     """
     import time as _time
 
@@ -133,7 +133,7 @@ def extract_or_estimate_with_refetch(ex, order: dict, symbol_full: str,
     if real > 0:
         return real
 
-    # Re-fetch versuchen (Bitget gibt manchmal erst nach ~300ms Fee zurck)
+    # Re-fetch once the exchange has had time to attach fee details.
     order_id = order.get("id") or order.get("orderId")
     if order_id and ex is not None and symbol_full:
         for attempt in range(max_attempts):

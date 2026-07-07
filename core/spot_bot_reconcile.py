@@ -157,12 +157,13 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
             "WARN"
         )
         try:
-            send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                f" [{bot.BOT_NAME}] Offline close detected\n"
-                f"{sym}: {buy:.6f}  {close_price:.6f}\n"
-                f"PnL: {net_pnl:+.2f} USDT\n"
-                f"Source: {close_source}"
-            )
+            if not bool(getattr(bot, "simulation", True)):
+                send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                    f" [{bot.BOT_NAME}] Offline close detected\n"
+                    f"{sym}: {buy:.6f}  {close_price:.6f}\n"
+                    f"PnL: {net_pnl:+.2f} USDT\n"
+                    f"Source: {close_source}"
+                )
         except Exception:
             pass
         return True
@@ -261,6 +262,116 @@ def _gate_missing_for_removal(bot, sym, state_row, strikes, threshold: int = 2) 
         return True
 
 
+def _adopt_spot_orphans(bot, bal_data: dict) -> None:
+    """Adopt exchange spot balances that are not in local state.
+
+    Used by startup and periodic reconcile. Adoption is claim-gated and
+    fail-closed when the shared registry is unavailable.
+    """
+    try:
+        from core.database import (
+            get_all_claimed_bases,
+            try_claim_orphan,
+            _base_symbol,
+            remove_open_position,
+        )
+        from core.logger import log_event, send_telegram
+        from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+
+        _SPOT_DUST_USDT = 1.0
+
+        current_syms = set(bot.state.keys())
+        other_spot = get_all_claimed_bases(
+            exclude_bot=bot.BOT_NAME,
+            is_futures=False,
+            fail_closed=True,
+        )
+        if other_spot is None:
+            log_event(
+                " Spot orphan adoption skipped: claim registry unavailable",
+                "WARN",
+            )
+            return
+
+        adopted, unadoptable = [], []
+        for coin, coin_bal in bal_data.items():
+            if not isinstance(coin_bal, dict):
+                continue
+            if coin in ("USDT", "USD", "BUSD", "USDC", "FDUSD"):
+                continue
+            base = _base_symbol(coin)
+            if not base or base in current_syms:
+                continue
+            if base in other_spot:
+                continue
+            try:
+                exch_amt = float(coin_bal.get("total", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if exch_amt <= 1e-8:
+                continue
+            try:
+                ticker = bot.ex.fetch_ticker(f"{base}/USDT")
+                price = float(ticker.get("last", 0) or 0)
+            except Exception:
+                price = 0.0
+            if price <= 0:
+                unadoptable.append(base)
+                continue
+            value_usdt = exch_amt * price
+            if value_usdt < _SPOT_DUST_USDT:
+                continue
+            if not try_claim_orphan(bot.BOT_NAME, base, "SPOT"):
+                continue
+            try:
+                from core.clock import now_utc as _now_utc
+                bot.state.add(base, {
+                    "buy": price,
+                    "buy_time": _now_utc().strftime("%Y-%m-%d %H:%M:%S"),
+                    "amount": exch_amt,
+                    "invested_usdt": value_usdt,
+                    "original_amount": exch_amt,
+                    "highest": price,
+                    "initial_entry_fee": 0.0,
+                    "fees_paid": 0.0,
+                    "partial_sold": False,
+                    "break_even": False,
+                    "be_active": False,
+                    "adopted": True,
+                })
+                current_syms.add(base)
+                adopted.append(base)
+            except Exception as exc:
+                remove_open_position(bot.BOT_NAME, base)
+                bot._log_error(f"spot adopt orphan {base}", exc)
+                unadoptable.append(base)
+
+        if adopted:
+            log_event(
+                f" Spot reconciliation: ADOPTED {len(adopted)} untracked "
+                f"balance(s)  now managed: {', '.join(sorted(adopted))}",
+                "WARN")
+            try:
+                if not bool(getattr(bot, "simulation", True)):
+                    send_telegram(
+                        TELEGRAM_TOKEN,
+                        TELEGRAM_CHAT_ID,
+                        f" [{bot.BOT_NAME}] Adopted {len(adopted)} untracked "
+                        f"spot balance(s):\n{', '.join(sorted(adopted))}\n"
+                        f"Now managed (stop-loss + trailing).",
+                    )
+            except Exception:
+                pass
+        if unadoptable:
+            log_event(
+                f" Spot reconciliation: {len(unadoptable)} balance(s) "
+                f"could NOT be adopted (no price)  review manually: "
+                f"{', '.join(sorted(unadoptable))}",
+                "WARN")
+    except Exception as err:
+        bot._log_error("spot orphan adoption", err)
+
+
 # 
 # Startup reconciliation (called once from SpotBot.run())
 # 
@@ -295,10 +406,9 @@ def startup_reconciliation(bot) -> None:
                       if float((bal_data.get(sym) or {}).get("total", 0) or 0) > 1e-8)
         if present == 0:
             log_event(
-                f" Spot reconciliation SKIPPED: fetch_balance shows none of "
-                f"{len(trades)} held coin(s)  likely an empty/partial balance read. "
-                f"NOT wiping state.", "WARN")
-            return
+                f" Spot reconciliation: fetch_balance shows none of "
+                f"{len(trades)} held coin(s); verifying each missing coin "
+                f"before any offline-close booking.", "WARN")
 
         strikes = getattr(bot, "_recon_missing_strikes", None)
         if strikes is None:
@@ -396,88 +506,7 @@ def startup_reconciliation(bot) -> None:
     except Exception as gh_err:
         bot._log_error("ghost position detection", gh_err)
 
-    #  Spot orphan adoption (exchange balance, bot unaware) 
-    try:
-        from core.database import get_all_claimed_bases, try_claim_orphan, _base_symbol, remove_open_position
-        from core.clock import now_utc
-        from core.logger import log_event, send_telegram
-        from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-
-        _SPOT_DUST_USDT = 1.0
-
-        current_syms = set(bot.state.keys())
-        _other_spot = get_all_claimed_bases(exclude_bot=bot.BOT_NAME, is_futures=False)
-
-        adopted, unadoptable = [], []
-        for coin, coin_bal in bal_data.items():
-            if not isinstance(coin_bal, dict):
-                continue
-            if coin in ("USDT", "USD", "BUSD", "USDC", "FDUSD"):
-                continue
-            base = _base_symbol(coin)
-            if not base or base in current_syms:
-                continue
-            if base in _other_spot:
-                continue
-            exch_amt = float(coin_bal.get("total", 0) or 0)
-            if exch_amt <= 1e-8:
-                continue
-            try:
-                ticker = bot.ex.fetch_ticker(f"{base}/USDT")
-                price = float(ticker.get("last", 0) or 0)
-            except Exception:
-                price = 0.0
-            if price <= 0:
-                unadoptable.append(base)
-                continue
-            value_usdt = exch_amt * price
-            if value_usdt < _SPOT_DUST_USDT:
-                continue
-            if not try_claim_orphan(bot.BOT_NAME, base, "SPOT"):
-                continue
-            try:
-                from core.clock import now_utc as _now_utc
-                bot.state.add(base, {
-                    "buy": price,
-                    "buy_time": _now_utc().strftime("%Y-%m-%d %H:%M:%S"),
-                    "amount": exch_amt,
-                    "invested_usdt": value_usdt,
-                    "original_amount": exch_amt,
-                    "highest": price,
-                    "initial_entry_fee": 0.0,
-                    "fees_paid": 0.0,
-                    "partial_sold": False,
-                    "break_even": False,
-                    "be_active": False,
-                    "adopted": True,
-                })
-                adopted.append(base)
-            except Exception as _ae:
-                remove_open_position(bot.BOT_NAME, base)
-                bot._log_error(f"spot adopt orphan {base}", _ae)
-                unadoptable.append(base)
-
-        if adopted:
-            log_event(
-                f" Spot reconciliation: ADOPTED {len(adopted)} untracked "
-                f"balance(s)  now managed: {', '.join(sorted(adopted))}",
-                "WARN")
-            try:
-                if not bool(getattr(bot, "simulation", True)):
-                    send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                        f" [{bot.BOT_NAME}] Adopted {len(adopted)} untracked "
-                        f"spot balance(s):\n{', '.join(sorted(adopted))}\n"
-                        f"Now managed (stop-loss + trailing).")
-            except Exception:
-                pass
-        if unadoptable:
-            log_event(
-                f" Spot reconciliation: {len(unadoptable)} balance(s) "
-                f"could NOT be adopted (no price)  review manually: "
-                f"{', '.join(sorted(unadoptable))}",
-                "WARN")
-    except Exception as _oa_err:
-        bot._log_error("spot orphan adoption", _oa_err)
+    _adopt_spot_orphans(bot, bal_data)
 
 
 # 
@@ -544,9 +573,9 @@ class ReconcileMixin:
                               if float((bal_data.get(sym) or {}).get("total", 0) or 0) > 1e-8)
                 if trades and present == 0:
                     log_event(
-                        f"[{self.BOT_NAME}] reconcile skipped  balance shows none "
-                        f"of {len(trades)} held coin(s) (empty/partial read)", "WARN")
-                    continue
+                        f"[{self.BOT_NAME}] reconcile balance shows none of "
+                        f"{len(trades)} held coin(s); verifying per coin",
+                        "WARN")
                 strikes = getattr(self, "_recon_missing_strikes", None)
                 if strikes is None:
                     strikes = self._recon_missing_strikes = {}
@@ -585,11 +614,12 @@ class ReconcileMixin:
                         f"{', '.join(phantoms)}", "WARN"
                     )
                     try:
-                        send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                            f" [{self.BOT_NAME}] Reconciliation: "
-                            f"{len(phantoms)} position(s) closed externally:\n"
-                            f"{', '.join(phantoms)}"
-                        )
+                        if not bool(getattr(self, "simulation", True)):
+                            send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                                f" [{self.BOT_NAME}] Reconciliation: "
+                                f"{len(phantoms)} position(s) closed externally:\n"
+                                f"{', '.join(phantoms)}"
+                            )
                     except Exception:
                         pass
                 if adjusted:
@@ -597,6 +627,7 @@ class ReconcileMixin:
                         f" Periodic reconciliation: adjusted "
                         f"{len(adjusted)}: {', '.join(adjusted)}", "WARN"
                     )
+                _adopt_spot_orphans(self, bal_data)
             except Exception as e:
                 # Transient network blips (DNS fail, SSL EOF, timeout) are not
                 # bugs  log them compactly and retry next cycle instead of

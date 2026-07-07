@@ -13,8 +13,8 @@ from typing import Any, Mapping
 from core.paths import PROJECT_ROOT
 
 
-_STATUS_REPLACE_RETRIES = 8
-_STATUS_REPLACE_SLEEP_SEC = 0.05
+_STATUS_REPLACE_RETRIES = 20
+_STATUS_REPLACE_SLEEP_SEC = 0.10
 
 
 def _log_status_write_failure(context: str, exc: Exception) -> None:
@@ -108,17 +108,20 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
                 fh.flush()
                 try:
                     os.fsync(fh.fileno())
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log_status_write_failure(f"write_runtime_status fsync({path})", exc)
             last_err = None
-            for _ in range(_STATUS_REPLACE_RETRIES):
+            for attempt in range(_STATUS_REPLACE_RETRIES):
                 try:
                     os.replace(tmp_name, path)
                     last_err = None
                     break
                 except PermissionError as exc:
                     last_err = exc
-                    time.sleep(_STATUS_REPLACE_SLEEP_SEC)
+                    time.sleep(
+                        _STATUS_REPLACE_SLEEP_SEC
+                        * (1.0 + (attempt % 3) * 0.25)
+                    )
             if last_err is not None:
                 _log_status_write_failure(f"write_runtime_status({path})",
                                           last_err)

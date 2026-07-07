@@ -68,13 +68,16 @@ def run_module(module: str, *args: str, timeout_sec: int = 45) -> dict[str, Any]
 
 def scan_recent_logs(minutes: int = 60, limit: int = 80,
                      log_root: Path = LOGS_DIR) -> list[dict[str, Any]]:
-    cutoff = datetime.now() - timedelta(minutes=max(1, minutes))
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+        minutes=max(1, minutes))
     hits: list[dict[str, Any]] = []
     for path in log_root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in {".log", ".jsonl", ".txt"}:
             continue
         try:
-            if datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
+            mtime_utc = datetime.fromtimestamp(
+                path.stat().st_mtime, tz=timezone.utc).replace(tzinfo=None)
+            if mtime_utc < cutoff:
                 continue
             with path.open("r", encoding="utf-8-sig", errors="replace") as fh:
                 for line_no, line in enumerate(fh, start=1):

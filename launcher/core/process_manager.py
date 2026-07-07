@@ -124,7 +124,9 @@ class BotProcess:
     _GRACEFUL_TIMEOUT_SEC: float = 75.0
     _FORCE_KILL_TIMEOUT_SEC: float = 5.0
 
-    def _mark_runtime_stopped(self, returncode=None) -> None:
+    def _mark_runtime_stopped(self, returncode=None, *,
+                              expected_run_id: str | None = None,
+                              expected_pid: int | None = None) -> None:
         if not self.bot_name:
             return
         try:
@@ -135,8 +137,7 @@ class BotProcess:
             if not log_dir:
                 return
             last = read_runtime_status(log_dir)
-            expected_run_id = self.run_id or ""
-            expected_pid = self.proc.pid if self.proc else None
+            expected_run_id = expected_run_id or ""
             last_run_id = str(last.get("run_id") or "")
             try:
                 last_pid = int(last.get("pid") or 0)
@@ -191,11 +192,33 @@ class BotProcess:
         # block ``is_running()`` if it ever needed the same lock  and
         # also block any concurrent start() call from happening once
         # the process is genuinely dead.
+        already_exited: tuple[int | None, str, int] | None = None
         with self._lifecycle_lock:
-            if not (self.proc and self.proc.poll() is None):
-                self.proc = None
+            if self.proc is None:
                 return
-            proc_to_stop = self.proc
+            if self.proc.poll() is not None:
+                proc_to_mark = self.proc
+                run_id_to_mark = self.run_id or ""
+                pid_to_mark = proc_to_mark.pid
+                returncode_to_mark = proc_to_mark.poll()
+                self.proc = None
+                already_exited = (
+                    returncode_to_mark,
+                    run_id_to_mark,
+                    pid_to_mark,
+                )
+            else:
+                proc_to_stop = self.proc
+                run_id_to_stop = self.run_id or ""
+                pid_to_stop = proc_to_stop.pid
+        if already_exited is not None:
+            returncode_to_mark, run_id_to_mark, pid_to_mark = already_exited
+            self._mark_runtime_stopped(
+                returncode_to_mark,
+                expected_run_id=run_id_to_mark,
+                expected_pid=pid_to_mark,
+            )
+            return
 
         #  Send the signal OUTSIDE the lock 
         signal_ok = False
@@ -260,7 +283,11 @@ class BotProcess:
             #  a concurrent start() shouldn't be clobbered.
             if self.proc is proc_to_stop:
                 self.proc = None
-        self._mark_runtime_stopped(proc_to_stop.poll())
+        self._mark_runtime_stopped(
+            proc_to_stop.poll(),
+            expected_run_id=run_id_to_stop,
+            expected_pid=pid_to_stop,
+        )
 
     def is_running(self) -> bool:
         # Lock-free read by design  Python's GIL makes the attribute load
@@ -272,9 +299,10 @@ class BotProcess:
     #  Stdout reader 
 
     def _reader(self) -> None:
-        if not self.proc:
+        proc = self.proc
+        if not proc or not proc.stdout:
             return
-        for line in self.proc.stdout:                  # type: ignore[union-attr]
+        for line in proc.stdout:
             line = line.rstrip("\n").rstrip("\r")
             if line and "\r" not in line:
                 # Drop-oldest policy: if the queue is full, ditch the

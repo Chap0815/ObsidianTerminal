@@ -163,7 +163,10 @@ def _mode_for_current_row(bot_name: str) -> str:
     name = str(bot_name or "").upper()
     if name.endswith(" (SIM)"):
         return "SIM"
-    return BOT_MODES.get(_base_bot_name(name), "SIM")
+    base = _base_bot_name(name)
+    if base in ALL_BOTS and name == base:
+        return "LIVE"
+    return BOT_MODES.get(base, "SIM")
 
 
 def _mode_badge(mode: str) -> str:
@@ -431,10 +434,9 @@ def _render_dark_table(df, max_rows: int = 200, height_px: int = None,
     Parameters:
         df  pandas DataFrame oder Series
         max_rows  clipping limit
-        height_px  falls gesetzt, scrollable container mit dieser Hhe
-        align_right_cols  column-namen die rechtsbndig sein sollen (Zahlen)
-        color_cols  dict {col_name: 'pnl'} fr color-coded zellen
-                            ('pnl' = grn positiv / rot negativ)
+        height_px  optional scrollable container height
+        align_right_cols  column names to align right
+        color_cols  dict {col_name: 'pnl'} for color-coded cells
     """
     import html as _html
     if df is None or len(df) == 0:
@@ -535,6 +537,10 @@ def _kpi_card(label: str, value, sub: str, accent_color: str = "#475569",
     else:
         css = "neu"
         value_str = str(value)
+    label_html = html.escape(str(label))
+    value_html = html.escape(str(value_str))
+    suffix_html = html.escape(str(suffix))
+    sub_html = html.escape(str(sub))
     return (
         f'<div style="position:relative; background:rgba(15,20,29,0.6); '
         f'backdrop-filter:blur(12px); border-radius:14px; '
@@ -542,9 +548,9 @@ def _kpi_card(label: str, value, sub: str, accent_color: str = "#475569",
         f'overflow:hidden;">'
         f'  <div style="position:absolute; top:0; left:0; right:0; height:2px; '
         f'background:linear-gradient(90deg, {accent_color}, transparent);"></div>'
-        f'  <div class="kpi-label" style="color:{accent_color};">{label}</div>'
-        f'  <div class="kpi-value {css}">{value_str} <span style="font-size:0.85rem; color:#475569; font-weight:600;">{suffix}</span></div>'
-        f'  <div class="kpi-sub">{sub}</div>'
+        f'  <div class="kpi-label" style="color:{accent_color};">{label_html}</div>'
+        f'  <div class="kpi-value {css}">{value_html} <span style="font-size:0.85rem; color:#475569; font-weight:600;">{suffix_html}</span></div>'
+        f'  <div class="kpi-sub">{sub_html}</div>'
         f'</div>'
     )
 
@@ -753,11 +759,17 @@ def aggregate_positions(trades_df: pd.DataFrame) -> pd.DataFrame:
     if trades_df is None or trades_df.empty:
         return pd.DataFrame(columns=["profit_usdt", "sell_time"])
     df = trades_df.copy()
-    for col in ("bot_name", "symbol", "buy_time"):
+    defaults = {
+        "bot_name": "",
+        "symbol": "",
+        "buy_time": "",
+        "sell_time": "",
+        "profit_usdt": 0.0,
+        "is_partial": 0,
+    }
+    for col, default in defaults.items():
         if col not in df.columns:
-            df[col] = ""
-    if "is_partial" not in df.columns:
-        df["is_partial"] = 0
+            df[col] = default
     df["_position_key"] = (
         df["bot_name"].astype(str) + "|" +
         df["symbol"].astype(str) + "|" +
@@ -809,15 +821,30 @@ def build_pnl_snapshot(
     bot_filter = set(bot_filter or [])
 
     if trades_df is not None and not trades_df.empty:
-        for mode, mdf in trades_df.groupby("mode"):
+        tdf = trades_df.copy()
+        if "mode" not in tdf.columns:
+            tdf["mode"] = tdf.apply(_mode_for_historical_row, axis=1)
+        else:
+            tdf["mode"] = tdf["mode"].fillna("LEGACY").astype(str).str.upper()
+        if "base_bot" not in tdf.columns and "bot_name" in tdf.columns:
+            tdf["base_bot"] = tdf["bot_name"].map(_base_bot_name)
+        if "profit_usdt" not in tdf.columns:
+            tdf["profit_usdt"] = 0.0
+
+        for mode, mdf in tdf.groupby("mode"):
+            if bot_filter:
+                bot_col = "base_bot" if "base_bot" in mdf.columns else "bot_name"
+                mdf = mdf[mdf[bot_col].map(_base_bot_name).isin(bot_filter)]
+                if mdf.empty:
+                    continue
             mode = str(mode or "LEGACY").upper()
             if mode not in modes:
                 modes[mode] = _bucket()
             modes[mode]["realized"] += float(mdf["profit_usdt"].fillna(0).sum())
             modes[mode]["fills"] += int(len(mdf))
             modes[mode]["positions"] += int(len(aggregate_positions(mdf)))
-        bot_col = "base_bot" if "base_bot" in trades_df.columns else "bot_name"
-        for (bot, mode), bdf in trades_df.groupby([bot_col, "mode"]):
+        bot_col = "base_bot" if "base_bot" in tdf.columns else "bot_name"
+        for (bot, mode), bdf in tdf.groupby([bot_col, "mode"]):
             bot = _base_bot_name(bot)
             mode = str(mode or "LEGACY").upper()
             if bot_filter and bot not in bot_filter:
@@ -887,12 +914,12 @@ def build_pnl_snapshot(
 def compute_metrics(trades_df: pd.DataFrame) -> dict:
     """
     Liefert das volle Set Performance-Metriken.
-    Bei zu wenig Daten gibt es 'N/A' zurck (statt zu craschen).
+    Returns 'N/A' when there is not enough data.
 
     P&L-Summe: alle Trades inkl. is_partial=1 (Partial-Close Ereignisse
-    sind echte realisierte Gewinne und mssen gezhlt werden).
+    are real realized gains and must be counted).
     Win-Rate: nur is_partial=0 (Final-Closes), damit ein Trade der einen
-    Partial-Win + einen Final-Win hat nicht doppelt als "Win" zhlt.
+    Partial-Win + final Win is not counted twice as a "Win".
     """
     n = len(trades_df)
     if n == 0:
@@ -1003,7 +1030,7 @@ with st.sidebar:
     st.markdown('<div class="section-title" style="margin-top:0;">REFRESH</div>',
                   unsafe_allow_html=True)
     auto_refresh = st.checkbox("Auto-refresh (10s)", value=True)
-    if st.button("  Refresh now", use_container_width=True):
+    if st.button("  Refresh now", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
@@ -1130,7 +1157,10 @@ with tab_overview:
     if total_open:
         unreal_fut = total_unreal
         try:
-            unreal_fut = float(open_fut_live["unrealized_pnl"].fillna(0).sum()) if not open_fut_live.empty else 0.0
+            _fut_for_kpi = open_fut_live
+            if bot_filter and not _fut_for_kpi.empty and "base_bot" in _fut_for_kpi.columns:
+                _fut_for_kpi = _fut_for_kpi[_fut_for_kpi["base_bot"].isin(bot_filter)]
+            unreal_fut = float(_fut_for_kpi["unrealized_pnl"].fillna(0).sum()) if not _fut_for_kpi.empty else 0.0
             unreal_spot = total_unreal - unreal_fut
         except Exception:
             unreal_fut = total_unreal
@@ -1220,7 +1250,7 @@ with tab_overview:
 
             badge = _mode_badge(BOT_MODES.get(bot, "SIM"))
 
-            html = (
+            bot_card_html = (
                 f'<div style="background:rgba(15,20,29,0.6); border-radius:14px; '
                 f'border:1px solid rgba(255,255,255,0.06); border-left:4px solid {accent}; '
                 f'padding:18px 22px;">'
@@ -1240,7 +1270,7 @@ with tab_overview:
                 f'</div>'
                 f'</div>'
             )
-            st.markdown(html, unsafe_allow_html=True)
+            st.markdown(bot_card_html, unsafe_allow_html=True)
 
     #  Equity Curve + Drawdown 
     _section("Equity Curve & Drawdown")
@@ -1295,7 +1325,7 @@ with tab_overview:
             yaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="USDT", showline=False),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         # Drawdown unten
         col_left, col_right = st.columns([3, 1])
@@ -1318,7 +1348,7 @@ with tab_overview:
                 yaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="USDT", showline=False),
                 showlegend=False
             )
-            st.plotly_chart(fig_dd, use_container_width=True)
+            st.plotly_chart(fig_dd, width="stretch")
         with col_right:
             max_dd = metrics.get("max_dd", 0)
             current_dd = eq_df["drawdown"].iloc[-1] if not eq_df.empty else 0
@@ -1370,7 +1400,7 @@ with tab_trades:
         if type_f == "Spot only":    view = view[view["is_futures"] == 0]
         elif type_f == "Futures only": view = view[view["is_futures"] == 1]
 
-        #  Summary ber gefilterte Daten 
+        # Summary over filtered data.
         sub_metrics = compute_metrics(view)
         m1, m2, m3, m4 = st.columns(4)
         with m1:
@@ -1475,7 +1505,7 @@ with tab_trades:
                 xaxis=dict(showline=False),
                 yaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="USDT")
             )
-            st.plotly_chart(fig_coin, use_container_width=True)
+            st.plotly_chart(fig_coin, width="stretch")
 
 
 # 
@@ -1492,6 +1522,8 @@ with tab_positions:
         for idx, t in enumerate(_rows):
             with cols[idx % len(cols)]:
                 sym = t["symbol"]
+                sym_html = html.escape(str(sym))
+                bot_html = html.escape(str(t.get("bot", "")))
                 buy = float(t.get("buy_price") or t.get("buy") or 0)
                 invested = float(t.get("invested_usdt", 0))
                 live = live_prices.get(f"{sym}USDT", buy)
@@ -1511,14 +1543,14 @@ with tab_positions:
                     if partial else ""
                 )
 
-                html = (
+                card_html = (
                     f'<div style="background:rgba(12,17,26,0.9); border-radius:14px; '
                     f'border:1px solid rgba(255,255,255,0.07); '
                     f'border-left:4px solid {accent}; padding:18px;">'
                     f'<div style="display:flex; justify-content:space-between;">'
                     f'<div>'
-                    f'<span style="font-size:1.1rem; font-weight:700; color:#e2e8f0;">{sym}</span>'
-                    f'<span style="font-size:0.7rem; color:#64748b; margin-left:8px;">{t["bot"]}</span>'
+                    f'<span style="font-size:1.1rem; font-weight:700; color:#e2e8f0;">{sym_html}</span>'
+                    f'<span style="font-size:0.7rem; color:#64748b; margin-left:8px;">{bot_html}</span>'
                     f'{mode_badge}'
                     f'{partial_badge}'
                     f'</div>'
@@ -1536,7 +1568,7 @@ with tab_positions:
                     f'</div>'
                     f'</div>'
                 )
-                st.markdown(html, unsafe_allow_html=True)
+                st.markdown(card_html, unsafe_allow_html=True)
 
     def _render_perp_cards(_df):
         cols = st.columns(min(3, max(1, len(_df))))
@@ -1575,22 +1607,25 @@ with tab_positions:
                     liq_warn = "Safe"
 
                 lev = int(row.leverage) if row.leverage else 1
+                sym_html = html.escape(str(row.symbol))
+                bot_html = html.escape(str(_bn))
+                pos_type_html = html.escape(str(pos_type))
 
-                html = (
+                card_html = (
                     f'<div style="background:rgba(12,17,26,0.9); border-radius:14px; '
                     f'border:1px solid rgba(255,255,255,0.07); '
                     f'border-left:4px solid {accent}; padding:18px;">'
                     f'<div style="display:flex; justify-content:space-between;">'
                     f'<div>'
-                    f'<span style="font-size:1.1rem; font-weight:700; color:#e2e8f0;">{row.symbol}</span>'
+                    f'<span style="font-size:1.1rem; font-weight:700; color:#e2e8f0;">{sym_html}</span>'
                     f'<span style="background:{accent}22; color:{accent}; '
                     f'font-size:0.6rem; padding:2px 7px; border-radius:4px; '
                     f'margin-left:8px; font-weight:800; text-transform:uppercase; '
-                    f'letter-spacing:0.06em;">{_bn}</span>'
+                    f'letter-spacing:0.06em;">{bot_html}</span>'
                     f'{mode_badge}'
                     f'<span style="background:rgba(249,115,22,0.15); color:{pos_color}; '
                     f'font-size:0.7rem; padding:2px 8px; border-radius:4px; '
-                    f'margin-left:8px; font-weight:700;">{pos_type} {lev}x</span>'
+                    f'margin-left:8px; font-weight:700;">{pos_type_html} {lev}x</span>'
                     f'</div>'
                     f'<div style="text-align:right;">'
                     f'<div class="kpi-value {pct_class}" style="font-size:1.5rem;">'
@@ -1626,7 +1661,7 @@ with tab_positions:
                     f'</div>'
                     f'</div>'
                 )
-                st.markdown(html, unsafe_allow_html=True)
+                st.markdown(card_html, unsafe_allow_html=True)
 
     #  Separate sections per bot and mode. LIVE positions are real exposure;
     # SIM positions are shown only as paper positions.
@@ -1763,7 +1798,7 @@ with tab_performance:
                             tickvals=[0, 6, 12, 18, 23], showline=False),
                 yaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="USDT")
             )
-            st.plotly_chart(fig_h, use_container_width=True)
+            st.plotly_chart(fig_h, width="stretch")
 
         with hm_right:
             day_df = perf_trades.dropna(subset=["day_of_week"]).copy()
@@ -1795,7 +1830,7 @@ with tab_performance:
                 xaxis=dict(showline=False),
                 yaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="USDT")
             )
-            st.plotly_chart(fig_d, use_container_width=True)
+            st.plotly_chart(fig_d, width="stretch")
 
         #  Hour x Weekday Heatmap 
         _section("Time-of-Week Heatmap")
@@ -1827,7 +1862,7 @@ with tab_performance:
                 xaxis=dict(title="Hour (UTC)", side="bottom"),
                 yaxis=dict(autorange="reversed")
             )
-            st.plotly_chart(fig_hm, use_container_width=True)
+            st.plotly_chart(fig_hm, width="stretch")
 
         #  Reason Breakdown 
         _section("Exit Reason Breakdown")
@@ -1855,7 +1890,7 @@ with tab_performance:
                 xaxis=dict(gridcolor="rgba(255,255,255,0.04)"),
                 yaxis=dict(autorange="reversed")
             )
-            st.plotly_chart(fig_r, use_container_width=True)
+            st.plotly_chart(fig_r, width="stretch")
         with rcol_r:
             colors = ["#22c55e" if v >= 0 else "#ef4444" for v in reason_stats["total_pnl"]]
             fig_rp = go.Figure(go.Bar(
@@ -1875,7 +1910,7 @@ with tab_performance:
                 xaxis=dict(gridcolor="rgba(255,255,255,0.04)"),
                 yaxis=dict(autorange="reversed", showticklabels=False)
             )
-            st.plotly_chart(fig_rp, use_container_width=True)
+            st.plotly_chart(fig_rp, width="stretch")
 
 
 # 
@@ -1904,7 +1939,7 @@ with tab_bots:
             "Worst":        bm.get("worst", 0),
         })
     comp_df = pd.DataFrame(comp_rows)
-    # Vorformatiert fr HTML-Tabelle
+    # Pre-format for HTML table rendering.
     comp_df_fmt = comp_df.copy()
     comp_df_fmt["Total P&L"]     = comp_df_fmt["Total P&L"].apply(lambda v: f"{v:+.2f} USDT")
     comp_df_fmt["Win Rate"]      = comp_df_fmt["Win Rate"].apply(lambda v: f"{v:.1f}%")
@@ -1950,7 +1985,7 @@ with tab_bots:
             yaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="Cumulative USDT"),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
         )
-        st.plotly_chart(fig_be, use_container_width=True)
+        st.plotly_chart(fig_be, width="stretch")
     else:
         st.info("No LIVE trades yet.")
 
@@ -1969,30 +2004,34 @@ with tab_bots:
                                   'No dynamic parameters yet</div>')
                 else:
                     for _, r in bot_params.iterrows():
-                        reason = (r["reason"] or "")[:50]
+                        param_name = html.escape(str(r["param_name"]))
+                        param_value = html.escape(str(r["param_value"]))
+                        updated_at = html.escape(str(r["updated_at"]))
+                        reason = html.escape(str(r["reason"] or "")[:50])
                         rows_html += (
                             '<div style="padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.04);">'
                             '<div style="display:flex; justify-content:space-between;">'
-                            f'<span style="color:#94a3b8; font-size:0.78rem;">{r["param_name"]}</span>'
+                            f'<span style="color:#94a3b8; font-size:0.78rem;">{param_name}</span>'
                             '<span style="color:#e2e8f0; font-family:JetBrains Mono; '
-                            f'font-weight:700; font-size:0.78rem;">{r["param_value"]}</span>'
+                            f'font-weight:700; font-size:0.78rem;">{param_value}</span>'
                             '</div>'
                             '<div style="color:#475569; font-size:0.65rem; margin-top:2px;">'
-                            f'{r["updated_at"]}  {reason}'
+                            f'{updated_at}  {reason}'
                             '</div>'
                             '</div>'
                         )
-                html = (
+                bot_html = html.escape(str(bot))
+                bot_card_html = (
                     f'<div style="background:rgba(12,17,26,0.9); border-radius:12px; '
                     f'border:1px solid rgba(255,255,255,0.06); '
                     f'border-left:3px solid {accent}; padding:14px 18px;">'
                     f'<div style="font-weight:700; color:{accent}; font-size:0.95rem; margin-bottom:8px;">'
-                    f'{bot}'
+                    f'{bot_html}'
                     f'</div>'
                     f'{rows_html}'
                     f'</div>'
                 )
-                st.markdown(html, unsafe_allow_html=True)
+                st.markdown(bot_card_html, unsafe_allow_html=True)
 
     #  Learning Log 
     _section("AI Learning Timeline")

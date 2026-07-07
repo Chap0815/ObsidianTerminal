@@ -18,6 +18,7 @@ import json
 import os
 import queue
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -52,6 +53,7 @@ from launcher.config.settings import (
     _get_pythonw_exe,
     _safe_mono_font,
     _safe_display_font,
+    effective_default_config,
     load_config,
     save_config,
     save_config_merge,
@@ -179,13 +181,11 @@ class ObsidianApp(ctk.CTk):
         self.mono_font = _safe_mono_font()
         self.display_font = _safe_display_font()
 
-        # Self-Healing: Prompt-Dateien anlegen falls fehlend
+        # Self-heal missing prompt files.
         self._ensure_prompt_files_exist()
 
-        # Pro Bot: Queue, BotProcess, Card-Reference (initialisiert in _build_main)
-        # maxsize=5000: bei sehr langen Bot-Runs (Tage/Wochen) kann die Queue
-        # sonst unbounded wachsen wenn UI langsamer liest als Bot schreibt.
-        # 5000 reicht fr 1-2h Backlog, alte Lines werden dann verworfen.
+        # Per bot: queue, process wrapper, card refs. Bound log queues so long
+        # runs cannot grow memory unbounded if UI reads slower than bots write.
         self.log_queues = {bot: queue.Queue(maxsize=5000) for bot in BOT_ORDER}
         # All bots support graceful close: SIGINT/SIGTERM/SIGBREAK handlers
         # are registered in each bot's run_bot()  they close all open positions
@@ -200,6 +200,7 @@ class ObsidianApp(ctk.CTk):
                       for bot in BOT_ORDER}
         self.cards = {}  # bot_name  card dict
         self.streamlit = None
+        self._dashboard_port = None
 
         self._pulse_step = 0
         self._vc_offset  = 0.0   # Virtual Capital Anzeigeoffset (kein DB-Reset)
@@ -209,12 +210,14 @@ class ObsidianApp(ctk.CTk):
         self.bad_hours_rows = {}  # bot_name  BadHoursRow widget
         self._collapsed = {bot: False for bot in BOT_ORDER}
         self._pending_update_data = None
-        # Visibility aus Config laden
+        self._update_status_override = ""
+        self._update_status_override_until = 0.0
+        self._update_notice_shown = False
+        # Load visibility from config.
         ui_cfg = self.config.get("UI", {})
         self._visible = {bot: (bot in ui_cfg.get("VISIBLE_BOTS", list(BOT_ORDER)))
                           for bot in BOT_ORDER}
-        # Karten-Collapse-Funktion entfernt: COLLAPSED_BOTS aus der Config wird
-        # bewusst ignoriert, _collapsed bleibt immer False.
+        # Collapse support was removed; old COLLAPSED_BOTS config is ignored.
 
         if HAS_PSUTIL:
             try: psutil.cpu_percent(interval=None)
@@ -296,17 +299,16 @@ class ObsidianApp(ctk.CTk):
             self.after(50, self._reassert_chrome)
 
     def _build_ui(self):
-        # Layout: sidebar links ber die volle Hhe, dann main rechts mit
-        # Header oben (row 0), Cards (row 1), Footer (row 2)
+        # Layout: sidebar on the left, main content on the right.
         self.grid_columnconfigure(0, weight=0, minsize=240)  # Sidebar fix
         self.grid_columnconfigure(1, weight=1)               # Main flex
         self.grid_rowconfigure(0, weight=0)                  # Header
         self.grid_rowconfigure(1, weight=1)                  # Cards
         self.grid_rowconfigure(2, weight=0)                  # Footer
 
-        # Sidebar zuerst (spannt alle Reihen)
+        # Sidebar spans all rows.
         self._build_sidebar()
-        # Header oben in der Main-Spalte
+        # Header in the main column.
         self._build_header()
         # Cards in der Mitte
         self._build_main()
@@ -459,10 +461,8 @@ class ObsidianApp(ctk.CTk):
             "the total rather than showing a wrong number.",
             delay_ms=500
         )
-        # Getrennte Anzeigen fr Spot- und Futures-Wallet (MEXC & hnliche
-        # Exchanges trennen die USDT-Pools strikt). Werden nur sichtbar,
-        # wenn beide Bot-Typen gleichzeitig auf LIVE laufen  sonst wirkt
-        # die Hauptzeile "Available Capital" allein.
+        # Separate spot/futures wallet rows. Shown only when both wallet types
+        # are relevant; otherwise the main Available Capital row is enough.
         self.sb_balance_spot  = self._sb_metric(_c, "  Spot Wallet",  "", COLORS["text_dim"])
         self.sb_balance_futures = self._sb_metric(_c, "  Futures Wallet", "", COLORS["text_dim"])
         attach_tooltip(
@@ -487,15 +487,15 @@ class ObsidianApp(ctk.CTk):
             "which works the same way across all ccxt exchanges.",
             delay_ms=500
         )
-        # Initial verborgen  werden vom Refresh sichtbar geschaltet
+        # Initially hidden; refresh shows them when needed.
         self.sb_balance_spot._wrap.pack_forget()
         self.sb_balance_futures._wrap.pack_forget()
 
-        # Virtual Capital Zeile mit Reset-Button (Reihenfolge gendert)
+        # Virtual Capital row with reset button.
         sim_header_row = ctk.CTkFrame(_c, fg_color="transparent")
         sim_header_row.pack(fill="x", pady=0)
 
-        # Erst den Button erstellen und RECHTS packen
+        # Create the button first and pack it on the right.
         self.sb_reset_btn = ctk.CTkButton(
             sim_header_row, text="", width=20, height=20, corner_radius=4,
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
@@ -506,10 +506,10 @@ class ObsidianApp(ctk.CTk):
         self.sb_reset_btn.pack(side="right", padx=(4, 0))  # pack statt place
         attach_tooltip(self.sb_reset_btn, "Reset Virtual Capital to 1000 USDT", delay_ms=600)
 
-        # Dann die Metrik  fllt den restlichen Platz links vom Button
+        # Then the metric fills the remaining space.
         self.sb_balance_sim = self._sb_metric(sim_header_row, "Virtual Capital", "", COLORS["purple"])
 
-        # PERFORMANCE  gerahmte Karte
+        # Performance card.
         _c = self._sb_card(inner)
         self._sb_section(_c, "PERFORMANCE")
         self.sb_total   = self._sb_metric_big(_c, "Mode PnL", "+0.00 USDT", COLORS["text_dim"])
@@ -523,7 +523,7 @@ class ObsidianApp(ctk.CTk):
         self.sb_cross_pos = self._sb_metric(_c, "Cross Open", "0", COLORS["text"])
         self.sb_futrend_pos = self._sb_metric(_c, "Future Trend Open", "0", COLORS["text"])
 
-        # SYSTEM MONITOR  gerahmte Karte mit Bars
+        # System monitor card.
         _c = self._sb_card(inner)
         self._sb_section(_c, "SYSTEM MONITOR")
         bars_box = ctk.CTkFrame(_c, fg_color="transparent")
@@ -537,20 +537,20 @@ class ObsidianApp(ctk.CTk):
         self.bar_vram = MiniBar(bars_box, "VRAM", COLORS["violet"],     height=20)
         self.bar_vram.pack(fill="x", pady=1)
 
-        # Grerer Font fr GPU
+        # Larger font for GPU model text.
         self.gpu_name_lbl = ctk.CTkLabel(bars_box, text="",
                                           font=ctk.CTkFont(self.mono_font, 11, "bold"),
                                           text_color=COLORS["text_dim"], anchor="w")
         self.gpu_name_lbl.pack(fill="x", pady=(2, 0))
 
-        # CONNECTIONS  gerahmte Karte
+        # Connections card.
         _c = self._sb_card(inner)
         self._sb_section(_c, "CONNECTIONS")
         self.sb_db = self._sb_status(_c, "Database", "", COLORS["text_muted"])
         self.sb_exchange = self._sb_status(_c, "Exchange", "", COLORS["text_muted"])
         self.sb_llm = self._sb_status(_c, "LLM", "", COLORS["text_muted"])
 
-        # Grerer Font fr LLM Model
+        # Larger font for LLM model text.
         self.sb_llm_model = ctk.CTkLabel(_c, text="",
                                           font=ctk.CTkFont(self.mono_font, 11, "bold"),
                                           text_color=COLORS["text_dim"], anchor="w")
@@ -564,12 +564,12 @@ class ObsidianApp(ctk.CTk):
                        command=self._show_model_selector
                        ).pack(fill="x", pady=(0, 3))
 
-        # ERRORS  gerahmte Karte
+        # Errors card.
         _c = self._sb_card(inner)
         err_row = ctk.CTkFrame(_c, fg_color="transparent")
         err_row.pack(fill="x", pady=(0, 2))
 
-        # Leicht grere Schrift fr Errors
+        # Slightly larger font for error status.
         ctk.CTkLabel(err_row, text=" Errors",
                       font=ctk.CTkFont(FONT_BODY, 10, "bold"),
                       text_color=COLORS["text_subtle"], anchor="w"
@@ -703,10 +703,7 @@ class ObsidianApp(ctk.CTk):
             print(f"[Env] could not open {path}: {e}")
 
     def _sb_card(self, parent):
-        """Gerahmter, abgerundeter Container fr eine Sidebar-Sektion
-        (neues Design). Gibt das innere Frame zurck, in das Sektion +
-        Metriken wie bisher gepackt werden  Widget-Referenzen bleiben
-        unverndert, nur die Verschachtelung ndert sich."""
+        """Framed sidebar section container; returns its inner frame."""
         card = ctk.CTkFrame(parent, fg_color=COLORS["panel_alt"],
                              border_color=COLORS["border"], border_width=1,
                              corner_radius=10)
@@ -734,7 +731,7 @@ class ObsidianApp(ctk.CTk):
                             text_color=color, anchor="e")
         lbl.pack(side="right")
         var._lbl  = lbl
-        var._wrap = row  # Referenz fr pack_forget / pack (Ein-/Ausblenden)
+        var._wrap = row  # Reference for pack_forget/pack.
         return var
 
     def _sb_metric_big(self, parent, label, value, color):
@@ -750,8 +747,8 @@ class ObsidianApp(ctk.CTk):
                             text_color=color, anchor="w")
         lbl.pack(fill="x", pady=(0, 0))
         var._lbl        = lbl
-        var._header_lbl = header_lbl  # Referenz fr dynamische Label-nderung
-        var._wrap  = wrap  # Referenz fr pack_forget / pack (Ein-/Ausblenden)
+        var._header_lbl = header_lbl  # Reference for dynamic label changes.
+        var._wrap  = wrap  # Reference for pack_forget/pack.
         return var
 
     def _sb_status(self, parent, label, value, color):
@@ -826,7 +823,7 @@ class ObsidianApp(ctk.CTk):
                 return None
             if _is_log_text(getattr(event, "widget", None)):
                 return None
-            speed = 9
+            speed = 18
             if getattr(event, "num", None) == 4:
                 units = -speed
             elif getattr(event, "num", None) == 5:
@@ -1170,11 +1167,11 @@ class ObsidianApp(ctk.CTk):
         sparkline = Sparkline(spark_wrap, height=40)
         sparkline.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
         attach_tooltip(sparkline,
-                        "Kumulierter realisierter PnL ber die letzten ~30\n"
-                        "abgeschlossenen Trades. Grn = aktuell im Plus,\n"
+                        "Kumulierter realisierter PnL ueber die letzten ~30\n"
+                        "abgeschlossenen Trades. Gruen = aktuell im Plus,\n"
                         "rot = im Minus. Aktualisiert alle 15s.",
                         delay_ms=400)
-        # spark_row-Alias fr body_widgets (Sichtbarkeits-Steuerung)
+        # Alias used by body_widgets visibility handling.
         spark_row = spark_wrap
 
         #  ROW 3: Parameters in tinted Container-Box 
@@ -1329,6 +1326,7 @@ class ObsidianApp(ctk.CTk):
                     {"UI": {"params_collapsed": dict(cs)}})
             except Exception:
                 pass
+            self.after_idle(self._refresh_main_scrollregion)
 
         chevron_lbl.bind("<Button-1>", _toggle_params)
         # Also let the user click the "PARAMETERS" label text itself, not
@@ -1570,19 +1568,18 @@ class ObsidianApp(ctk.CTk):
         bottom = 0 if row == last_row else 14
         return (left, right), (top, bottom)
 
-    #  VISIBILITY (komplettes Ein/Ausblenden) 
+    #  Visibility
 
     def _apply_initial_visibility(self):
-        """Beim Start: gem Config sichtbar/versteckt setzen + Pills entsprechend."""
+        """Apply config visibility and pill state on startup."""
         for bot in BOT_ORDER:
             self._update_pill_appearance(bot)
-        # Re-apply alle gemeinsam fr korrektes Layout
+        # Re-apply all together for consistent layout.
         self._refresh_visibility_layout()
-        # Collapse-Funktion entfernt  keine Karten-Collapse-Wiederherstellung
-        # mehr. Alte COLLAPSED_BOTS-Eintrge in der Config werden ignoriert.
+        # Collapse support was removed; old COLLAPSED_BOTS entries are ignored.
 
     def _toggle_visibility(self, bot: str):
-        """Toggle: sichtbar  versteckt."""
+        """Toggle visible/hidden."""
         self._visible[bot] = not self._visible.get(bot, True)
         self._update_pill_appearance(bot)
         self._refresh_visibility_layout()
@@ -1605,8 +1602,8 @@ class ObsidianApp(ctk.CTk):
 
     def _refresh_visibility_layout(self):
         """
-        Single Source of Truth fr das Karten-Layout.
-        Versteckt/zeigt jede Karte und re-gridded mit korrektem Padding.
+        Single source of truth for card layout.
+        Hides/shows each card and re-grids with consistent padding.
         """
         visible = [b for b in BOT_ORDER if self._visible.get(b, True)]
         visible_count = len(visible)
@@ -1754,10 +1751,36 @@ class ObsidianApp(ctk.CTk):
 
                 bot_names = ", ".join(running)
                 self.status_text.set(f"{len(running)} bot(s) running: {bot_names}")
+            override = self._active_update_status_override()
+            if override:
+                self.status_text.set(override)
             if getattr(self, "_pending_update_data", None):
                 self._set_update_cta_visible(True)
         except Exception:
             pass
+
+    def _set_update_status_override(self, message: str, *, ttl_sec: float | None = None) -> None:
+        self._update_status_override = str(message or "")
+        if ttl_sec is None or not self._update_status_override:
+            self._update_status_override_until = 0.0
+        else:
+            self._update_status_override_until = time.monotonic() + max(0.0, float(ttl_sec))
+        if self._update_status_override:
+            self.status_text.set(self._update_status_override)
+
+    def _clear_update_status_override(self) -> None:
+        self._update_status_override = ""
+        self._update_status_override_until = 0.0
+
+    def _active_update_status_override(self) -> str:
+        override = getattr(self, "_update_status_override", "")
+        if not override:
+            return ""
+        until = float(getattr(self, "_update_status_override_until", 0.0) or 0.0)
+        if until and time.monotonic() > until:
+            self._clear_update_status_override()
+            return ""
+        return override
 
     def _set_update_cta_visible(self, visible: bool) -> None:
         try:
@@ -1790,12 +1813,19 @@ class ObsidianApp(ctk.CTk):
             self._dirty_param_keys.setdefault(bot_name, set()).clear()
 
     def _save_params(self, bot_name: str):
-        dirty = self._dirty_param_keys.get(bot_name) or set(self.param_rows[bot_name])
+        card = self.cards[bot_name]
+        dirty = set(self._dirty_param_keys.get(bot_name) or set())
+        if not dirty:
+            self._log_to_card(card, "system", "No parameter changes to save")
+            return
         rows = self.param_rows.get(bot_name, {})
         updates = {k: rows[k].value for k in dirty if k in rows}
-        self.config = save_config_merge({bot_name: updates})
+        try:
+            self.config = save_config_merge({bot_name: updates})
+        except Exception as exc:
+            self._log_to_card(card, "error", f"Config save failed: {exc}")
+            return
         self._mark_dirty(bot_name, False)
-        card = self.cards[bot_name]
         self._log_to_card(card, "system", "Parameters saved to bot_config.json")
         accent = card["accent"]
         card["save_btn"].configure(text=" Saved", fg_color=COLORS["success"],
@@ -1808,23 +1838,39 @@ class ObsidianApp(ctk.CTk):
         ) if card["save_btn"].winfo_exists() else None)
 
     def _reset_params(self, bot_name):
-        defaults = DEFAULT_CONFIG.get(bot_name, {})
+        card = self.cards[bot_name]
+        try:
+            from tkinter import messagebox
+            ok = messagebox.askyesno(
+                "Reset parameters",
+                f"Reset visible {bot_name} parameters to defaults?\n\n"
+                "SIM/LIVE mode and hidden technical config are not changed.",
+            )
+            if not ok:
+                return
+        except Exception:
+            return
+        defaults = effective_default_config().get(bot_name, {})
         rows = self.param_rows.get(bot_name, {})
         updates = {
             k: defaults[k]
             for k in rows
             if k != "SIMULATION" and k in defaults
         }
+        if updates:
+            try:
+                self.config = save_config_merge({bot_name: updates})
+            except Exception as exc:
+                self._log_to_card(card, "error", f"Config reset failed: {exc}")
+                self._mark_dirty(bot_name, True)
+                return
         for key in updates:
             self.config[bot_name][key] = updates[key]
         for key, row in rows.items():
             if key not in updates:
                 continue
             row.set_value(updates[key])
-        if updates:
-            self.config = save_config_merge({bot_name: updates})
         self._mark_dirty(bot_name, False)
-        card = self.cards[bot_name]
         self._log_to_card(card, "system", "Parameters reset to defaults")
 
     def _toggle_simulation(self, bot_name: str):
@@ -2080,6 +2126,49 @@ class ObsidianApp(ctk.CTk):
         except Exception as e:
             print(f"[Launcher] _ensure_prompt_files_exist crashed: {e}")
 
+    @staticmethod
+    def _find_dashboard_port(preferred: int = 8501) -> int:
+        """Return a local port for Streamlit without assuming 8501 is free."""
+        for port in (preferred, 0):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    sock.bind(("127.0.0.1", port))
+                except OSError:
+                    continue
+                return int(sock.getsockname()[1])
+        raise OSError("no local dashboard port available")
+
+    def _dashboard_url(self) -> str:
+        return f"http://127.0.0.1:{int(self._dashboard_port or 8501)}"
+
+    def _open_dashboard_when_ready(self, url: str, attempt: int = 0) -> None:
+        """Open only the dashboard process this launcher started."""
+        if self.streamlit is None or self.streamlit.poll() is not None:
+            stderr = sys.stderr
+            if stderr is not None:
+                try:
+                    stderr.write("[Dashboard] process is not running\n")
+                except Exception:
+                    pass
+            return
+        try:
+            response = _req.get(f"{url}/_stcore/health", timeout=0.6)
+            if response.status_code < 500:
+                webbrowser.open(url)
+                return
+        except Exception:
+            pass
+        if attempt < 30:
+            self.after(500, lambda: self._open_dashboard_when_ready(url, attempt + 1))
+            return
+        stderr = sys.stderr
+        if stderr is not None:
+            try:
+                stderr.write(f"[Dashboard] not ready at {url}\n")
+            except Exception:
+                pass
+
     def _open_dashboard(self):
         """Open the streamlit dashboard.
 
@@ -2087,6 +2176,16 @@ class ObsidianApp(ctk.CTk):
         to the project root, not to this module's directory.
         """
         if self.streamlit is None or self.streamlit.poll() is not None:
+            try:
+                self._dashboard_port = self._find_dashboard_port(8501)
+            except Exception as e:
+                stderr = sys.stderr
+                if stderr is not None:
+                    try:
+                        stderr.write(f"[Dashboard] failed to allocate port: {e}\n")
+                    except Exception:
+                        pass
+                return
             kw = subprocess_no_window_kwargs()
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
@@ -2096,7 +2195,7 @@ class ObsidianApp(ctk.CTk):
                 self.streamlit = subprocess.Popen(
                     [_get_python_exe(), "-m", "streamlit", "run",
                      "tools/dashboard.py",
-                     "--server.port", "8501",
+                     "--server.port", str(self._dashboard_port),
                      "--server.headless", "true"],
                     env=env, cwd=PROJECT_ROOT, **kw
                 )
@@ -2109,9 +2208,9 @@ class ObsidianApp(ctk.CTk):
                         pass
                 return
 
-            self.after(2500, lambda: webbrowser.open("http://localhost:8501"))
+            self.after(500, lambda: self._open_dashboard_when_ready(self._dashboard_url()))
         else:
-            webbrowser.open("http://localhost:8501")
+            self._open_dashboard_when_ready(self._dashboard_url())
 
     def _check_for_updates_async(self) -> None:
         """Check private Git updates without blocking the launcher startup."""
@@ -2131,6 +2230,12 @@ class ObsidianApp(ctk.CTk):
                 )
                 raw = (r.stdout or "").strip()
                 data = json.loads(raw) if raw else {}
+                if r.returncode != 0 and not data:
+                    data = {
+                        "ok": False,
+                        "reason": "check_failed",
+                        "message": (r.stderr or r.stdout or "Update-Check fehlgeschlagen").strip(),
+                    }
             except Exception as exc:
                 data = {"ok": False, "reason": "check_failed", "message": str(exc)}
             self.after(0, lambda d=data: self._apply_update_check_result(d))
@@ -2148,10 +2253,13 @@ class ObsidianApp(ctk.CTk):
                     msg = "Update-System nicht konfiguriert."
                 elif reason == "remote_unreachable":
                     msg = "Update-Check nicht erreichbar. Pruefe SSH-Key/GitHub-Zugriff."
+                elif reason == "check_failed":
+                    detail = str(data.get("message") or "").strip()
+                    msg = "Update-Check fehlgeschlagen" + (f": {detail[:180]}" if detail else ".")
                 else:
                     msg = ""
                 if msg:
-                    self.status_text.set(msg)
+                    self._set_update_status_override(msg, ttl_sec=30.0)
                     if reason not in {"repo_missing", "git_missing"} and not getattr(self, "_update_notice_shown", False):
                         self._update_notice_shown = True
                         try:
@@ -2162,12 +2270,21 @@ class ObsidianApp(ctk.CTk):
                 return
             if not data.get("update_available"):
                 self._pending_update_data = None
+                self._clear_update_status_override()
                 self._set_update_cta_visible(False)
                 if last_update.get("status") == "failed":
-                    self.status_text.set(f"Letztes Update fehlgeschlagen: {last_update.get('message', '')}")
+                    self._set_update_status_override(
+                        f"Letztes Update fehlgeschlagen: {last_update.get('message', '')}",
+                        ttl_sec=45.0,
+                    )
                 return
             remote = str(data.get("remote") or "")[:8]
             failed_note = ""
+            same_failed_remote = (
+                last_update.get("status") == "failed"
+                and str(last_update.get("remote") or "")
+                and str(last_update.get("remote") or "") == str(data.get("remote") or "")
+            )
             if last_update.get("status") == "failed":
                 failed_note = f"\n\nLetzter Update-Versuch: {last_update.get('message', '')}"
             if data.get("bootstrap_required"):
@@ -2180,8 +2297,10 @@ class ObsidianApp(ctk.CTk):
                        "das Update installiert und danach automatisch neu gestartet."
                        + failed_note)
             self._pending_update_data = data
+            self._set_update_status_override(msg)
             self._set_update_cta_visible(True)
-            self.status_text.set(msg)
+            if same_failed_remote:
+                return
             if getattr(self, "_update_notice_shown", False):
                 return
             self._update_notice_shown = True
@@ -2248,6 +2367,7 @@ class ObsidianApp(ctk.CTk):
                 **subprocess_no_window_kwargs(),
             )
             self._set_update_cta_visible(False)
+            self._clear_update_status_override()
             self.status_text.set("Update startet, Launcher wird geschlossen ...")
             self.after(250, self._shutdown_clean)
         except Exception as exc:
@@ -2500,7 +2620,7 @@ class ObsidianApp(ctk.CTk):
         current = _LLM_DEFAULT
         try:
             if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, encoding="utf-8") as f:
+                with open(CONFIG_FILE, encoding="utf-8-sig") as f:
                     current = json.load(f).get("LLM_MODEL", current)
         except Exception:
             pass
@@ -2599,7 +2719,7 @@ class ObsidianApp(ctk.CTk):
         selected_var = ctk.StringVar(value=current)
 
         manual_label_ref = {}
-        # side="bottom": Feld + Label direkt BER den (ebenfalls bottom
+        # side="bottom": Feld + Label direkt ueber den (ebenfalls bottom
         # gepackten) Apply/Cancel-Buttons verankern, damit die dynamisch
         # eingefgte Modell-Liste sie nie aus dem Fenster drckt. Wegen
         # bottom-Stacking zuerst das Feld (landet unten), dann das Label.
@@ -2747,8 +2867,10 @@ class ObsidianApp(ctk.CTk):
         return detect_ai_mode_from_log(line)
 
     def _reset_virtual_capital(self):
-        """Setzt die Virtual Capital Anzeige zurck auf 1000 USDT.
-        Kein DB-Eintrag wird gelscht  nur der Anzeigeoffset wird gespeichert."""
+        """Reset the virtual-capital display to 1000 USDT.
+
+        No DB rows are deleted; only the display offset is stored.
+        """
         dlg = ctk.CTkToplevel(self)
         dlg.title("Reset Virtual Capital")
         dlg.geometry("400x190")
@@ -2772,7 +2894,7 @@ class ObsidianApp(ctk.CTk):
         row.pack()
 
         def _confirm():
-            # Aktuellen PnL als Offset speichern  Anzeige springt zurck auf 1000
+            # Store current PnL as offset so the display jumps back to 1000.
             try:
                 cache = self.poller.get_all()
                 all_stats = cache.get("stats", {})
@@ -2846,6 +2968,27 @@ class ObsidianApp(ctk.CTk):
         except Exception:
             pass
 
+    def _runtime_sim_for_running_bot(self, bot: str) -> bool | None:
+        """Return a running bot's own SIM/LIVE mode when the heartbeat is fresh."""
+        try:
+            if not self.bots[bot].is_running():
+                return None
+            rs = read_runtime_status(BOT_META[bot]["log_dir"])
+            run_id = str(getattr(self.bots[bot], "run_id", "") or "")
+            if run_id and str(rs.get("run_id") or "") != run_id:
+                return None
+            try:
+                age = time.monotonic() - float(rs.get("monotonic_ts") or 0.0)
+            except (TypeError, ValueError):
+                return None
+            if age < -5.0 or age > 45.0:
+                return None
+            if "simulation" in rs:
+                return bool(rs.get("simulation"))
+        except Exception:
+            return None
+        return None
+
     def _sync_sim_state(self):
         """Keep the in-memory SIMULATION flags AND the per-card SIM/LIVE badge in
         sync with bot_config.json on disk. The flag can change OUTSIDE the launcher
@@ -2863,6 +3006,14 @@ class ObsidianApp(ctk.CTk):
         except Exception:
             return
         for bot in BOT_ORDER:
+            runtime_sim = self._runtime_sim_for_running_bot(bot)
+            if runtime_sim is not None:
+                if bool(self.config.get(bot, {}).get("SIMULATION", True)) != runtime_sim:
+                    self.config.setdefault(bot, {})["SIMULATION"] = runtime_sim
+                    self._apply_sim_badge(bot, runtime_sim)
+                continue
+            if self.bots[bot].is_running():
+                continue
             try:
                 # raise_on_corrupt=False: a transiently locked/half-written config
                 # must not crash the UI loop  keep the last known badge instead.
@@ -2946,7 +3097,7 @@ class ObsidianApp(ctk.CTk):
                         build = str(rs.get("build_id") or "")
                         if build and build != "unknown":
                             status_label += f" - {build[:8]}"
-                        if "simulation" in rs:
+                        if "simulation" in rs and -5.0 <= stale_age <= 45.0:
                             _is_sim = bool(rs.get("simulation"))
                         if stale_age > 45.0:
                             status_label = f"Stale {int(stale_age)}s"
@@ -2968,7 +3119,12 @@ class ObsidianApp(ctk.CTk):
                                               border_width=2,
                                               border_color="#4b4664",
                                               text_color=COLORS["text_muted"])
-                card["stop_btn"].configure(state="normal")
+                card["stop_btn"].configure(state="normal",
+                                           fg_color="transparent",
+                                           hover_color="#3a1820",
+                                           text_color=COLORS["danger"],
+                                           border_width=2,
+                                           border_color=COLORS["danger"])
             else:
                 card["status"].set("Stopped")
                 try:
@@ -2981,7 +3137,12 @@ class ObsidianApp(ctk.CTk):
                                               border_width=2,
                                               border_color="#a7f3d0",
                                               text_color="#ffffff")
-                card["stop_btn"].configure(state="normal")
+                card["stop_btn"].configure(state="disabled",
+                                           fg_color="transparent",
+                                           hover_color=COLORS["panel_hover"],
+                                           text_color=COLORS["text_muted"],
+                                           border_width=2,
+                                           border_color=COLORS["border"])
 
             uses_llm = bool(BOT_META[bot].get("uses_llm", True)
                             and self.config.get(bot, {}).get("USE_LLM", False))
@@ -3109,7 +3270,7 @@ class ObsidianApp(ctk.CTk):
                 self.sb_balance_live.set(live_bal)
                 self.sb_balance_live._lbl.configure(text_color=COLORS["balanced"])
 
-            # Aufschlsselung Spot/Futures anzeigen, wenn:
+            # Aufschluesselung Spot/Futures anzeigen, wenn:
             #  Beide Wallets LIVE (Trennung sinnvoll), ODER
             #  Ein Wallet hat OFFENE POSITIONEN (equity > free  User
             #     sollte sehen, dass das Geld in Trades steckt, nicht
@@ -3143,7 +3304,7 @@ class ObsidianApp(ctk.CTk):
                                             fill="x", pady=(0, 4))
                     self.sb_balance_futures.set(cache.get("balance_live_futures", ""))
 
-                    # Live-Update des Tooltip-Textes mit der Positions-Aufschlsselung
+                    # Live-Update des Tooltip-Textes mit der Positions-Aufschluesselung
                     tip = getattr(self, "_futures_wallet_tooltip", None)
                     if tip is not None and futures_eq:
                         try:
@@ -3204,14 +3365,28 @@ class ObsidianApp(ctk.CTk):
         else:
             self.sb_balance_sim._wrap.master.pack_forget()
 
-        # Sidebar Performance  Summe ber alle Bots
+        # Sidebar performance follows the active money scope: LIVE when at
+        # least one live bot exists, otherwise SIM. This avoids mixing paper
+        # and real PnL in one headline number.
         all_stats = cache.get("stats", {})
-        total       = sum(s["pnl"]       for s in all_stats.values())
-        total_today = sum(s["today_pnl"] for s in all_stats.values())
-        total_count = sum(s["total"]     for s in all_stats.values())
-        total_wins  = sum((s["wr"]/100*s["total"]) for s in all_stats.values())
+        money_scope_live = any_live
+        scoped_stats = [
+            s for b, s in all_stats.items()
+            if bool(self.config.get(b, {}).get("SIMULATION", True)) != money_scope_live
+        ]
+        total       = sum(float(s.get("pnl", 0.0) or 0.0) for s in scoped_stats)
+        total_today = sum(float(s.get("today_pnl", 0.0) or 0.0) for s in scoped_stats)
+        total_count = sum(int(s.get("total", 0) or 0) for s in scoped_stats)
+        total_wins  = sum(
+            (float(s.get("wr", 0.0) or 0.0) / 100.0 * int(s.get("total", 0) or 0))
+            for s in scoped_stats
+        )
         avg_wr      = (total_wins / total_count * 100) if total_count > 0 else 0
 
+        try:
+            self.sb_total._header_lbl.configure(text=("LIVE PnL" if money_scope_live else "SIM PnL"))
+        except Exception:
+            pass
         sign = "+" if total >= 0 else ""
         self.sb_total.set(f"{sign}{total:.2f} USDT")
         total_color = COLORS["success"] if total > 0 else COLORS["danger"] if total < 0 else COLORS["text_dim"]
@@ -3230,12 +3405,20 @@ class ObsidianApp(ctk.CTk):
         else:
             self.sb_winrate.set("")
 
-        # Sidebar: Gesamt-Unrealized PnL (Summe aller Bots)
+        # Sidebar: total unrealized PnL across all bots.
         unr_cache = cache.get("unrealized", {})
         open_cache = cache.get("open", {})
-        total_open = sum(open_cache.values())
+        total_open = sum(
+            int(open_cache.get(b, 0) or 0)
+            for b in BOT_ORDER
+            if bool(self.config.get(b, {}).get("SIMULATION", True)) != money_scope_live
+        )
         if total_open > 0:
-            total_unr = sum(unr_cache.get(b, 0.0) for b in BOT_ORDER)
+            total_unr = sum(
+                float(unr_cache.get(b, 0.0) or 0.0)
+                for b in BOT_ORDER
+                if bool(self.config.get(b, {}).get("SIMULATION", True)) != money_scope_live
+            )
             sign_u = "+" if total_unr >= 0 else ""
             self.sb_unr_total.set(f"{sign_u}{total_unr:.2f} USDT")
             unr_color = (COLORS["success"] if total_unr > 0
@@ -3393,17 +3576,15 @@ class ObsidianApp(ctk.CTk):
         self._pulse_step = (self._pulse_step + 1) % 20
         phase = abs(10 - self._pulse_step) / 10.0
 
-        # Globalen LLM-Status fr Bots im "unknown"-Zustand nutzen
+        # Use global LLM status only while a bot's local mode is unknown.
         cache = self.poller.get_all()
         global_llm_online = bool((cache.get("llm") or {}).get("online"))
 
         for bot in BOT_ORDER:
             card = self.cards[bot]
             if self.bots[bot].is_running():
-                # Mechanische Bots (uses_llm=False, z.B. der Trend-Bot) haben
-                # KEINE KI-Entscheidung zum Anzeigen  sie drfen den GLOBALEN
-                # LLM-Status nicht erben, sonst pulst ihre LED "LLM aktiv" grn,
-                # obwohl sie nie ein LLM aufrufen. Neutraler Lauf-Indikator.
+                # Mechanical bots (uses_llm=False) must not inherit the global
+                # LLM status; show a neutral running indicator instead.
                 uses_llm = bool(BOT_META[bot].get("uses_llm", True)
                                 and self.config.get(bot, {}).get("USE_LLM", False))
                 if not uses_llm:
@@ -3412,18 +3593,18 @@ class ObsidianApp(ctk.CTk):
                     mode = card.get("ai_mode", "unknown")
 
                     if mode == "keyword":
-                        base_color = COLORS["warning"]  # Gelb  Keyword-Fallback
+                        base_color = COLORS["warning"]  # Keyword fallback.
                     elif mode == "llm":
-                        base_color = COLORS["success"]  # Grn  volle KI aktiv
+                        base_color = COLORS["success"]  # Full LLM active.
                     else:
-                        # Noch kein Log-Eintrag: Ollama-Status als Schtzwert
+                        # No log signal yet: use Ollama status as estimate.
                         base_color = COLORS["success"] if global_llm_online else COLORS["warning"]
 
-                # Sanftes Pulsieren
+                # Soft pulse.
                 color = base_color if phase > 0.3 else self._darker(base_color, 0.4)
                 card["led"].configure(text_color=color)
             else:
-                # Gestoppt: Statisch Rot, kein Blinken
+                # Stopped: static red, no blinking.
                 card["led"].configure(text_color=COLORS["danger"])
 
         self.after(150, self._pulse)

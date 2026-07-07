@@ -4,11 +4,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 from tools.ensure_git import find_git
+from tools.update_from_git import (
+    _load_update_config,
+    _redact_repo_url,
+    _ssh_command,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -28,14 +34,22 @@ def _read_json(path: Path) -> dict:
 
 
 def _repo_config() -> tuple[str, str]:
+    return _load_update_config()
+
+
+def _redact_text(text: str) -> str:
+    out = str(text or "")
     for path in CONFIG_PATHS:
-        if path.exists():
-            data = _read_json(path)
-            repo = str(data.get("repo_url") or "").strip()
-            branch = str(data.get("branch") or "main").strip() or "main"
-            if repo:
-                return repo, branch
-    return "", "main"
+        data = _read_json(path)
+        repo = str(data.get("repo_url") or "").strip()
+        if repo:
+            out = out.replace(repo, _redact_repo_url(repo))
+    env_repo = os.getenv("OBSIDIAN_UPDATE_REPO_URL", "").strip()
+    if env_repo:
+        out = out.replace(env_repo, _redact_repo_url(env_repo))
+    for url in set(re.findall(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s]+", out)):
+        out = out.replace(url, _redact_repo_url(url.rstrip(".,;")))
+    return out
 
 
 def _find_git() -> str:
@@ -44,11 +58,7 @@ def _find_git() -> str:
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     env = os.environ.copy()
-    key = Path.home() / ".ssh" / "obsidian_update_ed25519"
-    ssh_cmd = "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
-    if key.exists():
-        ssh_cmd += f' -i "{key}" -o IdentitiesOnly=yes'
-    env["GIT_SSH_COMMAND"] = env.get("GIT_SSH_COMMAND") or ssh_cmd
+    env["GIT_SSH_COMMAND"] = env.get("GIT_SSH_COMMAND") or _ssh_command()
     env["GIT_TERMINAL_PROMPT"] = "0"
     kwargs = {}
     if sys.platform == "win32":
@@ -70,7 +80,9 @@ def _last_update_status() -> dict:
     data = _read_json(UPDATE_STATUS_PATH)
     if not isinstance(data, dict):
         return {}
-    allowed = {"status", "message", "started_at", "finished_at", "returncode"}
+    if "message" in data:
+        data["message"] = _redact_text(str(data.get("message") or ""))
+    allowed = {"status", "message", "started_at", "finished_at", "returncode", "remote", "branch"}
     return {k: data.get(k) for k in allowed if k in data}
 
 
@@ -83,21 +95,25 @@ def check_update() -> dict:
             "message": "Git nicht gefunden",
             "last_update": _last_update_status(),
         }
-    repo, branch = _repo_config()
-    if not repo:
+    try:
+        repo, branch = _repo_config()
+    except RuntimeError as exc:
+        message = _redact_text(str(exc))
+        reason = "repo_missing" if "Kein privates Update-Repo" in message else "repo_invalid"
         return {
             "ok": False,
-            "reason": "repo_missing",
-            "message": "Update-Repo nicht konfiguriert",
+            "reason": reason,
+            "message": message,
             "last_update": _last_update_status(),
         }
 
     remote = _run([git, "ls-remote", repo, f"refs/heads/{branch}"])
     if remote.returncode != 0:
+        detail = _redact_text(remote.stderr or remote.stdout or "Remote nicht erreichbar")
         return {
             "ok": False,
             "reason": "remote_unreachable",
-            "message": (remote.stderr or remote.stdout or "Remote nicht erreichbar").strip()[:300],
+            "message": detail.strip()[:300],
             "last_update": _last_update_status(),
         }
     remote_hash = (remote.stdout.split() or [""])[0]
@@ -121,7 +137,7 @@ def check_update() -> dict:
 
     return {
         "ok": True,
-        "repo": repo,
+        "repo": _redact_repo_url(repo),
         "branch": branch,
         "remote": remote_hash,
         "local": local_hash,

@@ -4,7 +4,7 @@ config/telegram_config.py  Telegram credential loader.
 Reads TELEGRAM_TOKEN / TELEGRAM_CHAT_ID from .env and strips surrounding
 whitespace (a trailing space would otherwise make Telegram reject the token
 with a confusing 401). Exposes validate_telegram_config() as a fail-fast
-callers can run at startup; logs (never raises) on import if either is missing.
+callers can run explicitly when they need a diagnostic.
 """
 import os
 from typing import Tuple, Optional
@@ -25,6 +25,13 @@ def _clean(v: Optional[str]) -> Optional[str]:
 
 TELEGRAM_TOKEN: Optional[str]   = _clean(os.getenv("TELEGRAM_TOKEN"))
 TELEGRAM_CHAT_ID: Optional[str] = _clean(os.getenv("TELEGRAM_CHAT_ID"))
+
+
+def _mask_chat_id(cid: str) -> str:
+    text = str(cid or "")
+    if len(text) <= 4:
+        return "***"
+    return "***" + text[-4:]
 
 
 def validate_telegram_config(raise_on_missing: bool = False
@@ -67,33 +74,11 @@ def validate_telegram_config(raise_on_missing: bool = False
         return False, "TELEGRAM_CHAT_ID is empty"
     for cid in raw_ids:
         if not cid.lstrip("-").isdigit():
-            return False, (f"TELEGRAM_CHAT_ID has a non-numeric id: {cid!r} "
+            return False, (f"TELEGRAM_CHAT_ID has a non-numeric id: {_mask_chat_id(cid)!r} "
                            f"(use comma-separated numeric ids, e.g. 111111111,222222222)")
 
     return True, "ok"
 
 
-# Loud-fail at import-time if either is missing  but only log, never
-# raise. A bot without Telegram is still useful; Telegram-send sites
-# should guard with `if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:` already.
-try:
-    _ok, _msg = validate_telegram_config()
-    if not _ok:
-        try:
-            from core.logger import log_event
-            log_event(f"[telegram_config] {_msg}", "WARN")
-        except Exception:
-            # Fallback: log_event not importable at this stage during
-            # cold init  use silent_log if it's importable, else stderr.
-            try:
-                from bot_utils.silent_log import silent_log
-                silent_log("telegram_config import", ValueError(_msg))
-            except Exception:
-                import sys
-                if sys.stderr is not None:
-                    try:
-                        sys.stderr.write(f"[telegram_config] {_msg}\n")
-                    except Exception:
-                        pass
-except Exception:
-    pass
+# Telegram is optional. Importing this module must be quiet; callers that want
+# diagnostics should call validate_telegram_config() explicitly.

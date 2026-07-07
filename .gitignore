@@ -75,9 +75,7 @@ tools/regime_robustness.py
 tools/regime_robustness2.py
 tools/regime_sensitivity.py
 tools/regime_verdict.py
-tools/release_check.py
 tools/run_context_logger.bat
-tools/selftest.py
 tools/setup_logger_task.bat
 tools/signal_edge.py
 tools/test_indicator_fidelity.py

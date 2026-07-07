@@ -101,11 +101,12 @@ class ScanMixin:
                     )
                     if cb_failures == self.CB_FAILURE_THRESHOLD:
                         try:
-                            send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                                f" [{self.BOT_NAME}] Circuit breaker tripped\n"
-                                f"{cb_failures} consecutive errors. "
-                                f"Check error_log.txt."
-                            )
+                            if not self.simulation:
+                                send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                                    f" [{self.BOT_NAME}] Circuit breaker tripped\n"
+                                    f"{cb_failures} consecutive errors. "
+                                    f"Check error_log.txt."
+                                )
                         except Exception:
                             pass
                     if self._shutdown_event.wait(timeout=cb_backoff):
@@ -479,13 +480,14 @@ class ScanMixin:
             pass
 
         try:
-            send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                f" [{self.BOT_NAME}] KAUF {sym}\n"
-                f"Preis: {r['price']:.6f} USDT\n"
-                f"Einsatz: {trade_usdt:.2f} USDT (Kelly)\n"
-                f"RSI: 15m {r['rsi_15m']:.1f}|1h {r['rsi_1h']:.1f}|4h {r['rsi_4h']:.1f}\n"
-                f"Pump: {r['change_percent']:.1f}% | Phase: {regime['regime']}"
-            )
+            if not self.simulation:
+                send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                    f" [{self.BOT_NAME}] KAUF {sym}\n"
+                    f"Preis: {r['price']:.6f} USDT\n"
+                    f"Einsatz: {trade_usdt:.2f} USDT (Kelly)\n"
+                    f"RSI: 15m {r['rsi_15m']:.1f}|1h {r['rsi_1h']:.1f}|4h {r['rsi_4h']:.1f}\n"
+                    f"Pump: {r['change_percent']:.1f}% | Phase: {regime['regime']}"
+                )
         except Exception as e:
             log_event(f"Telegram failed: {e}", "WARN")
 

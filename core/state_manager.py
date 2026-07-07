@@ -93,8 +93,11 @@ class _SingleWriterJSON:
 
     def __init__(self, path: str):
         self.path = path
-        self._latest: Optional[dict] = None
+        self._latest: Optional[tuple[int, dict]] = None
         self._cv = threading.Condition()
+        self._write_lock = threading.Lock()
+        self._seq = 0
+        self._floor_rev = 0
         self._stop = False
         self._thread = threading.Thread(
             target=self._run, daemon=True,
@@ -102,22 +105,57 @@ class _SingleWriterJSON:
         )
         self._thread.start()
 
-    def submit(self, payload: dict) -> None:
+    def submit(self, payload: dict, rev: int | None = None) -> None:
         with self._cv:
-            self._latest = payload
+            if rev is None:
+                self._seq += 1
+                rev = self._seq
+            if rev < self._floor_rev:
+                return
+            self._latest = (rev, payload)
             self._cv.notify()
+
+    def write_now(self, payload: dict, rev: int | None = None) -> bool:
+        with self._cv:
+            if rev is None:
+                self._seq += 1
+                rev = self._seq
+            self._floor_rev = max(self._floor_rev, rev)
+            # Drop queued older snapshots so they cannot overwrite this
+            # critical synchronous write after a close/remove.
+            self._latest = None
+        try:
+            with self._write_lock:
+                self._write_atomic(payload)
+            return True
+        except Exception as e:
+            try:
+                from core.logger import log_event
+                log_event(f"[StateManager] JSON write failed for "
+                          f"{self.path}: {e}", "WARN")
+            except Exception:
+                pass
+            return False
 
     def _run(self) -> None:
         while not self._stop:
             with self._cv:
                 while self._latest is None and not self._stop:
                     self._cv.wait(timeout=2.0)
-                payload = self._latest
+                item = self._latest
                 self._latest = None
-            if payload is None:
+            if item is None:
                 continue
+            rev, payload = item
+            with self._cv:
+                if rev < self._floor_rev:
+                    continue
             try:
-                self._write_atomic(payload)
+                with self._write_lock:
+                    with self._cv:
+                        if rev < self._floor_rev:
+                            continue
+                    self._write_atomic(payload)
             except Exception as e:
                 try:
                     from core.logger import log_event
@@ -128,7 +166,10 @@ class _SingleWriterJSON:
 
     def _write_atomic(self, payload: dict) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        tmp = self.path + ".tmp"
+        tmp = (
+            f"{self.path}.tmp.{os.getpid()}."
+            f"{threading.get_ident()}.{time.monotonic_ns()}"
+        )
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, indent=2, ensure_ascii=False)
@@ -246,7 +287,10 @@ class StateManager:
         if migrated:
             self._write_sqlite_bulk(merged)
         if self.write_json and self._json_writer:
-            self._json_writer.submit({s: p.to_dict() for s, p in merged.items()})
+            self._json_writer.submit(
+                {s: p.to_dict() for s, p in merged.items()},
+                rev=self._persist_rev,
+            )
 
         return dict(self._positions)
 
@@ -257,11 +301,18 @@ class StateManager:
             snapshot = {s: p.to_dict() for s, p in self._positions.items()}
             rev = self._persist_rev = self._persist_rev + 1
         # Disk I/O outside lock
+        persisted = True
         with self._persist_lock:
             if self._is_current_revision(rev):
-                self._write_sqlite_single(position)
-                if self.write_json and self._json_writer:
-                    self._json_writer.submit(snapshot)
+                persisted = self._write_sqlite_single(position)
+                if persisted and self.write_json and self._json_writer:
+                    self._json_writer.submit(snapshot, rev=rev)
+        if not persisted:
+            with self.lock:
+                current = self._positions.get(position.symbol)
+                if current is position:
+                    self._positions.pop(position.symbol, None)
+            return
         self._emit("POSITION_OPENED", position)
 
     def update(self, symbol: str, **kwargs) -> Optional[Position]:
@@ -269,10 +320,12 @@ class StateManager:
         _alias = {"buy": "buy_price", "highest": "highest_price"}
         snapshot_pos = None
         snapshot = None
+        old_pos = None
         with self.lock:
             pos = self._positions.get(symbol)
             if pos is None:
                 return None
+            old_pos = Position.from_dict(pos.to_dict())
             for k, v in kwargs.items():
                 attr = _alias.get(k, k)
                 if hasattr(pos, attr):
@@ -281,11 +334,18 @@ class StateManager:
             snapshot     = {s: p.to_dict() for s, p in self._positions.items()}
             rev = self._persist_rev = self._persist_rev + 1
         # Disk I/O OUTSIDE lock
+        persisted = True
         with self._persist_lock:
             if self._is_current_revision(rev):
-                self._write_sqlite_single(snapshot_pos)
-                if self.write_json and self._json_writer:
-                    self._json_writer.submit(snapshot)
+                persisted = self._write_sqlite_single(snapshot_pos)
+                if persisted and self.write_json and self._json_writer:
+                    self._json_writer.submit(snapshot, rev=rev)
+        if not persisted:
+            with self.lock:
+                if symbol in self._positions:
+                    self._positions[symbol] = old_pos
+                    self._persist_rev += 1
+            return None
         return snapshot_pos
 
     def remove(self, symbol: str) -> Optional[Position]:
@@ -293,11 +353,28 @@ class StateManager:
             pos = self._positions.pop(symbol, None)
             snapshot = {s: p.to_dict() for s, p in self._positions.items()}
             rev = self._persist_rev = self._persist_rev + 1
+        persisted = True
         with self._persist_lock:
             if self._is_current_revision(rev):
-                self._delete_sqlite(symbol)
-                if self.write_json and self._json_writer:
-                    self._json_writer.submit(snapshot)
+                deleted = self._delete_sqlite(symbol)
+                # Backwards-compatible for tests/legacy monkeypatches from
+                # the old void-return helper; real _delete_sqlite now returns
+                # False only on confirmed persistence failure.
+                persisted = True if deleted is None else bool(deleted)
+                if persisted and self.write_json and self._json_writer:
+                    if hasattr(self._json_writer, "write_now"):
+                        persisted = self._json_writer.write_now(snapshot, rev=rev)
+                    else:
+                        self._json_writer.submit(snapshot, rev=rev)
+        if not persisted and pos is not None:
+            with self.lock:
+                self._positions[symbol] = pos
+                self._persist_rev += 1
+            try:
+                self._write_sqlite_single(pos)
+            except Exception:
+                pass
+            return None
         if pos:
             self._emit("POSITION_CLOSED", pos)
         return pos
@@ -320,10 +397,12 @@ class StateManager:
             rev = self._persist_rev
         with self._persist_lock:
             if self._is_current_revision(rev):
-                self._write_sqlite_bulk(snapshot)
-                if self.write_json and self._json_writer:
+                persisted = self._write_sqlite_bulk(snapshot)
+                if persisted and self.write_json and self._json_writer:
                     self._json_writer.submit(
-                        {s: p.to_dict() for s, p in snapshot.items()})
+                        {s: p.to_dict() for s, p in snapshot.items()},
+                        rev=rev,
+                    )
 
     def _is_current_revision(self, rev: int) -> bool:
         with self.lock:
@@ -417,7 +496,40 @@ class StateManager:
         "btc_trend", "fear_greed",
     })
 
-    def _upsert_row(self, conn, pos: Position) -> None:
+    @staticmethod
+    def _claim_base(symbol: str) -> str:
+        text = str(symbol or "").upper()
+        return text.split("/")[0].split(":")[0].strip()
+
+    @staticmethod
+    def _is_futures_type(position_type: str) -> bool:
+        return str(position_type or "").upper() != "SPOT"
+
+    def _blocked_by_other_owner(self, conn, pos: Position) -> bool:
+        base = self._claim_base(pos.symbol)
+        if not base:
+            return False
+        is_futures = self._is_futures_type(pos.position_type.value)
+        rows = conn.execute(
+            "SELECT bot_name, symbol, position_type FROM bot_open_positions "
+            "WHERE bot_name != ?",
+            (pos.bot_name,),
+        ).fetchall()
+        for row in rows:
+            other = dict(row)
+            if self._claim_base(other.get("symbol")) != base:
+                continue
+            if self._is_futures_type(other.get("position_type")) == is_futures:
+                self._warn(
+                    f"SQLite write blocked: {pos.symbol} already owned by "
+                    f"{other.get('bot_name')}"
+                )
+                return True
+        return False
+
+    def _upsert_row(self, conn, pos: Position) -> bool:
+        if self._blocked_by_other_owner(conn, pos):
+            return False
         d     = pos.to_dict()
         # Sanitize inf/nan in extra before serialization
         extra = {}
@@ -439,10 +551,9 @@ class StateManager:
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(bot_name, symbol) DO UPDATE SET
             buy_price     = excluded.buy_price,
-            -- buy_time bewusst NICHT berschreiben (analog opened_at): Reconciles
-            -- und partial-update calls drfen den Entry-Zeitstempel nicht
-            -- zurcksetzen, sonst rechnet die "wie lange offen" PnL-Analytics
-            -- ab dem letzten Update.
+            -- Keep the original buy_time, matching opened_at. Reconcile and
+            -- partial-update calls must not reset the entry timestamp because
+            -- PnL analytics use it for "time open" calculations.
             -- buy_time      = excluded.buy_time,
             amount        = excluded.amount,
             invested_usdt = excluded.invested_usdt,
@@ -456,7 +567,7 @@ class StateManager:
             btc_trend     = excluded.btc_trend,
             fear_greed    = excluded.fear_greed,
             extra_json    = excluded.extra_json
-            -- opened_at bewusst NICHT berschreiben (sonst PnL-Analytics falsch)
+            -- Keep opened_at stable, otherwise PnL analytics are wrong.
         """, (
             pos.bot_name, pos.symbol, pos.buy_price, pos.buy_time,
             pos.amount, pos.invested_usdt,
@@ -465,27 +576,33 @@ class StateManager:
             pos.change_pct, pos.btc_trend, pos.fear_greed,
             json.dumps(extra, allow_nan=False, default=str), pos.opened_at,
         ))
+        return True
 
-    def _write_sqlite_single(self, pos: Position) -> None:
+    def _write_sqlite_single(self, pos: Position) -> bool:
         conn = None
         try:
             conn = self._get_conn()
             conn.execute("BEGIN IMMEDIATE")
-            self._upsert_row(conn, pos)
+            persisted = self._upsert_row(conn, pos)
             conn.execute("COMMIT")
+            return persisted
         except Exception as e:
             self._warn(f"SQLite write error ({pos.symbol}): {e}")
             try:
                 conn.execute("ROLLBACK")
             except Exception:
                 pass
+            # Keep the in-memory state on transient DB failures so a live
+            # exchange position is still monitored. Only confirmed owner
+            # conflicts return False and roll back the local add.
+            return True
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
 
-    def _write_sqlite_bulk(self, positions: Dict[str, Position]) -> None:
+    def _write_sqlite_bulk(self, positions: Dict[str, Position]) -> bool:
         conn = None
         try:
             conn = self._get_conn()
@@ -503,21 +620,25 @@ class StateManager:
                     (self.bot_name, sym),
                 )
             for pos in positions.values():
-                self._upsert_row(conn, pos)
+                if not self._upsert_row(conn, pos):
+                    conn.execute("ROLLBACK")
+                    return False
             conn.execute("COMMIT")
+            return True
         except Exception as e:
             self._warn(f"SQLite bulk write error: {e}")
             try:
                 conn.execute("ROLLBACK")
             except Exception:
                 pass
+            return True
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
 
-    def _delete_sqlite(self, symbol: str) -> None:
+    def _delete_sqlite(self, symbol: str) -> bool:
         conn = None
         try:
             conn = self._get_conn()
@@ -527,12 +648,14 @@ class StateManager:
                 (self.bot_name, symbol),
             )
             conn.execute("COMMIT")
+            return True
         except Exception as e:
             self._warn(f"SQLite delete error ({symbol}): {e}")
             try:
                 conn.execute("ROLLBACK")
             except Exception:
                 pass
+            return False
         finally:
             try:
                 conn.close()

@@ -704,7 +704,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             # CROSS overrides MARGIN_MODE="cross"; FUTURES stays isolated. The
             # emergency close MUST send the same margin_mode the position was
             # opened with or MEXC rejects the reduce-only order.
-            margin_mode=str(d.get("margin_mode") or self.C("MARGIN_MODE", "isolated")),
+            margin_mode=str(self.C("MARGIN_MODE", "isolated")),
             shutdown_event=self._shutdown_event,
             reason=reason,
             ticker_cache=self.ticker_cache,

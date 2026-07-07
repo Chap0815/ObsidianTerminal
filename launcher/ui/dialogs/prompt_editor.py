@@ -16,6 +16,7 @@ import sys
 import customtkinter as ctk
 import tkinter as tk
 
+from bot_utils.silent_log import silent_log
 from launcher.config.settings import BOT_META, COLORS, FONT_BODY, PROJECT_ROOT
 from launcher.ui.components.widgets import safe_geometry
 from launcher.ui.theme import force_dark_titlebar
@@ -267,7 +268,7 @@ class PromptEditor(ctk.CTkToplevel):
                        ).pack(side="left")
 
         ctk.CTkLabel(f_inner,
-                      text="Speichern berschreibt die Datei  Bot muss danach neugestartet werden",
+                      text="Speichern ueberschreibt die Datei. Bot danach neu starten.",
                       font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                       text_color=COLORS["text_muted"]
                       ).pack(side="left", padx=(16, 0))
@@ -409,7 +410,7 @@ class PromptEditor(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             dlg,
-            text="Folgende Pfade wurden geprft (aber keiner existiert).\n"
+            text="Folgende Pfade wurden geprueft (aber keiner existiert).\n"
                   "Erwartet werden die Dateien:  "
                   f"prompts/{os.path.basename(self.prompt_path)}  "
                   f"oder  prompts/{os.path.basename(self.default_path)}",
@@ -587,8 +588,10 @@ class PromptEditor(ctk.CTkToplevel):
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write(content)
                 f.flush()
-                try: os.fsync(f.fileno())
-                except Exception: pass
+                try:
+                    os.fsync(f.fileno())
+                except Exception as e:
+                    silent_log(f"prompt_editor fsync({self.prompt_path})", e)
             os.replace(tmp, self.prompt_path)
             self._dirty = False
             self.status_lbl.configure(

@@ -458,7 +458,7 @@ def _fetch_fear_greed_history() -> list:
     if CMC_API_KEY:
         try:
             headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
-            # Parameter limit=2 holt automatisch heute und gestern fr den Vergleich
+            # limit=2 fetches today and yesterday for comparison.
             r = _http_get("https://pro-api.coinmarketcap.com/v3/fear-and-greed/historical?limit=2", headers=headers)
             r.raise_for_status()
             data = r.json().get("data", []) or []
@@ -574,5 +574,5 @@ def get_combined_news_text(symbol: str, include_general: bool = True,
         if general:
             headlines = general[:2] + headlines
     if not headlines:
-        return "Keine spezifischen News fr dieses Symbol verfgbar."
+        return "Keine spezifischen News fuer dieses Symbol verfuegbar."
     return " | ".join(headlines[:max_items + 2])

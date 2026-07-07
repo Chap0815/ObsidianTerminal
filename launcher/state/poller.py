@@ -34,15 +34,33 @@ from launcher.core.metrics_service import (
 )
 from launcher.core.system_monitor import get_system_stats
 
+_RUNTIME_MODE_MAX_AGE_SEC = 180.0
+
+
+def _runtime_status_is_fresh(rs: dict, *, now: float | None = None) -> bool:
+    """Runtime mode is authoritative only while its heartbeat is recent."""
+    if not isinstance(rs, dict):
+        return False
+    status = str(rs.get("status") or "").lower()
+    if status not in {"starting", "started", "ready", "running", "degraded"}:
+        return False
+    try:
+        mono = float(rs.get("monotonic_ts") or 0.0)
+    except (TypeError, ValueError):
+        mono = 0.0
+    if mono > 0:
+        age = (time.monotonic() if now is None else now) - mono
+        return -5.0 <= age <= _RUNTIME_MODE_MAX_AGE_SEC
+    return False
+
 
 def _runtime_or_config_sim(bot: str, cfg: dict | None = None) -> bool:
     """Return the mode the running process reports; config is fallback only."""
     try:
         from core.runtime_status import read_runtime_status
         rs = read_runtime_status(BOT_META[bot]["log_dir"])
-        if str(rs.get("status") or "").lower() in {"starting", "ready"}:
-            if "simulation" in rs:
-                return bool(rs.get("simulation"))
+        if _runtime_status_is_fresh(rs) and "simulation" in rs:
+            return bool(rs.get("simulation"))
     except Exception:
         pass
     try:
@@ -198,21 +216,38 @@ class DataPoller:
                 new_data["system"]   = get_system_stats()
                 new_data["market"]   = get_market_info()
                 new_data["exchange"] = get_exchange_status()
+                cfg_snapshot = None
+                try:
+                    if os.path.exists(CONFIG_FILE):
+                        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as fh:
+                            cfg_snapshot = json.load(fh)
+                except Exception:
+                    cfg_snapshot = None
+                mode_is_sim = {
+                    bot: _runtime_or_config_sim(bot, cfg_snapshot)
+                    for bot in BOT_ORDER
+                }
 
                 stats: dict = {}
                 opens: dict = {}
                 for bot in BOT_ORDER:
-                    stats[bot] = get_bot_stats(bot)
+                    stats[bot] = get_bot_stats(bot, mode_is_sim=mode_is_sim[bot])
                     if BOT_META[bot].get("is_futures"):
                         # Futures-type bots (FUTURES, CROSS) use futures_state as
                         # the authoritative source  SCOPED PER BOT so they don't
                         # sum each other's positions (both share the table).
                         opens[bot] = get_futures_state_count(bot)
                     else:
-                        opens[bot] = len(get_open_trades(BOT_META[bot]["log_dir"], bot))
+                        opens[bot] = len(get_open_trades(
+                            BOT_META[bot]["log_dir"], bot,
+                            mode_is_sim=mode_is_sim[bot]))
                 new_data["stats"] = stats
                 new_data["open"]  = opens
-                new_data["futures_positions"] = opens["FUTURES"]
+                new_data["futures_positions"] = sum(
+                    int(opens.get(bot, 0) or 0)
+                    for bot in BOT_ORDER
+                    if BOT_META[bot].get("is_futures")
+                )
 
                 #  Sparkline (PnL trend, last ~30 closed trades) 
                 # Refresh every 30s  sparklines only change when a trade
@@ -221,7 +256,8 @@ class DataPoller:
                     spark = {}
                     for bot in BOT_ORDER:
                         try:
-                            spark[bot] = get_pnl_sparkline(bot, limit=30)
+                            spark[bot] = get_pnl_sparkline(
+                                bot, limit=30, mode_is_sim=mode_is_sim[bot])
                         except Exception:
                             # Keep the previous values rather than wiping
                             # the chart on a transient DB hiccup
@@ -252,6 +288,7 @@ class DataPoller:
                                 BOT_META[spot_bot]["log_dir"],
                                 self._spot_exchange,
                                 bot_name=spot_bot,
+                                mode_is_sim=mode_is_sim[spot_bot],
                             )
                         except Exception:
                             # Reset connection so the next cycle tries a fresh one
@@ -309,17 +346,13 @@ class DataPoller:
                         #  both LIVE  sum of both wallets
                         live_spot = False
                         live_futures = False
-                        _cfg = None
-                        if os.path.exists(CONFIG_FILE):
-                            with open(CONFIG_FILE, "r", encoding="utf-8-sig") as _f:
-                                _cfg = json.load(_f)
-                            for _b in BOT_ORDER:
-                                if _runtime_or_config_sim(_b, _cfg):
-                                    continue
-                                if BOT_META.get(_b, {}).get("is_futures"):
-                                    live_futures = True
-                                else:
-                                    live_spot = True
+                        for _b in BOT_ORDER:
+                            if mode_is_sim.get(_b, True):
+                                continue
+                            if BOT_META.get(_b, {}).get("is_futures"):
+                                live_futures = True
+                            else:
+                                live_spot = True
 
                         if live_spot or live_futures:
                             # Use equity_utils for the real wallet equity

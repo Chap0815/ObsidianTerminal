@@ -123,29 +123,24 @@ def clamp_offset(win, x: int, y: int, w: int, h: int,
 #  Sparkline (mini PnL trend line in each bot card) 
 
 class Sparkline(tk.Frame):
-    """Kleine Verlaufslinie der kumulierten PnL ber die letzten Trades.
+    """Small trend line for cumulative PnL over the last trades.
 
-    Reine Anzeige  zeichnet eine Liste von Floats auf ein tk.Canvas.
-    Farbe richtet sich nach dem letzten Wert (grn = im Plus, rot = im
-    Minus). Wird vom Refresh-Loop via ``set_values()`` aktualisiert; die
-    Daten kommen aus ``metrics_service.get_pnl_sparkline``.
+    Display-only widget: draws a list of floats on a tk.Canvas. The color is
+    based on the final value (green = positive, red = negative). The refresh
+    loop calls ``set_values()`` with data from
+    ``metrics_service.get_pnl_sparkline``.
 
-    HINWEIS: erbt bewusst von ``tk.Frame`` (nicht ``ctk.CTkFrame``).
-    Ein rohes ``tk.Canvas`` als Kind eines CTkFrame fhrt zu
-    ``TypeError: unsupported operand 'int'+'str'`` beim Master-Setup,
-    weil CTkFrame intern keinen sauberen Tk-Master fr klassische
-    Tk-Widgets bereitstellt. tk.Frame umgeht das.
+    This intentionally inherits from ``tk.Frame`` instead of ``ctk.CTkFrame``:
+    a raw ``tk.Canvas`` below CTkFrame can hit ``TypeError: unsupported operand
+    'int'+'str'`` during Tk master setup.
     """
 
     def __init__(self, parent, width=180, height=34):
         super().__init__(parent, bg=COLORS["panel_alt"],
                          highlightthickness=0, bd=0, height=height)
         self.pack_propagate(False)
-        # WICHTIG: NICHT self._w / self._h verwenden  Tkinter benutzt
-        # self._w intern als Widget-Pfad-String. berschreiben mit einem
-        # int (width) fhrt zu "TypeError: 'int'+'str'" sobald ein Kind-
-        # Widget (tk.Canvas) seinen Pfad aus master._w bildet. Eigene
-        # Namen mit Prefix vermeiden die Kollision.
+        # Never use self._w / self._h here. Tkinter uses self._w internally as
+        # the widget path string; overwriting it breaks child widget creation.
         self._spark_w = width
         self._spark_h = height
         self.canvas = tk.Canvas(self, height=height, bg=COLORS["panel_alt"],
@@ -155,8 +150,7 @@ class Sparkline(tk.Frame):
         self.canvas.bind("<Configure>", lambda e: self._redraw())
 
     def set_values(self, values: list) -> None:
-        """Neue Datenreihe setzen + neu zeichnen. ``values`` ist die
-        kumulierte PnL-Kurve (lteste zuerst)."""
+        """Set a new cumulative PnL series (oldest first) and redraw."""
         self._values = list(values) if values else []
         self._redraw()
 
@@ -170,7 +164,7 @@ class Sparkline(tk.Frame):
         except Exception:
             w, h = self._spark_w, self._spark_h
         if not vals or len(vals) < 2 or w < 4 or h < 4:
-            # Platzhalter: dezente Mittellinie wenn keine Daten
+            # Placeholder: subtle center line when there is no data.
             c.create_line(2, h / 2, w - 2, h / 2,
                           fill=COLORS["border"], width=1)
             return
@@ -185,36 +179,35 @@ class Sparkline(tk.Frame):
         def _x(i): return pad + i * step_x
         def _y(v): return h - pad - ((v - vmin) / span) * (h - 2 * pad)
 
-        # Farbe nach letztem Wert (Endstand der Kurve)
+        # Color by final curve value.
         last = vals[-1]
         line_color = (COLORS["success"] if last > 0
                       else COLORS["danger"] if last < 0
                       else COLORS["text_dim"])
 
-        # Nulllinie (falls 0 im Wertebereich liegt) dezent einzeichnen
+        # Draw a subtle zero line if 0 is inside the displayed range.
         if vmin < 0 < vmax:
             zy = _y(0.0)
             c.create_line(pad, zy, w - pad, zy,
                           fill=COLORS["border"], width=1, dash=(2, 3))
 
-        # Punkte der Kurve
+        # Curve points.
         pts = []
         for i, v in enumerate(vals):
             pts.extend([_x(i), _y(v)])
 
-        # KLARE Linie  keine Flchenfllung (die wirkte als "Schattenpftze").
+        # Clear line, no area fill; the fill looked muddy in dense bot cards.
         c.create_line(*pts, fill=line_color, width=2,
                       capstyle="round", joinstyle="round", smooth=False)
 
-        # Endpunkt-Markierung (klein)
+        # Small endpoint marker.
         c.create_oval(_x(n - 1) - 2, _y(last) - 2,
                       _x(n - 1) + 2, _y(last) + 2,
                       fill=line_color, outline="")
 
     @staticmethod
     def _tint(hex_color: str) -> str:
-        """Dunkle, dezente Tnung einer Hex-Farbe fr die Flchenfllung
-        unter der Sparkline (~22% Helligkeit Richtung Panel-Hintergrund)."""
+        """Darken a hex color for subtle sparkline fill variants."""
         try:
             hc = hex_color.lstrip("#")
             r, g, b = int(hc[0:2], 16), int(hc[2:4], 16), int(hc[4:6], 16)

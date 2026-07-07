@@ -184,7 +184,7 @@ def _file_lock(path: str, timeout: float = 5.0):
 
 def set_cooldown(cool: dict, symbol: str, minutes: int,
                  cooldown_file: str) -> None:
-    """Setzt Cooldown fr `minutes` Minuten ab jetzt."""
+    """Set a cooldown for ``minutes`` minutes from now."""
     minutes = max(0, int(minutes))
     if minutes == 0:
         return
@@ -213,7 +213,7 @@ def check_in_cooldown(cool: dict, symbol: str) -> bool:
 
 def is_in_cooldown(cool: dict, symbol: str, cooldown_file: str) -> bool:
     """Legacy: read AND auto-purge expired entries. Schreibt die Datei
-    auf expired hits  daher NICHT fr Hot-Path verwenden."""
+    on expired hits; do not use in hot paths."""
     needs_persist = False
     snapshot = None
     with _COOLDOWN_LOCK:
@@ -280,7 +280,7 @@ def _persist(path: str, data: dict) -> None:
 
 
 def _atomic_write_json(path: str, data: dict) -> None:
-    """Retry-budget fr Windows AV scan interference."""
+    """Retry budget for Windows AV scan interference."""
     import json
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"

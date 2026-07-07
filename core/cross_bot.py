@@ -116,6 +116,115 @@ class CrossBot(FuturesBot):
         except (TypeError, ValueError):
             return 0.0
 
+    def _safe_float(self, value, default: float = 0.0) -> float:
+        try:
+            out = float(value)
+            return out if out == out else default
+        except (TypeError, ValueError):
+            return default
+
+    def _fetch_exchange_position(self, full: str) -> tuple[dict | None, bool]:
+        try:
+            from config.exchange_config import safe_fetch_positions
+            poss = safe_fetch_positions(self.ex, [full])
+            if poss is None:
+                return None, True
+        except Exception:
+            return None, True
+        for pos in poss or []:
+            if (pos.get("symbol") or "") != full:
+                continue
+            contracts = abs(self._safe_float(pos.get("contracts") or pos.get("size"), 0.0))
+            if contracts > 0:
+                return pos, False
+        return None, False
+
+    def _verify_entry_fill(self, full: str, order: dict,
+                           fallback_fill: float) -> tuple[float, float, bool, str]:
+        amount = self._safe_float((order or {}).get("filled"), 0.0)
+        fill = fallback_fill
+        for key in ("average", "price"):
+            fv = self._safe_float((order or {}).get(key), 0.0)
+            if fv > 0:
+                fill = fv
+                break
+        if amount > 0:
+            return amount, fill, False, "order"
+
+        oid = (order or {}).get("id") or (order or {}).get("orderId")
+        if oid:
+            for attempt in range(2):
+                time.sleep(0.4 * (1 + attempt))
+                try:
+                    refreshed = self.ex.fetch_order(str(oid), full) or {}
+                except Exception:
+                    continue
+                rf = self._safe_float(refreshed.get("filled"), 0.0)
+                if rf > 0:
+                    for key in ("average", "price"):
+                        fv = self._safe_float(refreshed.get(key), 0.0)
+                        if fv > 0:
+                            fill = fv
+                            break
+                    return rf, fill, False, "order_refresh"
+
+        pos, unavailable = self._fetch_exchange_position(full)
+        if pos:
+            contracts = abs(self._safe_float(pos.get("contracts") or pos.get("size"), 0.0))
+            for key in ("entryPrice", "entry_price"):
+                fv = self._safe_float(pos.get(key), 0.0)
+                if fv > 0:
+                    fill = fv
+                    break
+            return contracts, fill, False, "position"
+        return 0.0, fill, unavailable, "none"
+
+    def _heal_provisional_leg(self, base: str, d: dict) -> bool:
+        from core.logger import log_event
+        from core.database import remove_open_position
+
+        full = f"{base}/USDT:USDT"
+        try:
+            if float(d.get("entry_inflight_until") or 0.0) > time.time():
+                return False
+        except (TypeError, ValueError):
+            pass
+        pos, unavailable = self._fetch_exchange_position(full)
+        if pos is None:
+            if unavailable:
+                return False
+            log_event(f"[{self.BOT_NAME}] {base}: provisional leg had no "
+                      f"exchange position - removing stale claim", "WARN")
+            try:
+                self.state.remove(base)
+            except Exception:
+                pass
+            remove_open_position(self.BOT_NAME, base)
+            return False
+
+        contracts = abs(self._safe_float(pos.get("contracts") or pos.get("size"), 0.0))
+        entry = 0.0
+        for key in ("entryPrice", "entry_price"):
+            entry = self._safe_float(pos.get(key), 0.0)
+            if entry > 0:
+                break
+        if entry <= 0:
+            entry = self._safe_float(d.get("buy"), 0.0)
+        if contracts <= 0 or entry <= 0:
+            return False
+
+        self.state.update_many(base, {
+            "buy": entry,
+            "highest": max(self._safe_float(d.get("highest"), entry), entry),
+            "last_price": entry,
+            "amount": contracts,
+            "original_amount": contracts,
+            "provisional": False,
+        })
+        log_event(f"[{self.BOT_NAME}] {base}: provisional leg verified "
+                  f"from exchange position ({contracts:g} contracts)", "WARN")
+        return True
+
     def _cross_sim_roundtrip_fee(self, full_symbol: str, notional: float) -> float:
         if notional <= 0:
             return 0.0
@@ -834,6 +943,7 @@ class CrossBot(FuturesBot):
             return
         margin = notional / max(lev, 1.0)
         fees = 0.0
+        provisional = False
 
         #  Realistic execution + liquidity gate 
         # Use the ORDER-BOOK price you'd actually CROSS (ask for LONG, bid for
@@ -928,6 +1038,22 @@ class CrossBot(FuturesBot):
                 log_event(f"[{self.BOT_NAME}] {base}: claimed by another bot "
                           f"- skip", "WAIT")
                 return
+            self.state.add(base, {
+                "position_type": side,
+                "buy": exec_price,
+                "highest": exec_price,
+                "last_price": exec_price,
+                "buy_time": _utc(),
+                "invested_usdt": margin,
+                "leverage": lev,
+                "amount": contracts,
+                "original_amount": contracts,
+                "funding_paid": 0.0,
+                "fees_paid": 0.0,
+                "strategy": "xsec",
+                "provisional": True,
+                "entry_inflight_until": time.time() + 120.0,
+            })
             try:
                 order = create_order_with_retry(
                     self.ex, full, order_side, contracts, params=params,
@@ -962,7 +1088,7 @@ class CrossBot(FuturesBot):
                     from bot_utils.futures_order import _find_order_by_client_id
                     landed = _find_order_by_client_id(self.ex, full, _cid)
                     if landed is not None and float(landed.get("filled") or 0) > 0:
-                        _amt = float(landed.get("filled") or 0) or contracts
+                        _amt = float(landed.get("filled") or 0)
                         self.state.add(base, {
                             "position_type": side, "buy": exec_price,
                             "highest": exec_price, "last_price": exec_price,
@@ -978,20 +1104,37 @@ class CrossBot(FuturesBot):
                 except Exception:
                     pass
                 if not _landed:
+                    try:
+                        self.state.remove(base)
+                    except Exception:
+                        pass
                     remove_open_position(self.BOT_NAME, base)
                 return
-            amount = float(order.get("filled") or 0) or contracts
-            fill = exec_price
-            for _k in ("average", "price"):
-                _v = order.get(_k)
-                if _v:
-                    try:
-                        _fv = float(_v)
-                        if _fv > 0:
-                            fill = _fv
-                            break
-                    except (TypeError, ValueError):
-                        pass
+            amount, fill, positions_unavailable, verified_source = (
+                self._verify_entry_fill(full, order, exec_price)
+            )
+            provisional = False
+            if amount <= 0 and not positions_unavailable:
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: order returned no fill and "
+                    f"no exchange position was found - aborting state write",
+                    "WARN")
+                try:
+                    self.state.remove(base)
+                except Exception:
+                    pass
+                remove_open_position(self.BOT_NAME, base)
+                return
+            if amount <= 0:
+                amount = contracts
+                provisional = True
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: entry fill not yet verified "
+                    f"(positions unavailable) - tracking provisionally", "WARN")
+            elif verified_source == "position":
+                log_event(f"[{self.BOT_NAME}] {base}: entry amount verified "
+                          f"from exchange position ({amount:g} contracts)",
+                          "INFO")
             try:
                 fees = extract_or_estimate_futures_fee(
                     self.ex, order, full, fill, amount=amount, contract_size=cs)
@@ -1011,20 +1154,22 @@ class CrossBot(FuturesBot):
             "funding_paid": 0.0,
             "fees_paid": fees,
             "strategy": "xsec",
+            "provisional": provisional,
         })
-        log_event(f"[{self.BOT_NAME}] OPEN {side} {base} @ {fill:.6f} "
-                  f"(notional {notional:.1f}, margin {margin:.1f}, fee {fees:.4f})", "INFO")
-        try:
-            # Same format + symbol as the FUTURES open notification ().
-            if self._telegram_enabled():
-                from core.logger import send_telegram
-                from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-                send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                    f"[{self.BOT_NAME}] {side} {base} @ {lev:g}x\n"
-                    f"Entry: {fill:.6f} USDT\n"
-                    f"Margin: {margin:.2f} USDT (Notional: {notional:.2f})")
-        except Exception:
-            pass
+        if not provisional:
+            log_event(f"[{self.BOT_NAME}] OPEN {side} {base} @ {fill:.6f} "
+                      f"(notional {notional:.1f}, margin {margin:.1f}, fee {fees:.4f})", "INFO")
+            try:
+                # Same format + symbol as the FUTURES open notification.
+                if self._telegram_enabled():
+                    from core.logger import send_telegram
+                    from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+                    send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                        f"[{self.BOT_NAME}] {side} {base} @ {lev:g}x\n"
+                        f"Entry: {fill:.6f} USDT\n"
+                        f"Margin: {margin:.2f} USDT (Notional: {notional:.2f})")
+            except Exception:
+                pass
 
     def _close_leg(self, base: str, d: dict, reason: str) -> None:
         # Serialize closes per coin: monitor (disaster/killswitch) and scan
@@ -1054,6 +1199,43 @@ class CrossBot(FuturesBot):
         exch_oid = None
         profit_usdt = 0.0
         live_close_already_verified = False
+        pending_accounting = bool(d.get("accounting_pending"))
+
+        if d.get("claim_conflict") and not pending_accounting:
+            warned = getattr(self, "_claim_conflict_warned", set())
+            if base not in warned:
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: registry claim conflict - "
+                    f"close skipped fail-closed; run claim/state repair",
+                    "ERROR",
+                )
+                warned.add(base)
+                self._claim_conflict_warned = warned
+            return
+
+        if pending_accounting:
+            try:
+                close_price = float(
+                    d.get("accounting_pending_sell_price")
+                    or d.get("pending_close_price")
+                    or close_price
+                )
+            except (TypeError, ValueError):
+                pass
+            try:
+                close_fee = float(
+                    d.get("accounting_pending_fees_usdt")
+                    or d.get("pending_close_fee")
+                    or close_fee
+                )
+            except (TypeError, ValueError):
+                pass
+            exch_oid = (
+                d.get("accounting_pending_exchange_order_id")
+                or d.get("pending_close_order_id")
+                or exch_oid
+            )
+            live_close_already_verified = True
 
         if not self.simulation and d.get("pending_close_price"):
             try:
@@ -1087,6 +1269,7 @@ class CrossBot(FuturesBot):
             from bot_utils import (create_order_with_retry,
                                    extract_or_estimate_futures_fee,
                                    futures_contract_size,
+                                   is_no_position_error,
                                    verify_position_closed)
             from config.exchange_config import reduce_only_params, safe_amount_to_precision
             lev_int = max(1, int(__import__("math").ceil(lev)))
@@ -1108,63 +1291,92 @@ class CrossBot(FuturesBot):
                     shutdown_event=self._shutdown_event,
                     action_label=f"cross close {base}", log_event=log_event)
             except Exception as e:
-                log_event(f"[{self.BOT_NAME}] {base}: close FAILED ({e}) - "
-                          f"position KEPT for retry; close MANUALLY if it persists",
-                          "ERROR")
-                self._log_error(f"cross close {base}", e)
-                return   # keep state -> monitor / next rebalance retries
-            exch_oid = order.get("id") or order.get("orderId")
-            try:
-                from bot_utils.futures_exits import _resolve_fill_price
-                close_price, _fill_src = _resolve_fill_price(
-                    self.ex, full, order, close_price, log_event)
-            except Exception:
-                for _k in ("average", "price"):
-                    _v = order.get(_k)
-                    if _v:
-                        try:
-                            _fv = float(_v)
-                            if _fv > 0:
-                                close_price = _fv
-                                break
-                        except (TypeError, ValueError):
-                            pass
-            try:
-                cs = futures_contract_size(self.ex, full)
-                close_fee += extract_or_estimate_futures_fee(
-                    self.ex, order, full, close_price, amount=amt, contract_size=cs)
-            except Exception:
-                pass
-            try:
-                self.state.update_many(base, {
-                    "pending_close_price": close_price,
-                    "pending_close_fee": close_fee,
-                    "pending_close_order_id": exch_oid,
-                })
-            except Exception:
-                pass
+                if is_no_position_error(e):
+                    try:
+                        _closed, _remaining = verify_position_closed(self.ex, full)
+                    except Exception as ve:
+                        self._log_error(f"cross verify-close-after-error {base}", ve)
+                        log_event(
+                            f"[{self.BOT_NAME}] {base}: close error looked flat "
+                            f"but verification failed - kept for reconcile",
+                            "WARN",
+                        )
+                        return
+                    if _closed:
+                        log_event(
+                            f"[{self.BOT_NAME}] {base}: position already flat "
+                            f"on exchange ({str(e)[:80]}) - booking local close",
+                            "WARN",
+                        )
+                        live_close_already_verified = True
+                    else:
+                        log_event(
+                            f"[{self.BOT_NAME}] {base}: close error but "
+                            f"{_remaining:.6f} contracts remain - kept for retry",
+                            "WARN",
+                        )
+                        return
+                else:
+                    log_event(f"[{self.BOT_NAME}] {base}: close FAILED ({e}) - "
+                              f"position KEPT for retry; close MANUALLY if it persists",
+                              "ERROR")
+                    self._log_error(f"cross close {base}", e)
+                    return   # keep state -> monitor / next rebalance retries
+            if live_close_already_verified:
+                order = {}
+            else:
+                exch_oid = order.get("id") or order.get("orderId")
+                try:
+                    from bot_utils.futures_exits import _resolve_fill_price
+                    close_price, _fill_src = _resolve_fill_price(
+                        self.ex, full, order, close_price, log_event)
+                except Exception:
+                    for _k in ("average", "price"):
+                        _v = order.get(_k)
+                        if _v:
+                            try:
+                                _fv = float(_v)
+                                if _fv > 0:
+                                    close_price = _fv
+                                    break
+                            except (TypeError, ValueError):
+                                pass
+                try:
+                    cs = futures_contract_size(self.ex, full)
+                    close_fee += extract_or_estimate_futures_fee(
+                        self.ex, order, full, close_price, amount=amt, contract_size=cs)
+                except Exception:
+                    pass
+                try:
+                    self.state.update_many(base, {
+                        "pending_close_price": close_price,
+                        "pending_close_fee": close_fee,
+                        "pending_close_order_id": exch_oid,
+                    })
+                except Exception:
+                    pass
 
-            #  VERIFY THE CLOSE BEFORE BOOKING 
-            # Confirm the leg is flat (fetch_positions) BEFORE booking PnL and
-            # dropping it. On a partial fill in a thin alt book (routine on
-            # cross-margin alts) or an unverifiable close, keep the leg and let
-            # the monitor / next rebalance retry - the reduce-only retry caps to
-            # the true remaining size, so the eventual confirmed close books
-            # once and never leaves an unmanaged orphan or double-counts PnL.
-            try:
-                _closed, _remaining = verify_position_closed(self.ex, full)
-            except Exception as e:
-                self._log_error(f"cross verify-close {base}", e)
-                log_event(f"[{self.BOT_NAME}] {base}: close unverified - "
-                          f"keeping leg, retry next tick", "WARN")
-                return
-            if not _closed:
-                log_event(
-                    f"[{self.BOT_NAME}] {base}: close incomplete "
-                    f"(remaining {_remaining:.6f}) - keeping leg, retry next "
-                    f"tick (NOT booking - prevents orphan + double-count)",
-                    "WARN")
-                return
+                #  VERIFY THE CLOSE BEFORE BOOKING
+                # Confirm the leg is flat (fetch_positions) BEFORE booking PnL and
+                # dropping it. On a partial fill in a thin alt book (routine on
+                # cross-margin alts) or an unverifiable close, keep the leg and let
+                # the monitor / next rebalance retry - the reduce-only retry caps to
+                # the true remaining size, so the eventual confirmed close books
+                # once and never leaves an unmanaged orphan or double-counts PnL.
+                try:
+                    _closed, _remaining = verify_position_closed(self.ex, full)
+                except Exception as e:
+                    self._log_error(f"cross verify-close {base}", e)
+                    log_event(f"[{self.BOT_NAME}] {base}: close unverified - "
+                              f"keeping leg, retry next tick", "WARN")
+                    return
+                if not _closed:
+                    log_event(
+                        f"[{self.BOT_NAME}] {base}: close incomplete "
+                        f"(remaining {_remaining:.6f}) - keeping leg, retry next "
+                        f"tick (NOT booking - prevents orphan + double-count)",
+                        "WARN")
+                    return
 
         #  Record REALIZED PnL (so get_today_pnl / metrics / killswitch work) 
         if entry > 0 and close_price > 0 and margin > 0:
@@ -1197,6 +1409,38 @@ class CrossBot(FuturesBot):
                 mae_pct = profit_pct
             giveback_pct = max(0.0, mfe_pct - profit_pct)
             sell_time = _utc()
+            reason_for_db = f"Cross {reason}"
+            if pending_accounting:
+                try:
+                    profit_usdt = float(
+                        d.get("accounting_pending_profit_usdt", profit_usdt))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    profit_pct = float(
+                        d.get("accounting_pending_profit_pct", profit_pct))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    funding = float(
+                        d.get("accounting_pending_funding_paid", funding))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    mfe_pct = float(d.get("accounting_pending_mfe_pct", mfe_pct))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    mae_pct = float(d.get("accounting_pending_mae_pct", mae_pct))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    giveback_pct = float(
+                        d.get("accounting_pending_giveback_pct", giveback_pct))
+                except (TypeError, ValueError):
+                    pass
+                sell_time = d.get("accounting_pending_sell_time") or sell_time
+                reason_for_db = d.get("accounting_pending_reason") or reason_for_db
             try:
                 from core.database import save_trade_db
                 saved_ok = bool(save_trade_db(
@@ -1204,7 +1448,7 @@ class CrossBot(FuturesBot):
                     buy_price=entry, sell_price=close_price,
                     buy_time=d.get("buy_time", ""), sell_time=sell_time,
                     profit_pct=profit_pct, profit_usdt=profit_usdt,
-                    invested_usdt=margin, reason=f"Cross {reason}",
+                    invested_usdt=margin, reason=reason_for_db,
                     is_futures=True, position_type=pos_type, leverage=lev,
                     funding_paid=funding, fees_usdt=close_fee,
                     exchange_order_id=exch_oid,
@@ -1329,6 +1573,8 @@ class CrossBot(FuturesBot):
         from bot_utils.futures_math import price_move_pct
         wmoves = []   # (move_fraction, notional_weight)
         for base, d in self.state.get_all().items():
+            if d.get("provisional"):
+                continue
             entry = float(d.get("buy", 0) or 0)
             last = float(d.get("last_price", entry) or entry)
             margin = float(d.get("invested_usdt", 0) or 0)
@@ -1375,6 +1621,8 @@ class CrossBot(FuturesBot):
             realized = float(get_today_pnl(self.BOT_NAME).get("total_profit", 0.0) or 0.0)
             unreal = 0.0
             for _b, d in trades.items():
+                if d.get("provisional"):
+                    continue
                 entry = float(d.get("buy", 0) or 0)
                 last = float(d.get("last_price", entry) or entry)
                 margin = float(d.get("invested_usdt", 0) or 0)
@@ -1404,13 +1652,26 @@ class CrossBot(FuturesBot):
                 for base in list(trades.keys()):
                     if self.state.has(base):
                         self._close_leg(base, trades[base], reason="daily-loss killswitch")
+                if self.state.get_all():
+                    self._last_ks_check = 0.0
         except Exception as e:
             self._log_error("cross daily killswitch", e)
 
     def _monitor_tick(self) -> None:
         from core.database import upsert_futures_state
+        from core.logger import log_event
         from bot_utils.futures_math import price_move_pct, calc_unrealized_pnl
         trades = self.state.get_all()
+        if not trades:
+            return
+        for base, d in list(trades.items()):
+            if d.get("provisional"):
+                if self._heal_provisional_leg(base, d):
+                    healed = self.state.get(base)
+                    if healed:
+                        trades[base] = healed
+                else:
+                    trades.pop(base, None)
         if not trades:
             return
         # Account-level daily-loss killswitch (flatten + SAFE_MODE). Without
@@ -1430,6 +1691,17 @@ class CrossBot(FuturesBot):
         for base, d in trades.items():
             if self._shutdown_event.is_set():
                 return
+            if d.get("claim_conflict"):
+                warned = getattr(self, "_claim_conflict_warned", set())
+                if base not in warned:
+                    log_event(
+                        f"[{self.BOT_NAME}] {base}: registry claim conflict - "
+                        f"monitor skipped fail-closed; run claim/state repair",
+                        "ERROR",
+                    )
+                    warned.add(base)
+                    self._claim_conflict_warned = warned
+                continue
             if not self.state.has(base):   # closed this tick (killswitch) - skip
                 continue
             full = f"{base}/USDT:USDT"
@@ -1638,6 +1910,8 @@ class CrossBot(FuturesBot):
             if not self.state.has(base):
                 continue
             self._close_leg(base, d, reason="neutrality-guard")
+            if self.state.has(base):
+                continue
             # removing a LONG lowers net; removing a SHORT raises it
             net += -notional if heavy == "LONG" else notional
             gross -= notional

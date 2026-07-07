@@ -441,6 +441,28 @@ def fg_label(value: int) -> str:
 # Market-regime detection
 # 
 
+def _closed_daily_bars(bars: list) -> list:
+    """Return only completed 1d candles.
+
+    CCXT commonly includes the currently-forming daily candle as the last bar.
+    Regime gates must not repaint on that candle. If timestamps are missing or
+    malformed, conservatively drop the last bar.
+    """
+    if not bars:
+        return []
+    out = list(bars)
+    try:
+        last_ts = int(float(out[-1][0]))
+        now_ms = int(time.time() * 1000)
+        day_ms = 24 * 60 * 60 * 1000
+        today_start_ms = (now_ms // day_ms) * day_ms
+        if last_ts >= today_start_ms:
+            out = out[:-1]
+    except Exception:
+        out = out[:-1]
+    return out
+
+
 def get_market_regime(exchange) -> dict:
     def fetch():
         from core.database import log_market_regime
@@ -450,23 +472,24 @@ def get_market_regime(exchange) -> dict:
             btc_24h    = float(ticker_24h.get("percentage", 0) or 0)
 
             bars = exchange.fetch_ohlcv(symbol, "1d", limit=9)
+            closed_bars = _closed_daily_bars(bars)
 
             # Nicht jede Exchange fllt das ccxt-Ticker-Feld "percentage"
             # (KuCoin z.B. nicht; Bitget/MEXC schon). Fallback: 24h-nderung
-            # selbst aus den ohnehin geladenen Tagescandles berechnen 
+            # selbst aus den ohnehin geladenen, geschlossenen Tagescandles berechnen
             # exchange-unabhngig.
             if not btc_24h:
                 try:
-                    if bars and len(bars) >= 2:
-                        prev_close = bars[-2][4]
-                        last_close = bars[-1][4]
+                    if closed_bars and len(closed_bars) >= 2:
+                        prev_close = closed_bars[-2][4]
+                        last_close = closed_bars[-1][4]
                         if prev_close:
                             btc_24h = ((last_close - prev_close) / prev_close) * 100
                 except Exception:
                     pass  # bleibt 0.0 wenn auch das nicht klappt
 
-            if len(bars) >= 8:
-                btc_7d = ((bars[-1][4] - bars[-8][4]) / bars[-8][4]) * 100
+            if len(closed_bars) >= 8:
+                btc_7d = ((closed_bars[-1][4] - closed_bars[-8][4]) / closed_bars[-8][4]) * 100
             else:
                 btc_7d = 0.0
 
@@ -624,12 +647,12 @@ def can_buy_now(exchange, bot_name: str = "", open_symbols: list = None,
       BEAR regime  NOT blocked. BEAR is exactly when shorts make sense.
       Extreme Greed (F&G  85)  NOT blocked for shorts. High greed can
                        be a reversal/short signal.
-      Extreme Fear  (F&G  15)  blocks ALL entries (both LONG and
-                       SHORT). The function is a pre-filter called before
-                       the direction is chosen, so a False return pauses
-                       the whole scan. Extreme Fear is a whipsaw market
-                       where capitulation bounces chop up both directions,
-                       so a global pause is the safe choice here.
+      Extreme Fear  (F&G <= SHORTS_EXTREME_FEAR_BLOCK, default 10)
+                       blocks ALL entries (both LONG and SHORT). The function
+                       is a pre-filter called before the direction is chosen,
+                       so a False return pauses the whole scan. Extreme Fear is
+                       a whipsaw market where capitulation bounces chop up both
+                       directions, so a global pause is the safe choice here.
 
     Spot bots and futures LONG entries use the default allow_shorts=False.
     """
@@ -658,7 +681,12 @@ def can_buy_now(exchange, bot_name: str = "", open_symbols: list = None,
     fg = get_fear_greed()
     if allow_shorts:
         # For shorts: extreme FEAR = capitulation bounce risk
-        if fg <= 10:
+        try:
+            extreme_fear_block = int(os.getenv("SHORTS_EXTREME_FEAR_BLOCK", "10"))
+        except (TypeError, ValueError):
+            extreme_fear_block = 10
+        extreme_fear_block = max(0, min(50, extreme_fear_block))
+        if fg <= extreme_fear_block:
             return (False,
                     f"Extreme Fear (F&G={fg})  pausing all entries "
                     f"(capitulation whipsaw risk for both directions)")

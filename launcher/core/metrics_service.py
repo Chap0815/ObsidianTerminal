@@ -62,7 +62,24 @@ def query_db(sql: str, params: tuple = ()) -> list:
 
 #  Per-bot aggregates 
 
-def get_bot_stats(bot: str) -> dict:
+def _metrics_bot_key(bot: str, mode_is_sim: bool | None = None) -> str:
+    from core.database import metrics_bot_name, metrics_bot_name_for_mode
+    if mode_is_sim is None:
+        return metrics_bot_name(bot)
+    return metrics_bot_name_for_mode(bot, bool(mode_is_sim))
+
+
+def _metrics_bot_keys(bot: str, mode_is_sim: bool | None = None) -> tuple[str, ...]:
+    if mode_is_sim is not None:
+        return (_metrics_bot_key(bot, mode_is_sim),)
+    from core.database import metrics_bot_name_for_mode
+    return (
+        metrics_bot_name_for_mode(bot, False),
+        metrics_bot_name_for_mode(bot, True),
+    )
+
+
+def get_bot_stats(bot: str, mode_is_sim: bool | None = None) -> dict:
     """PnL, total trade count, win rate, and today's slice for one bot.
 
     Realized PnL **must** include partial-TP rows  otherwise the top
@@ -74,8 +91,7 @@ def get_bot_stats(bot: str) -> dict:
     a "completed trade" for win-rate purposes  the remainder is still
     open).
     """
-    from core.database import metrics_bot_name
-    bot = metrics_bot_name(bot)   # read SIM bot rows under "<bot> (SIM)"
+    bot = _metrics_bot_key(bot, mode_is_sim)
     rows_pnl = query_db(
         "SELECT COALESCE(SUM(profit_usdt),0) FROM trades WHERE bot_name=?",
         (bot,)
@@ -101,10 +117,7 @@ def get_bot_stats(bot: str) -> dict:
         "FROM trades WHERE bot_name=? AND sell_time>=? AND sell_time<?",
         (bot, start_utc, end_utc)
     )
-    #  Payoff: -Gewinn vs. -Verlust ber abgeschlossene Trades 
-    # Liefert die Kennzahl, um die sich die ganze Edge-Analyse dreht:
-    # avg_win / |avg_loss| = payoff_ratio. Nur is_partial=0 (abgeschlossene
-    # Trades), getrennt nach Gewinn (profit_usdt>0) und Verlust (<0).
+    # Payoff over final closed trades: avg_win / abs(avg_loss).
     rows_payoff = query_db(
         "SELECT "
         "  COALESCE(AVG(CASE WHEN profit_usdt > 0 THEN profit_usdt END), 0), "
@@ -121,7 +134,7 @@ def get_bot_stats(bot: str) -> dict:
     today_pnl = float(today_info.get("total_profit", 0.0) or 0.0)
     today_cnt = int(rows_today_cnt[0][0]) if rows_today_cnt else int(
         today_info.get("trade_count", 0) or 0)
-    # Payoff-Kennzahlen
+    # Payoff metrics
     avg_win  = float(rows_payoff[0][0]) if rows_payoff else 0.0
     avg_loss = float(rows_payoff[0][1]) if rows_payoff else 0.0   # negativ
     payoff   = (avg_win / abs(avg_loss)) if avg_loss else 0.0
@@ -130,18 +143,15 @@ def get_bot_stats(bot: str) -> dict:
             "avg_win": avg_win, "avg_loss": avg_loss, "payoff": payoff}
 
 
-def get_pnl_sparkline(bot: str, limit: int = 30) -> list:
-    """Kumulierte realisierte PnL-Kurve ber die letzten ``limit``
-    abgeschlossenen Trades eines Bots  fr die Mini-Sparkline in der Karte.
+def get_pnl_sparkline(bot: str, limit: int = 30,
+                      mode_is_sim: bool | None = None) -> list:
+    """Cumulative realized PnL over the last ``limit`` closed bot trades.
 
-    Gibt eine Liste von Floats zurck (kumulativer Verlauf, ltester zuerst).
-    Leere Liste, wenn keine Trades vorliegen. Nur abgeschlossene Trades
-    (``is_partial=0``), damit die Kurve echten realisierten Verlauf zeigt
-    und nicht durch Teil-TPs verzerrt wird. Read-only, billig, wird im
-    Poller mit 15s-Throttle aufgerufen (nicht jeden 1.5s-Tick).
+    Returns floats in chronological order. Uses final closes only
+    (``is_partial=0``), so the card sparkline shows realized performance
+    without partial-TP noise. Read-only and throttled by the poller.
     """
-    from core.database import metrics_bot_name
-    bot = metrics_bot_name(bot)
+    bot = _metrics_bot_key(bot, mode_is_sim)
     rows = query_db(
         "SELECT profit_usdt FROM trades "
         "WHERE bot_name=? AND is_partial=0 AND sell_time IS NOT NULL "
@@ -150,7 +160,7 @@ def get_pnl_sparkline(bot: str, limit: int = 30) -> list:
     )
     if not rows:
         return []
-    # rows kommen DESC (neueste zuerst)  umdrehen fr chronologische Kurve
+    # Rows are DESC; reverse for chronological sparkline.
     profits = [float(r[0]) for r in reversed(rows)]
     cumulative = []
     running = 0.0
@@ -160,7 +170,8 @@ def get_pnl_sparkline(bot: str, limit: int = 30) -> list:
     return cumulative
 
 
-def _spot_state_file(log_dir: str, bot_name: str = None) -> str:
+def _spot_state_file(log_dir: str, bot_name: str = None,
+                     mode_is_sim: bool | None = None) -> str:
     """Mode-aware state file: SIM bots use trades.sim.json (separate from LIVE)
     so the dashboard reads the SAME file the bot writes."""
     base = f"{log_dir}/trades.json"
@@ -168,15 +179,18 @@ def _spot_state_file(log_dir: str, bot_name: str = None) -> str:
         return base
     try:
         from bot_utils.sim_flag import read_simulation_flag, sim_state_path
-        return sim_state_path(base, bool(read_simulation_flag(bot_name)))
+        is_sim = (bool(read_simulation_flag(bot_name))
+                  if mode_is_sim is None else bool(mode_is_sim))
+        return sim_state_path(base, is_sim)
     except Exception:
         return base
 
 
-def get_open_trades(log_dir: str, bot_name: str = None) -> dict:
+def get_open_trades(log_dir: str, bot_name: str = None,
+                    mode_is_sim: bool | None = None) -> dict:
     """Open spot trades dict from the bot's (mode-aware) state file. ``{}`` if
     missing or malformed."""
-    d = load_json(_spot_state_file(log_dir, bot_name))
+    d = load_json(_spot_state_file(log_dir, bot_name, mode_is_sim))
     return d if isinstance(d, dict) else {}
 
 
@@ -219,15 +233,19 @@ def get_market_info():
     return {"regime": regime, "btc_24h": btc_24h, "fg": fg, "timestamp": ts}
 
 
-def get_futures_state_count(bot_name: str = None) -> int:
+def get_futures_state_count(bot_name: str = None,
+                            mode_is_sim: bool | None = None) -> int:
     """Number of rows in ``futures_state``. Pass ``bot_name`` to count only ONE
     bot's positions  required now that multiple futures-type bots (FUTURES +
     CROSS) share this table; without the filter the Futures counter summed both.
     """
     if bot_name:
-        from core.database import metrics_bot_name
-        rows = query_db("SELECT COUNT(*) FROM futures_state WHERE bot_name=?",
-                        (metrics_bot_name(bot_name),))
+        keys = _metrics_bot_keys(bot_name, mode_is_sim)
+        placeholders = ",".join("?" for _ in keys)
+        rows = query_db(
+            f"SELECT COUNT(*) FROM futures_state WHERE bot_name IN ({placeholders})",
+            keys,
+        )
     else:
         rows = query_db("SELECT COUNT(*) FROM futures_state")
     return int(rows[0][0]) if rows else 0
@@ -307,7 +325,7 @@ def _read_configured_model() -> str:
         from launcher.config.settings import CONFIG_FILE  # type: ignore
         if not os.path.exists(CONFIG_FILE):
             return ""
-        with open(CONFIG_FILE, encoding="utf-8") as f:
+        with open(CONFIG_FILE, encoding="utf-8-sig") as f:
             cfg = _json.load(f)
         return str(cfg.get("LLM_MODEL", "")).strip()
     except Exception:
@@ -317,10 +335,7 @@ def _read_configured_model() -> str:
 #  Exchange liveness 
 
 def _exchange_display_name() -> str:
-    """Hbscher Brsenname fr die UI (z. B. 'Bitget'). Liest EXCHANGE aus
-    der .env via exchange_config; fllt bei Fehler still auf 'Exchange'
-    zurck. So zeigt die Sidebar bei zwei Instanzen mit verschiedenen .env
-    auf einen Blick, WELCHE Brse die jeweilige Instanz nutzt."""
+    """Human-readable exchange name for the UI."""
     try:
         # Module is config.exchange_config (env is the fallback below).
         from config.exchange_config import get_active_exchange_name
@@ -387,7 +402,8 @@ def get_exchange_status() -> dict:
 
 #  Unrealized PnL 
 
-def get_unrealized_pnl_futures(bot_name: str = None) -> float:
+def get_unrealized_pnl_futures(bot_name: str = None,
+                               mode_is_sim: bool | None = None) -> float:
     """Sum of unrealized PnL from ``futures_state``. Pass ``bot_name`` to scope
     to ONE bot  FUTURES + CROSS share this table, so without the filter the
     Futures unrealized PnL wrongly included the Cross bot's (even in SIM).
@@ -400,7 +416,6 @@ def get_unrealized_pnl_futures(bot_name: str = None) -> float:
          ``unrealized_pnl`` is still 0 (e.g. right after a position open,
          before the first monitor tick).
     """
-    from core.database import metrics_bot_name
     rows = query_db("""
         SELECT
             COALESCE(SUM(
@@ -424,12 +439,17 @@ def get_unrealized_pnl_futures(bot_name: str = None) -> float:
             ), 0.0)
         FROM futures_state
         {where}
-    """.format(where=("WHERE bot_name=?" if bot_name else "")),
-        ((metrics_bot_name(bot_name),) if bot_name else ()))
+    """.format(where=(
+        "WHERE bot_name IN ({})".format(",".join(
+            "?" for _ in _metrics_bot_keys(bot_name, mode_is_sim)))
+        if bot_name else ""
+    )),
+        (_metrics_bot_keys(bot_name, mode_is_sim) if bot_name else ()))
     return float(rows[0][0]) if rows else 0.0
 
 
-def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None) -> float:
+def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
+                            mode_is_sim: bool | None = None) -> float:
     """Unrealized PnL for open spot positions in the bot's (mode-aware) state.
 
     Strategy:
@@ -439,7 +459,7 @@ def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None) -
       3. Errors are logged via the standard ``logging`` module  never
          silently swallowed.
     """
-    trades = load_json(_spot_state_file(log_dir, bot_name))
+    trades = load_json(_spot_state_file(log_dir, bot_name, mode_is_sim))
     if not trades:
         return 0.0
     if exchange is None:

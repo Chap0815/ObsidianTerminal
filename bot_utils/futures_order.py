@@ -149,6 +149,27 @@ def _is_permanent_error(err_str: str) -> bool:
     return bool(_PERMANENT_PATTERN_RE.search(err_str))
 
 
+_NO_POSITION_PATTERN_RE = re.compile(
+    r"position\s+(?:does\s+not\s+exist|not\s+exist|not\s+found)"
+    r"|position\s+is\s+nonexistent"
+    r"|nonexistent\s+or\s+closed"
+    r"|no\s+(?:open\s+)?position"
+    r"|zero\s+position"
+    r"|\b2009\b",
+    re.IGNORECASE,
+)
+
+
+def is_no_position_error(exc_or_text) -> bool:
+    """True only for exchange errors that imply the position is already flat.
+
+    This is narrower than the generic permanent-order classifier: precision,
+    min-notional, balance, or symbol errors are permanent too, but must not
+    trigger local close accounting/cleanup.
+    """
+    return bool(_NO_POSITION_PATTERN_RE.search(str(exc_or_text or "")))
+
+
 def _is_rate_limit_error(err_str: str) -> bool:
     """MEXC code 510 / 429 / 'too frequent' - transient; needs a longer wait."""
     s = err_str.lower()
@@ -487,6 +508,33 @@ def futures_contract_size(ex, symbol_full: str) -> float:
         return v if v > 0 else 1.0
     except (TypeError, ValueError, AttributeError):
         return 1.0
+
+
+def filled_margin_usdt(amount: float,
+                       contract_size: float,
+                       fill_price: float,
+                       leverage: float,
+                       fallback_margin: float = 0.0) -> tuple[float, bool]:
+    """Return margin implied by the actual filled futures position.
+
+    Futures PnL math uses ``margin * leverage`` as notional. After a partial
+    entry fill, storing the intended margin would overstate open PnL and risk
+    gates. The exchange truth is contracts * contractSize * fill / leverage.
+    """
+    try:
+        amt = float(amount)
+        cs = float(contract_size)
+        px = float(fill_price)
+        lev = float(leverage)
+        raw = (amt * cs * px) / lev if lev > 0 else 0.0
+        if raw > 0:
+            return raw, True
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    try:
+        return float(fallback_margin or 0.0), False
+    except (TypeError, ValueError):
+        return 0.0, False
 
 
 def extract_or_estimate_futures_fee(ex,

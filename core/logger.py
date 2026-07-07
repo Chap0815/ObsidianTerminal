@@ -721,10 +721,21 @@ _TG_PROXIES = (
 )
 
 _TG_QUEUE: queue.Queue = queue.Queue(maxsize=100)
-# overflow log path resolved against the script directory
-_TG_OVERFLOW_LOG = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "telegram_overflow.log"
-)
+
+
+def _telegram_overflow_log_path() -> str:
+    try:
+        from core.paths import LOGS_DIR
+        return os.path.join(str(LOGS_DIR), "telegram_overflow.log")
+    except Exception:
+        return os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "logs",
+            "telegram_overflow.log",
+        )
+
+
+_TG_OVERFLOW_LOG = _telegram_overflow_log_path()
 # rate-limit the user-visible "queue overflow" warning
 _TG_OVERFLOW_LAST_WARN = 0.0
 
@@ -843,6 +854,19 @@ def _rotate_overflow_if_needed() -> None:
         pass
 
 
+def _write_telegram_overflow(cid: str, msg: str) -> None:
+    safe_cid = str(cid)
+    if len(safe_cid) > 4:
+        safe_cid = "***" + safe_cid[-4:]
+    os.makedirs(os.path.dirname(_TG_OVERFLOW_LOG), exist_ok=True)
+    with open(_TG_OVERFLOW_LOG, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "ts": _date(),
+            "chat_id": safe_cid,
+            "msg": redact(msg)[:500],
+        }) + "\n")
+
+
 def send_telegram(token, chat_id, msg) -> None:
     global _TG_OVERFLOW_LAST_WARN
     if not token or not chat_id:
@@ -873,15 +897,7 @@ def send_telegram(token, chat_id, msg) -> None:
                     pass
             try:
                 _rotate_overflow_if_needed()
-                safe_cid = str(cid)
-                if len(safe_cid) > 4:
-                    safe_cid = "***" + safe_cid[-4:]
-                with open(_TG_OVERFLOW_LOG, "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps({
-                        "ts": _date(),
-                        "chat_id": safe_cid,
-                        "msg": redact(msg)[:500],
-                    }) + "\n")
+                _write_telegram_overflow(cid, msg)
             except Exception:
                 pass
 

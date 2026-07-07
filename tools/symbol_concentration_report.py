@@ -34,8 +34,8 @@ class SymbolMetrics:
     avg_giveback: float | None
 
 
-def _idea_key(row: TradeRow) -> tuple[str, str, str, str, str]:
-    return (row.bot, row.mode, row.symbol, row.buy_time, row.sell_time)
+def _idea_key(row: TradeRow) -> tuple[str, str, str, str]:
+    return (row.bot, row.mode, row.symbol, row.buy_time)
 
 
 def _avg(values: Iterable[float | None]) -> float | None:

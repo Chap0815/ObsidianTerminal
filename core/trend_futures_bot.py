@@ -581,6 +581,7 @@ class TrendFuturesBot(FuturesBot):
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
         from bot_utils import (create_order_with_retry,
                                extract_or_estimate_futures_fee,
+                               filled_margin_usdt,
                                futures_contract_size,
                                calc_liquidation_price,
                                distance_to_liquidation_pct,
@@ -632,6 +633,7 @@ class TrendFuturesBot(FuturesBot):
         fill = price
         fees = 0.0
         amount = contracts
+        provisional = False
         exch_oid = None
         margin_mode = str(self.C("MARGIN_MODE", "isolated") or "isolated").lower()
 
@@ -675,7 +677,8 @@ class TrendFuturesBot(FuturesBot):
                 return
             self._record_open(base, fill, margin, eff_lev, contracts, 0.0,
                               provisional=True, lev_cap=lev_cap, mm_rate=mm,
-                              margin_mode=margin_mode)
+                              margin_mode=margin_mode,
+                              entry_inflight=True)
             try:
                 order = create_order_with_retry(
                     self.ex, full, "buy", contracts, params=params,
@@ -693,8 +696,17 @@ class TrendFuturesBot(FuturesBot):
                     landed = _find_order_by_client_id(self.ex, full, _cid,
                                                       log_event=log_event)
                     if landed and float(landed.get("filled") or 0) > 0:
-                        amount = float(landed.get("filled") or 0) or contracts
-                        self._record_open(base, price, margin, eff_lev, amount,
+                        amount = float(landed.get("filled") or 0)
+                        landed_fill = price
+                        for _k in ("average", "price"):
+                            _fv = self._safe_float(landed.get(_k), 0.0)
+                            if _fv > 0:
+                                landed_fill = _fv
+                                break
+                        actual_margin, _ = filled_margin_usdt(
+                            amount, cs, landed_fill, eff_lev, margin)
+                        self._record_open(base, landed_fill, actual_margin,
+                                          eff_lev, amount,
                                           0.0, provisional=False,
                                           lev_cap=lev_cap, mm_rate=mm,
                                           entry_shadow=shadow,
@@ -711,18 +723,31 @@ class TrendFuturesBot(FuturesBot):
                         pass
                     remove_open_position(self.BOT_NAME, base)
                 return
-            exch_oid = order.get("id") or order.get("orderId")
-            amount = float(order.get("filled") or 0) or contracts
-            for _k in ("average", "price"):
-                _v = order.get(_k)
-                if _v:
-                    try:
-                        _fv = float(_v)
-                        if _fv > 0:
-                            fill = _fv
-                            break
-                    except (TypeError, ValueError):
-                        pass
+            amount, fill, positions_unavailable, verified_source = (
+                self._verify_entry_fill(base, full, order, contracts, fill)
+            )
+            if amount <= 0 and not positions_unavailable:
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: order returned no fill and "
+                    f"no exchange position was found - aborting state write",
+                    "WARN")
+                try:
+                    self.state.remove(base)
+                except Exception:
+                    pass
+                remove_open_position(self.BOT_NAME, base)
+                return
+            provisional = False
+            if amount <= 0:
+                amount = contracts
+                provisional = True
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: entry fill not yet verified "
+                    f"(positions unavailable) - tracking provisionally", "WARN")
+            elif verified_source == "position":
+                log_event(f"[{self.BOT_NAME}] {base}: entry amount verified "
+                          f"from exchange position ({amount:g} contracts)",
+                          "INFO")
             try:
                 fees = extract_or_estimate_futures_fee(
                     self.ex, order, full, fill, amount=amount, contract_size=cs)
@@ -732,23 +757,107 @@ class TrendFuturesBot(FuturesBot):
             from bot_utils.fee_math import taker_fee_rate
             fees = notional * taker_fee_rate(self.ex, full, 0.0006)
 
-        self._record_open(base, fill, margin, eff_lev, amount, fees,
-                          lev_cap=lev_cap, mm_rate=mm,
-                          entry_shadow=shadow, margin_mode=margin_mode)
-        log_event(f"[{self.BOT_NAME}] OPEN LONG {base} @ {fill:.6f} "
-                  f"({eff_lev:g}x, notional {notional:.1f}, fee {fees:.4f})", "INFO")
+        actual_margin, margin_from_fill = filled_margin_usdt(
+            amount, cs, fill, eff_lev, margin)
         try:
-            send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                f" [{self.BOT_NAME}] LONG {base} @ {eff_lev:g}x\n"
-                f"Entry: {fill:.6f}  Margin: {margin:.2f} (Notional {notional:.2f})")
+            if margin_from_fill and margin > 0:
+                fill_ratio = actual_margin / max(float(margin), 1e-9)
+                if fill_ratio < 0.90 or fill_ratio > 1.10:
+                    log_event(
+                        f"[{self.BOT_NAME}] {base}: entry margin adjusted "
+                        f"from fill {margin:.2f} -> {actual_margin:.2f} USDT "
+                        f"(filled={amount:g}, contract_size={cs})",
+                        "INFO")
         except Exception:
             pass
+
+        self._record_open(base, fill, actual_margin, eff_lev, amount, fees,
+                          provisional=provisional, lev_cap=lev_cap, mm_rate=mm,
+                          entry_shadow=shadow, margin_mode=margin_mode)
+        if not provisional:
+            log_event(f"[{self.BOT_NAME}] OPEN LONG {base} @ {fill:.6f} "
+                      f"({eff_lev:g}x, notional {actual_margin * eff_lev:.1f}, "
+                      f"fee {fees:.4f})", "INFO")
+            try:
+                if not self.simulation:
+                    send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                        f" [{self.BOT_NAME}] LONG {base} @ {eff_lev:g}x\n"
+                        f"Entry: {fill:.6f}  Margin: {actual_margin:.2f} "
+                        f"(Notional {actual_margin * eff_lev:.2f})")
+            except Exception:
+                pass
+
+    def _verify_entry_fill(self, base: str, full: str, order: dict,
+                           requested_amount: float,
+                           fallback_fill: float) -> tuple[float, float, bool, str]:
+        """Return verified contracts/fill after a market entry.
+
+        ``positions_unavailable=True`` means the exchange position endpoint could
+        not be trusted; callers should keep a provisional state instead of
+        creating either a phantom final position or an unmanaged live orphan.
+        """
+        amount = self._safe_float((order or {}).get("filled"), 0.0)
+        fill = fallback_fill
+        for key in ("average", "price"):
+            value = (order or {}).get(key)
+            fv = self._safe_float(value, 0.0)
+            if fv > 0:
+                fill = fv
+                break
+        if amount > 0:
+            return amount, fill, False, "order"
+
+        oid = (order or {}).get("id") or (order or {}).get("orderId")
+        if oid:
+            for attempt in range(2):
+                time.sleep(0.4 * (1 + attempt))
+                try:
+                    refreshed = self.ex.fetch_order(str(oid), full) or {}
+                except Exception:
+                    continue
+                rf = self._safe_float(refreshed.get("filled"), 0.0)
+                if rf > 0:
+                    for key in ("average", "price"):
+                        fv = self._safe_float(refreshed.get(key), 0.0)
+                        if fv > 0:
+                            fill = fv
+                            break
+                    return rf, fill, False, "order_refresh"
+
+        pos, unavailable = self._fetch_exchange_position(full)
+        if pos:
+            contracts = self._safe_float(pos.get("contracts") or pos.get("size"), 0.0)
+            contracts = abs(contracts)
+            for key in ("entryPrice", "entry_price"):
+                fv = self._safe_float(pos.get(key), 0.0)
+                if fv > 0:
+                    fill = fv
+                    break
+            return contracts, fill, False, "position"
+        return 0.0, fill, unavailable, "none"
+
+    def _fetch_exchange_position(self, full: str) -> tuple[dict | None, bool]:
+        try:
+            from config.exchange_config import safe_fetch_positions
+            poss = safe_fetch_positions(self.ex, [full])
+            if poss is None:
+                return None, True
+        except Exception:
+            return None, True
+        for pos in poss or []:
+            if (pos.get("symbol") or "") != full:
+                continue
+            contracts = abs(self._safe_float(pos.get("contracts") or pos.get("size"), 0.0))
+            if contracts > 0:
+                return pos, False
+        return None, False
 
     def _record_open(self, base, fill, margin, eff_lev, amount, fees,
                       provisional: bool = False, lev_cap=None,
                       mm_rate: float = 0.01,
                       entry_shadow: Optional[dict] = None,
-                      margin_mode: str = "isolated") -> None:
+                      margin_mode: str = "isolated",
+                      entry_inflight: bool = False) -> None:
         from core.logger import _date as _utc
         from bot_utils import calc_liquidation_price, distance_to_liquidation_pct
         # Liquidation uses the INTEGER leverage the exchange runs (ceil) + real
@@ -766,6 +875,8 @@ class TrendFuturesBot(FuturesBot):
             "initial_entry_fee": fees, "fees_paid": fees,
             "strategy": "trend", "provisional": provisional,
         }
+        if provisional and entry_inflight:
+            row["entry_inflight_until"] = time.time() + 120.0
         if entry_shadow:
             row.update({
                 "entry_shadow_would_block": bool(entry_shadow.get("would_block")),
@@ -839,7 +950,8 @@ class TrendFuturesBot(FuturesBot):
         elif amt > 0 and not live_close_already_verified:
             from bot_utils import (create_order_with_retry,
                                     extract_or_estimate_futures_fee,
-                                    futures_contract_size, verify_position_closed)
+                                    futures_contract_size, is_no_position_error,
+                                    verify_position_closed)
             from config.exchange_config import (reduce_only_params,
                                                 safe_amount_to_precision)
             lev_cap = max(1, int(math.ceil(lev)))
@@ -863,47 +975,72 @@ class TrendFuturesBot(FuturesBot):
                     shutdown_event=self._shutdown_event,
                     action_label=f"trend close {base}", log_event=log_event)
             except Exception as e:
-                log_event(f"[{self.BOT_NAME}]  {base}: close FAILED ({e})  "
-                          f"KEPT for retry", "ERROR")
-                self._log_error(f"trend close {base}", e)
-                return
-            exch_oid = order.get("id") or order.get("orderId")
-            for _k in ("average", "price"):
-                _v = order.get(_k)
-                if _v:
+                if is_no_position_error(e):
                     try:
-                        _fv = float(_v)
-                        if _fv > 0:
-                            close_price = _fv
-                            break
-                    except (TypeError, ValueError):
-                        pass
-            try:
-                close_fee += extract_or_estimate_futures_fee(
-                    self.ex, order, full, close_price, amount=amt, contract_size=cs)
-            except Exception:
-                pass
-            try:
-                self.state.update_many(base, {
-                    "pending_close_price": close_price,
-                    "pending_close_fee": close_fee,
-                    "pending_close_order_id": exch_oid,
-                })
-            except Exception:
-                pass
+                        _closed, _remaining = verify_position_closed(self.ex, full)
+                    except Exception as ve:
+                        self._log_error(f"trend verify-close-after-error {base}", ve)
+                        log_event(
+                            f"[{self.BOT_NAME}]  {base}: close error looked flat "
+                            f"but verification failed - kept for reconcile",
+                            "WARN")
+                        return
+                    if _closed:
+                        log_event(
+                            f"[{self.BOT_NAME}] {base}: position already flat "
+                            f"on exchange ({str(e)[:80]}) - booking local close",
+                            "WARN")
+                        live_close_already_verified = True
+                    else:
+                        log_event(
+                            f"[{self.BOT_NAME}]  {base}: close error but "
+                            f"{_remaining:.6f} contracts remain - kept for retry",
+                            "WARN")
+                        return
+                else:
+                    log_event(f"[{self.BOT_NAME}]  {base}: close FAILED ({e})  "
+                              f"KEPT for retry", "ERROR")
+                    self._log_error(f"trend close {base}", e)
+                    return
+            if not live_close_already_verified:
+                exch_oid = order.get("id") or order.get("orderId")
+                for _k in ("average", "price"):
+                    _v = order.get(_k)
+                    if _v:
+                        try:
+                            _fv = float(_v)
+                            if _fv > 0:
+                                close_price = _fv
+                                break
+                        except (TypeError, ValueError):
+                            pass
+                try:
+                    close_fee += extract_or_estimate_futures_fee(
+                        self.ex, order, full, close_price, amount=amt, contract_size=cs)
+                except Exception:
+                    pass
+                try:
+                    self.state.update_many(base, {
+                        "pending_close_price": close_price,
+                        "pending_close_fee": close_fee,
+                        "pending_close_order_id": exch_oid,
+                    })
+                except Exception:
+                    pass
             # VERIFY before booking  keep state on a partial/unverifiable close.
-            try:
-                _closed, _remaining = verify_position_closed(self.ex, full)
-            except Exception as e:
-                self._log_error(f"trend verify-close {base}", e)
-                log_event(f"[{self.BOT_NAME}]  {base}: close unverified  keep, "
-                          f"retry", "WARN")
-                return
-            if not _closed:
-                log_event(f"[{self.BOT_NAME}]  {base}: close incomplete "
-                          f"(remaining {_remaining:.6f})  keep, retry (no "
-                          f"double-count)", "WARN")
-                return
+            if not live_close_already_verified:
+                try:
+                    _closed, _remaining = verify_position_closed(self.ex, full)
+                except Exception as e:
+                    self._log_error(f"trend verify-close {base}", e)
+                    log_event(f"[{self.BOT_NAME}]  {base}: close unverified  keep, "
+                              f"retry", "WARN")
+                    return
+                if not _closed:
+                    log_event(f"[{self.BOT_NAME}]  {base}: close incomplete "
+                              f"(remaining {_remaining:.6f})  keep, retry (no "
+                              f"double-count)", "WARN")
+                    return
 
         #  Book realized PnL 
         profit_usdt = 0.0
@@ -1015,9 +1152,10 @@ class TrendFuturesBot(FuturesBot):
         log_event(f"[{self.BOT_NAME}] CLOSE {pos_type} {base} @ {close_price:.6f} "
                   f"({reason}, PnL {profit_usdt:+.2f})", "INFO")
         try:
-            send_telegram(tg_token, tg_chat,
-                f"{'' if profit_usdt >= 0 else ''} [{self.BOT_NAME}] CLOSE "
-                f"{pos_type} {base}\nPnL {profit_usdt:+.2f} USDT  {reason}")
+            if not self.simulation:
+                send_telegram(tg_token, tg_chat,
+                    f"{'' if profit_usdt >= 0 else ''} [{self.BOT_NAME}] CLOSE "
+                    f"{pos_type} {base}\nPnL {profit_usdt:+.2f} USDT  {reason}")
         except Exception:
             pass
 
@@ -1044,7 +1182,9 @@ class TrendFuturesBot(FuturesBot):
                         if self._shutdown_event.is_set():
                             break
                         if d.get("provisional"):
-                            continue
+                            if not self._heal_provisional_position(base, d):
+                                continue
+                            d = self.state.get(base) or d
                         try:
                             self._check_safety(base, d)
                         except Exception as e:
@@ -1054,6 +1194,65 @@ class TrendFuturesBot(FuturesBot):
                 self._log_error("trend monitor", e)
             if self._shutdown_event.wait(timeout=interval):
                 return
+
+    def _heal_provisional_position(self, base: str, d: dict) -> bool:
+        """Resolve a provisional entry state after restart/API uncertainty."""
+        from core.logger import log_event
+        from core.database import remove_open_position
+        from bot_utils import calc_liquidation_price, distance_to_liquidation_pct
+
+        full = f"{base}/USDT:USDT"
+        try:
+            if float(d.get("entry_inflight_until") or 0.0) > time.time():
+                return False
+        except (TypeError, ValueError):
+            pass
+        pos, unavailable = self._fetch_exchange_position(full)
+        if pos is None:
+            if unavailable:
+                return False
+            log_event(f"[{self.BOT_NAME}] {base}: provisional state had no "
+                      f"exchange position - removing stale claim", "WARN")
+            try:
+                self.state.remove(base)
+            except Exception:
+                pass
+            remove_open_position(self.BOT_NAME, base)
+            return False
+
+        contracts = abs(self._safe_float(pos.get("contracts") or pos.get("size"), 0.0))
+        entry = 0.0
+        for key in ("entryPrice", "entry_price"):
+            entry = self._safe_float(pos.get(key), 0.0)
+            if entry > 0:
+                break
+        if entry <= 0:
+            entry = self._safe_float(d.get("buy"), 0.0)
+        if contracts <= 0 or entry <= 0:
+            return False
+
+        lev = self._safe_float(d.get("leverage"), 1.0) or 1.0
+        mm = self._safe_float(d.get("maintenance_margin_rate"), 0.01) or 0.01
+        try:
+            liq = self._safe_float(pos.get("liquidationPrice"), 0.0)
+        except Exception:
+            liq = 0.0
+        if liq <= 0:
+            liq = calc_liquidation_price(entry, math.ceil(lev), "LONG", mm)
+        fields = {
+            "buy": entry,
+            "highest": max(self._safe_float(d.get("highest"), entry), entry),
+            "last_price": entry,
+            "amount": contracts,
+            "original_amount": contracts,
+            "provisional": False,
+            "liquidation_price": liq,
+            "initial_liq_distance": distance_to_liquidation_pct(entry, liq, "LONG"),
+        }
+        self.state.update_many(base, fields)
+        log_event(f"[{self.BOT_NAME}] {base}: provisional entry verified "
+                  f"from exchange position ({contracts:g} contracts)", "WARN")
+        return True
 
     def _check_safety(self, base: str, d: dict) -> None:
         from core.database import upsert_futures_state

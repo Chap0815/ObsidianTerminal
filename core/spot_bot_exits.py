@@ -526,6 +526,17 @@ class ExitsMixin:
             except Exception as exc:
                 self._log_error(f"spot pending accounting retry {sym}", exc)
             return
+        if d.get("claim_conflict"):
+            warned = getattr(self, "_claim_conflict_warned", set())
+            if sym not in warned:
+                log_event(
+                    f"[{self.BOT_NAME}] {sym}: registry claim conflict - "
+                    f"monitor skipped fail-closed; run claim/state repair",
+                    "ERROR",
+                )
+                warned.add(sym)
+                self._claim_conflict_warned = warned
+            return
         self._retry_pending_partial_accounting(sym, d)
         d = self.state.get(sym) or d
         if d.get("accounting_pending_partials"):
@@ -868,12 +879,13 @@ class ExitsMixin:
             "WIN"
         )
         try:
-            send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                f" [{self.BOT_NAME}] PARTIAL TAKE-PROFIT {sym}\n"
-                f"{int(partial_pct*100)}% @ {fill_price:.6f} "
-                f"(+{real_prof_pct:.2f}%, +{profit_partial:.2f} USDT)\n"
-                f"Stop: Break-Even"
-            )
+            if not self.simulation:
+                send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                    f" [{self.BOT_NAME}] PARTIAL TAKE-PROFIT {sym}\n"
+                    f"{int(partial_pct*100)}% @ {fill_price:.6f} "
+                    f"(+{real_prof_pct:.2f}%, +{profit_partial:.2f} USDT)\n"
+                    f"Stop: Break-Even"
+                )
         except Exception as e:
             log_event(f"Telegram failed: {e}", "WARN")
         return True
@@ -1014,11 +1026,12 @@ class ExitsMixin:
                     self._log_error(f"spot orphan accounting {sym}", acc_err)
                     return
                 try:
-                    send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                        f" [{self.BOT_NAME}] {sym} orphan cleared\n"
-                        f"Base balance ~0 on exchange  offline close booked "
-                        f"and position removed from tracking."
-                    )
+                    if not self.simulation:
+                        send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                            f" [{self.BOT_NAME}] {sym} orphan cleared\n"
+                            f"Base balance ~0 on exchange  offline close booked "
+                            f"and position removed from tracking."
+                        )
                 except Exception:
                     pass
                 self.state.remove(sym)
@@ -1146,13 +1159,14 @@ class ExitsMixin:
             self._log_error(f"spot post-close logging {sym}", e)
 
         try:
-            send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                f"{'' if real_prof_pct >= 0 else ''} "
-                f"[{self.BOT_NAME}] SELL {sym}\n"
-                f"Profit: {'+' if real_prof_pct >= 0 else ''}"
-                f"{real_prof_pct:.2f}% ({profit_usdt:+.2f} USDT)\n"
-                f"Fees: {accumulated_fees:.3f} | Reason: {reason}"
-            )
+            if not self.simulation:
+                send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                    f"{'' if real_prof_pct >= 0 else ''} "
+                    f"[{self.BOT_NAME}] SELL {sym}\n"
+                    f"Profit: {'+' if real_prof_pct >= 0 else ''}"
+                    f"{real_prof_pct:.2f}% ({profit_usdt:+.2f} USDT)\n"
+                    f"Fees: {accumulated_fees:.3f} | Reason: {reason}"
+                )
         except Exception as e:
             log_event(f"Telegram failed: {e}", "WARN")
 

@@ -86,7 +86,7 @@ def is_in_trend(closes: List[float], p: TrendParams,
     Returns (in_trend, votes, detail)."""
     votes, detail = trend_votes(closes, p)
     if currently_held:
-        in_trend = votes >= min(p.exit_vote, p.vote_min)
+        in_trend = votes >= p.exit_vote
     else:
         in_trend = votes >= p.vote_min
     return in_trend, votes, detail
