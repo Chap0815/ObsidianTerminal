@@ -46,6 +46,8 @@ _LIVE_RESIDUAL_DUST_USDT = 1.0
 
 
 def _finite_float(value) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -460,9 +462,9 @@ def refresh_spot_positions_with_live_prices(positions: list) -> list:
         p2 = dict(p)
         try:
             sym       = p.get("symbol", "")
-            buy_price = float(p.get("buy_price") or 0)
-            margin    = float(p.get("invested_usdt") or 0)
-            stored_curr = float(p.get("current_price") or 0)
+            buy_price = _positive_finite(p.get("buy_price"))
+            margin = _positive_finite(p.get("invested_usdt"))
+            stored_curr = _positive_finite(p.get("current_price"))
 
             # Prefer live, fall back to stored
             curr = stored_curr
@@ -479,19 +481,35 @@ def refresh_spot_positions_with_live_prices(positions: list) -> list:
                         sym, type(e).__name__,
                     )
 
-            if curr > 0 and buy_price > 0:
+            invalid_fields = []
+            if buy_price is None:
+                invalid_fields.append("buy_price")
+            if curr is None:
+                invalid_fields.append("current_price")
+            if margin is None:
+                invalid_fields.append("invested_usdt")
+
+            p2["buy_price"] = buy_price if buy_price is not None else 0.0
+            p2["current_price"] = curr if curr is not None else 0.0
+            p2["invested_usdt"] = margin if margin is not None else 0.0
+            if invalid_fields:
+                p2["invalid_state"] = True
+                p2["state_error"] = (
+                    "invalid spot refresh numeric: "
+                    + ", ".join(invalid_fields)
+                )
+
+            if curr is not None and buy_price is not None and margin is not None:
                 profit_pct  = (curr - buy_price) / buy_price * 100.0
-                profit_usdt = round(margin * (profit_pct / 100.0), 4) \
-                                if margin > 0 else 0.0
-                p2["current_price"]  = curr
+                profit_usdt = round(margin * (profit_pct / 100.0), 4)
                 p2["unrealized_pct"] = profit_pct
                 p2["unrealized_pnl"] = profit_usdt
             else:
                 import logging
                 logging.warning(
                     "[StopDialog Spot] %s: cannot recompute "
-                    "(buy=%s, curr=%s); keeping stored.",
-                    sym, buy_price, curr,
+                    "(buy=%s, curr=%s, margin=%s); keeping stored.",
+                    sym, buy_price, curr, margin,
                 )
         except Exception as e:
             import logging
@@ -573,10 +591,10 @@ def refresh_positions_with_live_prices(positions: list) -> list:
         try:
             sym       = p.get("symbol") or ""
             pos_type  = (p.get("position_type") or "LONG").upper()
-            entry     = float(p.get("entry_price") or 0)
-            margin    = float(p.get("margin_usdt") or 0)
-            lev       = float(p.get("leverage") or 0)
-            db_curr   = float(p.get("current_price") or 0)
+            entry     = _positive_finite(p.get("entry_price")) or 0.0
+            margin    = _positive_finite(p.get("margin_usdt")) or 0.0
+            lev       = _positive_finite(p.get("leverage")) or 0.0
+            db_curr   = _positive_finite(p.get("current_price")) or 0.0
 
             # Try to refresh current price live; fall back to DB value.
             curr = db_curr
@@ -1348,17 +1366,14 @@ def direct_close_remaining_futures(
                         for k in ("average", "price"):
                             v = order.get(k)
                             if v is not None:
-                                try:
-                                    fv = float(v)
-                                    if fv > 0:
-                                        curr = fv
-                                        break
-                                except (TypeError, ValueError):
-                                    continue
+                                fv = _positive_finite(v)
+                                if fv is not None:
+                                    curr = fv
+                                    break
                         try:
                             fee_obj = order.get("fee") or {}
-                            fc_cost = float(fee_obj.get("cost", 0) or 0)
-                            if fc_cost > 0:
+                            fc_cost = _non_negative_finite(fee_obj.get("cost"))
+                            if fc_cost is not None and fc_cost > 0:
                                 exit_fee = fc_cost
                         except Exception:
                             pass

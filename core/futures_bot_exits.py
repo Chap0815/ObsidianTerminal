@@ -48,6 +48,51 @@ class FuturesExitsMixin:
             return 0.0
         return price if math.isfinite(price) and price > 0 else 0.0
 
+    @staticmethod
+    def _safe_nonnegative_amount(value) -> float:
+        if isinstance(value, bool):
+            return 0.0
+        try:
+            amount = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return amount if math.isfinite(amount) and amount >= 0 else 0.0
+
+    @staticmethod
+    def _safe_finite_float(value, default: float = 0.0) -> float:
+        if isinstance(value, bool):
+            return default
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return parsed if math.isfinite(parsed) else default
+
+    @classmethod
+    def _safe_positive_float(cls, value, default: float = 0.0) -> float:
+        parsed = cls._safe_finite_float(value, default)
+        return parsed if parsed > 0 else default
+
+    @staticmethod
+    def _precision_amount_or_none(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            amount = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return amount if math.isfinite(amount) else None
+
+    @classmethod
+    def _order_fill_price(cls, order: dict) -> float:
+        if not isinstance(order, dict):
+            return 0.0
+        for key in ("average", "price"):
+            price = cls._safe_positive_price(order.get(key))
+            if price > 0:
+                return price
+        return 0.0
+
     @classmethod
     def _ticker_price(cls, ticker: dict) -> float:
         if not isinstance(ticker, dict):
@@ -58,7 +103,9 @@ class FuturesExitsMixin:
         return price
 
     def _retry_pending_partial_accounting(self, sym: str, d: dict) -> None:
-        pending = list(d.get("accounting_pending_partials") or [])
+        from bot_utils.trade_state import normalize_pending_accounting_items
+        pending = normalize_pending_accounting_items(
+            d.get("accounting_pending_partials"))
         if not pending:
             return
         from core.database import save_trade_db
@@ -260,9 +307,15 @@ class FuturesExitsMixin:
             unrealized_today = 0.0
             for sym, d in trades.items():
                 try:
-                    entry = float(d.get("buy", 0))
-                    margin = float(d.get("invested_usdt", 0))
-                    lev = float(d.get("leverage", self.C("LEVERAGE", 3)))
+                    entry = FuturesExitsMixin._safe_positive_price(
+                        d.get("buy"))
+                    margin = FuturesExitsMixin._safe_positive_float(
+                        d.get("invested_usdt"), 0.0)
+                    lev = FuturesExitsMixin._safe_positive_float(
+                        d.get("leverage"),
+                        FuturesExitsMixin._safe_positive_float(
+                            self.C("LEVERAGE", 3), 3.0),
+                    )
                     pt = d.get("position_type", "LONG")
                     last = self._killswitch_price(sym, d, entry)
                     if entry > 0 and margin > 0 and last > 0:
@@ -379,21 +432,24 @@ class FuturesExitsMixin:
         try:
             tk = self.ticker_cache.get(self.ex, symbol_full, timeout=1.5,
                                        critical=True)
-            px = float(tk.get("last") or tk.get("close") or 0)
+            px = FuturesExitsMixin._safe_positive_price(tk.get("last"))
+            if px <= 0:
+                px = FuturesExitsMixin._safe_positive_price(tk.get("close"))
             if px > 0:
                 return px
         except Exception:
             pass
         try:
-            px = float(self._fallback_mark_price(symbol_full) or 0.0)
+            px = FuturesExitsMixin._safe_positive_price(
+                self._fallback_mark_price(symbol_full))
             if px > 0:
                 return px
         except Exception:
             pass
-        try:
-            return float(d.get("last_price", entry) or entry)
-        except (TypeError, ValueError):
-            return float(entry or 0.0)
+        px = FuturesExitsMixin._safe_positive_price(d.get("last_price"))
+        if px > 0:
+            return px
+        return FuturesExitsMixin._safe_positive_price(entry)
 
   #  Periodic funding-paid persistence 
 
@@ -424,9 +480,19 @@ class FuturesExitsMixin:
         except ImportError:
             return
 
+        def _finite_money(value):
+            if isinstance(value, bool):
+                return None
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return parsed if math.isfinite(parsed) else None
+
         for sym, d in trades.items():
             try:
-                next_check = float(d.get("funding_next_check_at", 0))
+                next_check = FuturesExitsMixin._safe_finite_float(
+                    d.get("funding_next_check_at", 0), 0.0)
                 if next_check <= 0:
                     # First sight (just opened / adopted): stagger the initial
                     # fetch instead of bursting every position at once on the
@@ -443,8 +509,9 @@ class FuturesExitsMixin:
                 buy_time = d.get("buy_time")
                 if not buy_time:
                     continue
-                lev = float(d.get("leverage", 1))
-                entry = float(d.get("buy", 0))
+                lev = FuturesExitsMixin._safe_positive_float(
+                    d.get("leverage"), 0.0)
+                entry = FuturesExitsMixin._safe_positive_price(d.get("buy"))
   # WHOLE-position notional (original_amount  contract_size  entry),
   # NOT the partial-reduced invested_usdt  lev. funding_paid must
                 # stay the funding of the FULL position so the close-time
@@ -453,10 +520,16 @@ class FuturesExitsMixin:
   # the reduction (remaining/original) and understated funding.
                 pos_type = d.get("position_type", "LONG")
                 symbol_full = f"{sym}/USDT:USDT"
-                orig_amt = float(d.get("original_amount", d.get("amount", 0)))
+                orig_amt = FuturesExitsMixin._safe_positive_float(
+                    d.get("original_amount", d.get("amount", 0)), 0.0)
                 if lev <= 0 or entry <= 0 or orig_amt <= 0:
                     continue
-                notional = orig_amt * self._get_contract_size(symbol_full) * entry
+                contract_size = FuturesExitsMixin._safe_positive_float(
+                    self._get_contract_size(symbol_full), 0.0)
+                if contract_size <= 0:
+                    continue
+                notional = orig_amt * contract_size * entry
+                current = _finite_money(d.get("funding_paid"))
                 if self.simulation:
   # No real exchange position to query  estimate funding from
   # the live rate  settlements crossed so paper PnL carries it.
@@ -466,13 +539,16 @@ class FuturesExitsMixin:
                     realized = fetch_or_estimate_funding(
                         self.ex, symbol_full, buy_time,
                         notional_usdt=notional, pos_type=pos_type,
-                        fallback_state_value=float(d.get("funding_paid", 0.0)),
+                        fallback_state_value=current if current is not None else 0.0,
                     )
                 update = {
                     "funding_next_check_at": now_epoch + self._FUNDING_REFRESH_INTERVAL_SEC,
                 }
+                realized = _finite_money(realized)
                 if realized is not None:
-                    update["funding_paid"] = float(realized)
+                    update["funding_paid"] = realized
+                elif current is None:
+                    update["funding_paid"] = 0.0
                 self.state.update_many(sym, update)
             except Exception as _fr_err:
   # Best-effort  don't fail the monitor over a funding refresh.
@@ -617,9 +693,13 @@ class FuturesExitsMixin:
         self._clear_price_unavailable(sym)
 
         pos_type = d["position_type"]
-        lev = float(d.get("leverage", self.C("LEVERAGE", 3)))
-        margin = float(d["invested_usdt"])
-        entry = float(d["buy"])
+        lev = FuturesExitsMixin._safe_positive_float(
+            d.get("leverage"),
+            FuturesExitsMixin._safe_positive_float(self.C("LEVERAGE", 3), 3.0),
+        )
+        margin = FuturesExitsMixin._safe_positive_float(
+            d.get("invested_usdt"), 0.0)
+        entry = FuturesExitsMixin._safe_positive_price(d.get("buy"))
 
         # Guard: a corrupted/zero entry price would cause a ZeroDivisionError
         # in calc_unrealized_pnl (divides by entry). This can happen if a
@@ -633,20 +713,33 @@ class FuturesExitsMixin:
             )
             return
 
-        # Sanity: heal margin/leverage if broken (defensive)
-        if lev <= 0:
-            lev = float(self.C("LEVERAGE", 3))
+        # Sanity: heal margin if broken (defensive)
         if margin <= 0:
             try:
-                _amt = float(d.get("amount", 0))
+                _amt = FuturesExitsMixin._safe_nonnegative_amount(
+                    d.get("amount", 0))
                 # contract_size-aware: _amt is in CONTRACTS, so notional =
                 # amount * contract_size * price (required for contract_size!=1
                 # coins, else the healed margin feeds the full-close PnL wrong).
-                _cs = self._get_contract_size(f"{sym}/USDT:USDT")
+                _cs = FuturesExitsMixin._safe_positive_float(
+                    self._get_contract_size(f"{sym}/USDT:USDT"), 1.0)
                 if _amt > 0 and entry > 0 and lev > 0:
                     margin = round((_amt * _cs * entry) / lev, 4)
             except Exception:
                 pass
+        if margin <= 0:
+            log_event(
+                f"Monitor: {sym} has invalid margin - skipping tick, "
+                f"will retry next cycle", "WARN"
+            )
+            return
+        if FuturesExitsMixin._safe_positive_float(
+                d.get("invested_usdt"), 0.0) != margin:
+            d["invested_usdt"] = margin
+            try:
+                self.state.update(sym, "invested_usdt", margin)
+            except Exception as e:
+                self._log_error(f"futures margin repair {sym}", e)
 
         # Liquidation price: exchange-reported > local approximation.
         # Feed the exchange's ACTUAL maintenance-margin tier into the
@@ -658,41 +751,51 @@ class FuturesExitsMixin:
             now_ts = time.time()
             # Throttle the exchange-liq API call; between refreshes use the
             # cached liquidation_price (or a local estimate if none stored yet).
-            if now_ts >= float(d.get("liq_next_check_at", 0)):
+            if now_ts >= FuturesExitsMixin._safe_finite_float(
+                    d.get("liq_next_check_at"), 0.0):
                 exch_liq = get_exchange_liq_price(self.ex, symbol_full)
-                upd = {"liq_next_check_at": now_ts + self.LIQ_REFRESH_INTERVAL_SEC}
+                interval = FuturesExitsMixin._safe_positive_float(
+                    getattr(self, "LIQ_REFRESH_INTERVAL_SEC", 90.0), 90.0)
+                upd = {"liq_next_check_at": now_ts + interval}
                 if exch_liq > 0:
                     liq_price = exch_liq
                     upd["liquidation_price"] = exch_liq
                 else:
-                    liq_price = float(d.get("liquidation_price",
-                                              calc_liquidation_price(entry, lev, pos_type, mm_rate)))
+                    liq_price = FuturesExitsMixin._safe_positive_float(
+                        d.get("liquidation_price"),
+                        calc_liquidation_price(entry, lev, pos_type, mm_rate))
                 self.state.update_many(sym, upd)
             else:
-                liq_price = float(d.get("liquidation_price",
-                                          calc_liquidation_price(entry, lev, pos_type, mm_rate)))
+                liq_price = FuturesExitsMixin._safe_positive_float(
+                    d.get("liquidation_price"),
+                    calc_liquidation_price(entry, lev, pos_type, mm_rate))
         else:
-            liq_price = float(d.get("liquidation_price",
-                                      calc_liquidation_price(entry, lev, pos_type, mm_rate)))
+            liq_price = FuturesExitsMixin._safe_positive_float(
+                d.get("liquidation_price"),
+                calc_liquidation_price(entry, lev, pos_type, mm_rate))
 
         pnl_usdt, pnl_pct_margin = calc_unrealized_pnl(entry, curr, margin, lev, pos_type)
         move_pct = price_move_pct(entry, curr, pos_type)
         liq_dist = distance_to_liquidation_pct(curr, liq_price, pos_type)
         telemetry = {}
         try:
-            prev_max_pct = float(d.get("max_profit_pct", move_pct))
+            prev_max_pct = FuturesExitsMixin._safe_finite_float(
+                d.get("max_profit_pct"), move_pct)
         except (TypeError, ValueError):
             prev_max_pct = move_pct
         try:
-            prev_min_pct = float(d.get("min_profit_pct", move_pct))
+            prev_min_pct = FuturesExitsMixin._safe_finite_float(
+                d.get("min_profit_pct"), move_pct)
         except (TypeError, ValueError):
             prev_min_pct = move_pct
         try:
-            prev_max_usdt = float(d.get("max_profit_usdt", pnl_usdt))
+            prev_max_usdt = FuturesExitsMixin._safe_finite_float(
+                d.get("max_profit_usdt"), pnl_usdt)
         except (TypeError, ValueError):
             prev_max_usdt = pnl_usdt
         try:
-            prev_min_usdt = float(d.get("min_profit_usdt", pnl_usdt))
+            prev_min_usdt = FuturesExitsMixin._safe_finite_float(
+                d.get("min_profit_usdt"), pnl_usdt)
         except (TypeError, ValueError):
             prev_min_usdt = pnl_usdt
         if "max_profit_pct" not in d or move_pct > prev_max_pct:
@@ -708,7 +811,8 @@ class FuturesExitsMixin:
             d.update(telemetry)
 
         # Update highest favorable move
-        highest = d.get("highest", entry)
+        highest = FuturesExitsMixin._safe_positive_float(
+            d.get("highest"), entry)
         if is_new_high(curr, highest, pos_type):
             self.state.update(sym, "highest", curr)
             highest = curr
@@ -738,7 +842,8 @@ class FuturesExitsMixin:
             pass  # dashboard state is best-effort
 
   #  Breakeven activation 
-        be_trigger = float(self.C("BREAKEVEN_TRIGGER", 0))
+        be_trigger = FuturesExitsMixin._safe_finite_float(
+            self.C("BREAKEVEN_TRIGGER", 0), 0.0)
         if be_trigger > 0 and not d.get("be_active", False) and move_pct >= be_trigger:
             safe_be_price = fee_buffered_breakeven(entry, pos_type, fee_buffer=0.003)
             self.state.update_many(sym, {"be_active": True, "be_price": safe_be_price})
@@ -757,9 +862,17 @@ class FuturesExitsMixin:
         )
 
   #  Partial TP (only if no exit fired) 
-        activation = float(self.C("ACTIVATION_PROFIT"))
+        activation = FuturesExitsMixin._safe_finite_float(
+            self.C("ACTIVATION_PROFIT"), 0.0)
+        partial_blocked_until = FuturesExitsMixin._safe_finite_float(
+            d.get("partial_tp_blocked_min_notional_until"), 0.0)
+        partial_block_active = (
+            bool(d.get("partial_tp_blocked_min_notional"))
+            and time.time() < partial_blocked_until
+        )
         if (not sell_trigger
                 and not d.get("partial_sold")
+                and not partial_block_active
                 and move_pct >= activation):
             from core.symbol_locks import close_lock
             with close_lock(sym, bot_name=self.BOT_NAME) as got:
@@ -802,7 +915,8 @@ class FuturesExitsMixin:
         from core.logger import log_event
 
   #  1. Liquidation protection (highest priority) 
-        initial_liq_dist = float(d.get("initial_liq_distance", 0))
+        initial_liq_dist = FuturesExitsMixin._safe_positive_float(
+            d.get("initial_liq_distance"), 0.0)
         if initial_liq_dist <= 0:
             initial_liq_dist = max(1.0, 100.0 / max(1.0, lev))
             try:
@@ -811,7 +925,8 @@ class FuturesExitsMixin:
                 pass
 
         consumed = liq_buffer_consumed_pct(initial_liq_dist, liq_dist)
-        panic_threshold = 100.0 - float(self.C("LIQ_SAFETY_PCT", 25.0))
+        panic_threshold = 100.0 - FuturesExitsMixin._safe_finite_float(
+            self.C("LIQ_SAFETY_PCT", 25.0), 25.0)
         if consumed >= panic_threshold:
             log_event(
                 f"EMERGENCY: Liquidation buffer "
@@ -824,28 +939,33 @@ class FuturesExitsMixin:
 
   #  2. Breakeven stop (when be_active) 
         if d.get("be_active"):
-            be_price = float(d.get("be_price", entry))
+            be_price = FuturesExitsMixin._safe_positive_float(
+                d.get("be_price"), entry)
             if breakeven_stop_hit(curr, be_price, pos_type):
                 return True, "Breakeven-Stop"
 
   #  3. Trailing / SL 
-        trailing_dist = float(self.C("TRAILING_DISTANCE"))
-        post_partial_trailing_dist = float(
-            self.C("POST_PARTIAL_TRAILING_DISTANCE", trailing_dist))
-        activation = float(self.C("ACTIVATION_PROFIT"))
+        trailing_dist = FuturesExitsMixin._safe_finite_float(
+            self.C("TRAILING_DISTANCE"), 0.0)
+        post_partial_trailing_dist = FuturesExitsMixin._safe_finite_float(
+            self.C("POST_PARTIAL_TRAILING_DISTANCE", trailing_dist),
+            trailing_dist)
+        activation = FuturesExitsMixin._safe_finite_float(
+            self.C("ACTIVATION_PROFIT"), 0.0)
         if (post_partial_trailing_dist <= 0.0
                 or (activation > 0.0 and post_partial_trailing_dist >= activation)):
             post_partial_trailing_dist = trailing_dist
-        initial_sl = float(self.C("INITIAL_STOP_LOSS"))
+        initial_sl = FuturesExitsMixin._safe_finite_float(
+            self.C("INITIAL_STOP_LOSS"), -100.0)
 
         if d.get("break_even"):
             # Post-partial-TP: trailing fully armed
             if trailing_stop_hit(curr, highest, post_partial_trailing_dist, pos_type):
                 return True, "Trailing Stop"
-            be_floor = float(d.get(
-                "be_price",
+            be_floor = FuturesExitsMixin._safe_positive_float(
+                d.get("be_price"),
                 fee_buffered_breakeven(entry, pos_type, fee_buffer=0.003),
-            ))
+            )
             if breakeven_stop_hit(curr, be_floor, pos_type):
                 return True, "Break-Even Stop"
         else:
@@ -893,17 +1013,27 @@ class FuturesExitsMixin:
                                  extract_or_estimate_futures_fee,
                                  safe_remaining)
 
-        partial_pct = float(self.C("PARTIAL_SELL_PCT"))
+        partial_pct = FuturesExitsMixin._safe_finite_float(
+            self.C("PARTIAL_SELL_PCT"), 0.0)
+        if partial_pct <= 0:
+            return False
+        if partial_pct > 1:
+            partial_pct = 1.0
         symbol_full = f"{sym}/USDT:USDT"
-        raw_partial = float(d.get("amount", 0)) * partial_pct
+        amount_total = FuturesExitsMixin._safe_nonnegative_amount(
+            d.get("amount", 0))
+        if amount_total <= 0:
+            return False
+        raw_partial = amount_total * partial_pct
         margin_mode = str(d.get("margin_mode") or self.C("MARGIN_MODE", "isolated") or "isolated").lower()
 
         # Include contract size in the notional computation. For typical Bitget
         # USDT-M perpetuals contract_size=1; for inverse/COIN-M or markets with
         # contract multipliers (Bybit inverse) it's the difference between TP
         # firing correctly and skipping erroneously.
-        contract_size = self._get_contract_size(symbol_full)
-        remaining_after = float(d.get("amount", 0)) - raw_partial
+        contract_size = FuturesExitsMixin._safe_positive_float(
+            self._get_contract_size(symbol_full), 0.0)
+        remaining_after = amount_total - raw_partial
         slice_notional = raw_partial * curr * contract_size
         rem_notional   = remaining_after * curr * contract_size
 
@@ -928,6 +1058,7 @@ class FuturesExitsMixin:
             self.state.update_many(sym, {
                 "break_even": True,
                 "partial_tp_blocked_min_notional": True,
+                "partial_tp_blocked_min_notional_until": time.time() + 300.0,
             })
             return False
 
@@ -945,8 +1076,15 @@ class FuturesExitsMixin:
             try:
                 try:
                     from config.exchange_config import safe_amount_to_precision
-                    partial_amount = float(safe_amount_to_precision(
-                        self.ex, symbol_full, raw_partial))
+                    partial_amount = FuturesExitsMixin._precision_amount_or_none(
+                        safe_amount_to_precision(self.ex, symbol_full, raw_partial)
+                    )
+                    if partial_amount is None:
+                        log_event(
+                            f"{sym}: partial amount precision invalid - skip",
+                            "WARN",
+                        )
+                        return False
                 except Exception:
                     partial_amount = round(raw_partial, 4)
                 if partial_amount <= 0:
@@ -966,43 +1104,28 @@ class FuturesExitsMixin:
                 )
                 exch_oid = order.get("id") or order.get("orderId")
                 actual_filled = 0.0
-                try:
-                    actual_filled = float(order.get("filled") or 0.0)
-                except (TypeError, ValueError):
-                    actual_filled = 0.0
+                actual_filled = FuturesExitsMixin._safe_nonnegative_amount(
+                    order.get("filled") if isinstance(order, dict) else None)
                 try:
                     from bot_utils.futures_exits import _resolve_fill_price
                     fill_price, fill_src = _resolve_fill_price(
                         self.ex, symbol_full, order, fill_price, log_event)
                 except Exception:
-                    for k in ("average", "price"):
-                        v = order.get(k)
-                        if v:
-                            try:
-                                fv = float(v)
-                                if fv > 0:
-                                    fill_price = fv
-                                    break
-                            except (TypeError, ValueError):
-                                continue
+                    fallback_fill = FuturesExitsMixin._order_fill_price(order)
+                    if fallback_fill > 0:
+                        fill_price = fallback_fill
                 if actual_filled <= 0 and exch_oid:
                     try:
                         import time as _t
                         for _att in range(2):
                             _t.sleep(0.35 * (1 + _att))
                             refreshed = self.ex.fetch_order(str(exch_oid), symbol_full)
-                            actual_filled = float((refreshed or {}).get("filled") or 0.0)
+                            actual_filled = FuturesExitsMixin._safe_nonnegative_amount(
+                                (refreshed or {}).get("filled"))
                             if actual_filled > 0:
-                                for k in ("average", "price"):
-                                    v = (refreshed or {}).get(k)
-                                    if v:
-                                        try:
-                                            fv = float(v)
-                                            if fv > 0:
-                                                fill_price = fv
-                                                break
-                                        except (TypeError, ValueError):
-                                            continue
+                                fallback_fill = FuturesExitsMixin._order_fill_price(refreshed or {})
+                                if fallback_fill > 0:
+                                    fill_price = fallback_fill
                                 order = refreshed or order
                                 break
                     except Exception:
@@ -1093,15 +1216,24 @@ class FuturesExitsMixin:
             log_event(f"save_trade_db partial {sym} failed: {e}", "WARN")
 
         # Update state
-        new_amount = safe_remaining(float(d.get("amount", 0)), partial_amount)
+        new_amount = safe_remaining(
+            FuturesExitsMixin._safe_nonnegative_amount(d.get("amount", 0)),
+            partial_amount,
+        )
         new_invested = max(0.0, margin - notional_partial / max(lev, 1))
-        new_fees = float(d.get("fees_paid", 0.0)) + partial_fee
-        prev_realized = float(d.get("partial_profit_realized", 0.0))
-        prev_funding_booked = float(d.get("funding_booked_on_partials", 0.0))
+        new_fees = (
+            FuturesExitsMixin._safe_finite_float(d.get("fees_paid"), 0.0)
+            + partial_fee
+        )
+        prev_realized = FuturesExitsMixin._safe_finite_float(
+            d.get("partial_profit_realized"), 0.0)
+        prev_funding_booked = FuturesExitsMixin._safe_finite_float(
+            d.get("funding_booked_on_partials"), 0.0)
         updates = {
             "partial_sold": True,
             "break_even": True,
             "partial_tp_blocked_min_notional": False,
+            "partial_tp_blocked_min_notional_until": 0.0,
             "amount": new_amount,
             "invested_usdt": new_invested,
             "fees_paid": new_fees,
@@ -1109,7 +1241,9 @@ class FuturesExitsMixin:
             "funding_booked_on_partials": prev_funding_booked + funding_partial,
         }
         if not accounting_ok:
-            pending = list(d.get("accounting_pending_partials") or [])
+            from bot_utils.trade_state import normalize_pending_accounting_items
+            pending = normalize_pending_accounting_items(
+                d.get("accounting_pending_partials"))
             pending.append(partial_trade)
             updates["accounting_pending_partials"] = pending
             log_event(
@@ -1152,11 +1286,11 @@ class FuturesExitsMixin:
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
         from trading.risk_manager import analyze_and_adapt
         from bot_utils import (create_order_with_retry,
-                                 extract_order_fee_futures,
                                  extract_or_estimate_futures_fee,
                                  fetch_or_estimate_funding,
                                  is_no_position_error,
                                  verify_position_closed)
+        from bot_utils.futures_order import _extract_order_fee_futures_known
 
         symbol_full = f"{sym}/USDT:USDT"
         if d.get("verified_flat_pending_accounting"):
@@ -1168,27 +1302,45 @@ class FuturesExitsMixin:
             return
         fill_price = curr
         close_fee = 0.0
-        raw_amount = abs(float(d.get("amount", 0)))
-        contract_size = self._get_contract_size(symbol_full)
+        raw_amount = FuturesExitsMixin._safe_nonnegative_amount(
+            d.get("amount", 0))
+        if raw_amount <= 0:
+            log_event(
+                f"{sym}: close skipped, invalid state amount "
+                f"({d.get('amount')!r})",
+                "ERROR",
+            )
+            return
+        contract_size = FuturesExitsMixin._safe_positive_float(
+            self._get_contract_size(symbol_full), 0.0)
         exch_oid = None  # real order id - unique trade-dedup key
         margin_mode = str(d.get("margin_mode") or self.C("MARGIN_MODE", "isolated") or "isolated").lower()
 
         if self.simulation:
             if raw_amount > 0 and fill_price > 0:
                 from bot_utils.fee_math import taker_fee_rate
-                close_fee = (raw_amount * contract_size * fill_price
-                             * taker_fee_rate(self.ex, symbol_full, 0.0006))
+                if contract_size > 0:
+                    close_fee = (raw_amount * contract_size * fill_price
+                                 * taker_fee_rate(self.ex, symbol_full, 0.0006))
 
         if not self.simulation:
             order = None
             close_amount = raw_amount
             order_filled = 0.0
+            pending_fee_from_fallback = False
             try:
                 close_side = "sell" if pos_type == "LONG" else "buy"
                 try:
                     from config.exchange_config import safe_amount_to_precision
-                    close_amount = float(safe_amount_to_precision(
-                        self.ex, symbol_full, raw_amount))
+                    close_amount = FuturesExitsMixin._precision_amount_or_none(
+                        safe_amount_to_precision(self.ex, symbol_full, raw_amount)
+                    )
+                    if close_amount is None:
+                        log_event(
+                            f"{sym}: close skipped, invalid precision amount",
+                            "ERROR",
+                        )
+                        return
                 except Exception:
                     close_amount = float(raw_amount)
                 if close_amount <= 0 and raw_amount > 0:
@@ -1207,25 +1359,16 @@ class FuturesExitsMixin:
                     log_struct=log_struct,
                 )
                 exch_oid = order.get("id") or order.get("orderId")
-                try:
-                    order_filled = max(0.0, float(order.get("filled") or 0.0))
-                except (TypeError, ValueError):
-                    order_filled = 0.0
+                order_filled = FuturesExitsMixin._safe_nonnegative_amount(
+                    order.get("filled") if isinstance(order, dict) else None)
                 try:
                     from bot_utils.futures_exits import _resolve_fill_price
                     fill_price, _fill_src = _resolve_fill_price(
                         self.ex, symbol_full, order, fill_price, log_event)
                 except Exception:
-                    for k in ("average", "price"):
-                        v = order.get(k)
-                        if v:
-                            try:
-                                fv = float(v)
-                                if fv > 0:
-                                    fill_price = fv
-                                    break
-                            except (TypeError, ValueError):
-                                continue
+                    fallback_fill = FuturesExitsMixin._order_fill_price(order)
+                    if fallback_fill > 0:
+                        fill_price = fallback_fill
                 close_fee = 0.0
             except Exception as e:
                 if is_no_position_error(e):
@@ -1277,14 +1420,15 @@ class FuturesExitsMixin:
                         if _oid:
                             pending_oid = _oid
                     except Exception:
-                        try:
-                            fill_price = float(d.get("pending_close_price") or fill_price)
-                        except (TypeError, ValueError):
-                            pass
-                        try:
-                            close_fee = float(d.get("pending_close_fee") or close_fee)
-                        except (TypeError, ValueError):
-                            pass
+                        pending_price = FuturesExitsMixin._safe_positive_price(
+                            d.get("pending_close_price"))
+                        if pending_price > 0:
+                            fill_price = pending_price
+                        pending_fee = FuturesExitsMixin._safe_finite_float(
+                            d.get("pending_close_fee"), None)
+                        if pending_fee is not None:
+                            close_fee = pending_fee
+                            pending_fee_from_fallback = True
                     exch_oid = pending_oid or exch_oid
                     log_event(
                         f"{sym}: position no longer exists on exchange "
@@ -1360,31 +1504,39 @@ class FuturesExitsMixin:
                 from bot_utils.close_fragments import (
                     add_close_fragment_update, pending_close_values)
                 prev_amount, _px, _fee, _oid = pending_close_values(d)
-                fragment = max(0.0, raw_amount - prev_amount)
-                if fragment > 0 and fill_price > 0:
-                    frag_fee = extract_or_estimate_futures_fee(
-                        self.ex, order or {}, symbol_full, fill_price,
-                        amount=fragment, contract_size=contract_size,
-                    )
-                    pending_view = dict(d)
-                    pending_view.update(add_close_fragment_update(
-                        d, amount=fragment, price=fill_price,
-                        fee=frag_fee, order_id=exch_oid,
-                    ))
-                    _amt, _price, _fee, _oid = pending_close_values(pending_view)
-                    if _amt > 0 and _price > 0:
-                        fill_price = _price
-                        close_fee = _fee
-                        exch_oid = _oid or exch_oid
+                if order is None and prev_amount <= 0 and _px > 0:
+                    fill_price = _px
+                    close_fee = _fee
+                    exch_oid = _oid or exch_oid
                 else:
-                    _amt, _price, _fee, _oid = pending_close_values(d)
-                    if _amt > 0 and _price > 0:
-                        fill_price = _price
-                        close_fee = _fee
-                        exch_oid = _oid or exch_oid
+                    fragment = max(0.0, raw_amount - prev_amount)
+                    if fragment > 0 and fill_price > 0:
+                        frag_fee = extract_or_estimate_futures_fee(
+                            self.ex, order or {}, symbol_full, fill_price,
+                            amount=fragment, contract_size=contract_size,
+                        )
+                        pending_view = dict(d)
+                        pending_view.update(add_close_fragment_update(
+                            d, amount=fragment, price=fill_price,
+                            fee=frag_fee, order_id=exch_oid,
+                        ))
+                        _amt, _price, _fee, _oid = pending_close_values(pending_view)
+                        if _amt > 0 and _price > 0:
+                            fill_price = _price
+                            close_fee = _fee
+                            exch_oid = _oid or exch_oid
+                    else:
+                        _amt, _price, _fee, _oid = pending_close_values(d)
+                        if _amt > 0 and _price > 0:
+                            fill_price = _price
+                            close_fee = _fee
+                            exch_oid = _oid or exch_oid
             except Exception:
-                close_fee = extract_order_fee_futures(order or {})
-                if close_fee <= 0:
+                close_fee_known = pending_fee_from_fallback
+                if not close_fee_known:
+                    close_fee, close_fee_known = _extract_order_fee_futures_known(
+                        order or {})
+                if not close_fee_known:
                     try:
                         close_fee = extract_or_estimate_futures_fee(
                             self.ex, order or {}, symbol_full, fill_price,
@@ -1397,13 +1549,18 @@ class FuturesExitsMixin:
         move_pct_real = price_move_pct(entry, fill_price, pos_type) if entry > 0 else move_pct
         pnl_real, _ = (calc_unrealized_pnl(entry, fill_price, margin, lev, pos_type)
                         if entry > 0 and margin > 0 else (pnl_usdt, 0.0))
-        mfe_pct = float(d.get("max_profit_pct", move_pct_real) or move_pct_real)
-        mae_pct = float(d.get("min_profit_pct", move_pct_real) or move_pct_real)
+        mfe_pct = FuturesExitsMixin._safe_finite_float(
+            d.get("max_profit_pct"), move_pct_real)
+        mae_pct = FuturesExitsMixin._safe_finite_float(
+            d.get("min_profit_pct"), move_pct_real)
         giveback_pct = max(0.0, mfe_pct - move_pct_real)
 
-        initial_entry_fee = float(d.get("initial_entry_fee", d.get("fees_paid", 0.0)))
-        original_amount = float(d.get("original_amount", d.get("amount", 0)))
-        current_amount = float(d.get("amount", 0))
+        initial_entry_fee = FuturesExitsMixin._safe_finite_float(
+            d.get("initial_entry_fee", d.get("fees_paid", 0.0)), 0.0)
+        original_amount = FuturesExitsMixin._safe_nonnegative_amount(
+            d.get("original_amount", d.get("amount", 0)))
+        current_amount = FuturesExitsMixin._safe_nonnegative_amount(
+            d.get("amount", 0))
   # Safe helper  defends against the original_amount=0 + partial_sold=True
         # combination (would otherwise double-deduct the entry fee).
         partial_sold = bool(d.get("partial_sold"))
@@ -1412,11 +1569,13 @@ class FuturesExitsMixin:
             partial_sold=partial_sold
         )
 
-        funding_pd = float(d.get("funding_paid", 0.0))
-        funding_booked = float(d.get("funding_booked_on_partials", 0.0))
+        funding_pd = FuturesExitsMixin._safe_finite_float(
+            d.get("funding_paid"), 0.0)
+        funding_booked = FuturesExitsMixin._safe_finite_float(
+            d.get("funding_booked_on_partials"), 0.0)
         # Scale by ACTUAL remaining ratio via the safe helper so a corrupted
         # original_amount can't crash the math.
-        if partial_sold:
+        if partial_sold and original_amount > 0:
             funding_pd = safe_remaining_funding(
                 funding_pd, current_amount, original_amount,
                 partial_sold=True, booked_on_partials=funding_booked,
@@ -1431,11 +1590,13 @@ class FuturesExitsMixin:
                 realized = fetch_or_estimate_funding(
                     self.ex, symbol_full, d.get("buy_time"),
                     notional_usdt=notional, pos_type=pos_type,
-                    fallback_state_value=float(d.get("funding_paid", 0.0))
+                    fallback_state_value=FuturesExitsMixin._safe_finite_float(
+                        d.get("funding_paid"), 0.0)
                 )
+                realized = FuturesExitsMixin._safe_finite_float(realized, None)
                 if realized is not None:
                     # Safe helper for the realized-funding scaling too
-                    if partial_sold:
+                    if partial_sold and original_amount > 0:
                         realized = safe_remaining_funding(
                             realized, current_amount, original_amount,
                             partial_sold=True,
@@ -1448,7 +1609,8 @@ class FuturesExitsMixin:
         slice_fees = proportional_entry_fee + close_fee
         profit_usdt = round(pnl_real - slice_fees - funding_pd, 2)
         # Round-trip fee total for the whole trade (Telegram display only).
-        lifetime_fees = float(d.get("fees_paid", 0.0)) + close_fee
+        lifetime_fees = FuturesExitsMixin._safe_finite_float(
+            d.get("fees_paid"), 0.0) + close_fee
 
         # Persist accounting first. Once a live close is verified flat, the
         # local state is the last recoverable source for PnL/accounting. Do not
@@ -1520,7 +1682,8 @@ class FuturesExitsMixin:
             log_event(f"log_sell {sym} failed: {e}", "WARN")
 
         try:
-            partial_realized = float(d.get("partial_profit_realized", 0.0))
+            partial_realized = FuturesExitsMixin._safe_finite_float(
+                d.get("partial_profit_realized"), 0.0)
             if d.get("partial_sold") and abs(partial_realized) > 0.005:
                 total = profit_usdt + partial_realized
                 total_line = (f"Total PnL: {total:+.2f} USDT "

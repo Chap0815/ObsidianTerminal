@@ -74,6 +74,15 @@ def _to_bool(value) -> bool | None:
     return None
 
 
+def _finite_float(value) -> float:
+    if isinstance(value, bool):
+        raise ValueError("boolean is not numeric")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("not finite")
+    return parsed
+
+
 def _pid_cmdline(pid: int) -> str:
     try:
         import psutil  # type: ignore
@@ -264,9 +273,7 @@ def _check_config(bot_name: str | None,
                                  f"{name}: LIVE but hidden in UI.VISIBLE_BOTS"))
         for key in ("POSITION_SIZE", "MAX_OPEN_TRADES", "MAX_DAILY_LOSS"):
             try:
-                val = float(section.get(key))
-                if not math.isfinite(val):
-                    raise ValueError("not finite")
+                val = _finite_float(section.get(key))
                 if key == "MAX_OPEN_TRADES" and not (1.0 <= val <= 50.0):
                     issues.append(_issue(
                         "error", "max_open_trades_invalid",
@@ -282,9 +289,9 @@ def _check_config(bot_name: str | None,
                 issues.append(_issue("error", "config_numeric",
                                      f"{name}: {key} is not numeric/finite"))
         try:
-            pos = float(section.get("POSITION_SIZE"))
+            pos = _finite_float(section.get("POSITION_SIZE"))
             pos_max_raw = section.get("POSITION_SIZE_MAX", pos)
-            pos_max = float(pos_max_raw)
+            pos_max = _finite_float(pos_max_raw)
             limit = POSITION_LIMIT_BY_BOT.get(name, 150.0)
             if pos <= 0 or pos > limit:
                 issues.append(_issue(
@@ -304,7 +311,7 @@ def _check_config(bot_name: str | None,
         lev_limits = LEVERAGE_LIMIT_BY_BOT.get(name)
         if lev_limits and "LEVERAGE" in section:
             try:
-                lev = float(section.get("LEVERAGE"))
+                lev = _finite_float(section.get("LEVERAGE"))
                 lo, hi = lev_limits
                 if not (lo <= lev <= hi):
                     issues.append(_issue(
@@ -318,22 +325,23 @@ def _check_config(bot_name: str | None,
                 issues.append(_issue("error", "leverage_numeric",
                                      f"{name}: LEVERAGE is not numeric"))
         try:
-            initial_sl = float(section.get("INITIAL_STOP_LOSS"))
+            initial_sl = _finite_float(section.get("INITIAL_STOP_LOSS"))
             if not (-100.0 < initial_sl < 0.0):
                 issues.append(_issue(
                     "error", "initial_stop_loss_invalid",
                     f"{name}: INITIAL_STOP_LOSS={initial_sl} must be negative and > -100"))
-            lev = float(section.get("LEVERAGE", 1) or 1)
+            lev_raw = section.get("LEVERAGE", 1)
+            lev = 1.0 if lev_raw is None else _finite_float(lev_raw)
             if lev > 1.0 and initial_sl <= -((100.0 / lev) * 0.9):
                 issues.append(_issue(
                     "error", "initial_stop_loss_beyond_liq",
                     f"{name}: INITIAL_STOP_LOSS={initial_sl} sits at/beyond liquidation at {lev:g}x"))
         except Exception:
             issues.append(_issue("error", "initial_stop_loss_numeric",
-                                 f"{name}: INITIAL_STOP_LOSS is not numeric"))
+                                     f"{name}: INITIAL_STOP_LOSS is not numeric"))
         if "PER_LEG_DISASTER_STOP" in section:
             try:
-                pds = float(section.get("PER_LEG_DISASTER_STOP"))
+                pds = _finite_float(section.get("PER_LEG_DISASTER_STOP"))
                 if pds >= 0.0:
                     issues.append(_issue(
                         "error", "per_leg_disaster_stop_invalid",
@@ -343,13 +351,13 @@ def _check_config(bot_name: str | None,
                                      f"{name}: PER_LEG_DISASTER_STOP is not numeric"))
         if "TRAILING_DISTANCE" in section and "ACTIVATION_PROFIT" in section:
             try:
-                td = float(section.get("TRAILING_DISTANCE"))
-                ap = float(section.get("ACTIVATION_PROFIT"))
+                td = _finite_float(section.get("TRAILING_DISTANCE"))
+                ap = _finite_float(section.get("ACTIVATION_PROFIT"))
                 if td >= ap:
                     issues.append(_issue("error", "trailing_invalid",
                                          f"{name}: TRAILING_DISTANCE >= ACTIVATION_PROFIT"))
                 if "POST_PARTIAL_TRAILING_DISTANCE" in section:
-                    ptd = float(section.get("POST_PARTIAL_TRAILING_DISTANCE"))
+                    ptd = _finite_float(section.get("POST_PARTIAL_TRAILING_DISTANCE"))
                     if ptd <= 0:
                         issues.append(_issue("error", "post_partial_trailing_invalid",
                                              f"{name}: POST_PARTIAL_TRAILING_DISTANCE <= 0"))
@@ -380,8 +388,8 @@ def _check_config(bot_name: str | None,
             if key not in section:
                 continue
             try:
-                val = float(section.get(key))
-                if not math.isfinite(val) or not (lo <= val <= hi):
+                val = _finite_float(section.get(key))
+                if not (lo <= val <= hi):
                     issues.append(_issue(
                         "error", "config_range_invalid",
                         f"{name}: {key}={section.get(key)} outside {lo:g}-{hi:g}"))

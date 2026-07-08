@@ -28,6 +28,7 @@ import time as _time
 from typing import Optional, Tuple, Dict, List
 
 from core.spot_bot import SpotBot
+from bot_utils.safe_numeric import safe_positive_float
 from trading.trend_signal import (is_in_trend, params_from_cfg, TrendParams,
                                    has_full_history, bars_required)
 from trading.vol_target import (realized_vol, vol_target_multiplier,
@@ -110,7 +111,10 @@ class TrendBot(SpotBot):
             pass
         try:
             t = self.ex.fetch_ticker(f"{sym}/USDT")
-            return float(t.get("last") or t.get("close") or 0)
+            price = safe_positive_float(t.get("last"), 0.0)
+            if price > 0:
+                return price
+            return safe_positive_float(t.get("close"), 0.0)
         except Exception:
             return 0.0
 

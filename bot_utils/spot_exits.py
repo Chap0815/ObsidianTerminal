@@ -16,6 +16,8 @@ _EMERGENCY_RESIDUAL_DUST_USDT = 1.0
 #  Helpers 
 
 def _finite_float(value, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -29,6 +31,8 @@ def _positive_finite(value, default: float = 0.0) -> float:
 
 
 def _positive_finite_decimal(value) -> Optional[Decimal]:
+    if isinstance(value, bool):
+        return None
     try:
         parsed = Decimal(str(value))
     except Exception:
@@ -90,6 +94,8 @@ def _exchange_precision_step(ex, symbol_pair: str) -> Optional[Decimal]:
         if not isinstance(mkt, dict):
             return None
         prec = (mkt.get("precision") or {}).get("amount")
+        if isinstance(prec, bool):
+            return None
         if prec is None:
             return None
         # CCXT precision can be either an int (decimal places) or
@@ -154,6 +160,8 @@ def _free_base_balance(ex, symbol_pair: str):
             if isinstance(sub, dict):
                 free = sub.get("free")
         if free is None:
+            return None
+        if isinstance(free, bool):
             return None
         parsed = float(free)
         return parsed if math.isfinite(parsed) and parsed >= 0 else None
@@ -450,8 +458,9 @@ def emergency_close_all_spot(*,
                 curr = 0.0
                 try:
                     ticker = ex.fetch_ticker(symbol_pair)
-                    curr = _positive_finite(
-                        ticker.get("last") or ticker.get("close"))
+                    curr = _positive_finite(ticker.get("last"))
+                    if curr <= 0:
+                        curr = _positive_finite(ticker.get("close"))
                 except Exception as e:
                     log_event(f"  Price for {sym} unavailable: {e}", "WARN")
                 if curr <= 0:

@@ -28,6 +28,7 @@ from bot_utils import (
     safe_remaining,
     safe_proportional_fee,
 )
+from bot_utils.safe_numeric import safe_positive_float
 
 
 # Minimum notional safety margin  exchanges reject sells below this.
@@ -59,6 +60,8 @@ _LIVE_RESIDUAL_DUST_USDT = 1.0
 
 
 def _finite_float(value, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -109,7 +112,9 @@ class ExitsMixin:
     """Monitor thread + exit decision logic."""
 
     def _retry_pending_partial_accounting(self, sym: str, d: dict) -> None:
-        pending = list(d.get("accounting_pending_partials") or [])
+        from bot_utils.trade_state import normalize_pending_accounting_items
+        pending = normalize_pending_accounting_items(
+            d.get("accounting_pending_partials"))
         if not pending:
             return
         from core.database import save_trade_db
@@ -453,19 +458,21 @@ class ExitsMixin:
         pair = f"{sym}/USDT"
         t = batch.get(pair)
         if isinstance(t, dict):
-            try:
-                v = float(t.get("last") or t.get("close") or 0)
-                if v > 0:
-                    return v
-            except (TypeError, ValueError):
-                pass
+            v = safe_positive_float(t.get("last"), 0.0)
+            if v <= 0:
+                v = safe_positive_float(t.get("close"), 0.0)
+            if v > 0:
+                return v
         if self._ticker_backoff_active():
             return 0.0
         try:
             from bot_utils.api_budget import try_consume_api_call
             if not try_consume_api_call("fetch_ticker", critical=True):
                 return 0.0
-            result = float(self.ex.fetch_ticker(pair).get("last") or 0)
+            ticker = self.ex.fetch_ticker(pair) or {}
+            result = safe_positive_float(ticker.get("last"), 0.0)
+            if result <= 0:
+                result = safe_positive_float(ticker.get("close"), 0.0)
             return result
         except Exception as e:
             try:
@@ -634,8 +641,14 @@ class ExitsMixin:
 
         # Partial Take-Profit
         activation_profit = float(self.C("ACTIVATION_PROFIT"))
+        partial_blocked_until = _finite_float(
+            d.get("partial_tp_blocked_min_notional_until"), 0.0)
+        partial_block_active = (
+            bool(d.get("partial_tp_blocked_min_notional"))
+            and time.time() < partial_blocked_until
+        )
         if (not d.get("partial_sold")
-                and not d.get("partial_tp_blocked_min_notional")
+                and not partial_block_active
                 and prof >= activation_profit):
             handled = self._execute_partial_tp(sym, d, curr)
             if handled:
@@ -784,6 +797,7 @@ class ExitsMixin:
                 )
                 self.state.update_many(sym, {
                     "partial_tp_blocked_min_notional": True,
+                    "partial_tp_blocked_min_notional_until": time.time() + 300.0,
                     "break_even": True,
                 })
                 return True
@@ -809,8 +823,14 @@ class ExitsMixin:
             # Re-check after acquiring: maybe state was already mutated
             # by the lock-holder (e.g. emergency-close marked sold).
             d_live = self.state.get(sym)
+            live_blocked_until = _finite_float(
+                (d_live or {}).get("partial_tp_blocked_min_notional_until"), 0.0)
+            live_block_active = (
+                bool((d_live or {}).get("partial_tp_blocked_min_notional"))
+                and time.time() < live_blocked_until
+            )
             if (d_live is None or d_live.get("partial_sold")
-                    or d_live.get("partial_tp_blocked_min_notional")):
+                    or live_block_active):
                 return False
             try:
                 live_amount = _positive_finite(d_live.get("amount"))
@@ -831,6 +851,7 @@ class ExitsMixin:
                     or live_rem_test * curr < min_notional):
                 self.state.update_many(sym, {
                     "partial_tp_blocked_min_notional": True,
+                    "partial_tp_blocked_min_notional_until": time.time() + 300.0,
                     "break_even": True,
                 })
                 return True
@@ -956,9 +977,13 @@ class ExitsMixin:
             "amount": new_amount,
             "fees_paid": new_fees_paid,
             "break_even": True,
+            "partial_tp_blocked_min_notional": False,
+            "partial_tp_blocked_min_notional_until": 0.0,
         }
         if not accounting_ok:
-            pending = list(d.get("accounting_pending_partials") or [])
+            from bot_utils.trade_state import normalize_pending_accounting_items
+            pending = normalize_pending_accounting_items(
+                d.get("accounting_pending_partials"))
             pending.append(partial_trade)
             updates["accounting_pending_partials"] = pending
             log_event(
@@ -1217,7 +1242,9 @@ class ExitsMixin:
             if partial_live_fill:
                 remaining_after_fill = safe_remaining(
                     requested_amount, remaining_amount)
-                pending = list(d.get("accounting_pending_partials") or [])
+                from bot_utils.trade_state import normalize_pending_accounting_items
+                pending = normalize_pending_accounting_items(
+                    d.get("accounting_pending_partials"))
                 pending.append(trade_row)
                 try:
                     self.state.update_many(sym, {

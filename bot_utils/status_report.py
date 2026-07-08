@@ -9,7 +9,23 @@ monitor tick)  no extra API calls. Best-effort: never raises into the heartbeat.
 """
 from __future__ import annotations
 
+import math
 import time
+
+
+def _finite_float_or_none(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _positive_float_or_none(value):
+    parsed = _finite_float_or_none(value)
+    return parsed if parsed is not None and parsed > 0 else None
 
 
 def _positions_summary(snapshot: dict, is_futures: bool):
@@ -22,20 +38,26 @@ def _positions_summary(snapshot: dict, is_futures: bool):
     total = 0.0
     for sym, d in snapshot.items():
         try:
-            entry = float(d.get("buy", 0) or 0)
-            last = float(d.get("last_price", entry) or entry)
-            if entry <= 0:
+            entry = _positive_float_or_none(d.get("buy"))
+            last = _positive_float_or_none(d.get("last_price"))
+            if entry is None or last is None:
                 continue
             if is_futures:
                 side = d.get("position_type", "LONG")
-                margin = float(d.get("invested_usdt", 0) or 0)
-                lev = float(d.get("leverage", 1) or 1)
+                margin = _positive_float_or_none(d.get("invested_usdt"))
+                lev = _positive_float_or_none(d.get("leverage"))
+                if margin is None or lev is None:
+                    continue
                 pnl, pct = calc_unrealized_pnl(entry, last, margin, lev, side)
             else:
                 side = "SPOT"
-                amount = float(d.get("amount", 0) or 0)
+                amount = _positive_float_or_none(d.get("amount"))
+                if amount is None:
+                    continue
                 pnl = amount * (last - entry)
                 pct = price_move_pct(entry, last, "LONG")
+            if not (math.isfinite(pnl) and math.isfinite(pct)):
+                continue
             total += pnl
             rows.append((pnl, side, sym, pct))
         except Exception:

@@ -67,6 +67,7 @@ from typing import Dict, List, Optional, Tuple
 from core.models import Position, Signal, PositionType
 from core.state_manager import StateManager
 from core.event_bus import get_bus, register_console_logger, register_structured_logger
+from bot_utils.safe_numeric import safe_positive_float
 
 
 #  Helpers 
@@ -364,9 +365,13 @@ class BaseBot(ABC):
         # REST fallback
         try:
             ticker = self._exchange.fetch_ticker(symbol)
-            return float(ticker.get("last") or ticker.get("close") or fallback)
+            price = safe_positive_float(ticker.get("last"), 0.0)
+            if price > 0:
+                return price
+            price = safe_positive_float(ticker.get("close"), 0.0)
+            return price if price > 0 else safe_positive_float(fallback, 0.0)
         except Exception:
-            return fallback
+            return safe_positive_float(fallback, 0.0)
 
     #  Abstract methods (subclasses must implement) 
 

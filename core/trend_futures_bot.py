@@ -72,11 +72,58 @@ class TrendFuturesBot(FuturesBot):
         return max(p.sma_slow, p.cross_slow, p.sma_fast, p.cross_fast) + 60
 
     def _safe_float(self, value, default: float = 0.0) -> float:
+        if isinstance(value, bool):
+            return default
         try:
             out = float(value)
             return out if math.isfinite(out) else default
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return default
+
+    @staticmethod
+    def _precision_amount_or_none(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            amount = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return amount if math.isfinite(amount) else None
+
+    @staticmethod
+    def _finite_float_or_none(value) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            out = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return out if math.isfinite(out) else None
+
+    def _entry_contract_size(self, full: str, fallback_reader) -> float:
+        markets = getattr(self.ex, "markets", None) or {}
+        market = markets.get(full) or {}
+        info = market.get("info") if isinstance(market, dict) else {}
+        if not isinstance(info, dict):
+            info = {}
+        candidates = []
+        if isinstance(market, dict):
+            candidates.extend([
+                market.get("contractSize"),
+                market.get("contract_size"),
+            ])
+        candidates.extend([
+            info.get("contractSize"),
+            info.get("contract_size"),
+        ])
+        explicit = [value for value in candidates if value is not None]
+        for value in explicit:
+            cs = self._safe_float(value, 0.0)
+            if cs > 0.0:
+                return cs
+        if explicit:
+            return 0.0
+        return self._safe_float(fallback_reader(self.ex, full), 0.0)
 
     def _bool_cfg(self, key: str, default: bool = False) -> bool:
         value = self.C(key, default)
@@ -283,11 +330,11 @@ class TrendFuturesBot(FuturesBot):
             self._log_error(f"trend cooldown set {base}", e)
 
     def _post_partial_trailing(self, base_distance: float, d: dict) -> tuple[float, bool]:
-        try:
-            amount = abs(float(d.get("amount", 0) or 0))
-            original = abs(float(d.get("original_amount", amount) or amount))
-        except (TypeError, ValueError):
-            return base_distance, False
+        amount = abs(self._safe_float(d.get("amount"), 0.0))
+        if "original_amount" in d:
+            original = abs(self._safe_float(d.get("original_amount"), 0.0))
+        else:
+            original = amount
         if not d.get("partial_sold") or amount <= 0 or original <= 0 or amount >= original:
             return base_distance, False
         configured = self._f("POST_PARTIAL_TRAILING_DISTANCE", 1.0)
@@ -341,7 +388,8 @@ class TrendFuturesBot(FuturesBot):
     def _maybe_blacklist_bad_symbol(self, base: str, reason: str,
                                     profit_usdt: float, move_pct: float,
                                     log_event=None) -> None:
-        if profit_usdt >= 0:
+        profit = self._finite_float_or_none(profit_usdt)
+        if profit is None or profit >= 0:
             return
         if str(self.C("BAD_SYMBOL_FILTER", True)).strip().lower() not in (
                 "1", "true", "yes", "on"):
@@ -351,15 +399,18 @@ class TrendFuturesBot(FuturesBot):
             r = str(reason or "").lower()
             single_stop_pct = self._f("SINGLE_STOP_MIN_LOSS_PCT", 5.0)
             single_stop_hours = self._i("SINGLE_STOP_BLACKLIST_HOURS", 4)
-            if "stop-loss" in r and move_pct <= -abs(single_stop_pct) and single_stop_hours > 0:
+            move = self._finite_float_or_none(move_pct)
+            if (move is not None and "stop-loss" in r
+                    and move <= -abs(single_stop_pct)
+                    and single_stop_hours > 0):
                 add_to_blacklist(
-                    base, self.BOT_NAME, profit_usdt, hours=single_stop_hours,
-                    reason=f"futrend single stop {move_pct:.2f}%",
+                    base, self.BOT_NAME, profit, hours=single_stop_hours,
+                    reason=f"futrend single stop {move:.2f}%",
                     incremental=True,
                 )
                 if log_event:
                     log_event(f"[{self.BOT_NAME}] {base}: bad-symbol pause "
-                              f"{single_stop_hours}h after {move_pct:.2f}% stop",
+                              f"{single_stop_hours}h after {move:.2f}% stop",
                               "WARN")
                 return
 
@@ -370,16 +421,17 @@ class TrendFuturesBot(FuturesBot):
             if hours <= 0:
                 return
             recent = get_recent_trades(self.BOT_NAME, limit=40, days=lookback_days)
-            losses = [
-                float(t.get("profit_usdt", 0) or 0)
-                for t in recent
-                if str(t.get("symbol", "")).upper() == base.upper()
-                and float(t.get("profit_usdt", 0) or 0) < 0
-            ]
+            losses = []
+            for t in recent:
+                if str(t.get("symbol", "")).upper() != base.upper():
+                    continue
+                pnl = self._finite_float_or_none(t.get("profit_usdt"))
+                if pnl is not None and pnl < 0:
+                    losses.append(pnl)
             total_loss = abs(sum(losses))
             if len(losses) >= loss_count_min or total_loss >= total_loss_min:
                 add_to_blacklist(
-                    base, self.BOT_NAME, total_loss or abs(profit_usdt),
+                    base, self.BOT_NAME, total_loss or abs(profit),
                     hours=hours,
                     reason=(f"futrend repeated damage: {len(losses)} losses, "
                             f"-{total_loss:.2f} USDT/{lookback_days}d"),
@@ -749,8 +801,10 @@ class TrendFuturesBot(FuturesBot):
             mm = get_maintenance_margin_rate(self.ex, full)
         except Exception:
             mm = 0.01
-        cs = self._safe_float(futures_contract_size(self.ex, full), 0.0)
+        cs = self._entry_contract_size(full, futures_contract_size)
         if not math.isfinite(cs) or cs <= 0:
+            log_event(f"[{self.BOT_NAME}] {base}: invalid contract size - skip",
+                      "WARN")
             return
         contracts = (notional / price) / max(cs, 1e-9)
         if not math.isfinite(contracts) or contracts <= 0:
@@ -762,6 +816,40 @@ class TrendFuturesBot(FuturesBot):
         margin_mode = str(self.C("MARGIN_MODE", "isolated") or "isolated").lower()
 
         if not self.simulation:
+            min_contracts = 0.0
+            try:
+                _lim = ((getattr(self.ex, "markets", {}) or {}).get(full, {})
+                        .get("limits") or {})
+                _min = (_lim.get("amount") or {}).get("min")
+                min_contracts = self._safe_float(_min, 0.0)
+                if min_contracts > 0.0 and contracts < min_contracts:
+                    log_event(f"[{self.BOT_NAME}] {base}: {contracts:g} < min "
+                              f"{min_contracts:g} - skip (notional too small)",
+                              "INFO")
+                    return
+                _cmin = (_lim.get("cost") or {}).get("min")
+                min_cost = self._safe_float(_cmin, 0.0)
+                if min_cost > 0.0 and notional < min_cost:
+                    log_event(f"[{self.BOT_NAME}] {base}: notional {notional:.2f} < "
+                              f"exchange min-cost {min_cost:.2f} - skip", "INFO")
+                    return
+            except Exception:
+                pass
+            try:
+                raw_contracts = safe_amount_to_precision(self.ex, full, contracts)
+                contracts = 0.0 if isinstance(raw_contracts, bool) else float(raw_contracts)
+            except Exception:
+                raw_contracts = contracts
+                contracts = 0.0
+            if not math.isfinite(contracts) or contracts <= 0:
+                log_event(f"[{self.BOT_NAME}] {base}: invalid contracts "
+                          f"{raw_contracts!r} after precision - skip", "WARN")
+                return
+            if min_contracts > 0.0 and contracts < min_contracts:
+                log_event(f"[{self.BOT_NAME}] {base}: precision amount "
+                          f"{contracts:g} < min {min_contracts:g} - skip",
+                          "INFO")
+                return
             try:
                 must_set_leverage(self.ex, lev_cap, full, direction="LONG",
                                   margin_mode=margin_mode)
@@ -771,24 +859,6 @@ class TrendFuturesBot(FuturesBot):
                 return
             safe_set_margin_mode(self.ex, margin_mode, full, leverage=lev_cap,
                                  direction="LONG")
-            try:
-                _lim = ((getattr(self.ex, "markets", {}) or {}).get(full, {})
-                        .get("limits") or {})
-                _min = (_lim.get("amount") or {}).get("min")
-                if _min and contracts < float(_min):
-                    log_event(f"[{self.BOT_NAME}] {base}: {contracts:g} < min "
-                              f"{_min:g} - skip (notional too small)", "INFO")
-                    return
-                _cmin = (_lim.get("cost") or {}).get("min")
-                if _cmin and notional < float(_cmin):
-                    log_event(f"[{self.BOT_NAME}] {base}: notional {notional:.2f} < "
-                              f"exchange min-cost {float(_cmin):.2f} - skip", "INFO")
-                    return
-            except Exception:
-                pass
-            contracts = float(safe_amount_to_precision(self.ex, full, contracts))
-            if not math.isfinite(contracts) or contracts <= 0:
-                return
             import hashlib as _h
             _cid = (f"{self.BUY_PREFIX}-{base}-"
                     + _h.sha256(f"{self.BOT_NAME}:{base}:{int(time.time()//30)}"
@@ -1081,9 +1151,25 @@ class TrendFuturesBot(FuturesBot):
         from config.exchange_config import reduce_only_params, safe_amount_to_precision
 
         try:
-            amt = float(safe_amount_to_precision(self.ex, full, amount))
+            amt = TrendFuturesBot._precision_amount_or_none(
+                safe_amount_to_precision(self.ex, full, amount)
+            )
+            if amt is None:
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: cannot rollback untracked live "
+                    f"entry ({reason}) - invalid precision amount",
+                    "ERROR",
+                )
+                return False
         except Exception:
-            amt = float(amount or 0.0)
+            amt = TrendFuturesBot._precision_amount_or_none(amount)
+            if amt is None:
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: cannot rollback untracked live "
+                    f"entry ({reason}) - invalid raw amount",
+                    "ERROR",
+                )
+                return False
         if amt <= 0:
             log_event(
                 f"[{self.BOT_NAME}] {base}: cannot rollback untracked live "
@@ -1207,6 +1293,63 @@ class TrendFuturesBot(FuturesBot):
         from core.database import save_trade_db
         from core.logger import log_struct
         full = f"{base}/USDT:USDT"
+
+        sentinel = object()
+
+        def _finite_float(value, default=0.0):
+            if isinstance(value, bool):
+                return default
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return default
+            return parsed if math.isfinite(parsed) else default
+
+        def _positive_float(value, default=0.0):
+            parsed = _finite_float(value, default)
+            return parsed if parsed is not None and parsed > 0 else default
+
+        def _nonnegative_float(value, default=0.0):
+            parsed = _finite_float(value, default)
+            return parsed if parsed is not None and parsed >= 0 else default
+
+        def _required_positive(key):
+            return _positive_float(d.get(key), None)
+
+        def _optional_positive(key, default):
+            if d.get(key, sentinel) is sentinel:
+                return default
+            return _positive_float(d.get(key), None)
+
+        def _finite_non_bool_number(value) -> bool:
+            if isinstance(value, bool):
+                return False
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            return math.isfinite(parsed)
+
+        def _pending_fragment_is_complete(p_amount, p_price, p_fee, state) -> bool:
+            if p_amount + 1e-12 < amt or p_price <= 0:
+                return False
+            for key in (
+                "pending_close_filled_amount",
+                "pending_close_notional_sum",
+                "pending_close_price",
+                "pending_close_fee",
+            ):
+                raw = state.get(key)
+                if raw is not None and not _finite_non_bool_number(raw):
+                    return False
+            return _finite_non_bool_number(p_fee)
+
+        def _log_invalid_pending_fragment() -> None:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: invalid pending close fragment - "
+                f"state kept for reconcile/offline accounting",
+                "WARN")
+
         if d.get("verified_flat_pending_accounting"):
             log_event(
                 f"[{self.BOT_NAME}] {base}: position already verified flat; "
@@ -1214,19 +1357,30 @@ class TrendFuturesBot(FuturesBot):
                 "WARN")
             return
         pos_type = d.get("position_type", "LONG")
-        entry = float(d.get("buy", 0) or 0)
-        margin = float(d.get("invested_usdt", 0) or 0)
-        lev = float(d.get("leverage", 1) or 1)
-        amt = abs(float(d.get("amount", 0) or 0))
+        entry = _required_positive("buy")
+        margin = _required_positive("invested_usdt")
+        lev = _required_positive("leverage")
+        amt = _required_positive("amount")
+        if entry is None or margin is None or lev is None or amt is None:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: close accounting skipped due to "
+                f"invalid core state - state kept for review", "WARN")
+            return
         close_fee = 0.0
-        initial_entry_fee = float(d.get("initial_entry_fee",
-                                        d.get("fees_paid", 0.0)) or 0.0)
-        original_amount = float(d.get("original_amount", amt) or amt)
-        close_price = float(d.get("last_price", entry) or entry)
+        initial_entry_fee = _finite_float(
+            d.get("initial_entry_fee", d.get("fees_paid", 0.0)), 0.0)
+        original_amount = _nonnegative_float(
+            d.get("original_amount", amt), 0.0)
+        close_price = _optional_positive("last_price", entry)
+        if close_price is None:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: close accounting skipped due to "
+                f"invalid close price - state kept for review", "WARN")
+            return
         exch_oid = None
         try:
             from bot_utils import futures_contract_size
-            cs = futures_contract_size(self.ex, full)
+            cs = _positive_float(futures_contract_size(self.ex, full), 0.0)
         except Exception:
             cs = 1.0
         live_close_already_verified = False
@@ -1237,6 +1391,9 @@ class TrendFuturesBot(FuturesBot):
                 _closed, _remaining = verify_position_closed(self.ex, full)
                 if _closed:
                     _amt, _price, _fee, _oid = pending_close_values(d)
+                    if not _pending_fragment_is_complete(_amt, _price, _fee, d):
+                        _log_invalid_pending_fragment()
+                        return
                     if _price > 0:
                         close_price = _price
                     close_fee = _fee
@@ -1247,8 +1404,9 @@ class TrendFuturesBot(FuturesBot):
 
         if self.simulation:
             from bot_utils.fee_math import taker_fee_rate
-            close_fee += amt * cs * close_price * taker_fee_rate(
-                self.ex, f"{base}/USDT:USDT", 0.0006)
+            if cs > 0:
+                close_fee += amt * cs * close_price * taker_fee_rate(
+                    self.ex, f"{base}/USDT:USDT", 0.0006)
         elif amt > 0 and not live_close_already_verified:
             from bot_utils import (create_order_with_retry,
                                     extract_or_estimate_futures_fee,
@@ -1258,7 +1416,8 @@ class TrendFuturesBot(FuturesBot):
                                                 safe_amount_to_precision)
             lev_cap = max(1, int(math.ceil(lev)))
             try:
-                amt = float(safe_amount_to_precision(self.ex, full, amt))
+                amt = _nonnegative_float(
+                    safe_amount_to_precision(self.ex, full, amt), 0.0)
             except Exception:
                 pass
             if amt <= 0:
@@ -1277,8 +1436,8 @@ class TrendFuturesBot(FuturesBot):
                     shutdown_event=self._shutdown_event,
                     action_label=f"trend close {base}", log_event=log_event)
                 try:
-                    order_filled = max(0.0, float(order.get("filled") or 0.0))
-                except (TypeError, ValueError):
+                    order_filled = _nonnegative_float(order.get("filled"), 0.0)
+                except AttributeError:
                     order_filled = 0.0
             except Exception as e:
                 if is_no_position_error(e):
@@ -1317,21 +1476,22 @@ class TrendFuturesBot(FuturesBot):
                         try:
                             from bot_utils.close_fragments import pending_close_values
                             _amt, _price, _fee, _oid = pending_close_values(d)
+                            if not _pending_fragment_is_complete(
+                                _amt, _price, _fee, d
+                            ):
+                                _log_invalid_pending_fragment()
+                                return
                             if _price > 0:
                                 close_price = _price
                             close_fee = _fee
                             exch_oid = _oid or d.get("pending_close_order_id") or exch_oid
                         except Exception:
-                            try:
-                                close_price = float(
-                                    d.get("pending_close_price") or close_price)
-                            except (TypeError, ValueError):
-                                pass
-                            try:
-                                close_fee = float(
-                                    d.get("pending_close_fee") or close_fee)
-                            except (TypeError, ValueError):
-                                pass
+                            pending_price = _positive_float(
+                                d.get("pending_close_price"), close_price)
+                            if pending_price > 0:
+                                close_price = pending_price
+                            close_fee = _nonnegative_float(
+                                d.get("pending_close_fee"), close_fee)
                             exch_oid = d.get("pending_close_order_id") or exch_oid
                         live_close_already_verified = True
                     else:
@@ -1347,16 +1507,18 @@ class TrendFuturesBot(FuturesBot):
                     return
             if not live_close_already_verified:
                 exch_oid = order.get("id") or order.get("orderId")
-                for _k in ("average", "price"):
-                    _v = order.get(_k)
-                    if _v:
-                        try:
-                            _fv = float(_v)
+                try:
+                    from bot_utils.futures_exits import _resolve_fill_price
+                    close_price, _fill_src = _resolve_fill_price(
+                        self.ex, full, order, close_price, log_event)
+                except Exception:
+                    for _k in ("average", "price"):
+                        _v = order.get(_k)
+                        if _v:
+                            _fv = _positive_float(_v, 0.0)
                             if _fv > 0:
                                 close_price = _fv
                                 break
-                        except (TypeError, ValueError):
-                            pass
             # VERIFY before booking  keep state on a partial/unverifiable close.
             if not live_close_already_verified:
                 try:
@@ -1382,7 +1544,8 @@ class TrendFuturesBot(FuturesBot):
                         from bot_utils.close_fragments import (
                             add_close_fragment_update, pending_close_values)
                         prev_amount, _px, _fee, _oid = pending_close_values(d)
-                        total_filled = max(0.0, amt - float(_remaining))
+                        total_filled = max(
+                            0.0, amt - _nonnegative_float(_remaining, 0.0))
                         fragment = max(0.0, total_filled - prev_amount)
                         if fragment > 0 and close_price > 0:
                             frag_fee = extract_or_estimate_futures_fee(
@@ -1411,8 +1574,15 @@ class TrendFuturesBot(FuturesBot):
                             d, amount=fragment, price=close_price,
                             fee=frag_fee, order_id=exch_oid))
                         _amt, _price, _fee, _oid = pending_close_values(pending_view)
+                        validation_state = pending_view
                     else:
                         _amt, _price, _fee, _oid = pending_close_values(d)
+                        validation_state = d
+                    if not _pending_fragment_is_complete(
+                        _amt, _price, _fee, validation_state
+                    ):
+                        _log_invalid_pending_fragment()
+                        return
                     if _amt > 0 and _price > 0:
                         close_price = _price
                         close_fee = _fee
@@ -1431,8 +1601,9 @@ class TrendFuturesBot(FuturesBot):
             pnl, _ = calc_unrealized_pnl(entry, close_price, margin, lev, pos_type)
             from bot_utils import safe_remaining_funding, safe_proportional_fee
             partial_sold = bool(d.get("partial_sold"))
-            funding = float(d.get("funding_paid", 0.0) or 0.0)
-            funding_booked = float(d.get("funding_booked_on_partials", 0.0) or 0.0)
+            funding = _finite_float(d.get("funding_paid"), 0.0)
+            funding_booked = _finite_float(
+                d.get("funding_booked_on_partials"), 0.0)
             if not self.simulation:
                 try:
                     from bot_utils.futures_funding import fetch_or_estimate_funding
@@ -1446,11 +1617,12 @@ class TrendFuturesBot(FuturesBot):
                         notional_usdt=notional, pos_type=pos_type,
                         fallback_state_value=funding,
                     )
+                    fresh_funding = _finite_float(fresh_funding, None)
                     if fresh_funding is not None:
-                        funding = float(fresh_funding)
+                        funding = fresh_funding
                 except Exception:
                     pass
-            if partial_sold:
+            if partial_sold and original_amount > 0:
                 funding = safe_remaining_funding(
                     funding, amt, original_amount, partial_sold=True,
                     booked_on_partials=funding_booked,
@@ -1460,8 +1632,8 @@ class TrendFuturesBot(FuturesBot):
                                               partial_sold=partial_sold)
             profit_usdt = round(pnl - entry_fee - close_fee - funding, 4)
             move = price_move_pct(entry, close_price, pos_type)
-            mfe_pct = float(d.get("max_profit_pct", move) or move)
-            mae_pct = float(d.get("min_profit_pct", move) or move)
+            mfe_pct = _finite_float(d.get("max_profit_pct"), move)
+            mae_pct = _finite_float(d.get("min_profit_pct"), move)
             giveback_pct = max(0.0, mfe_pct - move)
             try:
                 log_struct("futrend_close_audit", bot=self.BOT_NAME, symbol=base,
@@ -1592,10 +1764,8 @@ class TrendFuturesBot(FuturesBot):
         from bot_utils import calc_liquidation_price, distance_to_liquidation_pct
 
         full = f"{base}/USDT:USDT"
-        try:
-            inflight_active = float(d.get("entry_inflight_until") or 0.0) > time.time()
-        except (TypeError, ValueError):
-            inflight_active = False
+        inflight_active = self._safe_float(
+            d.get("entry_inflight_until"), 0.0) > time.time()
         pos, unavailable = self._fetch_exchange_position(full)
         if pos is None:
             if inflight_active:
@@ -1681,11 +1851,31 @@ class TrendFuturesBot(FuturesBot):
             self._clear_price_unavailable(base)
         except Exception:
             pass
-        entry = float(d.get("buy", 0) or 0)
+        entry = self._safe_float(d.get("buy"), 0.0)
         if entry <= 0:
             return
-        lev = float(d.get("leverage", 1) or 1)
-        margin = float(d.get("invested_usdt", 0) or 0)
+        lev = self._safe_float(d.get("leverage"), 1.0)
+        if lev <= 0:
+            lev = 1.0
+        amount = abs(self._safe_float(d.get("amount"), 0.0))
+        margin = self._safe_float(d.get("invested_usdt"), 0.0)
+        if margin <= 0 and amount > 0:
+            try:
+                from bot_utils import futures_contract_size
+                cs = self._safe_float(futures_contract_size(self.ex, full), 1.0)
+                if cs <= 0:
+                    cs = 1.0
+            except Exception:
+                cs = 1.0
+            margin = (amount * cs * entry) / lev
+        if margin <= 0:
+            return
+        if self._safe_float(d.get("invested_usdt"), 0.0) != margin:
+            d["invested_usdt"] = margin
+            try:
+                self.state.update(base, "invested_usdt", margin)
+            except Exception as e:
+                self._log_error(f"trend margin repair {base}", e)
         pos_type = d.get("position_type", "LONG")
         d["last_price"] = curr
         try:
@@ -1698,19 +1888,19 @@ class TrendFuturesBot(FuturesBot):
             entry, curr, margin, lev, pos_type)
         telemetry = {}
         try:
-            prev_max_pct = float(d.get("max_profit_pct", move))
+            prev_max_pct = self._safe_float(d.get("max_profit_pct"), move)
         except (TypeError, ValueError):
             prev_max_pct = move
         try:
-            prev_min_pct = float(d.get("min_profit_pct", move))
+            prev_min_pct = self._safe_float(d.get("min_profit_pct"), move)
         except (TypeError, ValueError):
             prev_min_pct = move
         try:
-            prev_max_usdt = float(d.get("max_profit_usdt", pnl_now))
+            prev_max_usdt = self._safe_float(d.get("max_profit_usdt"), pnl_now)
         except (TypeError, ValueError):
             prev_max_usdt = pnl_now
         try:
-            prev_min_usdt = float(d.get("min_profit_usdt", pnl_now))
+            prev_min_usdt = self._safe_float(d.get("min_profit_usdt"), pnl_now)
         except (TypeError, ValueError):
             prev_min_usdt = pnl_now
         if "max_profit_pct" not in d or move > prev_max_pct:
@@ -1728,7 +1918,7 @@ class TrendFuturesBot(FuturesBot):
             except Exception as e:
                 self._log_error(f"trend telemetry update {base}", e)
 
-        highest = float(d.get("highest", entry) or entry)
+        highest = self._safe_float(d.get("highest"), entry)
         if pos_type == "LONG" and curr > highest:
             highest = curr
             d["highest"] = highest
@@ -1736,7 +1926,7 @@ class TrendFuturesBot(FuturesBot):
                 self.state.update(base, "highest", highest)
             except Exception as e:
                 self._log_error(f"trend highest update {base}", e)
-        lowest = float(d.get("lowest", entry) or entry)
+        lowest = self._safe_float(d.get("lowest"), entry)
         if pos_type == "SHORT" and curr < lowest:
             lowest = curr
             d["lowest"] = lowest
@@ -1759,13 +1949,16 @@ class TrendFuturesBot(FuturesBot):
 
         # 2) Liquidation-buffer guard (last resort).
         mm = get_maintenance_margin_rate(self.ex, full)
-        liq = float(d.get("liquidation_price",
-                          calc_liquidation_price(entry, lev, pos_type, mm)))
+        liq = self._safe_float(
+            d.get("liquidation_price"),
+            calc_liquidation_price(entry, lev, pos_type, mm),
+        )
         if not self.simulation:
             now_ts = time.time()
-            if now_ts >= float(d.get("liq_next_check_at", 0) or 0):
-                upd = {"liq_next_check_at": now_ts + float(
-                    getattr(self, "LIQ_REFRESH_INTERVAL_SEC", 90.0))}
+            if now_ts >= self._safe_float(d.get("liq_next_check_at"), 0.0):
+                interval = self._safe_float(
+                    getattr(self, "LIQ_REFRESH_INTERVAL_SEC", 90.0), 90.0)
+                upd = {"liq_next_check_at": now_ts + interval}
                 try:
                     exch_liq = get_exchange_liq_price(self.ex, full)
                 except Exception:
@@ -1778,7 +1971,7 @@ class TrendFuturesBot(FuturesBot):
                 except Exception:
                     pass
         cur_dist = distance_to_liquidation_pct(curr, liq, pos_type)
-        init_dist = float(d.get("initial_liq_distance", 0) or 0)
+        init_dist = self._safe_float(d.get("initial_liq_distance"), 0.0)
         if init_dist <= 0:
             init_dist = max(1.0, 100.0 / max(1.0, lev))
         consumed = liq_buffer_consumed_pct(init_dist, cur_dist)
@@ -1882,7 +2075,7 @@ class TrendFuturesBot(FuturesBot):
                     self._close_position(base, d, reason="Trailing Stop")
                     return
             if d.get("be_active") and breakeven_stop_hit(
-                    curr, float(d.get("be_price", entry) or entry), pos_type):
+                    curr, self._safe_float(d.get("be_price"), entry), pos_type):
                 self._close_position(base, d, reason="Breakeven-Stop")
                 return
             if d.get("break_even") and breakeven_stop_hit(curr, entry, pos_type):

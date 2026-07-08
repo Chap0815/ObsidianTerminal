@@ -19,13 +19,30 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     Handles ``None``, empty string, ``NaN``, ``Infinity`` and non-numeric
     types without raising.
     """
-    if value is None:
+    if value is None or isinstance(value, bool):
         return default
     try:
         f = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     if not math.isfinite(f):
+        return default
+    return f
+
+
+def safe_positive_float(value: Any, default: float = 0.0) -> float:
+    """Coerce ``value`` to a finite positive float, or return ``default``.
+
+    Intended for prices, amounts and notionals where zero/negative/boolean
+    values must not be treated as valid market data.
+    """
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(f) or f <= 0:
         return default
     return f
 
@@ -36,11 +53,11 @@ def safe_int(value: Any, default: int = 0) -> int:
     Truncates floats. Returns ``default`` on TypeError/ValueError/OverflowError
     and on non-finite inputs (NaN, Inf).
     """
-    if value is None:
+    if value is None or isinstance(value, bool):
         return default
     try:
         f = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     # Pre-filter non-finite values  int() on Inf raises OverflowError,
     # int() on NaN raises ValueError.

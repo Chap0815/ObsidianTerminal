@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import math
 import threading
 import time
 from typing import Optional, Dict, Any, List
@@ -32,6 +33,10 @@ _CLAIM_FIELDS = frozenset((
     "leverage", "position_type", "buy_time",
 ))
 
+_CLAIM_NUMERIC_FIELDS = frozenset((
+    "amount", "invested_usdt", "buy_price", "buy", "leverage",
+))
+
 _CLAIM_EXTRA_FIELDS = frozenset((
     "original_amount", "initial_entry_fee", "fees_paid", "funding_paid",
     "funding_booked_on_partials", "partial_sold", "break_even", "be_active",
@@ -39,6 +44,87 @@ _CLAIM_EXTRA_FIELDS = frozenset((
     "initial_liq_distance", "margin_mode", "accounting_pending_partials",
     "unpriced_external_partials",
 ))
+
+
+def _finite_float(value, default: float = 0.0) -> float:
+    parsed = _finite_float_or_none(value)
+    return default if parsed is None else parsed
+
+
+def _finite_float_or_none(value) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _validate_numeric_field(key: str, value) -> Optional[str]:
+    if key not in _CLAIM_NUMERIC_FIELDS:
+        return None
+    parsed = _finite_float_or_none(value)
+    if parsed is None:
+        return f"invalid {key}=non-numeric"
+    if key in ("buy", "buy_price", "amount", "leverage") and parsed <= 0:
+        return f"invalid {key}={parsed!r}"
+    if key == "invested_usdt" and parsed < 0:
+        return f"invalid {key}={parsed!r}"
+    return None
+
+
+def _normalize_position_row(data: dict) -> tuple[Optional[dict], str]:
+    if not isinstance(data, dict):
+        return None, "not-dict"
+
+    raw_buy = data.get("buy_price")
+    buy_val = _finite_float_or_none(raw_buy)
+    if buy_val is None or buy_val <= 0:
+        raw_buy = data.get("buy")
+        buy_val = _finite_float_or_none(raw_buy)
+    if buy_val is None or buy_val <= 0:
+        return None, "invalid buy=0.0"
+
+    amount = _finite_float_or_none(data.get("amount"))
+    if amount is None or amount <= 0:
+        return None, "invalid amount=0.0"
+
+    normalized = copy.deepcopy(data)
+    if "buy_price" in normalized:
+        normalized["buy_price"] = buy_val
+    if "buy" in normalized:
+        normalized["buy"] = buy_val
+
+    leverage = _finite_float_or_none(normalized.get("leverage"))
+    if leverage is None or leverage <= 0:
+        leverage = 1.0
+    normalized["leverage"] = leverage
+
+    invested = _finite_float_or_none(normalized.get("invested_usdt"))
+    if invested is None or invested < 0:
+        invested = buy_val * amount / leverage
+    normalized["invested_usdt"] = invested
+    return normalized, ""
+
+
+def _reject_update_reason(fields: dict) -> Optional[str]:
+    for key, value in fields.items():
+        reason = _validate_numeric_field(key, value)
+        if reason is not None:
+            return reason
+    return None
+
+
+def normalize_pending_accounting_items(value) -> List[Dict[str, Any]]:
+    """Return valid pending accounting items from legacy/corrupt state shapes."""
+    if not value:
+        return []
+    if isinstance(value, dict):
+        return [dict(value)]
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
 
 
 def remove_with_restore_fields(state, sym: str, fields: Dict[str, Any]) -> bool:
@@ -117,17 +203,31 @@ class TradeState:
             return True
         try:
             from core.database import upsert_open_position
-            extra = {k: copy.deepcopy(data.get(k))
-                     for k in _CLAIM_EXTRA_FIELDS if k in data}
+            normalized, reason = _normalize_position_row(data)
+            if normalized is None:
+                self._log_registry_warning(
+                    f"upsert rejected invalid numeric state for "
+                    f"{self._bot_name}:{sym}: {reason}"
+                )
+                return False
+
+            extra = {k: copy.deepcopy(normalized.get(k))
+                     for k in _CLAIM_EXTRA_FIELDS if k in normalized}
             ok = upsert_open_position(
                 bot_name=self._bot_name, symbol=sym,
-                buy_price=float(data.get("buy_price") or data.get("buy") or 0),
-                buy_time=data.get("buy_time") or "",
-                amount=float(data.get("amount") or 0),
-                invested_usdt=float(data.get("invested_usdt") or 0),
-                position_type=data.get("position_type",
-                                       "FUTURES" if self._is_futures else "SPOT"),
-                leverage=float(data.get("leverage") or 1),
+                buy_price=_finite_float(
+                    normalized.get("buy_price")
+                    if normalized.get("buy_price") is not None
+                    else normalized.get("buy")
+                ),
+                buy_time=normalized.get("buy_time") or "",
+                amount=_finite_float(normalized.get("amount")),
+                invested_usdt=_finite_float(normalized.get("invested_usdt")),
+                position_type=normalized.get(
+                    "position_type",
+                    "FUTURES" if self._is_futures else "SPOT",
+                ),
+                leverage=_finite_float(normalized.get("leverage"), 1.0),
                 state="OPEN",
                 extra=extra,
             )
@@ -397,18 +497,15 @@ class TradeState:
         buggy screener producing amount=0 consistently is visible to the
         dashboard / Telegram instead of just silently yielding no trades.
         """
-        rejection_reason = None
-        try:
-            import math as _math
-            buy_val = float(data.get("buy_price") or data.get("buy") or 0)
-            amt_val = float(data.get("amount") or 0)
-            if not (_math.isfinite(buy_val) and buy_val > 0):
-                rejection_reason = f"invalid buy={buy_val!r}"
-            elif not (_math.isfinite(amt_val) and amt_val > 0):
-                rejection_reason = f"invalid amount={amt_val!r}"
-        except (TypeError, ValueError):
-            rejection_reason = "non-numeric buy/amount"
-            buy_val = amt_val = 0.0
+        normalized, rejection_reason = _normalize_position_row(data)
+        if normalized is not None:
+            data = normalized
+            rejection_reason = None
+        buy_val = _finite_float(
+            data.get("buy_price") if data and data.get("buy_price") is not None
+            else data.get("buy") if data else None
+        )
+        amt_val = _finite_float(data.get("amount") if data else None)
 
         if rejection_reason is not None:
             import sys as _sys
@@ -449,12 +546,35 @@ class TradeState:
         """Set one field on an existing trade. Returns False if not durable."""
         snapshot = None
         claim_row = None
+        locked_reject_reason = None
+        reject_reason = _reject_update_reason({key: value})
+        if reject_reason is not None:
+            self._log_registry_warning(
+                f"update rejected invalid numeric field for "
+                f"{self._bot_name or '-'}:{sym}: {reject_reason}"
+            )
+            return False
         with self._lock:
             if sym in self._trades:
-                self._trades[sym][key] = value
-                rev, snapshot = self._snapshot_locked()
                 if key in _CLAIM_FIELDS:
-                    claim_row = copy.deepcopy(self._trades[sym])
+                    candidate = copy.deepcopy(self._trades[sym])
+                    candidate[key] = value
+                    normalized, reason = _normalize_position_row(candidate)
+                    if normalized is None:
+                        locked_reject_reason = reason
+                    else:
+                        self._trades[sym] = normalized
+                        claim_row = copy.deepcopy(normalized)
+                        rev, snapshot = self._snapshot_locked()
+                else:
+                    self._trades[sym][key] = value
+                    rev, snapshot = self._snapshot_locked()
+        if locked_reject_reason is not None:
+            self._log_registry_warning(
+                f"update rejected invalid state for "
+                f"{self._bot_name or '-'}:{sym}: {locked_reject_reason}"
+            )
+            return False
         if snapshot is not None:
             status = self._persist_snapshot(rev, snapshot)
             # Keep the shared claim row in sync when a claim-relevant field
@@ -471,14 +591,43 @@ class TradeState:
 
     def update_many(self, sym: str, fields: dict) -> bool:
         """Set multiple fields atomically; returns False if not durable."""
+        if not isinstance(fields, dict):
+            self._log_registry_warning(
+                f"update_many rejected non-dict fields for "
+                f"{self._bot_name or '-'}:{sym}"
+            )
+            return False
         snapshot = None
         claim_row = None
+        locked_reject_reason = None
+        reject_reason = _reject_update_reason(fields)
+        if reject_reason is not None:
+            self._log_registry_warning(
+                f"update_many rejected invalid numeric field for "
+                f"{self._bot_name or '-'}:{sym}: {reject_reason}"
+            )
+            return False
         with self._lock:
             if sym in self._trades:
-                self._trades[sym].update(fields)
-                rev, snapshot = self._snapshot_locked()
                 if _CLAIM_FIELDS.intersection(fields):
-                    claim_row = copy.deepcopy(self._trades[sym])
+                    candidate = copy.deepcopy(self._trades[sym])
+                    candidate.update(fields)
+                    normalized, reason = _normalize_position_row(candidate)
+                    if normalized is None:
+                        locked_reject_reason = reason
+                    else:
+                        self._trades[sym] = normalized
+                        claim_row = copy.deepcopy(normalized)
+                        rev, snapshot = self._snapshot_locked()
+                else:
+                    self._trades[sym].update(fields)
+                    rev, snapshot = self._snapshot_locked()
+        if locked_reject_reason is not None:
+            self._log_registry_warning(
+                f"update_many rejected invalid state for "
+                f"{self._bot_name or '-'}:{sym}: {locked_reject_reason}"
+            )
+            return False
         if snapshot is not None:
             status = self._persist_snapshot(rev, snapshot)
             registry_ok = True

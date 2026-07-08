@@ -29,6 +29,7 @@ Why not use bal['USDT']['used']?
   works everywhere.
 """
 from __future__ import annotations
+import math
 from typing import Optional
 
 LIVE_FUTURES_BOTS = {"FUTURES", "CROSS", "FUTREND"}
@@ -38,12 +39,13 @@ LIVE_FUTURES_BOTS = {"FUTURES", "CROSS", "FUTREND"}
 
 def _safe_float(value, default: float = 0.0) -> float:
     """Convert to float, swallow all conversion errors."""
-    if value is None:
+    if value is None or isinstance(value, bool):
         return default
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
         return default
+    return parsed if math.isfinite(parsed) else default
 
 
 def _read_usdt_free(bal: dict) -> Optional[float]:
@@ -69,13 +71,32 @@ def _read_usdt_free(bal: dict) -> Optional[float]:
             if v is None:
                 break
         if v is not None:
-            try:
-                f = float(v)
-                if f >= 0:
-                    return f
-            except (TypeError, ValueError):
-                continue
+            f = _safe_float(v, -1.0)
+            if f >= 0:
+                return f
     return None
+
+
+def _read_currency_free(data: dict) -> float:
+    if not isinstance(data, dict):
+        return 0.0
+    for key in ("free", "available"):
+        raw = data.get(key)
+        if raw is None:
+            continue
+        parsed = _safe_float(raw, -1.0)
+        if parsed >= 0:
+            return parsed
+    return 0.0
+
+
+def _read_currency_total_or_free(data: dict) -> float:
+    if not isinstance(data, dict):
+        return 0.0
+    total = _safe_float(data.get("total"), -1.0)
+    if total >= 0:
+        return total
+    return _read_currency_free(data)
 
 
 def _sum_position_margin_and_upnl(positions: list) -> tuple[float, float, int, list]:
@@ -99,7 +120,9 @@ def _sum_position_margin_and_upnl(positions: list) -> tuple[float, float, int, l
         if not isinstance(p, dict):
             continue
         # Skip closed/zero positions
-        contracts = _safe_float(p.get("contracts") or p.get("size") or 0)
+        contracts = _safe_float(p.get("contracts"))
+        if contracts == 0.0:
+            contracts = _safe_float(p.get("size"))
         if not (abs(contracts) > 0):
             continue
         count += 1
@@ -163,10 +186,10 @@ def _live_futures_state_by_symbol(db_rows: list,
             continue
         base = str(sym).split("/")[0].split(":")[0]
         db_by_sym[base] = {
-            "unrealized":      float(row.get("unrealized_pnl") or 0.0),
-            "unrealized_pct":  float(row.get("unrealized_pct") or 0.0),
-            "current_price":   float(row.get("current_price") or 0.0),
-            "entry_price":     float(row.get("entry_price") or 0.0),
+            "unrealized":      _safe_float(row.get("unrealized_pnl")),
+            "unrealized_pct":  _safe_float(row.get("unrealized_pct")),
+            "current_price":   _safe_float(row.get("current_price")),
+            "entry_price":     _safe_float(row.get("entry_price")),
         }
     return db_by_sym
 
@@ -305,9 +328,11 @@ def compute_spot_equity(ex) -> Optional[dict]:
     if not isinstance(bal, dict):
         return None
 
-    # First pass: collect stablecoin free totals (counted 1:1)
-    # and other coins (need price lookup)
+    # First pass: collect stablecoin free totals separately from stablecoin
+    # wallet equity. Locked quote balances are still equity, but they must not
+    # render as available/free capital.
     stable_free = 0.0
+    stable_equity = 0.0
     non_stable_holdings: dict[str, float] = {}
 
     # Iterate top-level keys that are currency dicts (skip ccxt metadata
@@ -319,13 +344,16 @@ def compute_spot_equity(ex) -> Optional[dict]:
             continue
         if not isinstance(data, dict):
             continue
-        total = _safe_float(data.get("total"))
-        if total <= 0:
-            continue
-
         if symbol in _QUOTE_ASSETS_AS_USDT:
-            stable_free += total
+            free_amount = _read_currency_free(data)
+            equity_amount = _read_currency_total_or_free(data)
+            if free_amount > 0 or equity_amount > 0:
+                stable_free += free_amount
+                stable_equity += equity_amount
         else:
+            total = _safe_float(data.get("total"))
+            if total <= 0:
+                continue
             non_stable_holdings[symbol] = total
 
     # Second pass: fetch prices for non-stable holdings.
@@ -356,14 +384,18 @@ def compute_spot_equity(ex) -> Optional[dict]:
             # Try the bulk cache first
             t = ticker_cache.get(pair)
             if isinstance(t, dict):
-                price = _safe_float(t.get("last") or t.get("close"))
+                price = _safe_float(t.get("last"))
+                if price <= 0:
+                    price = _safe_float(t.get("close"))
 
             # Fall back to per-symbol fetch
             if price <= 0:
                 try:
                     t = ex.fetch_ticker(pair)
                     if isinstance(t, dict):
-                        price = _safe_float(t.get("last") or t.get("close"))
+                        price = _safe_float(t.get("last"))
+                        if price <= 0:
+                            price = _safe_float(t.get("close"))
                 except Exception:
                     price = 0.0
 
@@ -380,7 +412,7 @@ def compute_spot_equity(ex) -> Optional[dict]:
             in_positions_value += value_usdt
             open_count += 1
 
-    equity = stable_free + in_positions_value
+    equity = stable_equity + in_positions_value
 
     return {
         "free":         round(stable_free, 4),

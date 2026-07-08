@@ -33,6 +33,11 @@ import threading
 import uuid
 
 from launcher.config.settings import PROJECT_ROOT, _get_python_exe, subprocess_no_window_kwargs
+from launcher.core.runtime_status_values import (
+    nonnegative_int_or_zero,
+    positive_int_or_zero,
+    strict_bool_or_none,
+)
 
 
 class BotProcess:
@@ -140,10 +145,8 @@ class BotProcess:
             last = read_runtime_status(log_dir)
             expected_run_id = expected_run_id or ""
             last_run_id = str(last.get("run_id") or "")
-            try:
-                last_pid = int(last.get("pid") or 0)
-            except (TypeError, ValueError):
-                last_pid = 0
+            last_pid = positive_int_or_zero(last.get("pid"))
+            last_simulation = strict_bool_or_none(last.get("simulation"))
             if expected_run_id and last_run_id and last_run_id != expected_run_id:
                 return
             if expected_pid and last_pid and last_pid != expected_pid:
@@ -152,10 +155,12 @@ class BotProcess:
                 log_dir,
                 self.bot_name,
                 "stopped",
-                bool(last.get("simulation", True)),
+                True if last_simulation is None else last_simulation,
                 threads={"monitor": False, "scan": False, "reconcile": False},
                 extra={
-                    "open_positions": int(last.get("open_positions") or 0),
+                    "open_positions": nonnegative_int_or_zero(
+                        last.get("open_positions")
+                    ),
                     "previous_status": str(last.get("status") or ""),
                     "stopped_by": "launcher",
                     "returncode": returncode,

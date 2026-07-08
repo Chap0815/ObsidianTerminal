@@ -90,6 +90,11 @@ try:
 except Exception:
     _RATE_LIMIT_EXC = ()
 
+_MEXC_RATE_LIMIT_CODE_RE = re.compile(
+    r'(?:["\']?code["\']?\s*[:=]\s*510\b|\bcode\s+510\b)',
+    re.IGNORECASE,
+)
+
 
 def is_rate_limited(exc: BaseException) -> bool:
     """True if the exception is an exchange rate-limit / DDoS response.
@@ -107,7 +112,7 @@ def is_rate_limited(exc: BaseException) -> bool:
     return ("429" in s or "too many requests" in s
             or "rate limit" in s or "ratelimit" in s
             or "too frequent" in s
-            or '"code":510' in s or "code 510" in s)
+            or bool(_MEXC_RATE_LIMIT_CODE_RE.search(s)))
 
 
 def is_server_error(exc: BaseException) -> bool:

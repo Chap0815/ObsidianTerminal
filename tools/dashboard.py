@@ -623,6 +623,26 @@ def _futures_row_unrealized_pct(row) -> float:
     return futures_unrealized_from_row(row)[1]
 
 
+def _finite_float_or_none(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _ticker_price_or_none(ticker: dict | None) -> float | None:
+    if not isinstance(ticker, dict):
+        return None
+    for key in ("last", "close"):
+        price = _finite_float_or_none(ticker.get(key))
+        if price is not None and price > 0:
+            return price
+    return None
+
+
 #  Daten-Loader 
 
 def _ro_connect():
@@ -707,16 +727,30 @@ def load_futures_live() -> pd.DataFrame:
                     key = (bot, mode, str(sym).upper())
                     if key in existing:
                         continue
-                    try:
-                        entry = float(d.get("buy_price") or d.get("buy") or 0)
-                        current = float(d.get("last_price") or entry or 0)
-                        margin = float(d.get("margin_usdt")
-                                       or d.get("invested_usdt") or 0)
-                        leverage = float(d.get("leverage") or 1)
-                    except (TypeError, ValueError):
+                    entry = _finite_float_or_none(d.get("buy_price"))
+                    if entry is None or entry <= 0:
+                        entry = _finite_float_or_none(d.get("buy"))
+                    if entry is None or entry <= 0:
                         continue
-                    if entry <= 0 or margin <= 0:
+
+                    current = _finite_float_or_none(d.get("last_price"))
+                    if current is None or current <= 0:
+                        current = entry
+
+                    margin = _finite_float_or_none(d.get("margin_usdt"))
+                    if margin is None or margin <= 0:
+                        margin = _finite_float_or_none(d.get("invested_usdt"))
+                    if margin is None or margin <= 0:
                         continue
+
+                    leverage = _finite_float_or_none(d.get("leverage"))
+                    if leverage is None or leverage <= 0:
+                        leverage = 1.0
+
+                    liq = _finite_float_or_none(d.get("liquidation_price"))
+                    if liq is None or liq < 0:
+                        liq = 0.0
+
                     bot_name = bot if mode == "LIVE" else f"{bot} (SIM)"
                     rows.append({
                         "bot_name": bot_name,
@@ -730,8 +764,7 @@ def load_futures_live() -> pd.DataFrame:
                         "leverage": leverage,
                         "unrealized_pnl": 0.0,
                         "unrealized_pct": 0.0,
-                        "liquidation_price": float(
-                            d.get("liquidation_price", 0) or 0),
+                        "liquidation_price": liq,
                         "last_update": d.get("last_update", ""),
                         "opened_at": d.get("buy_time") or d.get("opened_at"),
                         "state_is_stale": True,
@@ -801,14 +834,13 @@ def load_open_spot_trades() -> list:
                         continue
                     if str(d.get("state", "OPEN")).upper() == "CLOSED":
                         continue
-                    try:
-                        amount = float(d.get("amount", 0) or 0)
-                        buy = float(_state_value_prefer_key(d, "buy_price", "buy") or 0)
-                    except (TypeError, ValueError):
-                        continue
+                    amount = _finite_float_or_none(d.get("amount"))
+                    buy = _finite_float_or_none(
+                        _state_value_prefer_key(d, "buy_price", "buy")
+                    )
                     if (
-                        not math.isfinite(amount)
-                        or not math.isfinite(buy)
+                        amount is None
+                        or buy is None
                         or amount <= 0
                         or buy <= 0
                     ):
@@ -876,20 +908,17 @@ def get_live_prices(symbols: tuple[str, ...] = ()) -> dict:
             base = sym.split("/")[0].upper()
             if base not in wanted:
                 continue
-            price = t.get("last") or t.get("close")
-            if price:
-                try:
-                    out[f"{base}USDT"] = float(price)
-                except (TypeError, ValueError):
-                    pass
+            price = _ticker_price_or_none(t)
+            if price is not None:
+                out[f"{base}USDT"] = price
         for base in wanted:
             if f"{base}USDT" in out:
                 continue
             try:
                 t = ex.fetch_ticker(f"{base}/USDT") or {}
-                price = t.get("last") or t.get("close")
-                if price:
-                    out[f"{base}USDT"] = float(price)
+                price = _ticker_price_or_none(t)
+                if price is not None:
+                    out[f"{base}USDT"] = price
             except Exception:
                 continue
         return out
@@ -900,9 +929,9 @@ def get_live_prices(symbols: tuple[str, ...] = ()) -> dict:
             for base in wanted:
                 try:
                     t = ex.fetch_ticker(f"{base}/USDT") or {}
-                    price = t.get("last") or t.get("close")
-                    if price:
-                        out[f"{base}USDT"] = float(price)
+                    price = _ticker_price_or_none(t)
+                    if price is not None:
+                        out[f"{base}USDT"] = price
                 except Exception:
                     continue
         except Exception:
@@ -1086,12 +1115,14 @@ def build_pnl_snapshot(
             if bot in bots else None
         )
         try:
-            buy = float(_state_value_prefer_key(_t, "buy_price", "buy") or 0)
-            amount = float(_t.get("amount", 0) or 0)
+            buy = _finite_float_or_none(
+                _state_value_prefer_key(_t, "buy_price", "buy")
+            )
+            amount = _finite_float_or_none(_t.get("amount"))
             base = str(_t.get("symbol", "")).upper().replace("/USDT", "").replace("USDT", "")
             if (
-                not math.isfinite(buy)
-                or not math.isfinite(amount)
+                buy is None
+                or amount is None
                 or buy <= 0
                 or amount <= 0
             ):
@@ -1103,7 +1134,8 @@ def build_pnl_snapshot(
                     bucket["price_unavailable"] += 1
                 continue
             live_raw = live_prices.get(f"{base}USDT")
-            if live_raw is None:
+            live = _finite_float_or_none(live_raw)
+            if live is None or live <= 0:
                 for bucket in (mode_bucket, bot_bucket, bot_mode_bucket):
                     if bucket is None:
                         continue
@@ -1111,7 +1143,6 @@ def build_pnl_snapshot(
                     bucket["open_spot"] += 1
                     bucket["price_unavailable"] += 1
                 continue
-            live = float(live_raw)
             unr = spot_unrealized_pnl(buy, live, amount)
         except Exception:
             for bucket in (mode_bucket, bot_bucket, bot_mode_bucket):
@@ -1136,10 +1167,7 @@ def build_pnl_snapshot(
             if filter_active and bot not in bot_filter:
                 continue
             mode = str(row.get("mode", "SIM")).upper()
-            try:
-                unr = float(row.get("unrealized_pnl", 0) or 0)
-            except Exception:
-                unr = 0.0
+            unr = _futures_row_unrealized(row)
             if mode in modes:
                 modes[mode]["unrealized"] += unr
                 modes[mode]["open_count"] += 1
@@ -1899,19 +1927,23 @@ with tab_positions:
                 sym = t["symbol"]
                 sym_html = html.escape(str(sym))
                 bot_html = html.escape(str(t.get("bot", "")))
-                buy = float(_state_value_prefer_key(t, "buy_price", "buy") or 0)
-                amount = float(t.get("amount", 0) or 0)
+                buy = _finite_float_or_none(
+                    _state_value_prefer_key(t, "buy_price", "buy")
+                )
+                amount = _finite_float_or_none(t.get("amount"))
                 if (
-                    not math.isfinite(buy)
-                    or not math.isfinite(amount)
+                    buy is None
+                    or amount is None
                     or buy <= 0
                     or amount <= 0
                 ):
                     continue
                 entry_notional = amount * buy
                 live_raw = live_prices.get(f"{sym}USDT")
-                price_missing = live_raw is None
-                live = float(live_raw) if live_raw is not None else buy
+                live = _finite_float_or_none(live_raw)
+                price_missing = live is None or live <= 0
+                if price_missing:
+                    live = buy
                 pct = ((live - buy) / buy * 100) if (buy > 0 and not price_missing) else 0
                 pnl = spot_unrealized_pnl(buy, live, amount) if not price_missing else 0.0
                 accent = BOT_ACCENTS.get(t["bot"], "#b07ae0")

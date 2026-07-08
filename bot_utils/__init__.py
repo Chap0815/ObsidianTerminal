@@ -71,7 +71,8 @@ from bot_utils.circuit_breaker import (record_slippage, check_spread_ok,
                                          SafeMode,
                                          MAX_SLIPPAGE_PCT, MAX_SPREAD_PCT)
 # defensive numeric coercion helpers
-from bot_utils.safe_numeric import safe_float, safe_int, safe_dict_float
+from bot_utils.safe_numeric import (safe_float, safe_int, safe_dict_float,
+                                      safe_positive_float)
 # rate-limited stderr logger for "swallowed" exceptions
 from bot_utils.silent_log import silent_log
 # corruption-safe proportional fee + funding math
@@ -113,5 +114,7 @@ __all__ = [
     # Circuit breaker
     "record_slippage", "check_spread_ok", "SafeMode",
     "MAX_SLIPPAGE_PCT", "MAX_SPREAD_PCT",
+    # Defensive numeric
+    "safe_float", "safe_int", "safe_dict_float", "safe_positive_float",
     "safe_proportional_fee", "safe_funding_scale", "safe_remaining_funding",
 ]

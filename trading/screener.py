@@ -12,6 +12,7 @@ from __future__ import annotations
 import atexit
 import copy
 import json as _json
+import math
 import os
 import threading
 import time
@@ -25,6 +26,7 @@ from bot_utils.indicators import rsi as _ta_rsi, macd_signal as _ta_macd_signal,
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from core.logger import log_event
+from bot_utils.safe_numeric import safe_positive_float
 
 from core.constants import (
     MIN_VOLUME_USDT_SPOT_LIVE,
@@ -902,27 +904,37 @@ def get_top_momentum_coins(
             rej_new += 1
             continue
 
-        qv   = ticker.get("quoteVolume")
-        last = ticker.get("last") or ticker.get("close")
-        if not qv and last:
-            bv = ticker.get("baseVolume")
-            if bv:
-                qv = float(bv) * float(last)
-        if not qv or not last:
+        qv = safe_positive_float(ticker.get("quoteVolume"), 0.0)
+        last = safe_positive_float(ticker.get("last"), 0.0)
+        if last <= 0:
+            last = safe_positive_float(ticker.get("close"), 0.0)
+        if qv <= 0 and last > 0:
+            bv = safe_positive_float(ticker.get("baseVolume"), 0.0)
+            if bv > 0:
+                qv = safe_positive_float(bv * last, 0.0)
+        if qv <= 0 or last <= 0:
             rej_no_vol += 1
             continue
-        if ticker.get("percentage") is None:
+        raw_pct = ticker.get("percentage")
+        if raw_pct is None or isinstance(raw_pct, bool):
+            rej_no_pct += 1
+            continue
+        try:
+            chg = float(raw_pct)
+        except (TypeError, ValueError, OverflowError):
+            rej_no_pct += 1
+            continue
+        if not math.isfinite(chg):
             rej_no_pct += 1
             continue
 
-        vol = float(qv)
-        chg = float(ticker["percentage"])
+        vol = qv
         if vol < min_volume:
             rej_volume += 1
             continue
 
         entry = {"symbol": symbol, "change_percent": chg,
-                 "price": float(last), "volume": vol}
+                 "price": last, "volume": vol}
 
         if "long" in directions:
             if min_pump <= chg <= MAX_24H_PUMP:

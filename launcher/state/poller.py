@@ -15,11 +15,17 @@ itself runs at ~1.5 s with per-source throttling:
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
 
 from launcher.config.settings import BOT_META, BOT_ORDER, CONFIG_FILE
+from launcher.core.runtime_status_values import (
+    finite_float_or_none,
+    positive_int_or_zero,
+    strict_bool_or_none,
+)
 from launcher.core.metrics_service import (
     MetricsDbReadError,
     get_bot_stats,
@@ -53,18 +59,14 @@ def _runtime_status_is_fresh(rs: dict, *, now: float | None = None) -> bool:
     status = str(rs.get("status") or "").lower()
     if status not in {"starting", "started", "ready", "running", "degraded"}:
         return False
-    try:
-        wall_ts = float(rs.get("wall_ts") or rs.get("epoch_ts") or 0.0)
-    except (TypeError, ValueError):
-        wall_ts = 0.0
-    if wall_ts > 0:
+    wall_ts = finite_float_or_none(rs.get("wall_ts"))
+    if wall_ts is None or wall_ts <= 0.0:
+        wall_ts = finite_float_or_none(rs.get("epoch_ts")) or 0.0
+    if wall_ts > 0.0:
         age = time.time() - wall_ts
         return -5.0 <= age <= _RUNTIME_MODE_MAX_AGE_SEC
-    try:
-        mono = float(rs.get("monotonic_ts") or 0.0)
-    except (TypeError, ValueError):
-        mono = 0.0
-    if mono > 0:
+    mono = finite_float_or_none(rs.get("monotonic_ts")) or 0.0
+    if mono > 0.0:
         age = (time.monotonic() if now is None else now) - mono
         return -5.0 <= age <= _RUNTIME_MODE_MAX_AGE_SEC
     return False
@@ -75,18 +77,16 @@ def _runtime_or_config_sim(bot: str, cfg: dict | None = None) -> bool:
     try:
         from core.runtime_status import read_runtime_status
         rs = read_runtime_status(BOT_META[bot]["log_dir"])
-        try:
-            pid = int(rs.get("pid") or 0)
-        except (TypeError, ValueError):
-            pid = 0
-        if _runtime_status_is_fresh(rs) and "simulation" in rs:
+        pid = positive_int_or_zero(rs.get("pid"))
+        runtime_sim = strict_bool_or_none(rs.get("simulation"))
+        if _runtime_status_is_fresh(rs) and runtime_sim is not None:
             try:
                 from core.process_identity import pid_matches_bot
                 if not pid_matches_bot(pid, bot):
                     raise RuntimeError("runtime pid does not match bot")
             except Exception:
                 raise
-            return bool(rs.get("simulation"))
+            return runtime_sim
     except Exception:
         pass
     try:
@@ -432,7 +432,7 @@ class DataPoller:
                                 bal = ex_obj.fetch_balance()
                                 paths = (
                                     ("USDT", "free"), ("USDT", "available"),
-                                    ("free", "USDT"), ("total", "USDT"),
+                                    ("free", "USDT"),
                                 )
                                 for path in paths:
                                     v = bal
@@ -444,8 +444,10 @@ class DataPoller:
                                             break
                                     if v is not None:
                                         try:
+                                            if isinstance(v, bool):
+                                                continue
                                             fv = float(v)
-                                            if fv >= 0:
+                                            if math.isfinite(fv) and fv >= 0:
                                                 return fv
                                         except Exception:
                                             pass

@@ -18,10 +18,25 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
 
+from bot_utils.safe_numeric import safe_positive_float
+
 
 class TickerOverloaded(Exception):
     """Raised when the ticker pool is saturated and a fetch is dropped.
     Callers should treat this like a timeout: try cached, else skip."""
+
+
+def _normalize_ticker_price(ticker: dict | None) -> dict | None:
+    if not isinstance(ticker, dict):
+        return None
+    price = safe_positive_float(ticker.get("last"), 0.0)
+    if price <= 0:
+        price = safe_positive_float(ticker.get("close"), 0.0)
+    if price <= 0:
+        return None
+    out = dict(ticker)
+    out["last"] = price
+    return out
 
 
 class TickerCache:
@@ -165,6 +180,12 @@ class TickerCache:
             # Timestamp AFTER fetch completes (so cache TTL reflects
             # actual data freshness, not when we submitted the job).
             post_now = time.monotonic()
+            ticker = _normalize_ticker_price(ticker)
+            if ticker is None:
+                stale = self._stale(symbol_full, post_now, self.stale_max)
+                if stale is not None:
+                    return stale
+                raise ValueError(f"invalid ticker price for {symbol_full}")
             with self._cache_lock:
                 # insert/overwrite + LRU bookkeeping in O(1).
                 if symbol_full in self._cache:

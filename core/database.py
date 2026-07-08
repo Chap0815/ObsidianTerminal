@@ -167,7 +167,38 @@ _METRICS_MODE_CUTOVER = "2026-06-18 00:00:00"
 
 def set_metrics_sim_mode(is_sim: bool | None) -> None:
     global _METRICS_SIM_OVERRIDE
-    _METRICS_SIM_OVERRIDE = None if is_sim is None else bool(is_sim)
+    parsed = _coerce_mode_is_sim(is_sim)
+    _METRICS_SIM_OVERRIDE = parsed
+
+
+def _coerce_mode_is_sim(value) -> bool | None:
+    """Normalize persisted/runtime SIM flags without Python truthiness traps."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value == 0:
+            return False
+        if value == 1:
+            return True
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        if value == 0.0:
+            return False
+        if value == 1.0:
+            return True
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "t", "yes", "y", "sim", "paper"}:
+            return True
+        if normalized in {"0", "false", "f", "no", "n", "live", "real"}:
+            return False
+        return None
+    return None
 
 
 def _is_sim_for(bot_name: str) -> bool:
@@ -187,9 +218,10 @@ def _is_sim_for(bot_name: str) -> bool:
 def _metric_bot_for_mode(bot_name, mode_is_sim=None):
     if not bot_name or str(bot_name).endswith(_SIM_TAG):
         return bot_name
-    if mode_is_sim is None:
-        mode_is_sim = _is_sim_for(bot_name)
-    return f"{bot_name}{_SIM_TAG}" if bool(mode_is_sim) else bot_name
+    parsed_mode = _coerce_mode_is_sim(mode_is_sim)
+    if parsed_mode is None:
+        parsed_mode = _is_sim_for(bot_name)
+    return f"{bot_name}{_SIM_TAG}" if parsed_mode else bot_name
 
 
 def _metric_bot(bot_name):
@@ -205,11 +237,13 @@ def metrics_bot_name(bot_name):
 
 def metrics_bot_name_for_mode(bot_name, is_sim: bool):
     """Explicit launcher/helper namespace. Does not read bot_config.json."""
-    return _metric_bot_for_mode(bot_name, bool(is_sim))
+    return _metric_bot_for_mode(bot_name, is_sim)
 
 
 def _sanitize_float(v, default: float = 0.0) -> float:
     if v is None:
+        return default
+    if isinstance(v, bool):
         return default
     try:
         f = float(v)
@@ -912,8 +946,6 @@ def trade_pnl_sanity_reason(
     if not math.isfinite(lev) or lev <= 0:
         lev = 1.0
 
-    if fees < 0:
-        return f"fees_usdt {fees:.6g} is negative"
     if not is_futures and abs(funding) > 0.000001:
         return f"spot funding_paid {funding:.6g} is non-zero"
 
@@ -951,9 +983,10 @@ def save_trade_db(
     mode_is_sim=None,
 ) -> bool:
     raw_bot_name = bot_name
+    explicit_mode = _coerce_mode_is_sim(mode_is_sim)
     trade_is_sim = 1 if str(raw_bot_name or "").endswith(_SIM_TAG) else (
-        (1 if bool(mode_is_sim) else 0)
-        if mode_is_sim is not None else
+        (1 if explicit_mode else 0)
+        if explicit_mode is not None else
         1 if _is_sim_for(raw_bot_name) else 0
     )
     mode_source = "runtime"
@@ -970,10 +1003,13 @@ def save_trade_db(
     if leverage is not None:
         accounting_values["leverage"] = leverage
     for _name, _value in accounting_values.items():
-        try:
-            _finite_value = float(_value)
-        except (TypeError, ValueError):
+        if isinstance(_value, bool):
             _finite_value = float("nan")
+        else:
+            try:
+                _finite_value = float(_value)
+            except (TypeError, ValueError):
+                _finite_value = float("nan")
         if not math.isfinite(_finite_value):
             try:
                 from core.logger import log_event

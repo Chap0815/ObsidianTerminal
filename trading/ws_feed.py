@@ -16,6 +16,7 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from typing import Dict, List, Optional, Set
 
+from bot_utils.safe_numeric import safe_positive_float
 from core.constants import TICKER_CACHE_TTL_SEC, TICKER_STALE_MAX_SEC
 
 CACHE_STALE_SEC    = TICKER_STALE_MAX_SEC
@@ -155,7 +156,13 @@ class WebSocketFeed:
 
     def get_price(self, symbol: str, fallback: float = 0.0) -> float:
         t = self.get_ticker(symbol)
-        return float(t.get("last") or t.get("close") or fallback) if t else fallback
+        if not t:
+            return safe_positive_float(fallback, 0.0)
+        price = safe_positive_float(t.get("last"), 0.0)
+        if price > 0:
+            return price
+        price = safe_positive_float(t.get("close"), 0.0)
+        return price if price > 0 else safe_positive_float(fallback, 0.0)
 
     def is_fresh(self, symbol: str) -> bool:
         return self.get_ticker(symbol) is not None
@@ -170,8 +177,13 @@ class WebSocketFeed:
             return self._seq
 
     def _update_cache(self, symbol: str, ticker: dict) -> None:
+        price = safe_positive_float(ticker.get("last"), 0.0)
+        if price <= 0:
+            price = safe_positive_float(ticker.get("close"), 0.0)
+        if price <= 0:
+            return
         entry = {
-            "last":       ticker.get("last")   or ticker.get("close"),
+            "last":       price,
             "bid":        ticker.get("bid"),
             "ask":        ticker.get("ask"),
             "volume":     ticker.get("quoteVolume") or ticker.get("baseVolume"),

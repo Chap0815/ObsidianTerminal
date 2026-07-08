@@ -54,6 +54,31 @@ def _state_value_prefer_key(row: dict, preferred: str, legacy: str):
     return row.get(preferred) if preferred in row else row.get(legacy)
 
 
+def _finite_float(value, default: float = 0.0) -> float:
+    parsed = _finite_float_or_none(value)
+    return default if parsed is None else parsed
+
+
+def _finite_float_or_none(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _nonnegative_int(value, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def query_db(sql: str, params: tuple = ()) -> list:
     """Single-shot SQLite read with a 20 s timeout + busy_timeout PRAGMA.
 
@@ -139,9 +164,9 @@ def _get_today_pnl_for_metrics_key(bot_key: str) -> dict:
     if rows:
         total_profit, trade_count, is_paused = rows[0]
         return {
-            "total_profit": float(total_profit or 0.0),
-            "trade_count": int(trade_count or 0),
-            "is_paused": int(is_paused or 0),
+            "total_profit": _finite_float(total_profit),
+            "trade_count": _nonnegative_int(trade_count),
+            "is_paused": _nonnegative_int(is_paused),
         }
     return {"total_profit": 0.0, "trade_count": 0, "is_paused": 0}
 
@@ -194,19 +219,30 @@ def get_bot_stats(bot: str, mode_is_sim: bool | None = None) -> dict:
         "FROM trades WHERE bot_name=? AND is_partial=0",
         (bot,)
     )
-    pnl = float(rows_pnl[0][0]) if rows_pnl else 0.0
+    pnl = _finite_float(rows_pnl[0][0]) if rows_pnl else 0.0
     if rows:
-        total, wins = int(rows[0][0]), int(rows[0][1])
+        total = _nonnegative_int(rows[0][0])
+        wins = min(_nonnegative_int(rows[0][1]), total)
         wr = (wins / total * 100) if total > 0 else 0.0
     else:
         total, wr = 0, 0.0
-    today_pnl = float(today_info.get("total_profit", 0.0) or 0.0)
-    today_cnt = int(rows_today_cnt[0][0]) if rows_today_cnt else int(
-        today_info.get("trade_count", 0) or 0)
+    today_pnl = _finite_float(today_info.get("total_profit", 0.0))
+    today_cnt = (
+        _nonnegative_int(rows_today_cnt[0][0])
+        if rows_today_cnt
+        else _nonnegative_int(today_info.get("trade_count", 0))
+    )
     # Payoff metrics
-    avg_win  = float(rows_payoff[0][0]) if rows_payoff else 0.0
-    avg_loss = float(rows_payoff[0][1]) if rows_payoff else 0.0   # negativ
-    payoff   = (avg_win / abs(avg_loss)) if avg_loss else 0.0
+    avg_win  = _finite_float(rows_payoff[0][0]) if rows_payoff else 0.0
+    avg_loss = _finite_float(rows_payoff[0][1]) if rows_payoff else 0.0
+    payoff = 0.0
+    if avg_loss:
+        try:
+            payoff = avg_win / abs(avg_loss)
+        except (OverflowError, ZeroDivisionError):
+            payoff = 0.0
+        if not math.isfinite(payoff):
+            payoff = 0.0
     return {"pnl": pnl, "total": total, "wr": wr,
             "today_pnl": today_pnl, "today_cnt": today_cnt,
             "avg_win": avg_win, "avg_loss": avg_loss, "payoff": payoff}
@@ -230,11 +266,18 @@ def get_pnl_sparkline(bot: str, limit: int = 30,
     if not rows:
         return []
     # Rows are DESC; reverse for chronological sparkline.
-    profits = [float(r[0]) for r in reversed(rows)]
+    profits = []
+    for r in reversed(rows):
+        value = _finite_float_or_none(r[0])
+        if value is not None:
+            profits.append(value)
     cumulative = []
     running = 0.0
     for p in profits:
-        running += p
+        running_next = running + p
+        if not math.isfinite(running_next):
+            break
+        running = running_next
         cumulative.append(running)
     return cumulative
 
@@ -533,8 +576,10 @@ def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
         # Instrument the launcher's own API consumption
         for sym in trades:
             t = batch.get(f"{sym}/USDT") or {}
-            p = float(t.get("last") or t.get("close") or 0)
-            if p > 0:
+            p = _finite_float_or_none(t.get("last"))
+            if p is None or p <= 0:
+                p = _finite_float_or_none(t.get("close"))
+            if p is not None and p > 0:
                 price_map[sym] = p
     except Exception as e:
         # Batch unsupported or API error  individual calls take over
@@ -554,8 +599,10 @@ def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
             except ImportError:
                 pass
             t = exchange.fetch_ticker(f"{sym}/USDT") or {}
-            p = float(t.get("last") or t.get("close") or 0)
-            if p > 0:
+            p = _finite_float_or_none(t.get("last"))
+            if p is None or p <= 0:
+                p = _finite_float_or_none(t.get("close"))
+            if p is not None and p > 0:
                 price_map[sym] = p
         except Exception:
             pass  # price unavailable  position contributes 0
@@ -567,14 +614,9 @@ def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
             # trades.json may use the legacy schema ("buy") or the
             # StateManager schema ("buy_price"). Accept both.
             buy_raw = _state_value_prefer_key(d, "buy_price", "buy")
-            buy = float(buy_raw)
-            amount = float(d.get("amount", 0))
-            if (
-                not math.isfinite(buy)
-                or not math.isfinite(amount)
-                or buy <= 0
-                or amount <= 0
-            ):
+            buy = _finite_float_or_none(buy_raw)
+            amount = _finite_float_or_none(d.get("amount"))
+            if buy is None or amount is None or buy <= 0 or amount <= 0:
                 continue
             curr = price_map.get(sym, 0.0)
             if curr > 0:

@@ -22,6 +22,40 @@ from bot_utils.order_utils import extract_base_fee_amount
 SPOT_DEFAULT_TAKER_FEE = 0.001
 
 
+def _order_id_text(value) -> str:
+    """Return a fetch_order-safe order id string, or empty for bogus ids."""
+    if value is None or isinstance(value, bool):
+        return ""
+    try:
+        text = str(value).strip()
+    except Exception:
+        return ""
+    return text
+
+
+def _order_id_for_refetch(order: dict) -> str:
+    if not isinstance(order, dict):
+        return ""
+    candidates = [
+        order.get("id"),
+        order.get("orderId"),
+        order.get("order_id"),
+    ]
+    info = order.get("info")
+    if isinstance(info, dict):
+        candidates.extend([
+            info.get("orderId"),
+            info.get("order_id"),
+            info.get("orderID"),
+            info.get("id"),
+        ])
+    for candidate in candidates:
+        order_id = _order_id_text(candidate)
+        if order_id:
+            return order_id
+    return ""
+
+
 def extract_or_estimate_base_fee(ex,
                                     order: dict,
                                     symbol_pair: str,
@@ -57,7 +91,7 @@ def extract_or_estimate_base_fee(ex,
         return fee
 
     # Step 2: refetch loop (cancellable)
-    order_id = order.get("id") if isinstance(order, dict) else None
+    order_id = _order_id_for_refetch(order)
     if order_id and ex is not None and symbol_pair:
         for _ in range(max_attempts):
             # Cancellable sleep  exit early on SIGTERM
@@ -67,7 +101,7 @@ def extract_or_estimate_base_fee(ex,
             else:
                 time.sleep(retry_delay)
             try:
-                refreshed = ex.fetch_order(str(order_id), symbol_pair)
+                refreshed = ex.fetch_order(order_id, symbol_pair)
                 if isinstance(refreshed, dict):
                     fee = extract_base_fee_amount(refreshed, base_symbol)
                     if fee > 0:

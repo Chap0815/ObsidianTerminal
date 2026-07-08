@@ -12,6 +12,7 @@ from __future__ import annotations
 import threading
 import time
 import os
+import math
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
@@ -44,6 +45,16 @@ _OI_LOCK = threading.Lock()
 # screening thousands of altcoins doesn't leak _OI_HISTORY dict entries.
 _OI_LAST_SWEEP_MONO: float = 0.0
 _OI_SWEEP_INTERVAL = 600.0   # sweep at most every 10 minutes
+
+
+def _finite_float_or_none(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _maybe_sweep_oi_history(now_mono: float) -> None:
@@ -158,7 +169,7 @@ def fetch_realized_funding(ex,
                 continue
             ts = h.get("timestamp")
             try:
-                ts_i = int(ts) if ts is not None else None
+                ts_i = int(ts) if ts is not None and not isinstance(ts, bool) else None
             except (TypeError, ValueError):
                 ts_i = None
             info = h.get("info") if isinstance(h.get("info"), dict) else {}
@@ -182,11 +193,10 @@ def fetch_realized_funding(ex,
 
     total = 0.0
     for h in history:
-        try:
-            amt = float(h.get("amount") or 0)
-            total -= amt  # flip: exchange uses +received/-paid; we want +cost
-        except (TypeError, ValueError):
+        amt = _finite_float_or_none(h.get("amount"))
+        if amt is None:
             continue
+        total -= amt  # flip: exchange uses +received/-paid; we want +cost
     return total
 
 
@@ -244,9 +254,9 @@ def estimate_funding_paid(ex,
         from config.exchange_config import safe_fetch_funding_rate
         fr = safe_fetch_funding_rate(ex, symbol_full)
         if isinstance(fr, dict):
-            v = fr.get("fundingRate")
-            if v is not None:
-                funding_rate_dec = float(v)
+            parsed_rate = _finite_float_or_none(fr.get("fundingRate"))
+            if parsed_rate is not None:
+                funding_rate_dec = parsed_rate
     except Exception:
         funding_rate_dec = 0.0
     # Epsilon comparison  exchanges occasionally return microscopic rates
@@ -276,11 +286,9 @@ def get_funding_info(ex, symbol_full: str) -> Tuple[float, float, float]:
         try:
             from config.exchange_config import safe_fetch_funding_rate
             funding = safe_fetch_funding_rate(ex, symbol_full)
-            if funding is not None:
-                try:
-                    rate = float(funding.get("fundingRate", 0) or 0) * 100
-                except (TypeError, ValueError):
-                    rate = 0.0
+            if isinstance(funding, dict):
+                parsed_rate = _finite_float_or_none(funding.get("fundingRate"))
+                rate = (parsed_rate * 100) if parsed_rate is not None else 0.0
         except Exception:
             pass
 
@@ -295,13 +303,10 @@ def get_funding_info(ex, symbol_full: str) -> Tuple[float, float, float]:
                     v = oi.get(k)
                     if v is None and isinstance(oi.get("info"), dict):
                         v = oi["info"].get(k)
-                    if v:
-                        try:
-                            oi_usdt = float(v) / 1_000_000
-                            if oi_usdt > 0:
-                                break
-                        except (ValueError, TypeError):
-                            continue
+                    parsed_oi = _finite_float_or_none(v)
+                    if parsed_oi is not None and parsed_oi > 0:
+                        oi_usdt = parsed_oi / 1_000_000
+                        break
         except Exception:
             pass
 

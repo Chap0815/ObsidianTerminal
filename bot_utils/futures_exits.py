@@ -42,6 +42,8 @@ def _extract_fill_from_order(order: dict) -> Optional[float]:
         return None
     for key in ("average", "price"):
         val = order.get(key)
+        if isinstance(val, bool):
+            continue
         if val is None:
             continue
         try:
@@ -55,6 +57,8 @@ def _extract_fill_from_order(order: dict) -> Optional[float]:
         for key in ("avgPrice", "averagePrice", "filledAvgPrice",
                      "fillPrice", "price"):
             val = info.get(key)
+            if isinstance(val, bool):
+                continue
             if val is None:
                 continue
             try:
@@ -67,6 +71,8 @@ def _extract_fill_from_order(order: dict) -> Optional[float]:
 
 
 def _positive_finite_or_zero(value) -> float:
+    if isinstance(value, bool):
+        return 0.0
     try:
         parsed = float(value or 0)
     except (TypeError, ValueError, OverflowError):
@@ -75,6 +81,8 @@ def _positive_finite_or_zero(value) -> float:
 
 
 def _finite_or_default(value, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -85,6 +93,16 @@ def _finite_or_default(value, default: float = 0.0) -> float:
 def _positive_finite_or_default(value, default: float = 0.0) -> float:
     parsed = _finite_or_default(value, default)
     return parsed if parsed > 0 else default
+
+
+def _finite_precision_amount_or_none(value) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _exchange_id(ex) -> str:
@@ -258,10 +276,17 @@ def _flatten_without_accounting(**kw):
         symbol_full = f"{sym}/USDT:USDT"
         side = "sell" if pos_type == "LONG" else "buy"
         try:
-            close_amount = float(ex.amount_to_precision(symbol_full, amount))
+            close_amount = _finite_precision_amount_or_none(
+                ex.amount_to_precision(symbol_full, amount)
+            )
+            if close_amount is None:
+                return (sym, "failed", 0.0,
+                        "close lock held and close amount invalid")
         except Exception:
             close_amount = round(amount, 4)
-        if not math.isfinite(close_amount):
+        if close_amount <= 0 and amount > 0:
+            close_amount = round(amount, 4)
+        if not math.isfinite(close_amount) or close_amount <= 0:
             return (sym, "failed", 0.0,
                     "close lock held and close amount invalid")
         params = reduce_only_params(
@@ -329,8 +354,9 @@ def _close_single_position_impl(*,
         if ticker_cache is not None:
             try:
                 ticker = ticker_cache.get(ex, symbol_full, timeout=5.0)
-                curr = _positive_finite_or_zero(
-                    ticker.get("last") or ticker.get("close") or 0)
+                curr = _positive_finite_or_zero(ticker.get("last"))
+                if curr <= 0:
+                    curr = _positive_finite_or_zero(ticker.get("close"))
             except Exception as e:
                 log_event(
                     f"  Price (cached) for {sym} unavailable: {e} - "
@@ -339,8 +365,9 @@ def _close_single_position_impl(*,
         if curr <= 0:
             try:
                 ticker = ex.fetch_ticker(symbol_full)
-                curr = _positive_finite_or_zero(
-                    ticker.get("last") or ticker.get("close") or 0)
+                curr = _positive_finite_or_zero(ticker.get("last"))
+                if curr <= 0:
+                    curr = _positive_finite_or_zero(ticker.get("close"))
             except Exception as e2:
                 log_event(f"  Price (direct) for {sym} unavailable: {e2}", "WARN")
         if curr <= 0:
@@ -375,13 +402,16 @@ def _close_single_position_impl(*,
                 raw_amount = amount
                 try:
                     from config.exchange_config import safe_amount_to_precision
-                    close_amount = float(safe_amount_to_precision(
-                        ex, symbol_full, raw_amount))
+                    close_amount = _finite_precision_amount_or_none(
+                        safe_amount_to_precision(ex, symbol_full, raw_amount)
+                    )
+                    if close_amount is None:
+                        return (sym, "failed", 0.0, "close amount invalid")
                 except Exception:
                     close_amount = float(raw_amount)
                 if close_amount <= 0 and raw_amount > 0:
                     close_amount = float(raw_amount)
-                if not math.isfinite(close_amount):
+                if not math.isfinite(close_amount) or close_amount <= 0:
                     return (sym, "failed", 0.0, "close amount invalid")
 
                 ok, why = _check_min_notional(ex, symbol_full,

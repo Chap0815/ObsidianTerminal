@@ -43,6 +43,8 @@ def effective_balance(info: dict, dust_threshold: float = 1e-8) -> float:
             v = info.get(key)
             if v is None:
                 return None
+            if isinstance(v, bool):
+                return None
             parsed = float(v)
         except (TypeError, ValueError, OverflowError):
             return None

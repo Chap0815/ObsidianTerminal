@@ -6,6 +6,7 @@ bad-hour learning, per-coin blacklisting, self-diagnosis, and the kill-switch
 pipeline (loss streak, API error rate, BTC crash).
 """
 import json
+import math
 import os
 import statistics
 import threading
@@ -21,6 +22,16 @@ from core.database import (
     get_today_pnl, pause_bot_today,
 )
 from core.logger import log_event
+
+
+def _finite_float_or_none(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _fatal_exit(code: int = 1) -> None:
@@ -444,15 +455,25 @@ def own_momentum_blocked(bot_name: str) -> tuple:
         trades = get_recent_trades(bot_name, limit=window, days=RECENT_TRADES_DAYS)
         if len(trades) < window:
             return False, ""  # warmup  not enough history, stay open
-        net = sum(float(t.get("profit_usdt", 0.0) or 0.0) for t in trades[:window])
-        total_inv = sum(float(t.get("invested_usdt", 0.0) or 0.0)
-                        for t in trades[:window])
+        net = 0.0
+        total_inv = 0.0
+        for t in trades[:window]:
+            pnl = _finite_float_or_none(t.get("profit_usdt"))
+            invested = _finite_float_or_none(t.get("invested_usdt"))
+            if pnl is None or invested is None or invested <= 0.0:
+                return False, ""  # corrupt history must not create a false pause
+            net += pnl
+            total_inv += invested
         # Deadband: only pause on a MEANINGFUL net loss, not fee/rounding noise.
         # The loss must exceed OWN_MOMENTUM_MIN_LOSS_PCT % of the capital deployed
         # across the window (default 0.5%). Without this a net of e.g. -0.02 USDT
         # (effectively breakeven) would pause all entries.
         try:
-            min_loss_pct = max(0.0, float(cfg.get("OWN_MOMENTUM_MIN_LOSS_PCT", 0.5)))
+            min_loss_pct = _finite_float_or_none(
+                cfg.get("OWN_MOMENTUM_MIN_LOSS_PCT", 0.5))
+            if min_loss_pct is None:
+                raise ValueError("invalid OWN_MOMENTUM_MIN_LOSS_PCT")
+            min_loss_pct = max(0.0, min_loss_pct)
         except (TypeError, ValueError):
             min_loss_pct = 0.5
         threshold = -(min_loss_pct / 100.0) * total_inv if total_inv > 0 else 0.0
@@ -1069,9 +1090,20 @@ def check_kill_switches(bot_name: str, exchange=None,
             reason = str(t.get("reason") or "").lower()
             if "manual" in reason:
                 break
+            profit = _finite_float_or_none(t.get("profit_usdt"))
+            if profit is None:
+                if (
+                    t.get("is_win") == 1
+                    and not isinstance(t.get("is_win"), bool)
+                ):
+                    break
+                if t.get("is_win") != 0 or isinstance(t.get("is_win"), bool):
+                    break
+                continue
             is_loss = (
                 t.get("is_win") == 0
-                and float(t.get("profit_usdt") or 0) <= 0
+                and not isinstance(t.get("is_win"), bool)
+                and profit < 0
             )
             if not is_loss:
                 break

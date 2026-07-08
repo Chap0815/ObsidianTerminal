@@ -10,6 +10,7 @@ Key behaviors:
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -130,6 +131,15 @@ def atomic_save_json(path: str, data) -> bool:
 
 #  Generic state validator 
 
+def _finite_float_or_none(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
 def _validate_state(trades: dict,
                      require_position_type: bool,
                      log_fn: Optional[Callable] = None,
@@ -161,23 +171,29 @@ def _validate_state(trades: dict,
         if not isinstance(d, dict):
             rejected.append(f"{sym}(not-dict)")
             continue
+        d = copy.deepcopy(d)
 
-        try:
-            buy = float(d.get("buy_price") or d.get("buy") or 0)
-            if not math.isfinite(buy) or buy <= 0:
-                rejected.append(f"{sym}(buy={d.get('buy')})")
-                continue
-        except (TypeError, ValueError):
+        raw_buy = d.get("buy_price")
+        buy = _finite_float_or_none(raw_buy)
+        if buy is None or buy <= 0:
+            raw_buy = d.get("buy")
+            buy = _finite_float_or_none(raw_buy)
+        if buy is None:
             rejected.append(f"{sym}(buy-cast)")
             continue
+        if buy <= 0:
+            rejected.append(f"{sym}(buy={raw_buy})")
+            continue
+        if "buy_price" in d:
+            d["buy_price"] = buy
 
-        try:
-            amt = float(d.get("amount", 0))
-            if not math.isfinite(amt) or amt <= 0:
-                rejected.append(f"{sym}(amount={d.get('amount')})")
-                continue
-        except (TypeError, ValueError):
+        raw_amount = d.get("amount", 0)
+        amt = _finite_float_or_none(raw_amount)
+        if amt is None:
             rejected.append(f"{sym}(amount-cast)")
+            continue
+        if amt <= 0:
+            rejected.append(f"{sym}(amount={raw_amount})")
             continue
 
         if require_position_type and d.get("position_type") not in ("LONG", "SHORT"):
@@ -188,17 +204,26 @@ def _validate_state(trades: dict,
             rejected.append(f"{sym}(buy_time)")
             continue
 
+        leverage = 1.0
+        raw_leverage = d.get("leverage")
+        if raw_leverage is not None:
+            parsed_leverage = _finite_float_or_none(raw_leverage)
+            leverage = parsed_leverage if parsed_leverage is not None and parsed_leverage > 0 else 1.0
+            d["leverage"] = leverage
+
+        raw_invested = d.get("invested_usdt")
+        if raw_invested is not None:
+            invested = _finite_float_or_none(raw_invested)
+            if invested is None or invested < 0:
+                d["invested_usdt"] = buy * amt / leverage
+
         # Heal NaN/Inf in optional numeric fields
-        for field in ("highest", "invested_usdt", "fees_paid",
+        for field in ("highest", "fees_paid",
                        "initial_entry_fee", "original_amount",
                        "funding_paid", "liquidation_price"):
             v = d.get(field)
             if v is not None:
-                try:
-                    fv = float(v)
-                    if not math.isfinite(fv):
-                        d[field] = 0.0 if field != "highest" else buy
-                except (TypeError, ValueError):
+                if _finite_float_or_none(v) is None:
                     d[field] = 0.0 if field != "highest" else buy
 
         clean[sym] = d

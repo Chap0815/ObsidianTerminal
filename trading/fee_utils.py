@@ -6,6 +6,7 @@ zweite fetch_order(id) hat dann die Details (siehe
 extract_or_estimate_with_refetch).
 """
 from __future__ import annotations
+import math
 from typing import Optional
 
 try:
@@ -20,6 +21,21 @@ except ImportError:
 DISCOUNT_TOKEN_FALLBACK_RATE = DEFAULT_TAKER_FEE
 
 
+def _finite_float_or_none(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _safe_positive_float(value) -> float:
+    parsed = _finite_float_or_none(value)
+    return parsed if parsed is not None and parsed > 0 else 0.0
+
+
 def fee_to_usdt(fee_dict: dict, order_dict: dict,
                 base_override: str = "") -> float:
     """Convert a single CCXT fee dict to USDT.
@@ -31,14 +47,17 @@ def fee_to_usdt(fee_dict: dict, order_dict: dict,
     """
     if not isinstance(fee_dict, dict):
         return 0.0
-    try:
-        cost = abs(float(fee_dict.get("cost", 0) or 0))
-    except (TypeError, ValueError):
+    parsed_cost = _finite_float_or_none(fee_dict.get("cost"))
+    if parsed_cost is None:
         return 0.0
-    if cost <= 0:
+    cost = parsed_cost
+    if cost == 0:
         return 0.0
 
-    currency = (fee_dict.get("currency") or "").upper()
+    raw_currency = fee_dict.get("currency")
+    if raw_currency is not None and not isinstance(raw_currency, str):
+        return 0.0
+    currency = (raw_currency or "").upper()
 
     if not currency or currency in STABLECOIN_EQUIVALENTS:
         return cost
@@ -56,6 +75,8 @@ def fee_to_usdt(fee_dict: dict, order_dict: dict,
         if fill_price > 0:
             return cost * fill_price
 
+    if cost < 0:
+        return 0.0
     return _discount_fallback(order_dict)
 
 
@@ -82,12 +103,12 @@ def estimate_fee_usdt(amount_coins: float, fill_price: float,
     """Estimate the USDT fee when the exchange didn't return one."""
     if taker_rate is None:
         taker_rate = DEFAULT_TAKER_FEE
-    try:
-        amt = max(0.0, float(amount_coins))
-        px  = max(0.0, float(fill_price))
-    except (TypeError, ValueError):
+    amt = _safe_positive_float(amount_coins)
+    px = _safe_positive_float(fill_price)
+    rate = _safe_positive_float(taker_rate)
+    if amt <= 0 or px <= 0 or rate <= 0:
         return 0.0
-    return round(amt * px * max(0.0, taker_rate), 6)
+    return round(amt * px * rate, 6)
 
 
 def extract_or_estimate(order: dict, fill_price: float,
@@ -97,7 +118,7 @@ def extract_or_estimate(order: dict, fill_price: float,
     real = extract_fee_usdt(order, base_override)
     if real > 0:
         return real
-    filled = float(order.get("filled") or order.get("amount") or 0)
+    filled = _first_positive_order_value(order, "filled", "amount")
     if taker_rate is None:
         taker_rate = DEFAULT_TAKER_FEE
     return estimate_fee_usdt(filled, fill_price, taker_rate)
@@ -135,6 +156,8 @@ def extract_or_estimate_with_refetch(ex, order: dict, symbol_full: str,
 
     # Re-fetch once the exchange has had time to attach fee details.
     order_id = order.get("id") or order.get("orderId")
+    if isinstance(order_id, bool):
+        order_id = None
     if order_id and ex is not None and symbol_full:
         for attempt in range(max_attempts):
             try:
@@ -148,7 +171,7 @@ def extract_or_estimate_with_refetch(ex, order: dict, symbol_full: str,
                 continue
 
     # Letzter Resort: estimate
-    filled = float(order.get("filled") or order.get("amount") or 0)
+    filled = _first_positive_order_value(order, "filled", "amount")
     if taker_rate is None:
         taker_rate = DEFAULT_TAKER_FEE
     return estimate_fee_usdt(filled, fill_price, taker_rate)
@@ -177,10 +200,13 @@ def base_currency_fee_amount(order: dict, base_currency: str) -> float:
 
     for fee in sources:
         try:
-            currency = (fee.get("currency") or "").upper()
+            raw_currency = fee.get("currency")
+            if raw_currency is not None and not isinstance(raw_currency, str):
+                continue
+            currency = (raw_currency or "").upper()
             if currency == base_upper:
-                cost = abs(float(fee.get("cost", 0) or 0))
-                if cost > 0:
+                cost = _finite_float_or_none(fee.get("cost"))
+                if cost is not None and cost != 0:
                     total += cost
         except (TypeError, ValueError):
             continue
@@ -194,19 +220,23 @@ def _safe_fill_price(order_dict: dict) -> float:
         return 0.0
     for key in ("average", "price"):
         val = order_dict.get(key)
-        try:
-            fv = float(val) if val is not None else 0.0
-            if fv > 0:
-                return fv
-        except (TypeError, ValueError):
-            continue
-    try:
-        cost = float(order_dict.get("cost") or 0)
-        filled = float(order_dict.get("filled") or 0)
-        if cost > 0 and filled > 0:
-            return cost / filled
-    except (TypeError, ValueError):
-        pass
+        fv = _safe_positive_float(val)
+        if fv > 0:
+            return fv
+    cost = _safe_positive_float(order_dict.get("cost"))
+    filled = _safe_positive_float(order_dict.get("filled"))
+    if cost > 0 and filled > 0:
+        return cost / filled
+    return 0.0
+
+
+def _first_positive_order_value(order_dict: dict, *keys: str) -> float:
+    if not isinstance(order_dict, dict):
+        return 0.0
+    for key in keys:
+        parsed = _safe_positive_float(order_dict.get(key))
+        if parsed > 0:
+            return parsed
     return 0.0
 
 
@@ -214,7 +244,7 @@ def _discount_fallback(order_dict: dict) -> float:
     """Conservative fee estimate when currency is unknown discount token."""
     if not isinstance(order_dict, dict):
         return 0.0
-    filled = float(order_dict.get("filled") or order_dict.get("amount") or 0)
+    filled = _first_positive_order_value(order_dict, "filled", "amount")
     price  = _safe_fill_price(order_dict)
     if filled > 0 and price > 0:
         return round(filled * price * DISCOUNT_TOKEN_FALLBACK_RATE, 6)

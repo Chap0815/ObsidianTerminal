@@ -30,6 +30,15 @@ def _upper_text(value) -> str:
     return value.upper() if isinstance(value, str) else ""
 
 
+def _order_id_text(value) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    try:
+        return str(value).strip()
+    except Exception:
+        return ""
+
+
 def _safe_positive_price(value) -> float:
     parsed = _finite_float_or_none(value)
     return parsed if parsed is not None and parsed > 0 else 0.0
@@ -59,16 +68,28 @@ def order_was_filled(order: dict, requested_amount: float = 0.0,
     """
     if not isinstance(order, dict):
         return False
-    status = str(order.get("status", "")).lower()
+    raw_status = order.get("status")
+    status_is_malformed = (
+        raw_status is not None
+        and not isinstance(raw_status, str)
+    )
+    status = raw_status.strip().lower() if isinstance(raw_status, str) else ""
     if status in ("closed", "filled"):
+        has_fill_or_cost = False
+        has_positive_fill_or_cost = False
         for key in ("filled", "cost"):
-            if (
-                order.get(key) is not None
-                and _finite_float_or_none(order.get(key)) is None
-            ):
+            if order.get(key) is None:
+                continue
+            parsed = _finite_float_or_none(order.get(key))
+            if parsed is None:
                 if trust_terminal_status_with_bad_numbers:
                     continue
                 return False
+            has_fill_or_cost = True
+            if parsed > 0:
+                has_positive_fill_or_cost = True
+        if has_fill_or_cost and not has_positive_fill_or_cost:
+            return False
         return True
     if status in ("canceled", "cancelled", "rejected", "expired", "new",
                   "open", "pending"):
@@ -102,11 +123,14 @@ def order_was_filled(order: dict, requested_amount: float = 0.0,
         return False
     if math.isfinite(cost) and cost > 0:
         return True
+    if status_is_malformed:
+        return False
     # AMBIGUOUS: no status, no fill data. If the exchange ACCEPTED the order
     # (it has an id and create_*_order didn't raise), treat it as filled 
     # this is MEXC's normal minimal market-order response, not a failure.
     # An empty/garbage dict (no id) is still treated as NOT filled.
-    return bool(order.get("id") or order.get("orderId"))
+    return bool(_order_id_text(order.get("id")) or
+                _order_id_text(order.get("orderId")))
 
 
 def extract_fill_price(order: dict, fallback: float) -> float:
@@ -140,21 +164,30 @@ def convert_fee_to_usdt(fee_dict, order_dict) -> float:
     Returns 0.0 if conversion isn't safely possible (e.g. fee in unknown
     discount token like BNB/BGB/KCS  we'd need an external price feed).
     """
+    fee, _known = _convert_fee_to_usdt_known(fee_dict, order_dict)
+    return fee
+
+
+def _convert_fee_to_usdt_known(fee_dict, order_dict) -> tuple[float, bool]:
     if not isinstance(fee_dict, dict):
-        return 0.0
+        return 0.0, False
     parsed_cost = _finite_float_or_none(fee_dict.get("cost"))
     if parsed_cost is None:
-        return 0.0
-    cost = abs(parsed_cost)
-    if not math.isfinite(cost) or cost <= 0:
-        return 0.0
+        return 0.0, False
+    cost = parsed_cost
+    if not math.isfinite(cost):
+        return 0.0, False
 
     raw_currency = fee_dict.get("currency")
     if raw_currency is not None and not isinstance(raw_currency, str):
-        return 0.0
+        return 0.0, False
     currency = _upper_text(raw_currency)
-    if not currency or currency in ("USDT", "USD", "BUSD", "USDC", "FDUSD"):
-        return cost
+    if not currency:
+        return 0.0, False
+    if cost == 0:
+        return 0.0, True
+    if currency in ("USDT", "USD", "BUSD", "USDC", "FDUSD"):
+        return cost, True
 
     symbol = (order_dict.get("symbol") or "") if isinstance(order_dict, dict) else ""
     symbol = symbol if isinstance(symbol, str) else ""
@@ -169,10 +202,10 @@ def convert_fee_to_usdt(fee_dict, order_dict) -> float:
                 break
         if fill_price > 0:
             converted = cost * fill_price
-            return converted if math.isfinite(converted) else 0.0
-        return 0.0
+            return (converted, True) if math.isfinite(converted) else (0.0, False)
+        return 0.0, False
 
-    return 0.0
+    return 0.0, False
 
 
 def extract_order_fee(order: dict) -> float:
@@ -192,9 +225,15 @@ def extract_order_fee(order: dict) -> float:
         valid = [f for f in fees_list
                   if isinstance(f, dict) and f.get("cost") is not None]
         if valid:
-            plural_total = sum(convert_fee_to_usdt(f, order) for f in valid)
-            if math.isfinite(plural_total) and plural_total > 0:
-                return plural_total
+            saw_known = False
+            plural_total = 0.0
+            for fee_dict in valid:
+                fee, known = _convert_fee_to_usdt_known(fee_dict, order)
+                if known:
+                    saw_known = True
+                    plural_total += fee
+            if saw_known:
+                return plural_total if math.isfinite(plural_total) else 0.0
             singular_fee = order.get("fee")
             if isinstance(singular_fee, dict) and singular_fee.get("cost") is not None:
                 return convert_fee_to_usdt(singular_fee, order)
@@ -203,34 +242,37 @@ def extract_order_fee(order: dict) -> float:
     return convert_fee_to_usdt(order.get("fee") or {}, order)
 
 
+def _base_fee_amount_from_fee(fee_dict, base_upper: str) -> float:
+    if not isinstance(fee_dict, dict):
+        return 0.0
+    raw_currency = fee_dict.get("currency")
+    if raw_currency is not None and not isinstance(raw_currency, str):
+        return 0.0
+    if _upper_text(raw_currency) != base_upper:
+        return 0.0
+    fv = _finite_float_or_none(fee_dict.get("cost"))
+    if fv is None:
+        return 0.0
+    return fv if math.isfinite(fv) and fv > 0 else 0.0
+
+
 def extract_base_fee_amount(order: dict, base_symbol: str) -> float:
-    """Sum BASE-currency fees from both singular `fee` and plural `fees`."""
+    """Return BASE-currency fee without double-counting summary fee fields."""
     if not isinstance(order, dict) or not base_symbol:
         return 0.0
     base_upper = _upper_text(base_symbol)
     if not base_upper:
         return 0.0
-    sources = []
-    f = order.get("fee")
-    if isinstance(f, dict):
-        sources.append(f)
     fl = order.get("fees")
     if isinstance(fl, list):
-        sources.extend(x for x in fl if isinstance(x, dict))
-    total = 0.0
-    for fo in sources:
-        raw_currency = fo.get("currency")
-        if raw_currency is not None and not isinstance(raw_currency, str):
-            continue
-        fc = _upper_text(raw_currency)
-        if fc != base_upper:
-            continue
-        fv = _finite_float_or_none(fo.get("cost"))
-        if fv is None:
-            continue
-        if math.isfinite(fv) and fv > 0:
-            total += fv
-    return total if math.isfinite(total) else 0.0
+        plural_total = sum(
+            _base_fee_amount_from_fee(fee, base_upper)
+            for fee in fl
+            if isinstance(fee, dict)
+        )
+        if math.isfinite(plural_total) and plural_total > 0:
+            return plural_total
+    return _base_fee_amount_from_fee(order.get("fee"), base_upper)
 
 
 #  Safe remaining 
@@ -263,12 +305,18 @@ def safe_remaining(current_amount: float, sold_amount: float,
     # pre-filter non-finite inputs
     if not _is_safe_finite(current_amount):
         return 0.0
+    current_value = float(current_amount)
+    if current_value <= 0:
+        return 0.0
     if not _is_safe_finite(sold_amount):
         # Sold is corrupt but current is finite  treat sold as 0
         sold_amount = 0.0
+    else:
+        sold_value = float(sold_amount)
+        sold_amount = sold_value if sold_value > 0 else 0.0
 
     try:
-        rem = Decimal(str(current_amount)) - Decimal(str(sold_amount))
+        rem = Decimal(str(current_value)) - Decimal(str(sold_amount))
     except (InvalidOperation, TypeError, ValueError):
         return 0.0
 
@@ -279,9 +327,11 @@ def safe_remaining(current_amount: float, sold_amount: float,
 
     try:
         threshold = Decimal(str(dust_threshold))
-        if rem < threshold:
-            return 0.0
+        if not threshold.is_finite() or threshold < 0:
+            threshold = Decimal("0")
     except (InvalidOperation, TypeError, ValueError):
+        threshold = Decimal("0")
+    if rem < threshold:
         return 0.0
 
     return float(rem)

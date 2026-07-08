@@ -343,24 +343,30 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
                         curr2 = p.get("current_price", buy2)
                         pnl_u = p.get("unrealized_pnl", 0.0)
                         pnl_p = p.get("unrealized_pct", 0.0)
-                        pc = COLORS["success"] if pnl_u >= 0 else COLORS["danger"]
+                        invalid = bool(p.get("invalid_state"))
+                        pc = COLORS["warning"] if invalid else (
+                            COLORS["success"] if pnl_u >= 0 else COLORS["danger"])
+                        buy_text = "Invalid" if invalid else f"{buy2:.6f}"
+                        curr_text = "Invalid" if invalid else f"{curr2:.6f}"
+                        pnl_pct_text = "stale" if invalid else f"{pnl_p:+.2f}%"
+                        pnl_usdt_text = "stale" if invalid else f"{pnl_u:+.2f}"
                         ctk.CTkLabel(r, text=p["symbol"],
                                       font=ctk.CTkFont(app.mono_font, 11, "bold"),
                                       text_color=COLORS["text"],
                                       width=80, anchor="w").pack(side="left")
-                        ctk.CTkLabel(r, text=f"{buy2:.6f}",
+                        ctk.CTkLabel(r, text=buy_text,
                                       font=ctk.CTkFont(app.mono_font, 10),
                                       text_color=COLORS["text_dim"],
                                       width=90, anchor="w").pack(side="left")
-                        ctk.CTkLabel(r, text=f"{curr2:.6f}",
+                        ctk.CTkLabel(r, text=curr_text,
                                       font=ctk.CTkFont(app.mono_font, 10),
                                       text_color=COLORS["text"],
                                       width=90, anchor="w").pack(side="left")
-                        ctk.CTkLabel(r, text=f"{pnl_p:+.2f}%",
+                        ctk.CTkLabel(r, text=pnl_pct_text,
                                       font=ctk.CTkFont(app.mono_font, 10, "bold"),
                                       text_color=pc,
                                       width=80, anchor="w").pack(side="left")
-                        ctk.CTkLabel(r, text=f"{pnl_u:+.2f}",
+                        ctk.CTkLabel(r, text=pnl_usdt_text,
                                       font=ctk.CTkFont(app.mono_font, 10, "bold"),
                                       text_color=pc,
                                       width=90, anchor="w").pack(side="left")
@@ -724,7 +730,7 @@ def emergency_close_futures_and_stop(app, name: str) -> None:
 #  Emergency-close (no confirmation) 
 
 def emergency_close_futures(app) -> None:
-    """Red 'Emergency Close' button in the FUTURES card header.
+    """Red 'Quick Close' button in the FUTURES card header.
 
     No confirmation dialog  in an emergency an extra click costs precious
     seconds, so the button fires straight into the close workflow. The
@@ -739,7 +745,7 @@ def emergency_close_futures(app) -> None:
 
     show_busy_dialog(
         app,
-        "Emergency Close",
+        "Quick Close",
         "Terminating bot and closing all positions",
         lambda update: async_emergency_close(
             app, card, bot_was_running, update),

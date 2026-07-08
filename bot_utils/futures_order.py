@@ -68,6 +68,12 @@ def _normalize_order_side(side) -> str:
     return normalized if normalized in {"buy", "sell"} else ""
 
 
+def _normalize_order_status(status) -> str:
+    if not isinstance(status, str):
+        return ""
+    return status.strip().lower()
+
+
 def _normalize_max_attempts(max_attempts) -> int:
     if isinstance(max_attempts, bool):
         return 0
@@ -90,7 +96,7 @@ def classify_order_state(order) -> str:
     """Map a CCXT order dict to a bot state-machine string."""
     if not isinstance(order, dict):
         return ORDER_STATE_FAILED
-    status = (order.get("status") or "").lower()
+    status = _normalize_order_status(order.get("status"))
     filled = _finite_nonnegative_order_value(order.get("filled"))
     amount = _finite_nonnegative_order_value(order.get("amount"))
 
@@ -193,6 +199,15 @@ _NO_POSITION_PATTERN_RE = re.compile(
     re.IGNORECASE,
 )
 
+_RATE_LIMIT_CODE_RE = re.compile(
+    r'(?:["\']?code["\']?\s*[:=]\s*510\b|\bcode\s+510\b)',
+    re.IGNORECASE,
+)
+
+
+class _InvalidOrderResponse(RuntimeError):
+    pass
+
 
 def is_no_position_error(exc_or_text) -> bool:
     """True only for exchange errors that imply the position is already flat.
@@ -206,9 +221,14 @@ def is_no_position_error(exc_or_text) -> bool:
 
 def _is_rate_limit_error(err_str: str) -> bool:
     """MEXC code 510 / 429 / 'too frequent' - transient; needs a longer wait."""
-    s = err_str.lower()
-    return ("510" in s or "too frequent" in s or "too many request" in s
-            or "rate limit" in s or "ratelimit" in s or "429" in s)
+    try:
+        from bot_utils.network_retry import is_rate_limited
+        return is_rate_limited(Exception(err_str))
+    except Exception:
+        s = err_str.lower()
+        return ("too frequent" in s or "too many request" in s
+                or "rate limit" in s or "ratelimit" in s or "429" in s
+                or bool(_RATE_LIMIT_CODE_RE.search(s)))
 
 
 # Exchange-specific keys that carry the client order id inside the raw
@@ -222,19 +242,84 @@ _CLIENT_ID_INFO_KEYS = (
 )
 
 
+def _order_id_text(value) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    try:
+        text = str(value).strip()
+    except Exception:
+        return ""
+    return text
+
+
+def _first_order_id_text(*values) -> str:
+    for value in values:
+        text = _order_id_text(value)
+        if text:
+            return text
+    return ""
+
+
 def _order_client_id_matches(o: dict, cid: str) -> bool:
     """True if order dict ``o`` carries client id ``cid`` - top-level first,
     then the raw ``info`` payload under known per-exchange aliases."""
     if not isinstance(o, dict):
         return False
-    if o.get("clientOrderId") == cid:
+    cid_text = _order_id_text(cid)
+    if not cid_text:
+        return False
+    if _order_id_text(o.get("clientOrderId")) == cid_text:
         return True
     info = o.get("info")
     if isinstance(info, dict):
         for k in _CLIENT_ID_INFO_KEYS:
-            if info.get(k) == cid:
+            if _order_id_text(info.get(k)) == cid_text:
                 return True
     return False
+
+
+def _order_response_has_evidence(order: dict) -> bool:
+    """True when a create_order response contains minimal exchange evidence."""
+    if not isinstance(order, dict):
+        return False
+    if _first_order_id_text(
+        order.get("id"),
+        order.get("orderId"),
+        order.get("order_id"),
+        order.get("orderID"),
+        order.get("clientOrderId"),
+    ):
+        return True
+    info = order.get("info")
+    if isinstance(info, dict):
+        if any(_order_id_text(info.get(k)) for k in _CLIENT_ID_INFO_KEYS):
+            return True
+        if _first_order_id_text(
+            info.get("orderId"),
+            info.get("order_id"),
+            info.get("orderID"),
+            info.get("id"),
+        ):
+            return True
+    status = _normalize_order_status(order.get("status"))
+    if status in (
+        "open", "new", "closed", "filled", "partially_filled",
+        "partiallyfilled", "canceled", "cancelled", "expired", "rejected",
+    ):
+        return True
+    return (
+        _finite_nonnegative_order_value(order.get("filled")) > 0
+        or _finite_nonnegative_order_value(order.get("cost")) > 0
+    )
+
+
+def _order_response_has_fill_evidence(order: dict) -> bool:
+    if not isinstance(order, dict):
+        return False
+    return (
+        _finite_nonnegative_order_value(order.get("filled")) > 0
+        or _finite_nonnegative_order_value(order.get("cost")) > 0
+    )
 
 
 def _order_landed(o: dict) -> bool:
@@ -247,14 +332,28 @@ def _order_landed(o: dict) -> bool:
     filled>0-only check would let a retry fire a duplicate."""
     if not isinstance(o, dict):
         return False
-    status = (o.get("status") or "").lower()
+    status = _normalize_order_status(o.get("status"))
     if status in ("rejected", "canceled", "cancelled", "expired"):
         return False
     if _finite_nonnegative_order_value(o.get("filled")) > 0:
         return True
     if status in ("open", "new", "closed", "partially_filled", "partiallyfilled"):
         return True
-    oid = o.get("id") or o.get("orderId")
+    oid = _first_order_id_text(
+        o.get("id"),
+        o.get("orderId"),
+        o.get("order_id"),
+        o.get("orderID"),
+    )
+    if not oid:
+        info = o.get("info")
+        if isinstance(info, dict):
+            oid = _first_order_id_text(
+                info.get("id"),
+                info.get("orderId"),
+                info.get("order_id"),
+                info.get("orderID"),
+            )
     return bool(oid)
 
 
@@ -287,9 +386,12 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
                 return o
     except Exception as e:
         if log_event:
-            log_event(f"clientOrderId lookup (open orders) failed for "
-                      f"{symbol_full}: {type(e).__name__} - relying on "
-                      f"server-side dedup", "WARN")
+            try:
+                log_event(f"clientOrderId lookup (open orders) failed for "
+                          f"{symbol_full}: {type(e).__name__} - relying on "
+                          f"server-side dedup", "WARN")
+            except Exception:
+                pass
     has = getattr(ex, "has", {}) or {}
     try:
         if has.get("fetchOrders"):
@@ -300,8 +402,11 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
                     return o
     except Exception as e:
         if log_event:
-            log_event(f"clientOrderId lookup (history) failed for "
-                      f"{symbol_full}: {type(e).__name__}", "WARN")
+            try:
+                log_event(f"clientOrderId lookup (history) failed for "
+                          f"{symbol_full}: {type(e).__name__}", "WARN")
+            except Exception:
+                pass
     # A just-filled MARKET order is no longer "open", and several supported
   # venues (bitget  the DEFAULT  okx, bybit, kucoin, gate) don't expose the
     # unified fetchOrders. Such a fill surfaces in closed orders / my-trades, so
@@ -316,8 +421,11 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
                     return o
     except Exception as e:
         if log_event:
-            log_event(f"clientOrderId lookup (closed orders) failed for "
-                      f"{symbol_full}: {type(e).__name__}", "WARN")
+            try:
+                log_event(f"clientOrderId lookup (closed orders) failed for "
+                          f"{symbol_full}: {type(e).__name__}", "WARN")
+            except Exception:
+                pass
     try:
         if has.get("fetchMyTrades"):
             for t in (_budgeted(
@@ -327,8 +435,11 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
                     return t
     except Exception as e:
         if log_event:
-            log_event(f"clientOrderId lookup (my trades) failed for "
-                      f"{symbol_full}: {type(e).__name__}", "WARN")
+            try:
+                log_event(f"clientOrderId lookup (my trades) failed for "
+                          f"{symbol_full}: {type(e).__name__}", "WARN")
+            except Exception:
+                pass
     return None
 
 
@@ -386,7 +497,38 @@ def create_order_with_retry(ex,
             order = ex.create_order(
                 order_symbol, "market", order_side, order_amount,
                 params=order_params)
+            if not _order_response_has_evidence(order):
+                cid = order_params.get("clientOrderId")
+                existing = _find_order_by_client_id(
+                    ex, order_symbol, cid, log_event=log_event) if cid else None
+                if existing is not None and _order_landed(existing):
+                    if log_event:
+                        try:
+                            log_event(
+                                f"{action_label}: recovered already-landed order "
+                                "after malformed exchange response  NOT retrying",
+                                "WARN")
+                        except Exception:
+                            pass
+                    return existing
+                raise _InvalidOrderResponse(
+                    f"{action_label}: invalid exchange order response "
+                    f"{type(order).__name__}; missing order id/status/fill "
+                    "evidence; not retrying to avoid duplicate market order"
+                )
             order_state = classify_order_state(order)
+            if (
+                order_state in (
+                    ORDER_STATE_FAILED,
+                    ORDER_STATE_CANCELED,
+                    ORDER_STATE_EXPIRED,
+                )
+                and not _order_response_has_fill_evidence(order)
+            ):
+                raise _InvalidOrderResponse(
+                    f"{action_label}: exchange returned terminal order state "
+                    f"{order_state}; not treating it as placed"
+                )
             if isinstance(order, dict):
                 order["_bot_state"] = order_state
                 order["_bot_attempts"] = attempt
@@ -411,6 +553,22 @@ def create_order_with_retry(ex,
         except Exception as e:
             last_err = e
             err_str = str(e).lower()
+            if isinstance(e, _InvalidOrderResponse):
+                if log_struct:
+                    try:
+                        latency_ms = int((time.monotonic() - t_start) * 1000)
+                        log_struct(
+                            "order_failed",
+                            symbol=order_symbol, side=order_side,
+                            amount=order_amount,
+                            attempts=attempt, latency_ms=latency_ms,
+                            error_type=type(e).__name__,
+                            error_msg=str(e)[:200],
+                            permanent=True, action=action_label,
+                        )
+                    except Exception:
+                        pass
+                raise
             is_permanent = _is_permanent_error(err_str)
             if is_permanent:
                 if log_struct:
@@ -455,13 +613,16 @@ def create_order_with_retry(ex,
                 if _is_rate_limit_error(err_str):
                     wait = max(wait, 1.5 * (2 ** (attempt - 1)))
                 if log_event:
-                    log_event(
-                        f"{action_label} attempt {attempt}/{attempts_limit} "
+                    try:
+                        log_event(
+                            f"{action_label} attempt {attempt}/{attempts_limit} "
   f"failed: {e}  retry in {wait:.1f}s "
   f"(backoff {multiplier:.0f})",
-                        "WARN"
-                    )
-                if abort_on_shutdown:
+                            "WARN"
+                        )
+                    except Exception:
+                        pass
+                if abort_on_shutdown and shutdown_event is not None:
                     if shutdown_event.wait(timeout=wait):
                         raise last_err
                 else:
@@ -487,11 +648,11 @@ def create_order_with_retry(ex,
 _FUTURES_DISCOUNT_TOKENS = ("MX", "BNB", "BGB", "OKB", "HT", "KCS", "GT")
 
 
-def _finite_abs_fee_cost(value) -> Optional[float]:
+def _finite_fee_cost(value) -> Optional[float]:
     if value is None or isinstance(value, bool):
         return None
     try:
-        cost = abs(float(value))
+        cost = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
     return cost if math.isfinite(cost) else None
@@ -515,6 +676,26 @@ def _first_positive_float(*values) -> float:
     return 0.0
 
 
+def _position_contracts_abs(pos: dict) -> Optional[float]:
+    """Parse exchange position size; malformed payload means untrusted state."""
+    if not isinstance(pos, dict):
+        return None
+    raw = pos.get("contracts")
+    if raw in (None, "", 0, 0.0):
+        raw = pos.get("size")
+    if isinstance(raw, bool):
+        return None
+    try:
+        contracts = abs(float(raw or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return contracts if math.isfinite(contracts) else None
+
+
+def _upper_currency_text(value) -> str:
+    return value.strip().upper() if isinstance(value, str) else ""
+
+
 def _order_with_fee_context(order, ex=None, symbol_full: str = "",
                             contract_size: Optional[float] = None) -> dict:
     payload = dict(order) if isinstance(order, dict) else {}
@@ -532,18 +713,27 @@ def _order_with_fee_context(order, ex=None, symbol_full: str = "",
 def _convert_fee_to_usdt_futures_known(fee_dict, order_dict) -> tuple[float, bool]:
     if not isinstance(fee_dict, dict) or fee_dict.get("cost") is None:
         return 0.0, False
-    cost = _finite_abs_fee_cost(fee_dict.get("cost"))
+    cost = _finite_fee_cost(fee_dict.get("cost"))
     if cost is None:
         return 0.0, False
-    if cost <= 0:
-        return 0.0, True
 
-    currency = (fee_dict.get("currency") or "").upper()
-    if not currency or currency in ("USDT", "USD", "BUSD", "USDC", "FDUSD"):
+    raw_currency = fee_dict.get("currency")
+    if raw_currency is not None and not isinstance(raw_currency, str):
+        return 0.0, False
+    currency = _upper_currency_text(raw_currency)
+    if not currency:
+        return 0.0, False
+    if cost == 0:
+        return 0.0, True
+    if currency in ("USDT", "USD", "BUSD", "USDC", "FDUSD"):
         return cost, True
     if currency in _FUTURES_DISCOUNT_TOKENS:
         converted = _discount_token_fee_to_usdt(currency, cost, order_dict)
-        return converted, converted > 0
+        if converted != 0 and math.isfinite(converted):
+            return converted, True
+        if cost < 0:
+            return 0.0, True
+        return converted, False
     return 0.0, False
 
 
@@ -582,6 +772,8 @@ def _discount_token_fee_to_usdt(currency: str, cost: float,
                     return converted
         except Exception:
             pass
+    if cost < 0:
+        return 0.0
     try:
         filled = _first_positive_float(
             order_dict.get("filled"),
@@ -632,6 +824,7 @@ def _extract_order_fee_futures_known(order) -> tuple[float, bool]:
     fees_list = order.get("fees") or []
     if isinstance(fees_list, list):
         saw_fee = False
+        saw_known = False
         all_known = True
         total = 0.0
         for fee_dict in fees_list:
@@ -646,11 +839,12 @@ def _extract_order_fee_futures_known(order) -> tuple[float, bool]:
             saw_fee = True
             fee, known = _convert_fee_to_usdt_futures_known(fee_dict, order)
             if known:
+                saw_known = True
                 total += fee
             else:
                 all_known = False
         if saw_fee:
-            if all_known:
+            if saw_known:
                 return total if math.isfinite(total) else 0.0, math.isfinite(total)
             singular_fee, singular_known = _convert_fee_to_usdt_futures_known(
                 order.get("fee") or {}, order)
@@ -713,7 +907,7 @@ def _is_mexc_swap_symbol(ex, symbol_full: str) -> bool:
 
 def _order_id_is_fetchable(ex, symbol_full: str, order_id) -> bool:
     """MEXC swap fetch_order only accepts the numeric exchange order id."""
-    oid = str(order_id or "").strip()
+    oid = _order_id_text(order_id)
     if not oid:
         return False
     if _is_mexc_swap_symbol(ex, symbol_full):
@@ -741,12 +935,12 @@ def _order_id_for_fee_refetch(ex, symbol_full: str, order: dict):
         ))
     if _is_mexc_swap_symbol(ex, symbol_full):
         for candidate in candidates:
-            oid = str(candidate or "").strip()
+            oid = _order_id_text(candidate)
             if oid.isdigit():
                 return oid
         return None
     for candidate in candidates:
-        oid = str(candidate or "").strip()
+        oid = _order_id_text(candidate)
         if oid:
             return oid
     return None
@@ -764,6 +958,10 @@ def filled_margin_usdt(amount: float,
     gates. The exchange truth is contracts * contractSize * fill / leverage.
     """
     try:
+        if any(isinstance(v, bool) for v in (
+            amount, contract_size, fill_price, leverage
+        )):
+            raise ValueError("boolean margin input")
         amt = float(amount)
         cs = float(contract_size)
         px = float(fill_price)
@@ -776,6 +974,8 @@ def filled_margin_usdt(amount: float,
     except (TypeError, ValueError, OverflowError, ZeroDivisionError):
         pass
     try:
+        if isinstance(fallback_margin, bool):
+            raise ValueError("boolean fallback margin")
         fallback = float(fallback_margin or 0.0)
         if math.isfinite(fallback):
             return fallback, False
@@ -852,6 +1052,8 @@ def extract_or_estimate_futures_fee(ex,
     # when the response carries no fill yet. Notional ALWAYS includes contractSize.
     filled = 0.0
     for candidate in (order_payload.get("filled"), order_payload.get("amount")):
+        if isinstance(candidate, bool):
+            continue
         try:
             filled_candidate = float(candidate)
         except (TypeError, ValueError, OverflowError):
@@ -861,6 +1063,8 @@ def extract_or_estimate_futures_fee(ex,
             break
     if (not math.isfinite(filled) or filled <= 0) and amount is not None:
         try:
+            if isinstance(amount, bool):
+                raise ValueError("boolean amount")
             filled = float(amount)
         except (TypeError, ValueError, OverflowError):
             filled = 0.0
@@ -869,18 +1073,24 @@ def extract_or_estimate_futures_fee(ex,
     if contract_size is None:
         contract_size = futures_contract_size(ex, symbol_full)
     try:
+        if isinstance(contract_size, bool):
+            raise ValueError("boolean contract size")
         cs = float(contract_size)
         if not math.isfinite(cs) or cs <= 0:
             cs = 1.0
     except (TypeError, ValueError, OverflowError):
         cs = 1.0
     try:
+        if isinstance(fill_price, bool):
+            raise ValueError("boolean fill price")
         fp = float(fill_price)
     except (TypeError, ValueError, OverflowError):
         fp = 0.0
     if not math.isfinite(fp) or filled <= 0 or fp <= 0:
         return 0.0
     try:
+        if isinstance(taker_rate, bool):
+            raise ValueError("boolean taker rate")
         rate = float(taker_rate)
     except (TypeError, ValueError, OverflowError):
         rate = FUTURES_DEFAULT_TAKER_FEE
@@ -942,11 +1152,8 @@ def fetch_open_position(ex, symbol_full: str) -> Tuple[Optional[dict], bool]:
             continue
         if (pos.get("symbol") or "") != symbol_full:
             continue
-        try:
-            contracts = abs(float(pos.get("contracts") or pos.get("size") or 0.0))
-        except (TypeError, ValueError, OverflowError):
-            return None, True
-        if not math.isfinite(contracts):
+        contracts = _position_contracts_abs(pos)
+        if contracts is None:
             return None, True
         if contracts > 1e-8:
             return pos, False
@@ -976,11 +1183,11 @@ def verify_position_closed(ex, symbol_full: str, timeout: float = 5.0
             elif pos is None:
                 return True, 0.0
             else:
-                try:
-                    last_remaining = abs(float(
-                        pos.get("contracts") or pos.get("size") or 0.0))
-                except (TypeError, ValueError, OverflowError):
+                parsed_remaining = _position_contracts_abs(pos)
+                if parsed_remaining is None:
                     last_remaining = -1.0
+                else:
+                    last_remaining = parsed_remaining
         except Exception:
             pass
 
@@ -1030,11 +1237,13 @@ def get_exchange_liq_price(ex, symbol_full: str) -> float:
                 if v is None and isinstance(p.get("info"), dict):
                     v = p["info"].get(k)
                 if v is not None:
+                    if isinstance(v, bool):
+                        continue
                     try:
                         fv = float(v)
-                        if fv > 0:
+                        if math.isfinite(fv) and fv > 0:
                             return fv
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         continue
         return 0.0
     except Exception:

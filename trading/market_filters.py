@@ -15,6 +15,7 @@ from collections import OrderedDict
 from typing import Optional
 from dotenv import load_dotenv
 from core.constants import NONCRYPTO_BASES, STOCK_TOKEN_BASES
+from bot_utils.safe_numeric import safe_positive_float
 
 load_dotenv()
 
@@ -593,14 +594,7 @@ def get_market_regime(exchange) -> dict:
 # 
 
 def is_price_valid(price) -> bool:
-    import math as _math
-    if price is None:
-        return False
-    try:
-        p = float(price)
-        return not _math.isnan(p) and not _math.isinf(p) and p > 0
-    except (TypeError, ValueError):
-        return False
+    return safe_positive_float(price, 0.0) > 0
 
 
 # 
@@ -746,7 +740,9 @@ def can_buy_now(exchange, bot_name: str = "", open_symbols: list = None,
         if price is None:
             try:
                 ticker = exchange.fetch_ticker(candidate_symbol)
-                price  = ticker.get("last") or ticker.get("close")
+                price = safe_positive_float(ticker.get("last"), 0.0)
+                if price <= 0:
+                    price = safe_positive_float(ticker.get("close"), 0.0)
             except Exception:
                 price = None
         if price is not None and not is_price_valid(price):

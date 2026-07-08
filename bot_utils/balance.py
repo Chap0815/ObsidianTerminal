@@ -38,6 +38,8 @@ _STABLECOINS = {"USDT", "USD", "BUSD", "USDC", "FDUSD", "TUSD", ""}
 
 
 def _finite_nonnegative_float(value) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):

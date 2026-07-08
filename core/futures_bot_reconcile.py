@@ -15,6 +15,60 @@ import time
 from core.clock import now_utc
 
 
+def _finite_float_or_none(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _positive_float_or_none(value) -> float | None:
+    parsed = _finite_float_or_none(value)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def _positive_abs_float_or_none(value) -> float | None:
+    parsed = _finite_float_or_none(value)
+    if parsed is None:
+        return None
+    parsed = abs(parsed)
+    return parsed if parsed > 0 else None
+
+
+def _position_signed_contracts_or_none(position: dict | None) -> float | None:
+    if not isinstance(position, dict):
+        return None
+    for key in ("contracts", "size"):
+        if key not in position or position.get(key) is None:
+            continue
+        parsed = _finite_float_or_none(position.get(key))
+        if parsed is None:
+            return None
+        if parsed != 0:
+            return parsed
+    return 0.0
+
+
+def _position_contracts_or_none(position: dict | None) -> float | None:
+    signed = _position_signed_contracts_or_none(position)
+    if signed is None:
+        return None
+    contracts = abs(signed)
+    return contracts if contracts > 0 else 0.0
+
+
+def _nonnegative_float_or_none(value) -> float | None:
+    parsed = _finite_float_or_none(value)
+    return parsed if parsed is not None and parsed >= 0 else None
+
+
+def _is_true_bool(value) -> bool:
+    return value is True
+
+
 def _is_reduce_only_trade(t: dict) -> bool:
     info = t.get("info", {}) or {}
     raw_reduce_only = (
@@ -49,29 +103,36 @@ def _is_close_trade_for_position(t: dict, pos_type: str | None) -> bool:
 
 
 def _trade_amount(t: dict) -> float:
-    try:
-        amount = abs(float(t.get("amount", 0) or 0))
-    except (TypeError, ValueError, OverflowError):
+    amount = _finite_float_or_none(t.get("amount"))
+    if amount is None:
         return 0.0
-    return amount if amount > 0 and amount < float("inf") else 0.0
+    amount = abs(amount)
+    return amount if amount > 0 else 0.0
 
 
 def _trade_fee_usdt(t: dict) -> float:
+    fee, _known = _trade_fee_usdt_known(t)
+    return fee
+
+
+def _trade_fee_usdt_known(t: dict) -> tuple[float, bool]:
     fee = t.get("fee") or {}
-    try:
-        cost = abs(float(fee.get("cost", 0) or 0))
-    except (TypeError, ValueError, OverflowError, AttributeError):
-        cost = 0.0
+    if not isinstance(fee, dict):
+        return 0.0, False
+    cost = _finite_float_or_none(fee.get("cost"))
+    if cost is None:
+        return 0.0, False
     currency = str(fee.get("currency", "") if isinstance(fee, dict) else "").upper()
-    return cost if currency in {"USDT", "USD"} and cost < float("inf") else 0.0
+    if currency not in {"USDT", "USD"}:
+        return 0.0, False
+    return cost, True
 
 
 def _trade_price(t: dict) -> float:
-    try:
-        price = float(t.get("price", 0) or 0)
-    except (TypeError, ValueError, OverflowError):
+    price = _finite_float_or_none(t.get("price"))
+    if price is None:
         return 0.0
-    return price if price > 0 and price < float("inf") else 0.0
+    return price if price > 0 else 0.0
 
 
 def _estimate_futures_close_fee_usdt(
@@ -80,14 +141,13 @@ def _estimate_futures_close_fee_usdt(
     close_price: float,
     fee_rate: float,
 ) -> float:
-    try:
-        amt = float(amount)
-        cs = float(contract_size)
-        price = float(close_price)
-        rate = float(fee_rate)
-    except (TypeError, ValueError, OverflowError):
+    amt = _finite_float_or_none(amount)
+    cs = _finite_float_or_none(contract_size)
+    price = _finite_float_or_none(close_price)
+    rate = _finite_float_or_none(fee_rate)
+    if amt is None or cs is None or price is None or rate is None:
         return 0.0
-    if not all(math.isfinite(v) and v >= 0 for v in (amt, cs, price, rate)):
+    if not all(v >= 0 for v in (amt, cs, price, rate)):
         return 0.0
     try:
         fee = amt * cs * price * rate
@@ -114,6 +174,7 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
     qty = 0.0
     notional = 0.0
     fee_usdt = 0.0
+    fees_known = True
     used_side_fallback = False
     for t in reversed(trades):
         is_reduce = _is_reduce_only_trade(t)
@@ -129,11 +190,13 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
             break
         try:
             trade_notional = take * price
-            fee_part = _trade_fee_usdt(t) * (take / amt)
+            trade_fee, fee_known = _trade_fee_usdt_known(t)
+            fee_part = trade_fee * (take / amt)
         except (OverflowError, ZeroDivisionError):
             continue
         if not (math.isfinite(trade_notional) and math.isfinite(fee_part)):
             continue
+        fees_known = fees_known and fee_known
         qty += take
         notional += trade_notional
         fee_usdt += fee_part
@@ -147,7 +210,16 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
             break
     if qty + 1e-12 < target or qty <= 0:
         return 0.0, 0.0, "unavailable"
-    source = "fetch_my_trades_side_vwap" if used_side_fallback else "fetch_my_trades_vwap"
+    if used_side_fallback:
+        source = (
+            "fetch_my_trades_side_vwap"
+            if fees_known else "fetch_my_trades_side_vwap_fee_unknown"
+        )
+    else:
+        source = (
+            "fetch_my_trades_vwap"
+            if fees_known else "fetch_my_trades_vwap_fee_unknown"
+        )
     vwap = notional / qty
     if not (math.isfinite(vwap) and math.isfinite(fee_usdt)):
         return 0.0, 0.0, "unavailable"
@@ -166,22 +238,36 @@ def _find_futures_external_close_price(bot, symbol_full: str,
         return 0.0, 0.0, "unavailable"
     try:
         ticker = bot.ex.fetch_ticker(symbol_full)
-        price = float(ticker.get("last", 0) or 0)
-        if price > 0:
+        price = _positive_float_or_none(ticker.get("last"))
+        if price is None:
+            price = _positive_float_or_none(ticker.get("close"))
+        if price is not None and price > 0:
             return price, 0.0, "current_ticker"
     except Exception:
         pass
     return 0.0, 0.0, "unavailable"
 
 
+def _futures_close_fee_is_known(source: str) -> bool:
+    return (
+        isinstance(source, str)
+        and source.startswith("fetch_my_trades")
+        and not source.endswith("_fee_unknown")
+    )
+
+
 def _append_pending_partial(row: dict, item: dict) -> list:
-    pending = list(row.get("accounting_pending_partials") or [])
+    from bot_utils.trade_state import normalize_pending_accounting_items
+    pending = normalize_pending_accounting_items(
+        row.get("accounting_pending_partials"))
     pending.append(dict(item))
     return pending
 
 
 def _append_unpriced_partial(row: dict, item: dict) -> list:
-    pending = list(row.get("unpriced_external_partials") or [])
+    from bot_utils.trade_state import normalize_pending_accounting_items
+    pending = normalize_pending_accounting_items(
+        row.get("unpriced_external_partials"))
     pending.append(dict(item))
     return pending
 
@@ -220,10 +306,7 @@ def _fetch_futures_contracts(bot, sym: str) -> float | None:
     for p in poss or []:
         if (p.get("symbol") or "") != full:
             continue
-        try:
-            return abs(float(p.get("contracts") or p.get("size") or 0))
-        except (TypeError, ValueError):
-            return None
+        return _position_contracts_or_none(p)
     return 0.0
 
 
@@ -240,13 +323,17 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
     from bot_utils import safe_proportional_fee, safe_funding_scale
     from bot_utils.futures_order import FUTURES_DEFAULT_TAKER_FEE
 
-    entry = float(state_row.get("buy", 0) or 0)
-    local_amt = abs(float(state_row.get("amount", 0) or 0))
-    remaining_contracts = max(0.0, abs(float(remaining_contracts or 0.0)))
+    entry = _positive_float_or_none(state_row.get("buy"))
+    local_amt = _positive_abs_float_or_none(state_row.get("amount"))
+    remaining_contracts = _positive_abs_float_or_none(remaining_contracts)
+    if entry is None or local_amt is None or remaining_contracts is None:
+        return False, {}
     sold_contracts = max(0.0, local_amt - remaining_contracts)
     pos_type = str(state_row.get("position_type") or "LONG").upper()
-    lev = float(state_row.get("leverage", 1) or 1)
-    margin = float(state_row.get("invested_usdt", 0) or 0)
+    lev = _positive_float_or_none(state_row.get("leverage", 1))
+    margin = _nonnegative_float_or_none(state_row.get("invested_usdt"))
+    if lev is None or margin is None:
+        return False, {}
     if entry <= 0 or local_amt <= 0 or sold_contracts <= 0 or remaining_contracts <= 0:
         return False, {}
 
@@ -267,7 +354,10 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
             "invested_usdt": margin_remaining,
             "partial_sold": True,
         }
-        if "original_amount" not in state_row:
+        original_amount = _positive_abs_float_or_none(
+            state_row.get("original_amount"))
+        repair_original_amount = original_amount is None
+        if repair_original_amount:
             fields["original_amount"] = local_amt
         fields["unpriced_external_partials"] = _append_unpriced_partial(
             state_row,
@@ -297,27 +387,54 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
     else:
         move_pct = ((close_price - entry) / entry) * 100
     gross_pnl = margin_sold * (move_pct * lev) / 100.0
-    original_amount = float(state_row.get("original_amount") or local_amt)
+    partial_sold = _is_true_bool(state_row.get("partial_sold"))
+    original_amount = _positive_abs_float_or_none(state_row.get("original_amount"))
+    repair_original_amount = original_amount is None
+    if repair_original_amount and partial_sold:
+        return False, {}
+    if repair_original_amount:
+        original_amount = local_amt
+    initial_entry_fee = _nonnegative_float_or_none(state_row.get(
+        "initial_entry_fee", state_row.get("fees_paid", 0))) or 0.0
+    funding_total = _finite_float_or_none(state_row.get("funding_paid", 0))
+    if funding_total is None:
+        funding_total = 0.0
     entry_fee = safe_proportional_fee(
-        float(state_row.get("initial_entry_fee",
-                            state_row.get("fees_paid", 0)) or 0),
-        sold_contracts, original_amount,
-        partial_sold=bool(state_row.get("partial_sold")),
+        initial_entry_fee, sold_contracts, original_amount,
+        partial_sold=partial_sold,
     )
     funding_partial = safe_funding_scale(
-        float(state_row.get("funding_paid", 0) or 0),
-        sold_contracts, original_amount,
-        partial_sold=bool(state_row.get("partial_sold")),
+        funding_total, sold_contracts, original_amount,
+        partial_sold=partial_sold,
     )
     close_fee = (
         close_fee_actual
-        if close_fee_actual > 0 and math.isfinite(close_fee_actual)
+        if (
+            _futures_close_fee_is_known(source)
+            and math.isfinite(close_fee_actual)
+        )
         else _estimate_futures_close_fee_usdt(
             sold_contracts, contract_size, close_price,
             FUTURES_DEFAULT_TAKER_FEE,
         )
     )
     profit_usdt = round(gross_pnl - entry_fee - close_fee - funding_partial, 4)
+    prev_realized = _finite_float_or_none(
+        state_row.get("partial_profit_realized", 0.0))
+    prev_funding = _finite_float_or_none(
+        state_row.get("funding_booked_on_partials", 0.0))
+    if prev_realized is None or prev_funding is None:
+        return False, {}
+    if not all(math.isfinite(v) for v in (
+        close_price, entry_fee, close_fee, funding_partial, gross_pnl,
+        profit_usdt, margin_sold, margin_remaining, prev_realized,
+        prev_funding,
+    )):
+        log_event(
+            f" Reconciliation: {sym} external futures partial skipped  "
+            f"non-finite accounting value",
+            "WARN")
+        return False, {}
     item = {
         "bot_name": bot.BOT_NAME,
         "mode_is_sim": getattr(bot, "simulation", None),
@@ -344,8 +461,6 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
         ),
     }
     saved = bool(save_trade_db(**item))
-    prev_realized = float(state_row.get("partial_profit_realized", 0.0) or 0.0)
-    prev_funding = float(state_row.get("funding_booked_on_partials", 0.0) or 0.0)
     fields = {
         "amount": remaining_contracts,
         "invested_usdt": margin_remaining,
@@ -353,7 +468,7 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
         "partial_profit_realized": prev_realized + profit_usdt,
         "funding_booked_on_partials": prev_funding + funding_partial,
     }
-    if "original_amount" not in state_row:
+    if repair_original_amount:
         fields["original_amount"] = local_amt
     if not saved:
         fields["accounting_pending_partials"] = _append_pending_partial(
@@ -374,27 +489,35 @@ def _row_with_unpriced_futures_partials(state_row: dict) -> dict:
     those unbooked partial slices with the remaining state slice so one offline
     close can book the full not-yet-accounted exposure and then release state.
     """
+    from bot_utils.trade_state import normalize_pending_accounting_items
+
     row = dict(state_row)
-    pending = list(row.get("unpriced_external_partials") or [])
+    pending = normalize_pending_accounting_items(
+        row.get("unpriced_external_partials"))
     if not pending:
         return row
-    try:
-        amount = abs(float(row.get("amount", 0) or 0))
-    except (TypeError, ValueError):
-        amount = 0.0
-    try:
-        invested = float(row.get("invested_usdt", 0) or 0)
-    except (TypeError, ValueError):
-        invested = 0.0
+    amount = _nonnegative_float_or_none(row.get("amount"))
+    invested = _nonnegative_float_or_none(row.get("invested_usdt"))
+    if (
+        (amount is None and "amount" in row)
+        or (invested is None and "invested_usdt" in row)
+    ):
+        return row
+    amount = amount or 0.0
+    invested = invested or 0.0
     for item in pending:
-        try:
-            amount += abs(float(item.get("sold_contracts", 0) or 0))
-        except (TypeError, ValueError, AttributeError):
-            pass
-        try:
-            invested += float(item.get("invested_usdt", 0) or 0)
-        except (TypeError, ValueError, AttributeError):
-            pass
+        if not isinstance(item, dict):
+            return row
+        sold_contracts = _nonnegative_float_or_none(item.get("sold_contracts"))
+        if sold_contracts is None:
+            return row
+        amount += sold_contracts
+        invested_usdt = _nonnegative_float_or_none(item.get("invested_usdt"))
+        if invested_usdt is None:
+            return row
+        invested += invested_usdt
+        if not (math.isfinite(amount) and math.isfinite(invested)):
+            return row
     if amount > 0:
         row["amount"] = amount
     if invested > 0:
@@ -435,15 +558,13 @@ class FuturesReconcileMixin:
             # Build set of symbols with non-zero contracts on exchange
             exchange_open: dict = {}
             for p in exchange_positions:
-                try:
-                    contracts = abs(float(p.get("contracts") or p.get("size") or 0))
-                    if contracts > 0:
-                        full_sym = p.get("symbol", "")
-                        base = full_sym.split("/")[0] if "/" in full_sym else full_sym
-                        if base:
-                            exchange_open[base] = p
-                except (TypeError, ValueError):
+                contracts = _position_contracts_or_none(p)
+                if contracts is None or contracts <= 0:
                     continue
+                full_sym = p.get("symbol", "")
+                base = full_sym.split("/")[0] if "/" in full_sym else full_sym
+                if base:
+                    exchange_open[base] = p
 
             # SAFETY GATE  if local state has positions but exchange shows
             # ZERO, refuse to wipe state. Protects against auth/network glitches
@@ -484,9 +605,10 @@ class FuturesReconcileMixin:
                     strikes.pop(sym, None)
                     try:
                         local_row = local_state[sym]
-                        local_amt = abs(float(local_row.get("amount", 0) or 0))
+                        local_amt = _positive_abs_float_or_none(
+                            local_row.get("amount")) or 0.0
                         p = exchange_open.get(sym) or {}
-                        exch_amt = abs(float(p.get("contracts") or p.get("size") or 0))
+                        exch_amt = _position_contracts_or_none(p) or 0.0
                         if (local_amt > 0 and exch_amt > 0
                                 and exch_amt < local_amt * 0.95
                                 and not _is_fresh_position(
@@ -495,7 +617,8 @@ class FuturesReconcileMixin:
                                 if not got or not self.state.has(sym):
                                     continue
                                 live_row = self.state.get(sym) or local_row
-                                live_amt = abs(float(live_row.get("amount", 0) or 0))
+                                live_amt = _positive_abs_float_or_none(
+                                    live_row.get("amount")) or 0.0
                                 refetched_amt = _fetch_futures_contracts(self, sym)
                                 if refetched_amt is None:
                                     log_event(
@@ -597,15 +720,27 @@ class FuturesReconcileMixin:
                     }
                     try:
                         from bot_utils.trade_state import remove_with_restore_fields
-                        # Scope by bot: FUTURES + CROSS share futures_state;
-                        # unscoped would wipe the other bot's dashboard row.
-                        remove_futures_state(
-                            sym, self.BOT_NAME,
-                            mode_is_sim=getattr(self, "simulation", None))
                         removed_state = remove_with_restore_fields(
                             self.state, sym, restore,
                         )
                         if removed_state:
+                            try:
+                                # Scope by bot: FUTURES + CROSS share futures_state;
+                                # unscoped would wipe the other bot's dashboard row.
+                                remove_futures_state(
+                                    sym, self.BOT_NAME,
+                                    mode_is_sim=getattr(self, "simulation", None))
+                            except Exception:
+                                keep = dict(close_row)
+                                keep.update(restore)
+                                keep["futures_state_cleanup_pending"] = True
+                                try:
+                                    self.state.add(sym, keep)
+                                except Exception as state_err:
+                                    self._log_error(
+                                        f"restore reconcile state {sym}",
+                                        state_err)
+                                raise
                             strikes.pop(sym, None)
                     except Exception as e:
                         self._log_error(f"reconcile-remove {sym}", e)
@@ -670,16 +805,30 @@ class FuturesReconcileMixin:
                 p = exchange_open.get(base) or {}
                 info = p.get("info") if isinstance(p.get("info"), dict) else {}
                 try:
-                    entry = float(p.get("entryPrice") or info.get("entryPrice")
-                                  or info.get("openAvgPrice") or 0)
-                    raw_contracts = float(p.get("contracts") or p.get("size") or 0)
+                    entry = (
+                        _positive_float_or_none(p.get("entryPrice"))
+                        or _positive_float_or_none(info.get("entryPrice"))
+                        or _positive_float_or_none(info.get("openAvgPrice"))
+                    )
+                    if entry is None:
+                        raise ValueError("invalid exchange entry price")
+                    raw_contracts = _position_signed_contracts_or_none(p)
+                    if raw_contracts is None:
+                        raise ValueError("invalid exchange contracts")
                     contracts = abs(raw_contracts)
                     side = str(p.get("side") or "").lower()
                     if not side and raw_contracts < 0:
                         side = "short"
-                    lev = float(p.get("leverage") or self.C("LEVERAGE", 3) or 3)
-                    liq = float(p.get("liquidationPrice")
-                                or info.get("liquidationPrice") or 0)
+                    lev = (
+                        _positive_float_or_none(p.get("leverage"))
+                        or _positive_float_or_none(self.C("LEVERAGE", 3))
+                        or 3.0
+                    )
+                    liq = (
+                        _finite_float_or_none(p.get("liquidationPrice"))
+                        or _finite_float_or_none(info.get("liquidationPrice"))
+                        or 0.0
+                    )
                     mm_mode = str(p.get("marginMode") or info.get("marginMode")
                                   or info.get("marginType") or "").lower()
                 except (TypeError, ValueError):
@@ -830,10 +979,9 @@ class FuturesReconcileMixin:
         for p in poss or []:
             if (p.get("symbol") or "") != full:
                 continue
-            try:
-                contracts = abs(float(p.get("contracts") or p.get("size") or 0))
-            except (TypeError, ValueError):
-                contracts = 0.0
+            contracts = _position_contracts_or_none(p)
+            if contracts is None:
+                return True
             if contracts > 0:
                 return True
         return False
@@ -865,23 +1013,36 @@ class FuturesReconcileMixin:
         from bot_utils.futures_order import FUTURES_DEFAULT_TAKER_FEE
 
         try:
-            entry = float(state_row.get("buy", 0) or 0)
-            amount = float(state_row.get("amount", 0) or 0)
+            entry = _positive_float_or_none(state_row.get("buy"))
+            amount = _positive_abs_float_or_none(state_row.get("amount"))
             pos_type = state_row.get("position_type", "LONG")
-            lev = float(state_row.get("leverage", 1) or 1)
-            margin = float(state_row.get("invested_usdt", 0) or 0)
+            lev = _positive_float_or_none(state_row.get("leverage", 1))
+            margin = _nonnegative_float_or_none(state_row.get("invested_usdt"))
             buy_time = state_row.get("buy_time", "")
-            initial_entry_fee = float(state_row.get(
-                "initial_entry_fee", state_row.get("fees_paid", 0)) or 0)
-            funding_total = float(state_row.get("funding_paid", 0) or 0)
-            funding_booked = float(state_row.get(
-                "funding_booked_on_partials", 0) or 0)
-            original_amount = float(state_row.get(
-                "original_amount", state_row.get("amount", 0)) or 0)
-            partial_sold = bool(state_row.get("partial_sold"))
-            liq_price = float(state_row.get("liquidation_price", 0) or 0)
+            initial_entry_fee = _nonnegative_float_or_none(state_row.get(
+                "initial_entry_fee", state_row.get("fees_paid", 0))) or 0.0
+            funding_total = _finite_float_or_none(
+                state_row.get("funding_paid", 0))
+            if funding_total is None:
+                funding_total = 0.0
+            funding_booked = _finite_float_or_none(
+                state_row.get("funding_booked_on_partials", 0))
+            if funding_booked is None:
+                funding_booked = 0.0
+            partial_sold = _is_true_bool(state_row.get("partial_sold"))
+            original_amount = _positive_abs_float_or_none(
+                state_row.get("original_amount"))
+            if original_amount is None and partial_sold:
+                log_event(
+                    f" {sym}: offline-close record skipped  invalid "
+                    f"original_amount for partial position", "WARN")
+                return False
+            if original_amount is None:
+                original_amount = amount
+            liq_price = _positive_float_or_none(
+                state_row.get("liquidation_price")) or 0.0
 
-            if entry <= 0 or amount <= 0:
+            if entry is None or amount is None or lev is None or margin is None:
                 log_event(
                     f" {sym}: offline-close record skipped  invalid "
                     f"state (entry={entry}, amount={amount})", "WARN"
@@ -896,13 +1057,11 @@ class FuturesReconcileMixin:
             close_source = "estimate"
             pending_accounting = bool(state_row.get("accounting_pending"))
             if pending_accounting:
-                try:
-                    close_price = float(
-                        state_row.get("accounting_pending_sell_price") or 0)
-                    if close_price > 0:
-                        close_source = "accounting_pending"
-                except (TypeError, ValueError):
-                    close_price = 0.0
+                pending_price = _positive_float_or_none(
+                    state_row.get("accounting_pending_sell_price"))
+                if pending_price is not None:
+                    close_price = pending_price
+                    close_source = "accounting_pending"
             if close_price <= 0:
                 close_price, close_fee_actual, close_source = (
                     _find_futures_external_close_price(
@@ -913,8 +1072,15 @@ class FuturesReconcileMixin:
             if close_price <= 0:
                 try:
                     ticker = self.ex.fetch_ticker(symbol_full)
-                    close_price = float(ticker.get("last", 0) or 0)
-                    close_source = "current_ticker"
+                    close_price = _positive_float_or_none(
+                        ticker.get("last") if isinstance(ticker, dict) else None
+                    ) or 0.0
+                    if close_price <= 0 and isinstance(ticker, dict):
+                        close_price = _positive_float_or_none(
+                            ticker.get("close")
+                        ) or 0.0
+                    if close_price > 0:
+                        close_source = "current_ticker"
                 except Exception:
                     pass
 
@@ -951,7 +1117,10 @@ class FuturesReconcileMixin:
                 _cs = 1.0
             close_fee = (
                 close_fee_actual
-                if close_fee_actual > 0 and math.isfinite(close_fee_actual)
+                if (
+                    _futures_close_fee_is_known(close_source)
+                    and math.isfinite(close_fee_actual)
+                )
                 else _estimate_futures_close_fee_usdt(
                     amount, _cs, close_price, FUTURES_DEFAULT_TAKER_FEE)
             )
@@ -970,28 +1139,23 @@ class FuturesReconcileMixin:
             # its captured realized values over a later ticker estimate.
             net_pnl = round(gross_pnl - entry_fee - close_fee - funding_pd, 4)
             if pending_accounting and close_source == "accounting_pending":
-                try:
-                    net_pnl = float(
-                        state_row.get("accounting_pending_profit_usdt"))
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    funding_pd = float(
-                        state_row.get("accounting_pending_funding_paid"))
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    close_fee_total = float(
-                        state_row.get("accounting_pending_fees_usdt"))
+                pending_pnl = _finite_float_or_none(
+                    state_row.get("accounting_pending_profit_usdt"))
+                if pending_pnl is not None:
+                    net_pnl = pending_pnl
+                pending_funding = _finite_float_or_none(
+                    state_row.get("accounting_pending_funding_paid"))
+                if pending_funding is not None:
+                    funding_pd = pending_funding
+                close_fee_total = _nonnegative_float_or_none(
+                    state_row.get("accounting_pending_fees_usdt"))
+                if close_fee_total is not None:
                     entry_fee = 0.0
                     close_fee = close_fee_total
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    price_move_pct = float(
-                        state_row.get("accounting_pending_profit_pct"))
-                except (TypeError, ValueError):
-                    pass
+                pending_pct = _finite_float_or_none(
+                    state_row.get("accounting_pending_profit_pct"))
+                if pending_pct is not None:
+                    price_move_pct = pending_pct
             mfe_pct = state_row.get("accounting_pending_mfe_pct")
             mae_pct = state_row.get("accounting_pending_mae_pct")
             giveback_pct = state_row.get("accounting_pending_giveback_pct")
@@ -1004,6 +1168,16 @@ class FuturesReconcileMixin:
                 or (f"Offline close ({close_source})"
                     if close_source != "liquidation_price"
                     else "LIQUIDATED (offline)"))
+
+            if not all(math.isfinite(v) for v in (
+                entry, amount, lev, margin, initial_entry_fee, funding_total,
+                funding_booked, original_amount, liq_price, close_price,
+                close_fee, entry_fee, funding_pd, price_move_pct, net_pnl,
+            )):
+                log_event(
+                    f" {sym}: offline-close record skipped  "
+                    f"non-finite accounting value", "WARN")
+                return False
 
             saved = save_trade_db(
                 bot_name=self.BOT_NAME,

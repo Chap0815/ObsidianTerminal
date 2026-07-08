@@ -7,23 +7,30 @@ close price instead of only the last retry's price.
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
 def _f(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
     try:
         out = float(value)
-        return out if out == out else default
-    except (TypeError, ValueError):
+        return out if math.isfinite(out) else default
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
 def pending_close_values(state: dict) -> tuple[float, float, float, str | None]:
     amount = max(0.0, _f(state.get("pending_close_filled_amount")))
     notional = max(0.0, _f(state.get("pending_close_notional_sum")))
-    fee = max(0.0, _f(state.get("pending_close_fee")))
-    price = (notional / amount) if amount > 0 else _f(
-        state.get("pending_close_price"))
+    fee = _f(state.get("pending_close_fee"))
+    fallback_price = max(0.0, _f(state.get("pending_close_price")))
+    price = (
+        (notional / amount)
+        if amount > 0 and notional > 0
+        else fallback_price
+    )
     oid = state.get("pending_close_order_id")
     return amount, price, fee, str(oid) if oid else None
 
@@ -38,11 +45,15 @@ def add_close_fragment_update(
 ) -> dict:
     amount = max(0.0, _f(amount))
     price = max(0.0, _f(price))
-    fee = max(0.0, _f(fee))
+    fee = _f(fee)
     prev_amount, _prev_price, prev_fee, prev_oid = pending_close_values(state)
     prev_notional = max(0.0, _f(state.get("pending_close_notional_sum")))
     if prev_notional <= 0.0 and prev_amount > 0 and _prev_price > 0:
         prev_notional = prev_amount * _prev_price
+    elif prev_notional <= 0.0 and prev_amount > 0:
+        prev_amount = 0.0
+        prev_fee = 0.0
+        prev_oid = None
 
     new_amount = prev_amount + amount
     new_notional = prev_notional + (amount * price if amount > 0 else 0.0)
@@ -56,4 +67,3 @@ def add_close_fragment_update(
         "pending_close_fee": new_fee,
         "pending_close_order_id": str(oid) if oid else None,
     }
-

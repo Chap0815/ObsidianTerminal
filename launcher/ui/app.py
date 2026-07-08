@@ -15,6 +15,7 @@ touching the caller methods.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import re
@@ -35,6 +36,26 @@ try:
     import psutil  # noqa: F401  (used inside _refresh via HAS_PSUTIL)
 except ImportError:
     pass
+
+
+def _ui_finite_float(value, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _ui_nonnegative_int(value, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if parsed >= 0 else default
 
 # Modular launcher imports
 from launcher.config.settings import (
@@ -77,6 +98,11 @@ try:
 except ImportError:
     PARAM_DEFS_FUTREND = PARAM_DEFS_FUTURES
 from launcher.core.process_manager import BotProcess
+from launcher.core.runtime_status_values import (
+    finite_float_or_none,
+    positive_int_or_zero,
+    strict_bool_or_none,
+)
 from core.runtime_status import read_runtime_status
 from launcher.core.system_monitor import HAS_PSUTIL
 from launcher.state.poller import DataPoller, _runtime_status_is_fresh
@@ -94,6 +120,19 @@ from launcher.ui.theme import force_dark_titlebar
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
+
+
+def _runtime_simulation_flag(rs: dict | None) -> bool | None:
+    if not isinstance(rs, dict):
+        return None
+    return strict_bool_or_none(rs.get("simulation"))
+
+
+def _runtime_monotonic_age(rs: dict, *, now: float | None = None) -> float | None:
+    mono = finite_float_or_none(rs.get("monotonic_ts"))
+    if mono is None or mono <= 0.0:
+        return None
+    return (time.monotonic() if now is None else now) - mono
 
 
 class ObsidianApp(ctk.CTk):
@@ -1007,7 +1046,7 @@ class ObsidianApp(ctk.CTk):
         emerg = None
         if is_futures:
             emerg = ctk.CTkButton(
-                action_frame, text="Close Pos",
+                action_frame, text="Quick Close",
                 width=76, height=22, corner_radius=4,
                 font=ctk.CTkFont(FONT_BODY, 10, "bold"),
                 fg_color=COLORS["danger"], hover_color="#b91c1c",
@@ -1754,8 +1793,9 @@ class ObsidianApp(ctk.CTk):
 
                 def _running_bot_is_sim(bot: str) -> bool:
                     rs = external.get(bot)
-                    if rs is not None and "simulation" in rs:
-                        return bool(rs.get("simulation"))
+                    runtime_sim = _runtime_simulation_flag(rs)
+                    if runtime_sim is not None:
+                        return runtime_sim
                     if bot in mode_cache:
                         return bool(mode_cache[bot])
                     return bool(self.config.get(bot, {}).get("SIMULATION", True))
@@ -3182,14 +3222,12 @@ class ObsidianApp(ctk.CTk):
             run_id = str(getattr(self.bots[bot], "run_id", "") or "")
             if run_id and str(rs.get("run_id") or "") != run_id:
                 return None
-            try:
-                age = time.monotonic() - float(rs.get("monotonic_ts") or 0.0)
-            except (TypeError, ValueError):
+            age = _runtime_monotonic_age(rs)
+            if age is None:
                 return None
             if age < -5.0 or age > 45.0:
                 return None
-            if "simulation" in rs:
-                return bool(rs.get("simulation"))
+            return _runtime_simulation_flag(rs)
         except Exception:
             return None
         return None
@@ -3202,10 +3240,7 @@ class ObsidianApp(ctk.CTk):
             rs = read_runtime_status(BOT_META[bot]["log_dir"])
             if not _runtime_status_is_fresh(rs):
                 return None
-            try:
-                pid = int(rs.get("pid") or 0)
-            except (TypeError, ValueError):
-                pid = 0
+            pid = positive_int_or_zero(rs.get("pid"))
             from core.process_identity import pid_matches_bot
             if not pid_matches_bot(pid, bot):
                 return None
@@ -3248,8 +3283,8 @@ class ObsidianApp(ctk.CTk):
             if self.bots[bot].is_running():
                 continue
             external_rs = self._external_runtime_status(bot)
-            if external_rs is not None and "simulation" in external_rs:
-                external_sim = bool(external_rs.get("simulation"))
+            external_sim = _runtime_simulation_flag(external_rs)
+            if external_sim is not None:
                 if bool(self.config.get(bot, {}).get("SIMULATION", True)) != external_sim:
                     self.config.setdefault(bot, {})["SIMULATION"] = external_sim
                     self._apply_sim_badge(bot, external_sim)
@@ -3330,18 +3365,17 @@ class ObsidianApp(ctk.CTk):
                     rs = read_runtime_status(BOT_META[bot]["log_dir"])
                     run_id = str(getattr(self.bots[bot], "run_id", "") or "")
                     if str(rs.get("run_id") or "") == run_id:
-                        try:
-                            stale_age = time.monotonic() - float(
-                                rs.get("monotonic_ts") or 0.0)
-                        except (TypeError, ValueError):
-                            stale_age = 0.0
+                        stale_age = _runtime_monotonic_age(rs)
                         status_label = str(rs.get("status") or "starting").title()
                         build = str(rs.get("build_id") or "")
                         if build and build != "unknown":
                             status_label += f" - {build[:8]}"
-                        if "simulation" in rs and -5.0 <= stale_age <= 45.0:
-                            _is_sim = bool(rs.get("simulation"))
-                        if stale_age > 45.0:
+                        runtime_sim = _runtime_simulation_flag(rs)
+                        if (runtime_sim is not None
+                                and stale_age is not None
+                                and -5.0 <= stale_age <= 45.0):
+                            _is_sim = runtime_sim
+                        if stale_age is not None and stale_age > 45.0:
                             status_label = f"Stale {int(stale_age)}s"
                     else:
                         status_label = "Starting"
@@ -3369,8 +3403,9 @@ class ObsidianApp(ctk.CTk):
                                            border_color=COLORS["danger"])
             elif external_running:
                 try:
-                    if "simulation" in external_rs:
-                        _is_sim = bool(external_rs.get("simulation"))
+                    external_sim = _runtime_simulation_flag(external_rs)
+                    if external_sim is not None:
+                        _is_sim = external_sim
                     status_label = str(external_rs.get("status") or "running").title()
                     build = str(external_rs.get("build_id") or "")
                     if build and build != "unknown":
@@ -3464,13 +3499,14 @@ class ObsidianApp(ctk.CTk):
                 color = COLORS["success"] if stats["pnl"] > 0 else COLORS["danger"] if stats["pnl"] < 0 else COLORS["text_dim"]
                 card["pnl_lbl"].configure(text_color=color)
                 card["total_var"].set(str(stats["total"]))
-                today_pnl = float(stats.get("today_pnl", 0.0) or 0.0)
+                today_pnl = _ui_finite_float(stats.get("today_pnl"))
                 card["today_var"].set(f"{today_pnl:+.2f}")
                 if stats["total"] > 0:
                     card["wr_var"].set(f"{stats['wr']:.0f}%")
                 else:
                     card["wr_var"].set("")
-                card["open_var"].set(str(cache.get("open", {}).get(bot, 0)))
+                card["open_var"].set(str(_ui_nonnegative_int(
+                    cache.get("open", {}).get(bot))))
 
             #  Sparkline (PnL-Trend) aktualisieren 
             try:
@@ -3521,8 +3557,8 @@ class ObsidianApp(ctk.CTk):
                 pass
 
             # Unrealized PnL  live aus DataPoller-Cache
-            unr_val = cache.get("unrealized", {}).get(bot, 0.0)
-            open_count = cache.get("open", {}).get(bot, 0)
+            unr_val = _ui_finite_float(cache.get("unrealized", {}).get(bot))
+            open_count = _ui_nonnegative_int(cache.get("open", {}).get(bot))
             if open_count == 0:
                 card["unr_var"].set("")
                 card["unr_lbl"].configure(text_color=COLORS["text_muted"])
@@ -3675,7 +3711,8 @@ class ObsidianApp(ctk.CTk):
                 self.sb_balance_sim.set("DB ERR")
             else:
                 all_stats = cache.get("stats", {})
-                raw_pnl   = sum(s["pnl"] for b, s in all_stats.items()
+                raw_pnl   = sum(_ui_finite_float(s.get("pnl"))
+                                for b, s in all_stats.items()
                                 if _cache_sim(b))
                 vc_value  = 1000.0 + raw_pnl - self._vc_offset
                 self.sb_balance_sim.set(f"{vc_value:.2f} USDT")
@@ -3691,11 +3728,12 @@ class ObsidianApp(ctk.CTk):
             s for b, s in all_stats.items()
             if _cache_sim(b) != money_scope_live
         ]
-        total       = sum(float(s.get("pnl", 0.0) or 0.0) for s in scoped_stats)
-        total_today = sum(float(s.get("today_pnl", 0.0) or 0.0) for s in scoped_stats)
-        total_count = sum(int(s.get("total", 0) or 0) for s in scoped_stats)
+        total       = sum(_ui_finite_float(s.get("pnl")) for s in scoped_stats)
+        total_today = sum(_ui_finite_float(s.get("today_pnl")) for s in scoped_stats)
+        total_count = sum(_ui_nonnegative_int(s.get("total")) for s in scoped_stats)
         total_wins  = sum(
-            (float(s.get("wr", 0.0) or 0.0) / 100.0 * int(s.get("total", 0) or 0))
+            (_ui_finite_float(s.get("wr")) / 100.0
+             * _ui_nonnegative_int(s.get("total")))
             for s in scoped_stats
         )
         avg_wr      = (total_wins / total_count * 100) if total_count > 0 else 0
@@ -3734,13 +3772,13 @@ class ObsidianApp(ctk.CTk):
         unr_cache = cache.get("unrealized", {})
         open_cache = cache.get("open", {})
         total_open = sum(
-            int(open_cache.get(b, 0) or 0)
+            _ui_nonnegative_int(open_cache.get(b))
             for b in BOT_ORDER
             if _cache_sim(b) != money_scope_live
         )
         if total_open > 0:
             total_unr = sum(
-                float(unr_cache.get(b, 0.0) or 0.0)
+                _ui_finite_float(unr_cache.get(b))
                 for b in BOT_ORDER
                 if _cache_sim(b) != money_scope_live
             )
@@ -3760,7 +3798,7 @@ class ObsidianApp(ctk.CTk):
                 (self.sb_spot_pos,    "SPOT",    COLORS["balanced"]),
                 (self.sb_cross_pos,   "CROSS",   COLORS["cross"]),
                 (self.sb_futrend_pos, "FUTREND", COLORS["futrend"])):
-            _n = open_cache.get(_key, 0)
+            _n = _ui_nonnegative_int(open_cache.get(_key))
             _pos_var.set("--" if metrics_error else str(_n))
             try:
                 _pos_var._lbl.configure(
@@ -3768,7 +3806,7 @@ class ObsidianApp(ctk.CTk):
                     else _hl if _n > 0 else COLORS["text"])
             except Exception:
                 pass
-        fut_open = open_cache.get("FUTURES", 0)
+        fut_open = _ui_nonnegative_int(open_cache.get("FUTURES"))
         self.sb_fut_pos.set("--" if metrics_error else str(fut_open))
         if metrics_error:
             self.sb_fut_pos._lbl.configure(text_color=COLORS["warning"])
@@ -3779,8 +3817,8 @@ class ObsidianApp(ctk.CTk):
 
         for _bot, _count in (
                 ("FUTURES", fut_open),
-                ("CROSS", open_cache.get("CROSS", 0)),
-                ("FUTREND", open_cache.get("FUTREND", 0))):
+                ("CROSS", _ui_nonnegative_int(open_cache.get("CROSS"))),
+                ("FUTREND", _ui_nonnegative_int(open_cache.get("FUTREND")))):
             _btn = self.emergency_btns.get(_bot)
             if _btn is None:
                 continue

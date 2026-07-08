@@ -829,9 +829,13 @@ def _markets_precision_step(ex, symbol: str) -> Optional[Decimal]:
         if not isinstance(mkt, dict):
             return None
         prec = (mkt.get("precision") or {}).get("amount")
+        if isinstance(prec, bool):
+            return None
         if prec is None:
             # Try limits.amount.min as a step proxy
             mn = ((mkt.get("limits") or {}).get("amount") or {}).get("min")
+            if isinstance(mn, bool):
+                return None
             if mn is None:
                 return None
             try:
@@ -875,6 +879,8 @@ def _market_amount_min(ex, symbol: str) -> Optional[Decimal]:
         if not isinstance(mkt, dict):
             return None
         mn = ((mkt.get("limits") or {}).get("amount") or {}).get("min")
+        if isinstance(mn, bool):
+            return None
         if mn is None:
             return None
         out = Decimal(str(mn))
@@ -898,6 +904,9 @@ def safe_amount_to_precision(ex, symbol: str, amount: float) -> float:
 
     NEVER returns the unmodified raw float.
     """
+    if isinstance(amount, bool):
+        return 0.0
+
     try:
         min_amt = _market_amount_min(ex, symbol)
         amt_dec = Decimal(str(amount))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,18 +13,25 @@ FUTURES_STATE_STALE_SEC = 30 * 60
 SPOT_STATE_STALE_SEC = 30 * 60
 
 
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
 def spot_unrealized_pnl(entry_price: Any, current_price: Any, amount: Any) -> float:
     """Remaining spot-position MTM in USDT.
 
     Use the remaining base amount, not original invested notional. This keeps
     launcher and dashboard aligned after base-fees, partial sells, or dust.
     """
-    try:
-        entry = float(entry_price or 0.0)
-        current = float(current_price or 0.0)
-        qty = float(amount or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+    entry = _finite_float(entry_price)
+    current = _finite_float(current_price)
+    qty = _finite_float(amount)
     if entry <= 0.0 or current <= 0.0 or qty <= 0.0:
         return 0.0
     return qty * (current - entry)
@@ -36,14 +44,14 @@ def futures_unrealized_from_row(row: Any) -> tuple[float, float]:
     except AttributeError:
         return 0.0, 0.0
     try:
-        stored_pnl = float(get("unrealized_pnl", 0.0) or 0.0)
-        stored_pct = float(get("unrealized_pct", 0.0) or 0.0)
+        stored_pnl = _finite_float(get("unrealized_pnl", 0.0))
+        stored_pct = _finite_float(get("unrealized_pct", 0.0))
         if stored_pnl != 0.0 and stored_pct != 0.0:
             return stored_pnl, stored_pct
-        entry = float(get("entry_price", 0.0) or 0.0)
-        current = float(get("current_price", 0.0) or 0.0)
-        margin = float(get("margin_usdt", 0.0) or 0.0)
-        leverage = float(get("leverage", 1.0) or 1.0)
+        entry = _finite_float(get("entry_price", 0.0))
+        current = _finite_float(get("current_price", 0.0))
+        margin = _finite_float(get("margin_usdt", 0.0))
+        leverage = _finite_float(get("leverage", 1.0), 1.0)
         side = str(get("position_type", "") or "").upper()
         if entry <= 0.0 or current <= 0.0 or margin <= 0.0:
             return stored_pnl, stored_pct

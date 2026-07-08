@@ -20,6 +20,7 @@ import threading
 from launcher.config.settings import (
     BOT_META,
     audit_event,
+    effective_default_config,
     load_config,
     save_config_merge,
 )
@@ -30,6 +31,7 @@ from launcher.core.positions import (
     get_open_spot_positions,
     mode_switch_blockers,
 )
+from launcher.core.runtime_status_values import positive_int_or_zero
 from launcher.state.poller import _runtime_or_config_sim
 from launcher.ui.logging_panel import log_to_card
 from core.pre_start_check import (
@@ -143,7 +145,7 @@ def _wait_for_bot_ready(name: str, bot, timeout_sec: float = 15.0) -> tuple[bool
         threads = last.get("threads") if isinstance(last.get("threads"), dict) else {}
         if (last.get("status") == "ready"
                 and str(last.get("run_id") or "") == str(run_id)
-                and int(last.get("pid") or 0) > 0
+                and positive_int_or_zero(last.get("pid")) > 0
                 and all(bool(threads.get(k))
                         for k in ("monitor", "scan", "reconcile"))):
             return True, str(last.get("build_id") or "unknown")
@@ -167,7 +169,15 @@ def _save_current_config(app, name: str) -> None:
         # Persist missing DEFAULT_CONFIG keys before starting. load_config()
         # fills them only in memory; without a write, a bot with older own
         # hardcoded defaults can still start with stale values.
-        app.config = save_config_merge({name: {}})
+        defaults = effective_default_config().get(name, {})
+        section = app.config.get(name) if isinstance(app.config, dict) else {}
+        section = section if isinstance(section, dict) else {}
+        missing = [
+            key for key in defaults
+            if key not in section
+        ] if isinstance(defaults, dict) else []
+        if missing:
+            app.config = save_config_merge({name: {}})
         return
     dirty = getattr(app, "_dirty_param_keys", {}).get(name) or set()
     if dirty:

@@ -39,6 +39,16 @@ class ScanMixin:
             return value
         return str(value).strip().lower() in ("1", "true", "yes", "on")
 
+    @staticmethod
+    def _positive_float(value, default: float = 0.0) -> float:
+        if isinstance(value, bool):
+            return float(default)
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return float(default)
+        return parsed if math.isfinite(parsed) and parsed > 0 else float(default)
+
     def _release_entry_claim_if_untracked(self, sym: str) -> bool:
         try:
             if self.state.has(sym):
@@ -306,7 +316,7 @@ class ScanMixin:
                     self.ex, bot_name=self.BOT_NAME,
                     open_symbols=self.state.keys(),
                     candidate_symbol=f"{sym}/USDT",
-                    known_price=float(r.get("price") or 0) or None,  # skip refetch
+                    known_price=self._positive_float(r.get("price")) or None,
                 )
                 if not ok:
                     log_event(f"{sym} skipped  {reason}", "WAIT")
@@ -360,6 +370,14 @@ class ScanMixin:
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
         sym = r["symbol"].split("/")[0]
+        signal_price = self._positive_float(r.get("price"))
+        if signal_price <= 0:
+            log_event(
+                f"{sym}: spot entry skipped  invalid screener price "
+                f"{r.get('price')!r}",
+                "WARN",
+            )
+            return None
 
         use_llm = self._bool_cfg_value(self.C("USE_LLM", False), False)
         news = ""
@@ -409,6 +427,17 @@ class ScanMixin:
         # Position sizing
         from trading.risk_manager import get_position_size
         trade_usdt = get_position_size(self.BOT_NAME) * size_mult
+        try:
+            trade_usdt = float(trade_usdt)
+        except (TypeError, ValueError, OverflowError):
+            trade_usdt = 0.0
+        if not math.isfinite(trade_usdt) or trade_usdt <= 0:
+            log_event(
+                f"{sym}: spot entry skipped  invalid trade size "
+                f"{trade_usdt!r}",
+                "WARN",
+            )
+            return None
         if regime["regime"] == "BEAR":
             trade_usdt = max(5.0, trade_usdt * 0.5)
             log_event(f"BEAR phase: position halved to {trade_usdt} USDT", "INFO")
@@ -429,7 +458,7 @@ class ScanMixin:
                 return None
 
         log_buy(
-            self.BOT_NAME, sym, r["price"], trade_usdt,
+            self.BOT_NAME, sym, signal_price, trade_usdt,
             (r["rsi_15m"], r["rsi_1h"], r["rsi_4h"]),
             news, "" if analysis_is_keyword else ans
         )
@@ -530,7 +559,7 @@ class ScanMixin:
                         else ("llm" if use_llm else "signal")),
                 fallback=bool(analysis_is_keyword),
                 rationale=parse_rationale(ans) if ans is not None else "",
-                price=float(r["price"]), size_usdt=float(trade_usdt),
+                price=signal_price, size_usdt=float(trade_usdt),
                 sim=bool(self.simulation),
             )
         except Exception:
@@ -540,7 +569,7 @@ class ScanMixin:
             if not self.simulation:
                 send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
                     f" [{self.BOT_NAME}] KAUF {sym}\n"
-                    f"Preis: {r['price']:.6f} USDT\n"
+                    f"Preis: {signal_price:.6f} USDT\n"
                     f"Einsatz: {trade_usdt:.2f} USDT (Kelly)\n"
                     f"RSI: 15m {r['rsi_15m']:.1f}|1h {r['rsi_1h']:.1f}|4h {r['rsi_4h']:.1f}\n"
                     f"Pump: {r['change_percent']:.1f}% | Phase: {regime['regime']}"
@@ -792,12 +821,19 @@ class ScanMixin:
         from core.logger import log_event
 
         # defensive price validation
-        try:
-            price = float(r.get("price") or 0)
-        except (TypeError, ValueError):
-            price = 0
+        price = ScanMixin._positive_float(r.get("price"))
         if price <= 0:
             log_event(f"Buy {sym}: invalid screener price {r.get('price')!r}  skip", "WARN")
+            return None
+        try:
+            trade_usdt = float(trade_usdt)
+        except (TypeError, ValueError, OverflowError):
+            trade_usdt = 0.0
+        if not math.isfinite(trade_usdt) or trade_usdt <= 0:
+            log_event(
+                f"Buy {sym}: invalid trade size {trade_usdt!r}  skip",
+                "WARN",
+            )
             return None
 
         if self.simulation:
@@ -857,9 +893,34 @@ class ScanMixin:
         try:
             # CRITICAL: CCXT amount is BASE currency, NOT quote.
             amount_coins = trade_usdt / price
+            raw_amount_coins = amount_coins
             try:
-                amount_coins = float(self.ex.amount_to_precision(
-                    f"{sym}/USDT", amount_coins))
+                raw_precision_amount = self.ex.amount_to_precision(
+                    f"{sym}/USDT", amount_coins)
+                amount_coins = (
+                    0.0 if isinstance(raw_precision_amount, bool)
+                    else float(raw_precision_amount)
+                )
+            except Exception:
+                amount_coins = raw_amount_coins
+            if not math.isfinite(amount_coins) or amount_coins <= 0:
+                log_event(
+                    f"Buy {sym}: invalid amount after precision  skip",
+                    "WARN")
+                return None
+            try:
+                _mkt = (getattr(self.ex, "markets", {}) or {}).get(f"{sym}/USDT", {})
+                _min_amount = ((_mkt.get("limits") or {}).get("amount") or {}).get("min")
+                if isinstance(_min_amount, bool):
+                    _min_amount = 0.0
+                else:
+                    _min_amount = float(_min_amount or 0.0)
+                if (math.isfinite(_min_amount) and _min_amount > 0.0
+                        and amount_coins < _min_amount):
+                    log_event(
+                        f"Buy {sym}: precision amount {amount_coins:g} < "
+                        f"exchange min {_min_amount:g}  skip", "INFO")
+                    return None
             except Exception:
                 pass
             if amount_coins <= 0:
@@ -965,6 +1026,9 @@ class ScanMixin:
 
             provisional_written = False
             provisional_fill_price = extract_fill_price(order, price)
+            if (not math.isfinite(provisional_fill_price)
+                    or provisional_fill_price <= 0):
+                provisional_fill_price = price
             try:
                 provisional_amount = float(order.get("filled") or amount_coins)
                 if not math.isfinite(provisional_amount) or provisional_amount <= 0:
@@ -1026,7 +1090,7 @@ class ScanMixin:
                                         fill_price=fill_price)
 
             # fill_price validation
-            if fill_price <= 0:
+            if not math.isfinite(fill_price) or fill_price <= 0:
                 # Rather than leave an orphan on the exchange, persist a
                 # provisional state with the screener price as the entry
                 # estimate so the monitor tracks the position from the next
@@ -1131,6 +1195,30 @@ class ScanMixin:
                     f"Buy {sym}: base-fee lookup failed "
                     f"({type(base_fee_exc).__name__}); using fallback "
                     f"{base_fee:.8f} {sym} so the entry is still tracked",
+                    "WARN",
+                )
+            try:
+                raw_base_fee = base_fee
+                if isinstance(raw_base_fee, bool):
+                    raise ValueError("boolean base fee")
+                base_fee = float(raw_base_fee)
+                max_plausible_base_fee = gross_amount * 0.05
+                if (not math.isfinite(base_fee)
+                        or base_fee < 0.0
+                        or base_fee > max_plausible_base_fee):
+                    raise ValueError("invalid base fee")
+            except (TypeError, ValueError, OverflowError):
+                try:
+                    from bot_utils.spot_fee_settle import SPOT_DEFAULT_TAKER_FEE
+                    fee_rate = float(SPOT_DEFAULT_TAKER_FEE)
+                except Exception:
+                    fee_rate = 0.001
+                if not math.isfinite(fee_rate) or fee_rate < 0.0 or fee_rate >= 1.0:
+                    fee_rate = 0.001
+                base_fee = max(0.0, gross_amount * fee_rate)
+                log_event(
+                    f"Buy {sym}: base-fee lookup returned invalid "
+                    f"{raw_base_fee!r}; using fallback {base_fee:.8f} {sym}",
                     "WARN",
                 )
             if base_fee > 0:

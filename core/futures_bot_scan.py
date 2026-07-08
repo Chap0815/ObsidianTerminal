@@ -329,6 +329,15 @@ class FuturesScanMixin:
                           "WAIT")
                 return
 
+        entry_price = self._positive_float(r.get("price"))
+        if entry_price <= 0:
+            log_event(
+                f"{sym}: skipped  invalid screener price "
+                f"{r.get('price')!r}",
+                "WARN"
+            )
+            return
+
         # LLM budget only applies when the strategy is explicitly configured to
         # use LLM analysis. With USE_LLM=false: no news, no model call, no veto.
         use_llm = self._bool_cfg_value(self.C("USE_LLM", False), False)
@@ -382,7 +391,7 @@ class FuturesScanMixin:
                     ans = self._news.analyze_sentiment(
                         sym, r["change_percent"],
                         r["rsi_15m"], r["rsi_1h"], r["rsi_4h"], news,
-                        market_regime=regime, price=r["price"],
+                        market_regime=regime, price=entry_price,
                         leverage=int(self.C("LEVERAGE")),
                         funding_rate=funding_rate,
                         open_interest_usdt=oi_usdt, oi_change=oi_change,
@@ -393,7 +402,7 @@ class FuturesScanMixin:
                     ans = self._news.analyze_sentiment(
                         sym, r["change_percent"],
                         r["rsi_15m"], r["rsi_1h"], r["rsi_4h"], news,
-                        market_regime=regime, price=r["price"],
+                        market_regime=regime, price=entry_price,
                         leverage=int(self.C("LEVERAGE")),
                         funding_rate=funding_rate,
                         open_interest_usdt=oi_usdt, oi_change=oi_change,
@@ -563,6 +572,17 @@ class FuturesScanMixin:
 
         # Position sizing
         margin_usdt = get_position_size(self.BOT_NAME)
+        try:
+            margin_usdt = float(margin_usdt)
+        except (TypeError, ValueError, OverflowError):
+            margin_usdt = 0.0
+        if not math.isfinite(margin_usdt) or margin_usdt <= 0:
+            log_event(
+                f"{sym}: {direction} skipped  invalid margin "
+                f"{margin_usdt!r}",
+                "WARN",
+            )
+            return
         if regime["regime"] == "BEAR" and direction == "LONG":
             margin_usdt = max(5.0, margin_usdt * 0.5)
             log_event(f"BEAR phase + LONG: margin halved to {margin_usdt} USDT", "INFO")
@@ -622,19 +642,6 @@ class FuturesScanMixin:
 
         #  Order placement 
         leverage = int(self.C("LEVERAGE"))
-        # Validate price BEFORE order  illiquid coins / cache misses sometimes
-        # return price=0, which would otherwise create an orphan position.
-        try:
-            entry_price = float(r.get("price") or 0)
-        except (TypeError, ValueError):
-            entry_price = 0
-        if entry_price <= 0:
-            log_event(
-                f"{sym}: {direction} skipped  invalid screener price "
-                f"{r.get('price')!r}",
-                "WARN"
-            )
-            return
         # Real maintenance-margin TIER (not the flat 0.01 default) for BOTH SIM
         # and LIVE (M-1) so the liq price isn't optimistic on high-MM small-caps.
         # The tier is market metadata  available without a live position  so
@@ -667,29 +674,20 @@ class FuturesScanMixin:
         else:
             # mm_rate + liq_price already computed above with the real tier.
             margin_mode = str(self.C("MARGIN_MODE", "isolated") or "isolated").lower()
-            # must_set_leverage raises on failure  ABORT trade
-            try:
-                must_set_leverage(self.ex, leverage, symbol_full,
-                                  direction=direction, margin_mode=margin_mode)
-            except LeverageNotSetError as lev_e:
-                log_event(
-                    f"set_leverage failed for {sym} at {leverage}x  "
-                    f"ABORTING trade ({lev_e})", "WARN"
-                )
-                log_struct("futures_open_aborted",
-                            symbol=sym, leverage=leverage,
-                            reason="set_leverage_failed")
-                return
-            safe_set_margin_mode(self.ex, margin_mode, symbol_full,
-                                 leverage=leverage, direction=direction)
-
             try:
                 notional = margin_usdt * leverage
                 amount_coins = notional / entry_price
                 # MEXC swap contracts have a contractSize (e.g. MEME=100). The
                 # order `amount` must be in CONTRACTS, not raw coins:
                 #   contracts = coins / contractSize
-                contract_size = self._get_contract_size(symbol_full)
+                raw_contract_size = self._get_contract_size(symbol_full)
+                if isinstance(raw_contract_size, bool):
+                    contract_size = 0.0
+                else:
+                    contract_size = self._positive_float(raw_contract_size)
+                if contract_size <= 0.0:
+                    log_event(f"{sym}: invalid contract size - skipping", "WARN")
+                    return
                 amount_contracts = amount_coins / contract_size
 
                 # MIN-AMOUNT GATE: some markets (e.g. KAS) require a minimum
@@ -697,13 +695,15 @@ class FuturesScanMixin:
                 # computed contracts can fall below that floor; the exchange
                 # rejects with "must be greater than minimum amount precision".
                 # Skip cleanly instead of failing the order 3x in a row.
+                min_contracts = 0.0
                 try:
                     _mkt = (getattr(self.ex, "markets", {}) or {}).get(symbol_full, {})
                     _min_amt = (((_mkt.get("limits") or {}).get("amount") or {}).get("min"))
-                    if _min_amt and amount_contracts < float(_min_amt):
+                    min_contracts = self._positive_float(_min_amt)
+                    if min_contracts > 0.0 and amount_contracts < min_contracts:
                         log_event(
                             f"{sym}: order amount {amount_contracts:g} < exchange "
-                            f"min {_min_amt:g} (margin too small for this "
+                            f"min {min_contracts:g} (margin too small for this "
                             f"contract) - skipping", "INFO")
                         return
                 except Exception:
@@ -711,12 +711,25 @@ class FuturesScanMixin:
 
                 try:
                     from config.exchange_config import safe_amount_to_precision
-                    amount_contracts = float(safe_amount_to_precision(
-                        self.ex, symbol_full, amount_contracts))
+                    raw_contracts = safe_amount_to_precision(
+                        self.ex, symbol_full, amount_contracts)
+                    amount_contracts = (
+                        0.0 if isinstance(raw_contracts, bool)
+                        else float(raw_contracts)
+                    )
                 except Exception:
-                    pass
-                if amount_contracts <= 0:
-                    log_event(f"Order {sym}: amount = 0 - skip", "WARN")
+                    raw_contracts = amount_contracts
+                    amount_contracts = 0.0
+                if (not math.isfinite(amount_contracts)
+                        or amount_contracts <= 0):
+                    log_event(
+                        f"Order {sym}: invalid amount {raw_contracts!r} "
+                        f"after precision - skip", "WARN")
+                    return
+                if min_contracts > 0.0 and amount_contracts < min_contracts:
+                    log_event(
+                        f"{sym}: precision amount {amount_contracts:g} < "
+                        f"exchange min {min_contracts:g} - skipping", "INFO")
                     return
 
                 # SAFETY GATE: never let the real cost exceed the intended
@@ -733,6 +746,24 @@ class FuturesScanMixin:
                                reason="sizing_safety_gate",
                                est_cost=est_cost, notional=notional)
                     return
+
+                # must_set_leverage raises on failure  ABORT trade. Do this
+                # only after all local sizing/precision gates passed, so a
+                # malformed amount cannot create exchange-side config changes.
+                try:
+                    must_set_leverage(self.ex, leverage, symbol_full,
+                                      direction=direction, margin_mode=margin_mode)
+                except LeverageNotSetError as lev_e:
+                    log_event(
+                        f"set_leverage failed for {sym} at {leverage}x  "
+                        f"ABORTING trade ({lev_e})", "WARN"
+                    )
+                    log_struct("futures_open_aborted",
+                                symbol=sym, leverage=leverage,
+                                reason="set_leverage_failed")
+                    return
+                safe_set_margin_mode(self.ex, margin_mode, symbol_full,
+                                     leverage=leverage, direction=direction)
 
                 side = "buy" if direction == "LONG" else "sell"
                 # MEXC requires `leverage` in params for isolated-margin swap
@@ -798,10 +829,10 @@ class FuturesScanMixin:
                                         if _v:
                                             try:
                                                 _fv = float(_v)
-                                                if _fv > 0:
+                                                if math.isfinite(_fv) and _fv > 0:
                                                     fill_price = _fv
                                                     break
-                                            except (ValueError, TypeError):
+                                            except (ValueError, TypeError, OverflowError):
                                                 pass
                                     break
                             except Exception:
@@ -824,10 +855,10 @@ class FuturesScanMixin:
                                     if _v:
                                         try:
                                             _fv = float(_v)
-                                            if _fv > 0:
+                                            if math.isfinite(_fv) and _fv > 0:
                                                 fill_price = _fv
                                                 break
-                                        except (ValueError, TypeError):
+                                        except (ValueError, TypeError, OverflowError):
                                             pass
                     except Exception:
                         positions_unavailable = True
@@ -1050,10 +1081,10 @@ class FuturesScanMixin:
                     if v:
                         try:
                             fv = float(v)
-                            if fv > 0:
+                            if math.isfinite(fv) and fv > 0:
                                 fill_price = fv
                                 break
-                        except (ValueError, TypeError):
+                        except (ValueError, TypeError, OverflowError):
                             continue
 
                 try:

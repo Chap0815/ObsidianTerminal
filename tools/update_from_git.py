@@ -857,11 +857,17 @@ def _restore_user_files(backup: Path) -> None:
             _copy_file(src, ROOT / rel)
 
 
+def _managed_runtime_candidates() -> list[tuple[Path, Path]]:
+    return [
+        (ROOT / ".venv", ROOT / ".venv" / "Scripts" / "python.exe"),
+        (ROOT / "python", ROOT / "python" / "python.exe"),
+    ]
+
+
 def _dependency_python() -> Path:
-    for rel in ((".venv", "Scripts", "python.exe"), ("python", "python.exe")):
-        candidate = ROOT.joinpath(*rel)
-        if candidate.exists():
-            return candidate
+    for _env_dir, python_exe in _managed_runtime_candidates():
+        if python_exe.exists():
+            return python_exe
     return Path(sys.executable)
 
 
@@ -872,13 +878,13 @@ def _install_dependencies_if_present(*, force_active_runtime: bool = False) -> N
             "requirements.lock.txt fehlt nach Update; "
             "Dependency-Update aus Sicherheitsgruenden abgebrochen."
         )
+    if not force_active_runtime:
+        _print(
+            "Python-Abhaengigkeiten unveraendert; Installation wird "
+            "uebersprungen."
+        )
+        return
     if _active_runtime_env_dir() is not None:
-        if not force_active_runtime:
-            _print(
-                "Python-Abhaengigkeiten unveraendert; Installation in der "
-                "aktiven Runtime wird uebersprungen."
-            )
-            return
         raise RuntimeError(
             "Dependency-Update benoetigt einen externen Update-Python. "
             "Starte das Update ueber den Launcher, nicht direkt aus der "
@@ -907,25 +913,22 @@ def _install_dependencies_if_present(*, force_active_runtime: bool = False) -> N
 def _runtime_env_dir() -> Path | None:
     """Return the mutable runtime environment managed by the installer."""
     exe = Path(sys.executable).resolve()
-    for name in ("python", ".venv"):
-        path = ROOT / name
+    for path, _python_exe in _managed_runtime_candidates():
         if path.exists() and path.is_dir():
             try:
                 exe.relative_to(path.resolve())
                 return path
             except ValueError:
                 continue
-    for name in ("python", ".venv"):
-        path = ROOT / name
-        if path.exists() and path.is_dir():
+    for path, python_exe in _managed_runtime_candidates():
+        if path.exists() and path.is_dir() and python_exe.exists():
             return path
     return None
 
 
 def _active_runtime_env_dir() -> Path | None:
     exe = Path(sys.executable).resolve()
-    for name in ("python", ".venv"):
-        path = ROOT / name
+    for path, _python_exe in _managed_runtime_candidates():
         if not path.exists() or not path.is_dir():
             continue
         try:
@@ -934,6 +937,55 @@ def _active_runtime_env_dir() -> Path | None:
         except ValueError:
             continue
     return None
+
+
+def _path_is_within(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _process_refs_path(value: Any, target: Path) -> bool:
+    if not value:
+        return False
+    try:
+        if _path_is_within(Path(str(value)), target):
+            return True
+    except Exception:
+        pass
+    target_text = target.resolve().as_posix().lower()
+    text = str(value).strip().strip('"').replace("\\", "/").lower()
+    return (
+        text == target_text
+        or text.startswith(target_text + "/")
+        or (target_text + "/") in text
+    )
+
+
+def _runtime_env_in_use(path: Path) -> bool:
+    """Best-effort check for another process using the bundled runtime."""
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return False
+    current = os.getpid()
+    for proc in psutil.process_iter(["pid", "exe", "cmdline", "cwd"]):
+        try:
+            pid = int(proc.info.get("pid") or 0)
+            if pid == current:
+                continue
+            exe = proc.info.get("exe")
+            cwd = proc.info.get("cwd")
+            cmdline = proc.info.get("cmdline") or []
+        except Exception:
+            continue
+        if _process_refs_path(exe, path) or _process_refs_path(cwd, path):
+            return True
+        if any(_process_refs_path(part, path) for part in cmdline):
+            return True
+    return False
 
 
 def _requirements_hash(path: Path) -> str:
@@ -994,6 +1046,14 @@ def _restore_runtime_env(snapshot: Path | None) -> None:
         return
     except ValueError:
         pass
+    if target.exists() and _runtime_env_in_use(target):
+        _print(
+            "Runtime rollback skipped: bundled Python runtime is still in "
+            "use by another process. Code/user rollback continues; close all "
+            "Obsidian processes and rerun the updater if dependencies need "
+            "repair."
+        )
+        return
     if target.exists():
         _rmtree(target)
     shutil.copytree(snapshot, target)
