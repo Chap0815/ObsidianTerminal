@@ -1317,7 +1317,6 @@ def direct_close_remaining_spot(
     except Exception as e:
         log("error", str(e))
         return {"closed": 0, "failed": ["state_path"], "total_pnl": 0.0}
-    state_bot_name = f"{bot_name} (SIM)" if sim_only else bot_name
     try:
         from core.database import save_trade_db, remove_open_position  # type: ignore
     except Exception as e:

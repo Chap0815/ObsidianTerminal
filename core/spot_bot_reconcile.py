@@ -83,7 +83,7 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
     Returns True only after DB accounting succeeded or was already present.
     Reconcile must keep state on False so the next cycle can retry.
     """
-    from core.logger import log_event, save_trade, send_telegram
+    from core.logger import log_event, send_telegram
     from core.database import save_trade_db
     from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
@@ -816,7 +816,6 @@ def startup_reconciliation(bot) -> None:
     #  Reverse ghost detection (SQLite has it, JSON doesn't) 
     try:
         from core.database import get_open_positions_db
-        import json as _json
         db_positions = get_open_positions_db(bot.BOT_NAME)
         rehydrated = []
         current_syms = set(bot.state.keys())

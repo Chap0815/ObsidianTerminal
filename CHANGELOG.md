@@ -22,3 +22,6 @@
   update status as current instead of surfacing a stale failed update attempt.
 - Added regression coverage for stale failed update status handling while
   preserving failed-status visibility for a still-pending remote update.
+- Cleaned dead imports and an unused launcher state variable from the
+  reconcile/accounting paths so the money-state files pass the local `ruff`
+  gate without changing runtime behavior.

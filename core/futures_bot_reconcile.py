@@ -759,7 +759,7 @@ class FuturesReconcileMixin:
           A Telegram heads-up is sent so the user notices the close
             (especially important for liquidations during long downtime).
         """
-        from core.logger import log_event, save_trade, send_telegram
+        from core.logger import log_event, send_telegram
         from core.database import save_trade_db
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
         from bot_utils import safe_proportional_fee, safe_remaining_funding
