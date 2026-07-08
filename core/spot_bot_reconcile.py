@@ -92,6 +92,22 @@ def _trade_price(t: dict) -> float:
     return price if math.isfinite(price) and price > 0 else 0.0
 
 
+def _spot_ticker_price(ticker: dict | None) -> float:
+    if not isinstance(ticker, dict):
+        return 0.0
+    for key in ("last", "close"):
+        raw = ticker.get(key)
+        if isinstance(raw, bool):
+            continue
+        try:
+            price = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(price) and price > 0:
+            return price
+    return 0.0
+
+
 def _estimate_spot_close_fee_usdt(amount: float, close_price: float,
                                   fee_rate: float = 0.001) -> float:
     try:
@@ -223,8 +239,8 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
         if close_price <= 0:
             try:
                 ticker = bot.ex.fetch_ticker(pair)
-                close_price = float(ticker.get("last", 0) or 0)
-                if math.isfinite(close_price) and close_price > 0:
+                close_price = _spot_ticker_price(ticker)
+                if close_price > 0:
                     close_source = "current_ticker"
                 else:
                     close_price = 0.0
@@ -353,8 +369,8 @@ def _find_spot_external_close_price(bot, sym: str, amount: float = 0.0,
         return 0.0, 0.0, "unavailable"
     try:
         ticker = bot.ex.fetch_ticker(pair)
-        price = float(ticker.get("last", 0) or 0)
-        if math.isfinite(price) and price > 0:
+        price = _spot_ticker_price(ticker)
+        if price > 0:
             return price, 0.0, "current_ticker"
     except Exception:
         pass
@@ -617,7 +633,7 @@ def _still_held_on_spot_exchange(bot, sym: str, dust_usdt: float = 1.0) -> bool:
     if total <= 0:
         return False
     try:
-        px = float((bot.ex.fetch_ticker(f"{sym}/USDT") or {}).get("last") or 0)
+        px = _spot_ticker_price(bot.ex.fetch_ticker(f"{sym}/USDT"))
         if px > 0 and total * px < dust_usdt:
             return False
     except Exception:
@@ -812,7 +828,7 @@ def _adopt_spot_orphans(bot, bal_data: dict) -> None:
                 continue
             try:
                 ticker = bot.ex.fetch_ticker(f"{base}/USDT")
-                price = float(ticker.get("last", 0) or 0)
+                price = _spot_ticker_price(ticker)
             except Exception:
                 price = 0.0
             if not (math.isfinite(price) and price > 0):

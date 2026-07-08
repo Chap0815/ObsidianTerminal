@@ -167,7 +167,7 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
     dlg.grab_set()
     dlg.transient(app)
     force_dark_titlebar(dlg)
-    safe_geometry(dlg, 580, dlg_height, parent=app)
+    safe_geometry(dlg, 620, dlg_height, parent=app)
 
     ctk.CTkLabel(dlg, text=" Open Positions Detected",
                   font=ctk.CTkFont(FONT_BODY, 16, "bold"),
@@ -261,7 +261,7 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
     # The poller updates every 30s  these prices are never more than 30s old.
     price_note = ctk.CTkLabel(
         dlg,
-        text=" Prices from last poll  click  to refresh live",
+        text=" Prices from last poll  click Refresh to refresh live",
         font=ctk.CTkFont(FONT_BODY, 9),
         text_color=COLORS["text_subtle"],
     )
@@ -394,9 +394,9 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
         command=_stop_only,
     ).pack(side="right", padx=(0, 8))
 
-    ctk.CTkButton(btns, text="R",
-        height=36, corner_radius=8, width=44,
-        font=ctk.CTkFont(FONT_BODY, 14),
+    ctk.CTkButton(btns, text="Refresh",
+        height=36, corner_radius=8, width=84,
+        font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         fg_color="transparent", hover_color=COLORS["panel_hover"],
         text_color=COLORS["text_dim"],
         border_width=1, border_color=COLORS["border"],
@@ -553,7 +553,7 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
     # Price-age note + on-demand live-refresh button.
     price_note_fut = ctk.CTkLabel(
         dlg,
-        text=" Prices from last poll  click  to refresh live",
+        text=" Prices from last poll  click Refresh to refresh live",
         font=ctk.CTkFont(FONT_BODY, 9),
         text_color=COLORS["text_subtle"],
     )
@@ -687,9 +687,9 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
         command=_stop_only,
     ).pack(side="right", padx=(0, 8))
 
-    ctk.CTkButton(btns, text="R",
-        height=36, corner_radius=8, width=44,
-        font=ctk.CTkFont(FONT_BODY, 14),
+    ctk.CTkButton(btns, text="Refresh",
+        height=36, corner_radius=8, width=84,
+        font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         fg_color="transparent", hover_color=COLORS["panel_hover"],
         text_color=COLORS["text_dim"],
         border_width=1, border_color=COLORS["border"],

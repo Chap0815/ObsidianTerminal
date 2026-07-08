@@ -777,7 +777,15 @@ def _restore_user_files(backup: Path) -> None:
             _copy_file(src, ROOT / rel)
 
 
-def _install_dependencies_if_present() -> None:
+def _dependency_python() -> Path:
+    for rel in ((".venv", "Scripts", "python.exe"), ("python", "python.exe")):
+        candidate = ROOT.joinpath(*rel)
+        if candidate.exists():
+            return candidate
+    return Path(sys.executable)
+
+
+def _install_dependencies_if_present(*, force_active_runtime: bool = False) -> None:
     req = ROOT / "requirements.lock.txt"
     if not req.exists():
         raise RuntimeError(
@@ -785,14 +793,21 @@ def _install_dependencies_if_present() -> None:
             "Dependency-Update aus Sicherheitsgruenden abgebrochen."
         )
     if _active_runtime_env_dir() is not None:
-        _print(
-            "Python-Abhaengigkeiten unveraendert; Installation in der "
-            "aktiven Runtime wird uebersprungen."
+        if not force_active_runtime:
+            _print(
+                "Python-Abhaengigkeiten unveraendert; Installation in der "
+                "aktiven Runtime wird uebersprungen."
+            )
+            return
+        raise RuntimeError(
+            "Dependency-Update benoetigt einen externen Update-Python. "
+            "Starte das Update ueber den Launcher, nicht direkt aus der "
+            "aktiven gebuendelten Runtime."
         )
-        return
     _print("Pruefe/aktualisiere Python-Abhaengigkeiten ...")
+    dep_python = _dependency_python()
     r = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-r", str(req)],
+        [str(dep_python), "-m", "pip", "install", "-r", str(req)],
         cwd=str(ROOT),
         text=True,
         capture_output=True,
@@ -842,35 +857,30 @@ def _active_runtime_env_dir() -> Path | None:
 
 
 def _requirements_hash(path: Path) -> str:
-    return _sha256(path) if path.exists() else ""
+    if not path.exists():
+        return ""
+    return _requirements_text_hash(path.read_text(encoding="utf-8-sig"))
 
 
 def _requirements_text_hash(text: str) -> str:
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+    normalized = "\n".join((text or "").splitlines())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def _guard_active_runtime_dependency_change(new_hash: str) -> None:
-    if _active_runtime_env_dir() is None:
-        return
+def _dependency_update_needed(new_hash: str) -> bool:
     current_hash = _requirements_hash(ROOT / "requirements.lock.txt")
-    if current_hash and new_hash and current_hash != new_hash:
-        raise RuntimeError(
-            "Update enthaelt geaenderte Python-Abhaengigkeiten. "
-            "Automatisches Update wurde abgebrochen, weil die aktive "
-            "gebuendelte Python-Runtime unter Windows nicht sicher "
-            "zurueckgerollt werden kann. Bitte mit einem neuen Installer "
-            "oder einem externen Update-Python aktualisieren."
-        )
+    return bool(new_hash and current_hash != new_hash)
 
 
-def _guard_dependency_update_from_path(path: Path) -> None:
-    _guard_active_runtime_dependency_change(_requirements_hash(path))
+def _dependency_update_needed_from_path(path: Path) -> bool:
+    return _dependency_update_needed(_requirements_hash(path))
 
 
-def _guard_dependency_update_from_ref(git: str, ref: str) -> None:
+def _dependency_update_needed_from_ref(git: str, ref: str) -> bool:
     r = _run([git, "show", f"{ref}:requirements.lock.txt"], check=False)
     if r.returncode == 0:
-        _guard_active_runtime_dependency_change(_requirements_text_hash(r.stdout or ""))
+        return _dependency_update_needed(_requirements_text_hash(r.stdout or ""))
+    return False
 
 
 def _snapshot_runtime_env(dst: Path) -> Path | None:
@@ -1369,7 +1379,7 @@ def _update_existing_repo(repo_url: str, branch: str) -> None:
         raise RuntimeError(
             "Lokaler Stand und Remote sind divergiert. Update abgebrochen, um keinen lokalen Fix zu verlieren."
         )
-    _guard_dependency_update_from_ref(git, "FETCH_HEAD")
+    dependency_update_needed = _dependency_update_needed_from_ref(git, "FETCH_HEAD")
 
     tracked_protected = _tracked_protected_files()
     if tracked_protected:
@@ -1402,7 +1412,8 @@ def _update_existing_repo(repo_url: str, branch: str) -> None:
             _verify_no_tracked_runtime_files(ROOT)
             _restore_user_files(backup)
             _verify_protected_files(protected_hashes)
-            _install_dependencies_if_present()
+            _install_dependencies_if_present(
+                force_active_runtime=dependency_update_needed)
             _restore_user_files(backup)
             _verify_protected_files(protected_hashes)
             _verify_updated_tree()
@@ -1440,14 +1451,16 @@ def _bootstrap_from_private_repo(repo_url: str, branch: str) -> None:
         try:
             _run([git, "clone", "--branch", branch, "--depth", "1", repo_url, str(clone_dir)], cwd=ROOT, timeout=300)
             _verify_no_tracked_runtime_files(clone_dir)
-            _guard_dependency_update_from_path(clone_dir / "requirements.lock.txt")
+            dependency_update_needed = _dependency_update_needed_from_path(
+                clone_dir / "requirements.lock.txt")
             _snapshot_current_app(snapshot_dir)
             _write_update_marker("bootstrap")
             _clean_nonprotected_code()
             _copy_tracked_tree(clone_dir)
             _restore_user_files(backup)
             _verify_protected_files(protected_hashes)
-            _install_dependencies_if_present()
+            _install_dependencies_if_present(
+                force_active_runtime=dependency_update_needed)
             _restore_user_files(backup)
             _verify_protected_files(protected_hashes)
             _verify_updated_tree()

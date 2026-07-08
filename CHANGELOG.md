@@ -2,6 +2,16 @@
 
 ## 2026-07-08
 
+- Fixed the private Git updater for installs with changed `requirements.lock.txt`:
+  dependency changes are now detected explicitly and the bundled Python runtime
+  is updated only when needed, instead of aborting automatic updates before the
+  code update can apply.
+- Renamed the Stop-dialog live-price button from `R` to `Refresh` and updated
+  the helper text so the action is clear before closing or preserving positions.
+- Hardened Spot reconciliation ticker-price handling: offline-close recovery,
+  external close-price lookup, dust checks and orphan adoption now resolve spot
+  ticker prices through `last -> close` and reject boolean, malformed,
+  non-finite or non-positive values before DB accounting or state adoption.
 - Hardened Streamlit dashboard bootstrapping: the dashboard now pins the
   project root at the front of `sys.path` before local imports, so
   `bot_utils.pnl_view` and `core.paths` resolve correctly even when Streamlit

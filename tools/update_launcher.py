@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -107,6 +109,25 @@ def _python_console() -> str:
         if candidate.exists():
             return str(candidate)
     return str(exe)
+
+
+def _external_update_python(temp_root: Path) -> tuple[str, Path | None]:
+    """Return a Python executable that is outside ROOT when possible.
+
+    Dependency updates may need to mutate ROOT/python. Running the updater from
+    that same interpreter makes rollback impossible on Windows, so portable
+    installs use a temporary copy of the bundled runtime.
+    """
+    portable = ROOT / "python" / "python.exe"
+    if portable.exists():
+        runtime_copy = temp_root / "python"
+        shutil.copytree(
+            ROOT / "python",
+            runtime_copy,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        return str(runtime_copy / "python.exe"), runtime_copy
+    return _python_console(), None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -211,16 +232,20 @@ def _restart_launcher() -> None:
 
 
 def _run_update() -> int:
-    cmd = [_python_console(), str(ROOT / "tools" / "update_from_git.py")]
-    _append_log("Starte Update: " + " ".join(cmd))
-    proc = subprocess.run(
-        cmd,
-        cwd=str(ROOT),
-        text=True,
-        capture_output=True,
-        timeout=7200,
-        **_hidden_kwargs(),
-    )
+    with tempfile.TemporaryDirectory(prefix="obsidian_update_python_") as tmp:
+        update_python, runtime_copy = _external_update_python(Path(tmp))
+        if runtime_copy is not None:
+            _append_log(f"Nutze externe temporaere Update-Runtime: {runtime_copy}")
+        cmd = [update_python, str(ROOT / "tools" / "update_from_git.py")]
+        _append_log("Starte Update: " + " ".join(cmd))
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            timeout=7200,
+            **_hidden_kwargs(),
+        )
     if proc.stdout:
         _append_log("STDOUT:\n" + proc.stdout.rstrip())
     if proc.stderr:

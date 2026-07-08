@@ -1,6 +1,6 @@
 {
-  "build_id": "65a6f5ffa1815620",
-  "created_at": "2026-07-08 17:45:08",
+  "build_id": "8af3f64d543487bc",
+  "created_at": "2026-07-08 18:05:50",
   "source": "update_deploy_manifest.py",
   "file_count": 144,
   "files": [
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "d8d1e105c49e25ef0822faea73a8c1c653a2f6982f61a70773592bf2d3bbad1b",
-      "bytes": 18188
+      "sha256": "7a42c14f33769093c9f14caa45c21e291cc8221c6278691cf3c272d3c560e8ff",
+      "bytes": 18920
     },
     {
       "path": "config/__init__.py",
@@ -306,8 +306,8 @@
     },
     {
       "path": "core/spot_bot_reconcile.py",
-      "sha256": "45f81d27e1bd6e28c04815fcb2fc70b7a6791afcea3753431534552a5312fb13",
-      "bytes": 46149
+      "sha256": "681295339026b5015b5425f29b8cb915f465ff1fa6cf152a219e548e816e1658",
+      "bytes": 46498
     },
     {
       "path": "core/spot_bot_scan.py",
@@ -451,8 +451,8 @@
     },
     {
       "path": "launcher/ui/dialogs/shutdown.py",
-      "sha256": "544cca32d4f1f0fa12fe958202a7c2f6c0dd7258d65678abfc6c4a97a3f0361f",
-      "bytes": 43090
+      "sha256": "36965b7ea6aa1e6cbeff9b5798f30a816790bf16fddba1ef9b361ba30660a63f",
+      "bytes": 43132
     },
     {
       "path": "launcher/ui/dialogs/tools.py",
@@ -636,13 +636,13 @@
     },
     {
       "path": "tools/update_from_git.py",
-      "sha256": "e5e054a62a537239ab6c7580a95b50dfdaf45cce3422edf34302cfe99df9cd58",
-      "bytes": 53506
+      "sha256": "ade890e47295d5ff94349d7ffa00628aba6c57553a450a172e964fef18a4f951",
+      "bytes": 53975
     },
     {
       "path": "tools/update_launcher.py",
-      "sha256": "385815f7abe836851323765e81de38cfd45946e31106cb1aef2cf71c1a47416c",
-      "bytes": 12425
+      "sha256": "ee1238f80fc17833f66a49b55e6bf0b59ce3ddaacf2ff9a222e29851a5f04bdf",
+      "bytes": 13511
     },
     {
       "path": "tools/xsec_momentum.py",
