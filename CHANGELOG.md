@@ -2,6 +2,10 @@
 
 ## 2026-07-08
 
+- Hardened Streamlit dashboard bootstrapping: the dashboard now pins the
+  project root at the front of `sys.path` before local imports, so
+  `bot_utils.pnl_view` and `core.paths` resolve correctly even when Streamlit
+  starts from an arbitrary working directory after an update.
 - Hardened Futures discount-token fee accounting: MX/BNB-style fee conversion
   now validates ticker `last -> close`, rejects malformed or non-finite prices,
   and keeps futures `contractSize` context for both immediate and refetched

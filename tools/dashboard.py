@@ -18,6 +18,14 @@ import html
 import sys as _sys
 from datetime import datetime, timedelta, timezone
 
+_DASHBOARD_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_DASHBOARD_DIR)  # tools/  project root
+try:
+    _sys.path.remove(_PROJECT_ROOT)
+except ValueError:
+    pass
+_sys.path.insert(0, _PROJECT_ROOT)
+
 import streamlit as st
 
 from bot_utils.pnl_view import (
@@ -45,10 +53,6 @@ st.set_page_config(
 # (system service, launcher process group, etc); a relative "trading_bot.db"
 # would silently create an empty DB next to wherever streamlit was launched
 # from, and every "no trades yet" reading would look like a working DB.
-_DASHBOARD_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_DASHBOARD_DIR)  # tools/  project root
-if _PROJECT_ROOT not in _sys.path:
-    _sys.path.insert(0, _PROJECT_ROOT)
 try:
     from core.paths import (
         DB_PATH_STR as DB_PATH,
