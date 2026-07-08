@@ -1353,6 +1353,13 @@ def _configure_git_manifest_checkout(git: str, cwd: Path | None = None) -> None:
     _run([git, "config", "core.eol", "lf"], cwd=repo, check=False)
 
 
+def _force_git_manifest_checkout(git: str, cwd: Path | None = None) -> None:
+    """Rewrite tracked files from the index after changing line-ending config."""
+    repo = cwd or ROOT
+    _configure_git_manifest_checkout(git, repo)
+    _run([git, "checkout-index", "-f", "-a"], cwd=repo)
+
+
 def _discard_self_bootstrap_edit(git: str) -> None:
     result = _run([git, "status", "--porcelain", "--", "tools/update_from_git.py"], check=False)
     if result.returncode == 0 and (result.stdout or "").strip():
@@ -1415,8 +1422,10 @@ def _update_existing_repo(repo_url: str, branch: str) -> None:
             _discard_self_bootstrap_edit(git)
             _run([git, "checkout", "-B", branch, "FETCH_HEAD"])
             _run([git, "reset", "--hard", "FETCH_HEAD"])
+            _force_git_manifest_checkout(git)
             _clean_nonprotected_code()
             _run([git, "reset", "--hard", "FETCH_HEAD"])
+            _force_git_manifest_checkout(git)
             _verify_no_tracked_runtime_files(ROOT)
             _restore_user_files(backup)
             _verify_protected_files(protected_hashes)
@@ -1463,6 +1472,7 @@ def _bootstrap_from_private_repo(repo_url: str, branch: str) -> None:
                 str(clone_dir),
             ], cwd=ROOT, timeout=300)
             _configure_git_manifest_checkout(git, clone_dir)
+            _force_git_manifest_checkout(git, clone_dir)
             _verify_no_tracked_runtime_files(clone_dir)
             dependency_update_needed = _dependency_update_needed_from_path(
                 clone_dir / "requirements.lock.txt")

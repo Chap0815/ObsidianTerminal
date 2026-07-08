@@ -9,6 +9,9 @@
 - Fixed Windows Git update checkouts by forcing LF working-tree bytes
   (`core.autocrlf=false`, `core.eol=lf`) before manifest verification, so
   byte-accurate release hashes no longer fail on CRLF-converted files.
+- Hardened the updater further by forcing tracked files to be rewritten from
+  the Git index after line-ending config changes, fixing installs where Git
+  considered old CRLF prompt files clean while the release manifest expected LF.
 - Renamed the Stop-dialog live-price button from `R` to `Refresh` and updated
   the helper text so the action is clear before closing or preserving positions.
 - Hardened Spot reconciliation ticker-price handling: offline-close recovery,
