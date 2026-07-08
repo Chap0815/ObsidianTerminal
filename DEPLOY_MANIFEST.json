@@ -1,6 +1,6 @@
 {
-  "build_id": "8a2a05ba86a3bae7",
-  "created_at": "2026-07-08 18:15:58",
+  "build_id": "141d6608c7e24a35",
+  "created_at": "2026-07-08 18:20:33",
   "source": "update_deploy_manifest.py",
   "file_count": 144,
   "files": [
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "cb5b924fc153658d03b6e2336ba8c638a7069affd1d95fbf0b46364acceadd3e",
-      "bytes": 19369
+      "sha256": "69f850064551116330602fd46556c2a679f187949921afbea27c3599f742cb03",
+      "bytes": 19571
     },
     {
       "path": "config/__init__.py",
@@ -636,8 +636,8 @@
     },
     {
       "path": "tools/update_from_git.py",
-      "sha256": "5e1ed692b069d2af5365358394d00eb5bfbb0e525da42232ebbc77d561f6e981",
-      "bytes": 54951
+      "sha256": "fe902e95c75a85032c004e8ccf7c71ed940d527be675537e63bdc6945b95e85a",
+      "bytes": 56030
     },
     {
       "path": "tools/update_launcher.py",

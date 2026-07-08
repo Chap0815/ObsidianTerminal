@@ -12,6 +12,9 @@
 - Hardened the updater further by forcing tracked files to be rewritten from
   the Git index after line-ending config changes, fixing installs where Git
   considered old CRLF prompt files clean while the release manifest expected LF.
+- Added a manifest-verification self-heal for non-protected release files:
+  byte/hash mismatches are rewritten once from the Git index before failing,
+  fixing old working trees with stale CRLF files.
 - Renamed the Stop-dialog live-price button from `R` to `Refresh` and updated
   the helper text so the action is clear before closing or preserving positions.
 - Hardened Spot reconciliation ticker-price handling: offline-close recovery,

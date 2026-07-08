@@ -950,6 +950,20 @@ def _verify_updated_tree() -> None:
             raise RuntimeError(f"Update-Smoke fehlgeschlagen fuer {rel}: {exc}") from exc
 
 
+def _rewrite_manifest_file_from_index(rel: str) -> bool:
+    path = ROOT / rel
+    if _is_protected_file(path):
+        return False
+    try:
+        if path.exists():
+            path.unlink()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        result = _run([_git(), "checkout-index", "-f", "--", rel], check=False)
+        return result.returncode == 0 and path.is_file()
+    except Exception:
+        return False
+
+
 def _verify_deploy_manifest_hashes() -> None:
     manifest_path = ROOT / "DEPLOY_MANIFEST.json"
     if not manifest_path.exists():
@@ -978,13 +992,28 @@ def _verify_deploy_manifest_hashes() -> None:
             continue
         path = ROOT / rel
         if not path.is_file():
-            problems.append(f"{rel}: fehlt")
-            continue
+            if not _rewrite_manifest_file_from_index(rel):
+                problems.append(f"{rel}: fehlt")
+                continue
         try:
-            if expected_bytes is not None and path.stat().st_size != int(expected_bytes):
+            byte_mismatch = (
+                expected_bytes is not None
+                and path.stat().st_size != int(expected_bytes)
+            )
+            hash_mismatch = (not byte_mismatch and _sha256(path) != expected_hash)
+            if byte_mismatch or hash_mismatch:
+                if _rewrite_manifest_file_from_index(rel):
+                    byte_mismatch = (
+                        expected_bytes is not None
+                        and path.stat().st_size != int(expected_bytes)
+                    )
+                    hash_mismatch = (
+                        not byte_mismatch and _sha256(path) != expected_hash
+                    )
+            if byte_mismatch:
                 problems.append(f"{rel}: Byte-Laenge weicht ab")
                 continue
-            if _sha256(path) != expected_hash:
+            if hash_mismatch:
                 problems.append(f"{rel}: Hash weicht ab")
         except Exception as exc:
             problems.append(f"{rel}: {exc}")
