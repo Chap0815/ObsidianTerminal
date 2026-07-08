@@ -6,6 +6,9 @@
   dependency changes are now detected explicitly and the bundled Python runtime
   is updated only when needed, instead of aborting automatic updates before the
   code update can apply.
+- Fixed Windows Git update checkouts by forcing LF working-tree bytes
+  (`core.autocrlf=false`, `core.eol=lf`) before manifest verification, so
+  byte-accurate release hashes no longer fail on CRLF-converted files.
 - Renamed the Stop-dialog live-price button from `R` to `Refresh` and updated
   the helper text so the action is clear before closing or preserving positions.
 - Hardened Spot reconciliation ticker-price handling: offline-close recovery,

@@ -1346,6 +1346,13 @@ def _is_ancestor(git: str, ancestor: str, descendant: str) -> bool:
     return _run([git, "merge-base", "--is-ancestor", ancestor, descendant], check=False).returncode == 0
 
 
+def _configure_git_manifest_checkout(git: str, cwd: Path | None = None) -> None:
+    """Keep working-tree bytes stable for DEPLOY_MANIFEST verification."""
+    repo = cwd or ROOT
+    _run([git, "config", "core.autocrlf", "false"], cwd=repo, check=False)
+    _run([git, "config", "core.eol", "lf"], cwd=repo, check=False)
+
+
 def _discard_self_bootstrap_edit(git: str) -> None:
     result = _run([git, "status", "--porcelain", "--", "tools/update_from_git.py"], check=False)
     if result.returncode == 0 and (result.stdout or "").strip():
@@ -1355,6 +1362,7 @@ def _discard_self_bootstrap_edit(git: str) -> None:
 
 def _update_existing_repo(repo_url: str, branch: str) -> None:
     git = _git()
+    _configure_git_manifest_checkout(git)
     old_head = ""
     r = _run([git, "rev-parse", "HEAD"], check=False)
     if r.returncode == 0:
@@ -1449,7 +1457,12 @@ def _bootstrap_from_private_repo(repo_url: str, branch: str) -> None:
         snapshot_dir = Path(tmp) / "rollback"
         runtime_snapshot = _snapshot_runtime_env(Path(tmp) / "runtime")
         try:
-            _run([git, "clone", "--branch", branch, "--depth", "1", repo_url, str(clone_dir)], cwd=ROOT, timeout=300)
+            _run([
+                git, "-c", "core.autocrlf=false", "-c", "core.eol=lf",
+                "clone", "--branch", branch, "--depth", "1", repo_url,
+                str(clone_dir),
+            ], cwd=ROOT, timeout=300)
+            _configure_git_manifest_checkout(git, clone_dir)
             _verify_no_tracked_runtime_files(clone_dir)
             dependency_update_needed = _dependency_update_needed_from_path(
                 clone_dir / "requirements.lock.txt")
