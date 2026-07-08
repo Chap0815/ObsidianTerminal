@@ -448,7 +448,8 @@ class CrossBot(FuturesBot):
         if paused:
             log_event(f"[{self.BOT_NAME}] paused: {why}", "WAIT")
             return
-        params = self._xsec_params(); k = int(params.k_per_side)
+        params = self._xsec_params()
+        k = int(params.k_per_side)
         prices, sym_map = self._fetch_universe_prices(params.lookback_hours)
         if not prices:
             log_event(f"[{self.BOT_NAME}] top-up: no universe data - skipped", "WARN")
@@ -465,12 +466,14 @@ class CrossBot(FuturesBot):
                     if not self.state.has(b) and sym_map.get(b)
                     and prices.get(b, [0])[-1] > 0
                     and not is_claimed_by_other(sym_map[b], self.BOT_NAME, is_futures=True)]
-        cand_l = _cand(book.longs); cand_s = _cand(book.shorts)
+        cand_l = _cand(book.longs)
+        cand_s = _cand(book.shorts)
         add_l, add_s = self._topup_counts(held_l, held_s, k,
                                           len(cand_l), len(cand_s))
         if add_l <= 0 and add_s <= 0:
             return
-        lev = self._leverage(); equity = self._equity()
+        lev = self._leverage()
+        equity = self._equity()
         gross = equity * lev * max(0.0, min(1.0, book.exposure_mult))
         gross = min(gross, equity * max(0.0, self._f("MAX_GROSS_EXPOSURE_PCT", 100.0)) / 100.0)
         notional = (gross / 2.0) / k if k > 0 else 0.0
@@ -1097,7 +1100,8 @@ class CrossBot(FuturesBot):
                 log_event(f"[{self.BOT_NAME}] {base}: contracts rounded to 0 - skip", "WARN")
                 return
             order_side = "buy" if side == "LONG" else "sell"
-            import hashlib as _h, time as _t
+            import hashlib as _h
+            import time as _t
             _cid = (f"{self.BUY_PREFIX}-{base}-"
                     + _h.sha256(f"{self.BOT_NAME}:{base}:{int(_t.time()//30)}".encode()
                                 ).hexdigest()[:10])
@@ -2167,8 +2171,8 @@ class CrossBot(FuturesBot):
 
         heavy = "LONG" if net > 0 else "SHORT"
         # Cut the worst-performing legs on the heavy side first (ascending uPnL).
-        candidates = sorted((l for l in legs if l[1] == heavy),
-                            key=lambda l: l[3])
+        candidates = sorted((leg for leg in legs if leg[1] == heavy),
+                            key=lambda leg: leg[3])
         log_event(f"[{self.BOT_NAME}] neutrality-guard: net notional "
                   f"{net:+.1f}/{gross:.1f} ({abs(net)/gross*100:.0f}% > "
                   f"{tol*100:.0f}%) - trimming {heavy} side", "WARN")

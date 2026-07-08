@@ -1,6 +1,6 @@
 {
-  "build_id": "fe80928b0242025b",
-  "created_at": "2026-07-08 08:31:18",
+  "build_id": "4ec4d5d6e3602ac0",
+  "created_at": "2026-07-08 08:37:17",
   "source": "update_deploy_manifest.py",
   "file_count": 143,
   "files": [
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "75d05e436aaffb3abeb7dfc2751b86fac8c850ab289482fe88380d322455d76d",
-      "bytes": 1074
+      "sha256": "5c10336c59566af8db0ede1536807a3798db12673f24ceb41f33506d4beb7829",
+      "bytes": 1472
     },
     {
       "path": "config/__init__.py",
@@ -231,8 +231,8 @@
     },
     {
       "path": "core/cross_bot.py",
-      "sha256": "09a5cf672674d05450892ede06b001c94093ffb084b654f1f1f64b3e38fc14a7",
-      "bytes": 105941
+      "sha256": "b36589c04f6ee975af67c1e873c11c3575aac77fa15ae8836778c552e7e92de1",
+      "bytes": 105990
     },
     {
       "path": "core/database.py",
@@ -251,8 +251,8 @@
     },
     {
       "path": "core/futures_bot_exits.py",
-      "sha256": "4853902f6882d93b4e32f984bc72c1dc8bfd9d72e49a8b3ba5e532cdca52a745",
-      "bytes": 74353
+      "sha256": "d169a65642af95ceccd306a334d4d4ce44bc88a5f535b25668d6315e4a6c9212",
+      "bytes": 74111
     },
     {
       "path": "core/futures_bot_reconcile.py",
@@ -261,8 +261,8 @@
     },
     {
       "path": "core/futures_bot_scan.py",
-      "sha256": "6fdbc57f2000dbeac55653ac053215ff049c77aca2429f6f2dd5f60864b18898",
-      "bytes": 69075
+      "sha256": "cf3c0b75a286be3358613c6b21eab3e8f5dff5c75c75f052ee68b97823c47936",
+      "bytes": 69086
     },
     {
       "path": "core/logger.py",
@@ -331,8 +331,8 @@
     },
     {
       "path": "core/trend_futures_bot.py",
-      "sha256": "6a71ac8f27c46dedb8b2ca2963f0e274628e6e73047d2dce3cceaa34fbd57a57",
-      "bytes": 82114
+      "sha256": "c39a26b015ee920b36974a09dd0be7e1090a44f5e97b619adbe20daef8f7b5c4",
+      "bytes": 81960
     },
     {
       "path": "env_parameter.txt",

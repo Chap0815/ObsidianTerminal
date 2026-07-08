@@ -655,7 +655,7 @@ class TrendFuturesBot(FuturesBot):
     #  Open one leveraged LONG 
     def _open_position(self, base: str, full: str, size_mult: float = 1.0,
                        entry_meta: Optional[dict] = None) -> None:
-        from core.logger import log_event, log_struct, send_telegram, _date as _utc
+        from core.logger import log_event, log_struct, send_telegram
         from core.database import (is_claimed_by_other, claim_symbol_for_entry,
                                    remove_open_position)
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
@@ -663,8 +663,6 @@ class TrendFuturesBot(FuturesBot):
                                extract_or_estimate_futures_fee,
                                filled_margin_usdt,
                                futures_contract_size,
-                               calc_liquidation_price,
-                               distance_to_liquidation_pct,
                                get_maintenance_margin_rate)
         from config.exchange_config import (must_set_leverage, LeverageNotSetError,
                                             safe_set_margin_mode, safe_amount_to_precision,
@@ -733,7 +731,6 @@ class TrendFuturesBot(FuturesBot):
         fees = 0.0
         amount = contracts
         provisional = False
-        exch_oid = None
         margin_mode = str(self.C("MARGIN_MODE", "isolated") or "isolated").lower()
 
         if not self.simulation:

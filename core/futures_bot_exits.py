@@ -990,18 +990,15 @@ class FuturesExitsMixin:
                         actual_filled = 0.0
                 if actual_filled <= 0:
                     try:
-                        from config.exchange_config import safe_fetch_positions
-                        positions = safe_fetch_positions(self.ex, [symbol_full]) or []
-                        remaining_live = None
+                        from bot_utils import fetch_open_position
                         old_amount = float(d.get("amount", 0) or 0)
-                        for pos in positions:
-                            if (pos.get("symbol") or "") != symbol_full:
-                                continue
+                        pos, unavailable = fetch_open_position(self.ex, symbol_full)
+                        if pos is not None:
                             remaining_live = abs(float(pos.get("contracts")
                                                        or pos.get("size") or 0.0))
-                            break
-                        if remaining_live is not None:
                             actual_filled = max(0.0, old_amount - remaining_live)
+                        elif unavailable:
+                            actual_filled = 0.0
                     except Exception:
                         actual_filled = 0.0
                 if actual_filled <= 0:
@@ -1440,7 +1437,6 @@ class FuturesExitsMixin:
         buy_time = d.get("buy_time", "")
         sell_time = _utc_now_str()
         accounting_ok = False
-        accounting_error = None
         try:
             accounting_ok = bool(save_trade_db(
                 bot_name=self.BOT_NAME, mode_is_sim=self.simulation, symbol=sym,
@@ -1465,7 +1461,6 @@ class FuturesExitsMixin:
             if not accounting_ok:
                 raise RuntimeError("save_trade_db returned False")
         except Exception as e:
-            accounting_error = e
             log_event(
                 f"save_trade_db {sym} failed after verified flat close: {e}. "
                 f"State kept for accounting recovery.", "WARN")

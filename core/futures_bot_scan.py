@@ -1328,7 +1328,8 @@ class FuturesScanMixin:
                 return default
 
         try:
-            rsi_15 = float(r.get("rsi_15m", 50)); rsi_h = float(r.get("rsi_1h", 50))
+            rsi_15 = float(r.get("rsi_15m", 50))
+            rsi_h = float(r.get("rsi_1h", 50))
             rsi_4  = float(r.get("rsi_4h", 50))
         except (TypeError, ValueError):
             rsi_15 = rsi_h = rsi_4 = 50.0
