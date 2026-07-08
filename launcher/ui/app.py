@@ -2281,6 +2281,28 @@ class ObsidianApp(ctk.CTk):
                     **subprocess_no_window_kwargs(),
                 )
 
+    def _write_dashboard_process_status(self) -> None:
+        if self.streamlit is None or not getattr(self.streamlit, "pid", None):
+            return
+        try:
+            status = {
+                "pid": int(self.streamlit.pid),
+                "port": int(self._dashboard_port or 0),
+                "build_id": self._current_dashboard_build_id(),
+                "project_root": str(PROJECT_ROOT),
+                "script": os.path.join(PROJECT_ROOT, "tools", "dashboard.py"),
+                "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "source": "launcher",
+            }
+            path = self._dashboard_status_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(status, fh, ensure_ascii=True, sort_keys=True)
+            os.replace(tmp, path)
+        except Exception:
+            pass
+
     def _open_existing_dashboard_if_healthy(self) -> bool:
         """Reuse only a dashboard process from the same deployed build."""
         seen: set[tuple[int, int]] = set()
@@ -2361,6 +2383,7 @@ class ObsidianApp(ctk.CTk):
                      "--server.headless", "true"],
                     env=env, cwd=PROJECT_ROOT, **kw
                 )
+                self._write_dashboard_process_status()
             except Exception as e:
                 stderr = sys.stderr
                 if stderr is not None:
