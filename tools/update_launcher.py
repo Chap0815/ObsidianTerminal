@@ -132,7 +132,6 @@ def _launcher_processes() -> list[str]:
     except Exception:
         return _launcher_processes_via_cim()
     current = os.getpid()
-    root_text = str(ROOT).lower()
     out: list[str] = []
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
@@ -143,9 +142,21 @@ def _launcher_processes() -> list[str]:
         except Exception:
             continue
         low = cmdline.lower()
-        if "launcher.pyw" in low and root_text in low:
+        if _cmdline_is_launcher(low):
             out.append(f"pid {pid}")
     return out
+
+
+def _cmdline_is_launcher(cmdline_lower: str) -> bool:
+    root_text = str(ROOT).lower()
+    if root_text not in cmdline_lower:
+        return False
+    compact = " ".join(cmdline_lower.replace("\\", "/").split())
+    return (
+        "launcher.pyw" in compact
+        or "-m launcher.main" in compact
+        or "-m launcher/main" in compact
+    )
 
 
 def _launcher_processes_via_cim() -> list[str]:
@@ -155,8 +166,9 @@ def _launcher_processes_via_cim() -> list[str]:
         f"$current={os.getpid()}; "
         "Get-CimInstance Win32_Process | "
         "Where-Object { $_.ProcessId -ne $current -and $_.CommandLine -and "
-        "$_.CommandLine.ToLower().Contains('launcher.pyw') -and "
-        "$_.CommandLine.ToLower().Contains($root) } | "
+        "$line=$_.CommandLine.ToLower().Replace('\\','/'); "
+        "$line.Contains($root) -and "
+        "($line.Contains('launcher.pyw') -or $line.Contains('-m launcher.main')) } | "
         "ForEach-Object { 'pid ' + $_.ProcessId }"
     )
     try:

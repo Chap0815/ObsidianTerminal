@@ -16,6 +16,14 @@ import math
 from typing import Tuple
 
 
+def _finite_float(value) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
 #  Liquidation price (approximation) 
 
 def calc_liquidation_price(entry: float,
@@ -43,12 +51,22 @@ def calc_liquidation_price(entry: float,
     # Guard against leverage=0 (would divide by zero). Fall back to a
     # safe 1x assumption rather than crashing  caller should have a
     # valid leverage, but state corruption shouldn't kill the monitor.
+    entry = _finite_float(entry)
+    leverage = _finite_float(leverage)
+    maintenance_margin = _finite_float(maintenance_margin)
+    if entry is None or entry <= 0:
+        return 0.0
+    if leverage is None:
+        return 0.0
     if leverage <= 0:
         leverage = 1.0
+    if maintenance_margin is None or maintenance_margin < 0:
+        maintenance_margin = 0.01
     if position_type == "LONG":
-        return entry * (1 - 1.0 / leverage + maintenance_margin)
+        liq = entry * (1 - 1.0 / leverage + maintenance_margin)
     else:
-        return entry * (1 + 1.0 / leverage - maintenance_margin)
+        liq = entry * (1 + 1.0 / leverage - maintenance_margin)
+    return liq if math.isfinite(liq) and liq > 0 else 0.0
 
 
 def cross_liquidation_price(entry: float, qty_signed: float, mm_rate: float,
@@ -96,7 +114,10 @@ def cross_liquidation_price(entry: float, qty_signed: float, mm_rate: float,
         return None
     other_sum = 0.0
     for (e_i, q_i, mm_i, mk_i) in others:
-        q_i = float(q_i); e_i = float(e_i); mm_i = float(mm_i); mk_i = float(mk_i)
+        q_i = float(q_i)
+        e_i = float(e_i)
+        mm_i = float(mm_i)
+        mk_i = float(mk_i)
         other_sum += q_i * (mk_i - e_i) - mm_i * abs(q_i) * mk_i  # uPnL_i  MM_i
     denom = mm * abs(q) - q
     if denom == 0.0:
@@ -114,12 +135,16 @@ def distance_to_liquidation_pct(current_price: float,
                                   position_type: str) -> float:
     """% distance from current price to liquidation  always positive when
     the position is alive, becomes negative if liquidation is breached."""
-    if current_price <= 0:
+    current_price = _finite_float(current_price)
+    liq_price = _finite_float(liq_price)
+    if (current_price is None or liq_price is None
+            or current_price <= 0 or liq_price <= 0):
         return 0.0
     if position_type == "LONG":
-        return ((current_price - liq_price) / current_price) * 100
+        dist = ((current_price - liq_price) / current_price) * 100
     else:
-        return ((liq_price - current_price) / current_price) * 100
+        dist = ((liq_price - current_price) / current_price) * 100
+    return dist if math.isfinite(dist) else 0.0
 
 
 def liq_buffer_consumed_pct(initial_dist: float, current_dist: float) -> float:
@@ -129,9 +154,14 @@ def liq_buffer_consumed_pct(initial_dist: float, current_dist: float) -> float:
     close the position before liquidation. Relative-to-initial makes the
     trigger work across leverage levels.
     """
+    initial_dist = _finite_float(initial_dist)
+    current_dist = _finite_float(current_dist)
+    if initial_dist is None or current_dist is None:
+        return 100.0
     if initial_dist <= 0:
         return 0.0
-    return ((initial_dist - current_dist) / initial_dist) * 100
+    consumed = ((initial_dist - current_dist) / initial_dist) * 100
+    return consumed if math.isfinite(consumed) else 0.0
 
 
 #  PnL math 
@@ -152,7 +182,12 @@ def calc_unrealized_pnl(entry: float,
     caller pre-checks entry. Callers should still skip the tick, but this
     guarantees the monitor can never crash here.
     """
-    if entry <= 0:
+    entry = _finite_float(entry)
+    current = _finite_float(current)
+    margin = _finite_float(margin)
+    leverage = _finite_float(leverage)
+    if (entry is None or current is None or margin is None or leverage is None
+            or entry <= 0 or current < 0 or margin <= 0 or leverage <= 0):
         return 0.0, 0.0
     notional = margin * leverage
     if position_type == "LONG":
@@ -161,6 +196,8 @@ def calc_unrealized_pnl(entry: float,
         price_pct = (entry - current) / entry
     pnl_usdt = notional * price_pct
     pct_on_margin = (pnl_usdt / margin) * 100 if margin > 0 else 0.0
+    if not (math.isfinite(pnl_usdt) and math.isfinite(pct_on_margin)):
+        return 0.0, 0.0
     return pnl_usdt, pct_on_margin
 
 
@@ -170,12 +207,15 @@ def price_move_pct(entry: float, current: float, position_type: str) -> float:
 
     Defensive: returns 0.0 on a non-positive entry rather than raising
     ZeroDivisionError (see calc_unrealized_pnl for rationale)."""
-    if entry <= 0:
+    entry = _finite_float(entry)
+    current = _finite_float(current)
+    if entry is None or current is None or entry <= 0 or current < 0:
         return 0.0
     if position_type == "LONG":
-        return ((current - entry) / entry) * 100
+        move = ((current - entry) / entry) * 100
     else:
-        return ((entry - current) / entry) * 100
+        move = ((entry - current) / entry) * 100
+    return move if math.isfinite(move) else 0.0
 
 
 #  Side-aware comparisons 
@@ -186,6 +226,12 @@ def is_new_high(curr: float, prev_high: float, position_type: str) -> bool:
     LONG: new high if curr > prev_high.
     SHORT: new (favorable) low if curr < prev_high.
     """
+    curr = _finite_float(curr)
+    prev_high = _finite_float(prev_high)
+    if curr is None or curr <= 0:
+        return False
+    if prev_high is None or prev_high <= 0:
+        return True
     if position_type == "LONG":
         return curr > prev_high
     return curr < prev_high
@@ -196,16 +242,33 @@ def trailing_stop_hit(curr: float,
                        trailing_distance_pct: float,
                        position_type: str) -> bool:
     """True if current price retraces by trailing_distance_pct% from highest."""
+    curr = _finite_float(curr)
+    highest = _finite_float(highest)
+    trailing_distance_pct = _finite_float(trailing_distance_pct)
+    if curr is None or curr <= 0:
+        return False
+    if highest is None or highest <= 0:
+        return True
+    if trailing_distance_pct is None or trailing_distance_pct < 0:
+        return True
     if position_type == "LONG":
-        return curr <= highest * (1 - trailing_distance_pct / 100)
+        stop_price = highest * (1 - trailing_distance_pct / 100)
+        return curr <= stop_price if math.isfinite(stop_price) else True
     else:
-        return curr >= highest * (1 + trailing_distance_pct / 100)
+        stop_price = highest * (1 + trailing_distance_pct / 100)
+        return curr >= stop_price if math.isfinite(stop_price) else True
 
 
 def breakeven_stop_hit(curr: float,
                         be_price: float,
                         position_type: str) -> bool:
     """True if BE stop is breached (price returned to entry-area)."""
+    curr = _finite_float(curr)
+    be_price = _finite_float(be_price)
+    if curr is None or curr <= 0:
+        return False
+    if be_price is None or be_price <= 0:
+        return True
     if position_type == "LONG":
         return curr <= be_price
     else:
@@ -259,7 +322,14 @@ def fee_buffered_breakeven(entry: float,
     Bitget Taker ~0.06%  2 sides  leverage  0.3% buffer covers most
     cases at moderate leverage.
     """
+    entry = _finite_float(entry)
+    fee_buffer = _finite_float(fee_buffer)
+    if entry is None or entry <= 0:
+        return 0.0
+    if fee_buffer is None or fee_buffer < 0:
+        fee_buffer = 0.003
     if position_type == "LONG":
-        return round(entry * (1.0 + fee_buffer), 8)
+        be_price = round(entry * (1.0 + fee_buffer), 8)
     else:
-        return round(entry * (1.0 - fee_buffer), 8)
+        be_price = round(entry * (1.0 - fee_buffer), 8)
+    return be_price if math.isfinite(be_price) and be_price > 0 else 0.0

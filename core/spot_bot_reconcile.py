@@ -14,30 +14,107 @@ handle the four crash/manual-interaction scenarios:
 """
 from __future__ import annotations
 
+import math
 import time
+
+from bot_utils.balance_resolver import effective_balance
+
+_SPOT_ORPHAN_MAX_USDT = 1_000_000_000.0
+
+
+def _spot_balance_payload_unclear(info: dict) -> bool:
+    if not isinstance(info, dict):
+        return False
+    for key in ("total", "free", "used"):
+        raw = info.get(key)
+        if raw is None:
+            continue
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return True
+        if not math.isfinite(parsed) or parsed < 0:
+            return True
+    return False
+
+
+def _spot_effective_balance(bal_data: dict | None, sym: str) -> float:
+    amount = _spot_effective_balance_or_none(bal_data, sym)
+    return amount if amount is not None else 0.0
+
+
+def _spot_effective_balance_or_none(bal_data: dict | None, sym: str) -> float | None:
+    if not isinstance(bal_data, dict):
+        return None
+    info = bal_data.get(sym) or {}
+    if _spot_balance_payload_unclear(info):
+        return None
+    return effective_balance(info)
+
+
+def _spot_balance_present_or_unclear(bal_data: dict | None, sym: str) -> bool:
+    amount = _spot_effective_balance_or_none(bal_data, sym)
+    return amount is None or amount > 1e-8
 
 
 def _trade_amount(t: dict) -> float:
     try:
-        return abs(float(t.get("amount", 0) or 0))
-    except (TypeError, ValueError):
+        amount = abs(float(t.get("amount", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
         return 0.0
+    return amount if math.isfinite(amount) and amount > 0 else 0.0
 
 
 def _trade_fee_usdt(t: dict) -> float:
+    fee, _known = _trade_fee_usdt_known(t)
+    return fee
+
+
+def _trade_fee_usdt_known(t: dict) -> tuple[float, bool]:
     fee = t.get("fee") or {}
+    if not isinstance(fee, dict) or fee.get("cost") is None:
+        return 0.0, False
     try:
-        cost = abs(float(fee.get("cost", 0) or 0))
-    except (TypeError, ValueError, AttributeError):
-        cost = 0.0
+        cost = float(fee.get("cost"))
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return 0.0, False
     currency = str(fee.get("currency", "") if isinstance(fee, dict) else "").upper()
-    return cost if currency in {"USDT", "USD"} else 0.0
+    if currency not in {"USDT", "USD"} or not math.isfinite(cost):
+        return 0.0, False
+    return cost, True
+
+
+def _trade_price(t: dict) -> float:
+    try:
+        price = float(t.get("price", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return price if math.isfinite(price) and price > 0 else 0.0
+
+
+def _estimate_spot_close_fee_usdt(amount: float, close_price: float,
+                                  fee_rate: float = 0.001) -> float:
+    try:
+        amt = float(amount)
+        price = float(close_price)
+        rate = float(fee_rate)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not all(math.isfinite(v) and v >= 0 for v in (amt, price, rate)):
+        return 0.0
+    try:
+        fee = amt * price * rate
+    except OverflowError:
+        return 0.0
+    return fee if math.isfinite(fee) else 0.0
 
 
 def _aggregate_spot_sell_trades(bot, pair: str, target_amount: float) -> tuple[float, float, str]:
     try:
         target = max(0.0, float(target_amount or 0.0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        target = 0.0
+    if not math.isfinite(target):
         target = 0.0
     if target <= 0 or not hasattr(bot.ex, "fetch_my_trades"):
         return 0.0, 0.0, "unavailable"
@@ -48,24 +125,44 @@ def _aggregate_spot_sell_trades(bot, pair: str, target_amount: float) -> tuple[f
     qty = 0.0
     notional = 0.0
     fee_usdt = 0.0
+    fees_known = True
     for t in reversed(trades):
         if str(t.get("side", "")).lower() != "sell":
             continue
         amt = _trade_amount(t)
-        price = float(t.get("price", 0) or 0)
+        price = _trade_price(t)
         if amt <= 0 or price <= 0:
             continue
         take = min(amt, max(0.0, target - qty))
         if take <= 0:
             break
+        try:
+            trade_notional = take * price
+            trade_fee, fee_known = _trade_fee_usdt_known(t)
+            fee_part = trade_fee * (take / amt)
+        except (OverflowError, ZeroDivisionError):
+            continue
+        if not (math.isfinite(trade_notional) and math.isfinite(fee_part)):
+            continue
+        fees_known = fees_known and fee_known
         qty += take
-        notional += take * price
-        fee_usdt += _trade_fee_usdt(t) * (take / amt)
+        notional += trade_notional
+        fee_usdt += fee_part
+        if not (
+            math.isfinite(qty)
+            and math.isfinite(notional)
+            and math.isfinite(fee_usdt)
+        ):
+            return 0.0, 0.0, "unavailable"
         if qty + 1e-12 >= target:
             break
     if qty + 1e-12 < target or qty <= 0:
         return 0.0, 0.0, "unavailable"
-    return notional / qty, fee_usdt, "fetch_my_trades_vwap"
+    vwap = notional / qty
+    if not (math.isfinite(vwap) and math.isfinite(fee_usdt)):
+        return 0.0, 0.0, "unavailable"
+    source = "fetch_my_trades_vwap" if fees_known else "fetch_my_trades_vwap_fee_unknown"
+    return vwap, fee_usdt, source
 
 
 def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
@@ -112,8 +209,10 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
             try:
                 close_price = float(
                     state_row.get("accounting_pending_sell_price") or 0)
-                if close_price > 0:
+                if math.isfinite(close_price) and close_price > 0:
                     close_source = "accounting_pending"
+                else:
+                    close_price = 0.0
             except (TypeError, ValueError):
                 close_price = 0.0
 
@@ -125,7 +224,10 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
             try:
                 ticker = bot.ex.fetch_ticker(pair)
                 close_price = float(ticker.get("last", 0) or 0)
-                close_source = "current_ticker"
+                if math.isfinite(close_price) and close_price > 0:
+                    close_source = "current_ticker"
+                else:
+                    close_price = 0.0
             except Exception:
                 pass
 
@@ -137,13 +239,14 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
             return False
 
         # Calculate net PnL: gross gain on amount minus fees
-        # Spot taker fee  0.1% on Bitget
         from bot_utils import safe_proportional_fee
-        SPOT_TAKER_FEE = 0.001
         close_fee = (
             close_fee_actual
-            if close_fee_actual > 0
-            else amount * close_price * SPOT_TAKER_FEE
+            if (
+                math.isfinite(close_fee_actual)
+                and close_source == "fetch_my_trades_vwap"
+            )
+            else _estimate_spot_close_fee_usdt(amount, close_price)
         )
         initial_entry_fee = float(state_row.get(
             "initial_entry_fee", state_row.get("fees_paid", 0)) or 0)
@@ -167,18 +270,32 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
         if pending_accounting and close_source == "accounting_pending":
             try:
                 net_pnl = float(state_row.get("accounting_pending_profit_usdt"))
+                if not math.isfinite(net_pnl):
+                    net_pnl = round(gross - entry_fee - close_fee, 4)
             except (TypeError, ValueError):
                 pass
             try:
                 profit_pct = float(state_row.get("accounting_pending_profit_pct"))
+                if not math.isfinite(profit_pct):
+                    profit_pct = ((close_price - buy) / buy) * 100 if buy > 0 else 0.0
             except (TypeError, ValueError):
                 pass
             try:
                 fees_total = float(state_row.get("accounting_pending_fees_usdt"))
-                entry_fee = 0.0
-                close_fee = fees_total
+                if math.isfinite(fees_total):
+                    entry_fee = 0.0
+                    close_fee = fees_total
             except (TypeError, ValueError):
                 pass
+
+        if not all(math.isfinite(v) for v in (
+            buy, amount, close_price, invested, entry_fee, close_fee,
+            net_pnl, profit_pct,
+        )):
+            log_event(
+                f" {sym}: offline-close skipped  non-finite accounting value",
+                "WARN")
+            return False
 
         saved = save_trade_db(
             bot_name=bot.BOT_NAME,
@@ -237,7 +354,7 @@ def _find_spot_external_close_price(bot, sym: str, amount: float = 0.0,
     try:
         ticker = bot.ex.fetch_ticker(pair)
         price = float(ticker.get("last", 0) or 0)
-        if price > 0:
+        if math.isfinite(price) and price > 0:
             return price, 0.0, "current_ticker"
     except Exception:
         pass
@@ -306,18 +423,30 @@ def _record_spot_external_partial(bot, sym: str, state_row: dict,
     from core.logger import log_event
     from bot_utils import safe_proportional_fee
 
-    local_amt = float(state_row.get("amount", 0) or 0)
-    buy = float(state_row.get("buy_price") or state_row.get("buy") or 0)
-    invested = float(state_row.get("invested_usdt", buy * local_amt) or 0)
-    remaining_amount = max(0.0, float(remaining_amount or 0.0))
+    try:
+        local_amt = float(state_row.get("amount", 0) or 0)
+        buy = float(state_row.get("buy_price") or state_row.get("buy") or 0)
+        invested = float(state_row.get("invested_usdt", buy * local_amt) or 0)
+        remaining_amount = max(0.0, float(remaining_amount or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return False, {}
     sold_amount = max(0.0, local_amt - remaining_amount)
+    if not all(math.isfinite(v) for v in (
+        local_amt, buy, invested, remaining_amount, sold_amount,
+    )):
+        return False, {}
     if buy <= 0 or local_amt <= 0 or sold_amount <= 0 or remaining_amount <= 0:
         return False, {}
 
     ratio_sold = min(1.0, sold_amount / local_amt)
     invested_sold = round(invested * ratio_sold, 8)
     invested_remaining = max(0.0, invested - invested_sold)
-    original_amount = float(state_row.get("original_amount") or local_amt)
+    try:
+        original_amount = float(state_row.get("original_amount") or local_amt)
+    except (TypeError, ValueError, OverflowError):
+        return False, {}
+    if not (math.isfinite(original_amount) and original_amount > 0):
+        return False, {}
     close_price, close_fee_actual, source = _find_spot_external_close_price(
         bot, sym, sold_amount, allow_ticker=False)
     if close_price <= 0:
@@ -353,11 +482,16 @@ def _record_spot_external_partial(bot, sym: str, state_row: dict,
 
     close_fee = (
         close_fee_actual
-        if close_fee_actual > 0
-        else sold_amount * close_price * 0.001
+        if math.isfinite(close_fee_actual) and source == "fetch_my_trades_vwap"
+        else _estimate_spot_close_fee_usdt(sold_amount, close_price)
     )
-    initial_entry_fee = float(state_row.get(
-        "initial_entry_fee", state_row.get("fees_paid", 0)) or 0)
+    try:
+        initial_entry_fee = float(state_row.get(
+            "initial_entry_fee", state_row.get("fees_paid", 0)) or 0)
+    except (TypeError, ValueError, OverflowError):
+        initial_entry_fee = 0.0
+    if not math.isfinite(initial_entry_fee):
+        initial_entry_fee = 0.0
     entry_fee = safe_proportional_fee(
         initial_entry_fee, sold_amount, original_amount,
         partial_sold=bool(state_row.get("partial_sold")),
@@ -365,6 +499,15 @@ def _record_spot_external_partial(bot, sym: str, state_row: dict,
     gross = sold_amount * (close_price - buy)
     profit_usdt = round(gross - entry_fee - close_fee, 4)
     profit_pct = ((close_price - buy) / buy) * 100 if buy > 0 else 0.0
+    if not all(math.isfinite(v) for v in (
+        close_price, close_fee, entry_fee, gross, profit_usdt, profit_pct,
+        invested_sold, invested_remaining,
+    )):
+        log_event(
+            f" Spot reconciliation: {sym} external partial skipped  "
+            f"non-finite accounting value",
+            "WARN")
+        return False, {}
     from core.clock import now_utc
     item = {
         "bot_name": bot.BOT_NAME,
@@ -466,8 +609,10 @@ def _still_held_on_spot_exchange(bot, sym: str, dust_usdt: float = 1.0) -> bool:
     count as not-held (matches the $1 spot dust filter)."""
     try:
         bal = bot.ex.fetch_balance()
-        total = float((bal.get(sym) or {}).get("total", 0) or 0)
+        total = _spot_effective_balance_or_none(bal, sym)
     except Exception:
+        return True
+    if total is None:
         return True
     if total <= 0:
         return False
@@ -484,7 +629,7 @@ def _fetch_spot_total(bot, sym: str) -> float | None:
     """Return confirmed wallet total for a coin, or None on unclear fetch."""
     try:
         bal = bot.ex.fetch_balance()
-        return float((bal.get(sym) or {}).get("total", 0) or 0)
+        return _spot_effective_balance_or_none(bal, sym)
     except Exception:
         return None
 
@@ -659,21 +804,25 @@ def _adopt_spot_orphans(bot, bal_data: dict) -> None:
                 continue
             if base in other_spot:
                 continue
-            try:
-                exch_amt = float(coin_bal.get("total", 0) or 0)
-            except (TypeError, ValueError):
+            if _spot_balance_payload_unclear(coin_bal):
+                unadoptable.append(base)
                 continue
-            if exch_amt <= 1e-8:
+            exch_amt = effective_balance(coin_bal)
+            if not (math.isfinite(exch_amt) and exch_amt > 1e-8):
                 continue
             try:
                 ticker = bot.ex.fetch_ticker(f"{base}/USDT")
                 price = float(ticker.get("last", 0) or 0)
             except Exception:
                 price = 0.0
-            if price <= 0:
+            if not (math.isfinite(price) and price > 0):
                 unadoptable.append(base)
                 continue
             value_usdt = exch_amt * price
+            if (not math.isfinite(value_usdt)
+                    or value_usdt > _SPOT_ORPHAN_MAX_USDT):
+                unadoptable.append(base)
+                continue
             if value_usdt < _SPOT_DUST_USDT:
                 continue
             if not try_claim_orphan(bot.BOT_NAME, base, "SPOT"):
@@ -695,10 +844,41 @@ def _adopt_spot_orphans(bot, bal_data: dict) -> None:
                     "adopted": True,
                 })
                 if added is False:
+                    if bot.state.has(base):
+                        try:
+                            bot.state.update_many(base, {
+                                "claim_registry_pending": True,
+                                "claim_registry_pending_reason": (
+                                    "adoption state.add returned False"),
+                                "adopted": True,
+                            })
+                        except Exception as state_exc:
+                            bot._log_error(
+                                f"mark adopted claim pending {base}",
+                                state_exc)
+                        current_syms.add(base)
+                        adopted.append(base)
+                        continue
                     raise RuntimeError("state.add returned False")
                 current_syms.add(base)
                 adopted.append(base)
             except Exception as exc:
+                if bot.state.has(base):
+                    try:
+                        bot.state.update_many(base, {
+                            "claim_registry_pending": True,
+                            "claim_registry_pending_reason": (
+                                "adoption state write raised after state mutation"),
+                            "adopted": True,
+                        })
+                    except Exception as state_exc:
+                        bot._log_error(
+                            f"mark adopted claim pending {base}",
+                            state_exc)
+                    current_syms.add(base)
+                    adopted.append(base)
+                    bot._log_error(f"spot adopt orphan {base}", exc)
+                    continue
                 remove_open_position(bot.BOT_NAME, base)
                 bot._log_error(f"spot adopt orphan {base}", exc)
                 unadoptable.append(base)
@@ -760,7 +940,7 @@ def startup_reconciliation(bot) -> None:
         # Safety gate: if we hold positions but the balance read shows NONE of
         # them, treat it as an empty/partial fetch and skip removing anything.
         present = sum(1 for sym in trades
-                      if float((bal_data.get(sym) or {}).get("total", 0) or 0) > 1e-8)
+                      if _spot_balance_present_or_unclear(bal_data, sym))
         if present == 0:
             log_event(
                 f" Spot reconciliation: fetch_balance shows none of "
@@ -776,8 +956,10 @@ def startup_reconciliation(bot) -> None:
         for sym, d in list(trades.items()):
             try:
                 local_amt = float(d.get("amount", 0))
-                coin_bal = bal_data.get(sym) or {}
-                exch_amt = float(coin_bal.get("total", 0) or 0)
+                exch_amt = _spot_effective_balance_or_none(bal_data, sym)
+                if exch_amt is None:
+                    strikes.pop(sym, None)
+                    continue
                 if exch_amt >= 1e-8:
                     strikes.pop(sym, None)
                 if exch_amt < 1e-8 and local_amt > 0:
@@ -824,13 +1006,19 @@ def startup_reconciliation(bot) -> None:
             if not sym or sym in current_syms:
                 continue
             # Verify the coin actually exists on exchange
-            exch_check = (bal_data or {}).get(sym) or {}
-            exch_amt = float(exch_check.get("total", 0) or 0)
-            if exch_amt <= 1e-8:
+            exch_amt = _spot_effective_balance_or_none(bal_data, sym)
+            if exch_amt is None or exch_amt <= 1e-8:
                 continue
             added = bot.state.add(sym, _state_from_spot_db_position(pos, exch_amt))
             if added is False:
-                raise RuntimeError(f"state.add returned False for {sym}")
+                if bot.state.has(sym):
+                    bot.state.update_many(sym, {
+                        "claim_registry_pending": True,
+                        "claim_registry_pending_reason": (
+                            "rehydrate state.add returned False"),
+                    })
+                else:
+                    raise RuntimeError(f"state.add returned False for {sym}")
             rehydrated.append(sym)
         if rehydrated:
             log_event(
@@ -905,7 +1093,7 @@ class ReconcileMixin:
                 adjusted = []
                 trades = self.state.get_all()
                 present = sum(1 for sym in trades
-                              if float((bal_data.get(sym) or {}).get("total", 0) or 0) > 1e-8)
+                              if _spot_balance_present_or_unclear(bal_data, sym))
                 if trades and present == 0:
                     log_event(
                         f"[{self.BOT_NAME}] reconcile balance shows none of "
@@ -917,7 +1105,10 @@ class ReconcileMixin:
                 for sym, d in list(trades.items()):
                     try:
                         local_amt = float(d.get("amount", 0))
-                        exch_amt = float((bal_data.get(sym) or {}).get("total", 0) or 0)
+                        exch_amt = _spot_effective_balance_or_none(bal_data, sym)
+                        if exch_amt is None:
+                            strikes.pop(sym, None)
+                            continue
                         if exch_amt >= 1e-8:
                             strikes.pop(sym, None)
                         if exch_amt < 1e-8 and local_amt > 0:

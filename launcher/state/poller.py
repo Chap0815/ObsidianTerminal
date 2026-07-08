@@ -21,6 +21,7 @@ import time
 
 from launcher.config.settings import BOT_META, BOT_ORDER, CONFIG_FILE
 from launcher.core.metrics_service import (
+    MetricsDbReadError,
     get_bot_stats,
     get_exchange_status,
     get_futures_state_count,
@@ -193,6 +194,7 @@ class DataPoller:
             "live_futures_active": False,
             "spot_equity":    None,
             "futures_equity": None,
+            "metrics_error": "",
         }
         self.lock = threading.Lock()
         self.running = True
@@ -245,8 +247,14 @@ class DataPoller:
                 # the later re-reads are harmless refreshes.
                 now = time.time()
                 new_data["system"]   = get_system_stats()
-                new_data["market"]   = get_market_info()
-                new_data["exchange"] = get_exchange_status()
+                try:
+                    new_data["market"] = get_market_info()
+                    new_data["exchange"] = get_exchange_status()
+                except MetricsDbReadError as exc:
+                    self._log_diag(f"market/exchange DB read failed: {exc}")
+                    new_data["market"] = self.cache.get("market")
+                    new_data["exchange"] = {"active": False, "label": "DB Error"}
+                    new_data["metrics_error"] = str(exc)[:160]
                 cfg_snapshot = None
                 try:
                     if os.path.exists(CONFIG_FILE):
@@ -260,26 +268,35 @@ class DataPoller:
                 }
                 new_data["mode_is_sim"] = dict(mode_is_sim)
 
-                stats: dict = {}
-                opens: dict = {}
-                for bot in BOT_ORDER:
-                    stats[bot] = get_bot_stats(bot, mode_is_sim=mode_is_sim[bot])
-                    if BOT_META[bot].get("is_futures"):
-                        # Futures-type bots (FUTURES, CROSS) use futures_state as
-                        # the authoritative source  SCOPED PER BOT so they don't
-                        # sum each other's positions (both share the table).
-                        opens[bot] = get_futures_state_count(bot, mode_is_sim=mode_is_sim[bot])
-                    else:
-                        opens[bot] = len(get_open_trades(
-                            BOT_META[bot]["log_dir"], bot,
-                            mode_is_sim=mode_is_sim[bot]))
-                new_data["stats"] = stats
-                new_data["open"]  = opens
-                new_data["futures_positions"] = sum(
-                    int(opens.get(bot, 0) or 0)
-                    for bot in BOT_ORDER
-                    if BOT_META[bot].get("is_futures")
-                )
+                try:
+                    stats: dict = {}
+                    opens: dict = {}
+                    for bot in BOT_ORDER:
+                        stats[bot] = get_bot_stats(bot, mode_is_sim=mode_is_sim[bot])
+                        if BOT_META[bot].get("is_futures"):
+                            # Futures-type bots (FUTURES, CROSS) use
+                            # futures_state as the authoritative source  SCOPED
+                            # PER BOT so they don't sum each other's positions.
+                            opens[bot] = get_futures_state_count(bot, mode_is_sim=mode_is_sim[bot])
+                        else:
+                            opens[bot] = len(get_open_trades(
+                                BOT_META[bot]["log_dir"], bot,
+                                mode_is_sim=mode_is_sim[bot]))
+                    new_data["stats"] = stats
+                    new_data["open"]  = opens
+                    new_data["futures_positions"] = sum(
+                        int(opens.get(bot, 0) or 0)
+                        for bot in BOT_ORDER
+                        if BOT_META[bot].get("is_futures")
+                    )
+                    new_data.setdefault("metrics_error", "")
+                except MetricsDbReadError as exc:
+                    self._log_diag(f"metrics DB read failed: {exc}")
+                    new_data["stats"] = self.cache.get("stats", {})
+                    new_data["open"] = self.cache.get("open", {})
+                    new_data["futures_positions"] = self.cache.get(
+                        "futures_positions", 0)
+                    new_data["metrics_error"] = str(exc)[:160]
 
                 #  Sparkline (PnL trend, last ~30 closed trades) 
                 # Refresh every 30s  sparklines only change when a trade
@@ -290,6 +307,10 @@ class DataPoller:
                         try:
                             spark[bot] = get_pnl_sparkline(
                                 bot, limit=30, mode_is_sim=mode_is_sim[bot])
+                        except MetricsDbReadError as exc:
+                            self._log_diag(f"sparkline DB read failed: {exc}")
+                            new_data["metrics_error"] = str(exc)[:160]
+                            spark[bot] = self.cache.get("sparkline", {}).get(bot, [])
                         except Exception:
                             # Keep the previous values rather than wiping
                             # the chart on a transient DB hiccup
@@ -309,8 +330,15 @@ class DataPoller:
                     # gets its own unrealized shown).
                     for fut_bot in BOT_ORDER:
                         if BOT_META[fut_bot].get("is_futures"):
-                            unr[fut_bot] = get_unrealized_pnl_futures(
-                                fut_bot, mode_is_sim=mode_is_sim[fut_bot])
+                            try:
+                                unr[fut_bot] = get_unrealized_pnl_futures(
+                                    fut_bot, mode_is_sim=mode_is_sim[fut_bot])
+                            except MetricsDbReadError as exc:
+                                self._log_diag(
+                                    f"unrealized DB read failed: {exc}")
+                                unr[fut_bot] = self.cache.get(
+                                    "unrealized", {}).get(fut_bot, 0.0)
+                                new_data["metrics_error"] = str(exc)[:160]
                     # SPOT bots: live ticker prices (one batch call per bot)
                     for spot_bot in ("TREND", "SPOT"):
                         try:
@@ -333,8 +361,13 @@ class DataPoller:
                     new_data["unrealized"] = self.cache.get(
                         "unrealized", {b: 0.0 for b in BOT_ORDER})
 
-                rows = query_db("SELECT COUNT(*) FROM trades WHERE is_partial=0")
-                new_data["trades_total"] = rows[0][0] if rows else 0
+                try:
+                    rows = query_db("SELECT COUNT(*) FROM trades WHERE is_partial=0")
+                    new_data["trades_total"] = rows[0][0] if rows else 0
+                except MetricsDbReadError as exc:
+                    self._log_diag(f"trade-count DB read failed: {exc}")
+                    new_data["trades_total"] = self.cache.get("trades_total", 0)
+                    new_data["metrics_error"] = str(exc)[:160]
 
                 # Incremental read via _ErrorLogCounter  O(1) when no new errors.
                 new_data["error_count"] = self._error_counter.count()

@@ -20,6 +20,7 @@ proves out over weeks of paper trading.
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -134,13 +135,75 @@ class CrossBot(FuturesBot):
     def _safe_float(self, value, default: float = 0.0) -> float:
         try:
             out = float(value)
-            return out if out == out else default
+            return out if math.isfinite(out) else default
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _safe_positive_price(value) -> float:
+        if isinstance(value, bool):
+            return 0.0
+        try:
+            price = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return price if math.isfinite(price) and price > 0 else 0.0
+
+    @classmethod
+    def _ticker_price(cls, ticker: dict) -> float:
+        if not isinstance(ticker, dict):
+            return 0.0
+        price = cls._safe_positive_price(ticker.get("last"))
+        if price <= 0:
+            price = cls._safe_positive_price(ticker.get("close"))
+        return price
 
     def _fetch_exchange_position(self, full: str) -> tuple[dict | None, bool]:
         from bot_utils import fetch_open_position
         return fetch_open_position(self.ex, full)
+
+    def _cleanup_untracked_entry_state(self, base: str, reason: str) -> bool:
+        from core.database import remove_open_position
+
+        restore = {
+            "provisional": True,
+            "entry_inflight_until": 0.0,
+            "entry_aborted": True,
+            "entry_abort_reason": reason,
+            "claim_release_pending": True,
+        }
+        try:
+            removed = self.state.remove(base, restore)
+        except Exception as exc:
+            self._log_error(f"cross cleanup untracked state {base}", exc)
+            removed = False
+        if removed:
+            return True
+        try:
+            self.state.update_many(base, restore)
+        except Exception as exc:
+            self._log_error(f"cross mark untracked cleanup pending {base}", exc)
+        try:
+            remove_open_position(self.BOT_NAME, base)
+        except Exception as exc:
+            self._log_error(f"cross release untracked claim {base}", exc)
+        return False
+
+    def _exchange_position_type(self, pos: dict) -> str:
+        info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+        for key in ("side", "positionSide", "posSide", "holdSide", "direction"):
+            value = str(pos.get(key) or info.get(key) or "").strip().lower()
+            if value in {"long", "buy"}:
+                return "LONG"
+            if value in {"short", "sell"}:
+                return "SHORT"
+        try:
+            raw = float(pos.get("contracts") or pos.get("size") or 0.0)
+        except (TypeError, ValueError):
+            raw = 0.0
+        if raw < 0:
+            return "SHORT"
+        return ""
 
     def _verify_entry_fill(self, full: str, order: dict,
                            fallback_fill: float) -> tuple[float, float, bool, str]:
@@ -182,18 +245,86 @@ class CrossBot(FuturesBot):
             return contracts, fill, False, "position"
         return 0.0, fill, unavailable, "none"
 
+    def _rollback_untracked_live_entry(
+        self,
+        base: str,
+        full: str,
+        side: str,
+        amount: float,
+        leverage: float,
+        reason: str,
+    ) -> bool:
+        """Close a live leg when durable state could not be written."""
+        from core.logger import log_event
+        from bot_utils import create_order_with_retry, verify_position_closed
+        from config.exchange_config import reduce_only_params, safe_amount_to_precision
+
+        try:
+            amt = float(safe_amount_to_precision(self.ex, full, amount))
+        except Exception:
+            amt = float(amount or 0.0)
+        if amt <= 0:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: cannot rollback untracked "
+                f"{side} leg ({reason}) - invalid amount",
+                "ERROR",
+            )
+            return False
+        pos_side = "long" if side == "LONG" else "short"
+        close_side = "sell" if side == "LONG" else "buy"
+        lev_int = max(1, int(math.ceil(float(leverage or 1.0))))
+        try:
+            create_order_with_retry(
+                self.ex,
+                full,
+                close_side,
+                amt,
+                params=reduce_only_params(
+                    position_side=pos_side,
+                    margin_mode="cross",
+                    leverage=lev_int,
+                ),
+                shutdown_event=self._shutdown_event,
+                action_label=f"cross rollback untracked {base}",
+                log_event=log_event,
+            )
+            closed, remaining = verify_position_closed(self.ex, full)
+            if closed:
+                self._cleanup_untracked_entry_state(base, reason)
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: untracked {side} leg "
+                    f"rollback verified flat ({reason})",
+                    "WARN",
+                )
+                return True
+            log_event(
+                f"[{self.BOT_NAME}] {base}: rollback close not verified "
+                f"(remaining {remaining:g}) - claim kept for reconcile",
+                "ERROR",
+            )
+            return False
+        except Exception as exc:
+            self._log_error(f"cross rollback untracked {base}", exc)
+            log_event(
+                f"[{self.BOT_NAME}] {base}: rollback close failed after "
+                f"state write failure - claim kept for reconcile: {exc}",
+                "ERROR",
+            )
+            return False
+
     def _heal_provisional_leg(self, base: str, d: dict) -> bool:
         from core.logger import log_event
         from core.database import remove_open_position
 
         full = f"{base}/USDT:USDT"
         try:
-            if float(d.get("entry_inflight_until") or 0.0) > time.time():
-                return False
+            inflight_active = float(d.get("entry_inflight_until") or 0.0) > time.time()
         except (TypeError, ValueError):
-            pass
+            inflight_active = False
         pos, unavailable = self._fetch_exchange_position(full)
         if pos is None:
+            if inflight_active:
+                return False
             if unavailable:
                 return False
             log_event(f"[{self.BOT_NAME}] {base}: provisional leg had no "
@@ -206,6 +337,25 @@ class CrossBot(FuturesBot):
             if removed_state:
                 remove_open_position(self.BOT_NAME, base)
             return False
+
+        expected_side = str(d.get("position_type") or "").upper()
+        actual_side = self._exchange_position_type(pos)
+        if expected_side in {"LONG", "SHORT"}:
+            if not actual_side:
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: provisional leg side could "
+                    f"not be verified from exchange - kept fail-closed",
+                    "WARN",
+                )
+                return False
+            if actual_side != expected_side:
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: provisional side mismatch "
+                    f"(state {expected_side}, exchange {actual_side}) - "
+                    f"kept fail-closed for reconcile/manual review",
+                    "ERROR",
+                )
+                return False
 
         contracts = abs(self._safe_float(pos.get("contracts") or pos.get("size"), 0.0))
         entry = 0.0
@@ -1112,7 +1262,7 @@ class CrossBot(FuturesBot):
                 log_event(f"[{self.BOT_NAME}] {base}: claimed by another bot "
                           f"- skip", "WAIT")
                 return
-            self.state.add(base, {
+            provisional_added = self.state.add(base, {
                 "position_type": side,
                 "buy": exec_price,
                 "highest": exec_price,
@@ -1129,6 +1279,15 @@ class CrossBot(FuturesBot):
                 "provisional": True,
                 "entry_inflight_until": time.time() + 120.0,
             })
+            if provisional_added is False:
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: state write failed before "
+                    f"LIVE {side} entry - aborting open",
+                    "ERROR",
+                )
+                self._cleanup_untracked_entry_state(
+                    base, "state write failed before entry")
+                return
             try:
                 order = create_order_with_retry(
                     self.ex, full, order_side, contracts, params=params,
@@ -1162,8 +1321,9 @@ class CrossBot(FuturesBot):
                 try:
                     from bot_utils.futures_order import _find_order_by_client_id
                     landed = _find_order_by_client_id(self.ex, full, _cid)
-                    _amt = float((landed or {}).get("filled")
-                                 or (landed or {}).get("amount") or 0)
+                    _amt = self._safe_float((landed or {}).get("filled"), 0.0)
+                    if _amt <= 0:
+                        _amt = self._safe_float((landed or {}).get("amount"), 0.0)
                     if landed is not None and _amt > 0:
                         try:
                             from bot_utils import filled_margin_usdt
@@ -1171,7 +1331,7 @@ class CrossBot(FuturesBot):
                                 _amt, cs, exec_price, lev, margin)
                         except Exception:
                             _filled_margin = margin
-                        self.state.add(base, {
+                        landed_added = self.state.add(base, {
                             "position_type": side, "buy": exec_price,
                             "highest": exec_price, "last_price": exec_price,
                             "buy_time": _utc(), "invested_usdt": _filled_margin,
@@ -1181,6 +1341,12 @@ class CrossBot(FuturesBot):
                             "contract_size": cs,
                             "provisional": True,
                         })
+                        if landed_added is False:
+                            self._rollback_untracked_live_entry(
+                                base, full, side, _amt, lev,
+                                "landed order after open error",
+                            )
+                            return
                         _landed = True
                         log_event(f"[{self.BOT_NAME}] {base}: order landed "
                                   f"despite error - tracked provisionally", "WARN")
@@ -1238,7 +1404,7 @@ class CrossBot(FuturesBot):
         except Exception:
             stored_notional = notional
 
-        self.state.add(base, {
+        tracked = self.state.add(base, {
             "position_type": side,
             "buy": fill,
             "highest": fill,
@@ -1254,6 +1420,21 @@ class CrossBot(FuturesBot):
             "contract_size": cs,
             "provisional": provisional,
         })
+        if tracked is False:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: state write failed after "
+                f"{'LIVE' if not self.simulation else 'SIM'} {side} entry",
+                "ERROR",
+            )
+            if not self.simulation:
+                self._rollback_untracked_live_entry(
+                    base, full, side, amount, lev,
+                    "state write failed after entry",
+                )
+            else:
+                self._cleanup_untracked_entry_state(
+                    base, "sim state write failed after entry")
+            return
         if not provisional:
             log_event(f"[{self.BOT_NAME}] OPEN {side} {base} @ {fill:.6f} "
                       f"(notional {stored_notional:.1f}, margin {stored_margin:.1f}, fee {fees:.4f})", "INFO")
@@ -1967,11 +2148,14 @@ class CrossBot(FuturesBot):
             full = f"{base}/USDT:USDT"
             try:
                 tk = self.ticker_cache.get(self.ex, full, timeout=5.0, critical=True)
-                curr = float(tk.get("last") or tk.get("close") or 0)
+                curr = CrossBot._ticker_price(tk)
             except Exception:
                 curr = 0.0
+            if curr <= 0:
                 try:
-                    curr = float(self._fallback_mark_price(full) or 0.0)
+                    curr = CrossBot._safe_positive_price(
+                        self._fallback_mark_price(full)
+                    )
                 except Exception:
                     curr = 0.0
                 if curr <= 0:
@@ -1982,6 +2166,10 @@ class CrossBot(FuturesBot):
                     continue
             if curr <= 0:
                 continue
+            try:
+                self._clear_price_unavailable(base)
+            except Exception:
+                pass
             self.state.update(base, "last_price", curr)
             pos_type = d.get("position_type", "LONG")
             entry = float(d.get("buy", 0) or 0)

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from core.logger import _date as _utc_now_str
 
+import math
 import time
 
 from bot_utils import (
@@ -37,6 +38,24 @@ from bot_utils import (
 
 
 class FuturesExitsMixin:
+    @staticmethod
+    def _safe_positive_price(value) -> float:
+        if isinstance(value, bool):
+            return 0.0
+        try:
+            price = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return price if math.isfinite(price) and price > 0 else 0.0
+
+    @classmethod
+    def _ticker_price(cls, ticker: dict) -> float:
+        if not isinstance(ticker, dict):
+            return 0.0
+        price = cls._safe_positive_price(ticker.get("last"))
+        if price <= 0:
+            price = cls._safe_positive_price(ticker.get("close"))
+        return price
 
     def _retry_pending_partial_accounting(self, sym: str, d: dict) -> None:
         pending = list(d.get("accounting_pending_partials") or [])
@@ -580,11 +599,11 @@ class FuturesExitsMixin:
             # stop-loss/liquidation checks below silently stop running.
             ticker = self.ticker_cache.get(self.ex, symbol_full, timeout=5.0,
                                            critical=True)
-            curr = float(ticker.get("last") or ticker.get("close") or 0)
+            curr = FuturesExitsMixin._ticker_price(ticker)
         except Exception as e:
             curr = 0.0
             log_event(f"Monitor: Price for {sym} unavailable: {e}", "WARN")
-        if curr <= 0:
+        if not math.isfinite(curr) or curr <= 0:
             # DON'T go blind: every safety check below (liq-buffer protection,
             # SL/trailing) and the last_price write the killswitch reads live
             # PAST this point. When the ticker feed is down (delist/halt/symbol
@@ -592,7 +611,7 @@ class FuturesExitsMixin:
             # leveraged position keeps its liq protection and the daily-loss
             # killswitch keeps seeing a real drawdown instead of a stale value.
             curr = self._fallback_mark_price(symbol_full)
-        if curr <= 0:
+        if not math.isfinite(curr) or curr <= 0:
             self._note_price_unavailable(sym)
             return
         self._clear_price_unavailable(sym)

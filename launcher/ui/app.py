@@ -26,8 +26,7 @@ import time
 import tkinter as tk
 import webbrowser
 from contextlib import suppress
-from datetime import datetime, timedelta
-from tkinter import font as tkfont
+from datetime import datetime
 
 import customtkinter as ctk
 import requests as _req
@@ -56,7 +55,6 @@ from launcher.config.settings import (
     _safe_display_font,
     effective_default_config,
     load_config,
-    save_config,
     save_config_merge,
     subprocess_no_window_kwargs,
 )
@@ -78,28 +76,15 @@ try:
     from launcher.config.settings import PARAM_DEFS_FUTREND
 except ImportError:
     PARAM_DEFS_FUTREND = PARAM_DEFS_FUTURES
-from launcher.core.metrics_service import (
-    get_bot_stats,
-    get_exchange_status,
-    get_futures_state_count,
-    get_llm_info,
-    get_market_info,
-    get_open_trades,
-    get_unrealized_pnl_futures,
-    get_unrealized_pnl_spot,
-    load_json,
-    query_db,
-)
 from launcher.core.process_manager import BotProcess
 from core.runtime_status import read_runtime_status
-from launcher.core.system_monitor import HAS_PSUTIL, get_system_stats
+from launcher.core.system_monitor import HAS_PSUTIL
 from launcher.state.poller import DataPoller, _runtime_status_is_fresh
 from launcher.ui.components.widgets import (
     BadHoursRow,
     MiniBar,
     ParamRow,
     Sparkline,
-    Tooltip,
     attach_tooltip,
 )
 from launcher.ui.dialogs.prompt_editor import PromptEditor
@@ -141,7 +126,8 @@ class ObsidianApp(ctk.CTk):
         # the app under the Python interpreter icon even though the
         # window itself shows the custom icon).
         try:
-            import os as _os, sys as _sys
+            import os as _os
+            import sys as _sys
             from launcher.config.settings import PROJECT_ROOT
             _script_dir = _os.path.dirname(_os.path.abspath(__file__))
             # Search candidates in priority order
@@ -686,7 +672,9 @@ class ObsidianApp(ctk.CTk):
     def _open_env_reference(self):
         """Open env_parameter.txt (the full .env reference) in the OS default
         text viewer. Project root = three levels up from launcher/ui/app.py."""
-        import os, sys, subprocess
+        import os
+        import subprocess
+        import sys
         root = os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))))
         path = os.path.join(root, "env_parameter.txt")
@@ -1613,7 +1601,6 @@ class ObsidianApp(ctk.CTk):
         self._persist_ui_prefs()
 
     def _update_pill_appearance(self, bot: str):
-        meta = BOT_META[bot]
         pill = self.visibility_pills[bot]
         is_visible = self._visible.get(bot, True)
         if is_visible:
@@ -1653,7 +1640,6 @@ class ObsidianApp(ctk.CTk):
         for i in range(self.MAX_CARD_COLUMNS):
             self.main_frame.grid_columnconfigure(
                 i, weight=1 if i < cols else 0, minsize=0)
-        max_rows = max(1, (visible_count + cols - 1) // cols)
         for i in range(len(BOT_ORDER)):
             self.main_frame.grid_rowconfigure(i, weight=0, minsize=0)
 
@@ -2542,7 +2528,6 @@ class ObsidianApp(ctk.CTk):
         running) so the user can see what's happening.
         """
         import requests as _rq
-        import json as _json
         from launcher.config.settings import OLLAMA_URL
 
         # Pick a card to log to (prefer a running bot, fallback to first)
@@ -2667,7 +2652,7 @@ class ObsidianApp(ctk.CTk):
                                     f"Failed to save LLM_MODEL: {reason}")
                 # Show in the dialog too so the user doesn't miss it
                 try:
-                    self.sb_llm_model.configure(text=f"  (save failed)")
+                    self.sb_llm_model.configure(text="  (save failed)")
                 except Exception:
                     pass
                 return
@@ -3377,20 +3362,29 @@ class ObsidianApp(ctk.CTk):
             else:
                 card["restart_hint"].configure(text="")
 
+            metrics_error = str(cache.get("metrics_error") or "").strip()
             stats = cache.get("stats", {}).get(bot, {"pnl": 0, "total": 0, "wr": 0,
                                                           "today_pnl": 0, "today_cnt": 0})
-            sign = "+" if stats["pnl"] >= 0 else ""
-            card["pnl_var"].set(f"{sign}{stats['pnl']:.2f}")
-            color = COLORS["success"] if stats["pnl"] > 0 else COLORS["danger"] if stats["pnl"] < 0 else COLORS["text_dim"]
-            card["pnl_lbl"].configure(text_color=color)
-            card["total_var"].set(str(stats["total"]))
-            today_pnl = float(stats.get("today_pnl", 0.0) or 0.0)
-            card["today_var"].set(f"{today_pnl:+.2f}")
-            if stats["total"] > 0:
-                card["wr_var"].set(f"{stats['wr']:.0f}%")
-            else:
+            if metrics_error:
+                card["pnl_var"].set("DB ERR")
+                card["pnl_lbl"].configure(text_color=COLORS["warning"])
+                card["total_var"].set("--")
+                card["today_var"].set("--")
                 card["wr_var"].set("")
-            card["open_var"].set(str(cache.get("open", {}).get(bot, 0)))
+                card["open_var"].set("--")
+            else:
+                sign = "+" if stats["pnl"] >= 0 else ""
+                card["pnl_var"].set(f"{sign}{stats['pnl']:.2f}")
+                color = COLORS["success"] if stats["pnl"] > 0 else COLORS["danger"] if stats["pnl"] < 0 else COLORS["text_dim"]
+                card["pnl_lbl"].configure(text_color=color)
+                card["total_var"].set(str(stats["total"]))
+                today_pnl = float(stats.get("today_pnl", 0.0) or 0.0)
+                card["today_var"].set(f"{today_pnl:+.2f}")
+                if stats["total"] > 0:
+                    card["wr_var"].set(f"{stats['wr']:.0f}%")
+                else:
+                    card["wr_var"].set("")
+                card["open_var"].set(str(cache.get("open", {}).get(bot, 0)))
 
             #  Sparkline (PnL-Trend) aktualisieren 
             try:
@@ -3408,7 +3402,11 @@ class ObsidianApp(ctk.CTk):
                 payoff   = stats.get("payoff", 0.0)
                 avg_win  = stats.get("avg_win", 0.0)
                 avg_loss = stats.get("avg_loss", 0.0)
-                if stats["total"] > 0:
+                if metrics_error:
+                    card["payoff_var"].set("")
+                    card["payoff_lbl"].configure(text_color=COLORS["warning"])
+                    card["payoff_detail"].set("DB read failed")
+                elif stats["total"] > 0:
                     wr_frac = stats["wr"] / 100.0
                     # Erwartungswert pro Trade in "R": wr*payoff - (1-wr)
                     ev = wr_frac * payoff - (1.0 - wr_frac)
@@ -3472,7 +3470,6 @@ class ObsidianApp(ctk.CTk):
 
         # Sidebar Account  Dynamisches Ein-/Ausblenden je nach Bot-Modus
         live_bal = cache.get("balance_live",  "")
-        sim_bal  = cache.get("balance_paper", "")
 
         mode_cache = cache.get("mode_is_sim") or {}
 
@@ -3580,17 +3577,22 @@ class ObsidianApp(ctk.CTk):
             self.sb_balance_spot._wrap.pack_forget()
             self.sb_balance_futures._wrap.pack_forget()
 
+        metrics_error = str(cache.get("metrics_error") or "").strip()
+
         # Virtual Capital Sektion (nur sichtbar wenn mind. 1 Bot auf SIM steht)
         if any_sim:
             self.sb_balance_sim._wrap.master.pack(fill="x", pady=0)
             # Offset abziehen damit die Anzeige nach Reset bei 1000 USDT startet.
             # Only SIM bots count toward the paper Virtual Capital  a LIVE
             # bot's realized PnL must not leak into it (separate worlds).
-            all_stats = cache.get("stats", {})
-            raw_pnl   = sum(s["pnl"] for b, s in all_stats.items()
-                            if _cache_sim(b))
-            vc_value  = 1000.0 + raw_pnl - self._vc_offset
-            self.sb_balance_sim.set(f"{vc_value:.2f} USDT")
+            if metrics_error:
+                self.sb_balance_sim.set("DB ERR")
+            else:
+                all_stats = cache.get("stats", {})
+                raw_pnl   = sum(s["pnl"] for b, s in all_stats.items()
+                                if _cache_sim(b))
+                vc_value  = 1000.0 + raw_pnl - self._vc_offset
+                self.sb_balance_sim.set(f"{vc_value:.2f} USDT")
         else:
             self.sb_balance_sim._wrap.master.pack_forget()
 
@@ -3616,23 +3618,31 @@ class ObsidianApp(ctk.CTk):
             self.sb_total._header_lbl.configure(text=("LIVE PnL" if money_scope_live else "SIM PnL"))
         except Exception:
             pass
-        sign = "+" if total >= 0 else ""
-        self.sb_total.set(f"{sign}{total:.2f} USDT")
-        total_color = COLORS["success"] if total > 0 else COLORS["danger"] if total < 0 else COLORS["text_dim"]
-        self.sb_total._lbl.configure(text_color=total_color)
-
-        sign_t = "+" if total_today >= 0 else ""
-        self.sb_today.set(f"{sign_t}{total_today:.2f} USDT")
-        today_color = COLORS["success"] if total_today > 0 else COLORS["danger"] if total_today < 0 else COLORS["text_dim"]
-        self.sb_today._lbl.configure(text_color=today_color)
-
-        self.sb_trades.set(str(total_count))
-        if total_count > 0:
-            self.sb_winrate.set(f"{avg_wr:.0f}%")
-            wr_color = COLORS["success"] if avg_wr >= 50 else COLORS["warning"] if avg_wr >= 40 else COLORS["danger"]
-            self.sb_winrate._lbl.configure(text_color=wr_color)
-        else:
+        if metrics_error:
+            self.sb_total.set("DB ERR")
+            self.sb_total._lbl.configure(text_color=COLORS["warning"])
+            self.sb_today.set("--")
+            self.sb_today._lbl.configure(text_color=COLORS["warning"])
+            self.sb_trades.set("--")
             self.sb_winrate.set("")
+        else:
+            sign = "+" if total >= 0 else ""
+            self.sb_total.set(f"{sign}{total:.2f} USDT")
+            total_color = COLORS["success"] if total > 0 else COLORS["danger"] if total < 0 else COLORS["text_dim"]
+            self.sb_total._lbl.configure(text_color=total_color)
+
+            sign_t = "+" if total_today >= 0 else ""
+            self.sb_today.set(f"{sign_t}{total_today:.2f} USDT")
+            today_color = COLORS["success"] if total_today > 0 else COLORS["danger"] if total_today < 0 else COLORS["text_dim"]
+            self.sb_today._lbl.configure(text_color=today_color)
+
+            self.sb_trades.set(str(total_count))
+            if total_count > 0:
+                self.sb_winrate.set(f"{avg_wr:.0f}%")
+                wr_color = COLORS["success"] if avg_wr >= 50 else COLORS["warning"] if avg_wr >= 40 else COLORS["danger"]
+                self.sb_winrate._lbl.configure(text_color=wr_color)
+            else:
+                self.sb_winrate.set("")
 
         # Sidebar: total unrealized PnL across all bots.
         unr_cache = cache.get("unrealized", {})
@@ -3665,15 +3675,18 @@ class ObsidianApp(ctk.CTk):
                 (self.sb_cross_pos,   "CROSS",   COLORS["cross"]),
                 (self.sb_futrend_pos, "FUTREND", COLORS["futrend"])):
             _n = open_cache.get(_key, 0)
-            _pos_var.set(str(_n))
+            _pos_var.set("--" if metrics_error else str(_n))
             try:
                 _pos_var._lbl.configure(
-                    text_color=_hl if _n > 0 else COLORS["text"])
+                    text_color=COLORS["warning"] if metrics_error
+                    else _hl if _n > 0 else COLORS["text"])
             except Exception:
                 pass
         fut_open = open_cache.get("FUTURES", 0)
-        self.sb_fut_pos.set(str(fut_open))
-        if fut_open > 0:
+        self.sb_fut_pos.set("--" if metrics_error else str(fut_open))
+        if metrics_error:
+            self.sb_fut_pos._lbl.configure(text_color=COLORS["warning"])
+        elif fut_open > 0:
             self.sb_fut_pos._lbl.configure(text_color=COLORS["futures"])
         else:
             self.sb_fut_pos._lbl.configure(text_color=COLORS["text"])
@@ -3735,7 +3748,10 @@ class ObsidianApp(ctk.CTk):
             self.gpu_name_lbl.configure(text="")
 
         # Connections
-        if os.path.exists(DB_PATH):
+        if metrics_error:
+            self.sb_db.set("Read error")
+            self.sb_db._lbl.configure(text_color=COLORS["warning"])
+        elif os.path.exists(DB_PATH):
             self.sb_db.set("Connected")
             self.sb_db._lbl.configure(text_color=COLORS["success"])
         else:
@@ -3743,10 +3759,14 @@ class ObsidianApp(ctk.CTk):
             self.sb_db._lbl.configure(text_color=COLORS["danger"])
 
         ex = cache.get("exchange") or {"active": False, "label": ""}
-        self.sb_exchange.set(ex["label"])
-        self.sb_exchange._lbl.configure(
-            text_color=COLORS["success"] if ex["active"] else COLORS["text_muted"]
-        )
+        if metrics_error:
+            self.sb_exchange.set("DB Error")
+            self.sb_exchange._lbl.configure(text_color=COLORS["warning"])
+        else:
+            self.sb_exchange.set(ex["label"])
+            self.sb_exchange._lbl.configure(
+                text_color=COLORS["success"] if ex["active"] else COLORS["text_muted"]
+            )
 
         llm_enabled = any(
             BOT_META.get(bot, {}).get("uses_llm", True)

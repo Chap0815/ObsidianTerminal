@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import inspect
 import threading
+import time
 from typing import Optional, Dict, Any, List
 
 from bot_utils.state_persist import (atomic_save_json,
@@ -84,6 +85,9 @@ class TradeState:
         self._persisted_rev = 0
         self._is_futures = is_futures
         self._registry_retry_pending: Dict[str, Dict[str, Any]] = {}
+        self._registry_retry_generation: Dict[str, int] = {}
+        self._registry_retry_interval_sec = 5.0
+        self._registry_retry_next_at = 0.0
         # bot_name drives the SHARED multi-bot ownership registry
         # (bot_open_positions). When set, add()/remove() mirror the claim so
         # is_claimed_by_other() actually works (see _registry_* below).
@@ -168,6 +172,25 @@ class TradeState:
             except Exception:
                 pass
 
+    def _mark_registry_pending(self, sym: str, reason: str) -> bool:
+        if not self._bot_name:
+            return True
+        with self._lock:
+            if sym not in self._trades:
+                return False
+            self._trades[sym]["claim_registry_pending"] = True
+            self._trades[sym]["claim_registry_pending_reason"] = reason
+            self._registry_retry_pending[sym] = copy.deepcopy(self._trades[sym])
+            self._registry_retry_generation[sym] = (
+                self._registry_retry_generation.get(sym, 0) + 1
+            )
+            self._registry_retry_next_at = max(
+                self._registry_retry_next_at,
+                time.monotonic() + self._registry_retry_interval_sec,
+            )
+            rev, snapshot = self._snapshot_locked()
+        return self._persist_snapshot(rev, snapshot) in ("persisted", "stale")
+
     def _resync_registry(self, clean: Dict[str, Dict[str, Any]]) -> None:
         """Re-claim locally loaded positions at startup.
 
@@ -197,6 +220,10 @@ class TradeState:
                     )
                     pending.append(sym)
                     self._registry_retry_pending[sym] = copy.deepcopy(data)
+                    self._registry_retry_next_at = max(
+                        self._registry_retry_next_at,
+                        time.monotonic() + self._registry_retry_interval_sec,
+                    )
                     continue
                 claimed_elsewhere = _base_symbol(sym) in claimed
             except Exception:
@@ -221,23 +248,39 @@ class TradeState:
                         self._trades[sym]["claim_registry_pending_reason"] = (
                             "registry_unavailable_on_startup"
                         )
+                        self._registry_retry_pending[sym] = copy.deepcopy(
+                            self._trades[sym])
+                        self._registry_retry_generation[sym] = (
+                            self._registry_retry_generation.get(sym, 0) + 1
+                        )
                 snapshot = copy.deepcopy(self._trades)
                 self._rev += 1
                 rev = self._rev
             self._persist_snapshot(rev, snapshot)
 
-    def retry_registry_pending(self) -> int:
+    def retry_registry_pending(self, *, force: bool = True) -> int:
         """Best-effort repair for claim rows that failed during startup."""
         if not self._bot_name:
             return 0
         with self._lock:
+            if (
+                not force
+                and self._registry_retry_pending
+                and time.monotonic() < self._registry_retry_next_at
+            ):
+                return 0
             pending = {
                 sym: copy.deepcopy(self._trades.get(sym, data))
                 for sym, data in self._registry_retry_pending.items()
                 if sym in self._trades
             }
+            pending_generation = {
+                sym: self._registry_retry_generation.get(sym, 0)
+                for sym in pending
+            }
         if not pending:
             return 0
+        next_retry_at = time.monotonic() + self._registry_retry_interval_sec
         repaired = []
         conflicted = []
         for sym, data in pending.items():
@@ -256,15 +299,33 @@ class TradeState:
             except Exception:
                 pass
         if not repaired and not conflicted:
+            with self._lock:
+                if self._registry_retry_pending:
+                    self._registry_retry_next_at = max(
+                        self._registry_retry_next_at, next_retry_at)
             return 0
         with self._lock:
+            cleared_repaired = []
             for sym in repaired:
+                if (
+                    self._registry_retry_generation.get(sym, 0)
+                    != pending_generation.get(sym, 0)
+                ):
+                    continue
                 self._registry_retry_pending.pop(sym, None)
+                self._registry_retry_generation.pop(sym, None)
                 if sym in self._trades:
                     self._trades[sym].pop("claim_registry_pending", None)
                     self._trades[sym].pop("claim_registry_pending_reason", None)
+                cleared_repaired.append(sym)
             for sym in conflicted:
+                if (
+                    self._registry_retry_generation.get(sym, 0)
+                    != pending_generation.get(sym, 0)
+                ):
+                    continue
                 self._registry_retry_pending.pop(sym, None)
+                self._registry_retry_generation.pop(sym, None)
                 if sym in self._trades:
                     self._trades[sym]["claim_conflict"] = True
                     self._trades[sym]["claim_conflict_reason"] = (
@@ -272,9 +333,12 @@ class TradeState:
                     )
                     self._trades[sym].pop("claim_registry_pending", None)
                     self._trades[sym].pop("claim_registry_pending_reason", None)
+            self._registry_retry_next_at = (
+                0.0 if not self._registry_retry_pending else next_retry_at
+            )
             rev, snapshot = self._snapshot_locked()
         self._persist_snapshot(rev, snapshot)
-        return len(repaired)
+        return len(cleared_repaired)
 
     #  Reads (always return deep copies) 
 
@@ -293,30 +357,30 @@ class TradeState:
 
     def get_all(self) -> dict:
         """Deep-copy snapshot of all trades  safe to iterate without lock."""
-        self.retry_registry_pending()
+        self.retry_registry_pending(force=False)
         with self._lock:
             return copy.deepcopy(self._trades)
 
     def get(self, sym: str) -> Optional[dict]:
         """Deep-copy of one trade, or None."""
-        self.retry_registry_pending()
+        self.retry_registry_pending(force=False)
         with self._lock:
             if sym not in self._trades:
                 return None
             return copy.deepcopy(self._trades[sym])
 
     def count(self) -> int:
-        self.retry_registry_pending()
+        self.retry_registry_pending(force=False)
         with self._lock:
             return len(self._trades)
 
     def has(self, sym: str) -> bool:
-        self.retry_registry_pending()
+        self.retry_registry_pending(force=False)
         with self._lock:
             return sym in self._trades
 
     def keys(self) -> List[str]:
-        self.retry_registry_pending()
+        self.retry_registry_pending(force=False)
         with self._lock:
             return list(self._trades.keys())
 
@@ -375,7 +439,11 @@ class TradeState:
         # like the JSON write). This is what makes is_claimed_by_other() work
         # so another bot won't open the SAME perp and net against us.
         registry_ok = self._registry_upsert(sym, data)
-        return status in ("persisted", "stale") and registry_ok
+        state_ok = status in ("persisted", "stale")
+        if not registry_ok and status in ("persisted", "stale"):
+            registry_ok = self._mark_registry_pending(
+                sym, "registry_add_failed")
+        return state_ok and registry_ok
 
     def update(self, sym: str, key: str, value) -> bool:
         """Set one field on an existing trade. Returns False if not durable."""
@@ -395,6 +463,9 @@ class TradeState:
             registry_ok = True
             if claim_row is not None:
                 registry_ok = self._registry_upsert(sym, claim_row)
+                if not registry_ok:
+                    registry_ok = self._mark_registry_pending(
+                        sym, "registry_update_failed")
             return status in ("persisted", "stale") and registry_ok
         return False
 
@@ -413,6 +484,9 @@ class TradeState:
             registry_ok = True
             if claim_row is not None:
                 registry_ok = self._registry_upsert(sym, claim_row)
+                if not registry_ok:
+                    registry_ok = self._mark_registry_pending(
+                        sym, "registry_update_failed")
             return status in ("persisted", "stale") and registry_ok
         return False
 

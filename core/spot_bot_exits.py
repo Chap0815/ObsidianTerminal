@@ -14,6 +14,7 @@ scan cycle that may include 30-90s LLM-analysis calls.
 """
 from __future__ import annotations
 
+import math
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -57,6 +58,19 @@ _BE_FEE_BUFFER = 0.003
 _LIVE_RESIDUAL_DUST_USDT = 1.0
 
 
+def _finite_float(value, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _positive_finite(value, default: float = 0.0) -> float:
+    parsed = _finite_float(value, default)
+    return parsed if parsed > 0 else default
+
+
 def _utc_now_str() -> str:
     """Exchange-anchored UTC timestamp. sell_time is later read by funding
     estimation that assumes UTC, so a local-time stamp would mis-attribute
@@ -79,19 +93,13 @@ def _position_age_hours(d: dict) -> Optional[float]:
 
 def _filled_base_amount(order, wrapper_sold, requested_amount: float) -> float:
     """Best-effort base amount that actually filled, capped to the request."""
-    requested = max(0.0, float(requested_amount or 0.0))
+    requested = _positive_finite(requested_amount)
     if isinstance(order, dict):
         for key in ("filled",):
-            try:
-                value = float(order.get(key) or 0.0)
-            except (TypeError, ValueError):
-                value = 0.0
+            value = _positive_finite(order.get(key))
             if value > 0:
                 return min(requested, value)
-    try:
-        sold = float(wrapper_sold or 0.0)
-    except (TypeError, ValueError):
-        sold = 0.0
+    sold = _positive_finite(wrapper_sold)
     if sold > 0:
         return min(requested, sold)
     return 0.0
@@ -292,7 +300,7 @@ class ExitsMixin:
         """
         from core.database import get_today_pnl, opened_today_local
         pnl_info = get_today_pnl(self.BOT_NAME, mode_is_sim=self.simulation)
-        today_realized = float(pnl_info.get("total_profit", 0.0))
+        today_realized = _finite_float(pnl_info.get("total_profit", 0.0))
 
         unrealized = 0.0
         for sym, d in trades.items():
@@ -302,10 +310,10 @@ class ExitsMixin:
                 # frame via opened_today_local, not a naive UTC-string prefix.
                 if not opened_today_local(d.get("buy_time", "")):
                     continue
-                buy = float(d.get("buy", 0))
-                amt = float(d.get("amount", 0))
+                buy = _positive_finite(d.get("buy"))
+                amt = _positive_finite(d.get("amount"))
                 # last_price first; fall back to buy (NOT highest).
-                last = float(d.get("last_price") or 0)
+                last = _positive_finite(d.get("last_price"))
                 if last <= 0:
                     last = buy
                 if buy <= 0 or amt <= 0 or last <= 0:
@@ -317,9 +325,10 @@ class ExitsMixin:
                 # Remaining proportional ENTRY fee  same basis the real close
                 # uses (safe_proportional_fee), so partial-sold positions don't
                 # re-subtract the already-realized partial-close fee.
-                initial_entry_fee = float(
+                initial_entry_fee = _positive_finite(
                     d.get("initial_entry_fee", d.get("fees_paid", 0.0)))
-                original_amount = float(d.get("original_amount", amt))
+                original_amount = _positive_finite(
+                    d.get("original_amount"), amt)
                 remaining_entry_fee = safe_proportional_fee(
                     initial_entry_fee, amt, original_amount,
                     partial_sold=bool(d.get("partial_sold")),
@@ -328,9 +337,10 @@ class ExitsMixin:
                 close_fee_est = amt * last * _UNREALIZED_CLOSE_FEE_RATE
 
                 unrealized += gross - remaining_entry_fee - close_fee_est
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
-        return today_realized + unrealized
+        total = today_realized + unrealized
+        return total if math.isfinite(total) else today_realized
 
     @staticmethod
     def _should_kill(total_today_pnl: float, max_daily_loss: float) -> bool:
@@ -356,8 +366,11 @@ class ExitsMixin:
         try:
             from bot_utils.api_budget import record_api_error, try_consume_api_call
         except ImportError:
-            record_api_error = lambda **kw: None
-            try_consume_api_call = lambda *a, **kw: True
+            def record_api_error(**kw):
+                return None
+
+            def try_consume_api_call(*a, **kw):
+                return True
 
         pairs = [f"{s}/USDT" for s in symbols]
         for i in range(0, len(pairs), TICKER_BATCH_SIZE):
@@ -578,9 +591,11 @@ class ExitsMixin:
         if d.get("accounting_pending_partials"):
             return
 
-        buy = d.get("buy", 0)
-        if buy <= 0:
+        buy = _positive_finite(d.get("buy"))
+        curr = _positive_finite(curr)
+        if buy <= 0 or curr <= 0:
             return
+        d["buy"] = buy
         prof = ((curr - buy) / buy) * 100
 
         # Keep the in-memory ``d["last_price"]`` fresh every tick (all the
@@ -634,21 +649,22 @@ class ExitsMixin:
     def _evaluate_full_exit(self, d: dict, curr: float,
                              prof: float, high_prof: float):
         """Pure decision function: return (should_sell, reason)."""
-        initial_sl = float(self.C("INITIAL_STOP_LOSS"))
-        activation_profit = float(self.C("ACTIVATION_PROFIT"))
-        trailing_dist = float(self.C("TRAILING_DISTANCE"))
-        post_partial_trailing_dist = float(
-            self.C("POST_PARTIAL_TRAILING_DISTANCE", trailing_dist))
+        initial_sl = _finite_float(self.C("INITIAL_STOP_LOSS"))
+        activation_profit = _finite_float(self.C("ACTIVATION_PROFIT"))
+        trailing_dist = _positive_finite(self.C("TRAILING_DISTANCE"))
+        post_partial_trailing_dist = _positive_finite(
+            self.C("POST_PARTIAL_TRAILING_DISTANCE", trailing_dist),
+            trailing_dist)
         if (post_partial_trailing_dist <= 0.0
                 or (activation_profit > 0.0
                     and post_partial_trailing_dist >= activation_profit)):
             post_partial_trailing_dist = trailing_dist
-        highest = d.get("highest", d.get("buy", 0))
-        buy = d.get("buy", 0)
+        buy = _positive_finite(d.get("buy"))
+        highest = _positive_finite(d.get("highest"), buy)
 
         # be_active: BREAKEVEN_TRIGGER fired  SL tightened to entry + fee buffer
         if d.get("be_active") and not d.get("break_even"):
-            be_price = float(d.get("be_price", buy))
+            be_price = _positive_finite(d.get("be_price"), buy)
             if curr <= be_price:
                 return True, "Break-Even Stop"
             if prof <= initial_sl:
@@ -674,8 +690,8 @@ class ExitsMixin:
         # positions, so it frees capital for new entries rather than cutting
         # frequency.
         try:
-            max_hold_h = float(self.C("MAX_HOLD_HOURS", 0) or 0)
-        except (TypeError, ValueError):
+            max_hold_h = _finite_float(self.C("MAX_HOLD_HOURS", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
             max_hold_h = 0.0
         if (max_hold_h > 0 and not d.get("break_even")
                 and prof < activation_profit):
@@ -702,8 +718,26 @@ class ExitsMixin:
         except ImportError:
             close_lock = None
 
-        partial_pct = float(self.C("PARTIAL_SELL_PCT"))
-        amount = d.get("amount", 0)
+        partial_pct = _finite_float(self.C("PARTIAL_SELL_PCT"))
+        if not 0 < partial_pct < 1:
+            log_event(
+                f" {sym}: invalid PARTIAL_SELL_PCT={partial_pct!r}  "
+                f"partial-TP skipped",
+                "WARN",
+            )
+            return False
+        amount = _positive_finite(d.get("amount"))
+        invested = _positive_finite(d.get("invested_usdt"))
+        curr = _positive_finite(curr)
+        if amount <= 0 or invested <= 0 or curr <= 0:
+            log_event(
+                f" {sym}: invalid partial-TP basis "
+                f"(amount={d.get('amount')!r}, "
+                f"invested={d.get('invested_usdt')!r}, price={curr!r})  "
+                f"skipped",
+                "WARN",
+            )
+            return False
 
         # Scale the partial up if the slice would be too small (rather than
         # skipping), and read per-symbol min-notional from exchange markets
@@ -713,7 +747,7 @@ class ExitsMixin:
             markets = getattr(self.ex, "markets", {}) or {}
             mkt = markets.get(f"{sym}/USDT") or {}
             cost_min = ((mkt.get("limits") or {}).get("cost") or {}).get("min")
-            min_notional = float(cost_min) if cost_min else MIN_NOTIONAL_BUFFER
+            min_notional = _positive_finite(cost_min, MIN_NOTIONAL_BUFFER)
         except Exception:
             min_notional = MIN_NOTIONAL_BUFFER
 
@@ -779,13 +813,21 @@ class ExitsMixin:
                     or d_live.get("partial_tp_blocked_min_notional")):
                 return False
             try:
-                live_amount = float(d_live.get("amount", 0) or 0)
+                live_amount = _positive_finite(d_live.get("amount"))
             except (TypeError, ValueError):
                 live_amount = 0.0
+            live_invested = _positive_finite(d_live.get("invested_usdt"))
             live_sld_test = live_amount * partial_pct
             live_rem_test = live_amount - live_sld_test
-            if (live_amount <= 0
-                    or live_sld_test * curr < min_notional
+            if live_amount <= 0 or live_invested <= 0:
+                log_event(
+                    f" {sym}: invalid live partial-TP state "
+                    f"(amount={d_live.get('amount')!r}, "
+                    f"invested={d_live.get('invested_usdt')!r})  skipped",
+                    "WARN",
+                )
+                return False
+            if (live_sld_test * curr < min_notional
                     or live_rem_test * curr < min_notional):
                 self.state.update_many(sym, {
                     "partial_tp_blocked_min_notional": True,
@@ -809,8 +851,20 @@ class ExitsMixin:
         from core.database import save_trade_db
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
-        buy = d.get("buy", 0)
-        amount = d.get("amount", 0)
+        buy = _positive_finite(d.get("buy"))
+        amount = _positive_finite(d.get("amount"))
+        current_invested = _positive_finite(d.get("invested_usdt"))
+        curr = _positive_finite(curr)
+        sld_test = _positive_finite(sld_test)
+        if buy <= 0 or amount <= 0 or current_invested <= 0 or curr <= 0:
+            log_event(
+                f" {sym}: invalid partial-TP state "
+                f"(buy={d.get('buy')!r}, amount={d.get('amount')!r}, "
+                f"invested={d.get('invested_usdt')!r}, price={curr!r})  "
+                f"skipped",
+                "WARN",
+            )
+            return False
 
         # Execute the partial sell
         fill_price = curr
@@ -839,7 +893,8 @@ class ExitsMixin:
                         f"(status={_st})  NOT booking, retry next tick", "WARN")
                     return False
                 exch_oid = order.get("id") or order.get("orderId")
-                fill_price = extract_fill_price(order, curr)
+                fill_price = _positive_finite(
+                    extract_fill_price(order, curr), curr)
                 try:
                     from trading.fee_utils import extract_or_estimate_with_refetch
                     partial_fee = extract_or_estimate_with_refetch(
@@ -854,8 +909,9 @@ class ExitsMixin:
 
         # Compute PnL with proportional entry fee
         real_prof_pct = ((fill_price - buy) / buy) * 100 if buy > 0 else 0.0
-        initial_entry_fee = float(d.get("initial_entry_fee", d.get("fees_paid", 0.0)))
-        original_amount = float(d.get("original_amount", amount))
+        initial_entry_fee = _positive_finite(
+            d.get("initial_entry_fee", d.get("fees_paid", 0.0)))
+        original_amount = _positive_finite(d.get("original_amount"), amount)
         # Safe proportional fee  won't double-deduct if state corrupted
         prop_entry_fee = safe_proportional_fee(
             initial_entry_fee, sold_amount, original_amount,
@@ -891,9 +947,9 @@ class ExitsMixin:
             self._log_error(f"spot partial save_trade_db {sym}", e)
 
         # Update state
-        new_invested = max(0.0, float(d.get("invested_usdt", 0)) - sold_invested)
+        new_invested = max(0.0, current_invested - sold_invested)
         new_amount = safe_remaining(amount, sold_amount)
-        new_fees_paid = float(d.get("fees_paid", 0.0)) + partial_fee
+        new_fees_paid = _positive_finite(d.get("fees_paid", 0.0)) + partial_fee
         updates = {
             "partial_sold": True,
             "invested_usdt": new_invested,
@@ -977,11 +1033,28 @@ class ExitsMixin:
         # make us sell a stale `amount`.
         d = d_live
 
-        buy = d.get("buy", 0)
-        fill_price = curr
+        buy = _positive_finite(d.get("buy"))
+        remaining_amount = _positive_finite(d.get("amount"))
+        current_invested = _positive_finite(d.get("invested_usdt"))
+        if remaining_amount <= 0:
+            log_event(
+                f" {sym}: invalid spot close amount in state "
+                f"({d.get('amount')!r})  keeping position for reconcile",
+                "WARN",
+            )
+            return
+        if buy <= 0 or current_invested <= 0:
+            log_event(
+                f" {sym}: invalid spot cost basis in state "
+                f"(buy={d.get('buy')!r}, invested={d.get('invested_usdt')!r}) "
+                f" keeping position for manual/reconcile review",
+                "WARN",
+            )
+            return
+
+        fill_price = _positive_finite(curr, buy)
         close_fee = 0.0
-        remaining_amount = d.get("amount", 0)
-        requested_amount = float(remaining_amount or 0.0)
+        requested_amount = remaining_amount
         partial_live_fill = False
         exch_oid = None  # real order id  unique trade-dedup key
         if self.simulation:
@@ -1027,7 +1100,8 @@ class ExitsMixin:
                         self._log_error(f"sell-unfilled cooldown set {sym}", ce)
                     return
                 exch_oid = order.get("id") or order.get("orderId")
-                fill_price = extract_fill_price(order, curr)
+                fill_price = _positive_finite(
+                    extract_fill_price(order, fill_price), fill_price)
                 residual_amount = safe_remaining(requested_amount, filled_amount)
                 if residual_amount * fill_price > _LIVE_RESIDUAL_DUST_USDT:
                     partial_live_fill = True
@@ -1094,23 +1168,24 @@ class ExitsMixin:
 
         # Proportional entry fee  safe helper won't double-deduct if
         # original_amount is missing AND a partial-TP already executed.
-        initial_entry_fee = float(d.get("initial_entry_fee", d.get("fees_paid", 0.0)))
-        original_amount = float(d.get("original_amount", remaining_amount))
+        initial_entry_fee = _positive_finite(
+            d.get("initial_entry_fee", d.get("fees_paid", 0.0)))
+        original_amount = _positive_finite(
+            d.get("original_amount"), remaining_amount)
         proportional_entry_fee = safe_proportional_fee(
             initial_entry_fee, remaining_amount, original_amount,
             partial_sold=bool(d.get("partial_sold"))
         )
-        accumulated_fees = float(d.get("fees_paid", 0.0)) + close_fee
+        accumulated_fees = _positive_finite(d.get("fees_paid", 0.0)) + close_fee
         profit_usdt = round(
             remaining_amount * (fill_price - buy)
             - proportional_entry_fee - close_fee, 2
         )
-        current_invested = max(0.0, float(d.get("invested_usdt", 0.0) or 0.0))
         if partial_live_fill and requested_amount > 0:
             booked_invested = current_invested * (remaining_amount / requested_amount)
             booked_reason = f"{reason} (partial fill)"
         else:
-            booked_invested = d.get("invested_usdt", 0)
+            booked_invested = current_invested
             booked_reason = reason
 
         sell_time = _utc_now_str()

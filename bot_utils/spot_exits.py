@@ -4,6 +4,7 @@ bot_utils/spot_exits.py  Spot market-sell + emergency-close helpers.
 from __future__ import annotations
 
 
+import math
 from decimal import Decimal, ROUND_DOWN
 from typing import Tuple, Callable, Optional
 
@@ -13,6 +14,40 @@ _EMERGENCY_RESIDUAL_DUST_USDT = 1.0
 
 
 #  Helpers 
+
+def _finite_float(value, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _positive_finite(value, default: float = 0.0) -> float:
+    parsed = _finite_float(value, default)
+    return parsed if parsed > 0 else default
+
+
+def _positive_finite_decimal(value) -> Optional[Decimal]:
+    try:
+        parsed = Decimal(str(value))
+    except Exception:
+        return None
+    return parsed if parsed.is_finite() and parsed > 0 else None
+
+
+def _precision_mode_is_tick_size(ex, market: dict) -> bool:
+    mode = market.get("precisionMode")
+    if mode is None:
+        mode = getattr(ex, "precisionMode", None)
+    if isinstance(mode, str):
+        return mode.strip().lower() in {"tick_size", "ticksize", "tick-size"}
+    try:
+        # ccxt.TICK_SIZE is 4; avoid importing ccxt in this hot helper.
+        return int(mode) == 4
+    except (TypeError, ValueError, OverflowError):
+        return False
+
 
 def _utc_now_str() -> str:
     """UTC timestamp  lazy import to avoid circular dependency."""
@@ -39,7 +74,7 @@ def _exchange_min_amount(ex, symbol_pair: str) -> Optional[Decimal]:
         mn = amt_limits.get("min")
         if mn is None:
             return None
-        return Decimal(str(mn))
+        return _positive_finite_decimal(mn)
     except Exception:
         return None
 
@@ -61,13 +96,19 @@ def _exchange_precision_step(ex, symbol_pair: str) -> Optional[Decimal]:
         # a Decimal-like step depending on the exchange.
         try:
             pf = float(prec)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
+        if not math.isfinite(pf):
+            return None
+        if _precision_mode_is_tick_size(ex, mkt):
+            return _positive_finite_decimal(prec)
+        if pf == 0:
+            return Decimal("1")
         if pf >= 1 and pf == int(pf):
             # Likely "number of decimal places"  convert to step
             return Decimal(10) ** -int(pf)
         if pf > 0:
-            return Decimal(str(pf))
+            return _positive_finite_decimal(pf)
         return None
     except Exception:
         return None
@@ -112,24 +153,21 @@ def _free_base_balance(ex, symbol_pair: str):
             sub = bal.get(base)
             if isinstance(sub, dict):
                 free = sub.get("free")
-        return float(free) if free is not None else None
+        if free is None:
+            return None
+        parsed = float(free)
+        return parsed if math.isfinite(parsed) and parsed >= 0 else None
     except Exception:
         return None
 
 
 def _filled_base_amount(order, wrapper_sold, requested_amount: float) -> float:
-    requested = max(0.0, float(requested_amount or 0.0))
+    requested = _positive_finite(requested_amount)
     if isinstance(order, dict):
-        try:
-            filled = float(order.get("filled") or 0.0)
-        except (TypeError, ValueError):
-            filled = 0.0
+        filled = _positive_finite(order.get("filled"))
         if filled > 0:
             return min(requested, filled)
-    try:
-        sold = float(wrapper_sold or 0.0)
-    except (TypeError, ValueError):
-        sold = 0.0
+    sold = _positive_finite(wrapper_sold)
     if sold > 0:
         return min(requested, sold)
     return 0.0
@@ -173,17 +211,14 @@ def _order_has_open_remainder(order) -> bool:
         return True
     if status:
         return False
-    try:
-        return float(order.get("remaining") or 0.0) > 0
-    except (TypeError, ValueError):
-        return False
+    return _positive_finite(order.get("remaining")) > 0
 
 
 def _emergency_residual_amount(ex, symbol_pair: str, requested_amount: float,
                                sold_amount: float, fill_price: float,
                                order=None) -> float:
-    requested = max(0.0, float(requested_amount or 0.0))
-    sold = max(0.0, float(sold_amount or 0.0))
+    requested = _positive_finite(requested_amount)
+    sold = _positive_finite(sold_amount)
     by_fill = max(0.0, requested - sold)
     if by_fill <= 0 or fill_price <= 0:
         return 0.0
@@ -197,7 +232,7 @@ def _emergency_residual_amount(ex, symbol_pair: str, requested_amount: float,
         free = None
     residual = by_fill
     if free is not None and free >= 0:
-        residual = min(residual, float(free))
+        residual = min(residual, _positive_finite(free))
     if residual * fill_price <= _EMERGENCY_RESIDUAL_DUST_USDT:
         return 0.0
     return min(residual, requested)
@@ -234,19 +269,23 @@ def spot_market_sell_safe(ex, symbol_pair: str, raw_amount: float
     many meme-coin listings work), falling back to 0.0001 only as a last resort.
     """
     rounded: float
+    safe_raw_amount = _positive_finite(raw_amount)
+    if safe_raw_amount <= 0:
+        raise ValueError(f"amount {raw_amount} is not positive finite")
     try:
-        rounded = float(ex.amount_to_precision(symbol_pair, raw_amount))
+        rounded = _positive_finite(
+            ex.amount_to_precision(symbol_pair, safe_raw_amount))
     except Exception:
         # Prefer market-metadata-derived step
         step = (_exchange_precision_step(ex, symbol_pair)
                  or _exchange_min_amount(ex, symbol_pair)
                  or Decimal("0.0001"))
-        amt_dec = Decimal(str(raw_amount))
+        amt_dec = Decimal(str(safe_raw_amount))
         try:
-            rounded = float(_round_to_step(amt_dec, step))
+            rounded = _positive_finite(_round_to_step(amt_dec, step))
         except Exception:
-            rounded = float(amt_dec.quantize(Decimal("0.0001"),
-                                              rounding=ROUND_DOWN))
+            rounded = _positive_finite(
+                amt_dec.quantize(Decimal("0.0001"), rounding=ROUND_DOWN))
 
     if rounded <= 0:
         raise ValueError(f"amount {raw_amount} rounded to {rounded}  invalid")
@@ -271,13 +310,13 @@ def spot_market_sell_safe(ex, symbol_pair: str, raw_amount: float
             steps_to_try.append(sd)
 
     last_exc: Optional[Exception] = None
-    raw_dec = Decimal(str(raw_amount))
+    raw_dec = Decimal(str(safe_raw_amount))
     _balance_capped = False   # re-read free balance at most once on Oversold
     for step in steps_to_try:
         if step is None:
             amt = rounded
         else:
-            amt = float(_round_to_step(raw_dec, step))
+            amt = _positive_finite(_round_to_step(raw_dec, step))
         if amt <= 0:
             continue
         try:
@@ -386,15 +425,33 @@ def emergency_close_all_spot(*,
                 continue
 
             try:
-                buy_price = float(d.get("buy", 0))
-                amount = float(d.get("amount", 0))
-                margin = float(d.get("invested_usdt", 0))
+                buy_price = _positive_finite(d.get("buy"))
+                amount = _positive_finite(d.get("amount"))
+                margin = _positive_finite(d.get("invested_usdt"))
                 symbol_pair = f"{sym}/USDT"
+                if amount <= 0:
+                    failed.append(f"{sym}: invalid state amount")
+                    log_event(
+                        f"Emergency: invalid amount for {sym} "
+                        f"({d.get('amount')!r})  keeping state",
+                        "WARN",
+                    )
+                    continue
+                if buy_price <= 0 or margin <= 0:
+                    failed.append(f"{sym}: invalid state cost basis")
+                    log_event(
+                        f"Emergency: invalid cost basis for {sym} "
+                        f"(buy={d.get('buy')!r}, invested={d.get('invested_usdt')!r}) "
+                        f" keeping state",
+                        "WARN",
+                    )
+                    continue
 
                 curr = 0.0
                 try:
                     ticker = ex.fetch_ticker(symbol_pair)
-                    curr = float(ticker.get("last") or ticker.get("close") or 0)
+                    curr = _positive_finite(
+                        ticker.get("last") or ticker.get("close"))
                 except Exception as e:
                     log_event(f"  Price for {sym} unavailable: {e}", "WARN")
                 if curr <= 0:
@@ -402,9 +459,10 @@ def emergency_close_all_spot(*,
 
                 profit_pct = ((curr - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
 
-                initial_entry_fee = float(d.get("initial_entry_fee",
-                                                  d.get("fees_paid", 0.0)))
-                original_amount = float(d.get("original_amount", amount))
+                initial_entry_fee = _positive_finite(
+                    d.get("initial_entry_fee", d.get("fees_paid", 0.0)))
+                original_amount = _positive_finite(
+                    d.get("original_amount"), amount)
                 from bot_utils import safe_proportional_fee
                 proportional_entry_fee = safe_proportional_fee(
                     initial_entry_fee, amount, original_amount,
@@ -470,7 +528,8 @@ def emergency_close_all_spot(*,
                             continue
                         exch_oid = order.get("id") or order.get("orderId")
                         sold_amount = _filled_base_amount(order, _sold, amount)
-                        fill_price = extract_fill_price(order, curr)
+                        fill_price = _positive_finite(
+                            extract_fill_price(order, curr), curr)
                         proportional_entry_fee = safe_proportional_fee(
                             initial_entry_fee, sold_amount, original_amount,
                             partial_sold=bool(d.get("partial_sold"))

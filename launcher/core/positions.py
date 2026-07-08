@@ -24,6 +24,7 @@ Nothing here imports tkinter directly. Keep it that way.
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import datetime, timezone
 
@@ -42,6 +43,50 @@ def _utc_now_str() -> str:
 
 
 _LIVE_RESIDUAL_DUST_USDT = 1.0
+
+
+def _finite_float(value) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _positive_finite(value) -> float | None:
+    parsed = _finite_float(value)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def _non_negative_finite(value) -> float | None:
+    parsed = _finite_float(value)
+    return parsed if parsed is not None and parsed >= 0 else None
+
+
+def _state_value_prefer_key(row: dict, preferred: str, legacy: str):
+    return row.get(preferred) if preferred in row else row.get(legacy)
+
+
+def _invalid_spot_position_row(
+    symbol: str,
+    row: dict | None,
+    detail: str,
+    simulation: bool,
+) -> dict:
+    row = row or {}
+    return {
+        "symbol": symbol,
+        "mode": "SIM" if bool(simulation) else "LIVE",
+        "buy_price": 0.0,
+        "current_price": 0.0,
+        "amount": 0.0,
+        "invested_usdt": 0.0,
+        "buy_time": row.get("buy_time") or row.get("opened_at"),
+        "unrealized_pnl": 0.0,
+        "unrealized_pct": 0.0,
+        "invalid_state": True,
+        "state_error": detail,
+    }
 
 
 def _clamp_sim_cross_close_costs(
@@ -83,21 +128,86 @@ def _clamp_sim_cross_close_costs(
 
 
 def _filled_base_amount(order, wrapper_sold, requested_amount: float) -> float:
-    requested = max(0.0, float(requested_amount or 0.0))
+    requested = _positive_finite(requested_amount) or 0.0
     if isinstance(order, dict):
-        try:
-            filled = float(order.get("filled") or 0.0)
-        except (TypeError, ValueError):
-            filled = 0.0
+        filled = _positive_finite(order.get("filled")) or 0.0
         if filled > 0:
             return min(requested, filled)
-    try:
-        sold = float(wrapper_sold or 0.0)
-    except (TypeError, ValueError):
-        sold = 0.0
+    sold = _positive_finite(wrapper_sold) or 0.0
     if sold > 0:
         return min(requested, sold)
     return 0.0
+
+
+def _normalized_spot_pending_trade(item: dict) -> dict | None:
+    row = dict(item)
+    buy_price = _positive_finite(row.get("buy_price"))
+    sell_price = _positive_finite(row.get("sell_price"))
+    profit_pct = _finite_float(row.get("profit_pct"))
+    profit_usdt = _finite_float(row.get("profit_usdt"))
+    invested_usdt = _positive_finite(row.get("invested_usdt"))
+    fees_usdt = _non_negative_finite(row.get("fees_usdt", 0.0))
+    if (
+        buy_price is None
+        or sell_price is None
+        or profit_pct is None
+        or profit_usdt is None
+        or invested_usdt is None
+        or fees_usdt is None
+    ):
+        return None
+    row.update({
+        "buy_price": buy_price,
+        "sell_price": sell_price,
+        "profit_pct": profit_pct,
+        "profit_usdt": profit_usdt,
+        "invested_usdt": invested_usdt,
+        "fees_usdt": fees_usdt,
+    })
+    return row
+
+
+def _normalized_futures_pending_trade(item: dict) -> dict | None:
+    row = dict(item)
+    buy_price = _positive_finite(row.get("buy_price"))
+    sell_price = _positive_finite(row.get("sell_price"))
+    profit_pct = _finite_float(row.get("profit_pct"))
+    profit_usdt = _finite_float(row.get("profit_usdt"))
+    invested_usdt = _positive_finite(row.get("invested_usdt"))
+    leverage = _positive_finite(row.get("leverage", 1.0))
+    liquidation_price = _non_negative_finite(row.get("liquidation_price", 0.0))
+    funding_paid = _finite_float(row.get("funding_paid", 0.0))
+    fees_usdt = _non_negative_finite(row.get("fees_usdt", 0.0))
+    if (
+        buy_price is None
+        or sell_price is None
+        or profit_pct is None
+        or profit_usdt is None
+        or invested_usdt is None
+        or leverage is None
+        or liquidation_price is None
+        or funding_paid is None
+        or fees_usdt is None
+    ):
+        return None
+    for optional_key in ("mfe_pct", "mae_pct", "giveback_pct"):
+        if row.get(optional_key) is not None:
+            optional_value = _finite_float(row.get(optional_key))
+            if optional_value is None:
+                return None
+            row[optional_key] = optional_value
+    row.update({
+        "buy_price": buy_price,
+        "sell_price": sell_price,
+        "profit_pct": profit_pct,
+        "profit_usdt": profit_usdt,
+        "invested_usdt": invested_usdt,
+        "leverage": leverage,
+        "liquidation_price": liquidation_price,
+        "funding_paid": funding_paid,
+        "fees_usdt": fees_usdt,
+    })
+    return row
 
 
 def _state_path_for(bot_name: str, simulation: bool | None = None) -> str:
@@ -151,24 +261,21 @@ def _json_state_has_open_position(path: str) -> bool:
         return False
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
+            data = json.load(f)
     except Exception:
+        return True
+    if data is None:
         return False
     if not isinstance(data, dict):
-        return False
+        return True
     for row in data.values():
         if not isinstance(row, dict):
-            continue
+            return True
         if str(row.get("state", "OPEN")).upper() == "CLOSED":
             continue
-        try:
-            amount = float(row.get("amount") or 0)
-        except (TypeError, ValueError):
-            amount = 0.0
-        # Fail closed: if a state row still has size, missing/malformed entry
-        # price must not make SIM/LIVE switching look safe.
-        if amount > 0:
-            return True
+        # Fail closed: a non-CLOSED state row is an open artifact even if
+        # its amount is missing, zero, negative or malformed.
+        return True
     return False
 
 
@@ -232,15 +339,35 @@ def get_open_spot_positions(bot_name: str,
         if not os.path.exists(path):
             return []
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
-    except Exception:
+            loaded_state = json.load(f)
+        if loaded_state is None:
+            data = {}
+        elif isinstance(loaded_state, dict):
+            data = loaded_state
+        else:
+            detail = f"Spot state read failed: expected object in {path}"
+            if strict:
+                raise RuntimeError(detail)
+            return [_invalid_spot_position_row(
+                "STATE", {}, detail, bool(effective_sim))]
+    except Exception as e:
         if strict:
             raise
-        return []
+        detail = f"Spot state read failed: {e}"
+        return [_invalid_spot_position_row(
+            "STATE", {}, detail, bool(effective_sim))]
 
     positions: list = []
     for sym, d in data.items():
         if not isinstance(d, dict):
+            detail = (
+                f"invalid open spot state for {sym}: "
+                f"expected object, got {type(d).__name__}"
+            )
+            if strict:
+                raise RuntimeError(detail)
+            positions.append(_invalid_spot_position_row(
+                sym, {}, detail, bool(effective_sim)))
             continue
         # Skip entries explicitly marked CLOSED (StateManager schema)
         # so we don't show partial-TP residue or stale closed positions.
@@ -248,33 +375,44 @@ def get_open_spot_positions(bot_name: str,
             continue
         # Prefer the new key, fall back to the old. Entries may have only
         # one or the other depending on which writer ran last.
-        buy_price = float(d.get("buy_price") or d.get("buy") or 0)
-        # Skip corrupted entries with buy_price=0  these would render as
-        # 0.000000 in the stop dialog. TradeState.add() rejects them on
-        # insert, but old data could still be on disk.
-        if buy_price <= 0:
+        buy_raw = _state_value_prefer_key(d, "buy_price", "buy")
+        buy_price = _positive_finite(buy_raw)
+        amount = _positive_finite(d.get("amount"))
+        invested = _positive_finite(d.get("invested_usdt"))
+        if buy_price is None or amount is None or invested is None:
+            detail = (
+                f"invalid open spot state for {sym}: "
+                f"buy={buy_raw!r}, "
+                f"amount={d.get('amount')!r}, "
+                f"invested={d.get('invested_usdt')!r}"
+            )
+            if strict:
+                raise RuntimeError(detail)
+            positions.append(_invalid_spot_position_row(
+                sym, d, detail, bool(effective_sim)))
             continue
-        highest = float(d.get("highest_price") or d.get("highest") or buy_price or 0)
+        highest = (
+            _positive_finite(d.get("highest_price") or d.get("highest"))
+            or buy_price
+        )
         # ``last_price`` is set by Monitor on every tick (V2)  the best
         # "current" estimate when ticker fetch failed in the launcher.
-        last_price = float(d.get("last_price") or 0)
+        last_price = _positive_finite(d.get("last_price"))
         # Without a last_price snapshot, fall back to highest (more
         # accurate than buy_price for the "Now" column).
-        current_price = last_price if last_price > 0 else highest
-        amount = float(d.get("amount", 0))
+        current_price = last_price if last_price is not None else highest
         # Compute unrealized PnL here so the spot stop dialog has it. Gross
         # (fee-free) is fine for a quick pre-close estimate; uses the monitor's
         # last_price snapshot (current_price).
         unreal_pnl = amount * (current_price - buy_price)
-        unreal_pct = ((current_price - buy_price) / buy_price * 100.0
-                      if buy_price > 0 else 0.0)
+        unreal_pct = (current_price - buy_price) / buy_price * 100.0
         positions.append({
             "symbol":         sym,
             "mode":           "SIM" if bool(effective_sim) else "LIVE",
             "buy_price":      buy_price,
             "current_price":  current_price,
             "amount":         amount,
-            "invested_usdt":  float(d.get("invested_usdt", 0)),
+            "invested_usdt":  invested,
             "buy_time":       d.get("buy_time") or d.get("opened_at"),
             "unrealized_pnl": unreal_pnl,
             "unrealized_pct": unreal_pct,
@@ -535,9 +673,19 @@ def direct_close_remaining_futures(
     try:
         if os.path.exists(trades_file):
             with open(trades_file, "r", encoding="utf-8") as f:
-                json_trades = json.load(f) or {}
-    except Exception:
-        pass
+                loaded_state = json.load(f)
+            if loaded_state is None:
+                json_trades = {}
+            elif isinstance(loaded_state, dict):
+                json_trades = loaded_state
+            else:
+                log("error",
+                    f"Futures JSON state read failed: expected object in {trades_file}")
+                return {"closed": 0, "failed": ["state_file"],
+                        "total_pnl": 0.0}
+    except Exception as e:
+        log("error", f"Futures JSON state read failed: {e}")
+        return {"closed": 0, "failed": ["state_file"], "total_pnl": 0.0}
 
     # Union: ``futures_state`` has CURRENT values (from the monitor
     # thread), JSON has original data (entry_price, amount). Combine both.
@@ -547,23 +695,24 @@ def direct_close_remaining_futures(
         if not sym:
             continue
         jt = json_trades.get(sym) or {}  # fee keys come from JSON, not from futures_state
+        jt_amount = _finite_float(jt.get("amount", 0))
+        jt_original = _finite_float(jt.get("original_amount", jt.get("amount", 0)))
         symbols_to_close[sym] = {
             "symbol":        sym,
             "position_type": p.get("position_type", "LONG"),
-            "entry_price":   float(p.get("entry_price", 0)),
-            "current_price": float(p.get("current_price", 0)),
+            "entry_price":   _finite_float(p.get("entry_price", 0)),
+            "current_price": _finite_float(p.get("current_price", 0)),
             # WICHTIG: the ``futures_state`` column is ``margin_usdt`` (not invested_usdt!)
-            "margin_usdt":   float(p.get("margin_usdt", 0)),
-            "leverage":      float(p.get("leverage", 3)),
-            "unrealized_pnl": float(p.get("unrealized_pnl", 0)),
-            "unrealized_pct": float(p.get("unrealized_pct", 0)),
-            "liquidation_price": float(p.get("liquidation_price", 0)),
-            "funding_paid":  float(p.get("funding_paid", 0.0)),
+            "margin_usdt":   _finite_float(p.get("margin_usdt", 0)),
+            "leverage":      _finite_float(p.get("leverage", 3)),
+            "unrealized_pnl": _finite_float(p.get("unrealized_pnl", 0)),
+            "unrealized_pct": _finite_float(p.get("unrealized_pct", 0)),
+            "liquidation_price": _finite_float(p.get("liquidation_price", 0)),
+            "funding_paid":  _finite_float(p.get("funding_paid", 0.0)),
             "opened_at":     p.get("opened_at"),
             # amount + fee keys come from JSON  futures_state doesn't store them
-            "amount":            float(jt.get("amount", 0)),
-            "original_amount":   float(jt.get("original_amount",
-                                              jt.get("amount", 0)) or 0),
+            "amount":            jt_amount,
+            "original_amount":   jt_original,
             "partial_sold":      bool(jt.get("partial_sold")),
             "funding_booked_on_partials": jt.get("funding_booked_on_partials"),
             "initial_entry_fee": jt.get("initial_entry_fee"),
@@ -584,29 +733,31 @@ def direct_close_remaining_futures(
             "accounting_pending_giveback_pct": jt.get("accounting_pending_giveback_pct"),
             "accounting_pending_partials": jt.get("accounting_pending_partials"),
             "_state_source": "futures_state",
+            "_raw_json_state": dict(jt) if jt else None,
         }
 
     for sym, j in json_trades.items():
         if sym not in symbols_to_close:
             # Accept legacy ("buy") or StateManager ("buy_price"). last_price
             # defaults to 0 when Monitor hasn't ticked yet.
-            _buy = float(j.get("buy_price") or j.get("buy") or 0)
-            _last = float(j.get("last_price") or 0)
+            _buy = _finite_float(_state_value_prefer_key(j, "buy_price", "buy"))
+            _last = _finite_float(j.get("last_price") or 0)
+            _current = _last if (_last is not None and _last > 0) else _buy
             symbols_to_close[sym] = {
                 "symbol":        sym,
                 "position_type": j.get("position_type", "LONG"),
                 "entry_price":   _buy,
-                "current_price": _last if _last > 0 else _buy,
-                "margin_usdt":   float(j.get("invested_usdt", 0)),
-                "leverage":      float(j.get("leverage", 3)),
+                "current_price": _current,
+                "margin_usdt":   _finite_float(j.get("invested_usdt", 0)),
+                "leverage":      _finite_float(j.get("leverage", 3)),
                 "unrealized_pnl": 0.0,
                 "unrealized_pct": 0.0,
-                "liquidation_price": float(j.get("liquidation_price", 0)),
-                "funding_paid":  float(j.get("funding_paid", 0.0)),
+                "liquidation_price": _finite_float(j.get("liquidation_price", 0)),
+                "funding_paid":  _finite_float(j.get("funding_paid", 0.0)),
                 "opened_at":     j.get("buy_time") or j.get("opened_at"),
-                "amount":            float(j.get("amount", 0)),
-                "original_amount":   float(j.get("original_amount",
-                                                  j.get("amount", 0)) or 0),
+                "amount":            _finite_float(j.get("amount", 0)),
+                "original_amount":   _finite_float(
+                    j.get("original_amount", j.get("amount", 0))),
                 "partial_sold":      bool(j.get("partial_sold")),
                 "funding_booked_on_partials": j.get("funding_booked_on_partials"),
                 "initial_entry_fee": j.get("initial_entry_fee"),
@@ -627,6 +778,7 @@ def direct_close_remaining_futures(
                 "accounting_pending_giveback_pct": j.get("accounting_pending_giveback_pct"),
                 "accounting_pending_partials": j.get("accounting_pending_partials"),
                 "_state_source": "json",
+                "_raw_json_state": dict(j),
             }
 
     if not symbols_to_close:
@@ -683,6 +835,14 @@ def direct_close_remaining_futures(
                 out[key] = row.get(key)
         return out
 
+    def _failed_futures_state(row: dict) -> dict:
+        raw = row.get("_raw_json_state")
+        if isinstance(raw, dict) and raw:
+            return dict(raw)
+        out = dict(row)
+        out.pop("_raw_json_state", None)
+        return out
+
     def _trade_already_booked(sym: str, row: dict) -> bool:
         buy_time = str(row.get("opened_at") or row.get("buy_time") or "")
         if not buy_time:
@@ -724,13 +884,13 @@ def direct_close_remaining_futures(
                 try:
                     if remove_open_position(bot_name, sym) is False:
                         failed_syms.append(sym)
-                        failed_position_updates[sym] = dict(p)
+                        failed_position_updates[sym] = _failed_futures_state(p)
                         log("error",
                             f"{sym}: claim release still pending - state kept")
                         continue
                 except Exception as e:
                     failed_syms.append(sym)
-                    failed_position_updates[sym] = dict(p)
+                    failed_position_updates[sym] = _failed_futures_state(p)
                     log("error", f"{sym}: claim release retry raised: {e}")
                     continue
                 try:
@@ -746,31 +906,93 @@ def direct_close_remaining_futures(
                 log("win", f"{sym}: claim cleanup completed")
                 continue
 
+            pending_amount = _positive_finite(p.get("amount"))
+            if (p.get("accounting_pending")
+                    or p.get("accounting_pending_partials")):
+                if pending_amount is None:
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = _failed_futures_state(p)
+                    log("error",
+                        f"{sym}: pending futures accounting skipped - "
+                        f"invalid amount ({p.get('amount')!r})")
+                    continue
+
             if p.get("accounting_pending"):
+                pending_entry = _positive_finite(
+                    p.get("entry_price") or p.get("buy"))
+                pending_sell = _positive_finite(
+                    p.get("accounting_pending_sell_price"))
+                pending_pct = _finite_float(
+                    p.get("accounting_pending_profit_pct"))
+                pending_pnl = _finite_float(
+                    p.get("accounting_pending_profit_usdt"))
+                pending_margin = _positive_finite(
+                    p.get("margin_usdt") or p.get("invested_usdt"))
+                pending_leverage = _positive_finite(p.get("leverage", 1.0))
+                pending_liq = _non_negative_finite(
+                    p.get("liquidation_price", 0.0))
+                pending_funding = _finite_float(
+                    0.0 if p.get("accounting_pending_funding_paid") is None
+                    else p.get("accounting_pending_funding_paid"))
+                pending_fees = _non_negative_finite(
+                    0.0 if p.get("accounting_pending_fees_usdt") is None
+                    else p.get("accounting_pending_fees_usdt"))
+                pending_mfe = p.get("accounting_pending_mfe_pct")
+                pending_mae = p.get("accounting_pending_mae_pct")
+                pending_giveback = p.get("accounting_pending_giveback_pct")
+                for _optional_pending in (
+                    pending_mfe,
+                    pending_mae,
+                    pending_giveback,
+                ):
+                    if (_optional_pending is not None
+                            and _finite_float(_optional_pending) is None):
+                        pending_fees = None
+                        break
+                if pending_mfe is not None:
+                    pending_mfe = _finite_float(pending_mfe)
+                if pending_mae is not None:
+                    pending_mae = _finite_float(pending_mae)
+                if pending_giveback is not None:
+                    pending_giveback = _finite_float(pending_giveback)
+                if (
+                    pending_entry is None
+                    or pending_sell is None
+                    or pending_pct is None
+                    or pending_pnl is None
+                    or pending_margin is None
+                    or pending_leverage is None
+                    or pending_liq is None
+                    or pending_funding is None
+                    or pending_fees is None
+                ):
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = _failed_futures_state(p)
+                    log("error",
+                        f"{sym}: pending futures accounting skipped - "
+                        f"invalid pending values")
+                    continue
                 pending_kwargs = dict(
                     bot_name=bot_name,
                     symbol=sym,
-                    buy_price=float(p.get("entry_price") or p.get("buy") or 0.0),
-                    sell_price=float(p.get("accounting_pending_sell_price")
-                                     or p.get("current_price")
-                                     or p.get("entry_price") or 0.0),
+                    buy_price=pending_entry,
+                    sell_price=pending_sell,
                     buy_time=p.get("opened_at") or p.get("buy_time") or _utc_now_str(),
                     sell_time=p.get("accounting_pending_sell_time") or _utc_now_str(),
-                    profit_pct=float(p.get("accounting_pending_profit_pct") or 0.0),
-                    profit_usdt=float(p.get("accounting_pending_profit_usdt") or 0.0),
-                    invested_usdt=float(p.get("margin_usdt")
-                                        or p.get("invested_usdt") or 0.0),
+                    profit_pct=pending_pct,
+                    profit_usdt=pending_pnl,
+                    invested_usdt=pending_margin,
                     reason=p.get("accounting_pending_reason") or reason,
                     is_futures=True,
                     position_type=p.get("position_type", "LONG"),
-                    leverage=float(p.get("leverage") or 1.0),
-                    liquidation_price=float(p.get("liquidation_price") or 0.0),
-                    funding_paid=float(p.get("accounting_pending_funding_paid") or 0.0),
-                    fees_usdt=float(p.get("accounting_pending_fees_usdt") or 0.0),
+                    leverage=pending_leverage,
+                    liquidation_price=pending_liq,
+                    funding_paid=pending_funding,
+                    fees_usdt=pending_fees,
                     exchange_order_id=p.get("accounting_pending_exchange_order_id"),
-                    mfe_pct=p.get("accounting_pending_mfe_pct"),
-                    mae_pct=p.get("accounting_pending_mae_pct"),
-                    giveback_pct=p.get("accounting_pending_giveback_pct"),
+                    mfe_pct=pending_mfe,
+                    mae_pct=pending_mae,
+                    giveback_pct=pending_giveback,
                     mode_is_sim=sim_only,
                 )
                 try:
@@ -780,19 +1002,19 @@ def direct_close_remaining_futures(
                     log("error", f"{sym}: pending futures DB retry raised: {e}")
                 if not saved_ok:
                     failed_syms.append(sym)
-                    failed_position_updates[sym] = dict(p)
+                    failed_position_updates[sym] = _failed_futures_state(p)
                     continue
                 if not sim_only:
                     try:
                         if remove_open_position(bot_name, sym) is False:
                             failed_syms.append(sym)
-                            failed_position_updates[sym] = dict(p)
+                            failed_position_updates[sym] = _failed_futures_state(p)
                             log("error",
                                 f"{sym}: claim release failed after pending DB retry")
                             continue
                     except Exception as e:
                         failed_syms.append(sym)
-                        failed_position_updates[sym] = dict(p)
+                        failed_position_updates[sym] = _failed_futures_state(p)
                         log("error",
                             f"{sym}: claim release raised after pending DB retry: {e}")
                         continue
@@ -813,11 +1035,28 @@ def direct_close_remaining_futures(
                 continue
 
             pos_type = p["position_type"]
-            entry    = p["entry_price"]
-            margin   = p["margin_usdt"]
-            lev      = p["leverage"]
-            amount   = abs(float(p["amount"]))
-            original_amount = float(p.get("original_amount") or amount or 0.0)
+            entry = _positive_finite(p.get("entry_price"))
+            margin = _positive_finite(p.get("margin_usdt"))
+            lev = _positive_finite(p.get("leverage"))
+            amount_raw = _finite_float(p.get("amount"))
+            if amount_raw is None:
+                failed_syms.append(sym)
+                failed_position_updates[sym] = _failed_futures_state(p)
+                log("error",
+                    f"{sym}: close skipped - invalid futures amount "
+                    f"({p.get('amount')!r})")
+                continue
+            amount = abs(amount_raw)
+            if entry is None or margin is None or lev is None:
+                failed_syms.append(sym)
+                failed_position_updates[sym] = _failed_futures_state(p)
+                log("error",
+                    f"{sym}: close skipped - invalid futures basis "
+                    f"(entry={p.get('entry_price')!r}, "
+                    f"margin={p.get('margin_usdt')!r}, "
+                    f"leverage={p.get('leverage')!r})")
+                continue
+            original_amount = _positive_finite(p.get("original_amount")) or amount
             partial_sold = bool(p.get("partial_sold"))
             symbol_full = f"{sym}/USDT:USDT"
 
@@ -825,7 +1064,13 @@ def direct_close_remaining_futures(
             if pending_partials:
                 remaining_pending = []
                 for item in pending_partials:
-                    retry_item = dict(item)
+                    retry_item = _normalized_futures_pending_trade(item)
+                    if retry_item is None:
+                        remaining_pending.append(item)
+                        log("error",
+                            f"{sym}: pending futures partial accounting "
+                            f"skipped - invalid pending values")
+                        continue
                     retry_item.setdefault("mode_is_sim", sim_only)
                     retry_item.setdefault("is_futures", True)
                     try:
@@ -855,21 +1100,21 @@ def direct_close_remaining_futures(
                             ex, symbol_full, timeout=5.0)
                     except Exception as e:
                         failed_syms.append(sym)
-                        failed_position_updates[sym] = dict(p)
+                        failed_position_updates[sym] = _failed_futures_state(p)
                         log("error",
                             f"{sym}: trade already booked but flat check failed "
                             f"({e}) - state kept")
                         continue
                     if not _closed:
                         failed_syms.append(sym)
-                        failed_position_updates[sym] = dict(p)
+                        failed_position_updates[sym] = _failed_futures_state(p)
                         log("error",
                             f"{sym}: trade already booked but exchange still "
                             f"shows {_remaining} contracts - manual review")
                         continue
                     try:
                         if remove_open_position(bot_name, sym) is False:
-                            retry_state = dict(p)
+                            retry_state = _failed_futures_state(p)
                             retry_state["claim_release_pending"] = True
                             retry_state["accounting_already_booked"] = True
                             failed_syms.append(sym)
@@ -878,7 +1123,7 @@ def direct_close_remaining_futures(
                                 f"{sym}: stale state found but claim release failed")
                             continue
                     except Exception as e:
-                        retry_state = dict(p)
+                        retry_state = _failed_futures_state(p)
                         retry_state["claim_release_pending"] = True
                         retry_state["accounting_already_booked"] = True
                         failed_syms.append(sym)
@@ -906,12 +1151,12 @@ def direct_close_remaining_futures(
                 continue
 
             # Live price for accurate PnL (same for SIM and LIVE)
-            curr = p["current_price"]
+            curr = _positive_finite(p.get("current_price")) or entry
             if ex is not None:
                 try:
                     t = ex.fetch_ticker(symbol_full)
-                    fresh = float(t.get("last") or t.get("close") or 0)
-                    if fresh > 0:
+                    fresh = _positive_finite(t.get("last") or t.get("close"))
+                    if fresh is not None:
                         curr = fresh
                 except Exception:
                     pass
@@ -926,23 +1171,30 @@ def direct_close_remaining_futures(
                 from bot_utils import (futures_contract_size,
                                        safe_remaining_funding,
                                        safe_proportional_fee)
-                contract_size = float(futures_contract_size(ex, symbol_full) or 1.0)
+                contract_size = (
+                    _positive_finite(futures_contract_size(ex, symbol_full))
+                    or 1.0
+                )
             except Exception:
                 from bot_utils import safe_remaining_funding, safe_proportional_fee
                 contract_size = 1.0
-            initial_entry_fee = float(p.get("initial_entry_fee") or
-                                      p.get("fees_paid") or
-                                      (notional * taker_fee))
+            initial_entry_fee = (
+                _non_negative_finite(p.get("initial_entry_fee"))
+                or _non_negative_finite(p.get("fees_paid"))
+                or (notional * taker_fee)
+            )
             entry_fee = safe_proportional_fee(
                 initial_entry_fee, amount, original_amount,
                 partial_sold=partial_sold,
             )
             funding_for_close = safe_remaining_funding(
-                float(p.get("funding_paid", 0.0) or 0.0),
+                _finite_float(p.get("funding_paid", 0.0)) or 0.0,
                 amount, original_amount,
                 partial_sold=partial_sold,
-                booked_on_partials=float(
-                    p.get("funding_booked_on_partials") or 0.0),
+                booked_on_partials=(
+                    _finite_float(p.get("funding_booked_on_partials"))
+                    or 0.0
+                ),
             )
             if amount > 0 and curr > 0:
                 exit_fee = amount * contract_size * curr * taker_fee
@@ -990,10 +1242,17 @@ def direct_close_remaining_futures(
                     # Round to exchange precision  Bitget/Binance reject
                     # close orders with too many decimals (InvalidOrder).
                     try:
-                        close_amt = float(ex.amount_to_precision(
+                        close_amt = _positive_finite(ex.amount_to_precision(
                             f"{sym}/USDT:USDT", amount))
                     except Exception:
                         close_amt = amount
+                    if close_amt is None:
+                        failed_syms.append(sym)
+                        failed_position_updates[sym] = _failed_futures_state(p)
+                        log("error",
+                            f"{sym}: LIVE close skipped - invalid precision "
+                            f"amount from exchange. Position KEPT.")
+                        continue
                     # Build reduce-only params via the SINGLE source of truth
                     # (exchange_config.reduce_only_params) so this matches the
                     # bot's own close paths exactly: correct per-bot margin_mode
@@ -1327,9 +1586,19 @@ def direct_close_remaining_spot(
     try:
         if os.path.exists(trades_file):
             with open(trades_file, "r", encoding="utf-8") as f:
-                json_trades = json.load(f) or {}
-    except Exception:
-        pass
+                loaded_state = json.load(f)
+            if loaded_state is None:
+                json_trades = {}
+            elif isinstance(loaded_state, dict):
+                json_trades = loaded_state
+            else:
+                log("error",
+                    f"Spot state read failed: expected object in {trades_file}")
+                return {"closed": 0, "failed": ["state_file"],
+                        "total_pnl": 0.0}
+    except Exception as e:
+        log("error", f"Spot state read failed: {e}")
+        return {"closed": 0, "failed": ["state_file"], "total_pnl": 0.0}
 
     if not json_trades:
         return {"closed": 0, "failed": [], "total_pnl": 0.0}
@@ -1366,15 +1635,37 @@ def direct_close_remaining_spot(
             _cl_got_s = True
         try:
             # Accept legacy ("buy") or StateManager ("buy_price").
-            buy_price = float(d.get("buy_price") or d.get("buy") or 0)
-            margin    = float(d.get("invested_usdt", 0))
-            amount    = float(d.get("amount", 0))
+            buy_raw = _state_value_prefer_key(d, "buy_price", "buy")
+            buy_price = _positive_finite(buy_raw)
+            margin = _positive_finite(d.get("invested_usdt"))
+            amount = _positive_finite(d.get("amount"))
+            if buy_price is None or margin is None:
+                log("error",
+                    f"{sym}: close skipped - invalid cost basis "
+                    f"(buy={buy_raw!r}, "
+                    f"invested={d.get('invested_usdt')!r})")
+                failed_syms.append(sym)
+                failed_position_updates[sym] = dict(d)
+                continue
+            if amount is None:
+                log("error",
+                    f"{sym}: close skipped - invalid amount "
+                    f"({d.get('amount')!r}). Position KEPT.")
+                failed_syms.append(sym)
+                failed_position_updates[sym] = dict(d)
+                continue
 
             pending_partials = list(d.get("accounting_pending_partials") or [])
             if pending_partials:
                 remaining_pending = []
                 for item in pending_partials:
-                    retry_item = dict(item)
+                    retry_item = _normalized_spot_pending_trade(item)
+                    if retry_item is None:
+                        log("error",
+                            f"{sym}: pending partial accounting skipped - "
+                            f"invalid pending values")
+                        remaining_pending.append(item)
+                        continue
                     retry_item.setdefault("mode_is_sim", sim_only)
                     try:
                         ok = bool(save_trade_db(**retry_item))
@@ -1393,18 +1684,35 @@ def direct_close_remaining_spot(
                 d["accounting_pending_partials"] = []
 
             if d.get("accounting_pending"):
+                pending_sell = _positive_finite(
+                    d.get("accounting_pending_sell_price"))
+                pending_pct = _finite_float(
+                    d.get("accounting_pending_profit_pct"))
+                pending_pnl = _finite_float(
+                    d.get("accounting_pending_profit_usdt"))
+                pending_fees = _non_negative_finite(
+                    d.get("accounting_pending_fees_usdt", 0.0))
+                if (pending_sell is None
+                        or pending_pct is None or pending_pnl is None
+                        or pending_fees is None):
+                    log("error",
+                        f"{sym}: pending accounting skipped - invalid pending "
+                        f"values")
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = dict(d)
+                    continue
                 pending_kwargs = dict(
                     bot_name=bot_name, symbol=sym,
                     buy_price=buy_price,
-                    sell_price=float(d.get("accounting_pending_sell_price") or buy_price),
+                    sell_price=pending_sell,
                     buy_time=d.get("buy_time") or _utc_now_str(),
                     sell_time=d.get("accounting_pending_sell_time") or _utc_now_str(),
-                    profit_pct=float(d.get("accounting_pending_profit_pct") or 0.0),
-                    profit_usdt=float(d.get("accounting_pending_profit_usdt") or 0.0),
+                    profit_pct=pending_pct,
+                    profit_usdt=pending_pnl,
                     invested_usdt=margin,
                     reason=d.get("accounting_pending_reason") or reason,
                     is_futures=False,
-                    fees_usdt=float(d.get("accounting_pending_fees_usdt") or 0.0),
+                    fees_usdt=pending_fees,
                     mode_is_sim=sim_only,
                 )
                 try:
@@ -1449,22 +1757,28 @@ def direct_close_remaining_spot(
                 continue
 
             try:
-                stored_price = float(d.get("last_price")
-                                     or d.get("current_price") or 0.0)
+                stored_price = (
+                    _positive_finite(d.get("last_price"))
+                    or _positive_finite(d.get("current_price"))
+                    or 0.0
+                )
             except (TypeError, ValueError):
                 stored_price = 0.0
             if stored_price <= 0 and sim_only:
                 try:
-                    stored_price = float(d.get("highest")
-                                         or d.get("highest_price") or 0.0)
+                    stored_price = (
+                        _positive_finite(d.get("highest"))
+                        or _positive_finite(d.get("highest_price"))
+                        or 0.0
+                    )
                 except (TypeError, ValueError):
                     stored_price = 0.0
             curr = stored_price if stored_price > 0 else buy_price
             if ex is not None:
                 try:
                     t = ex.fetch_ticker(f"{sym}/USDT")
-                    fresh = float(t.get("last") or t.get("close") or 0)
-                    if fresh > 0:
+                    fresh = _positive_finite(t.get("last") or t.get("close"))
+                    if fresh is not None:
                         curr = fresh
                 except Exception:
                     pass
@@ -1472,15 +1786,15 @@ def direct_close_remaining_spot(
             profit_pct  = ((curr - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
             # Taker fee on entry AND exit (mirrors the bot logic)
             taker_fee   = 0.001   # Spot: 0.1% per side (standard taker)
-            initial_entry_fee = float(d.get(
+            initial_entry_fee = _non_negative_finite(d.get(
                 "initial_entry_fee", d.get("fees_paid", margin * taker_fee)
-            ) or 0.0)
+            )) or 0.0
             try:
                 from bot_utils import safe_proportional_fee
                 entry_fee = safe_proportional_fee(
                     initial_entry_fee,
                     amount,
-                    float(d.get("original_amount", amount) or 0.0),
+                    _positive_finite(d.get("original_amount")) or amount,
                     partial_sold=bool(d.get("partial_sold")),
                 )
             except Exception:
@@ -1536,17 +1850,14 @@ def direct_close_remaining_spot(
                         for k in ("average", "price"):
                             v = order.get(k)
                             if v is not None:
-                                try:
-                                    fv = float(v)
-                                    if fv > 0:
-                                        fill_price = fv
-                                        break
-                                except (TypeError, ValueError):
-                                    continue
+                                fv = _positive_finite(v)
+                                if fv is not None:
+                                    fill_price = fv
+                                    break
                         try:
                             fee_obj = order.get("fee") or {}
                             fc = (fee_obj.get("currency") or "").upper()
-                            fc_cost = float(fee_obj.get("cost", 0) or 0)
+                            fc_cost = _finite_float(fee_obj.get("cost")) or 0.0
                             # Convert fee to USDT (see ``_convert_fee_to_usdt``
                             # in main_bot_balanced.py for full rationale).
                             if not fc or fc in ("USDT", "USD", "BUSD", "USDC", "FDUSD"):
@@ -1584,8 +1895,8 @@ def direct_close_remaining_spot(
                     except Exception:
                         InsufficientSellBalance = ()  # type: ignore
                     if InsufficientSellBalance and isinstance(e, InsufficientSellBalance):
-                        free_base = float(getattr(e, "free", 0.0) or 0.0)
-                        if free_base <= 0:
+                        free_base = _finite_float(getattr(e, "free", 0.0))
+                        if free_base is not None and free_base <= 0:
                             log("warn",
                                 f"[LIVE] {sym}: exchange balance already sold/empty "
                                 f"({e})  booking offline close")
@@ -1634,10 +1945,13 @@ def direct_close_remaining_spot(
                 if partial_live_fill:
                     residual = dict(d)
                     residual["amount"] = max(
-                        0.0, float(d.get("amount", 0) or 0) - amount)
+                        0.0, (_positive_finite(d.get("amount")) or 0.0) - amount)
                     residual["invested_usdt"] = max(
-                        0.0, float(d.get("invested_usdt", 0) or 0) - margin)
-                    residual["fees_paid"] = float(d.get("fees_paid", 0) or 0) + close_fee
+                        0.0, (_positive_finite(d.get("invested_usdt")) or 0.0) - margin)
+                    residual["fees_paid"] = (
+                        (_non_negative_finite(d.get("fees_paid")) or 0.0)
+                        + close_fee
+                    )
                     pending = list(residual.get("accounting_pending_partials") or [])
                     pending.append(trade_kwargs)
                     residual["accounting_pending_partials"] = pending
@@ -1659,10 +1973,13 @@ def direct_close_remaining_spot(
             if partial_live_fill:
                 residual = dict(d)
                 residual["amount"] = max(
-                    0.0, float(d.get("amount", 0) or 0) - amount)
+                    0.0, (_positive_finite(d.get("amount")) or 0.0) - amount)
                 residual["invested_usdt"] = max(
-                    0.0, float(d.get("invested_usdt", 0) or 0) - margin)
-                residual["fees_paid"] = float(d.get("fees_paid", 0) or 0) + close_fee
+                    0.0, (_positive_finite(d.get("invested_usdt")) or 0.0) - margin)
+                residual["fees_paid"] = (
+                    (_non_negative_finite(d.get("fees_paid")) or 0.0)
+                    + close_fee
+                )
                 residual["last_partial_fill_reason"] = reason
                 failed_position_updates[sym] = residual
                 failed_syms.append(sym)

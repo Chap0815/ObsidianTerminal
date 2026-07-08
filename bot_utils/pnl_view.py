@@ -1,6 +1,7 @@
 """Shared read-side PnL helpers for launcher/dashboard views."""
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -8,6 +9,7 @@ from bot_utils.futures_math import calc_unrealized_pnl
 
 
 FUTURES_STATE_STALE_SEC = 30 * 60
+SPOT_STATE_STALE_SEC = 30 * 60
 
 
 def spot_unrealized_pnl(entry_price: Any, current_price: Any, amount: Any) -> float:
@@ -102,6 +104,35 @@ def is_futures_state_fresh(
     must not count legacy or corrupt rows as open money by default.
     """
     age = futures_state_age_sec(row, now=now)
+    if age is None:
+        return False
+    if age < -60.0:
+        return False
+    return age <= max_age_sec
+
+
+def state_file_age_sec(path: str, *, now_ts: float | None = None) -> float | None:
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    ref = datetime.now(timezone.utc).timestamp() if now_ts is None else float(now_ts)
+    return ref - float(mtime)
+
+
+def is_state_file_fresh(
+    path: str,
+    *,
+    now_ts: float | None = None,
+    max_age_sec: float = SPOT_STATE_STALE_SEC,
+) -> bool:
+    """Return whether a JSON state file is fresh enough for money views.
+
+    Spot JSON state has no per-row heartbeat, so dashboards use the file mtime
+    as a conservative freshness proxy. Missing files, very old files, and files
+    dated far in the future are excluded from live money KPIs.
+    """
+    age = state_file_age_sec(path, now_ts=now_ts)
     if age is None:
         return False
     if age < -60.0:

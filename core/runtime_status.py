@@ -122,14 +122,36 @@ def _status_freshness(data: Mapping[str, Any]) -> float:
 
 
 def _write_fallback_status(path: Path, payload: Mapping[str, Any]) -> None:
+    fallback = path.with_name("runtime_status.fallback.json")
+    tmp_name = ""
     try:
-        fallback = path.with_name("runtime_status.fallback.json")
-        fallback.write_text(
-            json.dumps(dict(payload), indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=fallback.name + ".", suffix=".tmp", dir=str(fallback.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(dict(payload), fh, indent=2, sort_keys=True)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except Exception as exc:
+                _log_status_write_failure(
+                    f"write_runtime_status fallback fsync({path})", exc)
+        try:
+            os.replace(tmp_name, fallback)
+            tmp_name = ""
+        except OSError:
+            fallback.write_text(
+                json.dumps(dict(payload), indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
     except Exception as exc:
         _log_status_write_failure(f"write_runtime_status fallback({path})", exc)
+    finally:
+        if tmp_name:
+            try:
+                if os.path.exists(tmp_name):
+                    os.remove(tmp_name)
+            except OSError:
+                pass
 
 
 def write_runtime_status(log_dir: str | os.PathLike[str],

@@ -16,10 +16,31 @@ import math
 from decimal import Decimal, InvalidOperation
 
 
+def _finite_float_or_none(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _upper_text(value) -> str:
+    return value.upper() if isinstance(value, str) else ""
+
+
+def _safe_positive_price(value) -> float:
+    parsed = _finite_float_or_none(value)
+    return parsed if parsed is not None and parsed > 0 else 0.0
+
+
 #  Fill price 
 
 def order_was_filled(order: dict, requested_amount: float = 0.0,
-                     min_fill_ratio: float = 0.90) -> bool:
+                     min_fill_ratio: float = 0.90,
+                     *,
+                     trust_terminal_status_with_bad_numbers: bool = False) -> bool:
     """True only if a CCXT order actually executed.
 
     A market sell can return an order object that did NOT fill (status
@@ -40,32 +61,46 @@ def order_was_filled(order: dict, requested_amount: float = 0.0,
         return False
     status = str(order.get("status", "")).lower()
     if status in ("closed", "filled"):
+        for key in ("filled", "cost"):
+            if (
+                order.get(key) is not None
+                and _finite_float_or_none(order.get(key)) is None
+            ):
+                if trust_terminal_status_with_bad_numbers:
+                    continue
+                return False
         return True
     if status in ("canceled", "cancelled", "rejected", "expired", "new",
                   "open", "pending"):
         # Explicit non-filled state. Allow only if a real partial fill exists.
         filled = order.get("filled")
-        try:
-            f = float(filled) if filled is not None else 0.0
-        except (ValueError, TypeError):
-            f = 0.0
-        if requested_amount > 0 and f >= requested_amount * min_fill_ratio:
+        f = _finite_float_or_none(filled) if filled is not None else 0.0
+        if f is None:
+            return False
+        req = _finite_float_or_none(requested_amount) or 0.0
+        if (
+            math.isfinite(f)
+            and math.isfinite(req)
+            and req > 0
+            and f >= req * min_fill_ratio
+        ):
             return True
         return False
     # No usable status  fall back to filled / cost evidence.
-    try:
-        filled = float(order.get("filled") or 0)
-    except (ValueError, TypeError):
-        filled = 0.0
-    if filled > 0:
-        if requested_amount > 0:
-            return filled >= requested_amount * min_fill_ratio
+    filled_present = order.get("filled") is not None
+    filled = _finite_float_or_none(order.get("filled")) if filled_present else 0.0
+    if filled is None:
+        return False
+    if math.isfinite(filled) and filled > 0:
+        req = _finite_float_or_none(requested_amount) or 0.0
+        if math.isfinite(req) and req > 0:
+            return filled >= req * min_fill_ratio
         return True
-    try:
-        cost = float(order.get("cost") or 0)
-    except (ValueError, TypeError):
-        cost = 0.0
-    if cost > 0:
+    cost_present = order.get("cost") is not None
+    cost = _finite_float_or_none(order.get("cost")) if cost_present else 0.0
+    if cost is None:
+        return False
+    if math.isfinite(cost) and cost > 0:
         return True
     # AMBIGUOUS: no status, no fill data. If the exchange ACCEPTED the order
     # (it has an id and create_*_order didn't raise), treat it as filled 
@@ -81,24 +116,20 @@ def extract_fill_price(order: dict, fallback: float) -> float:
     value (usually the ticker price) when none is available.
     """
     if not isinstance(order, dict):
-        return fallback
+        return _safe_positive_price(fallback)
     for key in ("average", "price"):
         v = order.get(key)
         if v is not None:
-            try:
-                fv = float(v)
-                if fv > 0:
-                    return fv
-            except (ValueError, TypeError):
-                continue
-    try:
-        cost = float(order.get("cost") or 0)
-        filled = float(order.get("filled") or 0)
-        if cost > 0 and filled > 0:
-            return cost / filled
-    except (ValueError, TypeError):
-        pass
-    return fallback
+            fv = _finite_float_or_none(v)
+            if fv is not None and fv > 0:
+                return fv
+    cost = _finite_float_or_none(order.get("cost"))
+    filled = _finite_float_or_none(order.get("filled"))
+    if cost is not None and filled is not None and cost > 0 and filled > 0:
+        ratio = cost / filled
+        if math.isfinite(ratio) and ratio > 0:
+            return ratio
+    return _safe_positive_price(fallback)
 
 
 #  Fee extraction 
@@ -111,32 +142,34 @@ def convert_fee_to_usdt(fee_dict, order_dict) -> float:
     """
     if not isinstance(fee_dict, dict):
         return 0.0
-    try:
-        cost = abs(float(fee_dict.get("cost", 0) or 0))
-    except (TypeError, ValueError):
+    parsed_cost = _finite_float_or_none(fee_dict.get("cost"))
+    if parsed_cost is None:
         return 0.0
-    if cost <= 0:
+    cost = abs(parsed_cost)
+    if not math.isfinite(cost) or cost <= 0:
         return 0.0
 
-    currency = (fee_dict.get("currency") or "").upper()
+    raw_currency = fee_dict.get("currency")
+    if raw_currency is not None and not isinstance(raw_currency, str):
+        return 0.0
+    currency = _upper_text(raw_currency)
     if not currency or currency in ("USDT", "USD", "BUSD", "USDC", "FDUSD"):
         return cost
 
     symbol = (order_dict.get("symbol") or "") if isinstance(order_dict, dict) else ""
+    symbol = symbol if isinstance(symbol, str) else ""
     base = symbol.split("/")[0].upper() if "/" in symbol else ""
     if currency == base:
         fill_price = 0.0
         for k in ("average", "price"):
             v = order_dict.get(k) if isinstance(order_dict, dict) else None
-            try:
-                fv = float(v) if v is not None else 0.0
-                if fv > 0:
-                    fill_price = fv
-                    break
-            except (TypeError, ValueError):
-                continue
+            fv = _finite_float_or_none(v) if v is not None else None
+            if fv is not None and fv > 0:
+                fill_price = fv
+                break
         if fill_price > 0:
-            return cost * fill_price
+            converted = cost * fill_price
+            return converted if math.isfinite(converted) else 0.0
         return 0.0
 
     return 0.0
@@ -159,7 +192,13 @@ def extract_order_fee(order: dict) -> float:
         valid = [f for f in fees_list
                   if isinstance(f, dict) and f.get("cost") is not None]
         if valid:
-            return sum(convert_fee_to_usdt(f, order) for f in valid)
+            plural_total = sum(convert_fee_to_usdt(f, order) for f in valid)
+            if math.isfinite(plural_total) and plural_total > 0:
+                return plural_total
+            singular_fee = order.get("fee")
+            if isinstance(singular_fee, dict) and singular_fee.get("cost") is not None:
+                return convert_fee_to_usdt(singular_fee, order)
+            return 0.0
 
     return convert_fee_to_usdt(order.get("fee") or {}, order)
 
@@ -168,7 +207,9 @@ def extract_base_fee_amount(order: dict, base_symbol: str) -> float:
     """Sum BASE-currency fees from both singular `fee` and plural `fees`."""
     if not isinstance(order, dict) or not base_symbol:
         return 0.0
-    base_upper = base_symbol.upper()
+    base_upper = _upper_text(base_symbol)
+    if not base_upper:
+        return 0.0
     sources = []
     f = order.get("fee")
     if isinstance(f, dict):
@@ -178,16 +219,18 @@ def extract_base_fee_amount(order: dict, base_symbol: str) -> float:
         sources.extend(x for x in fl if isinstance(x, dict))
     total = 0.0
     for fo in sources:
-        fc = (fo.get("currency") or "").upper()
+        raw_currency = fo.get("currency")
+        if raw_currency is not None and not isinstance(raw_currency, str):
+            continue
+        fc = _upper_text(raw_currency)
         if fc != base_upper:
             continue
-        try:
-            fv = float(fo.get("cost", 0) or 0)
-        except (TypeError, ValueError):
+        fv = _finite_float_or_none(fo.get("cost"))
+        if fv is None:
             continue
-        if fv > 0:
+        if math.isfinite(fv) and fv > 0:
             total += fv
-    return total
+    return total if math.isfinite(total) else 0.0
 
 
 #  Safe remaining 
@@ -196,9 +239,11 @@ def _is_safe_finite(value) -> bool:
     """Return True iff value can be cast to a finite float."""
     if value is None:
         return False
+    if isinstance(value, bool):
+        return False
     try:
         fv = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
     return math.isfinite(fv)
 

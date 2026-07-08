@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from core.logger import _date as _utc_now_str
 
+import math
 import os
 
 from bot_utils import (
@@ -51,6 +52,52 @@ class FuturesScanMixin:
         if isinstance(value, bool):
             return value
         return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _finite_float(value, default: float = 0.0) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not math.isfinite(parsed):
+            return float(default)
+        return parsed
+
+    @staticmethod
+    def _positive_float(value, default: float = 0.0) -> float:
+        parsed = FuturesScanMixin._finite_float(value, default)
+        if parsed <= 0:
+            return float(default)
+        return parsed
+
+    def _cleanup_rolled_back_futures_entry_state(
+        self,
+        sym: str,
+        reason: str,
+    ) -> bool:
+        restore = {
+            "provisional": True,
+            "entry_aborted": True,
+            "entry_abort_reason": reason,
+            "claim_release_pending": True,
+        }
+        try:
+            removed = self.state.remove(sym, restore)
+        except Exception as exc:
+            self._log_error(f"cleanup rolled-back futures entry {sym}", exc)
+            removed = False
+        if removed:
+            return True
+        try:
+            if self.state.has(sym):
+                self.state.update_many(sym, restore)
+                return False
+        except Exception as exc:
+            self._log_error(
+                f"mark rolled-back futures entry cleanup pending {sym}", exc)
+        from core.database import remove_open_position
+        remove_open_position(self.BOT_NAME, sym)
+        return False
 
     def _scan_loop(self):
         from core.logger import log_event, send_telegram
@@ -556,16 +603,22 @@ class FuturesScanMixin:
                 from bot_utils.balance import safe_fetch_balance_usdt
                 available = safe_fetch_balance_usdt(self.ex,
                                                      error_logger=self._log_error)
-                if available is not None and available > 0:
-                    required = margin_usdt * 1.05
-                    if required > available:
-                        log_event(
-                            f"{sym}: skipping {direction}  need {required:.2f} USDT "
-                            f"but only {available:.2f} USDT free", "WARN"
-                        )
-                        return
-            except Exception:
-                pass  # best-effort
+            except Exception as exc:
+                self._log_error(f"{sym} balance precheck", exc)
+                available = None
+            if available is None:
+                log_event(
+                    f"{sym}: skipping {direction}  free USDT balance "
+                    f"unavailable", "WARN"
+                )
+                return
+            required = margin_usdt * 1.05
+            if required > available:
+                log_event(
+                    f"{sym}: skipping {direction}  need {required:.2f} USDT "
+                    f"but only {available:.2f} USDT free", "WARN"
+                )
+                return
 
         #  Order placement 
         leverage = int(self.C("LEVERAGE"))
@@ -724,7 +777,7 @@ class FuturesScanMixin:
                 # reload via fetch_order so Monitor/PnL/Funding use the real
                 # size instead of the requested one.
                 filled_raw = order.get("filled")
-                amount = float(filled_raw) if filled_raw else 0.0
+                amount = self._positive_float(filled_raw)
                 entry_verified = amount > 0
                 if amount <= 0:
                     oid = order.get("id") or order.get("orderId")
@@ -734,7 +787,8 @@ class FuturesScanMixin:
                             _t.sleep(0.4 * (1 + _att))
                             try:
                                 refreshed = self.ex.fetch_order(str(oid), symbol_full)
-                                rf = float((refreshed or {}).get("filled") or 0)
+                                rf = self._positive_float(
+                                    (refreshed or {}).get("filled"))
                                 if rf > 0:
                                     amount = rf
                                     entry_verified = True
@@ -760,8 +814,8 @@ class FuturesScanMixin:
                         pos, positions_unavailable = fetch_open_position(
                             self.ex, symbol_full)
                         if pos is not None:
-                            real_amt = abs(float(pos.get("contracts")
-                                                 or pos.get("size") or 0.0))
+                            real_amt = abs(self._finite_float(
+                                pos.get("contracts") or pos.get("size")))
                             if real_amt > 0:
                                 amount = real_amt
                                 positions_verified = True
@@ -1043,8 +1097,9 @@ class FuturesScanMixin:
                 try:
                     from bot_utils.futures_order import _find_order_by_client_id
                     landed = _find_order_by_client_id(self.ex, symbol_full, _cid)
-                    if landed is not None and float(landed.get("filled") or 0) > 0:
-                        _amt = float(landed.get("filled") or 0) or float(amount_contracts)
+                    _landed_amt = self._positive_float((landed or {}).get("filled"))
+                    if landed is not None and _landed_amt > 0:
+                        _amt = _landed_amt or float(amount_contracts)
                         added = self.state.add(sym, {
                             "position_type": direction, "buy": entry_price,
                             "highest": entry_price, "buy_time": _utc_now_str(),
@@ -1080,7 +1135,10 @@ class FuturesScanMixin:
                                 closed, remaining = verify_position_closed(
                                     self.ex, symbol_full)
                                 if closed:
-                                    remove_open_position(self.BOT_NAME, sym)
+                                    self._cleanup_rolled_back_futures_entry_state(
+                                        sym,
+                                        "landed order rolled back after state failure",
+                                    )
                                     log_event(
                                         f" {sym}: landed order rolled back "
                                         f"after state-write failure", "WARN")
@@ -1106,7 +1164,8 @@ class FuturesScanMixin:
                 except Exception:
                     pass
                 if not _landed:
-                    remove_open_position(self.BOT_NAME, sym)
+                    self._cleanup_rolled_back_futures_entry_state(
+                        sym, "futures entry failed before durable state")
                 return
 
         #  Persist full trade record (overwrites provisional) 
@@ -1193,7 +1252,8 @@ class FuturesScanMixin:
                 from bot_utils import verify_position_closed
                 closed, remaining = verify_position_closed(self.ex, symbol_full)
                 if closed:
-                    remove_open_position(self.BOT_NAME, sym)
+                    self._cleanup_rolled_back_futures_entry_state(
+                        sym, "state write failed after live futures entry")
                     log_event(
                         f"{sym}: rollback close verified after state failure",
                         "WARN")

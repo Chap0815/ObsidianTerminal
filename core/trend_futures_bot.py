@@ -216,17 +216,39 @@ class TrendFuturesBot(FuturesBot):
             "funding_limit_pct": funding_limit,
         }
 
-    def _audit_changed(self, d: dict, updates: dict) -> bool:
-        for key, val in updates.items():
-            old = d.get(key)
-            if isinstance(val, float):
-                if old is None:
-                    return True
-                tolerance = max(abs(val) * 0.001, 1e-8) if key.endswith("_price") else 0.05
-                if abs(self._safe_float(old) - val) >= tolerance:
-                    return True
-            elif old != val:
-                return True
+    def _trailing_audit_log_interval_sec(self) -> float:
+        try:
+            interval = float(self.C("TRAILING_AUDIT_LOG_INTERVAL_SEC", 300) or 300)
+        except (TypeError, ValueError, OverflowError):
+            interval = 300.0
+        return max(30.0, interval) if math.isfinite(interval) else 300.0
+
+    def _trailing_audit_signature(self, audit: dict) -> tuple:
+        """Fields whose changes should be logged immediately.
+
+        Price and move fields are still persisted to state; this signature only
+        throttles high-volume structured telemetry.
+        """
+        return (
+            bool(audit.get("trailing_enabled")),
+            bool(audit.get("trailing_armed")),
+            bool(audit.get("post_partial_trailing_active")),
+            round(self._safe_float(audit.get("trailing_activation_pct")), 4),
+            round(self._safe_float(audit.get("trailing_distance_pct")), 4),
+            round(self._safe_float(audit.get("trailing_base_distance_pct")), 4),
+        )
+
+    def _should_log_trailing_audit(self, base: str, audit: dict) -> bool:
+        cache = getattr(self, "_trailing_audit_log_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._trailing_audit_log_cache = cache
+        sig = self._trailing_audit_signature(audit)
+        now = time.monotonic()
+        last_sig, last_ts = cache.get(base, (None, 0.0))
+        if sig != last_sig or now - last_ts >= self._trailing_audit_log_interval_sec():
+            cache[base] = (sig, now)
+            return True
         return False
 
     #  Universe 
@@ -683,10 +705,12 @@ class TrendFuturesBot(FuturesBot):
         # Entry price from the ticker (cross-the-ask realism left to the live fill)
         try:
             tk = self.ticker_cache.get(self.ex, full, timeout=5.0)
-            price = float(tk.get("last") or tk.get("close") or 0)
+            price = self._safe_float(tk.get("last"), 0.0)
+            if price <= 0:
+                price = self._safe_float(tk.get("close"), 0.0)
         except Exception:
             return
-        if price <= 0:
+        if not math.isfinite(price) or price <= 0:
             return
 
         notional = margin * eff_lev
@@ -725,8 +749,12 @@ class TrendFuturesBot(FuturesBot):
             mm = get_maintenance_margin_rate(self.ex, full)
         except Exception:
             mm = 0.01
-        cs = futures_contract_size(self.ex, full)
+        cs = self._safe_float(futures_contract_size(self.ex, full), 0.0)
+        if not math.isfinite(cs) or cs <= 0:
+            return
         contracts = (notional / price) / max(cs, 1e-9)
+        if not math.isfinite(contracts) or contracts <= 0:
+            return
         fill = price
         fees = 0.0
         amount = contracts
@@ -759,7 +787,7 @@ class TrendFuturesBot(FuturesBot):
             except Exception:
                 pass
             contracts = float(safe_amount_to_precision(self.ex, full, contracts))
-            if contracts <= 0:
+            if not math.isfinite(contracts) or contracts <= 0:
                 return
             import hashlib as _h
             _cid = (f"{self.BUY_PREFIX}-{base}-"
@@ -771,10 +799,20 @@ class TrendFuturesBot(FuturesBot):
                 log_event(f"[{self.BOT_NAME}] {base}: claimed by another bot "
                           f" skip", "WAIT")
                 return
-            self._record_open(base, fill, margin, eff_lev, contracts, 0.0,
-                              provisional=True, lev_cap=lev_cap, mm_rate=mm,
-                              margin_mode=margin_mode,
-                              entry_inflight=True)
+            if not self._record_open(
+                base, fill, margin, eff_lev, contracts, 0.0,
+                provisional=True, lev_cap=lev_cap, mm_rate=mm,
+                margin_mode=margin_mode,
+                entry_inflight=True,
+            ):
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: state write failed before "
+                    f"LIVE entry - aborting open",
+                    "ERROR",
+                )
+                self._cleanup_untracked_entry_state(
+                    base, "state write failed before entry")
+                return
             try:
                 order = create_order_with_retry(
                     self.ex, full, "buy", contracts, params=params,
@@ -791,8 +829,10 @@ class TrendFuturesBot(FuturesBot):
                     from bot_utils.futures_order import _find_order_by_client_id
                     landed = _find_order_by_client_id(self.ex, full, _cid,
                                                       log_event=log_event)
-                    if landed and float(landed.get("filled") or 0) > 0:
-                        amount = float(landed.get("filled") or 0)
+                    landed_amount = self._safe_float(
+                        (landed or {}).get("filled"), 0.0)
+                    if landed and landed_amount > 0:
+                        amount = landed_amount
                         landed_fill = price
                         for _k in ("average", "price"):
                             _fv = self._safe_float(landed.get(_k), 0.0)
@@ -801,12 +841,20 @@ class TrendFuturesBot(FuturesBot):
                                 break
                         actual_margin, _ = filled_margin_usdt(
                             amount, cs, landed_fill, eff_lev, margin)
-                        self._record_open(base, landed_fill, actual_margin,
-                                          eff_lev, amount,
-                                          0.0, provisional=False,
-                                          lev_cap=lev_cap, mm_rate=mm,
-                                          entry_shadow=shadow,
-                                          margin_mode=margin_mode)
+                        tracked = self._record_open(
+                            base, landed_fill, actual_margin,
+                            eff_lev, amount,
+                            0.0, provisional=False,
+                            lev_cap=lev_cap, mm_rate=mm,
+                            entry_shadow=shadow,
+                            margin_mode=margin_mode,
+                        )
+                        if not tracked:
+                            self._rollback_untracked_live_entry(
+                                base, full, amount, eff_lev, margin_mode,
+                                "landed order after open error",
+                            )
+                            return
                         _landed = True
                         log_event(f"[{self.BOT_NAME}]  {base}: landed despite "
                                   f"error  tracked and monitoring enabled", "WARN")
@@ -870,9 +918,22 @@ class TrendFuturesBot(FuturesBot):
         except Exception:
             pass
 
-        self._record_open(base, fill, actual_margin, eff_lev, amount, fees,
-                          provisional=provisional, lev_cap=lev_cap, mm_rate=mm,
-                          entry_shadow=shadow, margin_mode=margin_mode)
+        tracked = self._record_open(
+            base, fill, actual_margin, eff_lev, amount, fees,
+            provisional=provisional, lev_cap=lev_cap, mm_rate=mm,
+            entry_shadow=shadow, margin_mode=margin_mode,
+        )
+        if not tracked:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: state write failed after LIVE "
+                f"entry - attempting immediate rollback close",
+                "ERROR",
+            )
+            self._rollback_untracked_live_entry(
+                base, full, amount, eff_lev, margin_mode,
+                "state write failed after entry",
+            )
+            return
         if not provisional:
             log_event(f"[{self.BOT_NAME}] OPEN LONG {base} @ {fill:.6f} "
                       f"({eff_lev:g}x, notional {actual_margin * eff_lev:.1f}, "
@@ -939,12 +1000,39 @@ class TrendFuturesBot(FuturesBot):
         from bot_utils import fetch_open_position
         return fetch_open_position(self.ex, full)
 
+    def _cleanup_untracked_entry_state(self, base: str, reason: str) -> bool:
+        from core.database import remove_open_position
+
+        restore = {
+            "provisional": True,
+            "entry_inflight_until": 0.0,
+            "entry_aborted": True,
+            "entry_abort_reason": reason,
+            "claim_release_pending": True,
+        }
+        try:
+            removed = self.state.remove(base, restore)
+        except Exception as exc:
+            self._log_error(f"trend cleanup untracked state {base}", exc)
+            removed = False
+        if removed:
+            return True
+        try:
+            self.state.update_many(base, restore)
+        except Exception as exc:
+            self._log_error(f"trend mark untracked cleanup pending {base}", exc)
+        try:
+            remove_open_position(self.BOT_NAME, base)
+        except Exception as exc:
+            self._log_error(f"trend release untracked claim {base}", exc)
+        return False
+
     def _record_open(self, base, fill, margin, eff_lev, amount, fees,
                       provisional: bool = False, lev_cap=None,
                       mm_rate: float = 0.01,
                       entry_shadow: Optional[dict] = None,
                       margin_mode: str = "isolated",
-                      entry_inflight: bool = False) -> None:
+                      entry_inflight: bool = False) -> bool:
         from core.logger import _date as _utc
         from bot_utils import calc_liquidation_price, distance_to_liquidation_pct
         # Liquidation uses the INTEGER leverage the exchange runs (ceil) + real
@@ -976,7 +1064,72 @@ class TrendFuturesBot(FuturesBot):
                 "entry_realized_vol": entry_shadow.get("realized_vol"),
                 "entry_vol_size_mult": entry_shadow.get("vol_size_mult"),
             })
-        self.state.add(base, row)
+        return self.state.add(base, row) is not False
+
+    def _rollback_untracked_live_entry(
+        self,
+        base: str,
+        full: str,
+        amount: float,
+        leverage: float,
+        margin_mode: str,
+        reason: str,
+    ) -> bool:
+        """Close a live entry when durable state could not be written."""
+        from core.logger import log_event
+        from bot_utils import create_order_with_retry, verify_position_closed
+        from config.exchange_config import reduce_only_params, safe_amount_to_precision
+
+        try:
+            amt = float(safe_amount_to_precision(self.ex, full, amount))
+        except Exception:
+            amt = float(amount or 0.0)
+        if amt <= 0:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: cannot rollback untracked live "
+                f"entry ({reason}) - invalid amount",
+                "ERROR",
+            )
+            return False
+        lev_int = max(1, int(math.ceil(float(leverage or 1.0))))
+        try:
+            create_order_with_retry(
+                self.ex,
+                full,
+                "sell",
+                amt,
+                params=reduce_only_params(
+                    position_side="long",
+                    margin_mode=margin_mode,
+                    leverage=lev_int,
+                ),
+                shutdown_event=self._shutdown_event,
+                action_label=f"trend rollback untracked {base}",
+                log_event=log_event,
+            )
+            closed, remaining = verify_position_closed(self.ex, full)
+            if closed:
+                self._cleanup_untracked_entry_state(base, reason)
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: untracked live entry "
+                    f"rollback verified flat ({reason})",
+                    "WARN",
+                )
+                return True
+            log_event(
+                f"[{self.BOT_NAME}] {base}: rollback close not verified "
+                f"(remaining {remaining:g}) - claim kept for reconcile",
+                "ERROR",
+            )
+            return False
+        except Exception as exc:
+            self._log_error(f"trend rollback untracked {base}", exc)
+            log_event(
+                f"[{self.BOT_NAME}] {base}: rollback close failed after "
+                f"state write failure - claim kept for reconcile: {exc}",
+                "ERROR",
+            )
+            return False
 
     #  Close one position (reduce-only, verify-before-book) 
     def _close_position(self, base: str, d: dict, reason: str) -> None:
@@ -1440,12 +1593,13 @@ class TrendFuturesBot(FuturesBot):
 
         full = f"{base}/USDT:USDT"
         try:
-            if float(d.get("entry_inflight_until") or 0.0) > time.time():
-                return False
+            inflight_active = float(d.get("entry_inflight_until") or 0.0) > time.time()
         except (TypeError, ValueError):
-            pass
+            inflight_active = False
         pos, unavailable = self._fetch_exchange_position(full)
         if pos is None:
+            if inflight_active:
+                return False
             if unavailable:
                 return False
             log_event(f"[{self.BOT_NAME}] {base}: provisional state had no "
@@ -1507,21 +1661,26 @@ class TrendFuturesBot(FuturesBot):
         full = f"{base}/USDT:USDT"
         try:
             tk = self.ticker_cache.get(self.ex, full, timeout=5.0, critical=True)
-            curr = float(tk.get("last") or tk.get("close") or 0)
+            curr = self._safe_float(tk.get("last"), 0.0)
+            if curr <= 0:
+                curr = self._safe_float(tk.get("close"), 0.0)
         except Exception:
             curr = 0.0
+        if not math.isfinite(curr) or curr <= 0:
             try:
-                curr = float(self._fallback_mark_price(full) or 0.0)
+                curr = self._safe_float(self._fallback_mark_price(full), 0.0)
             except Exception:
                 curr = 0.0
-            if curr <= 0:
-                try:
-                    self._note_price_unavailable(base)
-                except Exception:
-                    pass
-                return
-        if curr <= 0:
+        if not math.isfinite(curr) or curr <= 0:
+            try:
+                self._note_price_unavailable(base)
+            except Exception:
+                pass
             return
+        try:
+            self._clear_price_unavailable(base)
+        except Exception:
+            pass
         entry = float(d.get("buy", 0) or 0)
         if entry <= 0:
             return
@@ -1668,34 +1827,48 @@ class TrendFuturesBot(FuturesBot):
                 if partial_done:
                     return
 
-            trailing = self._f("TRAILING_DISTANCE", 0.0)
-            if trailing > 0:
-                effective_trailing, post_partial_trailing = (
-                    self._post_partial_trailing(trailing, d)
-                )
+            try:
+                trailing = float(self.C("TRAILING_DISTANCE", 0.0))
+            except (TypeError, ValueError, OverflowError):
+                trailing = float("nan")
+            trailing_invalid = (not math.isfinite(trailing)) or trailing < 0
+            if trailing > 0 or trailing_invalid:
+                if trailing_invalid:
+                    effective_trailing = trailing
+                    audit_trailing = 0.0
+                    audit_base_trailing = 0.0
+                    post_partial_trailing = False
+                else:
+                    effective_trailing, post_partial_trailing = (
+                        self._post_partial_trailing(trailing, d)
+                    )
+                    audit_trailing = effective_trailing
+                    audit_base_trailing = trailing
                 trailing_armed = bool(d.get("break_even")) or (
                     activation > 0 and high_move >= activation)
                 trail_stop = (extreme * (1.0 - effective_trailing / 100.0)
                               if pos_type == "LONG"
                               else extreme * (1.0 + effective_trailing / 100.0))
+                if not math.isfinite(trail_stop):
+                    trail_stop = 0.0
                 trail_audit = {
                     "trailing_enabled": True,
                     "trailing_armed": trailing_armed,
                     "trailing_activation_pct": activation,
-                    "trailing_distance_pct": effective_trailing,
-                    "trailing_base_distance_pct": trailing,
+                    "trailing_distance_pct": audit_trailing,
+                    "trailing_base_distance_pct": audit_base_trailing,
                     "post_partial_trailing_active": post_partial_trailing,
                     "trailing_peak_move_pct": high_move,
                     "trailing_current_move_pct": move,
                     "trailing_giveback_pct": max(0.0, high_move - move),
                     "trailing_stop_price": trail_stop,
                 }
-                if self._audit_changed(d, trail_audit):
-                    d.update(trail_audit)
-                    try:
-                        self.state.update_many(base, trail_audit)
-                    except Exception as e:
-                        self._log_error(f"trend trailing audit update {base}", e)
+                d.update(trail_audit)
+                try:
+                    self.state.update_many(base, trail_audit)
+                except Exception as e:
+                    self._log_error(f"trend trailing audit update {base}", e)
+                if self._should_log_trailing_audit(base, trail_audit):
                     try:
                         from core.logger import log_struct
                         log_struct("futrend_trailing_audit",

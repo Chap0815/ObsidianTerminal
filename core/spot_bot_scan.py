@@ -19,6 +19,7 @@ Flow per tick:
 """
 from __future__ import annotations
 
+import math
 import os
 
 from bot_utils import (
@@ -53,6 +54,36 @@ class ScanMixin:
         from core.database import remove_open_position
         remove_open_position(self.BOT_NAME, sym)
         return True
+
+    def _cleanup_rolled_back_entry_state(self, sym: str, reason: str) -> bool:
+        """Remove a state row after a verified rollback sell.
+
+        ``TradeState.add`` can return False after already mutating memory/JSON.
+        If rollback flattens the exchange position, we must not only release
+        the claim; we must remove or mark any phantom state row too.
+        """
+        restore = {
+            "provisional": True,
+            "entry_aborted": True,
+            "entry_abort_reason": reason,
+            "claim_release_pending": True,
+        }
+        try:
+            removed = self.state.remove(sym, restore)
+        except Exception as exc:
+            self._log_error(f"cleanup rolled-back entry {sym}", exc)
+            removed = False
+        if removed:
+            return True
+        try:
+            if self.state.has(sym):
+                self.state.update_many(sym, restore)
+                return False
+        except Exception as exc:
+            self._log_error(f"mark rolled-back entry cleanup pending {sym}", exc)
+        from core.database import remove_open_position
+        remove_open_position(self.BOT_NAME, sym)
+        return False
 
     def _assess_spot_entry_signal(self, r, regime: dict):
         rsi_15, rsi_h, rsi_4 = r["rsi_15m"], r["rsi_1h"], r["rsi_4h"]
@@ -121,8 +152,7 @@ class ScanMixin:
 
     def _scan_tick(self) -> None:
         from core.logger import log_event
-        from trading.market_filters import (can_buy_now, get_market_regime,
-                                              get_fear_greed, get_btc_change)
+        from trading.market_filters import can_buy_now, get_market_regime
         from trading.risk_manager import is_bot_paused, is_bad_hour
         from trading.screener import get_top_momentum_coins
 
@@ -468,7 +498,8 @@ class ScanMixin:
                 order, sold_amount = spot_market_sell_safe(
                     self.ex, f"{sym}/USDT", amount)
                 if order_was_filled(order, sold_amount, min_fill_ratio=1e-9):
-                    remove_open_position(self.BOT_NAME, sym)
+                    self._cleanup_rolled_back_entry_state(
+                        sym, "state write failed after live buy")
                     log_event(
                         f"Buy {sym}: rollback sell filled after state failure",
                         "WARN")
@@ -921,13 +952,62 @@ class ScanMixin:
             # sell can't loop on 30005 oversold. min_fill_ratio0 keeps real
             # partial fills (handled just below), rejecting only nothing-filled.
             from bot_utils.order_utils import order_was_filled
-            if not order_was_filled(order, amount_coins, min_fill_ratio=1e-9):
+            if not order_was_filled(
+                order,
+                amount_coins,
+                min_fill_ratio=1e-9,
+                trust_terminal_status_with_bad_numbers=True,
+            ):
                 log_event(
                     f"Buy {sym}: order returned but NOT filled "
                     f"(order={order!r})  skipping, no position booked", "WARN")
                 return None
 
-            amount = float(order.get("filled") or amount_coins)
+            provisional_written = False
+            provisional_fill_price = extract_fill_price(order, price)
+            try:
+                provisional_amount = float(order.get("filled") or amount_coins)
+                if not math.isfinite(provisional_amount) or provisional_amount <= 0:
+                    raise ValueError("non-finite filled amount")
+            except (TypeError, ValueError, OverflowError):
+                provisional_amount = amount_coins
+            try:
+                from core.logger import _date as _utc_now_str_inner
+                provisional_ok = self.state.add(sym, {
+                    "buy": provisional_fill_price,
+                    "highest": provisional_fill_price,
+                    "buy_time": _utc_now_str_inner(),
+                    "invested_usdt": provisional_amount * provisional_fill_price,
+                    "amount": provisional_amount,
+                    "original_amount": provisional_amount,
+                    "partial_sold": False,
+                    "be_active": False,
+                    "break_even": False,
+                    "initial_entry_fee": 0.0,
+                    "fees_paid": 0.0,
+                    "provisional": True,
+                })
+                provisional_written = provisional_ok is not False
+                if provisional_ok is False:
+                    log_event(
+                        f"Buy {sym}: early provisional state-write returned "
+                        f"False; final state write must recover before claim "
+                        f"release",
+                        "WARN")
+            except Exception as _prov_e:
+                log_event(
+                    f"Buy {sym}: early provisional state-write failed "
+                    f"({_prov_e})  relying on final write", "WARN")
+
+            try:
+                amount = float(order.get("filled") or amount_coins)
+                if not math.isfinite(amount) or amount <= 0:
+                    raise ValueError("non-finite filled amount")
+            except (TypeError, ValueError, OverflowError):
+                amount = amount_coins
+                log_event(
+                    f"Buy {sym}: filled amount malformed after accepted order; "
+                    f"using intended amount {amount:.8f} for tracking", "WARN")
             # detect partial fill
             if amount < amount_coins * 0.95:
                 log_event(
@@ -972,25 +1052,27 @@ class ScanMixin:
             # state.add corrects the provisional values).
             try:
                 from core.logger import _date as _utc_now_str_inner
-                provisional_ok = self.state.add(sym, {
-                    "buy": fill_price,
-                    "highest": fill_price,
-                    "buy_time": _utc_now_str_inner(),
-                    "invested_usdt": amount * fill_price,
-                    "amount": amount,
-                    "original_amount": amount,
-                    "partial_sold": False,
-                    "be_active": False,
-                    "break_even": False,
-                    "initial_entry_fee": 0.0,
-                    "fees_paid": 0.0,
-                    "provisional": True,
-                })
-                if provisional_ok is False:
-                    log_event(
-                        f"Buy {sym}: provisional state-write returned False; "
-                        f"final state write must recover before claim release",
-                        "WARN")
+                if not provisional_written:
+                    provisional_ok = self.state.add(sym, {
+                        "buy": fill_price,
+                        "highest": fill_price,
+                        "buy_time": _utc_now_str_inner(),
+                        "invested_usdt": amount * fill_price,
+                        "amount": amount,
+                        "original_amount": amount,
+                        "partial_sold": False,
+                        "be_active": False,
+                        "break_even": False,
+                        "initial_entry_fee": 0.0,
+                        "fees_paid": 0.0,
+                        "provisional": True,
+                    })
+                    if provisional_ok is False:
+                        log_event(
+                            f"Buy {sym}: provisional state-write returned "
+                            f"False; final state write must recover before "
+                            f"claim release",
+                            "WARN")
             except Exception as _prov_e:
                 # State write failure is non-fatal here  the final state.add
                 # below will retry. We just log.
@@ -999,16 +1081,27 @@ class ScanMixin:
                     f"({_prov_e})  relying on final write", "INFO"
                 )
 
-            # Entry fee
+            # Entry fee. Once a live buy has filled, fee extraction must not
+            # turn the whole entry into "failed"; otherwise the provisional
+            # state remains rough and the final net amount is never written.
             try:
                 from trading.fee_utils import extract_or_estimate_with_refetch
                 entry_fee = extract_or_estimate_with_refetch(
                     self.ex, order, f"{sym}/USDT", fill_price,
                     base_override=sym
                 )
-            except Exception:
-                from bot_utils.order_utils import extract_order_fee as _eof
-                entry_fee = _eof(order)
+            except Exception as fee_exc:
+                try:
+                    from bot_utils.order_utils import extract_order_fee as _eof
+                    entry_fee = _eof(order)
+                except Exception:
+                    entry_fee = max(0.0, amount * fill_price * 0.001)
+                log_event(
+                    f"Buy {sym}: entry-fee lookup failed "
+                    f"({type(fee_exc).__name__}); using fallback fee "
+                    f"{entry_fee:.6f} USDT",
+                    "WARN",
+                )
 
             # Async-aware base-fee resolution: the fee-in-base may not be
             # settled in the initial order response (200-500ms async delay on
@@ -1016,16 +1109,30 @@ class ScanMixin:
             # the real wallet balance and the later sell would hit
             # InsufficientBalance. This helper refetches up to 3 and falls back
             # to a taker-rate estimate.
-            from bot_utils.spot_fee_settle import extract_or_estimate_base_fee
-            base_fee = extract_or_estimate_base_fee(
-                self.ex, order, f"{sym}/USDT", sym,
-                max_attempts=3,
-                retry_delay=0.3,
-                fallback_filled=gross_amount,
-                log_event=log_event,
-                shutdown_event=getattr(self, "_shutdown_event", None),
-            )
             gross_amount = amount
+            try:
+                from bot_utils.spot_fee_settle import extract_or_estimate_base_fee
+                base_fee = extract_or_estimate_base_fee(
+                    self.ex, order, f"{sym}/USDT", sym,
+                    max_attempts=3,
+                    retry_delay=0.3,
+                    fallback_filled=gross_amount,
+                    log_event=log_event,
+                    shutdown_event=getattr(self, "_shutdown_event", None),
+                )
+            except Exception as base_fee_exc:
+                base_fee = max(0.0, gross_amount * 0.001)
+                try:
+                    from bot_utils.spot_fee_settle import SPOT_DEFAULT_TAKER_FEE
+                    base_fee = max(0.0, gross_amount * SPOT_DEFAULT_TAKER_FEE)
+                except Exception:
+                    pass
+                log_event(
+                    f"Buy {sym}: base-fee lookup failed "
+                    f"({type(base_fee_exc).__name__}); using fallback "
+                    f"{base_fee:.8f} {sym} so the entry is still tracked",
+                    "WARN",
+                )
             if base_fee > 0:
                 amount = max(0.0, amount - base_fee)
 

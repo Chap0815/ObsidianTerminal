@@ -10,8 +10,8 @@ last resort (mirrors ``extract_or_estimate_futures_fee``).
 """
 from __future__ import annotations
 
+import math
 import time
-from typing import Optional
 
 from bot_utils.order_utils import extract_base_fee_amount
 
@@ -85,28 +85,42 @@ def extract_or_estimate_base_fee(ex,
     # Step 3: estimate. The exchange WILL have charged a fee  we just
     # can't read it yet. Assuming the standard taker rate is FAR safer
     # than recording the gross amount (which leads to InsufficientBalance).
-    try:
-        filled = float(
-            order.get("filled")
-            or order.get("amount")
-            or fallback_filled
-            or 0
-        )
-    except (TypeError, ValueError):
-        filled = 0.0
-    if filled <= 0:
+    filled = 0.0
+    for candidate in (
+        order.get("filled") if isinstance(order, dict) else None,
+        order.get("amount") if isinstance(order, dict) else None,
+        fallback_filled,
+    ):
+        if candidate is None:
+            continue
+        try:
+            parsed = float(candidate)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(parsed) and parsed > 0:
+            filled = parsed
+            break
+    if not math.isfinite(filled) or filled <= 0:
         return 0.0
+    try:
+        rate = float(taker_rate)
+    except (TypeError, ValueError, OverflowError):
+        rate = SPOT_DEFAULT_TAKER_FEE
+    if not math.isfinite(rate) or rate < 0:
+        rate = SPOT_DEFAULT_TAKER_FEE
 
     # Conservative over-estimate: assume the fee WAS charged in base
     # coin even if we couldn't verify. Worst case we record a slightly
     # too-small amount, which means a later sell tries to sell SLIGHTLY
     # less than we own  that's safe (leaves dust on exchange).
-    estimated = filled * max(0.0, taker_rate)
+    estimated = filled * rate
+    if not math.isfinite(estimated):
+        estimated = 0.0
     if log_event:
         try:
             log_event(
                 f"spot fee for {symbol_pair} not settled after "
-                f"{max_attempts} refetches  using {taker_rate*100:.3f}% "
+                f"{max_attempts} refetches  using {rate*100:.3f}% "
                 f"estimate ({estimated:.8f} {base_symbol}) to avoid "
                 f"InsufficientBalance death loop", "WARN"
             )

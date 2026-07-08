@@ -19,6 +19,7 @@ All read-only. No widgets, no globals beyond the imported constants.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,9 @@ from launcher.config.settings import DB_PATH, OLLAMA_URL
 
 #  Low-level helpers 
 
+class MetricsDbReadError(RuntimeError):
+    """Raised when an existing launcher metrics DB cannot be read."""
+
 def load_json(path: str) -> dict:
     """Best-effort JSON load. Returns ``{}`` on any failure (missing file,
     parse error, empty file)."""
@@ -46,6 +50,10 @@ def load_json(path: str) -> dict:
         return {}
 
 
+def _state_value_prefer_key(row: dict, preferred: str, legacy: str):
+    return row.get(preferred) if preferred in row else row.get(legacy)
+
+
 def query_db(sql: str, params: tuple = ()) -> list:
     """Single-shot SQLite read with a 20 s timeout + busy_timeout PRAGMA.
 
@@ -55,19 +63,26 @@ def query_db(sql: str, params: tuple = ()) -> list:
     """
     if not os.path.exists(DB_PATH):
         return []
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH, timeout=20.0)
         conn.execute("PRAGMA busy_timeout=20000")
         rows = conn.execute(sql, params).fetchall()
         conn.close()
         return rows
-    except Exception:
-        return []
+    except Exception as exc:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+        raise MetricsDbReadError(str(exc)) from exc
 
 
 def query_db_dict(sql: str, params: tuple = ()) -> list[dict]:
     if not os.path.exists(DB_PATH):
         return []
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH, timeout=20.0)
         conn.row_factory = sqlite3.Row
@@ -75,8 +90,13 @@ def query_db_dict(sql: str, params: tuple = ()) -> list[dict]:
         rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
         conn.close()
         return rows
-    except Exception:
-        return []
+    except Exception as exc:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+        raise MetricsDbReadError(str(exc)) from exc
 
 
 #  Per-bot aggregates 
@@ -153,6 +173,8 @@ def get_bot_stats(bot: str, mode_is_sim: bool | None = None) -> dict:
         from core.database import local_day_utc_bounds
         today_info = _get_today_pnl_for_metrics_key(bot)
         start_utc, end_utc = local_day_utc_bounds()
+    except MetricsDbReadError:
+        raise
     except Exception:
         today_info = {"total_profit": 0.0, "trade_count": 0}
         today_dt = datetime.now(timezone.utc).replace(
@@ -274,6 +296,8 @@ def get_market_info():
             "ORDER BY timestamp DESC LIMIT 1"
         )
         fg = int(fg_rows[0][0]) if fg_rows else fg_fallback
+    except MetricsDbReadError:
+        raise
     except Exception:
         fg = fg_fallback
 
@@ -542,9 +566,15 @@ def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
         try:
             # trades.json may use the legacy schema ("buy") or the
             # StateManager schema ("buy_price"). Accept both.
-            buy    = float(d.get("buy_price") or d.get("buy") or 0)
+            buy_raw = _state_value_prefer_key(d, "buy_price", "buy")
+            buy = float(buy_raw)
             amount = float(d.get("amount", 0))
-            if buy <= 0 or amount <= 0:
+            if (
+                not math.isfinite(buy)
+                or not math.isfinite(amount)
+                or buy <= 0
+                or amount <= 0
+            ):
                 continue
             curr = price_map.get(sym, 0.0)
             if curr > 0:

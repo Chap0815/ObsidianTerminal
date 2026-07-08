@@ -120,10 +120,32 @@ def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
                         warned = False
                         while not _renew_stop.wait(_interval):
                             try:
-                                from core.database import renew_advisory_lock
+                                from core.database import (
+                                    acquire_advisory_lock,
+                                    renew_advisory_lock,
+                                )
                                 if not renew_advisory_lock(
                                         _adv_lock_name, _adv_holder_id,
                                         ttl_sec=_ADVISORY_TTL_SEC):
+                                    reacquired = False
+                                    if not _renew_stop.is_set():
+                                        try:
+                                            reacquired = acquire_advisory_lock(
+                                                _adv_lock_name, _adv_holder_id,
+                                                ttl_sec=_ADVISORY_TTL_SEC)
+                                        except Exception:
+                                            reacquired = False
+                                    if reacquired and _renew_stop.is_set():
+                                        try:
+                                            from core.database import release_advisory_lock
+                                            release_advisory_lock(
+                                                _adv_lock_name, _adv_holder_id)
+                                        except Exception:
+                                            pass
+                                        reacquired = False
+                                    if reacquired:
+                                        warned = False
+                                        continue
                                     if not warned:
                                         warned = True
                                         try:
@@ -168,7 +190,8 @@ def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
                 pass
         if _renew_thread is not None:
             try:
-                _renew_thread.join(timeout=0.2)
+                _renew_thread.join(
+                    timeout=max(1.0, min(5.0, float(_ADVISORY_TIMEOUT) + 0.5)))
             except Exception:
                 pass
         if _adv_acquired and _adv_lock_name and _adv_holder_id:

@@ -11,6 +11,7 @@ REQUIRED_RELEASE_ITEMS = [
     "requirements.lock.txt",
     "bot_config.default.json",
     "DEPLOY_MANIFEST.json",
+    "bots",
     "core",
     "launcher",
     "bot_utils",
@@ -31,6 +32,11 @@ REQUIRED_RELEASE_ITEMS = [
     "tools/update_launcher.py",
     "tools/release_check.py",
     "tools/selftest.py",
+    "bots/main_bot_aggressive.py",
+    "bots/main_bot_balanced.py",
+    "bots/main_bot_cross.py",
+    "bots/main_bot_futures.py",
+    "bots/main_bot_trendfut.py",
 ]
 
 
@@ -42,6 +48,11 @@ UPDATE_SMOKE_FILES = [
     "bot_config.default.json",
     "config/github_known_hosts",
     "config/update_config.example.json",
+    "bots/main_bot_aggressive.py",
+    "bots/main_bot_balanced.py",
+    "bots/main_bot_cross.py",
+    "bots/main_bot_futures.py",
+    "bots/main_bot_trendfut.py",
     "launcher/config/settings.py",
     "launcher/ui/app.py",
     "tools/dashboard.py",

@@ -1934,11 +1934,22 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
 def remove_open_position(bot_name: str, symbol: str) -> bool:
     conn = get_connection()
     try:
+        base = _base_symbol(symbol)
+        if not bot_name or not base:
+            return False
         conn.execute(
-            "DELETE FROM bot_open_positions WHERE bot_name=? AND symbol=?",
-            (bot_name, symbol))
+            """DELETE FROM bot_open_positions
+               WHERE bot_name=?
+                 AND (symbol = ? OR symbol LIKE ? OR symbol LIKE ?)""",
+            (bot_name, base, f"{base}/%", f"{base}:%"))
+        remaining = conn.execute(
+            """SELECT 1 FROM bot_open_positions
+               WHERE bot_name=?
+                 AND (symbol = ? OR symbol LIKE ? OR symbol LIKE ?)
+               LIMIT 1""",
+            (bot_name, base, f"{base}/%", f"{base}:%")).fetchone()
         conn.commit()
-        return True
+        return remaining is None
     except Exception as e:
         # A swallowed DELETE leaves a STALE row in the mirror  the
         # dashboard/risk reads would show a position that is actually closed,

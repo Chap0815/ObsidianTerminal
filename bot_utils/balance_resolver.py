@@ -10,7 +10,7 @@ DUST_THRESHOLD).
 """
 from __future__ import annotations
 
-from typing import Optional
+import math
 
 
 def effective_balance(info: dict, dust_threshold: float = 1e-8) -> float:
@@ -31,29 +31,39 @@ def effective_balance(info: dict, dust_threshold: float = 1e-8) -> float:
     if not isinstance(info, dict):
         return 0.0
 
-    def _safe_float(key: str) -> float:
+    try:
+        threshold = float(dust_threshold)
+    except (TypeError, ValueError, OverflowError):
+        threshold = 1e-8
+    if not (math.isfinite(threshold) and threshold >= 0):
+        threshold = 1e-8
+
+    def _safe_float(key: str) -> float | None:
         try:
             v = info.get(key)
             if v is None:
-                return 0.0
-            return float(v)
-        except (TypeError, ValueError):
-            return 0.0
+                return None
+            parsed = float(v)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if math.isfinite(parsed) and parsed >= 0 else None
 
     total = _safe_float("total")
     free  = _safe_float("free")
     used  = _safe_float("used")
 
     # Prefer total when it exists and is sane
-    if total > 0:
+    if total is not None and total > 0:
         result = total
-    elif free > 0 or used > 0:
+    elif (free or 0.0) > 0 or (used or 0.0) > 0:
         # Fallback: sum free + used. Some exchanges miss the total field.
-        result = free + used
+        result = (free or 0.0) + (used or 0.0)
+        if not math.isfinite(result):
+            result = max(free or 0.0, used or 0.0)
     else:
         result = 0.0
 
-    return result if result > dust_threshold else 0.0
+    return result if result > threshold else 0.0
 
 
 def is_position_held(info: dict, dust_threshold: float = 1e-8) -> bool:

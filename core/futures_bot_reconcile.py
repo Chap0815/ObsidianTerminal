@@ -9,6 +9,7 @@ Two reconciliation paths:
 """
 from __future__ import annotations
 
+import math
 import time
 
 from core.clock import now_utc
@@ -32,10 +33,14 @@ def _trade_side(t: dict) -> str:
 
 
 def _is_close_trade_for_position(t: dict, pos_type: str | None) -> bool:
-    if _is_reduce_only_trade(t):
-        return True
     side = _trade_side(t)
     ptype = str(pos_type or "").upper()
+    if _is_reduce_only_trade(t):
+        if ptype in {"LONG", "SHORT"}:
+            if ptype == "LONG":
+                return side in {"sell", "short"}
+            return side in {"buy", "long"}
+        return True
     if ptype == "LONG":
         return side in {"sell", "short"}
     if ptype == "SHORT":
@@ -45,19 +50,50 @@ def _is_close_trade_for_position(t: dict, pos_type: str | None) -> bool:
 
 def _trade_amount(t: dict) -> float:
     try:
-        return abs(float(t.get("amount", 0) or 0))
-    except (TypeError, ValueError):
+        amount = abs(float(t.get("amount", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
         return 0.0
+    return amount if amount > 0 and amount < float("inf") else 0.0
 
 
 def _trade_fee_usdt(t: dict) -> float:
     fee = t.get("fee") or {}
     try:
         cost = abs(float(fee.get("cost", 0) or 0))
-    except (TypeError, ValueError, AttributeError):
+    except (TypeError, ValueError, OverflowError, AttributeError):
         cost = 0.0
     currency = str(fee.get("currency", "") if isinstance(fee, dict) else "").upper()
-    return cost if currency in {"USDT", "USD"} else 0.0
+    return cost if currency in {"USDT", "USD"} and cost < float("inf") else 0.0
+
+
+def _trade_price(t: dict) -> float:
+    try:
+        price = float(t.get("price", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return price if price > 0 and price < float("inf") else 0.0
+
+
+def _estimate_futures_close_fee_usdt(
+    amount: float,
+    contract_size: float,
+    close_price: float,
+    fee_rate: float,
+) -> float:
+    try:
+        amt = float(amount)
+        cs = float(contract_size)
+        price = float(close_price)
+        rate = float(fee_rate)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not all(math.isfinite(v) and v >= 0 for v in (amt, cs, price, rate)):
+        return 0.0
+    try:
+        fee = amt * cs * price * rate
+    except OverflowError:
+        return 0.0
+    return fee if math.isfinite(fee) else 0.0
 
 
 def _aggregate_futures_reduce_trades(bot, symbol_full: str,
@@ -65,7 +101,9 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
                                      pos_type: str | None = None) -> tuple[float, float, str]:
     try:
         target = max(0.0, float(target_contracts or 0.0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        target = 0.0
+    if target >= float("inf"):
         target = 0.0
     if target <= 0 or not hasattr(bot.ex, "fetch_my_trades"):
         return 0.0, 0.0, "unavailable"
@@ -79,25 +117,41 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
     used_side_fallback = False
     for t in reversed(trades):
         is_reduce = _is_reduce_only_trade(t)
-        if not is_reduce and not _is_close_trade_for_position(t, pos_type):
+        if not _is_close_trade_for_position(t, pos_type):
             continue
         used_side_fallback = used_side_fallback or not is_reduce
         amt = _trade_amount(t)
-        price = float(t.get("price", 0) or 0)
+        price = _trade_price(t)
         if amt <= 0 or price <= 0:
             continue
         take = min(amt, max(0.0, target - qty))
         if take <= 0:
             break
+        try:
+            trade_notional = take * price
+            fee_part = _trade_fee_usdt(t) * (take / amt)
+        except (OverflowError, ZeroDivisionError):
+            continue
+        if not (math.isfinite(trade_notional) and math.isfinite(fee_part)):
+            continue
         qty += take
-        notional += take * price
-        fee_usdt += _trade_fee_usdt(t) * (take / amt)
+        notional += trade_notional
+        fee_usdt += fee_part
+        if not (
+            math.isfinite(qty)
+            and math.isfinite(notional)
+            and math.isfinite(fee_usdt)
+        ):
+            return 0.0, 0.0, "unavailable"
         if qty + 1e-12 >= target:
             break
     if qty + 1e-12 < target or qty <= 0:
         return 0.0, 0.0, "unavailable"
     source = "fetch_my_trades_side_vwap" if used_side_fallback else "fetch_my_trades_vwap"
-    return notional / qty, fee_usdt, source
+    vwap = notional / qty
+    if not (math.isfinite(vwap) and math.isfinite(fee_usdt)):
+        return 0.0, 0.0, "unavailable"
+    return vwap, fee_usdt, source
 
 
 def _find_futures_external_close_price(bot, symbol_full: str,
@@ -257,8 +311,11 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
     )
     close_fee = (
         close_fee_actual
-        if close_fee_actual > 0
-        else sold_contracts * contract_size * close_price * FUTURES_DEFAULT_TAKER_FEE
+        if close_fee_actual > 0 and math.isfinite(close_fee_actual)
+        else _estimate_futures_close_fee_usdt(
+            sold_contracts, contract_size, close_price,
+            FUTURES_DEFAULT_TAKER_FEE,
+        )
     )
     profit_usdt = round(gross_pnl - entry_fee - close_fee - funding_partial, 4)
     item = {
@@ -534,25 +591,38 @@ class FuturesReconcileMixin:
                         f"or liquidated while bot was offline)",
                         "WARN"
                     )
+                    restore = {
+                        "accounting_already_booked": True,
+                        "accounting_booked_reason": "Offline reconcile",
+                    }
                     try:
                         from bot_utils.trade_state import remove_with_restore_fields
+                        # Scope by bot: FUTURES + CROSS share futures_state;
+                        # unscoped would wipe the other bot's dashboard row.
+                        remove_futures_state(
+                            sym, self.BOT_NAME,
+                            mode_is_sim=getattr(self, "simulation", None))
                         removed_state = remove_with_restore_fields(
-                            self.state,
-                            sym,
-                            {
-                                "accounting_already_booked": True,
-                                "accounting_booked_reason": "Offline reconcile",
-                            },
+                            self.state, sym, restore,
                         )
                         if removed_state:
-                            # Scope by bot: FUTURES + CROSS share futures_state;
-                            # unscoped would wipe the other bot's dashboard row.
-                            remove_futures_state(
-                                sym, self.BOT_NAME,
-                                mode_is_sim=getattr(self, "simulation", None))
                             strikes.pop(sym, None)
                     except Exception as e:
                         self._log_error(f"reconcile-remove {sym}", e)
+                        try:
+                            keep = dict(restore)
+                            keep["futures_state_cleanup_pending"] = True
+                            self.state.update_many(sym, keep)
+                        except Exception as state_err:
+                            self._log_error(
+                                f"mark reconcile cleanup pending {sym}",
+                                state_err)
+                        log_event(
+                            f" Reconciliation: {sym} close already booked, "
+                            f"but futures_state cleanup failed  keeping state "
+                            f"for retry.",
+                            "WARN"
+                        )
 
             # Exchange-only positions. COEXISTENCE: a coin held by ANOTHER bot
             # (shared claims registry) is NOT our orphan  subtract those.
@@ -659,9 +729,38 @@ class FuturesReconcileMixin:
                         "margin_mode": mm_mode or self.C("MARGIN_MODE", "isolated"),
                     })
                     if added is False:
+                        if self.state.has(base):
+                            try:
+                                self.state.update_many(base, {
+                                    "claim_registry_pending": True,
+                                    "claim_registry_pending_reason": (
+                                        "adoption state.add returned False"),
+                                    "adopted": True,
+                                })
+                            except Exception as state_exc:
+                                self._log_error(
+                                    f"mark adopted claim pending {base}",
+                                    state_exc)
+                            adopted.append(base)
+                            continue
                         raise RuntimeError("state.add returned False")
                     adopted.append(base)
                 except Exception as _ae:
+                    if self.state.has(base):
+                        try:
+                            self.state.update_many(base, {
+                                "claim_registry_pending": True,
+                                "claim_registry_pending_reason": (
+                                    "adoption state write raised after state mutation"),
+                                "adopted": True,
+                            })
+                        except Exception as state_exc:
+                            self._log_error(
+                                f"mark adopted claim pending {base}",
+                                state_exc)
+                        adopted.append(base)
+                        self._log_error(f"adopt orphan {base}", _ae)
+                        continue
                     remove_open_position(self.BOT_NAME, base)  # release on failure
                     self._log_error(f"adopt orphan {base}", _ae)
                     unadoptable.append(base)
@@ -852,8 +951,9 @@ class FuturesReconcileMixin:
                 _cs = 1.0
             close_fee = (
                 close_fee_actual
-                if close_fee_actual > 0
-                else amount * _cs * close_price * FUTURES_DEFAULT_TAKER_FEE
+                if close_fee_actual > 0 and math.isfinite(close_fee_actual)
+                else _estimate_futures_close_fee_usdt(
+                    amount, _cs, close_price, FUTURES_DEFAULT_TAKER_FEE)
             )
             entry_fee = safe_proportional_fee(
                 initial_entry_fee, amount, original_amount,

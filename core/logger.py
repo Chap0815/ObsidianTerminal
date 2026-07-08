@@ -296,8 +296,16 @@ def _rotate_if_needed(path: str, max_bytes: int = None,
     1-arg calls in this module and errors.py's 3-arg call
     `_rotate_if_needed(path, ERROR_LOG_MAX_BYTES, ERROR_LOG_BACKUPS)`.
     """
-    mb = STRUCT_LOG_MAX_BYTES if max_bytes is None else int(max_bytes)
-    bk = STRUCT_LOG_BACKUPS  if backups   is None else int(backups)
+    try:
+        mb = STRUCT_LOG_MAX_BYTES if max_bytes is None else int(max_bytes)
+    except (TypeError, ValueError, OverflowError):
+        mb = STRUCT_LOG_MAX_BYTES
+    try:
+        bk = STRUCT_LOG_BACKUPS if backups is None else int(backups)
+    except (TypeError, ValueError, OverflowError):
+        bk = STRUCT_LOG_BACKUPS
+    if mb <= 0 or bk <= 0:
+        return
     try:
         if not os.path.exists(path):
             return
@@ -313,14 +321,9 @@ def _rotate_if_needed(path: str, max_bytes: int = None,
             src = f"{path}.{i - 1}"
             dst = f"{path}.{i}"
             if os.path.exists(src):
-                try:
-                    os.rename(src, dst)
-                except OSError:
+                if not _rename_with_retries(src, dst):
                     return
-        try:
-            os.rename(path, f"{path}.1")
-        except OSError:
-            pass
+        _rename_with_retries(path, f"{path}.1")
     except OSError:
         pass
 
@@ -331,6 +334,20 @@ def _rotate_if_needed(path: str, max_bytes: int = None,
 # without spinning the CPU.
 _ROTATE_MAX_RETRIES = 5
 _ROTATE_SLEEP_SEC   = 0.05
+
+
+def _rename_with_retries(src: str, dst: str) -> bool:
+    for attempt in range(_ROTATE_MAX_RETRIES):
+        try:
+            os.rename(src, dst)
+            return True
+        except PermissionError:
+            if attempt == _ROTATE_MAX_RETRIES - 1:
+                return False
+            time.sleep(_ROTATE_SLEEP_SEC)
+        except OSError:
+            return False
+    return False
 
 
 def _rotate_jsonl_if_needed(path: str) -> None:
@@ -361,29 +378,11 @@ def _rotate_jsonl_if_needed(path: str) -> None:
             dst = f"{path}.{i}"
             if not os.path.exists(src):
                 continue
-            for attempt in range(_ROTATE_MAX_RETRIES):
-                try:
-                    os.rename(src, dst)
-                    break
-                except PermissionError:
-                    if attempt == _ROTATE_MAX_RETRIES - 1:
-                        return
-                    time.sleep(_ROTATE_SLEEP_SEC)
-                except OSError:
-                    return
+            if not _rename_with_retries(src, dst):
+                return
 
         # Rotate current file (retry loop for Windows)
-        for attempt in range(_ROTATE_MAX_RETRIES):
-            try:
-                os.rename(path, f"{path}.1")
-                return
-            except PermissionError:
-                if attempt == _ROTATE_MAX_RETRIES - 1:
-                    # Give up cleanly  caller's next save will retry.
-                    return
-                time.sleep(_ROTATE_SLEEP_SEC)
-            except OSError:
-                return
+        _rename_with_retries(path, f"{path}.1")
     except OSError:
         pass
 
@@ -506,7 +505,8 @@ def log_buy(bot, sym, price, amt, rsi, news, analysis):
           f"{_c(sym, W)}  {_c(_now(), DIM)}")
     print(f"  {_c('Price:    ', DIM)} {_c(f'{price:.6f} USDT', W)}")
     print(f"  {_c('Margin:   ', DIM)} {_c(f'{amt:.2f} USDT', Y)}")
-    rsi_col = lambda v: _c(f"{v:.1f}", R if v > 80 else G if v < 50 else Y)
+    def rsi_col(v):
+        return _c(f"{v:.1f}", R if v > 80 else G if v < 50 else Y)
     print(f"  {_c('RSI:      ', DIM)} 15m {rsi_col(rsi_safe[0])}  |  "
           f"1h {rsi_col(rsi_safe[1])}  |  4h {rsi_col(rsi_safe[2])}")
     news_clean = clean_user_text((news or "").replace("\n", " ").strip())
@@ -522,7 +522,8 @@ def log_buy(bot, sym, price, amt, rsi, news, analysis):
         return
     ki = ki_raw
     try:
-        import json as _json, re as _re
+        import json as _json
+        import re as _re
         _m = _re.search(r"\{.*\}", ki_raw, _re.DOTALL)
         if _m:
             _d = _json.loads(_m.group(0))

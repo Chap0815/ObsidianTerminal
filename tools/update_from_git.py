@@ -55,6 +55,17 @@ PROTECTED_FILES = [
 ]
 PROTECTED_FILE_SET = {Path(rel).as_posix() for rel in PROTECTED_FILES}
 PROTECTED_DIRS = {"data", "logs", "backups", ".venv", "python", "prompts"}
+PROTECTED_DIR_SET_LOWER = {name.lower() for name in PROTECTED_DIRS}
+PROTECTED_LOCAL_CONFIG_SUFFIXES = (
+    ".local.json",
+    ".user.json",
+    ".local.toml",
+    ".user.toml",
+    ".local.yaml",
+    ".user.yaml",
+    ".local.yml",
+    ".user.yml",
+)
 CODE_DIRS = {
     "bots", "bot_utils", "config", "core", "launcher", "llm_slots",
     "news", "tools", "trading",
@@ -113,7 +124,11 @@ UPDATE_FORBIDDEN_SUFFIXES = {
     ".pyc",
     ".pyo",
     ".sqlite",
+    ".sqlite-shm",
+    ".sqlite-wal",
     ".sqlite3",
+    ".sqlite3-shm",
+    ".sqlite3-wal",
 }
 
 
@@ -548,27 +563,34 @@ def _running_bot_processes() -> list[str]:
     current = os.getpid()
     root_text = str(ROOT).replace("\\", "/").lower()
     from launcher.config.settings import BOT_META
-    markers = []
+    module_markers = []
+    script_markers = []
     for meta in BOT_META.values():
         module = str(meta.get("module") or "").lower()
         script = str(meta.get("script") or "").replace("\\", "/").lower()
         if module:
-            markers.append(module)
+            module_markers.append(module)
         if script:
-            markers.append(script)
-            markers.append(Path(script).name.lower())
+            script_markers.append(script)
+            script_markers.append(Path(script).name.lower())
     out: list[str] = []
-    for proc in psutil.process_iter(["pid", "cmdline"]):
+    for proc in psutil.process_iter(["pid", "cmdline", "cwd"]):
         try:
             pid = int(proc.info.get("pid") or 0)
             if pid == current:
                 continue
             cmdline = " ".join(proc.info.get("cmdline") or [])
+            proc_cwd = str(proc.info.get("cwd") or "")
         except Exception:
             continue
-        low = cmdline.lower()
-        norm = low.replace("\\", "/")
-        if root_text in norm and any(marker in norm for marker in markers):
+        norm = cmdline.lower().replace("\\", "/")
+        cwd_norm = proc_cwd.lower().replace("\\", "/")
+        module_match = any(marker in norm for marker in module_markers)
+        scoped_script_match = (
+            (root_text in norm or cwd_norm == root_text)
+            and any(marker in norm for marker in script_markers)
+        )
+        if module_match or scoped_script_match:
             out.append(f"bot process (pid {pid})")
     return out
 
@@ -576,26 +598,32 @@ def _running_bot_processes() -> list[str]:
 def _running_bot_processes_via_cim() -> list[str]:
     root = str(ROOT).replace("\\", "/").lower().replace("'", "''")
     from launcher.config.settings import BOT_META
-    markers = []
+    module_markers = []
+    script_markers = []
     for meta in BOT_META.values():
         module = str(meta.get("module") or "").lower()
         script = str(meta.get("script") or "").replace("\\", "/").lower()
         if module:
-            markers.append(module)
+            module_markers.append(module)
         if script:
-            markers.append(script)
-            markers.append(Path(script).name.lower())
+            script_markers.append(script)
+            script_markers.append(Path(script).name.lower())
     module_checks = " -or ".join(
         f"$_.CommandLine.ToLower().Replace('\\','/').Contains('{marker}')"
-        for marker in markers
+        for marker in module_markers
+    )
+    script_checks = " -or ".join(
+        f"$_.CommandLine.ToLower().Replace('\\','/').Contains('{marker}')"
+        for marker in script_markers
     )
     script = (
         f"$root='{root}'; "
         f"$current={os.getpid()}; "
         "Get-CimInstance Win32_Process | "
         "Where-Object { $_.ProcessId -ne $current -and $_.CommandLine -and "
+        f"(({module_checks}) -or "
         "$_.CommandLine.ToLower().Replace('\\','/').Contains($root) -and "
-        f"({module_checks})"
+        f"({script_checks}))"
         " } | ForEach-Object { 'bot process (pid ' + $_.ProcessId + ')' }"
     )
     try:
@@ -630,9 +658,21 @@ def _running_launchers() -> list[str]:
         except Exception:
             continue
         low = cmdline.lower()
-        if "launcher.pyw" in low and str(ROOT).lower() in low:
+        if _cmdline_is_launcher(low):
             out.append(f"launcher pid {pid}")
     return out
+
+
+def _cmdline_is_launcher(cmdline_lower: str) -> bool:
+    root_text = str(ROOT).lower()
+    if root_text not in cmdline_lower:
+        return False
+    compact = " ".join(cmdline_lower.replace("\\", "/").split())
+    return (
+        "launcher.pyw" in compact
+        or "-m launcher.main" in compact
+        or "-m launcher/main" in compact
+    )
 
 
 def _running_launchers_via_cim() -> list[str]:
@@ -642,8 +682,9 @@ def _running_launchers_via_cim() -> list[str]:
         f"$current={os.getpid()}; "
         "Get-CimInstance Win32_Process | "
         "Where-Object { $_.ProcessId -ne $current -and $_.CommandLine -and "
-        "$_.CommandLine.ToLower().Contains('launcher.pyw') -and "
-        "$_.CommandLine.ToLower().Contains($root) } | "
+        "$line=$_.CommandLine.ToLower().Replace('\\','/'); "
+        "$line.Contains($root) -and "
+        "($line.Contains('launcher.pyw') -or $line.Contains('-m launcher.main')) } | "
         "ForEach-Object { 'launcher pid ' + $_.ProcessId }"
     )
     try:
@@ -743,6 +784,12 @@ def _install_dependencies_if_present() -> None:
             "requirements.lock.txt fehlt nach Update; "
             "Dependency-Update aus Sicherheitsgruenden abgebrochen."
         )
+    if _active_runtime_env_dir() is not None:
+        _print(
+            "Python-Abhaengigkeiten unveraendert; Installation in der "
+            "aktiven Runtime wird uebersprungen."
+        )
+        return
     _print("Pruefe/aktualisiere Python-Abhaengigkeiten ...")
     r = subprocess.run(
         [sys.executable, "-m", "pip", "install", "-r", str(req)],
@@ -778,6 +825,52 @@ def _runtime_env_dir() -> Path | None:
         if path.exists() and path.is_dir():
             return path
     return None
+
+
+def _active_runtime_env_dir() -> Path | None:
+    exe = Path(sys.executable).resolve()
+    for name in ("python", ".venv"):
+        path = ROOT / name
+        if not path.exists() or not path.is_dir():
+            continue
+        try:
+            exe.relative_to(path.resolve())
+            return path
+        except ValueError:
+            continue
+    return None
+
+
+def _requirements_hash(path: Path) -> str:
+    return _sha256(path) if path.exists() else ""
+
+
+def _requirements_text_hash(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _guard_active_runtime_dependency_change(new_hash: str) -> None:
+    if _active_runtime_env_dir() is None:
+        return
+    current_hash = _requirements_hash(ROOT / "requirements.lock.txt")
+    if current_hash and new_hash and current_hash != new_hash:
+        raise RuntimeError(
+            "Update enthaelt geaenderte Python-Abhaengigkeiten. "
+            "Automatisches Update wurde abgebrochen, weil die aktive "
+            "gebuendelte Python-Runtime unter Windows nicht sicher "
+            "zurueckgerollt werden kann. Bitte mit einem neuen Installer "
+            "oder einem externen Update-Python aktualisieren."
+        )
+
+
+def _guard_dependency_update_from_path(path: Path) -> None:
+    _guard_active_runtime_dependency_change(_requirements_hash(path))
+
+
+def _guard_dependency_update_from_ref(git: str, ref: str) -> None:
+    r = _run([git, "show", f"{ref}:requirements.lock.txt"], check=False)
+    if r.returncode == 0:
+        _guard_active_runtime_dependency_change(_requirements_text_hash(r.stdout or ""))
 
 
 def _snapshot_runtime_env(dst: Path) -> Path | None:
@@ -835,6 +928,7 @@ def _verify_updated_tree() -> None:
     missing = [rel for rel in REQUIRED_RELEASE_ITEMS if not (ROOT / rel).exists()]
     if missing:
         raise RuntimeError("Update unvollstaendig, Dateien fehlen: " + ", ".join(missing))
+    _verify_deploy_manifest_hashes()
     compile_files = [rel for rel in SMOKE_FILES if rel.endswith(".py")]
     for rel in compile_files:
         path = ROOT / rel
@@ -844,6 +938,51 @@ def _verify_updated_tree() -> None:
             compile(source, str(path), "exec")
         except Exception as exc:
             raise RuntimeError(f"Update-Smoke fehlgeschlagen fuer {rel}: {exc}") from exc
+
+
+def _verify_deploy_manifest_hashes() -> None:
+    manifest_path = ROOT / "DEPLOY_MANIFEST.json"
+    if not manifest_path.exists():
+        raise RuntimeError("Update unvollstaendig, DEPLOY_MANIFEST.json fehlt")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise RuntimeError(f"Update-Manifest konnte nicht gelesen werden: {exc}") from exc
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("Update-Manifest ist leer oder ungueltig")
+
+    problems: list[str] = []
+    for item in files:
+        if not isinstance(item, dict):
+            problems.append("<invalid item>")
+            continue
+        rel = _normalize_update_rel(item.get("path"))
+        if rel is None or _is_forbidden_update_file(rel):
+            problems.append(str(item.get("path") or "<empty>"))
+            continue
+        expected_hash = str(item.get("sha256") or "").strip().lower()
+        expected_bytes = item.get("bytes")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            problems.append(f"{rel}: manifest hash fehlt/ungueltig")
+            continue
+        path = ROOT / rel
+        if not path.is_file():
+            problems.append(f"{rel}: fehlt")
+            continue
+        try:
+            if expected_bytes is not None and path.stat().st_size != int(expected_bytes):
+                problems.append(f"{rel}: Byte-Laenge weicht ab")
+                continue
+            if _sha256(path) != expected_hash:
+                problems.append(f"{rel}: Hash weicht ab")
+        except Exception as exc:
+            problems.append(f"{rel}: {exc}")
+    if problems:
+        raise RuntimeError(
+            "Update-Manifest-Pruefung fehlgeschlagen: "
+            + "; ".join(problems[:20])
+        )
 
 
 def _split_git_paths(stdout: str) -> list[str]:
@@ -976,15 +1115,37 @@ def _rel_posix(path: Path) -> str:
         return ""
 
 
+def _is_protected_local_config_rel(rel: str) -> bool:
+    rel_key = str(rel or "").replace("\\", "/").lower()
+    name = rel_key.rsplit("/", 1)[-1]
+    if name in {".env.local", ".env.user"}:
+        return True
+    return (
+        rel_key.startswith("config/")
+        and name.endswith(PROTECTED_LOCAL_CONFIG_SUFFIXES)
+    )
+
+
 def _is_protected_file(path: Path) -> bool:
-    return _rel_posix(path) in PROTECTED_FILE_SET
+    rel = _rel_posix(path)
+    rel_key = rel.lower()
+    protected_keys = {item.lower() for item in PROTECTED_FILE_SET}
+    return rel_key in protected_keys or _is_protected_local_config_rel(rel)
 
 
 def _dir_contains_protected_file(path: Path) -> bool:
     prefix = _rel_posix(path).rstrip("/")
     if not prefix:
         return False
-    return any(rel.startswith(prefix + "/") for rel in PROTECTED_FILE_SET)
+    prefix_key = prefix.lower()
+    protected_keys = {item.lower() for item in PROTECTED_FILE_SET}
+    if any(rel.startswith(prefix_key + "/") for rel in protected_keys):
+        return True
+    try:
+        return any(child.is_file() and _is_protected_file(child)
+                   for child in path.rglob("*"))
+    except OSError:
+        return False
 
 
 def _remove_path_preserving_protected(
@@ -1021,7 +1182,7 @@ def _clean_nonprotected_code() -> None:
         if path.exists():
             _remove_path_preserving_protected(path, errors)
     for path in ROOT.iterdir():
-        if (path.name in PROTECTED_DIRS or path.name == ".git"
+        if (path.name.lower() in PROTECTED_DIR_SET_LOWER or path.name == ".git"
                 or path.name == UPDATE_MARKER.name):
             continue
         if path.is_dir():
@@ -1138,7 +1299,7 @@ def _copy_tracked_tree(src_repo: Path) -> None:
 def _snapshot_current_app(dst: Path) -> None:
     dst.mkdir(parents=True, exist_ok=True)
     for item in ROOT.iterdir():
-        if item.name in PROTECTED_DIRS or item.name == UPDATE_MARKER.name:
+        if item.name.lower() in PROTECTED_DIR_SET_LOWER or item.name == UPDATE_MARKER.name:
             continue
         target = dst / item.name
         if item.is_dir():
@@ -1208,6 +1369,7 @@ def _update_existing_repo(repo_url: str, branch: str) -> None:
         raise RuntimeError(
             "Lokaler Stand und Remote sind divergiert. Update abgebrochen, um keinen lokalen Fix zu verlieren."
         )
+    _guard_dependency_update_from_ref(git, "FETCH_HEAD")
 
     tracked_protected = _tracked_protected_files()
     if tracked_protected:
@@ -1278,6 +1440,7 @@ def _bootstrap_from_private_repo(repo_url: str, branch: str) -> None:
         try:
             _run([git, "clone", "--branch", branch, "--depth", "1", repo_url, str(clone_dir)], cwd=ROOT, timeout=300)
             _verify_no_tracked_runtime_files(clone_dir)
+            _guard_dependency_update_from_path(clone_dir / "requirements.lock.txt")
             _snapshot_current_app(snapshot_dir)
             _write_update_marker("bootstrap")
             _clean_nonprotected_code()

@@ -327,8 +327,44 @@ class TrendBot(SpotBot):
                     self._release_entry_claim_if_untracked(sym)
                 continue
             amount, fill_price, gross_amount, entry_fee = entry
-            self._add_trend_state(sym, fill_price, amount, gross_amount,
-                                   entry_fee, votes)
+            state_ok = self._add_trend_state(
+                sym, fill_price, amount, gross_amount, entry_fee, votes)
+            if state_ok is False and not self.simulation:
+                log_event(
+                    f"Trend BUY {sym}: state write failed after LIVE fill - "
+                    f"attempting immediate rollback sell",
+                    "ERROR",
+                )
+                try:
+                    from bot_utils.spot_exits import spot_market_sell_safe
+                    from bot_utils.order_utils import order_was_filled
+                    order, sold_amount = spot_market_sell_safe(
+                        self.ex, f"{sym}/USDT", amount)
+                    if order_was_filled(order, sold_amount, min_fill_ratio=1e-9):
+                        self._cleanup_rolled_back_entry_state(
+                            sym, "trend state write failed after live buy")
+                        log_event(
+                            f"Trend BUY {sym}: rollback sell filled after "
+                            f"state failure",
+                            "WARN",
+                        )
+                    else:
+                        log_event(
+                            f"Trend BUY {sym}: CRITICAL rollback sell not "
+                            f"verified after state failure; claim kept for "
+                            f"manual recovery",
+                            "ERROR",
+                        )
+                except Exception as rb_exc:
+                    log_event(
+                        f"Trend BUY {sym}: CRITICAL untracked live position "
+                        f"risk after state failure; rollback sell failed "
+                        f"({rb_exc})",
+                        "ERROR",
+                    )
+                    self._log_error(
+                        f"trend rollback after state failure {sym}", rb_exc)
+                continue
             if free is not None:
                 free = max(0.0, free - coin_size)
             opened += 1
@@ -362,10 +398,10 @@ class TrendBot(SpotBot):
             "provisional": False,
         }
         if self.state.has(sym):
-            self.state.update_many(sym, fields)
+            return self.state.update_many(sym, fields)
         else:
             fields["buy_time"] = _utc_now_str()
-            self.state.add(sym, fields)
+            return self.state.add(sym, fields)
 
     #  MONITOR loop: exit coins that fell out of trend, + killswitch 
 

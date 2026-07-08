@@ -7,6 +7,7 @@ retries instead of treating the wallet as empty.
 """
 from __future__ import annotations
 
+import math
 from typing import Optional, Callable
 
 
@@ -34,6 +35,16 @@ _INFO_KEYS = (
 )
 
 _STABLECOINS = {"USDT", "USD", "BUSD", "USDC", "FDUSD", "TUSD", ""}
+
+
+def _finite_nonnegative_float(value) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if math.isfinite(parsed) and parsed >= 0:
+        return parsed
+    return None
 
 
 def safe_fetch_balance_usdt(ex,
@@ -98,13 +109,10 @@ def safe_fetch_balance_usdt(ex,
                 if v is None:
                     break
             if v is not None:
-                try:
-                    fv = float(v)
-                    if fv >= 0:  # accept 0.0 as valid empty
-                        return fv
-                except (TypeError, ValueError):
-                    continue
-        except (AttributeError, TypeError):
+                fv = _finite_nonnegative_float(v)
+                if fv is not None:  # accept 0.0 as valid empty
+                    return fv
+        except (AttributeError, TypeError, OverflowError):
             continue
 
     # Last resort: inspect raw "info"  but only when stablecoin is indicated
@@ -123,12 +131,9 @@ def safe_fetch_balance_usdt(ex,
         for k in _INFO_KEYS:
             v = info.get(k)
             if v is not None:
-                try:
-                    fv = float(v)
-                    if fv >= 0:
-                        return fv
-                except (TypeError, ValueError):
-                    continue
+                fv = _finite_nonnegative_float(v)
+                if fv is not None:
+                    return fv
 
     # return None (not 0.0) for unknown layouts  caller retries.
     _log("fetch_balance",

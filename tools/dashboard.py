@@ -15,6 +15,7 @@ import json
 import sqlite3
 import math
 import html
+import sys as _sys
 from datetime import datetime, timedelta, timezone
 
 import streamlit as st
@@ -23,7 +24,9 @@ from bot_utils.pnl_view import (
     futures_state_age_sec,
     futures_unrealized_from_row,
     is_futures_state_fresh,
+    is_state_file_fresh,
     spot_unrealized_pnl,
+    state_file_age_sec,
 )
 import pandas as pd
 import numpy as np
@@ -42,7 +45,6 @@ st.set_page_config(
 # (system service, launcher process group, etc); a relative "trading_bot.db"
 # would silently create an empty DB next to wherever streamlit was launched
 # from, and every "no trades yet" reading would look like a working DB.
-import sys as _sys
 _DASHBOARD_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_DASHBOARD_DIR)  # tools/  project root
 if _PROJECT_ROOT not in _sys.path:
@@ -103,6 +105,10 @@ _BOT_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "bot_config.json")
 # comparison, parameter timeline, learning log) covers all bots.
 ALL_BOTS = ["TREND", "SPOT", "FUTURES", "CROSS", "FUTREND"]
 MODE_NAMESPACE_CUTOVER_UTC = pd.Timestamp("2026-06-18 00:00:00", tz="UTC")
+
+
+def _state_value_prefer_key(row: dict, preferred: str, legacy: str):
+    return row.get(preferred) if preferred in row else row.get(legacy)
 
 
 def _load_bot_modes() -> dict:
@@ -461,13 +467,6 @@ def _render_dark_table(df, max_rows: int = 200, height_px: int = None,
     align_right_cols = set(align_right_cols or [])
     color_cols = color_cols or {}
 
-    # Header
-    th_html = "".join(
-        f'<th style="text-align:{"right" if c in align_right_cols else "left"};">'
-        f'{_html.escape(str(c))}</th>'
-        for c in df.columns
-    )
-
     # Container styling
     container_style = (
         "background:rgba(12,17,26,0.9); border-radius:12px; "
@@ -751,6 +750,8 @@ def load_open_spot_trades() -> list:
         ):
             if not os.path.exists(path):
                 continue
+            state_age_sec = state_file_age_sec(path)
+            state_age_warning = not is_state_file_fresh(path)
             try:
                 with open(path, encoding="utf-8") as f:
                     trades = json.load(f) or {}
@@ -761,19 +762,38 @@ def load_open_spot_trades() -> list:
                         continue
                     try:
                         amount = float(d.get("amount", 0) or 0)
-                        buy = float(d.get("buy_price") or d.get("buy") or 0)
+                        buy = float(_state_value_prefer_key(d, "buy_price", "buy") or 0)
                     except (TypeError, ValueError):
                         continue
-                    if amount <= 0 or buy <= 0:
+                    if (
+                        not math.isfinite(amount)
+                        or not math.isfinite(buy)
+                        or amount <= 0
+                        or buy <= 0
+                    ):
                         continue
                     rows.append({
                         "bot": bot,
                         "mode": mode,
                         "symbol": sym,
                         **d,
+                        "state_is_stale": False,
+                        "state_age_warning": state_age_warning,
+                        "state_age_sec": state_age_sec,
+                        "_state_source": "json_state",
                     })
-            except Exception:
-                continue
+            except Exception as exc:
+                rows.append({
+                    "bot": bot,
+                    "mode": mode,
+                    "symbol": "",
+                    "state_is_stale": True,
+                    "state_age_warning": True,
+                    "state_age_sec": state_age_sec,
+                    "state_error": f"{type(exc).__name__}: {exc}",
+                    "_state_source": "json_state",
+                    "_state_path": path,
+                })
     return rows
 
 
@@ -1012,6 +1032,8 @@ def build_pnl_snapshot(
                 bucket["positions"] += positions
 
     for _t in open_spot_rows or []:
+        if bool(_t.get("state_is_stale", False)):
+            continue
         bot = _base_bot_name(_t.get("bot_name") or _t.get("bot") or "")
         if filter_active and bot not in bot_filter:
             continue
@@ -1023,9 +1045,22 @@ def build_pnl_snapshot(
             if bot in bots else None
         )
         try:
-            buy = float(_t.get("buy_price") or _t.get("buy") or 0)
+            buy = float(_state_value_prefer_key(_t, "buy_price", "buy") or 0)
             amount = float(_t.get("amount", 0) or 0)
             base = str(_t.get("symbol", "")).upper().replace("/USDT", "").replace("USDT", "")
+            if (
+                not math.isfinite(buy)
+                or not math.isfinite(amount)
+                or buy <= 0
+                or amount <= 0
+            ):
+                for bucket in (mode_bucket, bot_bucket, bot_mode_bucket):
+                    if bucket is None:
+                        continue
+                    bucket["open_count"] += 1
+                    bucket["open_spot"] += 1
+                    bucket["price_unavailable"] += 1
+                continue
             live_raw = live_prices.get(f"{base}USDT")
             if live_raw is None:
                 for bucket in (mode_bucket, bot_bucket, bot_mode_bucket):
@@ -1305,8 +1340,16 @@ with tab_overview:
         row for row in open_spot_all
         if _base_bot_name(row.get("bot") or row.get("bot_name") or "") in selected_bots
     ]
-    open_spot_live = [t for t in open_spot_all if t.get("mode", "SIM") == "LIVE"]
-    open_spot_sim = [t for t in open_spot_all if t.get("mode", "SIM") == "SIM"]
+    open_spot_stale_all = [
+        t for t in open_spot_all
+        if t.get("state_is_stale") or t.get("state_error")
+    ]
+    open_spot_active_all = [
+        t for t in open_spot_all
+        if not (t.get("state_is_stale") or t.get("state_error"))
+    ]
+    open_spot_live = [t for t in open_spot_active_all if t.get("mode", "SIM") == "LIVE"]
+    open_spot_sim = [t for t in open_spot_active_all if t.get("mode", "SIM") == "SIM"]
     open_fut_all  = load_futures_live()
     if not open_fut_all.empty:
         _overview_fut_col = "base_bot" if "base_bot" in open_fut_all.columns else "bot_name"
@@ -1333,7 +1376,7 @@ with tab_overview:
     }))
     live_prices_kpi = get_live_prices(spot_symbols)
     pnl_snapshot = build_pnl_snapshot(
-        trades, open_spot_all, open_fut_active_all, live_prices_kpi,
+        trades, open_spot_active_all, open_fut_active_all, live_prices_kpi,
         selected_bots,
     )
     live_money = pnl_snapshot["modes"]["LIVE"]
@@ -1342,6 +1385,10 @@ with tab_overview:
     stale_live_futures = 0
     if not open_fut_stale_all.empty and "mode" in open_fut_stale_all.columns:
         stale_live_futures = int((open_fut_stale_all["mode"] == "LIVE").sum())
+    stale_live_spot = int(sum(
+        1 for row in open_spot_stale_all
+        if str(row.get("mode", "SIM")).upper() == "LIVE"
+    ))
     live_total = float(live_money["realized"])
     sim_total = float(sim_money["realized"])
     total_unreal = float(live_money["unrealized"])
@@ -1397,6 +1444,8 @@ with tab_overview:
         open_sub = f"{int(live_money['open_spot'])} live spot / {live_fut_visible} live futures"
         if sim_open:
             open_sub += f" / {sim_open} SIM"
+        if stale_live_spot:
+            open_sub += f" / {stale_live_spot} stale spot hidden"
         if stale_live_futures:
             open_sub += f" / {stale_live_futures} stale hidden"
         elif not open_fut_stale_all.empty:
@@ -1432,6 +1481,17 @@ with tab_overview:
         st.warning(
             f"{len(open_fut_stale_all)} stale futures_state row(s) excluded from live KPIs"
             + (f": {stale_bots}" if stale_bots else "")
+        )
+    if open_spot_stale_all:
+        stale_labels = sorted({
+            str(row.get("bot") or row.get("bot_name") or "").strip()
+            for row in open_spot_stale_all
+            if str(row.get("bot") or row.get("bot_name") or "").strip()
+        })
+        st.warning(
+            f"{len(open_spot_stale_all)} stale/unreadable spot state row(s) "
+            "excluded from open-position KPIs"
+            + (f": {', '.join(stale_labels)}" if stale_labels else "")
         )
     if live_price_missing:
         st.warning(
@@ -1632,12 +1692,18 @@ with tab_trades:
         if "mode" in view.columns and mode_f != "All":
             wanted = mode_f.split()[0]
             view = view[view["mode"] == wanted]
-        if outcome_f == "Wins only":  view = view[view["profit_usdt"] > 0]
-        elif outcome_f == "Losses only": view = view[view["profit_usdt"] < 0]
-        if coin_f:  view = view[view["symbol"].isin(coin_f)]
-        if reason_f: view = view[view["reason"].fillna("").isin(reason_f)]
-        if type_f == "Spot only":    view = view[view["is_futures"] == 0]
-        elif type_f == "Futures only": view = view[view["is_futures"] == 1]
+        if outcome_f == "Wins only":
+            view = view[view["profit_usdt"] > 0]
+        elif outcome_f == "Losses only":
+            view = view[view["profit_usdt"] < 0]
+        if coin_f:
+            view = view[view["symbol"].isin(coin_f)]
+        if reason_f:
+            view = view[view["reason"].fillna("").isin(reason_f)]
+        if type_f == "Spot only":
+            view = view[view["is_futures"] == 0]
+        elif type_f == "Futures only":
+            view = view[view["is_futures"] == 1]
 
         # Summary over filtered data.
         sub_metrics = compute_metrics(view)
@@ -1756,9 +1822,17 @@ with tab_positions:
         row for row in open_spot
         if _base_bot_name(row.get("bot") or row.get("bot_name") or "") in selected_bots
     ]
+    open_spot_stale = [
+        row for row in open_spot
+        if row.get("state_is_stale") or row.get("state_error")
+    ]
+    open_spot_active = [
+        row for row in open_spot
+        if not (row.get("state_is_stale") or row.get("state_error"))
+    ]
     position_spot_symbols = tuple(sorted({
         str(t.get("symbol", "")).upper().replace("/USDT", "").replace("USDT", "")
-        for t in open_spot
+        for t in open_spot_active
         if isinstance(t, dict) and str(t.get("symbol", "")).strip()
     }))
     live_prices = get_live_prices(position_spot_symbols)
@@ -1784,8 +1858,15 @@ with tab_positions:
                 sym = t["symbol"]
                 sym_html = html.escape(str(sym))
                 bot_html = html.escape(str(t.get("bot", "")))
-                buy = float(t.get("buy_price") or t.get("buy") or 0)
+                buy = float(_state_value_prefer_key(t, "buy_price", "buy") or 0)
                 amount = float(t.get("amount", 0) or 0)
+                if (
+                    not math.isfinite(buy)
+                    or not math.isfinite(amount)
+                    or buy <= 0
+                    or amount <= 0
+                ):
+                    continue
                 entry_notional = amount * buy
                 live_raw = live_prices.get(f"{sym}USDT")
                 price_missing = live_raw is None
@@ -1934,7 +2015,7 @@ with tab_positions:
     #  Separate sections per bot and mode. LIVE positions are real exposure;
     # SIM positions are shown only as paper positions.
     for _label, _bot in (("Trend", "TREND"), ("Spot", "SPOT")):
-        _rows = [r for r in open_spot if r.get("bot") == _bot]
+        _rows = [r for r in open_spot_active if r.get("bot") == _bot]
         _live_rows = [r for r in _rows if r.get("mode", "SIM") == "LIVE"]
         _sim_rows = [r for r in _rows if r.get("mode", "SIM") == "SIM"]
         _section(f"Open {_label} LIVE Positions")
@@ -1945,6 +2026,23 @@ with tab_positions:
         if _sim_rows:
             _section(f"Open {_label} SIM Positions")
             _render_spot_cards(_sim_rows)
+
+    if open_spot_stale:
+        _section("Stale Spot State")
+        st.warning(
+            f"{len(open_spot_stale)} stale/unreadable spot state row(s) are hidden "
+            "from open-position KPIs. Use repair/reconciliation before treating "
+            "them as live exposure."
+        )
+        stale_view = pd.DataFrame(open_spot_stale)
+        show_cols = [
+            c for c in ("bot", "symbol", "mode", "state_age_sec",
+                        "state_error", "_state_path")
+            if c in stale_view.columns
+        ]
+        if show_cols:
+            st.dataframe(stale_view[show_cols], width="stretch", hide_index=True)
+
     for _label, _bot in (("Futures", "FUTURES"), ("Cross", "CROSS"),
                          ("Future Trend", "FUTREND")):
         _fut_bot_col = "base_bot" if "base_bot" in open_fut_active.columns else "bot_name"

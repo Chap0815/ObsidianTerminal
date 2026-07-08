@@ -7,6 +7,7 @@ verification via verify_position_closed.
 """
 from __future__ import annotations
 
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -14,7 +15,6 @@ from typing import Callable, Optional, Tuple
 
 from bot_utils.futures_order import (
     create_order_with_retry,
-    extract_order_fee_futures,
     extract_or_estimate_futures_fee,
     futures_contract_size,
     is_no_position_error,
@@ -46,9 +46,9 @@ def _extract_fill_from_order(order: dict) -> Optional[float]:
             continue
         try:
             v = float(val)
-            if v > 0:
+            if math.isfinite(v) and v > 0:
                 return v
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
     info = order.get("info")
     if isinstance(info, dict):
@@ -59,11 +59,32 @@ def _extract_fill_from_order(order: dict) -> Optional[float]:
                 continue
             try:
                 v = float(val)
-                if v > 0:
+                if math.isfinite(v) and v > 0:
                     return v
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
     return None
+
+
+def _positive_finite_or_zero(value) -> float:
+    try:
+        parsed = float(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if math.isfinite(parsed) and parsed > 0 else 0.0
+
+
+def _finite_or_default(value, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _positive_finite_or_default(value, default: float = 0.0) -> float:
+    parsed = _finite_or_default(value, default)
+    return parsed if parsed > 0 else default
 
 
 def _exchange_id(ex) -> str:
@@ -135,7 +156,7 @@ def _resolve_fill_price(ex,
             same_order = [t for t in trades
                             if order_id and str(t.get("order") or "") == str(order_id)]
             if order_id and not same_order:
-                return float(fallback_price or 0), "fallback"
+                return _positive_finite_or_zero(fallback_price), "fallback"
             pool = same_order if order_id else trades
             try:
                 pool = sorted(pool,
@@ -147,9 +168,9 @@ def _resolve_fill_price(ex,
                 v = t.get("price")
                 try:
                     fv = float(v)
-                    if fv > 0:
+                    if math.isfinite(fv) and fv > 0:
                         return fv, "trades"
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     continue
     except Exception as e:
         try:
@@ -159,7 +180,7 @@ def _resolve_fill_price(ex,
         except Exception:
             pass
 
-    return float(fallback_price or 0), "fallback"
+    return _positive_finite_or_zero(fallback_price), "fallback"
 
 
 def _check_min_notional(ex, symbol_full: str,
@@ -227,8 +248,11 @@ def _flatten_without_accounting(**kw):
         return (sym, "failed", 0.0, "close lock held")
     try:
         pos_type = d.get("position_type", "LONG")
-        amount = abs(float(d.get("amount", 0) or 0))
-        lev = float(d.get("leverage", kw.get("default_leverage", 1)) or 1)
+        amount = abs(_finite_or_default(d.get("amount", 0), 0.0))
+        lev = _positive_finite_or_default(
+            d.get("leverage", kw.get("default_leverage", 1)),
+            kw.get("default_leverage", 1) or 1,
+        )
         if amount <= 0:
             return (sym, "failed", 0.0, "close lock held and amount invalid")
         symbol_full = f"{sym}/USDT:USDT"
@@ -237,6 +261,9 @@ def _flatten_without_accounting(**kw):
             close_amount = float(ex.amount_to_precision(symbol_full, amount))
         except Exception:
             close_amount = round(amount, 4)
+        if not math.isfinite(close_amount):
+            return (sym, "failed", 0.0,
+                    "close lock held and close amount invalid")
         params = reduce_only_params(
             position_side=("long" if pos_type == "LONG" else "short"),
             margin_mode=margin_mode,
@@ -286,10 +313,15 @@ def _close_single_position_impl(*,
     """Close ONE position. Returns (symbol, status, pnl, error_message)."""
     try:
         pos_type = d.get("position_type", "LONG")
-        entry = float(d.get("buy", 0))
-        margin = float(d.get("invested_usdt", 0))
-        lev = float(d.get("leverage", default_leverage))
-        amount = abs(float(d.get("amount", 0)))
+        entry = _positive_finite_or_zero(d.get("buy", 0))
+        margin = _positive_finite_or_zero(d.get("invested_usdt", 0))
+        lev = _positive_finite_or_default(d.get("leverage", default_leverage),
+                                          default_leverage or 1)
+        amount = abs(_finite_or_default(d.get("amount", 0), 0.0))
+        if amount <= 0:
+            return (sym, "failed", 0.0, "amount invalid")
+        if entry <= 0 or margin <= 0:
+            return (sym, "failed", 0.0, "entry/margin invalid")
         symbol_full = f"{sym}/USDT:USDT"
 
         # Price fallback chain
@@ -297,7 +329,8 @@ def _close_single_position_impl(*,
         if ticker_cache is not None:
             try:
                 ticker = ticker_cache.get(ex, symbol_full, timeout=5.0)
-                curr = float(ticker.get("last") or ticker.get("close") or 0)
+                curr = _positive_finite_or_zero(
+                    ticker.get("last") or ticker.get("close") or 0)
             except Exception as e:
                 log_event(
                     f"  Price (cached) for {sym} unavailable: {e} - "
@@ -306,11 +339,12 @@ def _close_single_position_impl(*,
         if curr <= 0:
             try:
                 ticker = ex.fetch_ticker(symbol_full)
-                curr = float(ticker.get("last") or ticker.get("close") or 0)
+                curr = _positive_finite_or_zero(
+                    ticker.get("last") or ticker.get("close") or 0)
             except Exception as e2:
                 log_event(f"  Price (direct) for {sym} unavailable: {e2}", "WARN")
         if curr <= 0:
-            curr = float(d.get("last_price", 0))
+            curr = _positive_finite_or_zero(d.get("last_price", 0))
         used_entry_fallback = False
         if curr <= 0:
             curr = entry
@@ -347,6 +381,8 @@ def _close_single_position_impl(*,
                     close_amount = float(raw_amount)
                 if close_amount <= 0 and raw_amount > 0:
                     close_amount = float(raw_amount)
+                if not math.isfinite(close_amount):
+                    return (sym, "failed", 0.0, "close amount invalid")
 
                 ok, why = _check_min_notional(ex, symbol_full,
                                                  close_amount, curr)
@@ -488,19 +524,20 @@ def _close_single_position_impl(*,
         pnl_usdt, _ = (calc_unrealized_pnl(entry, fill_price, margin, lev, pos_type)
                         if entry > 0 and margin > 0 else (0.0, 0.0))
 
-        initial_entry_fee = float(d.get("initial_entry_fee",
-                                          d.get("fees_paid", 0.0)))
-        original_amount = float(d.get("original_amount", amount))
-        from bot_utils import (safe_proportional_fee, safe_funding_scale,
-                               safe_remaining_funding)
+        initial_entry_fee = _positive_finite_or_zero(d.get(
+            "initial_entry_fee", d.get("fees_paid", 0.0)))
+        original_amount = _positive_finite_or_default(
+            d.get("original_amount", amount), amount)
+        from bot_utils import safe_proportional_fee, safe_remaining_funding
         partial_sold_flag = bool(d.get("partial_sold"))
         proportional_entry_fee = safe_proportional_fee(
             initial_entry_fee, amount, original_amount,
             partial_sold=partial_sold_flag
         )
 
-        funding_pd = float(d.get("funding_paid", 0.0))
-        funding_booked = float(d.get("funding_booked_on_partials", 0.0))
+        funding_pd = _finite_or_default(d.get("funding_paid", 0.0), 0.0)
+        funding_booked = _finite_or_default(
+            d.get("funding_booked_on_partials", 0.0), 0.0)
         if partial_sold_flag:
             funding_pd = safe_remaining_funding(
                 funding_pd, amount, original_amount,
@@ -551,7 +588,8 @@ def _close_single_position_impl(*,
                 btc_trend=d.get("btc_trend"), fear_greed=d.get("fear_greed"),
                 is_futures=True, position_type=pos_type,
                 leverage=lev,
-                liquidation_price=float(d.get("liquidation_price", 0)),
+                liquidation_price=_finite_or_default(
+                    d.get("liquidation_price", 0), 0.0),
                 funding_paid=funding_pd,
                 fees_usdt=slice_fees,
                 exchange_order_id=exch_oid,
