@@ -637,6 +637,61 @@ def extract_or_estimate_futures_fee(ex,
 
 #  Position verification 
 
+def fetch_open_position(ex, symbol_full: str) -> Tuple[Optional[dict], bool]:
+    """Return the open exchange position for ``symbol_full``.
+
+    MEXC/CCXT can occasionally return an empty list for symbol-scoped
+    ``fetch_positions([symbol])`` while the global positions endpoint still
+    contains the just-filled position. Entry paths must treat that as
+    "verification incomplete", not "no position", otherwise a live order can
+    become an unmanaged orphan.
+
+    Returns ``(position, unavailable)``. ``unavailable=True`` means the
+    exchange position endpoint could not be trusted and callers should keep or
+    create provisional state instead of deleting claims/state.
+    """
+    try:
+        from config.exchange_config import safe_fetch_positions
+    except Exception:
+        return None, True
+
+    try:
+        if not try_consume_api_call("fetch_positions:scoped"):
+            return None, True
+        positions = safe_fetch_positions(ex, [symbol_full])
+        scoped_has_symbol = False
+        if positions is not None:
+            try:
+                scoped_has_symbol = any(
+                    isinstance(p, dict)
+                    and (p.get("symbol") or "") == symbol_full
+                    for p in positions
+                )
+            except Exception:
+                scoped_has_symbol = False
+        if positions is None or not scoped_has_symbol:
+            if not try_consume_api_call("fetch_positions:global"):
+                return None, True
+            global_positions = safe_fetch_positions(ex)
+            if global_positions is None:
+                return None, True
+            positions = global_positions
+    except Exception:
+        return None, True
+
+    for pos in positions or []:
+        if not isinstance(pos, dict):
+            continue
+        if (pos.get("symbol") or "") != symbol_full:
+            continue
+        try:
+            contracts = abs(float(pos.get("contracts") or pos.get("size") or 0.0))
+        except (TypeError, ValueError):
+            continue
+        if contracts > 1e-8:
+            return pos, False
+    return None, False
+
 def verify_position_closed(ex, symbol_full: str, timeout: float = 5.0
                             ) -> Tuple[bool, float]:
     """Confirm via fetch_positions that contracts == 0 after a close.

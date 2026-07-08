@@ -939,20 +939,8 @@ class TrendFuturesBot(FuturesBot):
         return 0.0, fill, unavailable, "none"
 
     def _fetch_exchange_position(self, full: str) -> tuple[dict | None, bool]:
-        try:
-            from config.exchange_config import safe_fetch_positions
-            poss = safe_fetch_positions(self.ex, [full])
-            if poss is None:
-                return None, True
-        except Exception:
-            return None, True
-        for pos in poss or []:
-            if (pos.get("symbol") or "") != full:
-                continue
-            contracts = abs(self._safe_float(pos.get("contracts") or pos.get("size"), 0.0))
-            if contracts > 0:
-                return pos, False
-        return None, False
+        from bot_utils import fetch_open_position
+        return fetch_open_position(self.ex, full)
 
     def _record_open(self, base, fill, margin, eff_lev, amount, fees,
                       provisional: bool = False, lev_cap=None,

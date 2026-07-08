@@ -1,6 +1,6 @@
 {
-  "build_id": "7447742d8c42c745",
-  "created_at": "2026-07-08 08:15:19",
+  "build_id": "fe80928b0242025b",
+  "created_at": "2026-07-08 08:31:18",
   "source": "update_deploy_manifest.py",
   "file_count": 143,
   "files": [
@@ -11,8 +11,8 @@
     },
     {
       "path": "bot_utils/__init__.py",
-      "sha256": "f5c90364803d7d6f54dda0b1f2f3d4f1ee5abf2ff968a8d303ba714afdb96f52",
-      "bytes": 5606
+      "sha256": "050a3358e4ea8c7e81b8b21e2cfb07a6e579b4aab700b9370591b913ac0f4a57",
+      "bytes": 5689
     },
     {
       "path": "bot_utils/api_budget.py",
@@ -76,8 +76,8 @@
     },
     {
       "path": "bot_utils/futures_order.py",
-      "sha256": "e7e32642b6062eb38a5d6250904b8a7d66e76bcdabedf317a462108000e8081b",
-      "bytes": 29298
+      "sha256": "e8c8c125f44cf85d90e176e99a4e1fcf22efeaf6deda084e21fd08ea071a88e8",
+      "bytes": 31411
     },
     {
       "path": "bot_utils/indicators.py",
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "620b07590a8b4444bc8a9b035cf8f14c9a509b0c35f6633bf6f51e01f58aca26",
-      "bytes": 403
+      "sha256": "75d05e436aaffb3abeb7dfc2751b86fac8c850ab289482fe88380d322455d76d",
+      "bytes": 1074
     },
     {
       "path": "config/__init__.py",
@@ -231,8 +231,8 @@
     },
     {
       "path": "core/cross_bot.py",
-      "sha256": "df51240f7a0a75ee947132f09d66ecaeec36750d89edca4a830ef86b484a1002",
-      "bytes": 106613
+      "sha256": "09a5cf672674d05450892ede06b001c94093ffb084b654f1f1f64b3e38fc14a7",
+      "bytes": 105941
     },
     {
       "path": "core/database.py",
@@ -261,8 +261,8 @@
     },
     {
       "path": "core/futures_bot_scan.py",
-      "sha256": "32eea15d15a4d162fbfb97d7f8fb8166169f560848d998737f3b6780498c34b4",
-      "bytes": 69409
+      "sha256": "6fdbc57f2000dbeac55653ac053215ff049c77aca2429f6f2dd5f60864b18898",
+      "bytes": 69075
     },
     {
       "path": "core/logger.py",
@@ -331,8 +331,8 @@
     },
     {
       "path": "core/trend_futures_bot.py",
-      "sha256": "e8302ef0db2e044ebfb604a794b2386f3cd0b2b68afb6f8870c11d55176a81c1",
-      "bytes": 82560
+      "sha256": "6a71ac8f27c46dedb8b2ca2963f0e274628e6e73047d2dce3cceaa34fbd57a57",
+      "bytes": 82114
     },
     {
       "path": "env_parameter.txt",

@@ -756,30 +756,25 @@ class FuturesScanMixin:
                     positions_verified = False
                     positions_unavailable = False
                     try:
-                        from config.exchange_config import safe_fetch_positions
-                        positions = safe_fetch_positions(self.ex, [symbol_full])
-                        if positions is None:
-                            positions_unavailable = True
-                        else:
-                            for pos in positions:
-                                if (pos.get("symbol") or "") != symbol_full:
-                                    continue
-                                real_amt = abs(float(pos.get("contracts")
-                                                     or pos.get("size") or 0.0))
-                                if real_amt > 0:
-                                    amount = real_amt
-                                    positions_verified = True
-                                    for _k in ("entryPrice", "entry_price"):
-                                        _v = pos.get(_k)
-                                        if _v:
-                                            try:
-                                                _fv = float(_v)
-                                                if _fv > 0:
-                                                    fill_price = _fv
-                                                    break
-                                            except (ValueError, TypeError):
-                                                pass
-                                    break
+                        from bot_utils import fetch_open_position
+                        pos, positions_unavailable = fetch_open_position(
+                            self.ex, symbol_full)
+                        if pos is not None:
+                            real_amt = abs(float(pos.get("contracts")
+                                                 or pos.get("size") or 0.0))
+                            if real_amt > 0:
+                                amount = real_amt
+                                positions_verified = True
+                                for _k in ("entryPrice", "entry_price"):
+                                    _v = pos.get(_k)
+                                    if _v:
+                                        try:
+                                            _fv = float(_v)
+                                            if _fv > 0:
+                                                fill_price = _fv
+                                                break
+                                        except (ValueError, TypeError):
+                                            pass
                     except Exception:
                         positions_unavailable = True
                     if amount <= 0 and not positions_unavailable:

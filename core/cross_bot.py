@@ -139,28 +139,8 @@ class CrossBot(FuturesBot):
             return default
 
     def _fetch_exchange_position(self, full: str) -> tuple[dict | None, bool]:
-        try:
-            from config.exchange_config import safe_fetch_positions
-            poss = safe_fetch_positions(self.ex, [full])
-            if poss is None:
-                return None, True
-            scoped_has_symbol = any(
-                (pos.get("symbol") or "") == full for pos in (poss or [])
-            )
-            if not scoped_has_symbol:
-                global_poss = safe_fetch_positions(self.ex)
-                if global_poss is None:
-                    return None, True
-                poss = global_poss
-        except Exception:
-            return None, True
-        for pos in poss or []:
-            if (pos.get("symbol") or "") != full:
-                continue
-            contracts = abs(self._safe_float(pos.get("contracts") or pos.get("size"), 0.0))
-            if contracts > 0:
-                return pos, False
-        return None, False
+        from bot_utils import fetch_open_position
+        return fetch_open_position(self.ex, full)
 
     def _verify_entry_fill(self, full: str, order: dict,
                            fallback_fill: float) -> tuple[float, float, bool, str]:
@@ -436,10 +416,14 @@ class CrossBot(FuturesBot):
         worsening neutrality: first close a one-sided gap (bring the lagging
         side up to the leading side), then add balanced pairs. Bounded by K and
         available candidates. Returns (add_long, add_short)."""
-        catch_l = min(max(0, held_s - held_l), k - held_l, n_cand_l)
-        catch_s = min(max(0, held_l - held_s), k - held_s, n_cand_s)
-        pairs = max(0, min(k - held_l - catch_l, k - held_s - catch_s,
-                           n_cand_l - catch_l, n_cand_s - catch_s))
+        cap_l = max(0, k - held_l)
+        cap_s = max(0, k - held_s)
+        cand_l = max(0, n_cand_l)
+        cand_s = max(0, n_cand_s)
+        catch_l = min(max(0, held_s - held_l), cap_l, cand_l)
+        catch_s = min(max(0, held_l - held_s), cap_s, cand_s)
+        pairs = max(0, min(cap_l - catch_l, cap_s - catch_s,
+                           cand_l - catch_l, cand_s - catch_s))
         return catch_l + pairs, catch_s + pairs
 
     def _topup_tick(self) -> None:
