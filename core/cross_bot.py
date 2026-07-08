@@ -144,6 +144,14 @@ class CrossBot(FuturesBot):
             poss = safe_fetch_positions(self.ex, [full])
             if poss is None:
                 return None, True
+            scoped_has_symbol = any(
+                (pos.get("symbol") or "") == full for pos in (poss or [])
+            )
+            if not scoped_has_symbol:
+                global_poss = safe_fetch_positions(self.ex)
+                if global_poss is None:
+                    return None, True
+                poss = global_poss
         except Exception:
             return None, True
         for pos in poss or []:
@@ -1012,6 +1020,7 @@ class CrossBot(FuturesBot):
         margin = notional / max(lev, 1.0)
         fees = 0.0
         provisional = False
+        cs = 1.0
 
         #  Realistic execution + liquidity gate 
         # Use the ORDER-BOOK price you'd actually CROSS (ask for LONG, bid for

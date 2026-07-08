@@ -229,10 +229,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Obsidian update outside the launcher process.")
     parser.add_argument("--parent-pid", type=int, required=True)
     parser.add_argument("--restart", action="store_true")
+    parser.add_argument("--progress-ui", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--remote", default="", help=argparse.SUPPRESS)
     parser.add_argument("--branch", default="", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
+    if args.progress_ui:
+        return _run_with_progress_window(args)
+    return _main_impl(args)
+
+
+def _main_impl(args: argparse.Namespace) -> int:
     restart_after_update = False
     try:
         _write_status(
@@ -271,6 +278,113 @@ def main(argv: list[str] | None = None) -> int:
                     )
             except Exception as exc:
                 _append_log(f"Launcher-Neustart fehlgeschlagen: {exc}")
+
+
+def _status_text() -> str:
+    data = _read_status()
+    status = str(data.get("status") or "").strip()
+    msg = str(data.get("message") or "").strip()
+    if msg:
+        return msg
+    if status == "running":
+        return "Update laeuft ..."
+    if status == "success":
+        return "Update abgeschlossen."
+    if status == "failed":
+        return "Update fehlgeschlagen."
+    return "Update wird vorbereitet ..."
+
+
+def _run_with_progress_window(args: argparse.Namespace) -> int:
+    try:
+        import queue
+        import threading
+        import tkinter as tk
+        from tkinter import ttk
+    except Exception:
+        return _main_impl(args)
+
+    done: "queue.Queue[int]" = queue.Queue(maxsize=1)
+    win = tk.Tk()
+    win.title("Obsidian Update")
+    win.resizable(False, False)
+    win.configure(bg="#10101a")
+
+    width, height = 420, 130
+    try:
+        x = int((win.winfo_screenwidth() - width) / 2)
+        y = int((win.winfo_screenheight() - height) / 2)
+        win.geometry(f"{width}x{height}+{x}+{y}")
+    except Exception:
+        win.geometry(f"{width}x{height}")
+
+    title = tk.Label(
+        win,
+        text="Obsidian wird aktualisiert",
+        fg="#f4f2ff",
+        bg="#10101a",
+        font=("Segoe UI", 12, "bold"),
+    )
+    title.pack(anchor="w", padx=18, pady=(16, 6))
+    label = tk.Label(
+        win,
+        text="Update wird vorbereitet ...",
+        fg="#a9a3c8",
+        bg="#10101a",
+        font=("Segoe UI", 9),
+        wraplength=380,
+        justify="left",
+    )
+    label.pack(anchor="w", padx=18)
+    bar = ttk.Progressbar(win, orient="horizontal", mode="indeterminate", length=380)
+    bar.pack(padx=18, pady=(14, 6))
+    bar.start(12)
+    update_done = {"value": False}
+
+    def on_close() -> None:
+        if not update_done["value"]:
+            try:
+                win.iconify()
+            except Exception:
+                pass
+            return
+        win.destroy()
+
+    win.protocol("WM_DELETE_WINDOW", on_close)
+
+    def worker() -> None:
+        rc = 1
+        try:
+            rc = _main_impl(args)
+        finally:
+            try:
+                done.put_nowait(rc)
+            except Exception:
+                pass
+
+    def tick() -> None:
+        try:
+            rc = done.get_nowait()
+        except queue.Empty:
+            label.configure(text=_status_text())
+            win.after(400, tick)
+            return
+        update_done["value"] = True
+        bar.stop()
+        label.configure(text=("Update abgeschlossen. Launcher startet neu ..." if rc == 0 else _status_text()))
+        win.after(1200, win.destroy)
+
+    threading.Thread(target=worker, daemon=False).start()
+    win.after(200, tick)
+    try:
+        win.mainloop()
+    except Exception:
+        pass
+    try:
+        return int(done.get_nowait())
+    except Exception:
+        data = _read_status()
+        return 0 if data.get("status") == "success" else 1
 
 
 if __name__ == "__main__":

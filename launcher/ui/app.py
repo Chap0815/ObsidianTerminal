@@ -2200,6 +2200,58 @@ class ObsidianApp(ctk.CTk):
     def _dashboard_url(self) -> str:
         return f"http://127.0.0.1:{int(self._dashboard_port or 8501)}"
 
+    @staticmethod
+    def _dashboard_health_ok(port: int) -> bool:
+        try:
+            response = _req.get(f"http://127.0.0.1:{int(port)}/_stcore/health", timeout=0.35)
+            return response.status_code < 500
+        except Exception:
+            return False
+
+    @staticmethod
+    def _running_dashboard_ports() -> list[int]:
+        try:
+            import psutil  # type: ignore
+        except Exception:
+            return []
+        root_text = str(PROJECT_ROOT).lower()
+        ports: list[int] = []
+        for proc in psutil.process_iter(["pid", "cmdline", "cwd"]):
+            try:
+                parts = [str(p) for p in (proc.info.get("cmdline") or [])]
+                cmd = " ".join(parts)
+                low = cmd.lower()
+                cwd = str(proc.info.get("cwd") or "").lower()
+            except Exception:
+                continue
+            if "streamlit" not in low or "tools/dashboard.py" not in low:
+                continue
+            if root_text not in low and cwd != root_text:
+                continue
+            port = 8501
+            for idx, part in enumerate(parts[:-1]):
+                if part == "--server.port":
+                    try:
+                        port = int(parts[idx + 1])
+                    except Exception:
+                        port = 8501
+                    break
+            ports.append(port)
+        return ports
+
+    def _open_existing_dashboard_if_healthy(self) -> bool:
+        """Reuse an already-running dashboard after launcher restarts."""
+        ports = []
+        if self._dashboard_port:
+            ports.append(int(self._dashboard_port))
+        ports.extend(self._running_dashboard_ports())
+        for port in dict.fromkeys(ports):
+            if self._dashboard_health_ok(port):
+                self._dashboard_port = port
+                webbrowser.open(self._dashboard_url())
+                return True
+        return False
+
     def _open_dashboard_when_ready(self, url: str, attempt: int = 0) -> None:
         """Open only the dashboard process this launcher started."""
         if self.streamlit is None or self.streamlit.poll() is not None:
@@ -2234,6 +2286,9 @@ class ObsidianApp(ctk.CTk):
         to the project root, not to this module's directory.
         """
         if self.streamlit is None or self.streamlit.poll() is not None:
+            if self._open_existing_dashboard_if_healthy():
+                self.streamlit = None
+                return
             try:
                 self._dashboard_port = self._find_dashboard_port(8501)
             except Exception as e:
@@ -2431,6 +2486,7 @@ class ObsidianApp(ctk.CTk):
             pyw = _get_pythonw_exe()
             exe = pyw if pyw and os.path.exists(str(pyw)) else _get_python_exe()
             cmd = [exe, runner, "--parent-pid", str(os.getpid()), "--restart"]
+            cmd.append("--progress-ui")
             pending = getattr(self, "_pending_update_data", None)
             if isinstance(pending, dict):
                 remote = str(pending.get("remote") or "").strip()

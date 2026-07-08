@@ -1,6 +1,6 @@
 {
-  "build_id": "ed639776bd094220",
-  "created_at": "2026-07-08 07:59:24",
+  "build_id": "7447742d8c42c745",
+  "created_at": "2026-07-08 08:15:19",
   "source": "update_deploy_manifest.py",
   "file_count": 143,
   "files": [
@@ -231,8 +231,8 @@
     },
     {
       "path": "core/cross_bot.py",
-      "sha256": "02df60c25a7d7fff5af04d4724c60026723714c4ec36ed72a5d1752d9f600538",
-      "bytes": 106260
+      "sha256": "df51240f7a0a75ee947132f09d66ecaeec36750d89edca4a830ef86b484a1002",
+      "bytes": 106613
     },
     {
       "path": "core/database.py",
@@ -416,8 +416,8 @@
     },
     {
       "path": "launcher/ui/app.py",
-      "sha256": "4f9adf5a3a114b2fedf5016015190926a3221ac89ef703e527f88f07a66f15d0",
-      "bytes": 176213
+      "sha256": "2a2489fc6999096cbfa5f0aa9dbbdef10a76646b0b984ff641286a1b457b8a30",
+      "bytes": 178301
     },
     {
       "path": "launcher/ui/components/__init__.py",
@@ -636,8 +636,8 @@
     },
     {
       "path": "tools/update_launcher.py",
-      "sha256": "6924e72075935cda613f17cf26347c13f021493a088a3fbe30f701b1045d5fa2",
-      "bytes": 8916
+      "sha256": "af24273bc994bf2674141ee134d77b0053696cb20ecde2cec529163b21ed2af2",
+      "bytes": 12062
     },
     {
       "path": "tools/xsec_momentum.py",
