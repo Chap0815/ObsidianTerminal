@@ -703,6 +703,86 @@ def _running_launchers_via_cim() -> list[str]:
     return [line.strip() for line in (r.stdout or "").splitlines() if line.strip()]
 
 
+def _running_dashboard_processes() -> list[tuple[int, str]]:
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return _running_dashboard_processes_via_cim()
+    current = os.getpid()
+    root_text = str(ROOT).replace("\\", "/").lower()
+    out: list[tuple[int, str]] = []
+    for proc in psutil.process_iter(["pid", "cmdline", "cwd"]):
+        try:
+            pid = int(proc.info.get("pid") or 0)
+            if pid == current:
+                continue
+            cmdline = " ".join(proc.info.get("cmdline") or [])
+            proc_cwd = str(proc.info.get("cwd") or "")
+        except Exception:
+            continue
+        norm = cmdline.replace("\\", "/").lower()
+        cwd_norm = proc_cwd.replace("\\", "/").lower()
+        if "streamlit" not in norm or "tools/dashboard.py" not in norm:
+            continue
+        if root_text not in norm and cwd_norm != root_text:
+            continue
+        out.append((pid, f"dashboard pid {pid}"))
+    return out
+
+
+def _running_dashboard_processes_via_cim() -> list[tuple[int, str]]:
+    root = str(ROOT).replace("\\", "/").lower().replace("'", "''")
+    script = (
+        f"$root='{root}'; "
+        f"$current={os.getpid()}; "
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.ProcessId -ne $current -and $_.CommandLine -and "
+        "$line=$_.CommandLine.ToLower().Replace('\\','/'); "
+        "$line.Contains('streamlit') -and $line.Contains('tools/dashboard.py') -and "
+        "$line.Contains($root) } | "
+        "ForEach-Object { $_.ProcessId }"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            timeout=8,
+            **_hidden_kwargs(),
+        )
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    out: list[tuple[int, str]] = []
+    for line in (r.stdout or "").splitlines():
+        try:
+            pid = int(line.strip())
+        except Exception:
+            continue
+        out.append((pid, f"dashboard pid {pid}"))
+    return out
+
+
+def _terminate_dashboard_processes() -> list[str]:
+    stopped: list[str] = []
+    for pid, label in _running_dashboard_processes():
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                cwd=str(ROOT),
+                text=True,
+                capture_output=True,
+                timeout=8,
+                **_hidden_kwargs(),
+            )
+            stopped.append(label)
+        except Exception:
+            stopped.append(f"{label} (stop failed)")
+    return stopped
+
+
 def _copy_file(src: Path, dst: Path) -> None:
     if src.exists():
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -948,6 +1028,22 @@ def _verify_updated_tree() -> None:
             compile(source, str(path), "exec")
         except Exception as exc:
             raise RuntimeError(f"Update-Smoke fehlgeschlagen fuer {rel}: {exc}") from exc
+    try:
+        import bot_utils.pnl_view as pnl_view  # type: ignore
+
+        required = [
+            "futures_state_age_sec",
+            "futures_unrealized_from_row",
+            "is_futures_state_fresh",
+            "is_state_file_fresh",
+            "spot_unrealized_pnl",
+            "state_file_age_sec",
+        ]
+        missing_attrs = [name for name in required if not hasattr(pnl_view, name)]
+        if missing_attrs:
+            raise AttributeError(", ".join(missing_attrs))
+    except Exception as exc:
+        raise RuntimeError(f"Update-Smoke fehlgeschlagen fuer bot_utils.pnl_view: {exc}") from exc
 
 
 def _rewrite_manifest_file_from_index(rel: str) -> bool:
@@ -1567,6 +1663,9 @@ def main(argv: list[str] | None = None) -> int:
                 "Update abgebrochen: Bots laufen noch. Stoppe zuerst alle Bots:\n  "
                 + "\n  ".join(running)
             )
+        stopped_dashboards = _terminate_dashboard_processes()
+        if stopped_dashboards:
+            _print("Dashboard fuer Update beendet: " + ", ".join(stopped_dashboards))
 
         repo_url, branch = _load_update_config()
         target_branch = branch

@@ -1,6 +1,6 @@
 {
-  "build_id": "141d6608c7e24a35",
-  "created_at": "2026-07-08 18:20:33",
+  "build_id": "fb213f3c38d332b1",
+  "created_at": "2026-07-08 18:34:09",
   "source": "update_deploy_manifest.py",
   "file_count": 144,
   "files": [
@@ -386,8 +386,8 @@
     },
     {
       "path": "launcher/core/positions.py",
-      "sha256": "82a34de63cc77826b7cb6d3885b8d4d90ff5ec0ec19cc7f0418b1b8e7d56ca39",
-      "bytes": 93666
+      "sha256": "873ed4d5eef72ddc93abd7280da55a545d4f854634cc2a724030084512f8dcc5",
+      "bytes": 93960
     },
     {
       "path": "launcher/core/process_manager.py",
@@ -421,8 +421,8 @@
     },
     {
       "path": "launcher/ui/app.py",
-      "sha256": "8377b222403e98ecb90e440c0d55b8de0dd542438cce5ee8390aae293b85182a",
-      "bytes": 179604
+      "sha256": "53e2f3ef5990c0d8645fb17d4b06b78989db519724117eabeb679b0ab29d7fe7",
+      "bytes": 182340
     },
     {
       "path": "launcher/ui/components/__init__.py",
@@ -581,8 +581,8 @@
     },
     {
       "path": "tools/dashboard.py",
-      "sha256": "5d0e6fff4ad3a3a00ff2b88c20d7595fc018025d38ee03fd644f14a5e224eca1",
-      "bytes": 103252
+      "sha256": "fac2f106f7044285f85a7bad6b6d4f99ff71563132c62e31640f50d96482da46",
+      "bytes": 104513
     },
     {
       "path": "tools/ensure_git.py",
@@ -636,8 +636,8 @@
     },
     {
       "path": "tools/update_from_git.py",
-      "sha256": "fe902e95c75a85032c004e8ccf7c71ed940d527be675537e63bdc6945b95e85a",
-      "bytes": 56030
+      "sha256": "351c106b9d920547f00622af308ec71e46a5808f9e86d4b376a59d9c6ae27bce",
+      "bytes": 59511
     },
     {
       "path": "tools/update_launcher.py",

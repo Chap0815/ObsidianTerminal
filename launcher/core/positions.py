@@ -58,6 +58,19 @@ def _positive_finite(value) -> float | None:
     return parsed if parsed is not None and parsed > 0 else None
 
 
+def _ticker_last_close_price(ticker: dict | None) -> float | None:
+    if not isinstance(ticker, dict):
+        return None
+    for key in ("last", "close"):
+        raw = ticker.get(key)
+        if isinstance(raw, bool):
+            continue
+        price = _positive_finite(raw)
+        if price is not None:
+            return price
+    return None
+
+
 def _non_negative_finite(value) -> float | None:
     parsed = _finite_float(value)
     return parsed if parsed is not None and parsed >= 0 else None
@@ -456,8 +469,8 @@ def refresh_spot_positions_with_live_prices(positions: list) -> list:
             if ex is not None and sym:
                 try:
                     t = ex.fetch_ticker(f"{sym}/USDT")
-                    live = float(t.get("last") or t.get("close") or 0)
-                    if live > 0:
+                    live = _ticker_last_close_price(t)
+                    if live is not None:
                         curr = live
                 except Exception as e:
                     import logging
@@ -570,8 +583,8 @@ def refresh_positions_with_live_prices(positions: list) -> list:
             if ex is not None and sym:
                 try:
                     t = ex.fetch_ticker(f"{sym}/USDT:USDT")
-                    live = float(t.get("last") or t.get("close") or 0)
-                    if live > 0:
+                    live = _ticker_last_close_price(t)
+                    if live is not None:
                         curr = live
                 except Exception as e:
                     import logging
@@ -1155,7 +1168,7 @@ def direct_close_remaining_futures(
             if ex is not None:
                 try:
                     t = ex.fetch_ticker(symbol_full)
-                    fresh = _positive_finite(t.get("last") or t.get("close"))
+                    fresh = _ticker_last_close_price(t)
                     if fresh is not None:
                         curr = fresh
                 except Exception:
@@ -1777,7 +1790,7 @@ def direct_close_remaining_spot(
             if ex is not None:
                 try:
                     t = ex.fetch_ticker(f"{sym}/USDT")
-                    fresh = _positive_finite(t.get("last") or t.get("close"))
+                    fresh = _ticker_last_close_price(t)
                     if fresh is not None:
                         curr = fresh
                 except Exception:

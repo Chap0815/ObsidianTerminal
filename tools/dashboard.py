@@ -56,6 +56,7 @@ st.set_page_config(
 try:
     from core.paths import (
         DB_PATH_STR as DB_PATH,
+        LOGS_DIR,
         LOG_DIR_SPOT, LOG_DIR_TREND, LOG_DIR_FUTURES, LOG_DIR_CROSS,
         LOG_DIR_FUTREND,
     )
@@ -69,6 +70,7 @@ try:
 except Exception:
     # Fallback (should never fire in production)
     DB_PATH = os.path.join(_PROJECT_ROOT, "data", "trading_bot.db")
+    LOGS_DIR = os.path.join(_PROJECT_ROOT, "logs")
     LOG_DIRS = {
         "TREND":   os.path.join(_PROJECT_ROOT, "logs", "Trend"),
         "SPOT": os.path.join(_PROJECT_ROOT, "logs", "Spot"),
@@ -76,6 +78,41 @@ except Exception:
         "CROSS":   os.path.join(_PROJECT_ROOT, "logs", "Cross"),
         "FUTREND": os.path.join(_PROJECT_ROOT, "logs", "FuTrend"),
     }
+
+
+def _dashboard_build_id() -> str:
+    env_build = os.environ.get("OBSIDIAN_DASHBOARD_BUILD_ID")
+    if env_build:
+        return str(env_build)
+    try:
+        with open(os.path.join(_PROJECT_ROOT, "DEPLOY_MANIFEST.json"), "r", encoding="utf-8") as fh:
+            return str((json.load(fh) or {}).get("build_id") or "")
+    except Exception:
+        return ""
+
+
+def _write_dashboard_status() -> None:
+    try:
+        port_raw = os.environ.get("OBSIDIAN_DASHBOARD_PORT") or "0"
+        status = {
+            "pid": os.getpid(),
+            "port": int(port_raw) if str(port_raw).isdigit() else 0,
+            "build_id": _dashboard_build_id(),
+            "project_root": _PROJECT_ROOT,
+            "script": os.path.abspath(__file__),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        os.makedirs(str(LOGS_DIR), exist_ok=True)
+        path = os.path.join(str(LOGS_DIR), "dashboard_status.json")
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(status, fh, ensure_ascii=True, sort_keys=True)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+_write_dashboard_status()
 try:
     from core.database import get_local_today_str, utc_to_local_date_str
 except Exception:

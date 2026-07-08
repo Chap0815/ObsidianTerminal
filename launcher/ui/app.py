@@ -2195,19 +2195,31 @@ class ObsidianApp(ctk.CTk):
             return False
 
     @staticmethod
-    def _running_dashboard_ports() -> list[int]:
+    def _dashboard_status_path() -> str:
+        return os.path.join(PROJECT_ROOT, "logs", "dashboard_status.json")
+
+    @staticmethod
+    def _current_dashboard_build_id() -> str:
+        try:
+            with open(os.path.join(PROJECT_ROOT, "DEPLOY_MANIFEST.json"), "r", encoding="utf-8") as fh:
+                return str((json.load(fh) or {}).get("build_id") or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _running_dashboard_processes() -> list[dict[str, int]]:
         try:
             import psutil  # type: ignore
         except Exception:
             return []
-        root_text = str(PROJECT_ROOT).lower()
-        ports: list[int] = []
+        root_text = str(PROJECT_ROOT).replace("\\", "/").lower()
+        entries: list[dict[str, int]] = []
         for proc in psutil.process_iter(["pid", "cmdline", "cwd"]):
             try:
                 parts = [str(p) for p in (proc.info.get("cmdline") or [])]
                 cmd = " ".join(parts)
-                low = cmd.lower()
-                cwd = str(proc.info.get("cwd") or "").lower()
+                low = cmd.replace("\\", "/").lower()
+                cwd = str(proc.info.get("cwd") or "").replace("\\", "/").lower()
             except Exception:
                 continue
             if "streamlit" not in low or "tools/dashboard.py" not in low:
@@ -2222,20 +2234,69 @@ class ObsidianApp(ctk.CTk):
                     except Exception:
                         port = 8501
                     break
-            ports.append(port)
-        return ports
+            try:
+                entries.append({"pid": int(proc.info.get("pid") or 0), "port": int(port)})
+            except Exception:
+                continue
+        return entries
+
+    @staticmethod
+    def _running_dashboard_ports() -> list[int]:
+        return [entry["port"] for entry in ObsidianApp._running_dashboard_processes()]
+
+    def _dashboard_process_matches_current_build(self, entry: dict[str, int]) -> bool:
+        try:
+            with open(self._dashboard_status_path(), "r", encoding="utf-8") as fh:
+                status = json.load(fh) or {}
+        except Exception:
+            return False
+        try:
+            if int(status.get("pid") or -1) != int(entry.get("pid") or -2):
+                return False
+            if int(status.get("port") or -1) != int(entry.get("port") or -2):
+                return False
+        except Exception:
+            return False
+        status_root = str(status.get("project_root") or "").replace("\\", "/").lower()
+        current_root = str(PROJECT_ROOT).replace("\\", "/").lower()
+        if status_root != current_root:
+            return False
+        current_build = self._current_dashboard_build_id()
+        return bool(current_build) and str(status.get("build_id") or "") == current_build
+
+    @staticmethod
+    def _terminate_dashboard_process(pid: int) -> None:
+        if not pid:
+            return
+        try:
+            import psutil  # type: ignore
+            psutil.Process(int(pid)).terminate()
+        except Exception:
+            with suppress(Exception):
+                subprocess.run(
+                    ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    **subprocess_no_window_kwargs(),
+                )
 
     def _open_existing_dashboard_if_healthy(self) -> bool:
-        """Reuse an already-running dashboard after launcher restarts."""
-        ports = []
-        if self._dashboard_port:
-            ports.append(int(self._dashboard_port))
-        ports.extend(self._running_dashboard_ports())
-        for port in dict.fromkeys(ports):
-            if self._dashboard_health_ok(port):
+        """Reuse only a dashboard process from the same deployed build."""
+        seen: set[tuple[int, int]] = set()
+        for entry in self._running_dashboard_processes():
+            key = (int(entry.get("pid") or 0), int(entry.get("port") or 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            port = int(entry.get("port") or 0)
+            if not port or not self._dashboard_health_ok(port):
+                continue
+            if self._dashboard_process_matches_current_build(entry):
                 self._dashboard_port = port
                 webbrowser.open(self._dashboard_url())
                 return True
+            self._terminate_dashboard_process(int(entry.get("pid") or 0))
         return False
 
     def _open_dashboard_when_ready(self, url: str, attempt: int = 0) -> None:
@@ -2289,6 +2350,8 @@ class ObsidianApp(ctk.CTk):
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"
+            env["OBSIDIAN_DASHBOARD_PORT"] = str(self._dashboard_port)
+            env["OBSIDIAN_DASHBOARD_BUILD_ID"] = self._current_dashboard_build_id()
 
             try:
                 self.streamlit = subprocess.Popen(
