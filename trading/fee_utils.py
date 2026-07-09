@@ -68,12 +68,16 @@ def _fee_to_usdt_known(fee_dict: dict, order_dict: dict,
     if currency in STABLECOIN_EQUIVALENTS:
         return cost, True
 
-    base = base_override.upper() if base_override else ""
+    base = (
+        base_override.upper()
+        if isinstance(base_override, str) and base_override
+        else ""
+    )
     if not base and isinstance(order_dict, dict):
-        symbol = order_dict.get("symbol") or ""
-        if "/" in symbol:
+        symbol = order_dict.get("symbol")
+        if isinstance(symbol, str) and "/" in symbol:
             base = symbol.split("/")[0].upper()
-        elif symbol and symbol.endswith("USDT"):
+        elif isinstance(symbol, str) and symbol.endswith("USDT"):
             base = symbol[:-4].upper()
 
     if currency == base:

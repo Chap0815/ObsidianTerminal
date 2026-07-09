@@ -2,6 +2,8 @@
 
 ## 2026-07-09
 
+- Hardened legacy Spot fee base inference: non-string `base_override` and
+  order `symbol` payloads no longer crash fee conversion.
 - Hardened legacy Spot base-fee parsing: non-string base-currency arguments
   now fail closed instead of raising during base-fee extraction.
 - Hardened legacy Spot fee extraction fallback further: plural `fees` entries
