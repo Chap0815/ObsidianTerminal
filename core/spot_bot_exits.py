@@ -913,6 +913,7 @@ class ExitsMixin:
                         f" {sym}: partial-TP order did NOT fill "
                         f"(status={_st})  NOT booking, retry next tick", "WARN")
                     return False
+                sold_amount = _filled_base_amount(order, sold_amount, sold_amount)
                 exch_oid = order.get("id") or order.get("orderId")
                 fill_price = _positive_finite(
                     extract_fill_price(order, curr), curr)

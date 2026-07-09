@@ -2,6 +2,9 @@
 
 ## 2026-07-09
 
+- Hardened live Spot partial take-profit accounting: partial fills now book
+  PnL, invested capital and remaining amount from the exchange-reported filled
+  base amount instead of the requested sell size.
 - Hardened optimizer apply saves: applying a partial optimizer best-config now
   persists only the parameter keys emitted by the optimizer, so unsaved manual
   UI edits in the launcher config memory are not written to `bot_config.json`

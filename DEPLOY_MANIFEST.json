@@ -1,6 +1,6 @@
 {
-  "build_id": "0ae89bbfa3dd50d8",
-  "created_at": "2026-07-09 10:42:29",
+  "build_id": "314f3686dff4ac12",
+  "created_at": "2026-07-09 10:55:01",
   "source": "update_deploy_manifest.py",
   "file_count": 145,
   "files": [
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "4ce50166aecaf3a06359404fee1a65bc4c6e32131124ed4d84ab5071b0132fce",
-      "bytes": 42908
+      "sha256": "3274406bc59fd9252143e65bfec3bd112e145c85866754d1e4c02b69fb093e10",
+      "bytes": 43113
     },
     {
       "path": "config/__init__.py",
@@ -301,8 +301,8 @@
     },
     {
       "path": "core/spot_bot_exits.py",
-      "sha256": "d2c4ba812719c1a53ad28afda751691f225a7080aed98ca995ad437233e78ae3",
-      "bytes": 59467
+      "sha256": "a1b3d2eec9e136dfc1f4e3c39effb787949a3d829c882dcc3616ccc8f7cb26d8",
+      "bytes": 59550
     },
     {
       "path": "core/spot_bot_reconcile.py",
