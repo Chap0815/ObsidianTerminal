@@ -791,7 +791,9 @@ def _compute_stats(trades: list, total_costs: float, total_gross: float) -> dict
         "best_trade": best_trade,
         "avg_profit_pct": avg_profit_pct,
         "std_profit_pct": std_profit_pct,
-        "net_trades": [t["net"] for t in full],
+        # Optimizer robustness diagnostics consume this as the additive PnL
+        # series, so it must cover the same realized fills as total_net.
+        "net_trades": all_nets,
         "closed_trades": trades,
         "edge": total_net > 0 and exp_val > 0,
     }

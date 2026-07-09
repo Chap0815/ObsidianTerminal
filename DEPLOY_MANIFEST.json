@@ -1,6 +1,6 @@
 {
-  "build_id": "5d2bea116b9e61d1",
-  "created_at": "2026-07-09 12:21:30",
+  "build_id": "af923e8ec2792362",
+  "created_at": "2026-07-09 12:29:39",
   "source": "update_deploy_manifest.py",
   "file_count": 145,
   "files": [
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "ac03201ef296410556060fcfc93e0e6dcc0fc5da0fe1b8fd7e7a94c4ec477ac0",
-      "bytes": 45287
+      "sha256": "20b755a9a2c951169013adfb41f378c6af2749cb314757a593cd952ddc988d67",
+      "bytes": 45439
     },
     {
       "path": "config/__init__.py",
@@ -576,8 +576,8 @@
     },
     {
       "path": "tools/backtester.py",
-      "sha256": "eb865f7219a9fcb924240f10636716b84c824b7d49888f700e6c4a6e33ac72d5",
-      "bytes": 38937
+      "sha256": "dbebf43bdc86867104d95835d6a266a8f17a396730316a5ca1b4937022538904",
+      "bytes": 39070
     },
     {
       "path": "tools/check_connection.py",

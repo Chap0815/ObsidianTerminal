@@ -2,6 +2,8 @@
 
 ## 2026-07-09
 
+- Fixed Backtester optimizer diagnostics: `net_trades` now includes partial
+  realized PnL so robustness/DSR/Monte-Carlo checks use the same net basis.
 - Hardened Spot reconcile balance handling: boolean `free`/`used`/`total`
   balance payloads are now treated as unclear instead of confirmed zero.
 - Hardened legacy Spot fee base inference: non-string `base_override` and
