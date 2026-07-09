@@ -2,6 +2,9 @@
 
 ## 2026-07-09
 
+- Hardened USDT balance parsing: malformed non-string raw `info` currency
+  fields now fail closed instead of crashing the balance reader or accepting a
+  raw fallback amount.
 - Hardened shared order-fill detection: terminal `closed`/`filled` status
   without an order id, positive fill, or positive cost is now treated as a
   malformed external payload instead of a filled order.

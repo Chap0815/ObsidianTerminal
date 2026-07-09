@@ -120,10 +120,12 @@ def safe_fetch_balance_usdt(ex,
     # Last resort: inspect raw "info"  but only when stablecoin is indicated
     info = bal.get("info") if isinstance(bal, dict) else None
     if isinstance(info, dict):
-        raw_currency = (
+        raw_currency_value = (
             info.get("coin") or info.get("currency") or
             info.get("asset") or info.get("marginCoin") or ""
-        ).upper()
+        )
+        raw_currency = raw_currency_value.upper() if isinstance(
+            raw_currency_value, str) else "__INVALID__"
         if raw_currency not in _STABLECOINS:
             # non-stablecoin balance  refuse raw fallback.
             _log("fetch_balance",

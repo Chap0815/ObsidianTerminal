@@ -1,6 +1,6 @@
 {
-  "build_id": "a92432903f6e4384",
-  "created_at": "2026-07-09 11:30:59",
+  "build_id": "2c76427b9539207a",
+  "created_at": "2026-07-09 11:37:33",
   "source": "update_deploy_manifest.py",
   "file_count": 145,
   "files": [
@@ -21,8 +21,8 @@
     },
     {
       "path": "bot_utils/balance.py",
-      "sha256": "1d84fd884d7f4861a9819fa94de972ba2766b8d014785e7fca76e65368baaf6d",
-      "bytes": 4808
+      "sha256": "59af2bef110ec0d262328b5cbc8d9da96859dc170874279fea08bbf18a562c6b",
+      "bytes": 4927
     },
     {
       "path": "bot_utils/balance_resolver.py",
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "68e10c51f8aa89b5edbb3d3ae7b6eff15f4951674b376e539087dcf44ff72e03",
-      "bytes": 43874
+      "sha256": "ae8f80937d20a44be499d8faf9e2543b724343477a9bc570b9fdb250747350ef",
+      "bytes": 44050
     },
     {
       "path": "config/__init__.py",
