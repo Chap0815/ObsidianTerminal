@@ -41,6 +41,7 @@ from bot_utils import (
     filled_margin_usdt,
     get_maintenance_margin_rate,
 )
+from trading.entry_quality import EntryQuality, score_futures_entry
 
 
 class FuturesScanMixin:
@@ -69,6 +70,25 @@ class FuturesScanMixin:
         if parsed <= 0:
             return float(default)
         return parsed
+
+    def _entry_quality_min_score(self) -> float:
+        raw = self._finite_float(self.C("ENTRY_QUALITY_MIN_SCORE", 50.0), 50.0)
+        return max(0.0, min(100.0, raw))
+
+    def _entry_quality_filter_enabled(self) -> bool:
+        return self._bool_cfg_value(
+            self.C("ENTRY_QUALITY_FILTER_ENABLED", True), True)
+
+    @staticmethod
+    def _spread_pct_from_ticker(ticker: dict | None) -> float | None:
+        if not isinstance(ticker, dict):
+            return None
+        bid = FuturesScanMixin._positive_float(ticker.get("bid"))
+        ask = FuturesScanMixin._positive_float(ticker.get("ask"))
+        mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+        if mid <= 0:
+            return None
+        return (ask - bid) / mid * 100.0
 
     def _cleanup_rolled_back_futures_entry_state(
         self,
@@ -524,6 +544,7 @@ class FuturesScanMixin:
             return
 
         # Spread check (live only)
+        entry_spread_pct = None
         if not self.simulation:
             try:
                 entry_ticker = self.ticker_cache.get(self.ex, symbol_full, timeout=4.0)
@@ -536,6 +557,7 @@ class FuturesScanMixin:
                         entry_ticker["bid"] = bids[0][0]
                     if asks:
                         entry_ticker["ask"] = asks[0][0]
+                entry_spread_pct = self._spread_pct_from_ticker(entry_ticker)
                 if not check_spread_ok(entry_ticker, log_event=log_event,
                                        symbol=sym, missing_ok=False):
                     log_event(f"{sym}: {direction} blocked  spread too wide", "WAIT")
@@ -544,6 +566,52 @@ class FuturesScanMixin:
                 log_event(f"{sym}: {direction} blocked  spread check unavailable "
                           f"({type(e).__name__})", "WAIT")
                 return
+
+        try:
+            quality = score_futures_entry(
+                direction=direction,
+                confidence=confidence,
+                rsi_15m=r.get("rsi_15m"),
+                rsi_1h=r.get("rsi_1h"),
+                rsi_4h=r.get("rsi_4h"),
+                change_pct=r.get("change_percent"),
+                btc_change_pct=btc_chg,
+                funding_rate_pct=funding_rate,
+                oi_change_pct=oi_change,
+                spread_pct=entry_spread_pct,
+                regime=regime.get("regime"),
+            )
+        except Exception:
+            quality = EntryQuality(
+                score=0, label="LOW", reasons=("score_error",),
+                components={})
+        quality_fields = quality.as_log_fields()
+        quality_fields.update({
+            "bot": self.BOT_NAME,
+            "symbol": sym,
+            "full_symbol": symbol_full,
+            "stage": "candidate_pre_order",
+            "mode": "SIM" if self.simulation else "LIVE",
+            "direction": direction,
+            "confidence": confidence,
+            "spread_pct": entry_spread_pct,
+            "funding_rate_pct": funding_rate,
+            "oi_change_pct": oi_change,
+            "entry_quality_min_score": self._entry_quality_min_score(),
+        })
+        try:
+            log_struct("futures_entry_quality", **quality_fields)
+        except Exception:
+            pass
+        if (not self.simulation and self._entry_quality_filter_enabled()
+                and ("score_error" in quality.reasons
+                     or quality.score < self._entry_quality_min_score())):
+            log_event(
+                f"{sym}: {direction} blocked  entry quality "
+                f"{quality.score} < {self._entry_quality_min_score():.0f} "
+                f"({quality.label}; {','.join(quality.reasons) or 'no_reason'})",
+                "WAIT")
+            return
 
         #  Bull/Bear devil's-advocate veto (2nd LLM call, ~3-4s) 
         # Skipped in veto-only mode by default: direction is already price-based
@@ -655,6 +723,7 @@ class FuturesScanMixin:
         amount = 0.0
         fill_price = entry_price
         fees_paid = 0.0
+        entry_verified = bool(self.simulation)
 
         if self.simulation:
             try:
@@ -1247,6 +1316,9 @@ class FuturesScanMixin:
             "funding_paid": 0.0,
             "initial_entry_fee": fees_paid,
             "fees_paid": fees_paid,
+            "entry_quality_score": quality.score,
+            "entry_quality_label": quality.label,
+            "entry_quality_reasons": ",".join(quality.reasons),
             "partial_sold": False,
             "break_even": False,
             "be_active": False,
@@ -1320,6 +1392,9 @@ class FuturesScanMixin:
                 margin_usdt=float(actual_margin),
                 intended_margin_usdt=float(margin_usdt),
                 sim=bool(self.simulation),
+                entry_quality_score=quality.score,
+                entry_quality_label=quality.label,
+                entry_quality_reasons=",".join(quality.reasons),
             )
         except Exception:
             pass

@@ -66,7 +66,9 @@
                     "OWN_MOMENTUM_FILTER":  true,
                     "OWN_MOMENTUM_WINDOW":  5,
                     "SIMULATION":  true,
-                    "OWN_MOMENTUM_MIN_LOSS_PCT":  20.0
+                    "OWN_MOMENTUM_MIN_LOSS_PCT":  20.0,
+                    "ENTRY_QUALITY_FILTER_ENABLED":  true,
+                    "ENTRY_QUALITY_MIN_SCORE":  50.0
                 },
     "CROSS":  {
                   "XSEC_LOOKBACK_HOURS":  24,
@@ -118,6 +120,8 @@
                     "SIMULATION":  true,
                     "TREND_VOL_TARGET":  0,
                     "TREND_VOL_TARGET_LOOKBACK":  30,
+                    "ENTRY_QUALITY_FILTER_ENABLED":  true,
+                    "ENTRY_QUALITY_MIN_SCORE":  50.0,
                     "MAX_NEW_TRADES_PER_TICK":  1,
                     "COOLDOWN_AFTER_SL":  240,
                     "BAD_SYMBOL_FILTER":  true,

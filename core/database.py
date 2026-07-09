@@ -541,6 +541,8 @@ def _run_migrations(conn) -> None:
     _add_column_if_missing(conn, "trades", "giveback_pct",      "REAL")
     _add_column_if_missing(conn, "trades", "is_sim",            "INTEGER")
     _add_column_if_missing(conn, "trades", "mode_source",       "TEXT")
+    _add_column_if_missing(conn, "trades", "entry_quality_score", "REAL")
+    _add_column_if_missing(conn, "trades", "entry_quality_label", "TEXT")
     # exchange order id participates in the dedup key so two genuinely distinct
     # LIVE trades on the same symbol in the same wall-clock second can't
     # collapse into one row (which would drop the second trade's PnL from
@@ -980,8 +982,10 @@ def save_trade_db(
     is_futures=False, position_type=None, leverage=None,
     liquidation_price=None, funding_paid=0.0, fees_usdt=0.0,
     exchange_order_id=None, mfe_pct=None, mae_pct=None, giveback_pct=None,
-    mode_is_sim=None,
+    mode_is_sim=None, entry_quality_score=None, entry_quality_label=None,
 ) -> bool:
+    if not _INIT_DB_DONE:
+        init_db()
     raw_bot_name = bot_name
     explicit_mode = _coerce_mode_is_sim(mode_is_sim)
     trade_is_sim = 1 if str(raw_bot_name or "").endswith(_SIM_TAG) else (
@@ -1025,6 +1029,14 @@ def save_trade_db(
     invested_usdt = _sanitize_float(invested_usdt, 0.0)
     funding_paid  = _sanitize_float(funding_paid, 0.0)
     fees_usdt     = _sanitize_float(fees_usdt, 0.0)
+    entry_quality_score = (
+        _sanitize_float(entry_quality_score, None)
+        if entry_quality_score is not None else None
+    )
+    entry_quality_label = (
+        str(entry_quality_label)[:16]
+        if entry_quality_label is not None else None
+    )
 
     if buy_price <= 0 or sell_price <= 0:
         try:
@@ -1140,8 +1152,8 @@ def save_trade_db(
              is_futures, position_type, leverage,
              liquidation_price, funding_paid, fees_usdt,
              exchange_order_id, mfe_pct, mae_pct, giveback_pct,
-             is_sim, mode_source)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+             is_sim, mode_source, entry_quality_score, entry_quality_label)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
             bot_name, symbol, buy_price, sell_price, buy_time, sell_time,
             profit_pct, profit_usdt, invested_usdt, reason,
             _sanitize_float(rsi_15m, None) if rsi_15m is not None else None,
@@ -1161,7 +1173,7 @@ def save_trade_db(
             _sanitize_float(mfe_pct, None) if mfe_pct is not None else None,
             _sanitize_float(mae_pct, None) if mae_pct is not None else None,
             _sanitize_float(giveback_pct, None) if giveback_pct is not None else None,
-            trade_is_sim, mode_source,
+            trade_is_sim, mode_source, entry_quality_score, entry_quality_label,
         ))
         inserted = cur.rowcount > 0
         if inserted:

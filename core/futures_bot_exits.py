@@ -1213,6 +1213,8 @@ class FuturesExitsMixin:
             is_partial=True,
             fees_usdt=prop_entry_fee + partial_fee,
             exchange_order_id=exch_oid,
+            entry_quality_score=d.get("entry_quality_score"),
+            entry_quality_label=d.get("entry_quality_label"),
         )
         try:
             accounting_ok = bool(save_trade_db(**partial_trade))
@@ -1643,6 +1645,8 @@ class FuturesExitsMixin:
                 mfe_pct=mfe_pct,
                 mae_pct=mae_pct,
                 giveback_pct=giveback_pct,
+                entry_quality_score=d.get("entry_quality_score"),
+                entry_quality_label=d.get("entry_quality_label"),
             ))
             if not accounting_ok:
                 raise RuntimeError("save_trade_db returned False")
@@ -1665,6 +1669,10 @@ class FuturesExitsMixin:
                     "accounting_pending_mfe_pct": mfe_pct,
                     "accounting_pending_mae_pct": mae_pct,
                     "accounting_pending_giveback_pct": giveback_pct,
+                    "accounting_pending_entry_quality_score": d.get(
+                        "entry_quality_score"),
+                    "accounting_pending_entry_quality_label": d.get(
+                        "entry_quality_label"),
                 })
             except Exception as state_err:
                 log_event(

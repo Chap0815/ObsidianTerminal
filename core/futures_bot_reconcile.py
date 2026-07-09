@@ -1200,6 +1200,12 @@ class FuturesReconcileMixin:
                 mfe_pct=mfe_pct,
                 mae_pct=mae_pct,
                 giveback_pct=giveback_pct,
+                entry_quality_score=state_row.get(
+                    "accounting_pending_entry_quality_score",
+                    state_row.get("entry_quality_score")),
+                entry_quality_label=state_row.get(
+                    "accounting_pending_entry_quality_label",
+                    state_row.get("entry_quality_label")),
             )
             if not saved:
                 log_event(

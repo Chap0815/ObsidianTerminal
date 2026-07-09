@@ -253,6 +253,8 @@ DEFAULT_CONFIG = {
         "OWN_MOMENTUM_FILTER": True,
         "OWN_MOMENTUM_WINDOW": 5,
         "OWN_MOMENTUM_MIN_LOSS_PCT": 20.0,
+        "ENTRY_QUALITY_FILTER_ENABLED": True,
+        "ENTRY_QUALITY_MIN_SCORE": 50.0,
         "SIMULATION":        True,
     },
     # Cross-sectional momentum  market-neutral, cross-margin, experimental.
@@ -317,6 +319,8 @@ DEFAULT_CONFIG = {
         "TREND_EXIT_STALE_LIMIT": 3,
         "TREND_VOL_TARGET":          0,
         "TREND_VOL_TARGET_LOOKBACK": 30,
+        "ENTRY_QUALITY_FILTER_ENABLED": True,
+        "ENTRY_QUALITY_MIN_SCORE": 50.0,
         "COOLDOWN_AFTER_SL": 240,
         "BAD_SYMBOL_FILTER": True,
         "SINGLE_STOP_MIN_LOSS_PCT": 5.0,
@@ -383,6 +387,10 @@ PARAM_DEFS_SPOT = [
      "Number of recent own trades used by the self-momentum pause filter."),
     ("OWN_MOMENTUM_MIN_LOSS_PCT", "Momentum Loss", 1.0,   1.0,  50.0, ".0f", "%",
      "Self-momentum pause threshold as loss % of invested capital in the recent window."),
+    ("ENTRY_QUALITY_FILTER_ENABLED", "Entry Filter", 1.0, 0.0, 1.0, ".0f", "",
+     "1 = block LOW-quality live entries before balance/leverage/order. 0 = log only."),
+    ("ENTRY_QUALITY_MIN_SCORE", "Entry Min Score", 5.0, 0.0, 100.0, ".0f", "",
+     "Minimum live entry quality score. 50 blocks LOW while allowing MID/HIGH."),
 ]
 
 PARAM_DEFS_FUTURES = [
@@ -553,6 +561,10 @@ PARAM_DEFS_FUTREND = [
      "Move the protective stop to fee-buffered breakeven at this raw price move."),
     ("PARTIAL_SELL_PCT",     "Partial Close",      0.05,  0.05,   1.00, ".2f", "",
      "Fraction closed at Activation TP. 0.50 = close half, trail the rest."),
+    ("ENTRY_QUALITY_FILTER_ENABLED", "Entry Filter", 1.0, 0.0, 1.0, ".0f", "",
+     "1 = block LOW-quality live entries before balance/leverage/order. 0 = log only."),
+    ("ENTRY_QUALITY_MIN_SCORE", "Entry Min Score", 5.0, 0.0, 100.0, ".0f", "",
+     "Minimum live entry quality score. 50 blocks LOW while allowing MID/HIGH."),
     ("LIQ_SAFETY_PCT",       "Liq Safety",         1.0,   5.0,    50.0, ".0f", "%",
      "Force-close when this much of the liquidation buffer remains  last-resort "
      "catastrophe guard."),

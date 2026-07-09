@@ -31,6 +31,7 @@ from typing import Dict, List, Optional, Tuple
 from core.futures_bot import FuturesBot
 from core.cross_bot import _is_crypto_base   # shared crypto-only perp filter
 from trading.trend_signal import is_in_trend, params_from_cfg, has_full_history
+from trading.entry_quality import EntryQuality, score_futrend_entry
 from trading.vol_target import (realized_vol, vol_target_multiplier,
                                 basket_median_vol)
 
@@ -57,6 +58,12 @@ class TrendFuturesBot(FuturesBot):
             return int(float(self.C(key, default)))
         except (TypeError, ValueError):
             return default
+
+    def _entry_quality_min_score(self) -> float:
+        return max(0.0, min(100.0, self._f("ENTRY_QUALITY_MIN_SCORE", 50.0)))
+
+    def _entry_quality_filter_enabled(self) -> bool:
+        return bool(self._i("ENTRY_QUALITY_FILTER_ENABLED", 1))
 
     def _timeframe(self) -> str:
         tf = str(self.C("TREND_TIMEFRAME", "1h")).strip().lower()
@@ -239,7 +246,7 @@ class TrendFuturesBot(FuturesBot):
         if funding_rate_pct is not None and funding_rate_pct > funding_limit:
             reasons.append("long_pays_funding")
 
-        return {
+        snapshot = {
             "bot": self.BOT_NAME,
             "symbol": base,
             "full_symbol": full,
@@ -262,6 +269,31 @@ class TrendFuturesBot(FuturesBot):
             "spread_limit_pct": spread_limit,
             "funding_limit_pct": funding_limit,
         }
+        try:
+            quality = score_futrend_entry(
+                trend_votes=snapshot.get("trend_votes"),
+                spread_pct=spread_pct,
+                spread_limit_pct=spread_limit,
+                funding_rate_pct=funding_rate_pct,
+                funding_limit_pct=funding_limit,
+                realized_vol=snapshot.get("realized_vol"),
+                vol_size_mult=snapshot.get("vol_size_mult"),
+                would_block=snapshot.get("would_block"),
+            )
+        except Exception:
+            quality = EntryQuality(
+                score=0, label="LOW", reasons=("score_error",),
+                components={})
+        snapshot.update(quality.as_log_fields())
+        snapshot["entry_quality_min_score"] = self._entry_quality_min_score()
+        if (self._entry_quality_filter_enabled()
+                and ("score_error" in quality.reasons
+                     or quality.score < snapshot["entry_quality_min_score"])):
+            snapshot["would_block"] = True
+            existing = [r for r in str(snapshot.get("reasons") or "").split(",") if r]
+            existing.append("low_entry_quality")
+            snapshot["reasons"] = ",".join(dict.fromkeys(existing))
+        return snapshot
 
     def _trailing_audit_log_interval_sec(self) -> float:
         try:
@@ -1133,6 +1165,9 @@ class TrendFuturesBot(FuturesBot):
                 "entry_trend_votes": entry_shadow.get("trend_votes"),
                 "entry_realized_vol": entry_shadow.get("realized_vol"),
                 "entry_vol_size_mult": entry_shadow.get("vol_size_mult"),
+                "entry_quality_score": entry_shadow.get("entry_quality_score"),
+                "entry_quality_label": entry_shadow.get("entry_quality_label"),
+                "entry_quality_reasons": entry_shadow.get("entry_quality_reasons"),
             })
         return self.state.add(base, row) is not False
 
@@ -1648,7 +1683,10 @@ class TrendFuturesBot(FuturesBot):
                            trailing_peak_move_pct=d.get("trailing_peak_move_pct"),
                            trailing_stop_price=d.get("trailing_stop_price"),
                            entry_shadow_would_block=d.get("entry_shadow_would_block"),
-                           entry_shadow_reasons=d.get("entry_shadow_reasons"))
+                           entry_shadow_reasons=d.get("entry_shadow_reasons"),
+                           entry_quality_score=d.get("entry_quality_score"),
+                           entry_quality_label=d.get("entry_quality_label"),
+                           entry_quality_reasons=d.get("entry_quality_reasons"))
             except Exception:
                 pass
             sell_time = _utc()
@@ -1665,7 +1703,9 @@ class TrendFuturesBot(FuturesBot):
                     funding_paid=funding, fees_usdt=entry_fee + close_fee,
                     exchange_order_id=exch_oid,
                     mfe_pct=mfe_pct, mae_pct=mae_pct,
-                    giveback_pct=giveback_pct))
+                    giveback_pct=giveback_pct,
+                    entry_quality_score=d.get("entry_quality_score"),
+                    entry_quality_label=d.get("entry_quality_label")))
                 if not accounting_ok:
                     raise RuntimeError("save_trade_db returned False")
             except Exception as e:

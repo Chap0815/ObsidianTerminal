@@ -377,6 +377,8 @@ def _check_config(bot_name: str | None,
             ("TREND_VOL_TARGET_LOOKBACK", 2.0, 500.0),
             ("TREND_EXIT_STALE_LIMIT", 1.0, 50.0),
             ("MAX_NEW_TRADES_PER_TICK", 0.0, 50.0),
+            ("ENTRY_QUALITY_FILTER_ENABLED", 0.0, 1.0),
+            ("ENTRY_QUALITY_MIN_SCORE", 0.0, 100.0),
             ("XSEC_K", 1.0, 15.0),
             ("XSEC_LOOKBACK_HOURS", 6.0, 336.0),
             ("XSEC_REBALANCE_HOURS", 6.0, 336.0),
@@ -388,7 +390,16 @@ def _check_config(bot_name: str | None,
             if key not in section:
                 continue
             try:
-                val = _finite_float(section.get(key))
+                if key == "ENTRY_QUALITY_FILTER_ENABLED":
+                    bool_val = _to_bool(section.get(key))
+                    if bool_val is None:
+                        issues.append(_issue(
+                            "error", "config_range_invalid",
+                            f"{name}: {key}={section.get(key)} outside {lo:g}-{hi:g}"))
+                        continue
+                    val = 1.0 if bool_val else 0.0
+                else:
+                    val = _finite_float(section.get(key))
                 if not (lo <= val <= hi):
                     issues.append(_issue(
                         "error", "config_range_invalid",

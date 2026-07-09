@@ -20,6 +20,7 @@ REQUIRED_RELEASE_ITEMS = [
     "config/update_config.example.json",
     "news",
     "trading",
+    "trading/entry_quality.py",
     "tools",
     "core/runtime_status.py",
     "launcher/config/settings.py",

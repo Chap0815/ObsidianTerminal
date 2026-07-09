@@ -2,6 +2,11 @@
 
 ## 2026-07-09
 
+- Added production entry-quality filters for FUTURES and FUTREND: live entries
+  now score direction confidence, RSI alignment, relative strength, spread,
+  funding, OI/regime and trend volatility data, block LOW-quality setups before
+  claim/leverage/order side effects, fail closed on scoring errors, and persist
+  LOW/MID/HIGH buckets for PnL/MFE/MAE audit.
 - Fixed Futures systemic killswitch retry behavior: failed BTC-crash flatten
   attempts no longer set the hard-kill one-shot flag while positions remain.
 - Fixed Edge Audit trade classification: text flags like `is_partial='0'`
