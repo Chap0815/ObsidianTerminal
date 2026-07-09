@@ -751,7 +751,8 @@ def _compute_stats(trades: list, total_costs: float, total_gross: float) -> dict
     total_net = sum(t["net"] for t in trades)
     total_fees = sum(t.get("fees", t.get("cost", 0.0)) for t in trades)
     total_funding = sum(t.get("funding", 0.0) for t in trades)
-    cost_pct  = (total_costs / total_gross * 100) if total_gross > 0 else 0
+    gross_basis = sum(abs(t.get("gross", 0.0)) for t in trades)
+    cost_pct  = (total_costs / gross_basis * 100) if gross_basis > 0 else 0
     roi       = (total_net / INITIAL_CAPITAL) * 100
 
     curve = [INITIAL_CAPITAL]

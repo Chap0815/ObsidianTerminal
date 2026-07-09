@@ -2,6 +2,8 @@
 
 ## 2026-07-09
 
+- Fixed Backtester cost diagnostics: `cost_pct` now uses absolute realized
+  gross PnL as its basis so loss-only runs no longer report zero costs.
 - Fixed Backtester optimizer diagnostics: `net_trades` now includes partial
   realized PnL so robustness/DSR/Monte-Carlo checks use the same net basis.
 - Hardened Spot reconcile balance handling: boolean `free`/`used`/`total`
