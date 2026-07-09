@@ -45,22 +45,28 @@ def fee_to_usdt(fee_dict: dict, order_dict: dict,
       2. Currency matches base coin  cost  fill price.
       3. Unknown discount token  conservative estimate.
     """
+    fee, _known = _fee_to_usdt_known(fee_dict, order_dict, base_override)
+    return fee
+
+
+def _fee_to_usdt_known(fee_dict: dict, order_dict: dict,
+                       base_override: str = "") -> tuple[float, bool]:
     if not isinstance(fee_dict, dict):
-        return 0.0
+        return 0.0, False
     parsed_cost = _finite_float_or_none(fee_dict.get("cost"))
     if parsed_cost is None:
-        return 0.0
+        return 0.0, False
     cost = parsed_cost
     if cost == 0:
-        return 0.0
+        return 0.0, True
 
     raw_currency = fee_dict.get("currency")
     if raw_currency is not None and not isinstance(raw_currency, str):
-        return 0.0
+        return 0.0, False
     currency = (raw_currency or "").upper()
 
     if currency in STABLECOIN_EQUIVALENTS:
-        return cost
+        return cost, True
 
     base = base_override.upper() if base_override else ""
     if not base and isinstance(order_dict, dict):
@@ -73,11 +79,12 @@ def fee_to_usdt(fee_dict: dict, order_dict: dict,
     if currency == base:
         fill_price = _safe_fill_price(order_dict)
         if fill_price > 0:
-            return cost * fill_price
+            return cost * fill_price, True
 
     if cost < 0:
-        return 0.0
-    return _discount_fallback(order_dict)
+        return 0.0, False
+    fallback = _discount_fallback(order_dict)
+    return fallback, fallback > 0
 
 
 def extract_fee_usdt(order: dict, base_override: str = "") -> float:
@@ -95,9 +102,16 @@ def extract_fee_usdt(order: dict, base_override: str = "") -> float:
             and _finite_float_or_none(f.get("cost")) is not None
         ]
         if valid_entries:
-            return sum(
-                fee_to_usdt(f, order, base_override) for f in valid_entries
-            )
+            total = 0.0
+            saw_known = False
+            for fee_dict in valid_entries:
+                fee, known = _fee_to_usdt_known(
+                    fee_dict, order, base_override)
+                if known:
+                    saw_known = True
+                    total += fee
+            if saw_known:
+                return total if math.isfinite(total) else 0.0
 
     return fee_to_usdt(order.get("fee"), order, base_override)
 

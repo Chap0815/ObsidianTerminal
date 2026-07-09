@@ -2,6 +2,9 @@
 
 ## 2026-07-09
 
+- Hardened legacy Spot fee extraction fallback further: plural `fees` entries
+  with parseable but unconvertible unknown currencies no longer suppress a
+  valid singular `fee` fallback when they contribute no known USDT value.
 - Hardened legacy Spot fee extraction: malformed plural `fees` entries
   without parseable `cost` no longer suppress a valid singular `fee` fallback,
   while explicit zero-fee plural entries remain authoritative.
