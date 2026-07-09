@@ -34,7 +34,7 @@ _INFO_KEYS = (
     "free", "available", "withdrawable",
 )
 
-_STABLECOINS = {"USDT", "USD", "BUSD", "USDC", "FDUSD", "TUSD", ""}
+_STABLECOINS = {"USDT", "USD", "BUSD", "USDC", "FDUSD", "TUSD"}
 
 
 def _finite_nonnegative_float(value) -> Optional[float]:

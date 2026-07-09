@@ -2,6 +2,9 @@
 
 ## 2026-07-09
 
+- Hardened USDT balance raw-info fallback: raw balance fields without an
+  explicit stablecoin currency marker are no longer accepted as USDT free
+  capital.
 - Hardened USDT balance parsing: malformed non-string raw `info` currency
   fields now fail closed instead of crashing the balance reader or accepting a
   raw fallback amount.
