@@ -2,6 +2,10 @@
 
 ## 2026-07-09
 
+- Hardened live Spot/Trend-Spot buy cost validation: exchange-reported
+  `order.cost` is still preferred for `invested_usdt`, but absurd finite cost
+  payloads far outside the filled notional / intended trade size now fall back
+  to the reconstructed quote amount instead of poisoning position accounting.
 - Hardened live Spot/Trend-Spot buy cost accounting: filled buy entries now
   persist a finite positive exchange-reported `order.cost` as `invested_usdt`
   when available, falling back to `filled * fill_price` only when cost is

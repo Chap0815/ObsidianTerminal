@@ -50,11 +50,24 @@ class ScanMixin:
         return parsed if math.isfinite(parsed) and parsed > 0 else float(default)
 
     @staticmethod
-    def _quote_cost_or_fallback(order, fallback: float) -> float:
+    def _quote_cost_or_fallback(order, fallback: float,
+                                max_expected: float = 0.0) -> float:
         fallback_value = ScanMixin._positive_float(fallback)
         if not isinstance(order, dict):
             return fallback_value
-        return ScanMixin._positive_float(order.get("cost"), fallback_value)
+        max_expected_value = ScanMixin._positive_float(max_expected)
+        if max_expected_value > 0 and fallback_value > max_expected_value * 10.0:
+            fallback_value = max_expected_value
+        cost = ScanMixin._positive_float(order.get("cost"))
+        if cost <= 0:
+            return fallback_value
+        if max_expected_value > 0 and cost > max_expected_value * 10.0:
+            return fallback_value
+        if fallback_value > 0:
+            ratio = cost / fallback_value
+            if ratio < 0.1 or ratio > 10.0:
+                return fallback_value
+        return cost
 
     def _release_entry_claim_if_untracked(self, sym: str) -> bool:
         try:
@@ -1045,7 +1058,8 @@ class ScanMixin:
             try:
                 from core.logger import _date as _utc_now_str_inner
                 provisional_invested_usdt = ScanMixin._quote_cost_or_fallback(
-                    order, provisional_amount * provisional_fill_price)
+                    order, provisional_amount * provisional_fill_price,
+                    trade_usdt)
                 provisional_ok = self.state.add(sym, {
                     "buy": provisional_fill_price,
                     "highest": provisional_fill_price,
@@ -1118,7 +1132,7 @@ class ScanMixin:
                 fill_price = price
 
             invested_usdt = ScanMixin._quote_cost_or_fallback(
-                order, amount * fill_price)
+                order, amount * fill_price, trade_usdt)
 
             # Zombie protection  write a PROVISIONAL state row immediately
             # after the order returns, BEFORE the slow fee refetches (~1.8s). If
