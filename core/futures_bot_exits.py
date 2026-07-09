@@ -405,7 +405,6 @@ class FuturesExitsMixin:
                     except Exception:
                         btc_4h = 0.0
                     if btc_4h <= crash_pct:
-                        self._hard_kill_fired = True
                         log_event(
                             f"SYSTEMIC KILLSWITCH: BTC {btc_4h:+.1f}% in 4h "
                             f"<= {crash_pct:.0f}% - FLATTENING ALL POSITIONS NOW",
@@ -417,6 +416,12 @@ class FuturesExitsMixin:
                                 reason=f"BTC crash {btc_4h:+.1f}%/4h")
                         except Exception as _ce:
                             self._log_error("BTC-crash flatten", _ce)
+                        if not self.state.get_all():
+                            self._hard_kill_fired = True
+                        else:
+                            log_event(
+                                "SYSTEMIC KILLSWITCH: positions remain after "
+                                "flatten - will retry on next tick", "WARN")
         except Exception as e:
             self._log_error("killswitch check", e)
 

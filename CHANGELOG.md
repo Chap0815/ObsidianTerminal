@@ -2,6 +2,8 @@
 
 ## 2026-07-09
 
+- Fixed Futures systemic killswitch retry behavior: failed BTC-crash flatten
+  attempts no longer set the hard-kill one-shot flag while positions remain.
 - Fixed Edge Audit trade classification: text flags like `is_partial='0'`
   no longer get treated as partial trades by Python truthiness.
 - Fixed Backtester cost diagnostics: `cost_pct` now uses absolute realized
