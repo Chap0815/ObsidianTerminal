@@ -39,6 +39,8 @@
                  "OWN_MOMENTUM_FILTER":  true,
                  "OWN_MOMENTUM_WINDOW":  8,
                  "OWN_MOMENTUM_MIN_LOSS_PCT":  20.0,
+                 "ENTRY_QUALITY_FILTER_ENABLED":  true,
+                 "ENTRY_QUALITY_MIN_SCORE":  50.0,
                  "SIMULATION":  true,
                  "MONITOR_INTERVAL":  20
              },
@@ -88,6 +90,8 @@
                   "POSITION_SIZE":  10.0,
                   "MAX_OPEN_TRADES":  12,
                   "INITIAL_STOP_LOSS":  -25.0,
+                  "ENTRY_QUALITY_FILTER_ENABLED":  true,
+                  "ENTRY_QUALITY_MIN_SCORE":  50.0,
                   "SIMULATION":  true,
                   "XSEC_MAX_SPREAD_PCT":  0.5
               },

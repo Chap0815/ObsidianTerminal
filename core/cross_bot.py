@@ -103,6 +103,112 @@ class CrossBot(FuturesBot):
         except (TypeError, ValueError):
             return default
 
+    def _entry_quality_min_score(self) -> float:
+        raw = self._f("ENTRY_QUALITY_MIN_SCORE", 50.0)
+        return max(0.0, min(100.0, raw)) if math.isfinite(raw) else 50.0
+
+    def _entry_quality_filter_enabled(self) -> bool:
+        try:
+            value = self.C("ENTRY_QUALITY_FILTER_ENABLED", True)
+        except Exception:
+            value = self._f("ENTRY_QUALITY_FILTER_ENABLED", 1.0)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() not in ("0", "false", "no", "off")
+
+    def _cross_entry_quality_context(self, base: str, side: str, book,
+                                     prices: Dict[str, List[float]],
+                                     target_side_count: int) -> dict:
+        ranked = list(book.longs if side == "LONG" else book.shorts)
+        try:
+            rank_position = ranked.index(base) + 1
+        except ValueError:
+            rank_position = None
+        series = prices.get(base) or []
+        return_pct = None
+        try:
+            first = CrossBot._safe_float(self, series[0], 0.0)
+            last = CrossBot._safe_float(self, series[-1], 0.0)
+            if first > 0 and last > 0:
+                return_pct = (last / first - 1.0) * 100.0
+        except Exception:
+            pass
+        funding_cache = getattr(self, "_cross_funding_pct", {})
+        return {
+            "rank_position": rank_position,
+            "rank_count": len(ranked),
+            "return_pct": return_pct,
+            "funding_rate_pct": funding_cache.get(base),
+            "book_side_count": len(ranked),
+            "target_side_count": target_side_count,
+        }
+
+    def _open_leg_with_quality(self, base: str, full: str, side: str,
+                               notional: float, price: float, lev: float,
+                               book, prices: Dict[str, List[float]],
+                               target_side_count: int) -> None:
+        context = CrossBot._cross_entry_quality_context(
+            self, base, side, book, prices, target_side_count)
+        try:
+            import inspect
+            sig = inspect.signature(self._open_leg)
+            accepts_quality = (
+                "quality_context" in sig.parameters
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD
+                       for p in sig.parameters.values())
+            )
+        except Exception:
+            accepts_quality = True
+        if accepts_quality:
+            return self._open_leg(
+                base, full, side, notional, price, lev,
+                quality_context=context)
+        return self._open_leg(base, full, side, notional, price, lev)
+
+    def _score_cross_entry_quality(self, base: str, full: str, side: str,
+                                   quality_context: dict | None,
+                                   spread_pct: float | None,
+                                   max_spread_pct: float):
+        from trading.entry_quality import EntryQuality, score_cross_leg_entry
+
+        ctx = dict(quality_context or {})
+        try:
+            quality = score_cross_leg_entry(
+                side=side,
+                rank_position=ctx.get("rank_position"),
+                rank_count=ctx.get("rank_count"),
+                return_pct=ctx.get("return_pct"),
+                spread_pct=spread_pct,
+                max_spread_pct=max_spread_pct,
+                funding_rate_pct=ctx.get("funding_rate_pct"),
+                max_funding_pct=self._f("XSEC_MAX_FUNDING_PCT", 0.1),
+                book_side_count=ctx.get("book_side_count"),
+                target_side_count=ctx.get("target_side_count"),
+                is_claimed=ctx.get("is_claimed", False),
+            )
+        except Exception:
+            quality = EntryQuality(
+                score=0, label="LOW", reasons=("score_error",),
+                components={})
+        try:
+            from core.logger import log_struct
+            fields = quality.as_log_fields()
+            fields.update({
+                "bot": self.BOT_NAME,
+                "symbol": base,
+                "full_symbol": full,
+                "stage": "candidate_pre_order",
+                "mode": "SIM" if self.simulation else "LIVE",
+                "direction": side,
+                "spread_pct": spread_pct,
+                "entry_quality_min_score": self._entry_quality_min_score(),
+                **ctx,
+            })
+            log_struct("cross_entry_quality", **fields)
+        except Exception:
+            pass
+        return quality
+
     # Cross-margin safety ceiling in code (UI caps at 3; a hand-edited config
     # must not push the shared cross-margin book to the global 25x clamp).
     def _leverage(self) -> float:
@@ -554,6 +660,15 @@ class CrossBot(FuturesBot):
             from config.exchange_config import safe_fetch_funding_rate
             fr = safe_fetch_funding_rate(self.ex, full_symbol)
             rate = float((fr or {}).get("fundingRate") or 0.0)
+            try:
+                base = full_symbol.split("/")[0].upper()
+                cache = getattr(self, "_cross_funding_pct", None)
+                if not isinstance(cache, dict):
+                    cache = {}
+                    setattr(self, "_cross_funding_pct", cache)
+                cache[base] = rate * 100.0
+            except Exception:
+                pass
             return abs(rate) * 100.0 <= max_pct
         except Exception:
             return False
@@ -718,9 +833,13 @@ class CrossBot(FuturesBot):
         self._rebalance_in_progress = True
         try:
             for b in cand_l[:add_l]:
-                self._open_leg(b, sym_map[b], "LONG", notional, prices[b][-1], lev)
+                CrossBot._open_leg_with_quality(
+                    self, b, sym_map[b], "LONG", notional, prices[b][-1],
+                    lev, book, prices, k)
             for b in cand_s[:add_s]:
-                self._open_leg(b, sym_map[b], "SHORT", notional, prices[b][-1], lev)
+                CrossBot._open_leg_with_quality(
+                    self, b, sym_map[b], "SHORT", notional, prices[b][-1],
+                    lev, book, prices, k)
         finally:
             self._rebalance_in_progress = False
             cur = CrossBot._active_legs(self)
@@ -1210,8 +1329,9 @@ class CrossBot(FuturesBot):
         for base, side in to_open:
             if self._shutdown_event.is_set():
                 return
-            self._open_leg(base, sym_map[base], side, notional,
-                           prices[base][-1], lev)
+            CrossBot._open_leg_with_quality(
+                self, base, sym_map[base], side, notional, prices[base][-1],
+                lev, book, prices, final)
 
         # Backstop: a leg can still fail mid-open (min-size / claim race) and
         # leave the book net-directional - trim the excess to stay neutral.
@@ -1244,7 +1364,8 @@ class CrossBot(FuturesBot):
 
     #  Leg execution (SIM-first; live uses the proven futures helpers) 
     def _open_leg(self, base: str, full: str, side: str, notional: float,
-                  price: float, lev: float) -> None:
+                  price: float, lev: float,
+                  quality_context: dict | None = None) -> None:
         from core.logger import log_event, log_struct, _date as _utc
         from core.database import (is_claimed_by_other, claim_symbol_for_entry,
                                    remove_open_position)
@@ -1296,8 +1417,9 @@ class CrossBot(FuturesBot):
         # open without a fresh bid/ask; SIM may fall back to the signal price.
         exec_price = entry_price
         book_ok = False
+        spread_pct = None
+        max_spread = self._f("XSEC_MAX_SPREAD_PCT", 0.5)
         try:
-            max_spread = self._f("XSEC_MAX_SPREAD_PCT", 0.5)
             ob = self.ex.fetch_order_book(full, limit=5)
             bids = (ob or {}).get("bids") or []
             asks = (ob or {}).get("asks") or []
@@ -1335,6 +1457,19 @@ class CrossBot(FuturesBot):
                 f"{exec_price!r} - skip leg",
                 "WARN",
             )
+            return
+
+        quality = self._score_cross_entry_quality(
+            base, full, side, quality_context, spread_pct, max_spread)
+        if (quality_context is not None
+                and not self.simulation and self._entry_quality_filter_enabled()
+                and ("score_error" in quality.reasons
+                     or quality.score < self._entry_quality_min_score())):
+            log_event(
+                f"[{self.BOT_NAME}] {base}: {side} blocked  entry quality "
+                f"{quality.score} < {self._entry_quality_min_score():.0f} "
+                f"({quality.label}; {','.join(quality.reasons) or 'no_reason'})",
+                "WAIT")
             return
 
         if self.simulation:
@@ -1432,6 +1567,9 @@ class CrossBot(FuturesBot):
                 "fees_paid": 0.0,
                 "strategy": "xsec",
                 "contract_size": cs,
+                "entry_quality_score": quality.score,
+                "entry_quality_label": quality.label,
+                "entry_quality_reasons": ",".join(quality.reasons),
                 "provisional": True,
                 "entry_inflight_until": time.time() + 120.0,
             })
@@ -1495,6 +1633,9 @@ class CrossBot(FuturesBot):
                             "original_amount": _amt, "funding_paid": 0.0,
                             "fees_paid": 0.0, "strategy": "xsec",
                             "contract_size": cs,
+                            "entry_quality_score": quality.score,
+                            "entry_quality_label": quality.label,
+                            "entry_quality_reasons": ",".join(quality.reasons),
                             "provisional": True,
                         })
                         if landed_added is False:
@@ -1574,6 +1715,9 @@ class CrossBot(FuturesBot):
             "fees_paid": fees,
             "strategy": "xsec",
             "contract_size": cs,
+            "entry_quality_score": quality.score,
+            "entry_quality_label": quality.label,
+            "entry_quality_reasons": ",".join(quality.reasons),
             "provisional": provisional,
         })
         if tracked is False:
@@ -2138,7 +2282,10 @@ class CrossBot(FuturesBot):
                     funding_paid=funding, fees_usdt=total_fees,
                     exchange_order_id=exch_oid,
                     mfe_pct=mfe_pct, mae_pct=mae_pct,
-                    giveback_pct=giveback_pct))
+                    giveback_pct=giveback_pct,
+                    entry_quality_score=d.get("entry_quality_score"),
+                    entry_quality_label=d.get("entry_quality_label"),
+                    entry_quality_reasons=d.get("entry_quality_reasons")))
                 if not saved_ok:
                     raise RuntimeError("save_trade_db returned False")
             except Exception as e:
@@ -2161,6 +2308,12 @@ class CrossBot(FuturesBot):
                         "accounting_pending_mfe_pct": mfe_pct,
                         "accounting_pending_mae_pct": mae_pct,
                         "accounting_pending_giveback_pct": giveback_pct,
+                        "accounting_pending_entry_quality_score": d.get(
+                            "entry_quality_score"),
+                        "accounting_pending_entry_quality_label": d.get(
+                            "entry_quality_label"),
+                        "accounting_pending_entry_quality_reasons": d.get(
+                            "entry_quality_reasons"),
                     })
                 except Exception as state_err:
                     self._log_error(f"cross mark accounting_pending {base}",

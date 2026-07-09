@@ -93,6 +93,8 @@ class TrendFuturesLauncher(TrendFuturesBot):
         "SCAN_INTERVAL":        300,     # banner only (engine uses TREND_CHECK_MINUTES)
         "MAX_NEW_TRADES_PER_TICK": 1,
         "SIMULATION":           True,
+        "ENTRY_QUALITY_FILTER_ENABLED": True,
+        "ENTRY_QUALITY_MIN_SCORE": 50.0,
     }
 
     @staticmethod

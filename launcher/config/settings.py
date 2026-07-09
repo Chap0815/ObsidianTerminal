@@ -226,6 +226,8 @@ DEFAULT_CONFIG = {
         "OWN_MOMENTUM_FILTER": True,
         "OWN_MOMENTUM_WINDOW": 8,
         "OWN_MOMENTUM_MIN_LOSS_PCT": 20.0,
+        "ENTRY_QUALITY_FILTER_ENABLED": True,
+        "ENTRY_QUALITY_MIN_SCORE": 50.0,
         "SIMULATION":        True,
     },
     "FUTURES": {
@@ -279,6 +281,8 @@ DEFAULT_CONFIG = {
         "POSITION_SIZE":         10.0,
         "MAX_OPEN_TRADES":       12,
         "INITIAL_STOP_LOSS":     -25.0,
+        "ENTRY_QUALITY_FILTER_ENABLED": True,
+        "ENTRY_QUALITY_MIN_SCORE": 50.0,
         "SIMULATION":            True,
     },
     # Leveraged trend-following futures (per-coin, long/flat). SIM-first.
@@ -513,6 +517,10 @@ PARAM_DEFS_CROSS = [
      "Skip a coin whose order-book spread is wider than this  keeps the bot on "
      "LIQUID perps (illiquid junk would bleed on slippage). Also makes SIM "
      "realistic: it fills at the real ask/bid, not the mid."),
+    ("ENTRY_QUALITY_FILTER_ENABLED", "Entry Filter", 1.0, 0.0, 1.0, ".0f", "",
+     "1 = block LOW-quality live entries before balance/leverage/order. 0 = log only."),
+    ("ENTRY_QUALITY_MIN_SCORE", "Entry Min Score", 5.0, 0.0, 100.0, ".0f", "",
+     "Minimum live entry quality score. 50 blocks LOW while allowing MID/HIGH."),
     ("MAX_DAILY_LOSS",       "Daily Loss Limit",   5.0,-500.0,    -5.0, ".0f", "$",
      "Account killswitch: stop opening new positions past this USDT loss/day."),
     ("BASE_CAPITAL_USDT",    "Base Capital",      50.0,  50.0,100000.0, ".0f", "$",

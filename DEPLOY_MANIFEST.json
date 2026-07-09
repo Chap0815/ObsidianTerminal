@@ -1,13 +1,13 @@
 {
-  "build_id": "848eff94630cd2be",
-  "created_at": "2026-07-09 15:15:30",
+  "build_id": "375710de3089ccff",
+  "created_at": "2026-07-09 17:45:50",
   "source": "update_deploy_manifest.py",
   "file_count": 146,
   "files": [
     {
       "path": "bot_config.default.json",
-      "sha256": "6bc3e1c340031d089096f3a1bbe47cdbef775d2362ad9b37e9320cb627f931a5",
-      "bytes": 8201
+      "sha256": "f5a4b108d4963901ba3d9a284d1478d426800c9ac5113831fd14a14af29d3459",
+      "bytes": 8409
     },
     {
       "path": "bot_utils/__init__.py",
@@ -41,8 +41,8 @@
     },
     {
       "path": "bot_utils/config.py",
-      "sha256": "d95e20b4d94ca13b08908ce04c45a20b51a15d284cff7e902551f91a254b8657",
-      "bytes": 15306
+      "sha256": "a7ce833aaf36f59a4dfe2fbdd9765f07f4ea4f14268f28c94f0042d976625070",
+      "bytes": 15483
     },
     {
       "path": "bot_utils/equity_utils.py",
@@ -161,8 +161,8 @@
     },
     {
       "path": "bots/main_bot_aggressive.py",
-      "sha256": "f58c53a119eba94b57965413b80454c56b94c3c135e902fe0996caed05f81398",
-      "bytes": 2575
+      "sha256": "5bd645ab945d2fce69ec8922a54660aeb56a0529b40be2b2c9f5da0ac3c9a4eb",
+      "bytes": 2662
     },
     {
       "path": "bots/main_bot_balanced.py",
@@ -171,23 +171,23 @@
     },
     {
       "path": "bots/main_bot_cross.py",
-      "sha256": "1b0ed8bbf16762dee906c0737b0bca626b0010344ee39f73589560c240fd1500",
-      "bytes": 3408
+      "sha256": "3a90d1420b84ef6e6e4c740971df8ca75a2c6a7f8dd6d4adde11a001bb572ea1",
+      "bytes": 3495
     },
     {
       "path": "bots/main_bot_futures.py",
-      "sha256": "64d2566192d75bc3c5a4565856acc061693f1c382ca0f3ada5fc3c4f358bd208",
-      "bytes": 2988
+      "sha256": "c5d780659186f7aa67178cc89d696d7f44e947fd48ed495d0692e49372adf116",
+      "bytes": 3075
     },
     {
       "path": "bots/main_bot_trendfut.py",
-      "sha256": "9ac57b86755bc54d4efa79ff29f3a335a02c1c0672d249186152c190cbcdaf49",
-      "bytes": 4511
+      "sha256": "9d8588536b052db2f3278559c954f867398f1c70f61a3a97ab5bbb57d6aa338b",
+      "bytes": 4598
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "c16d40ed96828ea237d55c1ddd1dcf558535c1d4fdfe019f8ac702a6af4f8d6e",
-      "bytes": 46239
+      "sha256": "a5c336f4c9718e844a0e28a8336b6052a73001f123c848e1fa492f7ba542d6ce",
+      "bytes": 47066
     },
     {
       "path": "config/__init__.py",
@@ -231,13 +231,13 @@
     },
     {
       "path": "core/cross_bot.py",
-      "sha256": "2b34ae3c9c189c4cc6dd48d02ee5c5cfa4001e2b78a4e948ec7cfffede81c6c0",
-      "bytes": 126480
+      "sha256": "5320a5a5e4bc384d1b3b9debccf0b454e5749b3eeec79d7a93f66a5296394d31",
+      "bytes": 133470
     },
     {
       "path": "core/database.py",
-      "sha256": "14955705584e7f948695ec9e7854323f061603d90e08e000eabd9169aafeece6",
-      "bytes": 89131
+      "sha256": "837b23205d647b9099b91b41b1f8561689062bb3cf30077bb45363d0963b2f57",
+      "bytes": 89444
     },
     {
       "path": "core/event_bus.py",
@@ -301,8 +301,8 @@
     },
     {
       "path": "core/spot_bot_exits.py",
-      "sha256": "a1b3d2eec9e136dfc1f4e3c39effb787949a3d829c882dcc3616ccc8f7cb26d8",
-      "bytes": 59550
+      "sha256": "0dae4eb783b60edfe7a1cbec16cfd88bac4d3a4d81b32269aa424a035e8d63cf",
+      "bytes": 59930
     },
     {
       "path": "core/spot_bot_reconcile.py",
@@ -311,8 +311,8 @@
     },
     {
       "path": "core/spot_bot_scan.py",
-      "sha256": "2724e82250119bcb6eafec9cc391173fe5d097d82d2c0e071af51207de773c39",
-      "bytes": 56444
+      "sha256": "6307b60eb784244380c7660ede8027da4a177082195e60665d16ac2ed3ac07a4",
+      "bytes": 59839
     },
     {
       "path": "core/state_manager.py",
@@ -366,8 +366,8 @@
     },
     {
       "path": "launcher/config/settings.py",
-      "sha256": "9e9f0f680a426526ba6d2b4df35279cd973fcb0c90094bbd650d64968604b764",
-      "bytes": 45848
+      "sha256": "3c5288344e5b654b201a497d157fc43715e3014e881443d9abffdcfa341c5168",
+      "bytes": 46351
     },
     {
       "path": "launcher/core/__init__.py",
@@ -671,8 +671,8 @@
     },
     {
       "path": "trading/entry_quality.py",
-      "sha256": "f306ce654a8b12f19bfae1d28328d08dd6083843784e077d66516a974c376f04",
-      "bytes": 9065
+      "sha256": "2360812661bc3fdf2cc376c294598200672674f2fe84c64ebfa273e1b2297b30",
+      "bytes": 18028
     },
     {
       "path": "trading/fee_utils.py",

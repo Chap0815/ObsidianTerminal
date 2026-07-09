@@ -64,6 +64,8 @@ class AggressiveBot(SpotBot):
         "OWN_MOMENTUM_MIN_LOSS_PCT": 20.0,
         "SIMULATION":        True,
         "RSI_MAX":           85.0,
+        "ENTRY_QUALITY_FILTER_ENABLED": True,
+        "ENTRY_QUALITY_MIN_SCORE": 50.0,
     }
 
     @staticmethod

@@ -70,6 +70,8 @@ class CrossMomentumBot(CrossBot):
         "COOLDOWN_AFTER_SL":     0,
         "SCAN_INTERVAL":         300,    # banner only (rebalance uses XSEC_*)
         "SIMULATION":            True,
+        "ENTRY_QUALITY_FILTER_ENABLED": True,
+        "ENTRY_QUALITY_MIN_SCORE": 50.0,
     }
 
     @staticmethod

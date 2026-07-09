@@ -49,6 +49,71 @@ class ScanMixin:
             return float(default)
         return parsed if math.isfinite(parsed) and parsed > 0 else float(default)
 
+    def _entry_quality_min_score(self) -> float:
+        try:
+            raw = float(self.C("ENTRY_QUALITY_MIN_SCORE", 50.0))
+        except (TypeError, ValueError, OverflowError):
+            raw = 50.0
+        return max(0.0, min(100.0, raw)) if math.isfinite(raw) else 50.0
+
+    def _entry_quality_filter_enabled(self) -> bool:
+        return self._bool_cfg_value(
+            self.C("ENTRY_QUALITY_FILTER_ENABLED", True), True)
+
+    def _remember_spot_setup_history(self, sym: str, hist: dict) -> None:
+        try:
+            cache = getattr(self, "_spot_entry_quality_history", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                setattr(self, "_spot_entry_quality_history", cache)
+            cache[str(sym).upper()] = dict(hist or {})
+        except Exception:
+            pass
+
+    def _score_spot_entry_quality(self, sym: str, r: dict, regime: dict,
+                                  confidence: str):
+        from trading.entry_quality import EntryQuality, score_spot_entry
+
+        try:
+            hist = getattr(self, "_spot_entry_quality_history", {}).get(
+                str(sym).upper(), {})
+            quality = score_spot_entry(
+                confidence=confidence,
+                rsi_15m=r.get("rsi_15m"),
+                rsi_1h=r.get("rsi_1h"),
+                rsi_4h=r.get("rsi_4h"),
+                change_pct=r.get("change_percent"),
+                btc_change_pct=(regime or {}).get("btc_24h"),
+                regime=(regime or {}).get("regime"),
+                vol_surge=r.get("vol_surge"),
+                body_ratio=r.get("body_ratio"),
+                macd_hist=r.get("macd_hist"),
+                historical_winrate=hist.get("winrate"),
+                spread_pct=None,
+            )
+        except Exception:
+            quality = EntryQuality(
+                score=0, label="LOW", reasons=("score_error",),
+                components={})
+
+        try:
+            from core.logger import log_struct
+            fields = quality.as_log_fields()
+            fields.update({
+                "bot": self.BOT_NAME,
+                "symbol": sym,
+                "stage": "candidate_pre_sizing",
+                "mode": "SIM" if self.simulation else "LIVE",
+                "confidence": confidence,
+                "regime": (regime or {}).get("regime"),
+                "btc_change_pct": (regime or {}).get("btc_24h"),
+                "entry_quality_min_score": self._entry_quality_min_score(),
+            })
+            log_struct("spot_entry_quality", **fields)
+        except Exception:
+            pass
+        return quality
+
     @staticmethod
     def _quote_cost_or_fallback(order, fallback: float,
                                 max_expected: float = 0.0) -> float:
@@ -439,6 +504,17 @@ class ScanMixin:
             log_event(f"{sym}: {why}", "WAIT")
             return None
 
+        quality = self._score_spot_entry_quality(sym, r, regime, confidence)
+        if (not self.simulation and self._entry_quality_filter_enabled()
+                and ("score_error" in quality.reasons
+                     or quality.score < self._entry_quality_min_score())):
+            log_event(
+                f"{sym}: BUY blocked  entry quality "
+                f"{quality.score} < {self._entry_quality_min_score():.0f} "
+                f"({quality.label}; {','.join(quality.reasons) or 'no_reason'})",
+                "WAIT")
+            return None
+
         # Bull/Bear devil's-advocate veto is handled inside
         # news_brain.analyze_sentiment() when direction=="BUY" (it has full
         # prompt context); if it vetoes, direction is "WAIT" and we already
@@ -529,6 +605,9 @@ class ScanMixin:
             "break_even": False,
             "initial_entry_fee": entry_fee,
             "fees_paid": entry_fee,
+            "entry_quality_score": quality.score,
+            "entry_quality_label": quality.label,
+            "entry_quality_reasons": ",".join(quality.reasons),
             "provisional": False,
         }
         if self.state.has(sym):
@@ -653,6 +732,7 @@ class ScanMixin:
             hist = get_historical_winrate_for_setup(
                 self.BOT_NAME, rsi_bucket, chg_bucket, min_sample=8
             )
+            self._remember_spot_setup_history(sym, hist)
             if (hist["winrate"] is not None
                     and hist["winrate"] < 0.30
                     and confidence != "HIGH"):

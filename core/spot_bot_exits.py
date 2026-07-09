@@ -961,6 +961,9 @@ class ExitsMixin:
             fear_greed=d.get("fear_greed"),
             fees_usdt=slice_fees_total,
             exchange_order_id=exch_oid,
+            entry_quality_score=d.get("entry_quality_score"),
+            entry_quality_label=d.get("entry_quality_label"),
+            entry_quality_reasons=d.get("entry_quality_reasons"),
         )
         try:
             accounting_ok = bool(save_trade_db(**partial_trade))
@@ -1231,6 +1234,9 @@ class ExitsMixin:
             btc_trend=d.get("btc_trend"), fear_greed=d.get("fear_greed"),
             fees_usdt=proportional_entry_fee + close_fee,
             exchange_order_id=exch_oid,
+            entry_quality_score=d.get("entry_quality_score"),
+            entry_quality_label=d.get("entry_quality_label"),
+            entry_quality_reasons=d.get("entry_quality_reasons"),
         )
         if partial_live_fill:
             trade_row["is_partial"] = True

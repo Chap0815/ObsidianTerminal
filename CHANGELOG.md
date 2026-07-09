@@ -2,6 +2,17 @@
 
 ## 2026-07-09
 
+- Fixed entry-quality persistence for SPOT/CROSS/FUTREND/FUTURES close paths:
+  `entry_quality_reasons` now has a DB migration, is accepted by `save_trade_db`
+  and is persisted with score/label for later bucket audits.
+- Aligned bot class defaults with launcher/default config for entry-quality
+  gates so pre-start/default snapshots expose the same 50-score threshold.
+- Added production entry-quality filters for SPOT and CROSS: live SPOT entries
+  now score confidence, RSI alignment, pump exhaustion, BTC-relative strength,
+  regime, candle/volume/MACD and setup history before sizing/claim/order;
+  live CROSS entries now score basket rank, lookback momentum, spread, funding
+  and side balance before leverage/claim/order. SIM logs and persists buckets,
+  LIVE blocks LOW-quality setups at the existing min score of 50.
 - Added production entry-quality filters for FUTURES and FUTREND: live entries
   now score direction confidence, RSI alignment, relative strength, spread,
   funding, OI/regime and trend volatility data, block LOW-quality setups before
