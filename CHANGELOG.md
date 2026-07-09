@@ -2,6 +2,10 @@
 
 ## 2026-07-09
 
+- Hardened optimizer apply saves: applying a partial optimizer best-config now
+  persists only the parameter keys emitted by the optimizer, so unsaved manual
+  UI edits in the launcher config memory are not written to `bot_config.json`
+  as a side effect.
 - Hardened launcher visibility and parameter-panel preference saves: if full-config validation
   rejects a UI-only visibility or parameter-panel toggle, the launcher now rolls the affected
   state back and logs the rejection instead of crashing the Tk callback or

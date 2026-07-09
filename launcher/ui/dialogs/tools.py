@@ -41,6 +41,48 @@ from launcher.ui.theme import force_dark_titlebar
 DEFAULT_FUTURES_FUNDING_8H = 0.0001
 
 
+OPTIMIZER_CONFIG_MAPPING = {
+    "min_pump":          "MIN_PUMP",
+    "activation_profit": "ACTIVATION_PROFIT",
+    "trailing_distance": "TRAILING_DISTANCE",
+    "stop_loss":         "INITIAL_STOP_LOSS",
+    "partial_pct":       "PARTIAL_SELL_PCT",
+    "rsi_max":           "RSI_MAX",
+}
+
+
+def optimizer_best_config_updates(cfg: dict) -> tuple[dict, list[str]]:
+    """Return only config keys explicitly emitted by the optimizer."""
+    if not isinstance(cfg, dict):
+        return {}, []
+    updates: dict = {}
+    applied: list[str] = []
+    for opt_key, cfg_key in OPTIMIZER_CONFIG_MAPPING.items():
+        if opt_key not in cfg:
+            continue
+        val = cfg[opt_key]
+        updates[cfg_key] = val
+        applied.append(f"{cfg_key}={val}")
+    return updates, applied
+
+
+def apply_optimizer_best_config_to_app(app, strategy: str, cfg: dict) -> list[str]:
+    """Apply optimizer-emitted keys to UI memory and persist only those keys."""
+    updates, applied = optimizer_best_config_updates(cfg)
+    if not updates:
+        return applied
+    for cfg_key, val in updates.items():
+        app.config[strategy][cfg_key] = val
+        try:
+            row = app.param_rows.get(strategy, {}).get(cfg_key)
+            if row:
+                row.set_value(val)
+        except Exception:
+            pass
+    app.config = save_config_merge({strategy: dict(updates)})
+    return applied
+
+
 def _futures_funding_8h(bot_cfg: dict) -> float:
     """8h funding rate to model for a FUTURES run: live config override else default."""
     try:
@@ -684,40 +726,14 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             status_lbl.configure(text_color=COLORS["danger"])
             return
 
-        mapping = {
-            "min_pump":          "MIN_PUMP",
-            "activation_profit": "ACTIVATION_PROFIT",
-            "trailing_distance": "TRAILING_DISTANCE",
-            "stop_loss":         "INITIAL_STOP_LOSS",
-            "partial_pct":       "PARTIAL_SELL_PCT",
-            "rsi_max":           "RSI_MAX",
-        }
-        applied: list[str] = []
-        for opt_key, cfg_key in mapping.items():
-            if opt_key in cfg:
-                val = cfg[opt_key]
-                app.config[strategy][cfg_key] = val
-                applied.append(f"{cfg_key}={val}")
-                # Also update the visible param row
-                try:
-                    row = app.param_rows.get(strategy, {}).get(cfg_key)
-                    if row:
-                        row.set_value(val)
-                except Exception:
-                    pass
-
         try:
-            app.config = save_config_merge({strategy: {
-                cfg_key: app.config[strategy][cfg_key]
-                for cfg_key in (mapping.values())
-                if cfg_key in app.config.get(strategy, {})
-            }})
+            applied = apply_optimizer_best_config_to_app(app, strategy, cfg)
         except Exception as exc:
             try:
                 app.config = load_config()
                 rows = app.param_rows.get(strategy, {})
                 disk_section = app.config.get(strategy, {})
-                for cfg_key in mapping.values():
+                for cfg_key in OPTIMIZER_CONFIG_MAPPING.values():
                     row = rows.get(cfg_key)
                     if row and cfg_key in disk_section:
                         row.set_value(disk_section[cfg_key])
@@ -728,6 +744,12 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             status_lbl.configure(text_color=COLORS["danger"])
             _append_line("")
             _append_line(f" Configuration rejected for {strategy}: {exc}")
+            return
+        if not applied:
+            status_var.set(f" No optimizer parameters to apply for {strategy}.")
+            status_lbl.configure(text_color=COLORS["danger"])
+            _append_line("")
+            _append_line(f" No optimizer parameters to apply for {strategy}.")
             return
         app._mark_dirty(strategy, True)  # show the restart hint
 
