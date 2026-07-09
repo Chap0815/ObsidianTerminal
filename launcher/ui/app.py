@@ -1359,26 +1359,9 @@ class ObsidianApp(ctk.CTk):
         def _toggle_params(_event=None, n=name, body=params_box,
                             cv=chevron_var, flag=collapsed_flag,
                             the_card=card):
-            new_state = not flag["value"]
-            flag["value"] = new_state
-            if new_state:
-                body.pack_forget()
-                cv.set("> PARAMETERS")
-                the_card.grid_rowconfigure(3, **_PARAMS_ROW_COLLAPSED)
-            else:
-                body.pack(fill="x", padx=10, pady=(2, 12))
-                cv.set("v PARAMETERS")
-                the_card.grid_rowconfigure(3, **_PARAMS_ROW_EXPANDED)
-            # Persist so the user's choice survives launcher restart
-            try:
-                ui_cfg = self.config.setdefault("UI", {})
-                cs = ui_cfg.setdefault("params_collapsed", {})
-                cs[n] = new_state
-                self.config = save_config_merge(
-                    {"UI": {"params_collapsed": dict(cs)}})
-            except Exception:
-                pass
-            self.after_idle(self._refresh_main_scrollregion)
+            self._toggle_params_persisted(
+                n, body, cv, flag, the_card,
+                _PARAMS_ROW_COLLAPSED, _PARAMS_ROW_EXPANDED)
 
         chevron_lbl.bind("<Button-1>", _toggle_params)
         # Also let the user click the "PARAMETERS" label text itself, not
@@ -1632,12 +1615,64 @@ class ObsidianApp(ctk.CTk):
         self._refresh_visibility_layout()
         # Collapse support was removed; old COLLAPSED_BOTS entries are ignored.
 
+    def _apply_params_collapse_state(self, body, cv, card, collapsed: bool,
+                                     collapsed_layout: dict,
+                                     expanded_layout: dict) -> None:
+        if collapsed:
+            body.pack_forget()
+            cv.set("> PARAMETERS")
+            card.grid_rowconfigure(3, **collapsed_layout)
+        else:
+            body.pack(fill="x", padx=10, pady=(2, 12))
+            cv.set("v PARAMETERS")
+            card.grid_rowconfigure(3, **expanded_layout)
+
+    def _persist_param_collapse(self, bot: str, collapsed: bool) -> None:
+        ui_cfg = dict(self.config.get("UI", {}))
+        collapsed_map = dict(ui_cfg.get("params_collapsed", {}))
+        collapsed_map[bot] = collapsed
+        self.config = save_config_merge(
+            {"UI": {"params_collapsed": dict(collapsed_map)}})
+
+    def _toggle_params_persisted(self, bot: str, body, cv, flag: dict, card,
+                                 collapsed_layout: dict,
+                                 expanded_layout: dict) -> None:
+        previous = flag["value"]
+        new_state = not previous
+        flag["value"] = new_state
+        self._apply_params_collapse_state(
+            body, cv, card, new_state, collapsed_layout, expanded_layout)
+        try:
+            self._persist_param_collapse(bot, new_state)
+        except Exception as exc:
+            flag["value"] = previous
+            self._apply_params_collapse_state(
+                body, cv, card, previous, collapsed_layout, expanded_layout)
+            try:
+                self._log_to_card(
+                    card, "error", f"UI preference save failed: {exc}")
+            except Exception:
+                pass
+        self.after_idle(self._refresh_main_scrollregion)
+
     def _toggle_visibility(self, bot: str):
         """Toggle visible/hidden."""
+        previous = self._visible.get(bot, True)
         self._visible[bot] = not self._visible.get(bot, True)
         self._update_pill_appearance(bot)
         self._refresh_visibility_layout()
-        self._persist_ui_prefs()
+        try:
+            self._persist_ui_prefs()
+        except Exception as exc:
+            self._visible[bot] = previous
+            self._update_pill_appearance(bot)
+            self._refresh_visibility_layout()
+            try:
+                self._log_to_card(
+                    self.cards[bot], "error",
+                    f"UI preference save failed: {exc}")
+            except Exception:
+                pass
 
     def _update_pill_appearance(self, bot: str):
         pill = self.visibility_pills[bot]
@@ -1702,7 +1737,6 @@ class ObsidianApp(ctk.CTk):
             "VISIBLE_BOTS":   [b for b in BOT_ORDER if self._visible[b]],
             "COLLAPSED_BOTS": [b for b in BOT_ORDER if self._collapsed[b]],
         })
-        self.config["UI"] = ui_cfg
         self.config = save_config_merge({"UI": ui_cfg})
 
     #  STATUSBAR 

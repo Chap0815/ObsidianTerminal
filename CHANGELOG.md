@@ -2,6 +2,10 @@
 
 ## 2026-07-09
 
+- Hardened launcher visibility and parameter-panel preference saves: if full-config validation
+  rejects a UI-only visibility or parameter-panel toggle, the launcher now rolls the affected
+  state back and logs the rejection instead of crashing the Tk callback or
+  leaving memory out of sync with `bot_config.json`.
 - Hardened launcher parameter saves: UI/optimizer config writes now run the
   same pre-start config validation before replacing `bot_config.json`, so an
   invalid combination such as `TRAILING_DISTANCE >= ACTIVATION_PROFIT` is
