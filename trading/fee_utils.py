@@ -89,7 +89,11 @@ def extract_fee_usdt(order: dict, base_override: str = "") -> float:
 
     fees_list = order.get("fees") or []
     if isinstance(fees_list, list):
-        valid_entries = [f for f in fees_list if isinstance(f, dict)]
+        valid_entries = [
+            f for f in fees_list
+            if isinstance(f, dict)
+            and _finite_float_or_none(f.get("cost")) is not None
+        ]
         if valid_entries:
             return sum(
                 fee_to_usdt(f, order, base_override) for f in valid_entries
