@@ -59,7 +59,7 @@ def fee_to_usdt(fee_dict: dict, order_dict: dict,
         return 0.0
     currency = (raw_currency or "").upper()
 
-    if not currency or currency in STABLECOIN_EQUIVALENTS:
+    if currency in STABLECOIN_EQUIVALENTS:
         return cost
 
     base = base_override.upper() if base_override else ""

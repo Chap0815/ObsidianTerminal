@@ -1,6 +1,6 @@
 {
-  "build_id": "aaacf4b66bb9bad1",
-  "created_at": "2026-07-09 11:42:39",
+  "build_id": "30f7acb1c68877ea",
+  "created_at": "2026-07-09 11:47:58",
   "source": "update_deploy_manifest.py",
   "file_count": 145,
   "files": [
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "ddf5dd52256be6d34308160416c74a5a64af8577acfcab7959fbeedabe700bd1",
-      "bytes": 44208
+      "sha256": "3d163cf992d014f4a8b6fd1b1b7e1b31cbe3e2e753a234866ca682dab614e81e",
+      "bytes": 44427
     },
     {
       "path": "config/__init__.py",
@@ -671,8 +671,8 @@
     },
     {
       "path": "trading/fee_utils.py",
-      "sha256": "794da8fadde6bb7e1203519e24d4285264d862af31d1e71f4d5037d39f1e407f",
-      "bytes": 8500
+      "sha256": "418487afcccfa44f6dff1178072781ca5ad5d740c0ea28e669455d162511015c",
+      "bytes": 8484
     },
     {
       "path": "trading/market_filters.py",
