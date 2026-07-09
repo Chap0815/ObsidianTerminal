@@ -883,6 +883,23 @@ def save_config(cfg: dict) -> None:
             _save_config_unlocked(cfg)
 
 
+def validate_config_for_save(cfg: dict) -> None:
+    """Reject configs that would make bot pre-start validation fail.
+
+    This guards UI/optimizer writes before they hit bot_config.json, so a bad
+    parameter combination cannot strand the next launcher/bot start.
+    """
+    try:
+        from core.pre_start_check import _check_config, format_issues, has_errors
+        issues = _check_config(None, cfg, BOT_META)
+        if has_errors(issues):
+            lines = format_issues(i for i in issues if i.severity == "error")
+            raise ValueError("; ".join(lines))
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"config validation failed: {exc}") from exc
+
 def _save_config_unlocked(cfg: dict) -> None:
     previous_cfg = _read_config_for_audit()
     try:
@@ -951,6 +968,7 @@ def save_config_merge(section_updates: dict | None = None,
                     cfg[section] = cur
                 else:
                     cfg[section] = values
+            validate_config_for_save(cfg)
             _save_config_unlocked(cfg)
             return cfg
 

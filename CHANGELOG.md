@@ -2,6 +2,10 @@
 
 ## 2026-07-09
 
+- Hardened launcher parameter saves: UI/optimizer config writes now run the
+  same pre-start config validation before replacing `bot_config.json`, so an
+  invalid combination such as `TRAILING_DISTANCE >= ACTIVATION_PROFIT` is
+  rejected without breaking the next bot start.
 - Hardened Spot/Futures pending-partial accounting recovery: legacy or
   corrupted state shapes now normalize `accounting_pending_partials` and
   `unpriced_external_partials` before retry/append/rebuild, so a single

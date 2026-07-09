@@ -26,6 +26,7 @@ from launcher.config.settings import (
     FONT_BODY,
     PROJECT_ROOT,
     _get_python_exe,
+    load_config,
     save_config_merge,
     subprocess_no_window_kwargs,
 )
@@ -705,11 +706,29 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
                 except Exception:
                     pass
 
-        app.config = save_config_merge({strategy: {
-            cfg_key: app.config[strategy][cfg_key]
-            for cfg_key in (mapping.values())
-            if cfg_key in app.config.get(strategy, {})
-        }})
+        try:
+            app.config = save_config_merge({strategy: {
+                cfg_key: app.config[strategy][cfg_key]
+                for cfg_key in (mapping.values())
+                if cfg_key in app.config.get(strategy, {})
+            }})
+        except Exception as exc:
+            try:
+                app.config = load_config()
+                rows = app.param_rows.get(strategy, {})
+                disk_section = app.config.get(strategy, {})
+                for cfg_key in mapping.values():
+                    row = rows.get(cfg_key)
+                    if row and cfg_key in disk_section:
+                        row.set_value(disk_section[cfg_key])
+                app._mark_dirty(strategy, False)
+            except Exception:
+                pass
+            status_var.set(f" Config rejected for {strategy}: {exc}")
+            status_lbl.configure(text_color=COLORS["danger"])
+            _append_line("")
+            _append_line(f" Configuration rejected for {strategy}: {exc}")
+            return
         app._mark_dirty(strategy, True)  # show the restart hint
 
         status_var.set(f" Applied {len(applied)} parameter(s) to {strategy}. "

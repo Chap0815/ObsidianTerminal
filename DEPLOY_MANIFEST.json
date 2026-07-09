@@ -1,6 +1,6 @@
 {
-  "build_id": "126965455ffa9171",
-  "created_at": "2026-07-09 06:55:51",
+  "build_id": "8b81d01082bcba94",
+  "created_at": "2026-07-09 08:34:48",
   "source": "update_deploy_manifest.py",
   "file_count": 145,
   "files": [
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "438bb565110fec9d91deb27275e9b6509781bb860d00d13d1b3090fd060035c1",
-      "bytes": 42060
+      "sha256": "b07f1eb718440bfecbf9173afce09fdafd9d68997d77269c918d81d9e82fa7f1",
+      "bytes": 42337
     },
     {
       "path": "config/__init__.py",
@@ -366,8 +366,8 @@
     },
     {
       "path": "launcher/config/settings.py",
-      "sha256": "5c8b3d345a779e0bee58ae726a742d7c6add6ddbadb2b4490d52fef64d210bda",
-      "bytes": 44263
+      "sha256": "ea92bf7808ecbd6e51650367bb3b20614646b0778a8dfd1d7405b357afbbd899",
+      "bytes": 45016
     },
     {
       "path": "launcher/core/__init__.py",
@@ -461,8 +461,8 @@
     },
     {
       "path": "launcher/ui/dialogs/tools.py",
-      "sha256": "5e6a499460bc6d9607f23103837bc7ff642fe1c2a5d0b3312d031eae22111ad3",
-      "bytes": 41578
+      "sha256": "43825f49966ba7cfa40d619efe82ef5def3a7915612e7255cf1ece292e7f104d",
+      "bytes": 42404
     },
     {
       "path": "launcher/ui/logging_panel.py",
