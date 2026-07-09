@@ -1,6 +1,6 @@
 {
-  "build_id": "c69b872159508c3f",
-  "created_at": "2026-07-09 12:37:55",
+  "build_id": "f5eebc384a486026",
+  "created_at": "2026-07-09 12:44:51",
   "source": "update_deploy_manifest.py",
   "file_count": 145,
   "files": [
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "30027aeb898e565430fe05b46aa5a49c9505ad7988786da6a4a983d6b04ff78d",
-      "bytes": 45586
+      "sha256": "e813ee6a01bf7e86f08106d35d228e884b5f03aa1d6f9f2d7ecba85b4cc5bf58",
+      "bytes": 45724
     },
     {
       "path": "config/__init__.py",
