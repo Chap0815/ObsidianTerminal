@@ -53,6 +53,8 @@ def _spot_balance_payload_unclear(info: dict) -> bool:
         raw = info.get(key)
         if raw is None:
             continue
+        if isinstance(raw, bool):
+            return True
         try:
             parsed = float(raw)
         except (TypeError, ValueError, OverflowError):

@@ -2,6 +2,8 @@
 
 ## 2026-07-09
 
+- Hardened Spot reconcile balance handling: boolean `free`/`used`/`total`
+  balance payloads are now treated as unclear instead of confirmed zero.
 - Hardened legacy Spot fee base inference: non-string `base_override` and
   order `symbol` payloads no longer crash fee conversion.
 - Hardened legacy Spot base-fee parsing: non-string base-currency arguments
