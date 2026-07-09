@@ -2,6 +2,10 @@
 
 ## 2026-07-09
 
+- Hardened live Spot/Trend-Spot buy cost accounting: filled buy entries now
+  persist a finite positive exchange-reported `order.cost` as `invested_usdt`
+  when available, falling back to `filled * fill_price` only when cost is
+  missing or invalid.
 - Hardened live Spot partial take-profit accounting: partial fills now book
   PnL, invested capital and remaining amount from the exchange-reported filled
   base amount instead of the requested sell size.

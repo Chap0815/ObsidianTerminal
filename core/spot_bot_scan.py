@@ -49,6 +49,13 @@ class ScanMixin:
             return float(default)
         return parsed if math.isfinite(parsed) and parsed > 0 else float(default)
 
+    @staticmethod
+    def _quote_cost_or_fallback(order, fallback: float) -> float:
+        fallback_value = ScanMixin._positive_float(fallback)
+        if not isinstance(order, dict):
+            return fallback_value
+        return ScanMixin._positive_float(order.get("cost"), fallback_value)
+
     def _release_entry_claim_if_untracked(self, sym: str) -> bool:
         try:
             if self.state.has(sym):
@@ -482,7 +489,7 @@ class ScanMixin:
                 self._release_entry_claim_if_untracked(sym)
             return None  # buy failed  already logged
 
-        amount, fill_price, gross_amount, entry_fee = entry
+        amount, fill_price, gross_amount, invested_usdt, entry_fee = entry
 
         # Persist the final position. _place_buy_order already wrote a
         # PROVISIONAL row (zombie protection) before the slow fee refetches, so
@@ -495,7 +502,7 @@ class ScanMixin:
         position_fields = {
             "buy": fill_price,
             "highest": fill_price,
-            "invested_usdt": gross_amount * fill_price,
+            "invested_usdt": invested_usdt,
             "amount": amount,
             "original_amount": amount,
             "rsi_15m": r["rsi_15m"],
@@ -1037,11 +1044,13 @@ class ScanMixin:
                 provisional_amount = amount_coins
             try:
                 from core.logger import _date as _utc_now_str_inner
+                provisional_invested_usdt = ScanMixin._quote_cost_or_fallback(
+                    order, provisional_amount * provisional_fill_price)
                 provisional_ok = self.state.add(sym, {
                     "buy": provisional_fill_price,
                     "highest": provisional_fill_price,
                     "buy_time": _utc_now_str_inner(),
-                    "invested_usdt": provisional_amount * provisional_fill_price,
+                    "invested_usdt": provisional_invested_usdt,
                     "amount": provisional_amount,
                     "original_amount": provisional_amount,
                     "partial_sold": False,
@@ -1108,6 +1117,9 @@ class ScanMixin:
                 )
                 fill_price = price
 
+            invested_usdt = ScanMixin._quote_cost_or_fallback(
+                order, amount * fill_price)
+
             # Zombie protection  write a PROVISIONAL state row immediately
             # after the order returns, BEFORE the slow fee refetches (~1.8s). If
             # the bot is SIGKILLed in that window, the position would otherwise
@@ -1121,7 +1133,7 @@ class ScanMixin:
                         "buy": fill_price,
                         "highest": fill_price,
                         "buy_time": _utc_now_str_inner(),
-                        "invested_usdt": amount * fill_price,
+                        "invested_usdt": invested_usdt,
                         "amount": amount,
                         "original_amount": amount,
                         "partial_sold": False,
@@ -1224,7 +1236,7 @@ class ScanMixin:
             if base_fee > 0:
                 amount = max(0.0, amount - base_fee)
 
-            return amount, fill_price, gross_amount, entry_fee
+            return amount, fill_price, gross_amount, invested_usdt, entry_fee
 
         except Exception as e:
             log_event(f"Buy order {sym} failed: {e}", "WARN")

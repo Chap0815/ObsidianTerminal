@@ -330,9 +330,10 @@ class TrendBot(SpotBot):
                 if _trend_claimed:
                     self._release_entry_claim_if_untracked(sym)
                 continue
-            amount, fill_price, gross_amount, entry_fee = entry
+            amount, fill_price, gross_amount, invested_usdt, entry_fee = entry
             state_ok = self._add_trend_state(
-                sym, fill_price, amount, gross_amount, entry_fee, votes)
+                sym, fill_price, amount, gross_amount, invested_usdt,
+                entry_fee, votes)
             if state_ok is False and not self.simulation:
                 log_event(
                     f"Trend BUY {sym}: state write failed after LIVE fill - "
@@ -381,7 +382,7 @@ class TrendBot(SpotBot):
                   f"holding {self.state.count()}/{max_trades}", "SCAN")
 
     def _add_trend_state(self, sym, fill_price, amount, gross_amount,
-                         entry_fee, votes):
+                         invested_usdt, entry_fee, votes):
         # _place_buy_order already wrote a PROVISIONAL row (zombie protection);
         # patch it in place with the corrected NET amount + fees instead of a
         # second full add. Fall back to add() if the provisional didn't land.
@@ -389,7 +390,7 @@ class TrendBot(SpotBot):
         fields = {
             "buy": fill_price,
             "highest": fill_price,
-            "invested_usdt": gross_amount * fill_price,
+            "invested_usdt": invested_usdt,
             "amount": amount,
             "original_amount": amount,
             "partial_sold": False,
