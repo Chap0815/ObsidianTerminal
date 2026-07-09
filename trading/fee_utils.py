@@ -198,10 +198,12 @@ def extract_or_estimate_with_refetch(ex, order: dict, symbol_full: str,
 def base_currency_fee_amount(order: dict, base_currency: str) -> float:
     """Return total fee amount paid in the BASE currency (z.B. PEPE).
     Was Bots subtrahieren um real coin balance nach Trade zu berechnen."""
-    if not isinstance(order, dict) or not base_currency:
+    if not isinstance(order, dict) or not isinstance(base_currency, str):
         return 0.0
 
     base_upper = base_currency.upper()
+    if not base_upper:
+        return 0.0
     total = 0.0
 
     sources = []
