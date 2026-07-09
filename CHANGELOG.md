@@ -2,6 +2,9 @@
 
 ## 2026-07-09
 
+- Hardened shared order-fill detection: terminal `closed`/`filled` status
+  without an order id, positive fill, or positive cost is now treated as a
+  malformed external payload instead of a filled order.
 - Hardened live Spot/Trend-Spot buy cost validation: exchange-reported
   `order.cost` is still preferred for `invested_usdt`, but absurd finite cost
   payloads far outside the filled notional / intended trade size now fall back

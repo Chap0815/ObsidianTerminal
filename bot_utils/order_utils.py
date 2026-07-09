@@ -90,7 +90,10 @@ def order_was_filled(order: dict, requested_amount: float = 0.0,
                 has_positive_fill_or_cost = True
         if has_fill_or_cost and not has_positive_fill_or_cost:
             return False
-        return True
+        if has_positive_fill_or_cost:
+            return True
+        return bool(_order_id_text(order.get("id")) or
+                    _order_id_text(order.get("orderId")))
     if status in ("canceled", "cancelled", "rejected", "expired", "new",
                   "open", "pending"):
         # Explicit non-filled state. Allow only if a real partial fill exists.
