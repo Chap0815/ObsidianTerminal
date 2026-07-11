@@ -907,7 +907,7 @@ class ExitsMixin:
                 # in the wallet. Don't mutate state; return False so the position
                 # is re-evaluated next tick.
                 from bot_utils.order_utils import order_was_filled
-                if not order_was_filled(order, sold_amount):
+                if not order_was_filled(order, sold_amount, min_fill_ratio=1e-9):
                     _st = order.get("status") if isinstance(order, dict) else "?"
                     log_event(
                         f" {sym}: partial-TP order did NOT fill "

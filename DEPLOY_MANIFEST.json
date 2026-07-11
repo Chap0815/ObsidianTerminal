@@ -1,6 +1,6 @@
 {
-  "build_id": "375710de3089ccff",
-  "created_at": "2026-07-09 17:45:50",
+  "build_id": "c0f1d280520d2571",
+  "created_at": "2026-07-11 15:54:01",
   "source": "update_deploy_manifest.py",
   "file_count": 146,
   "files": [
@@ -226,8 +226,8 @@
     },
     {
       "path": "core/constants.py",
-      "sha256": "61cc3af907eee985a3b19b753e5adea8d1d987de004b4a838d964336b4e3460c",
-      "bytes": 7517
+      "sha256": "6b15905571cd8247384afcee47303dc4840f9b68d38ec017de00732ce86eb36b",
+      "bytes": 7516
     },
     {
       "path": "core/cross_bot.py",
@@ -301,8 +301,8 @@
     },
     {
       "path": "core/spot_bot_exits.py",
-      "sha256": "0dae4eb783b60edfe7a1cbec16cfd88bac4d3a4d81b32269aa424a035e8d63cf",
-      "bytes": 59930
+      "sha256": "4ffaf0c48f3179eaf102a0f6a07093205dcc82927b9b739b8d0f22c40f23e310",
+      "bytes": 59951
     },
     {
       "path": "core/spot_bot_reconcile.py",
@@ -311,8 +311,8 @@
     },
     {
       "path": "core/spot_bot_scan.py",
-      "sha256": "6307b60eb784244380c7660ede8027da4a177082195e60665d16ac2ed3ac07a4",
-      "bytes": 59839
+      "sha256": "aecb046e1ead7fc536d69e9d138b2bd912fcc7380079034a111db0fb88e44a72",
+      "bytes": 59905
     },
     {
       "path": "core/state_manager.py",
@@ -456,8 +456,8 @@
     },
     {
       "path": "launcher/ui/dialogs/shutdown.py",
-      "sha256": "339cd486330b8daf8a356af101c01f9cdf5668272ac5845bedf244f8c77bb5f6",
-      "bytes": 43548
+      "sha256": "d4bf1af3bb0722d031f7b26f33963dc11a93eccb934969152c8e9bce6463d251",
+      "bytes": 46040
     },
     {
       "path": "launcher/ui/dialogs/tools.py",
@@ -691,8 +691,8 @@
     },
     {
       "path": "trading/screener.py",
-      "sha256": "35b12cf89ed819ac72150d73011ddfddeefc4d962b39da25ae22466a8e6eb5b4",
-      "bytes": 40083
+      "sha256": "ab4da5725849d894ec0df3acf760d582a50451cf0d59ebdab39df75f8587328a",
+      "bytes": 40347
     },
     {
       "path": "trading/simulation.py",

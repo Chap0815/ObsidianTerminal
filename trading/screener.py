@@ -59,7 +59,7 @@ MAX_24H_PUMP            = MAX_24H_PUMP_PCT
 MAX_PARALLEL_WORKERS    = SCREENER_MAX_PARALLEL_WORKERS
 
 
-#  Bounded failure cache 
+#  Bounded failure cache
 class _BoundedFailureCache:
     def __init__(self, maxsize: int = 1024):
         self._d = OrderedDict()
@@ -366,8 +366,10 @@ def _compute_indicators(bars) -> dict:
         candle_range = h - l
         body         = abs(c - o)
         body_ratio   = (body / candle_range) if candle_range > 0 else 1.0
+        candle_dir   = -1.0 if c < o else (1.0 if c > o else 0.0)
     except Exception:
         body_ratio = 1.0
+        candle_dir = 0.0
 
     return {
         "rsi":        rsi,
@@ -376,6 +378,7 @@ def _compute_indicators(bars) -> dict:
         "ema_ratio":  ema_ratio,
         "vol_surge":  vol_surge,
         "body_ratio": body_ratio,
+        "candle_dir": candle_dir,
     }
 
 
@@ -666,7 +669,7 @@ def _apply_quality_filters(
     bots can scan for 8+ hours with 0 trades.
     """
     rsi_15, rsi_1h, rsi_4h = [], [], []
-    macd_1h, atr_1h, ema_1h, vsurge_1h, body_1h = [], [], [], [], []
+    macd_1h, atr_1h, ema_1h, vsurge_1h, body_1h, cdir_1h = [], [], [], [], [], []
     for sym in candidates["symbol"]:
         rsi_15.append   (results.get((sym, "15m"), {}).get("rsi",        50.0))
         rsi_1h.append   (results.get((sym, "1h"),  {}).get("rsi",        50.0))
@@ -677,6 +680,7 @@ def _apply_quality_filters(
         ema_1h.append   (r1h.get("ema_ratio",  0.0))
         vsurge_1h.append(r1h.get("vol_surge",  1.0))
         body_1h.append  (r1h.get("body_ratio", 1.0))
+        cdir_1h.append  (r1h.get("candle_dir", 0.0))
 
     candidates = candidates.copy()
     candidates["rsi_15m"]    = rsi_15
@@ -687,6 +691,7 @@ def _apply_quality_filters(
     candidates["ema_ratio"]  = ema_1h
     candidates["vol_surge"]  = vsurge_1h
     candidates["body_ratio"] = body_1h
+    candidates["candle_dir"] = cdir_1h
 
     top = candidates.copy()
     before = len(top)
@@ -727,8 +732,8 @@ def _apply_quality_filters(
         # EMA  1% : price at or below 1h EMA = bearish structural context.
         top = top[top["ema_ratio"] <= 1.0].copy()
         after_ema  = len(top)
-        # body_ratio  0.30 : real red candle, not just a wick
-        top = top[top["body_ratio"] >= 0.30].copy()
+        # body_ratio  0.30 + red close: real red candle, not just a wick
+        top = top[(top["body_ratio"] >= 0.30) & (top["candle_dir"] < 0)].copy()
         after_body = len(top)
         # RSI guard: don't short already-oversold coins (extreme
         # capitulation-bounce candidates, poor SHORT entries). OR-logic:
@@ -883,7 +888,7 @@ def get_top_momentum_coins(
 
     markets = getattr(exchange, "markets", None) or {}
 
-    #  Collect raw ticker data, direction-filtered 
+    #  Collect raw ticker data, direction-filtered
     long_data:  list = []
     short_data: list = []
     seen_total = seen_usdt = 0
@@ -945,7 +950,7 @@ def get_top_momentum_coins(
             if -MAX_24H_PUMP <= chg <= -min_pump:
                 short_data.append(entry)
 
-    #  Build candidate DataFrames 
+    #  Build candidate DataFrames
     pre_limit = min(
         max(limit * SCREENER_PRE_LIMIT_MULT, SCREENER_PRE_LIMIT_MIN),
         SCREENER_PRE_LIMIT_MAX,
@@ -970,7 +975,7 @@ def get_top_momentum_coins(
             "WAIT")
         return pd.DataFrame()
 
-    #  Fetch indicators for ALL unique symbols in ONE parallel pass 
+    #  Fetch indicators for ALL unique symbols in ONE parallel pass
     all_syms = set()
     if not long_candidates.empty:
         all_syms.update(long_candidates["symbol"])
@@ -1058,7 +1063,7 @@ def get_top_momentum_coins(
     with _fail_cache_lock:
         _save_fail_cache_locked(force=True)
 
-    #  Apply quality filters per direction 
+    #  Apply quality filters per direction
     result_frames = []
 
     if not long_candidates.empty:

@@ -712,19 +712,98 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
     ).pack(side="right", padx=(0, 8))
 
 
+def _quick_close_bool_or_none(value) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"true", "1", "yes", "on", "y", "t"}:
+            return True
+        if s in {"false", "0", "no", "off", "n", "f"}:
+            return False
+    return None
+
+
+def _quick_close_is_live(app, name: str) -> bool:
+    """Fail closed to LIVE when the launcher cannot prove SIM mode."""
+    try:
+        runtime_sim = app._runtime_sim_for_running_bot(name)
+        parsed = _quick_close_bool_or_none(runtime_sim)
+        if parsed is not None:
+            return not parsed
+    except Exception:
+        pass
+    try:
+        bot = app.bots.get(name)
+        start_cfg = getattr(bot, "start_config", None) if bot is not None else None
+        if isinstance(start_cfg, dict) and "SIMULATION" in start_cfg:
+            parsed = _quick_close_bool_or_none(start_cfg.get("SIMULATION"))
+            return True if parsed is None else not parsed
+    except Exception:
+        pass
+    try:
+        parsed = _quick_close_bool_or_none(app.config[name].get("SIMULATION"))
+        return True if parsed is None else not parsed
+    except Exception:
+        return True
+
+
+def _confirm_quick_close_if_live(app, name: str) -> bool:
+    if not _quick_close_is_live(app, name):
+        return True
+    try:
+        from tkinter import messagebox
+        return bool(messagebox.askyesno(
+            "Confirm LIVE close",
+            f"{name} is in LIVE mode. Close all open positions and stop the bot?",
+            parent=app,
+        ))
+    except Exception:
+        return False
+
+
 def emergency_close_futures_and_stop(app, name: str) -> None:
-    """Close all futures positions via graceful bot shutdown, in a
-    background thread so the UI stays responsive."""
+    """Close futures positions via graceful bot shutdown after LIVE confirm."""
     from launcher.core.bot_controller import async_close_and_stop_futures
 
     card = app.cards[name]
-    show_busy_dialog(
-        app,
-        f"Stopping {name}",
-        "Closing positions and shutting down",
-        lambda update: async_close_and_stop_futures(
-            app, name, card, update, reason="Manual Close & Stop"),
-    )
+    in_flight = getattr(app, "_quick_close_in_progress", set())
+    if not isinstance(in_flight, set):
+        try:
+            in_flight = set(in_flight or ())
+        except TypeError:
+            in_flight = set()
+    if name in in_flight:
+        log_to_card(card, "warn", f"{name}: close already in progress")
+        return
+    if not _confirm_quick_close_if_live(app, name):
+        log_to_card(card, "system", f"{name}: close cancelled")
+        return
+    in_flight.add(name)
+    app._quick_close_in_progress = in_flight
+
+    def _worker(update):
+        try:
+            async_close_and_stop_futures(
+                app, name, card, update, reason="Manual Close & Stop")
+        finally:
+            try:
+                in_flight.discard(name)
+            except Exception:
+                pass
+
+    try:
+        show_busy_dialog(
+            app,
+            f"Stopping {name}",
+            "Closing positions and shutting down",
+            _worker,
+        )
+    except Exception:
+        in_flight.discard(name)
+        raise
 
 
 #  Emergency-close (no confirmation) 

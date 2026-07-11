@@ -195,7 +195,7 @@ class ScanMixin:
             return "MEDIUM"
         return "LOW"
 
-    #  Scan-thread body 
+    #  Scan-thread body
 
     def _scan_loop(self):
         from core.logger import log_event, send_telegram
@@ -243,7 +243,7 @@ class ScanMixin:
             if self._shutdown_event.wait(timeout=scan_interval):
                 return
 
-    #  One scan tick 
+    #  One scan tick
 
     def _scan_tick(self) -> None:
         from core.logger import log_event
@@ -436,7 +436,7 @@ class ScanMixin:
                 log_event(f"Open-trade {sym} failed: {e}", "WARN")
                 self._log_error(f"_try_open_trade {sym}", e)
 
-    #  Cooldown helpers 
+    #  Cooldown helpers
 
     def _is_in_cooldown(self, sym: str) -> bool:
         """Read-only cooldown check (doesn't write to disk)."""
@@ -446,7 +446,7 @@ class ScanMixin:
         except ImportError:
             return False
 
-    #  Try opening one trade (per candidate) 
+    #  Try opening one trade (per candidate)
 
     def _try_open_trade(self, r, regime: dict, balance: float) -> float | None:
         """Run LLM analysis + quality filters + place order if everything
@@ -677,7 +677,7 @@ class ScanMixin:
             log_event(f"Telegram failed: {e}", "WARN")
         return float(trade_usdt)
 
-    #  Quality filters 
+    #  Quality filters
 
     def _quality_filters(self, sym: str, r, ans: str, regime: dict,
                          confidence_override: str = None):
@@ -781,7 +781,7 @@ class ScanMixin:
 
         return True, size_mult, ""
 
-    #  Order placement 
+    #  Order placement
 
     def _find_order_by_cid(self, symbol_pair: str, cid: str):
         """Locate an order by OUR clientOrderId (open orders first, then recent
@@ -911,7 +911,7 @@ class ScanMixin:
 
     def _place_buy_order(self, sym: str, r, trade_usdt: float):
         """Place a market buy. Returns (amount, fill_price, gross_amount,
-        entry_fee) on success, None on failure.
+        invested_usdt, entry_fee) on success, None on failure.
 
         Validates r["price"] > 0 before division (illiquid coins sometimes
         return price=0) and fill_price > 0 from the exchange (a malformed order
@@ -946,12 +946,13 @@ class ScanMixin:
                 _SLP = 0.001
             sim_fill_price = price * (1.0 + _SLP)  # buy side  adverse = higher
             amount = trade_usdt / sim_fill_price
+            invested_usdt = amount * sim_fill_price
             try:
                 from core.constants import DEFAULT_TAKER_FEE as _TKR
             except Exception:
                 _TKR = 0.001
-            entry_fee = amount * sim_fill_price * _TKR
-            return amount, sim_fill_price, amount, entry_fee
+            entry_fee = invested_usdt * _TKR
+            return amount, sim_fill_price, amount, invested_usdt, entry_fee
 
         # Pre-trade spread gate: refuse a market buy into a blown-out/vacuum
         # book; repeated abnormal spreads also trip SAFE_MODE.
