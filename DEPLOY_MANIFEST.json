@@ -1,6 +1,6 @@
 {
-  "build_id": "c0f1d280520d2571",
-  "created_at": "2026-07-11 15:54:01",
+  "build_id": "b99de564b02fbe99",
+  "created_at": "2026-07-11 16:58:48",
   "source": "update_deploy_manifest.py",
   "file_count": 146,
   "files": [
@@ -161,7 +161,7 @@
     },
     {
       "path": "bots/main_bot_aggressive.py",
-      "sha256": "5bd645ab945d2fce69ec8922a54660aeb56a0529b40be2b2c9f5da0ac3c9a4eb",
+      "sha256": "d784151e5f3b437041ddebaa4afab9d5903147522807e4bcee1e3934ac619359",
       "bytes": 2662
     },
     {
@@ -171,17 +171,17 @@
     },
     {
       "path": "bots/main_bot_cross.py",
-      "sha256": "3a90d1420b84ef6e6e4c740971df8ca75a2c6a7f8dd6d4adde11a001bb572ea1",
+      "sha256": "5ae06316222751aa4fb968bc5d77c866a82cde4ae8a0c6ad20cdd7ee6bb46b21",
       "bytes": 3495
     },
     {
       "path": "bots/main_bot_futures.py",
-      "sha256": "c5d780659186f7aa67178cc89d696d7f44e947fd48ed495d0692e49372adf116",
+      "sha256": "6ff466448e63025f68b54ba51a3beba6ce76dea95fbc750f5079ac3553a4660f",
       "bytes": 3075
     },
     {
       "path": "bots/main_bot_trendfut.py",
-      "sha256": "9d8588536b052db2f3278559c954f867398f1c70f61a3a97ab5bbb57d6aa338b",
+      "sha256": "1656def05f46b67ddb4737d269c21d364af61b51478977263460342fa71ff104",
       "bytes": 4598
     },
     {

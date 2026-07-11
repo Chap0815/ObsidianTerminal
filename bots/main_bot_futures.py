@@ -72,7 +72,7 @@ class FuturesExchangeBot(FuturesBot):
         "OWN_MOMENTUM_MIN_LOSS_PCT": 20.0,
         "SIMULATION":        True,
         "ENTRY_QUALITY_FILTER_ENABLED": True,
-        "ENTRY_QUALITY_MIN_SCORE": 50.0,
+        "ENTRY_QUALITY_MIN_SCORE": 75.0,
     }
 
     @staticmethod
