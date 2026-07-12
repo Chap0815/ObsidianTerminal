@@ -38,6 +38,76 @@ from bot_utils import (
 
 
 class FuturesExitsMixin:
+    def _record_futures_exit_shadow(
+        self, sym: str, d: dict, *, move_pct: float,
+        mfe_pct: float, mae_pct: float, now=None,
+    ) -> None:
+        """Persist first-hit counterfactual telemetry without changing exits."""
+        try:
+            from core.logger import log_struct
+            from trading.futures_exit_shadow import evaluate_exit_shadow_rules
+
+            triggers = evaluate_exit_shadow_rules(
+                buy_time=d.get("buy_time"),
+                move_pct=move_pct,
+                mfe_pct=mfe_pct,
+                mae_pct=mae_pct,
+                now=now,
+            )
+            raw_seen = d.get("exit_shadow_triggered_rules", [])
+            if isinstance(raw_seen, (list, tuple, set)):
+                seen = {str(item) for item in raw_seen if str(item)}
+            elif isinstance(raw_seen, str):
+                seen = {item for item in raw_seen.split(",") if item}
+            else:
+                seen = set()
+            new_triggers = [
+                item for item in triggers if str(item.get("rule")) not in seen
+            ]
+            if not new_triggers:
+                return
+
+            margin = self._safe_positive_float(d.get("invested_usdt"), 0.0)
+            leverage = self._safe_positive_float(d.get("leverage"), 1.0)
+            for trigger in new_triggers:
+                trigger_move = self._safe_finite_float(
+                    trigger.get("trigger_move_pct"), move_pct)
+                log_struct(
+                    "futures_exit_shadow",
+                    bot=self.BOT_NAME,
+                    symbol=sym,
+                    mode="SIM" if self.simulation else "LIVE",
+                    entry_id=d.get("entry_id", ""),
+                    direction=d.get("position_type", ""),
+                    entry_quality_score=d.get("entry_quality_score"),
+                    entry_quality_label=d.get("entry_quality_label"),
+                    gross_pnl_usdt=(
+                        margin * leverage * trigger_move / 100.0),
+                    actual_initial_stop_pct=self.C(
+                        "INITIAL_STOP_LOSS", -100.0),
+                    actual_breakeven_trigger_pct=self.C(
+                        "BREAKEVEN_TRIGGER", 0.0),
+                    actual_activation_profit_pct=self.C(
+                        "ACTIVATION_PROFIT", 0.0),
+                    actual_trailing_distance_pct=self.C(
+                        "TRAILING_DISTANCE", 0.0),
+                    **trigger,
+                )
+                seen.add(str(trigger["rule"]))
+            persisted = sorted(seen)
+            self.state.update_many(
+                sym, {"exit_shadow_triggered_rules": persisted})
+            d["exit_shadow_triggered_rules"] = persisted
+        except Exception as exc:
+            # Observability must never disturb exit supervision. Log once per
+            # process so a programming error remains visible without spamming.
+            if not getattr(self, "_exit_shadow_error_logged", False):
+                self._exit_shadow_error_logged = True
+                try:
+                    self._log_error(f"futures exit shadow {sym}", exc)
+                except Exception:
+                    pass
+
     @staticmethod
     def _safe_positive_price(value) -> float:
         if isinstance(value, bool):
@@ -814,6 +884,17 @@ class FuturesExitsMixin:
         if telemetry:
             self.state.update_many(sym, telemetry)
             d.update(telemetry)
+
+        FuturesExitsMixin._record_futures_exit_shadow(
+            self,
+            sym,
+            d,
+            move_pct=move_pct,
+            mfe_pct=FuturesExitsMixin._safe_finite_float(
+                d.get("max_profit_pct"), move_pct),
+            mae_pct=FuturesExitsMixin._safe_finite_float(
+                d.get("min_profit_pct"), move_pct),
+        )
 
         # Update highest favorable move
         highest = FuturesExitsMixin._safe_positive_float(

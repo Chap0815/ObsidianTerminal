@@ -12,14 +12,19 @@ class EntryQuality:
     label: str
     reasons: tuple[str, ...]
     components: dict[str, float]
+    raw_score: float | None = None
 
     def as_log_fields(self) -> dict[str, Any]:
-        return {
+        fields = {
             "entry_quality_score": self.score,
             "entry_quality_label": self.label,
             "entry_quality_reasons": ",".join(self.reasons),
             "entry_quality_components": self.components,
         }
+        if self.raw_score is not None:
+            fields["entry_quality_raw_score"] = round(self.raw_score, 4)
+            fields["entry_quality_saturated"] = not 0.0 < self.raw_score < 100.0
+        return fields
 
 
 def _finite_float(value: Any) -> float | None:
@@ -150,6 +155,7 @@ def score_futrend_entry(
         label=label_for_score(score),
         reasons=tuple(dict.fromkeys(reasons)),
         components={key: round(value, 4) for key, value in components.items()},
+        raw_score=raw,
     )
 
 
@@ -286,6 +292,7 @@ def score_futures_entry(
         label=label_for_score(score),
         reasons=tuple(dict.fromkeys(reasons)),
         components={key: round(value, 4) for key, value in components.items()},
+        raw_score=raw,
     )
 
 
@@ -448,6 +455,7 @@ def score_spot_entry(
         label=label_for_score(score),
         reasons=tuple(dict.fromkeys(reasons)),
         components={key: round(value, 4) for key, value in components.items()},
+        raw_score=raw,
     )
 
 
@@ -571,4 +579,5 @@ def score_cross_leg_entry(
         label=label_for_score(score),
         reasons=tuple(dict.fromkeys(reasons)),
         components={key: round(value, 4) for key, value in components.items()},
+        raw_score=raw,
     )

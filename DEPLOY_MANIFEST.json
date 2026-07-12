@@ -1,8 +1,8 @@
 {
-  "build_id": "8f60a13bb3e8f1f3",
-  "created_at": "2026-07-12 13:10:22",
+  "build_id": "e98100db78819aa5",
+  "created_at": "2026-07-12 16:36:45",
   "source": "update_deploy_manifest.py",
-  "file_count": 148,
+  "file_count": 149,
   "files": [
     {
       "path": "bot_config.default.json",
@@ -251,8 +251,8 @@
     },
     {
       "path": "core/futures_bot_exits.py",
-      "sha256": "1c7357c79fc6d691ead9ea0ca8b9999cb2ec2cdd9c76b82336ad628041eefece",
-      "bytes": 82993
+      "sha256": "6efbb068eb8f23040a92e13f8c7d9dc4995c21717c75b60a94186141ad147d98",
+      "bytes": 86556
     },
     {
       "path": "core/futures_bot_reconcile.py",
@@ -676,13 +676,18 @@
     },
     {
       "path": "trading/entry_quality.py",
-      "sha256": "2360812661bc3fdf2cc376c294598200672674f2fe84c64ebfa273e1b2297b30",
-      "bytes": 18028
+      "sha256": "cb3d70bfa3d396b6e07f325e66afeb90974a8e7ba3a3aa7daf3a119561c4dd33",
+      "bytes": 18372
     },
     {
       "path": "trading/fee_utils.py",
       "sha256": "d6eb4ce4084e61ef6e3beccfaa2e5b0173d431c20b256cd91b3943bc6de11855",
       "bytes": 9319
+    },
+    {
+      "path": "trading/futures_exit_shadow.py",
+      "sha256": "7f9280c6d73d837923b37b2a70e1223f05ee2cde69ce148e4c2c7cf8f60c4cb7",
+      "bytes": 4027
     },
     {
       "path": "trading/market_filters.py",
