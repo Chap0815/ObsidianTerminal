@@ -800,8 +800,10 @@ class TrendFuturesBot(FuturesBot):
         notional = margin * eff_lev
         from trading.entry_lifecycle import (emit_entry_lifecycle,
                                              new_entry_id)
-        entry_id = new_entry_id()
         entry_mode = "SIM" if self.simulation else "LIVE"
+        entry_id = new_entry_id(
+            bot=self.BOT_NAME, symbol=base, mode=entry_mode,
+            direction="LONG")
         shadow = self._entry_shadow_snapshot(
             base, full, tk, price, margin, eff_lev, entry_meta)
         shadow["entry_id"] = entry_id

@@ -762,6 +762,15 @@ class FuturesReconcileMixin:
             # Exchange-only positions. COEXISTENCE: a coin held by ANOTHER bot
             # (shared claims registry) is NOT our orphan  subtract those.
             orphan_syms = set(exchange_open.keys()) - set(local_state.keys())
+            own_claim_metadata = {}
+            try:
+                from core.database import get_open_positions_db
+                from trading.runtime_observability import (
+                    claim_recovery_metadata)
+                own_claim_metadata = claim_recovery_metadata(
+                    get_open_positions_db(self.BOT_NAME))
+            except Exception:
+                pass
             if orphan_syms:
                 try:
                     from core.database import get_all_claimed_bases, _base_symbol
@@ -864,7 +873,8 @@ class FuturesReconcileMixin:
                 if initial_liq_distance <= 0:
                     initial_liq_distance = max(1.0, 100.0 / max(1.0, lev))
                 try:
-                    added = self.state.add(base, {
+                    recovered_metadata = own_claim_metadata.get(base, {})
+                    adopted_state = {
                         "position_type": pos_type, "buy": entry, "highest": entry,
                         "last_price": entry,
                         "buy_time": now_utc().strftime("%Y-%m-%d %H:%M:%S"),
@@ -876,7 +886,10 @@ class FuturesReconcileMixin:
                         "partial_sold": False, "break_even": False,
                         "be_active": False, "adopted": True,
                         "margin_mode": mm_mode or self.C("MARGIN_MODE", "isolated"),
-                    })
+                    }
+                    adopted_state.update(recovered_metadata)
+                    adopted_state["adopted"] = True
+                    added = self.state.add(base, adopted_state)
                     if added is False:
                         if self.state.has(base):
                             try:
@@ -944,6 +957,25 @@ class FuturesReconcileMixin:
                 log_event(
                     f" Reconciliation: {len(local_state)} position(s) "
                     f"in sync with exchange", "INFO")
+            try:
+                from trading.runtime_observability import emit_startup_integrity
+                exchange_layer = {}
+                for base, position in exchange_open.items():
+                    signed = _position_signed_contracts_or_none(position)
+                    side = str(position.get("side") or "").upper()
+                    if not side and signed is not None:
+                        side = "SHORT" if signed < 0 else "LONG"
+                    exchange_layer[base] = {
+                        "amount": _position_contracts_or_none(position),
+                        "direction": side,
+                    }
+                emit_startup_integrity(
+                    bot_name=self.BOT_NAME, mode="LIVE",
+                    state_rows=self.state.get_all(),
+                    exchange_rows=exchange_layer,
+                )
+            except Exception:
+                pass
         except Exception as e:
             self._log_error("reconciliation", e)
 

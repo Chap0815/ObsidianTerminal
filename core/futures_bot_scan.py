@@ -569,8 +569,10 @@ class FuturesScanMixin:
 
         from trading.entry_lifecycle import (emit_entry_lifecycle,
                                              new_entry_id)
-        entry_id = new_entry_id()
         entry_mode = "SIM" if self.simulation else "LIVE"
+        entry_id = new_entry_id(
+            bot=self.BOT_NAME, symbol=sym, mode=entry_mode,
+            direction=direction)
         try:
             quality = score_futures_entry(
                 direction=direction,

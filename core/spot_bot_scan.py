@@ -507,8 +507,9 @@ class ScanMixin:
 
         from trading.entry_lifecycle import (emit_entry_lifecycle,
                                              new_entry_id)
-        entry_id = new_entry_id()
         entry_mode = "SIM" if self.simulation else "LIVE"
+        entry_id = new_entry_id(
+            bot=self.BOT_NAME, symbol=sym, mode=entry_mode, direction="BUY")
         quality = self._score_spot_entry_quality(
             sym, r, regime, confidence, entry_id)
         if (not self.simulation and self._entry_quality_filter_enabled()

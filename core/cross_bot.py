@@ -1551,8 +1551,9 @@ class CrossBot(FuturesBot):
 
         from trading.entry_lifecycle import (emit_entry_lifecycle,
                                              new_entry_id)
-        entry_id = new_entry_id()
         entry_mode = "SIM" if self.simulation else "LIVE"
+        entry_id = new_entry_id(
+            bot=self.BOT_NAME, symbol=base, mode=entry_mode, direction=side)
         quality = self._score_cross_entry_quality(
             base, full, side, quality_context, spread_pct, max_spread,
             entry_id)

@@ -365,6 +365,14 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                         "INFO"
                     )
                     try:
+                        from trading.runtime_observability import (
+                            log_runtime_observability)
+                        observability = log_runtime_observability(
+                            bot_name=self.BOT_NAME,
+                            mode="SIM" if self.simulation else "LIVE",
+                            state_rows=self.state.get_all(),
+                            ticker_cache=self.ticker_cache,
+                        )
                         threads = {
                             "monitor": self._monitor_thread.is_alive(),
                             "scan": self._scan_thread.is_alive(),
@@ -383,12 +391,19 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                             extra={
                                 "open_positions": tc,
                                 "safe_mode": bool(self.safe_mode.is_active()),
+                                **observability,
                             })
                     except Exception:
                         pass
                     last_heartbeat = now
                 if now - last_runtime_status >= 5.0:
                     try:
+                        from trading.runtime_observability import (
+                            runtime_observability_snapshot)
+                        observability = runtime_observability_snapshot(
+                            state_rows=self.state.get_all(),
+                            ticker_cache=self.ticker_cache,
+                        )
                         threads = {
                             "monitor": self._monitor_thread.is_alive(),
                             "scan": self._scan_thread.is_alive(),
@@ -406,6 +421,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                             extra={
                                 "open_positions": self.state.count(),
                                 "safe_mode": bool(self.safe_mode.is_active()),
+                                **observability,
                             })
                     except Exception:
                         pass

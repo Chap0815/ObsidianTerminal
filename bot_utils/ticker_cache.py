@@ -65,6 +65,50 @@ class TickerCache:
         self._inflight_sem = threading.Semaphore(in_flight_max)
         self._in_flight_max = in_flight_max
         self._rate_limited_until = 0.0
+        self._stats_lock = threading.Lock()
+        self._stats = {
+            "requests": 0,
+            "fresh_hits": 0,
+            "stale_hits": 0,
+            "fetch_attempts": 0,
+            "fetch_success": 0,
+            "fetch_errors": 0,
+            "budget_denied": 0,
+            "overloaded": 0,
+            "fetch_latency_ms_total": 0.0,
+            "fetch_latency_ms_max": 0.0,
+        }
+
+    def _note(self, key: str, value: float = 1.0) -> None:
+        with self._stats_lock:
+            self._stats[key] = self._stats.get(key, 0) + value
+
+    def stats(self) -> dict:
+        """Return a thread-safe aggregate snapshot without resetting it."""
+        with self._stats_lock:
+            data = dict(self._stats)
+        attempts = int(data.get("fetch_attempts") or 0)
+        total_ms = float(data.pop("fetch_latency_ms_total", 0.0) or 0.0)
+        data["fetch_latency_ms_avg"] = (
+            total_ms / attempts if attempts else 0.0)
+        data["cache_hit_rate"] = (
+            (float(data.get("fresh_hits") or 0)
+             + float(data.get("stale_hits") or 0))
+            / float(data.get("requests") or 1)
+        )
+        return data
+
+    def _note_stale_hit(self) -> None:
+        self._note("stale_hits")
+
+    def _note_fetch_result(self, started_at: float, *, ok: bool) -> None:
+        elapsed_ms = max(0.0, (time.monotonic() - started_at) * 1000.0)
+        with self._stats_lock:
+            key = "fetch_success" if ok else "fetch_errors"
+            self._stats[key] += 1
+            self._stats["fetch_latency_ms_total"] += elapsed_ms
+            self._stats["fetch_latency_ms_max"] = max(
+                self._stats["fetch_latency_ms_max"], elapsed_ms)
 
     def _stale(self, symbol_full: str, now: float, max_age: float) -> dict | None:
         with self._cache_lock:
@@ -97,6 +141,7 @@ class TickerCache:
           TickerOverloaded  pool saturated; stale cache also missing
         """
         pre_now = time.monotonic()
+        self._note("requests")
 
         # Fast path: fresh cache hit. Touch LRU position on read.
         with self._cache_lock:
@@ -105,12 +150,14 @@ class TickerCache:
                 # mark as recently used to keep popular symbols in cache
                 # during eviction storms.
                 self._cache.move_to_end(symbol_full)
+                self._note("fresh_hits")
                 return cached[1]
 
         if pre_now < self._rate_limited_until:
             max_age = self.stale_max if critical else self.rate_limit_stale_max
             stale = self._stale(symbol_full, pre_now, max_age)
             if stale is not None:
+                self._note_stale_hit()
                 return stale
             raise TickerOverloaded(
                 f"ticker fetch in rate-limit backoff for {symbol_full}"
@@ -122,7 +169,9 @@ class TickerCache:
                 stale = self._cache.get(symbol_full)
                 if stale and (pre_now - stale[0]) < self.stale_max:
                     self._cache.move_to_end(symbol_full)
+                    self._note_stale_hit()
                     return stale[1]
+            self._note("overloaded")
             raise TickerOverloaded(
                 f"ticker pool saturated ({self._in_flight_max} in flight)  "
                 f"dropping fetch for {symbol_full}"
@@ -139,20 +188,25 @@ class TickerCache:
             except Exception:
                 _allowed = True  # Budget module unavailable; do not block.
             if not _allowed:
+                self._note("budget_denied")
                 with self._cache_lock:
                     stale = self._cache.get(symbol_full)
                     if stale and (pre_now - stale[0]) < self.stale_max:
                         self._cache.move_to_end(symbol_full)
+                        self._note_stale_hit()
                         return stale[1]
                 raise TickerOverloaded(
                     f"API budget exhausted (cross-process)  dropping "
                     f"fetch for {symbol_full}, no fresh cache available"
                 )
 
+            self._note("fetch_attempts")
+            fetch_started_at = time.monotonic()
             future = self._pool.submit(ex.fetch_ticker, symbol_full)
             try:
                 ticker = future.result(timeout=timeout) or {}
             except _FutTimeout:
+                self._note_fetch_result(fetch_started_at, ok=False)
                 try:
                     future.cancel()
                 except Exception:
@@ -161,12 +215,14 @@ class TickerCache:
                     stale = self._cache.get(symbol_full)
                     if stale and (pre_now - stale[0]) < self.stale_max:
                         self._cache.move_to_end(symbol_full)
+                        self._note_stale_hit()
                         return stale[1]
                 raise TimeoutError(
                     f"fetch_ticker({symbol_full}) timed out after {timeout}s "
                     f"and no fresh cache (<{self.stale_max}s) available"
                 )
             except Exception as e:
+                self._note_fetch_result(fetch_started_at, ok=False)
                 if self._is_rate_limited(e):
                     self._rate_limited_until = (
                         time.monotonic() + self.rate_limit_backoff
@@ -174,8 +230,11 @@ class TickerCache:
                     max_age = self.stale_max if critical else self.rate_limit_stale_max
                     stale = self._stale(symbol_full, pre_now, max_age)
                     if stale is not None:
+                        self._note_stale_hit()
                         return stale
                 raise
+
+            self._note_fetch_result(fetch_started_at, ok=True)
 
             # Timestamp AFTER fetch completes (so cache TTL reflects
             # actual data freshness, not when we submitted the job).
@@ -184,6 +243,7 @@ class TickerCache:
             if ticker is None:
                 stale = self._stale(symbol_full, post_now, self.stale_max)
                 if stale is not None:
+                    self._note_stale_hit()
                     return stale
                 raise ValueError(f"invalid ticker price for {symbol_full}")
             with self._cache_lock:

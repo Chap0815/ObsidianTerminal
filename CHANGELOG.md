@@ -16,6 +16,10 @@
 - Completed terminal lifecycle telemetry for local Futures/FUTREND sizing
   rejects, oversized-entry recovery and CROSS lost-response recovery. This is
   observability-only and does not change order, sizing or risk decisions.
+- Preserved entry intent and quality metadata in the shared claim mirror and
+  crash recovery, added passive startup position-layer checks, lifecycle
+  watchdog health and aggregate ticker-cache telemetry. These checks reuse
+  existing snapshots and never place, close or resize orders.
 
 ## 2026-07-09
 

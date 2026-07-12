@@ -487,7 +487,7 @@ def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
     if fees_paid is None:
         fees_paid = 0.0
 
-    return {
+    restored = {
         "buy": buy_price,
         "buy_time": str(pos.get("buy_time") or ""),
         "amount": adopted_amount,
@@ -504,6 +504,13 @@ def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
         "initial_entry_fee": initial_entry_fee,
         "fees_paid": fees_paid,
     }
+    for key in (
+        "entry_id", "entry_quality_score", "entry_quality_label",
+        "entry_quality_reasons", "provisional", "adopted",
+    ):
+        if key in extra:
+            restored[key] = extra[key]
+    return restored
 
 
 def _record_spot_external_partial(bot, sym: str, state_row: dict,
@@ -1190,6 +1197,27 @@ def startup_reconciliation(bot) -> None:
         corrupt_ghost_syms.intersection_update(seen_ghost_bases)
     bot._spot_corrupt_ghost_bases = corrupt_ghost_syms
     _adopt_spot_orphans(bot, bal_data, skip_bases=corrupt_ghost_syms)
+    try:
+        from core.database import get_open_positions_db, _base_symbol
+        from trading.runtime_observability import emit_startup_integrity
+        managed = set(bot.state.keys())
+        for claim in get_open_positions_db(bot.BOT_NAME):
+            base = _base_symbol(claim.get("symbol", ""))
+            if base:
+                managed.add(base)
+        exchange_layer = {}
+        for base in managed:
+            amount = _spot_effective_balance_or_none(bal_data, base)
+            if amount is None:
+                exchange_layer[base] = {"amount": None, "direction": "SPOT"}
+            elif amount > 1e-8:
+                exchange_layer[base] = {"amount": amount, "direction": "SPOT"}
+        emit_startup_integrity(
+            bot_name=bot.BOT_NAME, mode="LIVE",
+            state_rows=bot.state.get_all(), exchange_rows=exchange_layer,
+        )
+    except Exception:
+        pass
 
 
 # 

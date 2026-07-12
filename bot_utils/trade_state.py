@@ -42,7 +42,8 @@ _CLAIM_EXTRA_FIELDS = frozenset((
     "funding_booked_on_partials", "partial_sold", "break_even", "be_active",
     "be_price", "highest", "last_price", "liquidation_price",
     "initial_liq_distance", "margin_mode", "accounting_pending_partials",
-    "unpriced_external_partials",
+    "unpriced_external_partials", "entry_id", "entry_quality_score",
+    "entry_quality_label", "entry_quality_reasons", "provisional", "adopted",
 ))
 
 
