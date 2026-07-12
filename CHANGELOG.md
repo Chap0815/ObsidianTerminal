@@ -20,6 +20,9 @@
   crash recovery, added passive startup position-layer checks, lifecycle
   watchdog health and aggregate ticker-cache telemetry. These checks reuse
   existing snapshots and never place, close or resize orders.
+- Scoped startup integrity warnings to the current bot's state and claims so
+  positions managed by another bot on the same futures account are reported
+  as ignored account context instead of false desynchronization warnings.
 
 ## 2026-07-09
 

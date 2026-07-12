@@ -148,7 +148,19 @@ def emit_startup_integrity(
         claims = get_open_positions_db(bot_name)
     except Exception:
         pass
-    report = compare_position_layers(state_rows, claims, exchange_rows)
+    owned_symbols = {_base_symbol(symbol) for symbol in state_rows}
+    if claims is not None:
+        owned_symbols.update(
+            _base_symbol(row.get("symbol")) for row in claims)
+    owned_symbols.discard("")
+    scoped_exchange = {
+        symbol: row for symbol, row in exchange_rows.items()
+        if _base_symbol(symbol) in owned_symbols
+    }
+    report = compare_position_layers(state_rows, claims, scoped_exchange)
+    report["account_exchange_count"] = len(exchange_rows)
+    report["ignored_unowned_exchange_count"] = max(
+        0, len(exchange_rows) - len(scoped_exchange))
     try:
         from core.logger import log_event, log_struct
         log_struct("startup_position_integrity", bot=bot_name, mode=mode,

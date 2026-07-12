@@ -1,6 +1,6 @@
 {
-  "build_id": "f5081015081135fb",
-  "created_at": "2026-07-12 11:04:08",
+  "build_id": "43475584cb3119af",
+  "created_at": "2026-07-12 11:14:45",
   "source": "update_deploy_manifest.py",
   "file_count": 148,
   "files": [
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "79eb14eafb59aee98af54f5b5e7092f9f0a3c7e73d0b9b2ad025a777a1035bf2",
-      "bytes": 48299
+      "sha256": "b00361740ae9a6d135281f9591429b3c2622fffa9a5d0e578861445fa90c780e",
+      "bytes": 48526
     },
     {
       "path": "config/__init__.py",
@@ -696,8 +696,8 @@
     },
     {
       "path": "trading/runtime_observability.py",
-      "sha256": "1d49787eef6bdcb5e12abd4b66100418a5c5e1d785560f3537b8067c6d8f841e",
-      "bytes": 8401
+      "sha256": "b56e378d66c4d88d07b3ad94bb877720a17139be878f616fc865183ceeaf3537",
+      "bytes": 8925
     },
     {
       "path": "trading/screener.py",
