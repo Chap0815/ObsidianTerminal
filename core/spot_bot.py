@@ -107,6 +107,9 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         self._cooldown_lock = threading.Lock()
         # populated in run()
         self.ex = None
+        # Spot uses batched ticker fetches instead of FuturesBot's TickerCache.
+        # Runtime observability accepts None and reports an empty cache section.
+        self.ticker_cache = None
         self.state: Optional[TradeState] = None
         self.cool: dict = {}
         # Safe-mode killswitch (initialized in run() after telegram config)

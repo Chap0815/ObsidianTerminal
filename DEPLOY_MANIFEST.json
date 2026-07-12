@@ -1,6 +1,6 @@
 {
-  "build_id": "43475584cb3119af",
-  "created_at": "2026-07-12 11:14:45",
+  "build_id": "8f60a13bb3e8f1f3",
+  "created_at": "2026-07-12 13:10:22",
   "source": "update_deploy_manifest.py",
   "file_count": 148,
   "files": [
@@ -296,8 +296,8 @@
     },
     {
       "path": "core/spot_bot.py",
-      "sha256": "eed4e5957acd511a61e04685d042324030c314cff15d30b04304c12b57db9111",
-      "bytes": 29041
+      "sha256": "fd3edb8c3652894aa61e8ea1045bb06e2d5835e5ce8d4deb7082730a71ce94b8",
+      "bytes": 29235
     },
     {
       "path": "core/spot_bot_exits.py",
