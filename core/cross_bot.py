@@ -104,8 +104,8 @@ class CrossBot(FuturesBot):
             return default
 
     def _entry_quality_min_score(self) -> float:
-        raw = self._f("ENTRY_QUALITY_MIN_SCORE", 50.0)
-        return max(0.0, min(100.0, raw)) if math.isfinite(raw) else 50.0
+        raw = self._f("ENTRY_QUALITY_MIN_SCORE", 75.0)
+        return max(0.0, min(100.0, raw)) if math.isfinite(raw) else 75.0
 
     def _entry_quality_filter_enabled(self) -> bool:
         try:
@@ -115,6 +115,85 @@ class CrossBot(FuturesBot):
         if isinstance(value, bool):
             return value
         return str(value).strip().lower() not in ("0", "false", "no", "off")
+
+    @staticmethod
+    def _cross_market_structure(book, prices: Dict[str, List[float]]) -> dict:
+        """Derive telemetry from the already-loaded, closed-bar universe."""
+        import statistics
+
+        returns: Dict[str, float] = {}
+        for base, series in (prices or {}).items():
+            try:
+                first = float(series[0])
+                last = float(series[-1])
+                value = (last / first - 1.0) * 100.0
+            except (IndexError, TypeError, ValueError, ZeroDivisionError):
+                continue
+            if first > 0 and last > 0 and math.isfinite(value):
+                returns[str(base).upper()] = value
+
+        values = list(returns.values())
+        dispersion = statistics.pstdev(values) if len(values) >= 2 else None
+        median_return = statistics.median(values) if values else None
+        breadth = (
+            sum(1 for value in values if value > 0) / len(values) * 100.0
+            if values else None
+        )
+        long_values = [returns[base] for base in getattr(book, "longs", [])
+                       if base in returns]
+        short_values = [returns[base] for base in getattr(book, "shorts", [])
+                        if base in returns]
+        separation = (
+            statistics.fmean(long_values) - statistics.fmean(short_values)
+            if long_values and short_values else None
+        )
+        separation_ratio = (
+            separation / dispersion
+            if separation is not None and dispersion is not None and dispersion > 0
+            else None
+        )
+
+        btc_series = (prices or {}).get("BTC") or []
+        btc_return = returns.get("BTC")
+        btc_hourly_returns = []
+        for previous, current in zip(btc_series, btc_series[1:]):
+            try:
+                move = (float(current) / float(previous) - 1.0) * 100.0
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+            if float(previous) > 0 and math.isfinite(move):
+                btc_hourly_returns.append(move)
+        btc_vol = (
+            statistics.pstdev(btc_hourly_returns) * math.sqrt(24.0)
+            if len(btc_hourly_returns) >= 2 else None
+        )
+        return {
+            "universe_count": len(values),
+            "universe_median_return_pct": median_return,
+            "universe_dispersion_pct": dispersion,
+            "market_breadth_positive_pct": breadth,
+            "long_short_separation_pct": separation,
+            "separation_to_dispersion": separation_ratio,
+            "btc_return_pct": btc_return,
+            "btc_realized_vol_24h_pct": btc_vol,
+        }
+
+    @staticmethod
+    def _cross_shadow_hypotheses(context: dict, quality) -> tuple[str, ...]:
+        """Research-only flags. Callers must never use these as trade gates."""
+        reasons = []
+        quality_reasons = set(getattr(quality, "reasons", ()) or ())
+        if "pays_funding" in quality_reasons:
+            reasons.append("pays_funding")
+        if context.get("rank_position") == 2:
+            reasons.append("rank_2")
+        ratio = context.get("separation_to_dispersion")
+        try:
+            if math.isfinite(float(ratio)) and float(ratio) < 1.0:
+                reasons.append("narrow_separation")
+        except (TypeError, ValueError):
+            pass
+        return tuple(reasons)
 
     def _cross_entry_quality_context(self, base: str, side: str, book,
                                      prices: Dict[str, List[float]],
@@ -134,7 +213,7 @@ class CrossBot(FuturesBot):
         except Exception:
             pass
         funding_cache = getattr(self, "_cross_funding_pct", {})
-        return {
+        context = {
             "rank_position": rank_position,
             "rank_count": len(ranked),
             "return_pct": return_pct,
@@ -142,6 +221,11 @@ class CrossBot(FuturesBot):
             "book_side_count": len(ranked),
             "target_side_count": target_side_count,
         }
+        try:
+            context.update(CrossBot._cross_market_structure(book, prices))
+        except Exception:
+            pass
+        return context
 
     def _open_leg_with_quality(self, base: str, full: str, side: str,
                                notional: float, price: float, lev: float,
@@ -168,7 +252,8 @@ class CrossBot(FuturesBot):
     def _score_cross_entry_quality(self, base: str, full: str, side: str,
                                    quality_context: dict | None,
                                    spread_pct: float | None,
-                                   max_spread_pct: float):
+                                   max_spread_pct: float,
+                                   entry_id: str = ""):
         from trading.entry_quality import EntryQuality, score_cross_leg_entry
 
         ctx = dict(quality_context or {})
@@ -193,6 +278,7 @@ class CrossBot(FuturesBot):
         try:
             from core.logger import log_struct
             fields = quality.as_log_fields()
+            shadow_reasons = CrossBot._cross_shadow_hypotheses(ctx, quality)
             fields.update({
                 "bot": self.BOT_NAME,
                 "symbol": base,
@@ -202,6 +288,10 @@ class CrossBot(FuturesBot):
                 "direction": side,
                 "spread_pct": spread_pct,
                 "entry_quality_min_score": self._entry_quality_min_score(),
+                "entry_id": entry_id,
+                "strategy_shadow_version": "xsec_observe_v1",
+                "strategy_shadow_would_veto": bool(shadow_reasons),
+                "strategy_shadow_reasons": ",".join(shadow_reasons),
                 **ctx,
             })
             log_struct("cross_entry_quality", **fields)
@@ -1459,8 +1549,13 @@ class CrossBot(FuturesBot):
             )
             return
 
+        from trading.entry_lifecycle import (emit_entry_lifecycle,
+                                             new_entry_id)
+        entry_id = new_entry_id()
+        entry_mode = "SIM" if self.simulation else "LIVE"
         quality = self._score_cross_entry_quality(
-            base, full, side, quality_context, spread_pct, max_spread)
+            base, full, side, quality_context, spread_pct, max_spread,
+            entry_id)
         if (quality_context is not None
                 and not self.simulation and self._entry_quality_filter_enabled()
                 and ("score_error" in quality.reasons
@@ -1470,6 +1565,10 @@ class CrossBot(FuturesBot):
                 f"{quality.score} < {self._entry_quality_min_score():.0f} "
                 f"({quality.label}; {','.join(quality.reasons) or 'no_reason'})",
                 "WAIT")
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=base,
+                stage="blocked", mode=entry_mode, reason="entry_quality",
+                direction=side)
             return
 
         if self.simulation:
@@ -1479,6 +1578,10 @@ class CrossBot(FuturesBot):
             # marginxleverage, so the coins-vs-contracts distinction is moot here.
             amount = notional / fill
             if not math.isfinite(amount) or amount <= 0:
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="aborted", mode=entry_mode,
+                    reason="invalid_sim_amount", direction=side)
                 return
             from bot_utils.fee_math import taker_fee_rate
             fees = amount * fill * taker_fee_rate(self.ex, full, 0.0006)
@@ -1497,11 +1600,19 @@ class CrossBot(FuturesBot):
             if not math.isfinite(cs) or cs <= 0.0:
                 log_event(f"[{self.BOT_NAME}] {base}: invalid contract size "
                           f"{raw_cs!r} - skip leg", "WARN")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="aborted", mode=entry_mode,
+                    reason="invalid_contract_size", direction=side)
                 return
             contracts = (notional / exec_price) / cs
             if not math.isfinite(contracts) or contracts <= 0.0:
                 log_event(f"[{self.BOT_NAME}] {base}: invalid contracts "
                           f"{contracts!r} before precision - skip leg", "WARN")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="aborted", mode=entry_mode,
+                    reason="invalid_contract_amount", direction=side)
                 return
             try:
                 _mkt = (getattr(self.ex, "markets", {}) or {}).get(full, {})
@@ -1510,11 +1621,19 @@ class CrossBot(FuturesBot):
                 if _min and contracts < float(_min):
                     log_event(f"[{self.BOT_NAME}] {base}: contracts {contracts:g} < "
                               f"exchange min {_min:g} - skip (notional too small)", "INFO")
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=base,
+                        stage="blocked", mode=entry_mode,
+                        reason="min_contract_amount", direction=side)
                     return
                 _cmin = ((_lim.get("cost") or {}).get("min"))
                 if _cmin and notional < float(_cmin):
                     log_event(f"[{self.BOT_NAME}] {base}: notional {notional:.2f} < "
                               f"exchange min-cost {float(_cmin):.2f} - skip leg", "INFO")
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=base,
+                        stage="blocked", mode=entry_mode,
+                        reason="min_notional", direction=side)
                     return
             except Exception:
                 pass
@@ -1527,6 +1646,10 @@ class CrossBot(FuturesBot):
             if not math.isfinite(contracts) or contracts <= 0.0:
                 log_event(f"[{self.BOT_NAME}] {base}: invalid contracts "
                           f"{raw_contracts!r} after precision - skip leg", "WARN")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="aborted", mode=entry_mode,
+                    reason="precision_amount", direction=side)
                 return
             lev_int = max(1, int(__import__("math").ceil(lev)))
             # CROSS margin + leverage. HARD fail -> skip the leg; NEVER open at
@@ -1537,6 +1660,10 @@ class CrossBot(FuturesBot):
             except LeverageNotSetError as e:
                 log_event(f"[{self.BOT_NAME}] {base}: set_leverage failed "
                           f"({e}) - skipping leg", "WARN")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="aborted", mode=entry_mode,
+                    reason="set_leverage_failed", direction=side)
                 return
             safe_set_margin_mode(self.ex, "cross", full, leverage=lev_int,
                                  direction=side.upper())
@@ -1552,6 +1679,10 @@ class CrossBot(FuturesBot):
             if not claim_symbol_for_entry(self.BOT_NAME, full, side):
                 log_event(f"[{self.BOT_NAME}] {base}: claimed by another bot "
                           f"- skip", "WAIT")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="blocked", mode=entry_mode,
+                    reason="claim_conflict", direction=side)
                 return
             provisional_added = self.state.add(base, {
                 "position_type": side,
@@ -1570,10 +1701,15 @@ class CrossBot(FuturesBot):
                 "entry_quality_score": quality.score,
                 "entry_quality_label": quality.label,
                 "entry_quality_reasons": ",".join(quality.reasons),
+                "entry_id": entry_id,
                 "provisional": True,
                 "entry_inflight_until": time.time() + 120.0,
             })
             if provisional_added is False:
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="state_failed", mode=entry_mode,
+                    reason="pre_order_state_write", direction=side)
                 log_event(
                     f"[{self.BOT_NAME}] {base}: state write failed before "
                     f"LIVE {side} entry - aborting open",
@@ -1583,12 +1719,20 @@ class CrossBot(FuturesBot):
                     base, "state write failed before entry")
                 return
             try:
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="order_attempt", mode=entry_mode,
+                    direction=side)
                 order = create_order_with_retry(
                     self.ex, full, order_side, contracts, params=params,
                     shutdown_event=self._shutdown_event,
                     action_label=f"cross open {base}",
                     log_event=log_event, log_struct=log_struct)
             except Exception as e:
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="order_failed", mode=entry_mode,
+                    reason=type(e).__name__, direction=side)
                 log_event(f"[{self.BOT_NAME}] {base}: open failed ({e})", "WARN")
                 self._log_error(f"cross open {base}", e)
                 _landed = False
@@ -1636,6 +1780,7 @@ class CrossBot(FuturesBot):
                             "entry_quality_score": quality.score,
                             "entry_quality_label": quality.label,
                             "entry_quality_reasons": ",".join(quality.reasons),
+                            "entry_id": entry_id,
                             "provisional": True,
                         })
                         if landed_added is False:
@@ -1645,6 +1790,12 @@ class CrossBot(FuturesBot):
                             )
                             return
                         _landed = True
+                        emit_entry_lifecycle(
+                            entry_id, bot=self.BOT_NAME, symbol=base,
+                            stage="opened", mode=entry_mode,
+                            reason="recovered_after_order_error",
+                            direction=side, provisional=True,
+                            recovered_after_error=True)
                         log_event(f"[{self.BOT_NAME}] {base}: order landed "
                                   f"despite error - tracked provisionally", "WARN")
                 except Exception:
@@ -1663,6 +1814,10 @@ class CrossBot(FuturesBot):
             )
             provisional = False
             if amount <= 0 and not positions_unavailable:
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="order_failed", mode=entry_mode,
+                    reason="no_verified_fill", direction=side)
                 log_event(
                     f"[{self.BOT_NAME}] {base}: order returned no fill and "
                     f"no exchange position was found - aborting state write",
@@ -1718,9 +1873,14 @@ class CrossBot(FuturesBot):
             "entry_quality_score": quality.score,
             "entry_quality_label": quality.label,
             "entry_quality_reasons": ",".join(quality.reasons),
+            "entry_id": entry_id,
             "provisional": provisional,
         })
         if tracked is False:
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=base,
+                stage="state_failed", mode=entry_mode,
+                reason="post_fill_state_write", direction=side)
             log_event(
                 f"[{self.BOT_NAME}] {base}: state write failed after "
                 f"{'LIVE' if not self.simulation else 'SIM'} {side} entry",
@@ -1735,6 +1895,10 @@ class CrossBot(FuturesBot):
                 self._cleanup_untracked_entry_state(
                     base, "sim state write failed after entry")
             return
+        emit_entry_lifecycle(
+            entry_id, bot=self.BOT_NAME, symbol=base,
+            stage="opened", mode=entry_mode, fill_price=fill,
+            margin_usdt=float(stored_margin), direction=side)
         if not provisional:
             log_event(f"[{self.BOT_NAME}] OPEN {side} {base} @ {fill:.6f} "
                       f"(notional {stored_notional:.1f}, margin {stored_margin:.1f}, fee {fees:.4f})", "INFO")
@@ -2285,7 +2449,8 @@ class CrossBot(FuturesBot):
                     giveback_pct=giveback_pct,
                     entry_quality_score=d.get("entry_quality_score"),
                     entry_quality_label=d.get("entry_quality_label"),
-                    entry_quality_reasons=d.get("entry_quality_reasons")))
+                    entry_quality_reasons=d.get("entry_quality_reasons"),
+                    entry_id=d.get("entry_id")))
                 if not saved_ok:
                     raise RuntimeError("save_trade_db returned False")
             except Exception as e:

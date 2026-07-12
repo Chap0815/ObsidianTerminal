@@ -21,6 +21,7 @@ REQUIRED_RELEASE_ITEMS = [
     "news",
     "trading",
     "trading/entry_quality.py",
+    "trading/entry_lifecycle.py",
     "tools",
     "core/runtime_status.py",
     "launcher/config/settings.py",

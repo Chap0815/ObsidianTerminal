@@ -1206,6 +1206,10 @@ class FuturesReconcileMixin:
                 entry_quality_label=state_row.get(
                     "accounting_pending_entry_quality_label",
                     state_row.get("entry_quality_label")),
+                entry_quality_reasons=state_row.get(
+                    "accounting_pending_entry_quality_reasons",
+                    state_row.get("entry_quality_reasons")),
+                entry_id=state_row.get("entry_id"),
             )
             if not saved:
                 log_event(

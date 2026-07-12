@@ -371,6 +371,10 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
             is_futures=False,
             fees_usdt=entry_fee + close_fee,
             exchange_order_id=state_row.get("accounting_pending_exchange_order_id"),
+            entry_quality_score=state_row.get("entry_quality_score"),
+            entry_quality_label=state_row.get("entry_quality_label"),
+            entry_quality_reasons=state_row.get("entry_quality_reasons"),
+            entry_id=state_row.get("entry_id"),
         )
         if not saved:
             log_event(

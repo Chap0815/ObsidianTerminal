@@ -544,6 +544,7 @@ def _run_migrations(conn) -> None:
     _add_column_if_missing(conn, "trades", "entry_quality_score", "REAL")
     _add_column_if_missing(conn, "trades", "entry_quality_label", "TEXT")
     _add_column_if_missing(conn, "trades", "entry_quality_reasons", "TEXT")
+    _add_column_if_missing(conn, "trades", "entry_id", "TEXT")
     # exchange order id participates in the dedup key so two genuinely distinct
     # LIVE trades on the same symbol in the same wall-clock second can't
     # collapse into one row (which would drop the second trade's PnL from
@@ -984,7 +985,7 @@ def save_trade_db(
     liquidation_price=None, funding_paid=0.0, fees_usdt=0.0,
     exchange_order_id=None, mfe_pct=None, mae_pct=None, giveback_pct=None,
     mode_is_sim=None, entry_quality_score=None, entry_quality_label=None,
-    entry_quality_reasons=None,
+    entry_quality_reasons=None, entry_id=None,
 ) -> bool:
     if not _INIT_DB_DONE:
         init_db()
@@ -1043,6 +1044,7 @@ def save_trade_db(
         str(entry_quality_reasons)[:512]
         if entry_quality_reasons is not None else None
     )
+    entry_id = str(entry_id)[:64] if entry_id is not None else None
 
     if buy_price <= 0 or sell_price <= 0:
         try:
@@ -1159,8 +1161,8 @@ def save_trade_db(
              liquidation_price, funding_paid, fees_usdt,
              exchange_order_id, mfe_pct, mae_pct, giveback_pct,
              is_sim, mode_source, entry_quality_score, entry_quality_label,
-             entry_quality_reasons)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+             entry_quality_reasons, entry_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
             bot_name, symbol, buy_price, sell_price, buy_time, sell_time,
             profit_pct, profit_usdt, invested_usdt, reason,
             _sanitize_float(rsi_15m, None) if rsi_15m is not None else None,
@@ -1181,7 +1183,7 @@ def save_trade_db(
             _sanitize_float(mae_pct, None) if mae_pct is not None else None,
             _sanitize_float(giveback_pct, None) if giveback_pct is not None else None,
             trade_is_sim, mode_source, entry_quality_score, entry_quality_label,
-            entry_quality_reasons,
+            entry_quality_reasons, entry_id,
         ))
         inserted = cur.rowcount > 0
         if inserted:

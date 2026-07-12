@@ -51,10 +51,10 @@ class ScanMixin:
 
     def _entry_quality_min_score(self) -> float:
         try:
-            raw = float(self.C("ENTRY_QUALITY_MIN_SCORE", 50.0))
+            raw = float(self.C("ENTRY_QUALITY_MIN_SCORE", 75.0))
         except (TypeError, ValueError, OverflowError):
-            raw = 50.0
-        return max(0.0, min(100.0, raw)) if math.isfinite(raw) else 50.0
+            raw = 75.0
+        return max(0.0, min(100.0, raw)) if math.isfinite(raw) else 75.0
 
     def _entry_quality_filter_enabled(self) -> bool:
         return self._bool_cfg_value(
@@ -71,7 +71,7 @@ class ScanMixin:
             pass
 
     def _score_spot_entry_quality(self, sym: str, r: dict, regime: dict,
-                                  confidence: str):
+                                  confidence: str, entry_id: str = ""):
         from trading.entry_quality import EntryQuality, score_spot_entry
 
         try:
@@ -108,6 +108,7 @@ class ScanMixin:
                 "regime": (regime or {}).get("regime"),
                 "btc_change_pct": (regime or {}).get("btc_24h"),
                 "entry_quality_min_score": self._entry_quality_min_score(),
+                "entry_id": entry_id,
             })
             log_struct("spot_entry_quality", **fields)
         except Exception:
@@ -504,7 +505,12 @@ class ScanMixin:
             log_event(f"{sym}: {why}", "WAIT")
             return None
 
-        quality = self._score_spot_entry_quality(sym, r, regime, confidence)
+        from trading.entry_lifecycle import (emit_entry_lifecycle,
+                                             new_entry_id)
+        entry_id = new_entry_id()
+        entry_mode = "SIM" if self.simulation else "LIVE"
+        quality = self._score_spot_entry_quality(
+            sym, r, regime, confidence, entry_id)
         if (not self.simulation and self._entry_quality_filter_enabled()
                 and ("score_error" in quality.reasons
                      or quality.score < self._entry_quality_min_score())):
@@ -513,6 +519,9 @@ class ScanMixin:
                 f"{quality.score} < {self._entry_quality_min_score():.0f} "
                 f"({quality.label}; {','.join(quality.reasons) or 'no_reason'})",
                 "WAIT")
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="blocked", mode=entry_mode, reason="entry_quality")
             return None
 
         # Bull/Bear devil's-advocate veto is handled inside
@@ -533,6 +542,9 @@ class ScanMixin:
                 f"{trade_usdt!r}",
                 "WARN",
             )
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="aborted", mode=entry_mode, reason="invalid_size")
             return None
         if regime["regime"] == "BEAR":
             trade_usdt = max(5.0, trade_usdt * 0.5)
@@ -551,6 +563,10 @@ class ScanMixin:
                     f"only {balance:.2f} USDT free.",
                     "WARN"
                 )
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=sym,
+                    stage="blocked", mode=entry_mode,
+                    reason="insufficient_balance")
                 return None
 
         log_buy(
@@ -565,15 +581,30 @@ class ScanMixin:
             if not claim_symbol_for_entry(self.BOT_NAME, sym, "SPOT"):
                 log_event(f"{sym} claimed by another bot  skip "
                           f"(coexistence)", "WAIT")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=sym,
+                    stage="blocked", mode=entry_mode,
+                    reason="claim_conflict")
                 return None
         _claimed = not self.simulation
+        emit_entry_lifecycle(
+            entry_id, bot=self.BOT_NAME, symbol=sym,
+            stage="order_attempt", mode=entry_mode)
         try:
             entry = self._place_buy_order(sym, r, trade_usdt)
         except Exception as _buy_exc:
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="order_failed", mode=entry_mode,
+                reason=type(_buy_exc).__name__)
             if _claimed:
                 self._release_entry_claim_if_untracked(sym)
             raise _buy_exc
         if entry is None:
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="order_failed", mode=entry_mode,
+                reason="no_verified_fill")
             if _claimed:
                 self._release_entry_claim_if_untracked(sym)
             return None  # buy failed  already logged
@@ -608,6 +639,7 @@ class ScanMixin:
             "entry_quality_score": quality.score,
             "entry_quality_label": quality.label,
             "entry_quality_reasons": ",".join(quality.reasons),
+            "entry_id": entry_id,
             "provisional": False,
         }
         if self.state.has(sym):
@@ -617,6 +649,10 @@ class ScanMixin:
             position_fields["buy_time"] = _utc_now_str()
             state_ok = self.state.add(sym, position_fields)
         if state_ok is False and not self.simulation:
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="state_failed", mode=entry_mode,
+                reason="post_fill_state_write")
             log_event(
                 f"Buy {sym}: state write failed after LIVE fill  "
                 f"attempting immediate rollback sell", "WARN")
@@ -642,6 +678,17 @@ class ScanMixin:
                     f"state failure; rollback sell failed ({rb_exc})", "WARN")
                 self._log_error(f"spot rollback after state failure {sym}", rb_exc)
             return
+
+        if state_ok is False:
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="state_failed", mode=entry_mode,
+                reason="post_fill_state_write")
+        else:
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="opened", mode=entry_mode, fill_price=fill_price,
+                size_usdt=float(trade_usdt))
 
         try:
             from core.logger import log_struct

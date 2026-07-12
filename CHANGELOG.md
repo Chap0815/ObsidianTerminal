@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-07-12
+
+- Set the packaged entry-quality default to 75 for SPOT, FUTURES, CROSS and
+  FUTREND while preserving existing user overrides in `bot_config.json`.
+- Added fail-soft entry intent IDs across quality logs, position state and
+  partial/final/offline-close accounting so one campaign can be correlated
+  without changing gates, sizing, claims, orders or exits.
+- Added CROSS market-structure telemetry derived from the already loaded
+  closed-bar universe (dispersion, breadth, LONG/SHORT separation and BTC
+  context). Research shadow-veto labels are observation-only and never block
+  or resize a trade.
+- Preserved entry-quality and intent metadata when Spot/Futures recovery records
+  an offline close.
+- Completed terminal lifecycle telemetry for local Futures/FUTREND sizing
+  rejects, oversized-entry recovery and CROSS lost-response recovery. This is
+  observability-only and does not change order, sizing or risk decisions.
+
 ## 2026-07-09
 
 - Fixed entry-quality persistence for SPOT/CROSS/FUTREND/FUTURES close paths:

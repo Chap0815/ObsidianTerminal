@@ -1215,6 +1215,8 @@ class FuturesExitsMixin:
             exchange_order_id=exch_oid,
             entry_quality_score=d.get("entry_quality_score"),
             entry_quality_label=d.get("entry_quality_label"),
+            entry_quality_reasons=d.get("entry_quality_reasons"),
+            entry_id=d.get("entry_id"),
         )
         try:
             accounting_ok = bool(save_trade_db(**partial_trade))
@@ -1647,6 +1649,8 @@ class FuturesExitsMixin:
                 giveback_pct=giveback_pct,
                 entry_quality_score=d.get("entry_quality_score"),
                 entry_quality_label=d.get("entry_quality_label"),
+                entry_quality_reasons=d.get("entry_quality_reasons"),
+                entry_id=d.get("entry_id"),
             ))
             if not accounting_ok:
                 raise RuntimeError("save_trade_db returned False")

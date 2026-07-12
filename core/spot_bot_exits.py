@@ -964,6 +964,7 @@ class ExitsMixin:
             entry_quality_score=d.get("entry_quality_score"),
             entry_quality_label=d.get("entry_quality_label"),
             entry_quality_reasons=d.get("entry_quality_reasons"),
+            entry_id=d.get("entry_id"),
         )
         try:
             accounting_ok = bool(save_trade_db(**partial_trade))
@@ -1237,6 +1238,7 @@ class ExitsMixin:
             entry_quality_score=d.get("entry_quality_score"),
             entry_quality_label=d.get("entry_quality_label"),
             entry_quality_reasons=d.get("entry_quality_reasons"),
+            entry_id=d.get("entry_id"),
         )
         if partial_live_fill:
             trade_row["is_partial"] = True

@@ -72,7 +72,7 @@ class FuturesScanMixin:
         return parsed
 
     def _entry_quality_min_score(self) -> float:
-        raw = self._finite_float(self.C("ENTRY_QUALITY_MIN_SCORE", 50.0), 50.0)
+        raw = self._finite_float(self.C("ENTRY_QUALITY_MIN_SCORE", 75.0), 75.0)
         return max(0.0, min(100.0, raw))
 
     def _entry_quality_filter_enabled(self) -> bool:
@@ -567,6 +567,10 @@ class FuturesScanMixin:
                           f"({type(e).__name__})", "WAIT")
                 return
 
+        from trading.entry_lifecycle import (emit_entry_lifecycle,
+                                             new_entry_id)
+        entry_id = new_entry_id()
+        entry_mode = "SIM" if self.simulation else "LIVE"
         try:
             quality = score_futures_entry(
                 direction=direction,
@@ -598,6 +602,7 @@ class FuturesScanMixin:
             "funding_rate_pct": funding_rate,
             "oi_change_pct": oi_change,
             "entry_quality_min_score": self._entry_quality_min_score(),
+            "entry_id": entry_id,
         })
         try:
             log_struct("futures_entry_quality", **quality_fields)
@@ -611,6 +616,9 @@ class FuturesScanMixin:
                 f"{quality.score} < {self._entry_quality_min_score():.0f} "
                 f"({quality.label}; {','.join(quality.reasons) or 'no_reason'})",
                 "WAIT")
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="blocked", mode=entry_mode, reason="entry_quality")
             return
 
         #  Bull/Bear devil's-advocate veto (2nd LLM call, ~3-4s) 
@@ -631,6 +639,10 @@ class FuturesScanMixin:
                             f"{sym}: Bull/Bear-Veto  {direction} verworfen "
                             f"(Risiken berwiegen)", "WAIT"
                         )
+                        emit_entry_lifecycle(
+                            entry_id, bot=self.BOT_NAME, symbol=sym,
+                            stage="blocked", mode=entry_mode,
+                            reason="bull_bear_veto")
                         return
             except Exception as e:
                 # Veto ist best-effort; ein Fehler darf den Trade nicht hart
@@ -650,6 +662,9 @@ class FuturesScanMixin:
                 f"{margin_usdt!r}",
                 "WARN",
             )
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="aborted", mode=entry_mode, reason="invalid_size")
             return
         if regime["regime"] == "BEAR" and direction == "LONG":
             margin_usdt = max(5.0, margin_usdt * 0.5)
@@ -699,6 +714,10 @@ class FuturesScanMixin:
                     f"{sym}: skipping {direction}  free USDT balance "
                     f"unavailable", "WARN"
                 )
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=sym,
+                    stage="blocked", mode=entry_mode,
+                    reason="balance_unavailable")
                 return
             required = margin_usdt * 1.05
             if required > available:
@@ -706,6 +725,10 @@ class FuturesScanMixin:
                     f"{sym}: skipping {direction}  need {required:.2f} USDT "
                     f"but only {available:.2f} USDT free", "WARN"
                 )
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=sym,
+                    stage="blocked", mode=entry_mode,
+                    reason="insufficient_balance")
                 return
 
         #  Order placement 
@@ -739,6 +762,10 @@ class FuturesScanMixin:
                 fees_paid = 0.0
             if amount <= 0:
                 log_event(f"{sym}: SIM {direction} amount=0  skip", "WARN")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=sym,
+                    stage="aborted", mode=entry_mode,
+                    reason="invalid_sim_amount")
                 return
         else:
             # mm_rate + liq_price already computed above with the real tier.
@@ -756,6 +783,10 @@ class FuturesScanMixin:
                     contract_size = self._positive_float(raw_contract_size)
                 if contract_size <= 0.0:
                     log_event(f"{sym}: invalid contract size - skipping", "WARN")
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=sym,
+                        stage="aborted", mode=entry_mode,
+                        reason="invalid_contract_size", direction=direction)
                     return
                 amount_contracts = amount_coins / contract_size
 
@@ -774,6 +805,10 @@ class FuturesScanMixin:
                             f"{sym}: order amount {amount_contracts:g} < exchange "
                             f"min {min_contracts:g} (margin too small for this "
                             f"contract) - skipping", "INFO")
+                        emit_entry_lifecycle(
+                            entry_id, bot=self.BOT_NAME, symbol=sym,
+                            stage="blocked", mode=entry_mode,
+                            reason="below_min_amount", direction=direction)
                         return
                 except Exception:
                     pass
@@ -794,11 +829,19 @@ class FuturesScanMixin:
                     log_event(
                         f"Order {sym}: invalid amount {raw_contracts!r} "
                         f"after precision - skip", "WARN")
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=sym,
+                        stage="aborted", mode=entry_mode,
+                        reason="invalid_precision_amount", direction=direction)
                     return
                 if min_contracts > 0.0 and amount_contracts < min_contracts:
                     log_event(
                         f"{sym}: precision amount {amount_contracts:g} < "
                         f"exchange min {min_contracts:g} - skipping", "INFO")
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=sym,
+                        stage="blocked", mode=entry_mode,
+                        reason="precision_below_min_amount", direction=direction)
                     return
 
                 # SAFETY GATE: never let the real cost exceed the intended
@@ -814,6 +857,10 @@ class FuturesScanMixin:
                     log_struct("futures_open_aborted", symbol=sym,
                                reason="sizing_safety_gate",
                                est_cost=est_cost, notional=notional)
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=sym,
+                        stage="aborted", mode=entry_mode,
+                        reason="sizing_safety_gate", direction=direction)
                     return
 
                 # must_set_leverage raises on failure  ABORT trade. Do this
@@ -830,6 +877,10 @@ class FuturesScanMixin:
                     log_struct("futures_open_aborted",
                                 symbol=sym, leverage=leverage,
                                 reason="set_leverage_failed")
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=sym,
+                        stage="aborted", mode=entry_mode,
+                        reason="set_leverage_failed")
                     return
                 safe_set_margin_mode(self.ex, margin_mode, symbol_full,
                                      leverage=leverage, direction=direction)
@@ -863,7 +914,15 @@ class FuturesScanMixin:
                 if not claim_symbol_for_entry(self.BOT_NAME, sym, direction):
                     log_event(f"{sym} claimed by another bot  skip "
                               f"(coexistence)", "WAIT")
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=sym,
+                        stage="blocked", mode=entry_mode,
+                        reason="claim_conflict")
                     return
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=sym,
+                    stage="order_attempt", mode=entry_mode,
+                    direction=direction)
                 order = create_order_with_retry(
                     self.ex, symbol_full, side, amount_contracts,
                     params=_entry_params,
@@ -932,6 +991,10 @@ class FuturesScanMixin:
                     except Exception:
                         positions_unavailable = True
                     if amount <= 0 and not positions_unavailable:
+                        emit_entry_lifecycle(
+                            entry_id, bot=self.BOT_NAME, symbol=sym,
+                            stage="order_failed", mode=entry_mode,
+                            reason="no_verified_fill", direction=direction)
                         log_event(
                             f"{sym}: order returned no fill and no exchange "
                             f"position was found  aborting state write",
@@ -1043,6 +1106,7 @@ class FuturesScanMixin:
                         log_struct("futures_emergency_close_failed",
                                    symbol=sym, error=str(_ce))
 
+                    residual_state = False
                     if not _closed_ok:
                         # Position (or a residual) is still open on the exchange.
                         # Write provisional state so it stays visible to
@@ -1063,6 +1127,10 @@ class FuturesScanMixin:
                                 "amount": amount,
                                 "original_amount": amount,
                                 "funding_paid": 0.0,
+                                "entry_id": entry_id,
+                                "entry_quality_score": quality.score,
+                                "entry_quality_label": quality.label,
+                                "entry_quality_reasons": ",".join(quality.reasons),
                                 "initial_entry_fee": 0.0,
                                 "fees_paid": 0.0,
                                 "partial_sold": False,
@@ -1076,6 +1144,7 @@ class FuturesScanMixin:
                                     f"returned False; claim kept, manual "
                                     f"recovery required", "ERROR")
                             else:
+                                residual_state = True
                                 log_event(
                                     f"{sym}: failed/partial close handed to "
                                     f"monitor for managed exit", "WARN")
@@ -1097,6 +1166,23 @@ class FuturesScanMixin:
                         log_event(f"{sym}: cooldown set failed ({_cde})", "WARN")
                     if _closed_ok:
                         remove_open_position(self.BOT_NAME, sym)
+                        emit_entry_lifecycle(
+                            entry_id, bot=self.BOT_NAME, symbol=sym,
+                            stage="aborted", mode=entry_mode,
+                            reason="oversized_entry_rolled_back",
+                            direction=direction)
+                    elif residual_state:
+                        emit_entry_lifecycle(
+                            entry_id, bot=self.BOT_NAME, symbol=sym,
+                            stage="opened", mode=entry_mode,
+                            reason="oversized_residual_managed",
+                            direction=direction, provisional=True)
+                    else:
+                        emit_entry_lifecycle(
+                            entry_id, bot=self.BOT_NAME, symbol=sym,
+                            stage="state_failed", mode=entry_mode,
+                            reason="oversized_residual_untracked",
+                            direction=direction)
                     return
 
                 # Orphan detection. If amount is still 0 after the order, the
@@ -1113,6 +1199,10 @@ class FuturesScanMixin:
                                 symbol=sym, direction=direction,
                                 requested=amount_contracts,
                                 order_id=str(order.get("id", "")))
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=sym,
+                        stage="order_failed", mode=entry_mode,
+                        reason="zero_amount_orphan_risk", direction=direction)
                     remove_open_position(self.BOT_NAME, sym)
                     return
 
@@ -1131,6 +1221,10 @@ class FuturesScanMixin:
                     "amount": amount,
                     "original_amount": amount,
                     "funding_paid": 0.0,
+                    "entry_id": entry_id,
+                    "entry_quality_score": quality.score,
+                    "entry_quality_label": quality.label,
+                    "entry_quality_reasons": ",".join(quality.reasons),
                     "initial_entry_fee": 0.0,
                     "fees_paid": 0.0,
                     "partial_sold": False,
@@ -1186,6 +1280,10 @@ class FuturesScanMixin:
                 liq_price = calc_liquidation_price(fill_price, leverage,
                                                      direction, mm_rate)
             except Exception as e:
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=sym,
+                    stage="order_failed", mode=entry_mode,
+                    reason=type(e).__name__, direction=direction)
                 log_event(f"Order {sym} failed: {e}", "WARN")
                 self._log_error(f"Open {sym}", e)
                 _landed = False
@@ -1210,6 +1308,10 @@ class FuturesScanMixin:
                                 entry_price, liq_price, direction),
                             "amount": _amt, "original_amount": _amt,
                             "funding_paid": 0.0, "initial_entry_fee": 0.0,
+                            "entry_id": entry_id,
+                            "entry_quality_score": quality.score,
+                            "entry_quality_label": quality.label,
+                            "entry_quality_reasons": ",".join(quality.reasons),
                             "fees_paid": 0.0, "partial_sold": False,
                             "break_even": False, "be_active": False,
                             "provisional": True,
@@ -1259,6 +1361,13 @@ class FuturesScanMixin:
                                     rb_exc)
                         else:
                             _landed = True
+                            emit_entry_lifecycle(
+                                entry_id, bot=self.BOT_NAME, symbol=sym,
+                                stage="opened", mode=entry_mode,
+                                fill_price=entry_price,
+                                margin_usdt=float(margin_usdt),
+                                direction=direction,
+                                recovered_after_error=True)
                             log_event(f" {sym}: order landed despite error  "
                                       f"tracked provisionally", "WARN")
                 except Exception:
@@ -1319,6 +1428,7 @@ class FuturesScanMixin:
             "entry_quality_score": quality.score,
             "entry_quality_label": quality.label,
             "entry_quality_reasons": ",".join(quality.reasons),
+            "entry_id": entry_id,
             "partial_sold": False,
             "break_even": False,
             "be_active": False,
@@ -1333,6 +1443,10 @@ class FuturesScanMixin:
             # First-write path (SIM mode never wrote provisional)
             state_ok = self.state.add(sym, trade_data)
         if state_ok is False and not self.simulation:
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="state_failed", mode=entry_mode,
+                reason="post_fill_state_write")
             log_event(
                 f"{sym}: state write failed after LIVE entry  attempting "
                 f"immediate reduce-only rollback", "WARN")
@@ -1371,6 +1485,17 @@ class FuturesScanMixin:
                 self._log_error(f"futures rollback after state failure {sym}", rb_exc)
             return
 
+        if state_ok is False:
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="state_failed", mode=entry_mode,
+                reason="post_fill_state_write")
+        if state_ok is not False:
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="opened", mode=entry_mode, fill_price=fill_price,
+                margin_usdt=float(actual_margin), direction=direction)
+
         try:
             from core.logger import log_struct
             from news.news_brain_core import parse_rationale
@@ -1395,6 +1520,7 @@ class FuturesScanMixin:
                 entry_quality_score=quality.score,
                 entry_quality_label=quality.label,
                 entry_quality_reasons=",".join(quality.reasons),
+                entry_id=entry_id,
             )
         except Exception:
             pass

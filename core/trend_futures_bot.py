@@ -60,7 +60,7 @@ class TrendFuturesBot(FuturesBot):
             return default
 
     def _entry_quality_min_score(self) -> float:
-        return max(0.0, min(100.0, self._f("ENTRY_QUALITY_MIN_SCORE", 50.0)))
+        return max(0.0, min(100.0, self._f("ENTRY_QUALITY_MIN_SCORE", 75.0)))
 
     def _entry_quality_filter_enabled(self) -> bool:
         return bool(self._i("ENTRY_QUALITY_FILTER_ENABLED", 1))
@@ -798,8 +798,13 @@ class TrendFuturesBot(FuturesBot):
             return
 
         notional = margin * eff_lev
+        from trading.entry_lifecycle import (emit_entry_lifecycle,
+                                             new_entry_id)
+        entry_id = new_entry_id()
+        entry_mode = "SIM" if self.simulation else "LIVE"
         shadow = self._entry_shadow_snapshot(
             base, full, tk, price, margin, eff_lev, entry_meta)
+        shadow["entry_id"] = entry_id
         try:
             log_struct("futrend_entry_shadow", **shadow)
         except Exception:
@@ -808,6 +813,10 @@ class TrendFuturesBot(FuturesBot):
             log_event(
                 f"[{self.BOT_NAME}] {base}: entry blocked by live shadow "
                 f"filter ({shadow.get('reasons')})", "WAIT")
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=base,
+                stage="blocked", mode=entry_mode, reason="entry_quality",
+                direction="LONG")
             return
         if not self.simulation:
             try:
@@ -821,6 +830,10 @@ class TrendFuturesBot(FuturesBot):
                 log_event(
                     f"[{self.BOT_NAME}] {base}: entry skipped - free USDT "
                     f"balance unavailable", "WARN")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="blocked", mode=entry_mode,
+                    reason="balance_unavailable", direction="LONG")
                 return
             required = margin * 1.05
             if required > available:
@@ -828,6 +841,10 @@ class TrendFuturesBot(FuturesBot):
                     f"[{self.BOT_NAME}] {base}: entry skipped - need "
                     f"{required:.2f} USDT free margin, available "
                     f"{available:.2f}", "WARN")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="blocked", mode=entry_mode,
+                    reason="insufficient_balance", direction="LONG")
                 return
         try:
             mm = get_maintenance_margin_rate(self.ex, full)
@@ -837,9 +854,17 @@ class TrendFuturesBot(FuturesBot):
         if not math.isfinite(cs) or cs <= 0:
             log_event(f"[{self.BOT_NAME}] {base}: invalid contract size - skip",
                       "WARN")
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=base,
+                stage="aborted", mode=entry_mode,
+                reason="invalid_contract_size", direction="LONG")
             return
         contracts = (notional / price) / max(cs, 1e-9)
         if not math.isfinite(contracts) or contracts <= 0:
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=base,
+                stage="aborted", mode=entry_mode,
+                reason="invalid_contract_amount", direction="LONG")
             return
         fill = price
         fees = 0.0
@@ -858,12 +883,20 @@ class TrendFuturesBot(FuturesBot):
                     log_event(f"[{self.BOT_NAME}] {base}: {contracts:g} < min "
                               f"{min_contracts:g} - skip (notional too small)",
                               "INFO")
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=base,
+                        stage="blocked", mode=entry_mode,
+                        reason="below_min_amount", direction="LONG")
                     return
                 _cmin = (_lim.get("cost") or {}).get("min")
                 min_cost = self._safe_float(_cmin, 0.0)
                 if min_cost > 0.0 and notional < min_cost:
                     log_event(f"[{self.BOT_NAME}] {base}: notional {notional:.2f} < "
                               f"exchange min-cost {min_cost:.2f} - skip", "INFO")
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=base,
+                        stage="blocked", mode=entry_mode,
+                        reason="below_min_cost", direction="LONG")
                     return
             except Exception:
                 pass
@@ -876,11 +909,19 @@ class TrendFuturesBot(FuturesBot):
             if not math.isfinite(contracts) or contracts <= 0:
                 log_event(f"[{self.BOT_NAME}] {base}: invalid contracts "
                           f"{raw_contracts!r} after precision - skip", "WARN")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="aborted", mode=entry_mode,
+                    reason="invalid_precision_amount", direction="LONG")
                 return
             if min_contracts > 0.0 and contracts < min_contracts:
                 log_event(f"[{self.BOT_NAME}] {base}: precision amount "
                           f"{contracts:g} < min {min_contracts:g} - skip",
                           "INFO")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="blocked", mode=entry_mode,
+                    reason="precision_below_min_amount", direction="LONG")
                 return
             try:
                 must_set_leverage(self.ex, lev_cap, full, direction="LONG",
@@ -888,6 +929,10 @@ class TrendFuturesBot(FuturesBot):
             except LeverageNotSetError as e:
                 log_event(f"[{self.BOT_NAME}] {base}: set_leverage failed ({e}) "
                           f" skip", "WARN")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="aborted", mode=entry_mode,
+                    reason="set_leverage_failed", direction="LONG")
                 return
             safe_set_margin_mode(self.ex, margin_mode, full, leverage=lev_cap,
                                  direction="LONG")
@@ -900,13 +945,22 @@ class TrendFuturesBot(FuturesBot):
             if not claim_symbol_for_entry(self.BOT_NAME, full, "LONG"):
                 log_event(f"[{self.BOT_NAME}] {base}: claimed by another bot "
                           f" skip", "WAIT")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="blocked", mode=entry_mode,
+                    reason="claim_conflict", direction="LONG")
                 return
             if not self._record_open(
                 base, fill, margin, eff_lev, contracts, 0.0,
                 provisional=True, lev_cap=lev_cap, mm_rate=mm,
                 margin_mode=margin_mode,
                 entry_inflight=True,
+                entry_shadow=shadow,
             ):
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="state_failed", mode=entry_mode,
+                    reason="pre_order_state_write", direction="LONG")
                 log_event(
                     f"[{self.BOT_NAME}] {base}: state write failed before "
                     f"LIVE entry - aborting open",
@@ -916,12 +970,20 @@ class TrendFuturesBot(FuturesBot):
                     base, "state write failed before entry")
                 return
             try:
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="order_attempt", mode=entry_mode,
+                    direction="LONG")
                 order = create_order_with_retry(
                     self.ex, full, "buy", contracts, params=params,
                     shutdown_event=self._shutdown_event,
                     action_label=f"trend open {base}",
                     log_event=log_event, log_struct=log_struct)
             except Exception as e:
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="order_failed", mode=entry_mode,
+                    reason=type(e).__name__, direction="LONG")
                 log_event(f"[{self.BOT_NAME}] {base}: open failed ({e})", "WARN")
                 self._log_error(f"trend open {base}", e)
                 # Orphan-prevention: create_order can RAISE after the order
@@ -958,6 +1020,12 @@ class TrendFuturesBot(FuturesBot):
                             )
                             return
                         _landed = True
+                        emit_entry_lifecycle(
+                            entry_id, bot=self.BOT_NAME, symbol=base,
+                            stage="opened", mode=entry_mode,
+                            fill_price=landed_fill,
+                            margin_usdt=float(actual_margin),
+                            direction="LONG", recovered_after_error=True)
                         log_event(f"[{self.BOT_NAME}]  {base}: landed despite "
                                   f"error  tracked and monitoring enabled", "WARN")
                 except Exception:
@@ -975,6 +1043,10 @@ class TrendFuturesBot(FuturesBot):
                 self._verify_entry_fill(base, full, order, contracts, fill)
             )
             if amount <= 0 and not positions_unavailable:
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="order_failed", mode=entry_mode,
+                    reason="no_verified_fill", direction="LONG")
                 log_event(
                     f"[{self.BOT_NAME}] {base}: order returned no fill and "
                     f"no exchange position was found - aborting state write",
@@ -1026,6 +1098,10 @@ class TrendFuturesBot(FuturesBot):
             entry_shadow=shadow, margin_mode=margin_mode,
         )
         if not tracked:
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=base,
+                stage="state_failed", mode=entry_mode,
+                reason="post_fill_state_write", direction="LONG")
             log_event(
                 f"[{self.BOT_NAME}] {base}: state write failed after LIVE "
                 f"entry - attempting immediate rollback close",
@@ -1036,6 +1112,10 @@ class TrendFuturesBot(FuturesBot):
                 "state write failed after entry",
             )
             return
+        emit_entry_lifecycle(
+            entry_id, bot=self.BOT_NAME, symbol=base,
+            stage="opened", mode=entry_mode, fill_price=fill,
+            margin_usdt=float(actual_margin), direction="LONG")
         if not provisional:
             log_event(f"[{self.BOT_NAME}] OPEN LONG {base} @ {fill:.6f} "
                       f"({eff_lev:g}x, notional {actual_margin * eff_lev:.1f}, "
@@ -1156,6 +1236,7 @@ class TrendFuturesBot(FuturesBot):
             row["entry_inflight_until"] = time.time() + 120.0
         if entry_shadow:
             row.update({
+                "entry_id": entry_shadow.get("entry_id"),
                 "entry_shadow_would_block": bool(entry_shadow.get("would_block")),
                 "entry_shadow_reasons": entry_shadow.get("reasons", ""),
                 "entry_spread_pct": entry_shadow.get("spread_pct"),
@@ -1705,7 +1786,9 @@ class TrendFuturesBot(FuturesBot):
                     mfe_pct=mfe_pct, mae_pct=mae_pct,
                     giveback_pct=giveback_pct,
                     entry_quality_score=d.get("entry_quality_score"),
-                    entry_quality_label=d.get("entry_quality_label")))
+                    entry_quality_label=d.get("entry_quality_label"),
+                    entry_quality_reasons=d.get("entry_quality_reasons"),
+                    entry_id=d.get("entry_id")))
                 if not accounting_ok:
                     raise RuntimeError("save_trade_db returned False")
             except Exception as e:
