@@ -295,6 +295,20 @@ def validate_config_or_die(bot_name: str) -> dict:
                         f"trailing stop would sit at/below entry. Refusing to "
                         f"start.", "WARN")
                     _fatal_exit(1)
+        if (bot_name.upper() == "FUTURES"
+                and "PRE_ACTIVATION_GIVEBACK_STOP_ENABLED" in cfg):
+            from trading.futures_peak_trail import validate_peak_trail_config
+
+            _peak_config, peak_error = validate_peak_trail_config(
+                enabled=cfg.get("PRE_ACTIVATION_GIVEBACK_STOP_ENABLED"),
+                activation_mfe_pct=cfg.get("PRE_ACTIVATION_MIN_MFE_PCT"),
+                giveback_pct=cfg.get("PRE_ACTIVATION_GIVEBACK_PCT"),
+            )
+            if peak_error:
+                log_event(
+                    f"[FUTURES] FATAL: invalid peak trail config: "
+                    f"{peak_error}. Refusing to start.", "WARN")
+                _fatal_exit(1)
         _checks = (
             ("MONITOR_INTERVAL", 5, 600),
             ("MAX_OPEN_TRADES", 1, 50),

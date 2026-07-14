@@ -247,6 +247,9 @@ DEFAULT_CONFIG = {
         "SCAN_INTERVAL":     150,    # 5min would be too long for futures
         "MONITOR_INTERVAL":  18.0,
         "BREAKEVEN_TRIGGER": 2.0,    # Move SL to BE at +2% price move
+        "PRE_ACTIVATION_GIVEBACK_STOP_ENABLED": True,
+        "PRE_ACTIVATION_MIN_MFE_PCT": 1.5,
+        "PRE_ACTIVATION_GIVEBACK_PCT": 0.75,
         "USE_TREND_FILTER":  0,      # EMA200 filter off (toggle)
         "USE_LLM":           False,
         "COOLDOWN_AFTER_SL": 240,
@@ -412,6 +415,12 @@ PARAM_DEFS_FUTURES = [
      "Initial stop in raw price terms. -3.5% sits above normal coin noise."),
     ("BREAKEVEN_TRIGGER", "Breakeven At",         0.25,  0.0,  10.0,  ".2f", "%",
      "Move SL to entry when profit reaches this %. 0 = disabled. Risk-free trades once moving."),
+    ("PRE_ACTIVATION_GIVEBACK_STOP_ENABLED", "Peak Trail", 1.0, 0.0, 1.0, ".0f", "",
+     "1 = protect favorable moves before the partial close. 0 = disabled."),
+    ("PRE_ACTIVATION_MIN_MFE_PCT", "Peak Activation", 0.25, 0.25, 10.0, ".2f", "%",
+     "Favorable raw price move required before the pre-activation peak trail is armed."),
+    ("PRE_ACTIVATION_GIVEBACK_PCT", "Peak Giveback", 0.25, 0.25, 10.0, ".2f", "%",
+     "Raw percentage-point giveback from the best seen move that closes the position."),
     ("PARTIAL_SELL_PCT",  "Partial Close",        0.05,  0.05, 1.00,  ".2f", "",
      "Fraction closed at Activation TP. Rest moves to break-even with trailing."),
     ("RSI_MAX",           "RSI Max",              1.0,  40.0, 90.0,  ".0f", "",

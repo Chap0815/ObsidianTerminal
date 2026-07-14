@@ -108,6 +108,98 @@ class FuturesExitsMixin:
                 except Exception:
                     pass
 
+    def _record_peak_trail_execution(
+        self, sym: str, d: dict, *, reason: str,
+        decision_price: float, fill_price: float,
+        decision_move_pct: float, fill_move_pct: float,
+        mfe_pct: float, latency_ms: float, profit_usdt: float,
+        fees_usdt: float, funding_paid: float,
+        accounting_saved: bool, exchange_order_id=None,
+    ) -> None:
+        """Persist verified peak-exit execution quality without affecting close."""
+        if reason != "Pre-Activation Giveback Stop":
+            return
+        try:
+            from core.logger import log_struct
+            from trading.futures_peak_trail import build_execution_metrics
+
+            metrics = build_execution_metrics(
+                position_type=d.get("position_type"),
+                decision_price=decision_price,
+                fill_price=fill_price,
+                decision_move_pct=decision_move_pct,
+                fill_move_pct=fill_move_pct,
+                mfe_pct=mfe_pct,
+                latency_ms=latency_ms,
+            )
+            log_struct(
+                "futures_peak_trail_execution",
+                bot=self.BOT_NAME,
+                symbol=sym,
+                mode="SIM" if self.simulation else "LIVE",
+                entry_id=d.get("entry_id", ""),
+                direction=d.get("position_type", ""),
+                reason=reason,
+                accounting_saved=bool(accounting_saved),
+                exchange_order_id=exchange_order_id,
+                profit_usdt=round(float(profit_usdt), 6),
+                fees_usdt=round(float(fees_usdt), 6),
+                funding_paid=round(float(funding_paid), 6),
+                configured_activation_mfe_pct=self.C(
+                    "PRE_ACTIVATION_MIN_MFE_PCT", 1.5),
+                configured_giveback_pct=self.C(
+                    "PRE_ACTIVATION_GIVEBACK_PCT", 0.75),
+                **metrics,
+            )
+        except Exception as exc:
+            if not getattr(self, "_peak_trail_execution_error_logged", False):
+                self._peak_trail_execution_error_logged = True
+                try:
+                    self._log_error(f"peak trail execution telemetry {sym}", exc)
+                except Exception:
+                    pass
+
+    def _prepare_peak_trail_decision(
+        self, sym: str, d: dict, *, reason: str,
+        decision_price: float, decision_move_pct: float, mfe_pct: float,
+    ) -> dict:
+        """Keep the first peak-exit decision stable across close retries."""
+        if reason != "Pre-Activation Giveback Stop":
+            return d
+
+        decision_at = FuturesExitsMixin._safe_positive_float(
+            d.get("peak_trail_decision_at"), 0.0)
+        stored_price = FuturesExitsMixin._safe_positive_price(
+            d.get("peak_trail_decision_price"))
+        stored_move = FuturesExitsMixin._safe_finite_float(
+            d.get("peak_trail_decision_move_pct"), None)
+        stored_mfe = FuturesExitsMixin._safe_finite_float(
+            d.get("peak_trail_decision_mfe_pct"), None)
+        if (decision_at > 0.0 and stored_price > 0.0
+                and stored_move is not None and stored_mfe is not None):
+            return d
+
+        fields = {
+            "peak_trail_decision_at": time.time(),
+            "peak_trail_decision_price": decision_price,
+            "peak_trail_decision_move_pct": decision_move_pct,
+            "peak_trail_decision_mfe_pct": mfe_pct,
+        }
+        prepared = dict(d)
+        prepared.update(fields)
+        try:
+            if not self.state.update_many(sym, fields):
+                raise RuntimeError("state update returned False")
+        except Exception as exc:
+            if not getattr(self, "_peak_trail_decision_error_logged", False):
+                self._peak_trail_decision_error_logged = True
+                try:
+                    self._log_error(
+                        f"persist peak trail decision {sym}", exc)
+                except Exception:
+                    pass
+        return prepared
+
     @staticmethod
     def _safe_positive_price(value) -> float:
         if isinstance(value, bool):
@@ -979,7 +1071,14 @@ class FuturesExitsMixin:
             with close_lock(sym, bot_name=self.BOT_NAME) as got:
                 if not got or not self.state.has(sym):
                     return
-                self._execute_full_close(sym, d, curr, move_pct, pnl_usdt,
+                live = self.state.get(sym) or d
+                live = FuturesExitsMixin._prepare_peak_trail_decision(
+                    self, sym, live, reason=reason,
+                    decision_price=curr, decision_move_pct=move_pct,
+                    mfe_pct=FuturesExitsMixin._safe_finite_float(
+                        live.get("max_profit_pct"), move_pct),
+                )
+                self._execute_full_close(sym, live, curr, move_pct, pnl_usdt,
                                            entry, liq_price, margin, lev, pos_type, reason)
 
   #  Exit evaluation (pure decision) 
@@ -989,10 +1088,11 @@ class FuturesExitsMixin:
         """Decide whether to close. Returns (should_close, reason).
 
         Priority:
-  1. Liquidation buffer consumed  "Liq protection"
+          1. Liquidation buffer consumed  "Liq protection"
           2. Breakeven stop (when be_active)
           3. (Partial TP handled by caller)
-  4. Trailing or SL  depends on partial_sold state
+          4. Pre-activation peak giveback (FUTURES only, before first partial)
+          5. Trailing or SL  depends on partial_sold state
 
   ``sym`` is passed explicitly (the trades dict has no "symbol" field 
         sym is the outer key) so the ``initial_liq_distance`` heal-write
@@ -1029,6 +1129,43 @@ class FuturesExitsMixin:
                 d.get("be_price"), entry)
             if breakeven_stop_hit(curr, be_price, pos_type):
                 return True, "Breakeven-Stop"
+
+        # Protect a proven favorable move before the regular partial-TP arms.
+        # This is deliberately FUTURES-only: CROSS shares this class but has a
+        # separate portfolio exit model, while FUTREND owns an independent
+        # pre-activation giveback implementation.
+        if (str(getattr(self, "BOT_NAME", "")).upper() == "FUTURES"
+                and not d.get("partial_sold")
+                and not d.get("break_even")):
+            from trading.futures_peak_trail import (
+                PEAK_TRAIL_EXIT_REASON,
+                peak_trail_hit,
+                validate_peak_trail_config,
+            )
+
+            peak_config, peak_error = validate_peak_trail_config(
+                enabled=self.C(
+                    "PRE_ACTIVATION_GIVEBACK_STOP_ENABLED", True),
+                activation_mfe_pct=self.C(
+                    "PRE_ACTIVATION_MIN_MFE_PCT", 1.5),
+                giveback_pct=self.C(
+                    "PRE_ACTIVATION_GIVEBACK_PCT", 0.75),
+            )
+            if peak_error:
+                if getattr(self, "_peak_trail_config_warning", "") != peak_error:
+                    self._peak_trail_config_warning = peak_error
+                    log_event(
+                        f"[FUTURES] peak trail config ignored: {peak_error}",
+                        "WARN",
+                    )
+            else:
+                self._peak_trail_config_warning = ""
+                mfe_pct = FuturesExitsMixin._safe_finite_float(
+                    d.get("max_profit_pct"), move_pct)
+                if peak_trail_hit(
+                        move_pct=move_pct, mfe_pct=mfe_pct,
+                        config=peak_config):
+                    return True, PEAK_TRAIL_EXIT_REASON
 
   #  3. Trailing / SL 
         trailing_dist = FuturesExitsMixin._safe_finite_float(
@@ -1382,6 +1519,7 @@ class FuturesExitsMixin:
                                  verify_position_closed)
         from bot_utils.futures_order import _extract_order_fee_futures_known
 
+        close_started_mono = time.monotonic()
         symbol_full = f"{sym}/USDT:USDT"
         if d.get("verified_flat_pending_accounting"):
             log_event(
@@ -1637,10 +1775,24 @@ class FuturesExitsMixin:
 
         # PnL with real fill + funding + proportional entry fee
         move_pct_real = price_move_pct(entry, fill_price, pos_type) if entry > 0 else move_pct
+        peak_decision_at = FuturesExitsMixin._safe_positive_float(
+            d.get("peak_trail_decision_at"), 0.0)
+        if reason == "Pre-Activation Giveback Stop" and peak_decision_at > 0.0:
+            execution_latency_ms = max(
+                0.0, (time.time() - peak_decision_at) * 1000.0)
+        else:
+            execution_latency_ms = max(
+                0.0, (time.monotonic() - close_started_mono) * 1000.0)
         pnl_real, _ = (calc_unrealized_pnl(entry, fill_price, margin, lev, pos_type)
                         if entry > 0 and margin > 0 else (pnl_usdt, 0.0))
         mfe_pct = FuturesExitsMixin._safe_finite_float(
             d.get("max_profit_pct"), move_pct_real)
+        peak_decision_price = FuturesExitsMixin._safe_positive_float(
+            d.get("peak_trail_decision_price"), curr)
+        peak_decision_move_pct = FuturesExitsMixin._safe_finite_float(
+            d.get("peak_trail_decision_move_pct"), move_pct)
+        peak_decision_mfe_pct = FuturesExitsMixin._safe_finite_float(
+            d.get("peak_trail_decision_mfe_pct"), mfe_pct)
         mae_pct = FuturesExitsMixin._safe_finite_float(
             d.get("min_profit_pct"), move_pct_real)
         giveback_pct = max(0.0, mfe_pct - move_pct_real)
@@ -1763,7 +1915,29 @@ class FuturesExitsMixin:
                 log_event(
                     f"mark accounting_pending {sym} failed: {state_err}",
                     "WARN")
+            FuturesExitsMixin._record_peak_trail_execution(
+                self, sym, d, reason=reason,
+                decision_price=peak_decision_price, fill_price=fill_price,
+                decision_move_pct=peak_decision_move_pct,
+                fill_move_pct=move_pct_real,
+                mfe_pct=peak_decision_mfe_pct,
+                latency_ms=execution_latency_ms,
+                profit_usdt=profit_usdt, fees_usdt=slice_fees,
+                funding_paid=funding_pd, accounting_saved=False,
+                exchange_order_id=exch_oid,
+            )
             return
+        FuturesExitsMixin._record_peak_trail_execution(
+            self, sym, d, reason=reason,
+            decision_price=peak_decision_price, fill_price=fill_price,
+            decision_move_pct=peak_decision_move_pct,
+            fill_move_pct=move_pct_real,
+            mfe_pct=peak_decision_mfe_pct,
+            latency_ms=execution_latency_ms,
+            profit_usdt=profit_usdt, fees_usdt=slice_fees,
+            funding_paid=funding_pd, accounting_saved=True,
+            exchange_order_id=exch_oid,
+        )
         try:
             save_trade(
                 log_dir=self.LOG_DIR, symbol=sym,

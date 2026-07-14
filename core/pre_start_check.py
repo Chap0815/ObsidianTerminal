@@ -63,7 +63,7 @@ def _read_config() -> tuple[dict, list[CheckIssue]]:
 def _to_bool(value) -> bool | None:
     if isinstance(value, bool):
         return value
-    if isinstance(value, int) and value in (0, 1):
+    if isinstance(value, (int, float)) and value in (0, 1):
         return bool(value)
     if isinstance(value, str):
         s = value.strip().lower()
@@ -367,6 +367,18 @@ def _check_config(bot_name: str | None,
             except Exception:
                 issues.append(_issue("error", "trailing_numeric",
                                      f"{name}: trailing/activation not numeric"))
+        if name == "FUTURES" and "PRE_ACTIVATION_GIVEBACK_STOP_ENABLED" in section:
+            from trading.futures_peak_trail import validate_peak_trail_config
+
+            _peak_config, peak_error = validate_peak_trail_config(
+                enabled=section.get("PRE_ACTIVATION_GIVEBACK_STOP_ENABLED"),
+                activation_mfe_pct=section.get("PRE_ACTIVATION_MIN_MFE_PCT"),
+                giveback_pct=section.get("PRE_ACTIVATION_GIVEBACK_PCT"),
+            )
+            if peak_error:
+                issues.append(_issue(
+                    "error", "pre_activation_peak_trail_invalid",
+                    f"FUTURES: invalid peak trail config: {peak_error}"))
         bounded_numeric = (
             ("TREND_VOTE_MIN", 1.0, 3.0),
             ("TREND_EXIT_VOTE", 1.0, 3.0),

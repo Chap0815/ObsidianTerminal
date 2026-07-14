@@ -1,13 +1,13 @@
 {
-  "build_id": "e98100db78819aa5",
-  "created_at": "2026-07-12 16:36:45",
+  "build_id": "e4a944a97e34463a",
+  "created_at": "2026-07-14 13:12:06",
   "source": "update_deploy_manifest.py",
-  "file_count": 149,
+  "file_count": 150,
   "files": [
     {
       "path": "bot_config.default.json",
-      "sha256": "1e897e0c31e052d0c0b4bfef1eaa522c8874196ea0cfd9f9a74b9b65f4af9cb9",
-      "bytes": 8409
+      "sha256": "e78bf82b0fa37a976b2e6c67aa61197a104fe2da597911180175de61a07855ec",
+      "bytes": 8589
     },
     {
       "path": "bot_utils/__init__.py",
@@ -176,8 +176,8 @@
     },
     {
       "path": "bots/main_bot_futures.py",
-      "sha256": "6ff466448e63025f68b54ba51a3beba6ce76dea95fbc750f5079ac3553a4660f",
-      "bytes": 3075
+      "sha256": "60f06a356967f5d3c94e2190966df263ba3624f584dc885d388b6dc005cbad5e",
+      "bytes": 3217
     },
     {
       "path": "bots/main_bot_trendfut.py",
@@ -246,13 +246,13 @@
     },
     {
       "path": "core/futures_bot.py",
-      "sha256": "8018dfb5c60f5f579906db12eeff9004957250817d410c3af597e595cd23974b",
-      "bytes": 32653
+      "sha256": "f8cd55b35713d21036c6baa747036dab1ccfb5c94ac9a3d0dbb37902f06d1c29",
+      "bytes": 33324
     },
     {
       "path": "core/futures_bot_exits.py",
-      "sha256": "6efbb068eb8f23040a92e13f8c7d9dc4995c21717c75b60a94186141ad147d98",
-      "bytes": 86556
+      "sha256": "9c212f3307ab974070ee312259fa9cac0cadcba1b5fca42438acc0ba5871763a",
+      "bytes": 94705
     },
     {
       "path": "core/futures_bot_reconcile.py",
@@ -281,8 +281,8 @@
     },
     {
       "path": "core/pre_start_check.py",
-      "sha256": "82f37aca8138642e09292f707623a0f4ce15493f4cd869cf55e2e75a41dc401d",
-      "bytes": 22835
+      "sha256": "95807192f14f27d7a1bebf5bd87ed9bfea0cf1aab5c4f6bda9e16a1984182a0c",
+      "bytes": 23521
     },
     {
       "path": "core/process_identity.py",
@@ -366,8 +366,8 @@
     },
     {
       "path": "launcher/config/settings.py",
-      "sha256": "717a8baf6604e1fed43039b2a1e3d89d555e504e937c2e7dee5b9c9ba4512a2f",
-      "bytes": 46342
+      "sha256": "9dc181d9d37cf57f48ff09899d91301bdea3a1596b4495cb33bc76de5b5f1e6b",
+      "bytes": 46992
     },
     {
       "path": "launcher/core/__init__.py",
@@ -690,14 +690,19 @@
       "bytes": 4027
     },
     {
+      "path": "trading/futures_peak_trail.py",
+      "sha256": "c096cb72cc080270e9b1dc553f247e48e2f434ba68849bdf10ea0bdd9129ec96",
+      "bytes": 4364
+    },
+    {
       "path": "trading/market_filters.py",
       "sha256": "5c1667c5a6ac720daf644cf9b61f11078ed826016c7a2fa2b822332ae5ffd66d",
       "bytes": 28004
     },
     {
       "path": "trading/risk_manager.py",
-      "sha256": "f7439b2a65690ce462777dbd4ac6194a0ca62f0c67bd0e49fa0cf99508ffcf85",
-      "bytes": 49023
+      "sha256": "8d6eb11e17f802c9cece94dc5ec0bae4518c3379178214d26700856dec92b9ee",
+      "bytes": 49727
     },
     {
       "path": "trading/runtime_observability.py",

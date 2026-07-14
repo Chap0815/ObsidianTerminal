@@ -198,6 +198,13 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "START"
         )
         log_event(
+            f"Pre-Activation Peak Trail: "
+            f"{self.C('PRE_ACTIVATION_GIVEBACK_STOP_ENABLED', True)}  "
+            f"MFE: +{self.C('PRE_ACTIVATION_MIN_MFE_PCT', 1.5)}%  "
+            f"Giveback: {self.C('PRE_ACTIVATION_GIVEBACK_PCT', 0.75)}%",
+            "START"
+        )
+        log_event(
             f"Scan: {self.C('SCAN_INTERVAL')}s  "
             f"Monitor: {self.C('MONITOR_INTERVAL', self.DEFAULT_MONITOR_INTERVAL)}s",
             "START"
@@ -216,6 +223,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     activation_tp=self.C("ACTIVATION_PROFIT"),
                     trail=self.C("TRAILING_DISTANCE"),
                     breakeven_trigger=self.C("BREAKEVEN_TRIGGER"),
+                    pre_activation_peak_trail_enabled=self.C(
+                        "PRE_ACTIVATION_GIVEBACK_STOP_ENABLED", True),
+                    pre_activation_min_mfe_pct=self.C(
+                        "PRE_ACTIVATION_MIN_MFE_PCT", 1.5),
+                    pre_activation_giveback_pct=self.C(
+                        "PRE_ACTIVATION_GIVEBACK_PCT", 0.75),
                     scan_interval=self.C("SCAN_INTERVAL"),
                     monitor_interval=self.C("MONITOR_INTERVAL",
                                              self.DEFAULT_MONITOR_INTERVAL))
