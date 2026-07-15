@@ -379,6 +379,22 @@ def _check_config(bot_name: str | None,
                 issues.append(_issue(
                     "error", "pre_activation_peak_trail_invalid",
                     f"FUTURES: invalid peak trail config: {peak_error}"))
+        if name == "FUTURES" and "MFE_FALLBACK_STOP_ENABLED" in section:
+            from trading.futures_mfe_fallback import (
+                validate_mfe_fallback_config,
+            )
+
+            _fallback_config, fallback_error = validate_mfe_fallback_config(
+                enabled=section.get("MFE_FALLBACK_STOP_ENABLED"),
+                min_age_minutes=section.get("MFE_FALLBACK_MIN_AGE_MINUTES"),
+                min_mfe_pct=section.get("MFE_FALLBACK_MIN_MFE_PCT"),
+                exit_move_pct=section.get("MFE_FALLBACK_EXIT_MOVE_PCT"),
+                initial_stop_loss_pct=section.get("INITIAL_STOP_LOSS"),
+            )
+            if fallback_error:
+                issues.append(_issue(
+                    "error", "mfe_fallback_invalid",
+                    f"FUTURES: invalid MFE fallback config: {fallback_error}"))
         bounded_numeric = (
             ("TREND_VOTE_MIN", 1.0, 3.0),
             ("TREND_EXIT_VOTE", 1.0, 3.0),

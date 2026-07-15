@@ -205,6 +205,14 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "START"
         )
         log_event(
+            f"Aged MFE Fallback: "
+            f"{self.C('MFE_FALLBACK_STOP_ENABLED', True)}  "
+            f"Age: {self.C('MFE_FALLBACK_MIN_AGE_MINUTES', 45.0)}min  "
+            f"MFE: +{self.C('MFE_FALLBACK_MIN_MFE_PCT', 0.8)}%  "
+            f"Exit: {self.C('MFE_FALLBACK_EXIT_MOVE_PCT', -1.5)}%",
+            "START"
+        )
+        log_event(
             f"Scan: {self.C('SCAN_INTERVAL')}s  "
             f"Monitor: {self.C('MONITOR_INTERVAL', self.DEFAULT_MONITOR_INTERVAL)}s",
             "START"
@@ -229,6 +237,14 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                         "PRE_ACTIVATION_MIN_MFE_PCT", 1.5),
                     pre_activation_giveback_pct=self.C(
                         "PRE_ACTIVATION_GIVEBACK_PCT", 0.75),
+                    mfe_fallback_enabled=self.C(
+                        "MFE_FALLBACK_STOP_ENABLED", True),
+                    mfe_fallback_min_age_minutes=self.C(
+                        "MFE_FALLBACK_MIN_AGE_MINUTES", 45.0),
+                    mfe_fallback_min_mfe_pct=self.C(
+                        "MFE_FALLBACK_MIN_MFE_PCT", 0.8),
+                    mfe_fallback_exit_move_pct=self.C(
+                        "MFE_FALLBACK_EXIT_MOVE_PCT", -1.5),
                     scan_interval=self.C("SCAN_INTERVAL"),
                     monitor_interval=self.C("MONITOR_INTERVAL",
                                              self.DEFAULT_MONITOR_INTERVAL))

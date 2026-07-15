@@ -1088,17 +1088,27 @@ class FuturesExitsMixin:
         """Decide whether to close. Returns (should_close, reason).
 
         Priority:
-          1. Liquidation buffer consumed  "Liq protection"
-          2. Breakeven stop (when be_active)
-          3. (Partial TP handled by caller)
-          4. Pre-activation peak giveback (FUTURES only, before first partial)
-          5. Trailing or SL  depends on partial_sold state
+          1. Previously verified partial full-close retry
+          2. Liquidation buffer consumed  "Liq protection"
+          3. Breakeven stop (when be_active)
+          4. (Partial TP handled by caller)
+          5. Pre-activation peak giveback (FUTURES only, before first partial)
+          6. Age-gated MFE fallback (owned FUTURES positions only)
+          7. Trailing or SL  depends on partial_sold state
 
   ``sym`` is passed explicitly (the trades dict has no "symbol" field 
         sym is the outer key) so the ``initial_liq_distance`` heal-write
         targets the right row.
         """
         from core.logger import log_event
+
+        # A verified fragment from a previous full-close attempt commits the
+        # position to flattening. Do not let a price rebound cancel the retry.
+        pending_filled = FuturesExitsMixin._safe_nonnegative_amount(
+            d.get("pending_close_filled_amount"))
+        if pending_filled > 0.0:
+            pending_reason = str(d.get("pending_close_reason") or "").strip()
+            return True, pending_reason or "Pending Full Close Retry"
 
   #  1. Liquidation protection (highest priority) 
         initial_liq_dist = FuturesExitsMixin._safe_positive_float(
@@ -1166,6 +1176,45 @@ class FuturesExitsMixin:
                         move_pct=move_pct, mfe_pct=mfe_pct,
                         config=peak_config):
                     return True, PEAK_TRAIL_EXIT_REASON
+
+        # Cut a failed favorable excursion only after enough observation time.
+        # Adopted positions have incomplete path history and an adoption-time
+        # timestamp, so they are intentionally outside this rule.
+        if (str(getattr(self, "BOT_NAME", "")).upper() == "FUTURES"
+                and not d.get("partial_sold")
+                and not d.get("break_even")
+                and not d.get("adopted")):
+            from trading.futures_mfe_fallback import (
+                MFE_FALLBACK_EXIT_REASON,
+                mfe_fallback_hit,
+                validate_mfe_fallback_config,
+            )
+
+            fallback_config, fallback_error = validate_mfe_fallback_config(
+                enabled=self.C("MFE_FALLBACK_STOP_ENABLED", True),
+                min_age_minutes=self.C(
+                    "MFE_FALLBACK_MIN_AGE_MINUTES", 45.0),
+                min_mfe_pct=self.C("MFE_FALLBACK_MIN_MFE_PCT", 0.8),
+                exit_move_pct=self.C("MFE_FALLBACK_EXIT_MOVE_PCT", -1.5),
+                initial_stop_loss_pct=self.C("INITIAL_STOP_LOSS", -4.0),
+            )
+            if fallback_error:
+                if (getattr(self, "_mfe_fallback_config_warning", "")
+                        != fallback_error):
+                    self._mfe_fallback_config_warning = fallback_error
+                    log_event(
+                        f"[FUTURES] MFE fallback config ignored: "
+                        f"{fallback_error}",
+                        "WARN",
+                    )
+            else:
+                self._mfe_fallback_config_warning = ""
+                mfe_pct = FuturesExitsMixin._safe_finite_float(
+                    d.get("max_profit_pct"), move_pct)
+                if mfe_fallback_hit(
+                        buy_time=d.get("buy_time"), move_pct=move_pct,
+                        mfe_pct=mfe_pct, config=fallback_config):
+                    return True, MFE_FALLBACK_EXIT_REASON
 
   #  3. Trailing / SL 
         trailing_dist = FuturesExitsMixin._safe_finite_float(
@@ -1689,10 +1738,13 @@ class FuturesExitsMixin:
                             self.ex, order or {}, symbol_full, fill_price,
                             amount=order_filled, contract_size=contract_size,
                         )
-                        self.state.update_many(sym, add_close_fragment_update(
+                        fragment_update = add_close_fragment_update(
                             d, amount=order_filled, price=fill_price,
                             fee=frag_fee, order_id=exch_oid,
-                        ))
+                        )
+                        fragment_update["pending_close_reason"] = str(
+                            reason or "Pending Full Close Retry")
+                        self.state.update_many(sym, fragment_update)
                     except Exception:
                         pass
                 self._log_error(f"verify-close {sym}", e)
@@ -1713,10 +1765,13 @@ class FuturesExitsMixin:
                                 self.ex, order or {}, symbol_full, fill_price,
                                 amount=fragment, contract_size=contract_size,
                             )
-                            self.state.update_many(sym, add_close_fragment_update(
+                            fragment_update = add_close_fragment_update(
                                 d, amount=fragment, price=fill_price,
                                 fee=frag_fee, order_id=exch_oid,
-                            ))
+                            )
+                            fragment_update["pending_close_reason"] = str(
+                                reason or "Pending Full Close Retry")
+                            self.state.update_many(sym, fragment_update)
                     except Exception:
                         pass
                     log_event(

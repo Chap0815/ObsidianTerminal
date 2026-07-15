@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-07-15
+
+- Added an active FUTURES-only aged-MFE fallback: an owned, non-adopted,
+  pre-partial position closes after at least 45 minutes when it previously
+  reached +0.8% MFE and subsequently falls to -1.5% raw price move.
+- Added fail-closed startup and hot-config validation, explicit startup
+  telemetry, a distinct accounting reason and loss-only re-entry cooldown for
+  the new protective exit. Existing liquidation, breakeven and peak-trail
+  exits retain priority; CROSS and FUTREND behavior is unchanged.
+- Persisted verified partial full-close intent and its original reason so a
+  price rebound or bot restart cannot cancel the remaining reduce-only retry.
+- Aligned direct-config validation with launcher bounds while allowing users
+  with an already tighter regular stop to start normally; in that case the
+  regular stop simply makes the fallback redundant.
+
 ## 2026-07-12
 
 - Set the packaged entry-quality default to 75 for SPOT, FUTURES, CROSS and

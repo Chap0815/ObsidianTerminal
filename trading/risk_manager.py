@@ -309,6 +309,24 @@ def validate_config_or_die(bot_name: str) -> dict:
                     f"[FUTURES] FATAL: invalid peak trail config: "
                     f"{peak_error}. Refusing to start.", "WARN")
                 _fatal_exit(1)
+        if (bot_name.upper() == "FUTURES"
+                and "MFE_FALLBACK_STOP_ENABLED" in cfg):
+            from trading.futures_mfe_fallback import (
+                validate_mfe_fallback_config,
+            )
+
+            _fallback_config, fallback_error = validate_mfe_fallback_config(
+                enabled=cfg.get("MFE_FALLBACK_STOP_ENABLED"),
+                min_age_minutes=cfg.get("MFE_FALLBACK_MIN_AGE_MINUTES"),
+                min_mfe_pct=cfg.get("MFE_FALLBACK_MIN_MFE_PCT"),
+                exit_move_pct=cfg.get("MFE_FALLBACK_EXIT_MOVE_PCT"),
+                initial_stop_loss_pct=cfg.get("INITIAL_STOP_LOSS"),
+            )
+            if fallback_error:
+                log_event(
+                    f"[FUTURES] FATAL: invalid MFE fallback config: "
+                    f"{fallback_error}. Refusing to start.", "WARN")
+                _fatal_exit(1)
         _checks = (
             ("MONITOR_INTERVAL", 5, 600),
             ("MAX_OPEN_TRADES", 1, 50),

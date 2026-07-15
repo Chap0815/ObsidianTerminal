@@ -41,7 +41,8 @@ def _utcnow() -> datetime:
 # stop can be re-bought on the very next scan tick (fee-bleed re-entry spam).
 _STOP_EXIT_REASONS = ("Stop-Loss", "Trailing Stop",
                       "Break-Even Stop", "Breakeven-Stop",
-                      "Pre-Activation Giveback Stop")
+                      "Pre-Activation Giveback Stop",
+                      "Aged MFE Fallback Stop")
 
 
 def should_cooldown_after_exit(reason: str, profit_usdt: float) -> bool:
