@@ -1,6 +1,6 @@
 {
-  "build_id": "d091b28a7ce0d47c",
-  "created_at": "2026-07-15 08:03:07",
+  "build_id": "8cd7c44219205b29",
+  "created_at": "2026-07-16 09:56:33",
   "source": "update_deploy_manifest.py",
   "file_count": 151,
   "files": [
@@ -176,8 +176,8 @@
     },
     {
       "path": "bots/main_bot_futures.py",
-      "sha256": "4e9ce46147b9001740b3790d5f04e248c2305986ffd232a72693ae5cc2a55aef",
-      "bytes": 3391
+      "sha256": "cebaa187c73279548e9bda049ee5c1beeb53480acc7d28001dedd8480f4fd991",
+      "bytes": 3425
     },
     {
       "path": "bots/main_bot_trendfut.py",
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "e934b5128b3d5fc47fca1756dda1201922c4796dd0f80225b3679dbeb9b86de0",
-      "bytes": 49406
+      "sha256": "a935b53a0972f38e29b437976a1cdc8921423cb3d8a4e31f2fbb56c106e3ab4b",
+      "bytes": 49888
     },
     {
       "path": "config/__init__.py",
@@ -246,8 +246,8 @@
     },
     {
       "path": "core/futures_bot.py",
-      "sha256": "fb7501cce08031819439a90522425324b46c0205eaa951fbf90df60c99bf2b02",
-      "bytes": 34131
+      "sha256": "2ea7de11ecffafb877ecdede27d71a567181495a567868cfd24b3b22822f7c73",
+      "bytes": 34791
     },
     {
       "path": "core/futures_bot_exits.py",
@@ -301,18 +301,18 @@
     },
     {
       "path": "core/spot_bot_exits.py",
-      "sha256": "66118fd577b8b4998c94f3d1c5beede76d721b0a0a4105a3ad770798cadc0c5c",
-      "bytes": 60031
+      "sha256": "54d35911bd47efab33bc0d88b61481117ec1249c28e132660e4c47cdbe633eb9",
+      "bytes": 62290
     },
     {
       "path": "core/spot_bot_reconcile.py",
-      "sha256": "cfc5fa49f67873c054abe56329428f5eade4390f3b524ccbba62c9eb84a42ced",
-      "bytes": 52537
+      "sha256": "22e36a1b86f8d56237fe3e3724f02e4611992b897ba972739555d1c6f19ee716",
+      "bytes": 54050
     },
     {
       "path": "core/spot_bot_scan.py",
-      "sha256": "1e6796e3e061de0a8d1e57cff41ac4ed58c6bc132488b359853921d3972fc6a3",
-      "bytes": 62204
+      "sha256": "4932a92f58a5003299bad0635483896c430447459dc0fc0e0fc7579188e583f9",
+      "bytes": 62338
     },
     {
       "path": "core/state_manager.py",

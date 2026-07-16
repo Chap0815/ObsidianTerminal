@@ -41,6 +41,7 @@ class FuturesExchangeBot(FuturesBot):
     COOLDOWN_FILE = f"{LOG_DIR}/cooldown.json"
     NEWS_MODULE_PATH = "news.news_brain_futures"
     BUY_PREFIX = "fut"
+    USES_AGED_MFE_FALLBACK = True
     BACKTEST_NOTE = (
         "Futures: LONG/SHORT at 3x leverage. "
         "Strict daily-loss killswitch + safe-mode on slippage anomalies."

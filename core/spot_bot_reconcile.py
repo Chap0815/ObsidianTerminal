@@ -348,9 +348,26 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
                 entry_fee = 0.0
                 close_fee = fees_total
 
+        from core.spot_bot_exits import _spot_excursion_metrics
+        mfe_pct, mae_pct, giveback_pct = _spot_excursion_metrics(
+            state_row, close_price)
+        if pending_accounting:
+            pending_mfe = _finite_float_or_none(
+                state_row.get("accounting_pending_mfe_pct"))
+            pending_mae = _finite_float_or_none(
+                state_row.get("accounting_pending_mae_pct"))
+            pending_giveback = _finite_float_or_none(
+                state_row.get("accounting_pending_giveback_pct"))
+            if pending_mfe is not None:
+                mfe_pct = max(0.0, pending_mfe)
+            if pending_mae is not None:
+                mae_pct = min(0.0, pending_mae)
+            if pending_giveback is not None:
+                giveback_pct = max(0.0, pending_giveback)
+
         if not all(math.isfinite(v) for v in (
             buy, amount, close_price, invested, entry_fee, close_fee,
-            net_pnl, profit_pct,
+            net_pnl, profit_pct, mfe_pct, mae_pct, giveback_pct,
         )):
             log_event(
                 f" {sym}: offline-close skipped  non-finite accounting value",
@@ -375,6 +392,9 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
             entry_quality_label=state_row.get("entry_quality_label"),
             entry_quality_reasons=state_row.get("entry_quality_reasons"),
             entry_id=state_row.get("entry_id"),
+            mfe_pct=mfe_pct,
+            mae_pct=mae_pct,
+            giveback_pct=giveback_pct,
         )
         if not saved:
             log_event(
@@ -501,6 +521,7 @@ def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
         "break_even": _is_true_bool(extra.get("break_even")),
         "be_active": _is_true_bool(extra.get("be_active")),
         "highest": highest,
+        "lowest": buy_price,
         "initial_entry_fee": initial_entry_fee,
         "fees_paid": fees_paid,
     }
@@ -614,9 +635,12 @@ def _record_spot_external_partial(bot, sym: str, state_row: dict,
     gross = sold_amount * (close_price - buy)
     profit_usdt = round(gross - entry_fee - close_fee, 4)
     profit_pct = ((close_price - buy) / buy) * 100 if buy > 0 else 0.0
+    from core.spot_bot_exits import _spot_excursion_metrics
+    mfe_pct, mae_pct, giveback_pct = _spot_excursion_metrics(
+        state_row, close_price)
     if not all(math.isfinite(v) for v in (
         close_price, close_fee, entry_fee, gross, profit_usdt, profit_pct,
-        invested_sold, invested_remaining,
+        invested_sold, invested_remaining, mfe_pct, mae_pct, giveback_pct,
     )):
         log_event(
             f" Spot reconciliation: {sym} external partial skipped  "
@@ -644,6 +668,13 @@ def _record_spot_external_partial(bot, sym: str, state_row: dict,
             f"{state_row.get('buy_time', '')}:"
             f"{local_amt:.12g}->{remaining_amount:.12g}"
         ),
+        "entry_quality_score": state_row.get("entry_quality_score"),
+        "entry_quality_label": state_row.get("entry_quality_label"),
+        "entry_quality_reasons": state_row.get("entry_quality_reasons"),
+        "entry_id": state_row.get("entry_id"),
+        "mfe_pct": mfe_pct,
+        "mae_pct": mae_pct,
+        "giveback_pct": giveback_pct,
     }
     saved = bool(save_trade_db(**item))
     fields = {

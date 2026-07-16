@@ -66,6 +66,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
     NEWS_MODULE_PATH: str = "news.news_brain_futures"
     BUY_PREFIX: str = "fut"
     BACKTEST_NOTE: str = ""
+    # Only the directional FUTURES implementation uses the aged MFE fallback
+    # exit in FuturesExitsMixin. CROSS and FUTREND share this lifecycle class
+    # but have separate exit engines and must not advertise that control.
+    USES_AGED_MFE_FALLBACK: bool = False
 
     # Reconciliation cadence (constants  could be overridden if needed)
     RECONCILE_INTERVAL_SEC: int = 300   # orphan-adoption safety net cadence
@@ -136,6 +140,21 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
     def _log_error(self, context: str, exc: Exception) -> None:
         _ext_log_error(self.BOT_NAME, context, exc)
 
+    def _startup_mfe_fallback_fields(self) -> dict[str, Any]:
+        """Return only telemetry for an exit capability this bot actually uses."""
+        if not self.USES_AGED_MFE_FALLBACK:
+            return {}
+        return {
+            "mfe_fallback_enabled": self.C(
+                "MFE_FALLBACK_STOP_ENABLED", True),
+            "mfe_fallback_min_age_minutes": self.C(
+                "MFE_FALLBACK_MIN_AGE_MINUTES", 45.0),
+            "mfe_fallback_min_mfe_pct": self.C(
+                "MFE_FALLBACK_MIN_MFE_PCT", 0.8),
+            "mfe_fallback_exit_move_pct": self.C(
+                "MFE_FALLBACK_EXIT_MOVE_PCT", -1.5),
+        }
+
     #  Run 
 
     def run(self) -> None:
@@ -204,14 +223,19 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             f"Giveback: {self.C('PRE_ACTIVATION_GIVEBACK_PCT', 0.75)}%",
             "START"
         )
-        log_event(
-            f"Aged MFE Fallback: "
-            f"{self.C('MFE_FALLBACK_STOP_ENABLED', True)}  "
-            f"Age: {self.C('MFE_FALLBACK_MIN_AGE_MINUTES', 45.0)}min  "
-            f"MFE: +{self.C('MFE_FALLBACK_MIN_MFE_PCT', 0.8)}%  "
-            f"Exit: {self.C('MFE_FALLBACK_EXIT_MOVE_PCT', -1.5)}%",
-            "START"
-        )
+        mfe_fallback_fields = self._startup_mfe_fallback_fields()
+        if mfe_fallback_fields:
+            log_event(
+                f"Aged MFE Fallback: "
+                f"{mfe_fallback_fields['mfe_fallback_enabled']}  "
+                f"Age: "
+                f"{mfe_fallback_fields['mfe_fallback_min_age_minutes']}min  "
+                f"MFE: +"
+                f"{mfe_fallback_fields['mfe_fallback_min_mfe_pct']}%  "
+                f"Exit: "
+                f"{mfe_fallback_fields['mfe_fallback_exit_move_pct']}%",
+                "START"
+            )
         log_event(
             f"Scan: {self.C('SCAN_INTERVAL')}s  "
             f"Monitor: {self.C('MONITOR_INTERVAL', self.DEFAULT_MONITOR_INTERVAL)}s",
@@ -219,35 +243,31 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         )
         log_separator("", color=self.BOT_COLOR)
 
-        log_struct("bot_started",
-                    bot=self.BOT_NAME, simulation=self.simulation,
-                    build_id=build_info.get("build_id", "unknown"),
-                    build_source=build_info.get("source", "fallback"),
-                    leverage=self.C("LEVERAGE"),
-                    max_trades=self.C("MAX_OPEN_TRADES"),
-                    position_size=self.C("POSITION_SIZE"),
-                    liq_safety_pct=self.C("LIQ_SAFETY_PCT"),
-                    stop_loss=self.C("INITIAL_STOP_LOSS"),
-                    activation_tp=self.C("ACTIVATION_PROFIT"),
-                    trail=self.C("TRAILING_DISTANCE"),
-                    breakeven_trigger=self.C("BREAKEVEN_TRIGGER"),
-                    pre_activation_peak_trail_enabled=self.C(
-                        "PRE_ACTIVATION_GIVEBACK_STOP_ENABLED", True),
-                    pre_activation_min_mfe_pct=self.C(
-                        "PRE_ACTIVATION_MIN_MFE_PCT", 1.5),
-                    pre_activation_giveback_pct=self.C(
-                        "PRE_ACTIVATION_GIVEBACK_PCT", 0.75),
-                    mfe_fallback_enabled=self.C(
-                        "MFE_FALLBACK_STOP_ENABLED", True),
-                    mfe_fallback_min_age_minutes=self.C(
-                        "MFE_FALLBACK_MIN_AGE_MINUTES", 45.0),
-                    mfe_fallback_min_mfe_pct=self.C(
-                        "MFE_FALLBACK_MIN_MFE_PCT", 0.8),
-                    mfe_fallback_exit_move_pct=self.C(
-                        "MFE_FALLBACK_EXIT_MOVE_PCT", -1.5),
-                    scan_interval=self.C("SCAN_INTERVAL"),
-                    monitor_interval=self.C("MONITOR_INTERVAL",
-                                             self.DEFAULT_MONITOR_INTERVAL))
+        started_fields = {
+            "bot": self.BOT_NAME,
+            "simulation": self.simulation,
+            "build_id": build_info.get("build_id", "unknown"),
+            "build_source": build_info.get("source", "fallback"),
+            "leverage": self.C("LEVERAGE"),
+            "max_trades": self.C("MAX_OPEN_TRADES"),
+            "position_size": self.C("POSITION_SIZE"),
+            "liq_safety_pct": self.C("LIQ_SAFETY_PCT"),
+            "stop_loss": self.C("INITIAL_STOP_LOSS"),
+            "activation_tp": self.C("ACTIVATION_PROFIT"),
+            "trail": self.C("TRAILING_DISTANCE"),
+            "breakeven_trigger": self.C("BREAKEVEN_TRIGGER"),
+            "pre_activation_peak_trail_enabled": self.C(
+                "PRE_ACTIVATION_GIVEBACK_STOP_ENABLED", True),
+            "pre_activation_min_mfe_pct": self.C(
+                "PRE_ACTIVATION_MIN_MFE_PCT", 1.5),
+            "pre_activation_giveback_pct": self.C(
+                "PRE_ACTIVATION_GIVEBACK_PCT", 0.75),
+            "scan_interval": self.C("SCAN_INTERVAL"),
+            "monitor_interval": self.C(
+                "MONITOR_INTERVAL", self.DEFAULT_MONITOR_INTERVAL),
+        }
+        started_fields.update(mfe_fallback_fields)
+        log_struct("bot_started", **started_fields)
 
         # Validate the news module only when the strategy is configured to use
         # it. With USE_LLM=false the bot is a signal engine and must not emit

@@ -74,6 +74,32 @@ def _positive_finite(value, default: float = 0.0) -> float:
     return parsed if parsed > 0 else default
 
 
+def _spot_excursion_metrics(d: dict, exit_price: float) -> tuple[float, float, float]:
+    """Return finite SPOT MFE, MAE and close-time giveback percentages.
+
+    SPOT positions are long-only. The actual fill participates in the extrema
+    so close slippage is not hidden. Legacy rows without ``lowest`` start their
+    adverse history at entry/the observed fill instead of inventing a historic
+    low that was never recorded.
+    """
+    buy = _positive_finite(d.get("buy_price"), 0.0)
+    if buy <= 0:
+        buy = _positive_finite(d.get("buy"), 0.0)
+    fill = _positive_finite(exit_price, buy)
+    if buy <= 0 or fill <= 0:
+        return 0.0, 0.0, 0.0
+
+    highest = _positive_finite(d.get("highest"), buy)
+    lowest = _positive_finite(d.get("lowest"), min(buy, fill))
+    highest = max(buy, fill, highest)
+    lowest = min(buy, fill, lowest)
+    move_pct = ((fill - buy) / buy) * 100.0
+    mfe_pct = max(0.0, ((highest - buy) / buy) * 100.0)
+    mae_pct = min(0.0, ((lowest - buy) / buy) * 100.0)
+    giveback_pct = max(0.0, mfe_pct - move_pct)
+    return mfe_pct, mae_pct, giveback_pct
+
+
 def _utc_now_str() -> str:
     """Exchange-anchored UTC timestamp. sell_time is later read by funding
     estimation that assumes UTC, so a local-time stamp would mis-attribute
@@ -611,17 +637,31 @@ class ExitsMixin:
         self._maybe_persist_last_price(sym, curr)
         d["last_price"] = curr
 
-        # Update highest
-        if curr > d.get("highest", buy):
-            self.state.update(sym, "highest", curr)
-            d["highest"] = curr  # keep local copy in sync for later math
+        # Track both favorable and adverse excursion. Older positions may not
+        # yet have ``lowest``; seed them from entry/current on the first tick.
+        highest = _positive_finite(d.get("highest"), buy)
+        lowest = _positive_finite(d.get("lowest"), min(buy, curr))
+        extrema_updates = {}
+        if curr > highest:
+            highest = curr
+            extrema_updates["highest"] = curr
+        elif "highest" not in d:
+            extrema_updates["highest"] = highest
+        if curr < lowest:
+            lowest = curr
+            extrema_updates["lowest"] = curr
+        elif "lowest" not in d:
+            extrema_updates["lowest"] = lowest
+        if extrema_updates:
+            self.state.update_many(sym, extrema_updates)
+            d.update(extrema_updates)
 
         if d.get("closing_retry_pending"):
             self._execute_full_exit(
                 sym, d, curr, d.get("closing_retry_reason") or "Close Retry")
             return
 
-        highest = d.get("highest", buy)
+        highest = _positive_finite(d.get("highest"), buy)
         high_prof = ((highest - buy) / buy) * 100
 
         # Breakeven activation
@@ -945,6 +985,7 @@ class ExitsMixin:
 
         sold_invested = sold_amount * buy
         slice_fees_total = prop_entry_fee + partial_fee
+        mfe_pct, mae_pct, giveback_pct = _spot_excursion_metrics(d, fill_price)
 
         partial_trade = dict(
             bot_name=self.BOT_NAME,
@@ -965,6 +1006,9 @@ class ExitsMixin:
             entry_quality_label=d.get("entry_quality_label"),
             entry_quality_reasons=d.get("entry_quality_reasons"),
             entry_id=d.get("entry_id"),
+            mfe_pct=mfe_pct,
+            mae_pct=mae_pct,
+            giveback_pct=giveback_pct,
         )
         try:
             accounting_ok = bool(save_trade_db(**partial_trade))
@@ -1221,6 +1265,7 @@ class ExitsMixin:
         sell_time = _utc_now_str()
         accounting_mode_is_sim = d.get("accounting_pending_mode_is_sim",
                                        self.simulation)
+        mfe_pct, mae_pct, giveback_pct = _spot_excursion_metrics(d, fill_price)
         trade_row = dict(
             bot_name=self.BOT_NAME,
             mode_is_sim=accounting_mode_is_sim,
@@ -1239,6 +1284,9 @@ class ExitsMixin:
             entry_quality_label=d.get("entry_quality_label"),
             entry_quality_reasons=d.get("entry_quality_reasons"),
             entry_id=d.get("entry_id"),
+            mfe_pct=mfe_pct,
+            mae_pct=mae_pct,
+            giveback_pct=giveback_pct,
         )
         if partial_live_fill:
             trade_row["is_partial"] = True
@@ -1282,6 +1330,9 @@ class ExitsMixin:
                     "accounting_pending_mode_is_sim": self.simulation,
                     "accounting_pending_fees_usdt": proportional_entry_fee + close_fee,
                     "accounting_pending_exchange_order_id": exch_oid,
+                    "accounting_pending_mfe_pct": mfe_pct,
+                    "accounting_pending_mae_pct": mae_pct,
+                    "accounting_pending_giveback_pct": giveback_pct,
                 })
             except Exception as state_err:
                 self._log_error(f"spot mark accounting_pending {sym}", state_err)

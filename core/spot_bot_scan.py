@@ -623,6 +623,7 @@ class ScanMixin:
         position_fields = {
             "buy": fill_price,
             "highest": fill_price,
+            "lowest": fill_price,
             "invested_usdt": invested_usdt,
             "amount": amount,
             "original_amount": amount,
@@ -1192,6 +1193,7 @@ class ScanMixin:
                 provisional_ok = self.state.add(sym, {
                     "buy": provisional_fill_price,
                     "highest": provisional_fill_price,
+                    "lowest": provisional_fill_price,
                     "buy_time": _utc_now_str_inner(),
                     "invested_usdt": provisional_invested_usdt,
                     "amount": provisional_amount,
@@ -1275,6 +1277,7 @@ class ScanMixin:
                     provisional_ok = self.state.add(sym, {
                         "buy": fill_price,
                         "highest": fill_price,
+                        "lowest": fill_price,
                         "buy_time": _utc_now_str_inner(),
                         "invested_usdt": invested_usdt,
                         "amount": amount,

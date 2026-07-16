@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-16
+
+- Scoped aged-MFE fallback startup telemetry to the directional FUTURES bot;
+  CROSS and FUTREND no longer advertise an exit capability they do not use.
+- Added finite SPOT MFE, MAE and close-time giveback persistence for partial,
+  final, retry and offline-reconciliation accounting. New positions track both
+  high and low watermarks; existing positions begin adverse-excursion tracking
+  at their first monitor tick after the update without inventing prior lows.
+
 ## 2026-07-15
 
 - Added an active FUTURES-only aged-MFE fallback: an owned, non-adopted,
