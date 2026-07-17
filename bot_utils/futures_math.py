@@ -279,7 +279,7 @@ def breakeven_stop_hit(curr: float,
 
 def funding_oi_filter(direction: str,
                        funding_pct: float,
-                       oi_change_pct: float,
+                       oi_change_pct: float | None,
                        confidence: str) -> Tuple[bool, str]:
     """Institutional-grade funding + OI filters as hard rules.
 

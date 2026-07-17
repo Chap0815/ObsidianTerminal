@@ -272,10 +272,14 @@ def estimate_funding_paid(ex,
 
 #  Current funding rate + OI snapshot 
 
-def get_funding_info(ex, symbol_full: str) -> Tuple[float, float, float]:
+def get_funding_info(
+    ex, symbol_full: str
+) -> Tuple[float, float, Optional[float]]:
     """Return (funding_rate_pct, open_interest_usdt_millions, oi_24h_change_pct).
 
-    First call after start returns 0.0 for OI change (no history yet).
+    OI change is ``None`` until a 12-26h-old comparison reading exists.  A
+    measured zero remains ``0.0`` so callers can distinguish stable OI from an
+    unavailable baseline.
     Maintains a 28h-window OI history for 24h-change computation.
     """
     now = time.monotonic()
@@ -311,7 +315,7 @@ def get_funding_info(ex, symbol_full: str) -> Tuple[float, float, float]:
             pass
 
     # OI 24h change  compute from cached history
-    oi_change = 0.0
+    oi_change: Optional[float] = None
     with _OI_LOCK:
         # Only touch _OI_HISTORY when we have a real reading, so we don't
         # leave empty lists hanging.

@@ -1544,7 +1544,7 @@ class FuturesScanMixin:
     #  Quality filters (direction-aware) 
 
     def _quality_filters(self, sym, r, direction, confidence,
-                          funding_pct, oi_change_pct):
+                          funding_pct, oi_change_pct: float | None):
         """Returns (allow, reason).
 
         Asymmetric for LONG vs SHORT: different RSI overbought/oversold,

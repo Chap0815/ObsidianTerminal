@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-07-17
+
+- Corrected FUTURES entry-quality OI semantics: a missing 12-26h comparison
+  baseline is now represented as unknown instead of a measured zero, so it no
+  longer receives the stable-OI score bonus. A genuinely measured zero change
+  retains the existing bonus; hard funding/OI rules remain neutral when the
+  baseline is unavailable.
+- Added a DEV-only chronological entry-score research report with explicit
+  early/late diagnostic slices and observed-campaign-only policy comparisons.
+  The helper is explicitly excluded from installer and release payloads.
+- Added a DEV-only causal historical entry replay with a pre-frozen OOS wall,
+  non-overlapping events, conservative costs, spread sensitivity and monthly
+  cluster-bootstrap gates. No tested FUTURES or FUTREND score policy passed the
+  release gate; the helper and raw reports remain outside release payloads.
+- No entry threshold, score weight, position sizing, exit, order or live
+  configuration was changed.
+
 ## 2026-07-16
 
 - Scoped aged-MFE fallback startup telemetry to the directional FUTURES bot;

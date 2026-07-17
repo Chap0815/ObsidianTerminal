@@ -1,6 +1,6 @@
 {
-  "build_id": "8cd7c44219205b29",
-  "created_at": "2026-07-16 09:56:33",
+  "build_id": "0069021b7e289bf8",
+  "created_at": "2026-07-17 08:40:42",
   "source": "update_deploy_manifest.py",
   "file_count": 151,
   "files": [
@@ -66,13 +66,13 @@
     },
     {
       "path": "bot_utils/futures_funding.py",
-      "sha256": "a856e81b268973de0d396d71ee379075828fe07a5cf19d26ee804312bd3cb35a",
-      "bytes": 11990
+      "sha256": "63dce1b0ea946f40a92f4c178515b12bc914b3b849bbe9b55d09f2c6bce98a5a",
+      "bytes": 12133
     },
     {
       "path": "bot_utils/futures_math.py",
-      "sha256": "9f37ed484bdcb0f1534f9c132f9e780cd86a1493f7c2f68968fbb41f1493c0fc",
-      "bytes": 13689
+      "sha256": "d986608531f3dd5a8a4b47ee1954398808a4bf35956be39a5628bfbd2a4e97dc",
+      "bytes": 13696
     },
     {
       "path": "bot_utils/futures_order.py",
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "a935b53a0972f38e29b437976a1cdc8921423cb3d8a4e31f2fbb56c106e3ab4b",
-      "bytes": 49888
+      "sha256": "ddcf1e51d7cbad6cab65c5ff47afeb48ed72d55eb2e74f073debd9ef4bd83fdb",
+      "bytes": 50878
     },
     {
       "path": "config/__init__.py",
@@ -261,8 +261,8 @@
     },
     {
       "path": "core/futures_bot_scan.py",
-      "sha256": "d9cda5836c6f6ce4fab6c7994ee135b6acc903a75e90cbd00c2f42428b780ece",
-      "bytes": 83080
+      "sha256": "040cd109672b3c758206c97baea21d5aa68f4f9b74387d0951b1444134b6ddd2",
+      "bytes": 83094
     },
     {
       "path": "core/logger.py",
