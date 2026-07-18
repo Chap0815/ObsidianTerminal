@@ -12,12 +12,18 @@ class MakerFirstConfig:
     market_fallback: bool = False
     depth_levels: int = 20
     tca_enabled: bool = True
+    market_reconcile_attempts: int = 3
+    market_reconcile_delay_seconds: float = 0.35
 
     def __post_init__(self) -> None:
         if self.mode not in {"disabled", "shadow", "enforce"}:
             raise ValueError(f"invalid maker-first mode: {self.mode!r}")
         if self.ttl_seconds < 0.0:
             raise ValueError("maker-first TTL cannot be negative")
+        if self.market_reconcile_attempts < 0 or self.market_reconcile_attempts > 10:
+            raise ValueError("market reconciliation attempts must be between 0 and 10")
+        if not 0.0 <= self.market_reconcile_delay_seconds <= 5.0:
+            raise ValueError("market reconciliation delay must be between 0 and 5 seconds")
 
 
 class _DatabaseJournal:
@@ -47,6 +53,8 @@ class _DatabaseJournal:
 
 
 def _number(value, default=0.0) -> float:
+    if isinstance(value, bool):
+        return default
     try:
         result = float(value)
     except (TypeError, ValueError):
@@ -64,6 +72,63 @@ def _order_status(order: dict, target_amount: float) -> str:
     return "OPEN"
 
 
+def _order_id(order: dict) -> str | None:
+    if not isinstance(order, dict):
+        return None
+    value = order.get("id") or order.get("orderId")
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _fee_usdt(order: dict) -> float:
+    try:
+        from trading.fee_utils import extract_fee_usdt
+
+        return _number(extract_fee_usdt(order))
+    except Exception:
+        fee = order.get("fee") if isinstance(order, dict) else None
+        return _number(fee.get("cost")) if isinstance(fee, dict) else 0.0
+
+
+def _refresh_order(exchange, order: dict, symbol: str) -> dict:
+    order_id = _order_id(order)
+    fetch_order = getattr(exchange, "fetch_order", None)
+    if not order_id or not callable(fetch_order):
+        return order
+    refreshed = fetch_order(order_id, symbol)
+    if not isinstance(refreshed, dict):
+        return order
+    merged = dict(order)
+    merged.update(refreshed)
+    return merged
+
+
+def _reconcile_market_response(
+    exchange,
+    order: dict,
+    *,
+    symbol: str,
+    amount: float,
+    config: MakerFirstConfig,
+) -> dict:
+    """Boundedly enrich a submitted order; never submits or cancels anything."""
+    latest = order
+    if _order_status(latest, amount) == "FILLED" or not _order_id(latest):
+        return latest
+    for _attempt in range(config.market_reconcile_attempts):
+        if config.market_reconcile_delay_seconds:
+            time.sleep(config.market_reconcile_delay_seconds)
+        try:
+            latest = _refresh_order(exchange, latest, symbol)
+        except Exception:
+            continue
+        if _order_status(latest, amount) == "FILLED":
+            break
+    return latest
+
+
 def _transition_from_order(journal, intent_id: str, order: dict, amount: float) -> str:
     status = _order_status(order, amount)
     filled = _number(order.get("filled"))
@@ -74,6 +139,7 @@ def _transition_from_order(journal, intent_id: str, order: dict, amount: float) 
         exchange_order_id=order.get("id"),
         filled_amount=filled,
         filled_notional=cost,
+        fee_usdt=_fee_usdt(order),
     )
     return status
 
@@ -128,6 +194,15 @@ def execute_entry_order(
     if config.mode != "enforce":
         try:
             order = market_order()
+            if not isinstance(order, dict):
+                raise RuntimeError("market order returned no order object")
+            order = _reconcile_market_response(
+                exchange,
+                order,
+                symbol=symbol,
+                amount=amount,
+                config=config,
+            )
             status = _transition_from_order(journal, intent_id, order, amount)
             if status == "FILLED":
                 journal.transition(intent_id, "FINALIZED")
@@ -282,8 +357,7 @@ def _record_fill_tca(
             average = cost / filled if filled else None
         if average is None:
             return
-        fee = order.get("fee") or {}
-        fee_cost = _number(fee.get("cost")) if isinstance(fee, dict) else 0.0
+        fee_cost = _fee_usdt(order)
         notional = _number(order.get("cost"))
         fee_rate = fee_cost / notional if notional else 0.001
         fill_tca = compute_fill_tca(
@@ -337,18 +411,47 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
                 intent["status"] = "RECOVERY_REQUIRED"
             unresolved.append(intent)
             continue
+        try:
+            order = _refresh_order(exchange, order, str(intent["symbol"]))
+        except Exception:
+            pass
         status = _order_status(order, float(intent["target_amount"]))
         try:
             if status == "FILLED":
                 if current == "PREPARED":
                     transition_order_intent(intent_id, "SUBMITTING")
-                transition_order_intent(
-                    intent_id,
-                    "FILLED",
-                    exchange_order_id=order.get("id"),
-                    filled_amount=_number(order.get("filled")),
-                    filled_notional=_number(order.get("cost")),
-                )
+                if current != "FILLED":
+                    transition_order_intent(
+                        intent_id,
+                        "FILLED",
+                        exchange_order_id=order.get("id"),
+                        filled_amount=_number(order.get("filled")),
+                        filled_notional=_number(order.get("cost")),
+                        fee_usdt=_fee_usdt(order),
+                    )
+                try:
+                    from core.database import get_latest_execution_tca_payload
+                    from trading.execution_quality import ArrivalTCA
+
+                    arrival_payload = get_latest_execution_tca_payload(
+                        intent_id, "arrival"
+                    )
+                    fill_payload = get_latest_execution_tca_payload(intent_id, "fill")
+                    if arrival_payload is not None and fill_payload is None:
+                        _record_fill_tca(
+                            _DatabaseJournal(),
+                            intent_id,
+                            ArrivalTCA(**arrival_payload),
+                            order,
+                            symbol=str(intent["symbol"]),
+                            side=(
+                                "buy"
+                                if str(intent["direction"]).upper() == "LONG"
+                                else "sell"
+                            ),
+                        )
+                except Exception:
+                    pass
                 transition_order_intent(intent_id, "FINALIZED")
                 continue
         except ValueError:

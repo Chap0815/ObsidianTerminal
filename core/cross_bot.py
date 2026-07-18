@@ -117,7 +117,12 @@ class CrossBot(FuturesBot):
         return str(value).strip().lower() not in ("0", "false", "no", "off")
 
     @staticmethod
-    def _cross_market_structure(book, prices: Dict[str, List[float]]) -> dict:
+    def _cross_market_structure(
+        book,
+        prices: Dict[str, List[float]],
+        quote_volumes: Dict[str, float] | None = None,
+        funding_rates_pct: Dict[str, float] | None = None,
+    ) -> dict:
         """Derive telemetry from the already-loaded, closed-bar universe."""
         import statistics
 
@@ -167,6 +172,67 @@ class CrossBot(FuturesBot):
             statistics.pstdev(btc_hourly_returns) * math.sqrt(24.0)
             if len(btc_hourly_returns) >= 2 else None
         )
+        histories = {}
+        for base, series in (prices or {}).items():
+            moves = []
+            for previous, current in zip(series, series[1:]):
+                try:
+                    previous_value = float(previous)
+                    current_value = float(current)
+                    move = current_value / previous_value - 1.0
+                except (TypeError, ValueError, ZeroDivisionError):
+                    continue
+                if previous_value > 0.0 and math.isfinite(move):
+                    moves.append(move)
+            if len(moves) >= 3:
+                histories[str(base).upper()] = moves
+        correlations = []
+        bases = sorted(histories)
+        for index, left in enumerate(bases):
+            for right in bases[index + 1:]:
+                length = min(len(histories[left]), len(histories[right]))
+                if length < 3:
+                    continue
+                try:
+                    correlation = statistics.correlation(
+                        histories[left][-length:], histories[right][-length:]
+                    )
+                except (statistics.StatisticsError, ValueError):
+                    continue
+                if math.isfinite(correlation):
+                    correlations.append(correlation)
+        average_correlation = (
+            statistics.fmean(correlations) if correlations else None
+        )
+        volumes = []
+        for base, value in (quote_volumes or {}).items():
+            if str(base).upper() not in returns or isinstance(value, bool):
+                continue
+            try:
+                parsed_volume = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(parsed_volume) and parsed_volume > 0.0:
+                volumes.append(parsed_volume)
+        liquidity_concentration = (
+            max(volumes) / sum(volumes) if volumes and sum(volumes) > 0.0 else None
+        )
+        funding_carry = []
+        funding = funding_rates_pct or {}
+        for base in getattr(book, "longs", []):
+            try:
+                rate = float(funding[base])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(rate):
+                funding_carry.append(-rate)
+        for base in getattr(book, "shorts", []):
+            try:
+                rate = float(funding[base])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(rate):
+                funding_carry.append(rate)
         return {
             "universe_count": len(values),
             "universe_median_return_pct": median_return,
@@ -176,6 +242,16 @@ class CrossBot(FuturesBot):
             "separation_to_dispersion": separation_ratio,
             "btc_return_pct": btc_return,
             "btc_realized_vol_24h_pct": btc_vol,
+            "average_pairwise_correlation": average_correlation,
+            "correlation_pair_count": len(correlations),
+            "liquidity_max_symbol_share": liquidity_concentration,
+            "expected_funding_carry_8h_pct": (
+                statistics.fmean(funding_carry) if funding_carry else None
+            ),
+            "funding_coverage": (
+                len(funding_carry)
+                / max(1, len(getattr(book, "longs", [])) + len(getattr(book, "shorts", [])))
+            ),
         }
 
     @staticmethod
@@ -222,7 +298,17 @@ class CrossBot(FuturesBot):
             "target_side_count": target_side_count,
         }
         try:
-            context.update(CrossBot._cross_market_structure(book, prices))
+            cached = getattr(self, "_cross_regime_snapshot", None)
+            context.update(
+                cached
+                if isinstance(cached, dict)
+                else CrossBot._cross_market_structure(
+                    book,
+                    prices,
+                    getattr(self, "_cross_quote_volumes", {}),
+                    funding_cache,
+                )
+            )
         except Exception:
             pass
         return context
@@ -289,7 +375,7 @@ class CrossBot(FuturesBot):
                 "spread_pct": spread_pct,
                 "entry_quality_min_score": self._entry_quality_min_score(),
                 "entry_id": entry_id,
-                "strategy_shadow_version": "xsec_observe_v1",
+                "strategy_shadow_version": "xsec_regime_v2",
                 "strategy_shadow_would_veto": bool(shadow_reasons),
                 "strategy_shadow_reasons": ",".join(shadow_reasons),
                 **ctx,
@@ -883,6 +969,12 @@ class CrossBot(FuturesBot):
             log_event(f"[{self.BOT_NAME}] top-up: no universe data - skipped", "WARN")
             return
         book = compute_target_book(prices, self._recent_rebalance_returns, params)
+        self._cross_regime_snapshot = CrossBot._cross_market_structure(
+            book,
+            prices,
+            getattr(self, "_cross_quote_volumes", {}),
+            getattr(self, "_cross_funding_pct", {}),
+        )
         if getattr(book, "is_flat", False):
             return
         cur = CrossBot._active_legs(self)
@@ -1063,7 +1155,9 @@ class CrossBot(FuturesBot):
             f"long {book.longs} | short {book.shorts}", "SCAN")
         log_struct("cross_rebalance", longs=book.longs, shorts=book.shorts,
                    exposure_mult=book.exposure_mult,
-                   recent_returns=self._recent_rebalance_returns[-params.crash_window:])
+                   recent_returns=self._recent_rebalance_returns[-params.crash_window:],
+                   strategy_shadow_version="xsec_regime_v2",
+                   **self._cross_regime_snapshot)
 
         # 3. diff target vs current and execute. Suppress the monitor's
         #    neutrality-guard for the duration + a short settle window: during
@@ -1215,6 +1309,10 @@ class CrossBot(FuturesBot):
             log_event(f"[{self.BOT_NAME}] funding filter excluded "
                       f"{len(skipped_fund)} coin(s) > {max_fund:g}%/8h: "
                       f"{', '.join(skipped_fund[:8])}", "INFO")
+        accepted = set(prices)
+        self._cross_quote_volumes = {
+            base: qv for qv, _symbol, base in cands if base in accepted
+        }
         return prices, sym_map
 
     #  Equity + sizing 

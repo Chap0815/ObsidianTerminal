@@ -28,6 +28,7 @@ REQUIRED_RELEASE_ITEMS = [
     "trading/entry_admission.py",
     "trading/entry_executor.py",
     "trading/execution_quality.py",
+    "trading/execution_cost_model.py",
     "trading/expectancy_runtime.py",
     "trading/expectancy_training.py",
     "trading/orderflow_experiment.py",

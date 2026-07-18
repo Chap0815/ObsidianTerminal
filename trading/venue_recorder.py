@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+import sqlite3
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -22,39 +23,156 @@ class VenueEvent:
     quality_flags: tuple[str, ...] = ()
 
 
-class AtomicPartitionWriter:
-    """Write one immutable JSON document per event via atomic rename."""
+class SQLitePartitionWriter:
+    """Deduplicated daily SQLite-WAL chunks; one file per stream and UTC day."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        retention_days: int = 30,
+        max_storage_gib: float = 20.0,
+    ) -> None:
         self.root = Path(root)
+        self.retention_days = max(1, int(retention_days))
+        self.max_storage_bytes = max(0, int(float(max_storage_gib) * 1024**3))
+        self._connections: dict[Path, sqlite3.Connection] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _day(event: VenueEvent) -> str:
+        day = str(event.exchange_time)[:10]
+        try:
+            datetime.strptime(day, "%Y-%m-%d")
+        except ValueError:
+            return "unknown-date"
+        return day
+
+    def _path(self, event: VenueEvent) -> Path:
+        return self.root / event.kind / f"{self._day(event)}.sqlite3"
+
+    def _connection(self, path: Path) -> sqlite3.Connection:
+        connection = self._connections.get(path)
+        if connection is not None:
+            return connection
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(path, timeout=15.0)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA busy_timeout=15000")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS venue_events (
+                   event_id TEXT PRIMARY KEY,
+                   market_id TEXT NOT NULL,
+                   exchange_time TEXT NOT NULL,
+                   received_time TEXT NOT NULL,
+                   schema_version INTEGER NOT NULL,
+                   quality_flags_json TEXT NOT NULL,
+                   payload_json TEXT NOT NULL
+               ) WITHOUT ROWID"""
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_venue_events_time "
+            "ON venue_events(exchange_time, market_id)"
+        )
+        connection.commit()
+        self._connections[path] = connection
+        return connection
 
     def write(self, event: VenueEvent) -> Path:
-        day = str(event.exchange_time)[:10]
-        if len(day) != 10:
-            day = "unknown-date"
-        digest = hashlib.sha256(event.event_id.encode("utf-8")).hexdigest()
-        target = self.root / event.kind / day / f"{digest}.json"
-        if target.exists():
-            return target
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temp = target.with_suffix(f".{os.getpid()}.tmp")
-        encoded = json.dumps(
-            asdict(event), sort_keys=True, separators=(",", ":"), allow_nan=False
-        ).encode("utf-8")
+        path = self._path(event)
+        payload = json.dumps(
+            event.payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        flags = json.dumps(event.quality_flags, separators=(",", ":"))
+        with self._lock:
+            connection = self._connection(path)
+            connection.execute(
+                """INSERT OR IGNORE INTO venue_events
+                   (event_id, market_id, exchange_time, received_time,
+                    schema_version, quality_flags_json, payload_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event.event_id,
+                    event.market_id,
+                    event.exchange_time,
+                    event.received_time,
+                    int(event.schema_version),
+                    flags,
+                    payload,
+                ),
+            )
+            connection.commit()
+        return path
+
+    def _close_path(self, path: Path) -> None:
+        connection = self._connections.pop(path, None)
+        if connection is not None:
+            connection.close()
+
+    @staticmethod
+    def _partition_date(path: Path) -> datetime | None:
         try:
-            with open(temp, "xb") as handle:
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp, target)
-        except FileExistsError:
-            pass
-        finally:
+            return datetime.strptime(path.stem, "%Y-%m-%d").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            return None
+
+    def _delete_partition(self, path: Path) -> None:
+        self._close_path(path)
+        for candidate in (
+            path,
+            Path(f"{path}-wal"),
+            Path(f"{path}-shm"),
+        ):
             try:
-                temp.unlink()
+                candidate.unlink()
             except FileNotFoundError:
                 pass
-        return target
+
+    def enforce_retention(self, *, now: datetime | None = None) -> None:
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        cutoff = (current - timedelta(days=self.retention_days)).date()
+        with self._lock:
+            partitions = sorted(self.root.glob("*/*.sqlite3"))
+            for path in partitions:
+                partition_date = self._partition_date(path)
+                if partition_date is not None and partition_date.date() < cutoff:
+                    self._delete_partition(path)
+            if self.max_storage_bytes <= 0:
+                return
+            partitions = sorted(
+                self.root.glob("*/*.sqlite3"),
+                key=lambda path: (self._partition_date(path) or current, str(path)),
+            )
+            def _storage_bytes() -> int:
+                total = 0
+                for item in self.root.glob("*/*"):
+                    if item.is_file():
+                        try:
+                            total += item.stat().st_size
+                        except OSError:
+                            pass
+                return total
+            total = _storage_bytes()
+            for path in partitions:
+                partition_date = self._partition_date(path)
+                if total <= self.max_storage_bytes:
+                    break
+                if partition_date is None or partition_date.date() >= current.date():
+                    continue
+                self._delete_partition(path)
+                total = _storage_bytes()
+
+    def close(self) -> None:
+        with self._lock:
+            for connection in self._connections.values():
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+            self._connections.clear()
 
 
 class MexcVenueRecorder:
@@ -69,10 +187,17 @@ class MexcVenueRecorder:
         depth_levels: int = 20,
         micro_interval_seconds: float = 6.0,
         overview_interval_seconds: float = 60.0,
+        retention_days: int = 30,
+        max_storage_gib: float = 20.0,
         log_event=None,
+        writer=None,
     ) -> None:
         self.exchange = exchange
-        self.writer = AtomicPartitionWriter(root)
+        self.writer = writer or SQLitePartitionWriter(
+            root,
+            retention_days=retention_days,
+            max_storage_gib=max_storage_gib,
+        )
         self.max_symbols = max(1, int(max_symbols))
         self.depth_levels = max(5, min(100, int(depth_levels)))
         self.micro_interval = max(1.0, float(micro_interval_seconds))
@@ -80,11 +205,10 @@ class MexcVenueRecorder:
         self.log_event = log_event
         self._universe: list[str] = []
         self._cursor = 0
+        self._next_retention_check = 0.0
 
     @staticmethod
     def _iso_now() -> str:
-        from datetime import datetime, timezone
-
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     @staticmethod
@@ -102,8 +226,9 @@ class MexcVenueRecorder:
         started_ms: int,
         ended_ms: int,
         flags: tuple[str, ...] = (),
+        market_id: str | None = None,
     ) -> Path:
-        market_id = self._market_id(self.exchange, symbol)
+        market_id = market_id or self._market_id(self.exchange, symbol)
         event_clock = exchange_ms if exchange_ms is not None else ended_ms
         digest_input = json.dumps(payload, sort_keys=True, default=str)
         digest = hashlib.blake2s(digest_input.encode("utf-8"), digest_size=8).hexdigest()
@@ -145,10 +270,13 @@ class MexcVenueRecorder:
             candidates.append((volume, symbol, ticker))
         candidates.sort(reverse=True)
         self._universe = [symbol for _volume, symbol, _ticker in candidates[: self.max_symbols]]
+        markets_payload = {}
         for _volume, symbol, ticker in candidates:
             info = ticker.get("info") if isinstance(ticker, dict) else {}
             info = info if isinstance(info, dict) else {}
-            payload = {
+            market_id = self._market_id(self.exchange, symbol)
+            markets_payload[market_id] = {
+                "symbol": symbol,
                 "last": ticker.get("last"),
                 "bid": ticker.get("bid"),
                 "ask": ticker.get("ask"),
@@ -160,15 +288,31 @@ class MexcVenueRecorder:
                 "next_settle_time": info.get("nextSettleTime"),
                 "universe_member": symbol in self._universe,
             }
-            self._write_event(
-                "overview",
-                symbol,
-                payload,
-                exchange_ms=ticker.get("timestamp"),
-                started_ms=started,
-                ended_ms=ended,
-            )
+        self._write_event(
+            "overview",
+            "",
+            {"markets": markets_payload},
+            exchange_ms=self._latest_timestamp(candidates, ended),
+            started_ms=started,
+            ended_ms=ended,
+            market_id="ALL_USDT_SWAPS",
+        )
         return len(candidates)
+
+    @staticmethod
+    def _latest_timestamp(candidates, fallback: int) -> int:
+        timestamps = []
+        for _volume, _symbol, ticker in candidates:
+            value = ticker.get("timestamp") if isinstance(ticker, dict) else None
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                timestamp = int(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if timestamp > 0:
+                timestamps.append(timestamp)
+        return max(timestamps, default=int(fallback))
 
     def capture_microstructure(self, symbol: str) -> tuple[Path, Path]:
         started_book = int(time.time() * 1000)
@@ -234,22 +378,32 @@ class MexcVenueRecorder:
 
     def run(self, shutdown_event: threading.Event) -> None:
         next_overview = 0.0
-        while not shutdown_event.is_set():
-            now = time.monotonic()
-            try:
-                if now >= next_overview or not self._universe:
-                    self.capture_overview()
-                    next_overview = now + self.overview_interval
-                if self._universe:
-                    symbol = self._universe[self._cursor % len(self._universe)]
-                    self._cursor += 1
-                    self.capture_microstructure(symbol)
-            except Exception as exc:
-                if self.log_event:
-                    try:
-                        self.log_event(
-                            f"Venue recorder gap: {type(exc).__name__}", "WARN"
-                        )
-                    except Exception:
-                        pass
-            shutdown_event.wait(self.micro_interval)
+        try:
+            while not shutdown_event.is_set():
+                now = time.monotonic()
+                try:
+                    if now >= self._next_retention_check:
+                        enforce = getattr(self.writer, "enforce_retention", None)
+                        if callable(enforce):
+                            enforce()
+                        self._next_retention_check = now + 3600.0
+                    if now >= next_overview or not self._universe:
+                        self.capture_overview()
+                        next_overview = now + self.overview_interval
+                    if self._universe:
+                        symbol = self._universe[self._cursor % len(self._universe)]
+                        self._cursor += 1
+                        self.capture_microstructure(symbol)
+                except Exception as exc:
+                    if self.log_event:
+                        try:
+                            self.log_event(
+                                f"Venue recorder gap: {type(exc).__name__}", "WARN"
+                            )
+                        except Exception:
+                            pass
+                shutdown_event.wait(self.micro_interval)
+        finally:
+            close = getattr(self.writer, "close", None)
+            if callable(close):
+                close()

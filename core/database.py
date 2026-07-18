@@ -2644,6 +2644,23 @@ def record_execution_tca(intent_id: str, stage: str, payload: dict) -> None:
     conn.commit()
 
 
+def get_latest_execution_tca_payload(intent_id: str, stage: str) -> dict | None:
+    """Return the newest decoded TCA stage for restart-safe enrichment."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT payload_json FROM execution_tca
+             WHERE intent_id=? AND stage=? ORDER BY id DESC LIMIT 1""",
+        (str(intent_id), str(stage)),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload_json"])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def schedule_execution_markouts(
     intent_id: str,
     *,

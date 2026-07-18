@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-07-18
+
+- Added bounded post-submit order reconciliation without any resubmission path.
+  Delayed MEXC market fills now enrich the persistent intent with filled amount,
+  notional and actual fee, then create fill TCA and restart-safe markouts. A
+  restart can backfill the same evidence from the stored arrival snapshot.
+- Fixed futures portfolio valuation for MEXC position shapes where unified
+  notional and mark fields are absent. Valuation now uses contract metadata and
+  position fair/mark data, one lazily fetched ticker snapshot, or a flagged
+  entry-price fallback. Entry-only valuation remains persistable in shadow but
+  fails closed if portfolio enforcement is enabled.
+- Replaced the one-JSON-file-per-event venue recorder with deduplicated daily
+  SQLite-WAL stream partitions. Overview is stored as one market-wide snapshot;
+  configurable retention and storage quotas never delete the current UTC
+  partition and leave legacy JSON data untouched.
+- Made expectancy probability calibration temporally disjoint from coefficient
+  fitting inside every purged walk-forward fold. OOS Brier score, log loss, ECE,
+  calibration slope and intercept are now reported.
+- Extended profit promotion gates with calibration, tail-risk, capacity,
+  regime/parameter stability, experiment-count and multiple-testing evidence.
+  Missing or malformed evidence fails closed and no research pass can enable
+  live trading without explicit manual approval.
+- Added a sample-gated empirical execution-cost model with symbol,
+  microstructure, volatility/regime, stress-quantile and participation-capacity
+  scopes built from paired arrival/fill TCA records.
+- Added depth-normalized order-flow imbalance with freshness and sequence
+  quality. REST snapshots are explicitly marked as non-promotable; only a
+  continuous valid book-event sequence can pass the OFI data-quality boundary.
+- Extended active CROSS shadow telemetry with pairwise correlation, liquidity
+  concentration and expected funding carry while preserving existing live
+  entry, sizing and neutrality behavior.
+- Hardened the SIM-only carry engine with projected net-carry admission after
+  fees, slippage, borrow, transfer, basis and ADL stress; capacity, liquidation
+  buffer and hedge mismatch controls; and restart-safe realized cost fields.
+- LLM remains disabled. Portfolio/expectancy gates remain shadow, maker-first
+  remains disabled, and no strategy experiment was promoted to live.
+
 ## 2026-07-17
 
 - Rebuilt optimizer promotion around one frozen winner and one untouched final

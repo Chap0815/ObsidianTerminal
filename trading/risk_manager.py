@@ -383,6 +383,8 @@ def validate_config_or_die(bot_name: str) -> dict:
             ("VENUE_RECORDER_MICRO_INTERVAL_SECONDS", 1, 600),
             ("VENUE_RECORDER_OVERVIEW_INTERVAL_SECONDS", 5, 3600),
             ("VENUE_RECORDER_DEPTH_LEVELS", 5, 100),
+            ("VENUE_RECORDER_RETENTION_DAYS", 1, 3650),
+            ("VENUE_RECORDER_MAX_STORAGE_GIB", 0.1, 1000),
         )
         for _key, _lo, _hi in _checks:
             if _key in cfg:

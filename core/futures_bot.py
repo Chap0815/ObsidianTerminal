@@ -439,6 +439,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 overview_interval_seconds=float(
                     self.C("VENUE_RECORDER_OVERVIEW_INTERVAL_SECONDS", 60.0)
                 ),
+                retention_days=int(
+                    self.C("VENUE_RECORDER_RETENTION_DAYS", 30)
+                ),
+                max_storage_gib=float(
+                    self.C("VENUE_RECORDER_MAX_STORAGE_GIB", 20.0)
+                ),
                 log_event=log_event,
             )
             self._venue_recorder_thread = threading.Thread(

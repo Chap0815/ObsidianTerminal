@@ -16,6 +16,8 @@ from trading.portfolio_risk import (
 
 
 def _finite(value) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         result = float(value)
     except (TypeError, ValueError):
@@ -46,40 +48,97 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
         equity = _balance_value(balance, "total")
         if free is None or equity is None or equity <= 0.0:
             raise ValueError("USDT equity unavailable")
+        tickers = None
+        markets = getattr(exchange, "markets", None) or {}
         positions = []
+        valuation_notes = []
         for raw in positions_raw:
             if not isinstance(raw, dict):
                 continue
             contracts = abs(_finite(raw.get("contracts")) or 0.0)
             notional = abs(_finite(raw.get("notional")) or 0.0)
-            if notional <= 0.0 and contracts > 0.0:
-                contract_size = abs(_finite(raw.get("contractSize")) or 1.0)
-                mark = abs(
-                    _finite(raw.get("markPrice"))
-                    or _finite(raw.get("last"))
+            symbol = str(raw.get("symbol") or "UNKNOWN")
+            if contracts <= 0.0 and notional <= 0.0:
+                continue
+            if notional <= 0.0:
+                market = markets.get(symbol) if isinstance(markets, dict) else {}
+                market = market if isinstance(market, dict) else {}
+                contract_size = abs(
+                    _finite(raw.get("contractSize"))
+                    or _finite(market.get("contractSize"))
                     or 0.0
                 )
-                notional = contracts * contract_size * mark
+                if contract_size <= 0.0:
+                    raise ValueError(f"contract size unavailable for {symbol}")
+                info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+                if tickers is None:
+                    try:
+                        fetched_tickers = exchange.fetch_tickers()
+                    except Exception:
+                        fetched_tickers = {}
+                    tickers = (
+                        fetched_tickers if isinstance(fetched_tickers, dict) else {}
+                    )
+                ticker = tickers.get(symbol) if isinstance(tickers, dict) else {}
+                ticker = ticker if isinstance(ticker, dict) else {}
+                ticker_info = (
+                    ticker.get("info") if isinstance(ticker.get("info"), dict) else {}
+                )
+                sources = (
+                    ("position_mark", raw.get("markPrice")),
+                    ("position_last", raw.get("last")),
+                    ("position_fair", info.get("fairPrice")),
+                    ("position_fair", info.get("fair_price")),
+                    ("ticker_mark", ticker.get("mark")),
+                    ("ticker_last", ticker.get("last")),
+                    ("ticker_close", ticker.get("close")),
+                    ("ticker_fair", ticker_info.get("fairPrice")),
+                    ("entry_fallback", raw.get("entryPrice")),
+                )
+                price_source = ""
+                price = 0.0
+                for candidate_source, raw_price in sources:
+                    candidate = abs(_finite(raw_price) or 0.0)
+                    if candidate > 0.0:
+                        price_source = candidate_source
+                        price = candidate
+                        break
+                if price <= 0.0:
+                    raise ValueError(f"valuation unavailable for {symbol}")
+                notional = contracts * contract_size * price
+                if price_source == "entry_fallback":
+                    valuation_notes.append(f"entry-price fallback for {symbol}")
             if notional <= 0.0:
-                continue
+                raise ValueError(f"valuation unavailable for {symbol}")
             side = "SHORT" if str(raw.get("side", "")).lower() == "short" else "LONG"
             positions.append(
                 PortfolioPosition(
-                    symbol=str(raw.get("symbol") or "UNKNOWN"),
+                    symbol=symbol,
                     side=side,
                     notional_usdt=notional,
                     cluster="majors" if str(raw.get("symbol", "")).startswith(("BTC/", "ETH/")) else "alts",
                 )
             )
-        return PortfolioSnapshot(equity, free, tuple(positions), now)
+        return PortfolioSnapshot(
+            equity,
+            free,
+            tuple(positions),
+            now,
+            known=not valuation_notes,
+            reason="; ".join(valuation_notes),
+        )
     except Exception as exc:
+        detail = str(exc).strip()
         return PortfolioSnapshot(
             0.0,
             0.0,
             (),
             now,
             known=False,
-            reason=f"account snapshot unavailable: {type(exc).__name__}",
+            reason=(
+                f"account snapshot unavailable: {type(exc).__name__}"
+                + (f": {detail}" if detail else "")
+            ),
         )
 
 
