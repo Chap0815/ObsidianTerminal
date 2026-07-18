@@ -309,6 +309,13 @@ class FuturesScanMixin:
                                               safe_set_margin_mode,
                                               entry_params)
 
+        if getattr(self, "_entry_recovery_blocked", False):
+            log_event(
+                f"[{self.BOT_NAME}] new entries blocked by unresolved order intent",
+                "WAIT",
+            )
+            return
+
         sym = r["symbol"].split("/")[0]
         symbol_full = f"{sym}/USDT:USDT"
 
@@ -623,6 +630,51 @@ class FuturesScanMixin:
                 stage="blocked", mode=entry_mode, reason="entry_quality")
             return
 
+        from trading.expectancy_runtime import evaluate_runtime_expectancy
+
+        expectancy_mode = str(
+            self.C("NET_EXPECTANCY_MODE", "shadow") or "shadow"
+        ).strip().lower()
+        expectancy = evaluate_runtime_expectancy(
+            bot_name=self.BOT_NAME,
+            mode=expectancy_mode,
+            features={
+                "score": quality.score,
+                "spread_bps": float(entry_spread_pct or 0.0) * 100.0,
+                "funding_rate_pct": float(funding_rate or 0.0),
+                "oi_change_pct": float(oi_change or 0.0),
+                "change_pct": float(r.get("change_percent") or 0.0),
+                "btc_change_pct": float(btc_chg or 0.0),
+            },
+        )
+        try:
+            log_struct(
+                "net_expectancy_decision",
+                bot=self.BOT_NAME,
+                entry_id=entry_id,
+                symbol=sym,
+                mode=expectancy_mode,
+                allowed=expectancy.allowed,
+                shadow_allowed=expectancy.shadow_allowed,
+                expected_net_bps=expectancy.expected_net_bps,
+                probability_positive=expectancy.probability_positive,
+                model_version=expectancy.model_version,
+                reason=expectancy.reason,
+            )
+        except Exception:
+            pass
+        if not expectancy.allowed:
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="blocked", mode=entry_mode,
+                reason="net_expectancy", direction=direction,
+            )
+            log_event(
+                f"{sym}: net expectancy blocked entry ({expectancy.reason})",
+                "WAIT",
+            )
+            return
+
         #  Bull/Bear devil's-advocate veto (2nd LLM call, ~3-4s) 
         # Skipped in veto-only mode by default: direction is already price-based
         # and the hard-signal filters (#2-#5) gate quality, so a second LLM veto
@@ -757,8 +809,7 @@ class FuturesScanMixin:
                 coins = (notional / entry_price) if entry_price > 0 else 0.0
                 amount = coins / max(contract_size, 1e-9)
                 from bot_utils.fee_math import taker_fee_rate
-                fees_paid = notional * taker_fee_rate(
-                    self.ex, symbol_full, 0.0006)
+                fees_paid = notional * taker_fee_rate(self.ex, symbol_full)
             except (TypeError, ValueError, ZeroDivisionError):
                 amount = 0.0
                 fees_paid = 0.0
@@ -865,6 +916,55 @@ class FuturesScanMixin:
                         reason="sizing_safety_gate", direction=direction)
                     return
 
+                from trading.portfolio_guard import evaluate_exchange_entry
+                from trading.portfolio_risk import PortfolioLimits
+                portfolio_mode = str(
+                    self.C("PORTFOLIO_RISK_MODE", "shadow") or "shadow"
+                ).strip().lower()
+                portfolio_decision = evaluate_exchange_entry(
+                    exchange=self.ex,
+                    intent_id=entry_id,
+                    bot_name=self.BOT_NAME,
+                    symbol=sym,
+                    side=direction,
+                    requested_notional=notional,
+                    mode=portfolio_mode,
+                    limits=PortfolioLimits(
+                        max_gross_pct=float(self.C("PORTFOLIO_MAX_GROSS_PCT", 100.0)),
+                        max_net_pct=float(self.C("PORTFOLIO_MAX_NET_PCT", 75.0)),
+                        min_free_pct=float(self.C("PORTFOLIO_MIN_FREE_PCT", 20.0)),
+                        max_cluster_pct=float(self.C("PORTFOLIO_MAX_CLUSTER_PCT", 35.0)),
+                        max_beta_pct=float(self.C("PORTFOLIO_MAX_BETA_PCT", 75.0)),
+                    ),
+                )
+                try:
+                    log_struct(
+                        "portfolio_entry_decision",
+                        bot=self.BOT_NAME,
+                        entry_id=entry_id,
+                        symbol=sym,
+                        mode=portfolio_mode,
+                        allowed=portfolio_decision.allowed,
+                        shadow_allowed=portfolio_decision.shadow_allowed,
+                        reasons=list(portfolio_decision.reasons),
+                        gross_after=portfolio_decision.gross_after,
+                        net_after=portfolio_decision.net_after,
+                    )
+                except Exception:
+                    pass
+                if not portfolio_decision.allowed:
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=sym,
+                        stage="blocked", mode=entry_mode,
+                        reason="portfolio_risk", direction=direction,
+                    )
+                    log_event(
+                        f"{sym}: portfolio risk blocked entry: "
+                        f"{', '.join(portfolio_decision.reasons)}",
+                        "WAIT",
+                    )
+                    return
+
                 # must_set_leverage raises on failure  ABORT trade. Do this
                 # only after all local sizing/precision gates passed, so a
                 # malformed amount cannot create exchange-side config changes.
@@ -895,25 +995,23 @@ class FuturesScanMixin:
                     _lev_int = int(leverage)
                 except (ValueError, TypeError):
                     _lev_int = leverage
-                # Stable per-intent clientOrderId so create_order_with_retry's
-                # transient-error retry can't open a SECOND position on a
-                # lost-response timeout. The 30s bucket makes a retry of the
-                # SAME intent reuse the SAME id; the BOT_NAME component keeps it
-                # unique across bots.
-                import hashlib as _hashlib
-                import time as _time
-                _bucket = int(_time.time() // 30)
-                _cid = (f"{self.BUY_PREFIX}-{sym}-"
-                        + _hashlib.sha256(
-                            f"{self.BOT_NAME}:{sym}:{_bucket}".encode()
-                        ).hexdigest()[:10])
+                # Stable across process restarts and within MEXC's 32-char cap.
+                from trading.execution_quality import make_client_order_id
+                _cid = make_client_order_id(entry_id, "entry", self.BUY_PREFIX)
                 _entry_params = entry_params(
                     position_side="long" if direction == "LONG" else "short",
                     margin_mode=margin_mode, leverage=_lev_int,
                     client_order_id=_cid)
                 from core.database import (claim_symbol_for_entry,
                                            remove_open_position)
-                if not claim_symbol_for_entry(self.BOT_NAME, sym, direction):
+                if not claim_symbol_for_entry(
+                    self.BOT_NAME,
+                    sym,
+                    direction,
+                    intent_id=entry_id,
+                    notional_usdt=notional,
+                    mode=entry_mode,
+                ):
                     log_event(f"{sym} claimed by another bot  skip "
                               f"(coexistence)", "WAIT")
                     emit_entry_lifecycle(
@@ -925,12 +1023,37 @@ class FuturesScanMixin:
                     entry_id, bot=self.BOT_NAME, symbol=sym,
                     stage="order_attempt", mode=entry_mode,
                     direction=direction)
-                order = create_order_with_retry(
-                    self.ex, symbol_full, side, amount_contracts,
-                    params=_entry_params,
-                    shutdown_event=self._shutdown_event,
-                    action_label=f"open {sym}",
-                    log_event=log_event, log_struct=log_struct,
+                from trading.entry_executor import (
+                    MakerFirstConfig,
+                    execute_entry_order,
+                )
+                maker_mode = str(
+                    self.C("MAKER_FIRST_MODE", "disabled") or "disabled"
+                ).strip().lower()
+                order = execute_entry_order(
+                    exchange=self.ex,
+                    symbol=symbol_full,
+                    side=side,
+                    amount=amount_contracts,
+                    intent_id=entry_id,
+                    client_order_id=_cid,
+                    bot_name=self.BOT_NAME,
+                    reference_price=entry_price,
+                    market_order=lambda: create_order_with_retry(
+                        self.ex, symbol_full, side, amount_contracts,
+                        params=_entry_params,
+                        shutdown_event=self._shutdown_event,
+                        action_label=f"open {sym}",
+                        log_event=log_event, log_struct=log_struct,
+                    ),
+                    config=MakerFirstConfig(
+                        mode=maker_mode,
+                        ttl_seconds=float(self.C("MAKER_FIRST_TTL_SECONDS", 3.0)),
+                        market_fallback=self._bool_cfg_value(
+                            self.C("MAKER_FIRST_MARKET_FALLBACK", False), False
+                        ),
+                        depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
+                    ),
                 )
                 # Prefer the ACTUAL filled amount. Bitget often returns
                 # filled=0/None on the initial market-order response (the fill

@@ -742,15 +742,27 @@ class ExitsMixin:
         # by default (MAX_HOLD_HOURS=0); enabling it only ADDS exits for stuck
         # positions, so it frees capital for new entries rather than cutting
         # frequency.
-        try:
-            max_hold_h = _finite_float(self.C("MAX_HOLD_HOURS", 0) or 0)
-        except (TypeError, ValueError, OverflowError):
-            max_hold_h = 0.0
-        if (max_hold_h > 0 and not d.get("break_even")
-                and prof < activation_profit):
-            age_h = _position_age_hours(d)
-            if age_h is not None and age_h >= max_hold_h:
-                return True, "Max Hold Time"
+        from trading.profit_experiments import time_decay_decision
+
+        age_h = _position_age_hours(d)
+        if age_h is not None and not d.get("break_even"):
+            max_age_minutes = _finite_float(
+                self.C("TIME_DECAY_MAX_AGE_MINUTES", 360.0), 360.0
+            )
+            legacy_hours = _finite_float(self.C("MAX_HOLD_HOURS", 0) or 0)
+            if legacy_hours > 0:
+                max_age_minutes = legacy_hours * 60.0
+            decay = time_decay_decision(
+                age_minutes=age_h * 60.0,
+                max_age_minutes=max_age_minutes,
+                mfe_pct=high_prof,
+                min_mfe_pct=_finite_float(
+                    self.C("TIME_DECAY_MIN_MFE_PCT", 0.5), 0.5
+                ),
+                mode=str(self.C("TIME_DECAY_MODE", "shadow") or "shadow").lower(),
+            )
+            if decay.should_exit:
+                return True, "Time Decay"
 
         return False, ""
 

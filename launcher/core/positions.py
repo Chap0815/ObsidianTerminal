@@ -126,7 +126,7 @@ def _clamp_sim_cross_close_costs(
     if str(bot_name).upper() != "CROSS" or not sim_only or notional <= 0:
         return entry_fee, exit_fee, funding_for_close
 
-    fee_rate = taker_fee if taker_fee > 0 else 0.0006
+    fee_rate = taker_fee if taker_fee > 0 else 0.001
     expected_side_fee = notional * fee_rate
     max_side_fee = max(expected_side_fee * 5.0, notional * 0.02)
 

@@ -27,10 +27,10 @@ prepare_entrypoint(__file__, __name__)
 
 require_portalocker()
 
-from core import FuturesBot
-from core.paths import LOG_DIR_FUTURES
-from config.exchange_config import get_futures_exchange_connection
-from bot_utils.sim_flag import read_simulation_flag
+from core import FuturesBot  # noqa: E402 - bootstrap prepares import path first
+from core.paths import LOG_DIR_FUTURES  # noqa: E402
+from config.exchange_config import get_futures_exchange_connection  # noqa: E402
+from bot_utils.sim_flag import read_simulation_flag  # noqa: E402
 
 
 class FuturesExchangeBot(FuturesBot):
@@ -81,6 +81,22 @@ class FuturesExchangeBot(FuturesBot):
         "SIMULATION":        True,
         "ENTRY_QUALITY_FILTER_ENABLED": True,
         "ENTRY_QUALITY_MIN_SCORE": 75.0,
+        "PORTFOLIO_RISK_MODE": "shadow",
+        "NET_EXPECTANCY_MODE": "shadow",
+        "TIME_DECAY_MODE": "shadow",
+        "TIME_DECAY_MAX_AGE_MINUTES": 360,
+        "TIME_DECAY_MIN_MFE_PCT": 0.5,
+        "MAKER_FIRST_MODE": "disabled",
+        "MAKER_FIRST_TTL_SECONDS": 3.0,
+        "MAKER_FIRST_MARKET_FALLBACK": False,
+        "TCA_ENABLED": True,
+        "TCA_DEPTH_LEVELS": 20,
+        "DEPTH_GATE_MODE": "shadow",
+        "VENUE_RECORDER_MODE": "enabled",
+        "VENUE_RECORDER_MAX_SYMBOLS": 8,
+        "VENUE_RECORDER_MICRO_INTERVAL_SECONDS": 6.0,
+        "VENUE_RECORDER_OVERVIEW_INTERVAL_SECONDS": 60.0,
+        "VENUE_RECORDER_DEPTH_LEVELS": 20,
     }
 
     @staticmethod

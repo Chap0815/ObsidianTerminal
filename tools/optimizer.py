@@ -46,7 +46,7 @@ from config.exchange_config import get_spot_exchange_connection
 from tools.backtester import (fetch_history, get_top_volume_coins,
                               filter_universe_by_history,
                               precompute_index, simulate_fast,
-                              calc_round_trip, DEFAULT_DAYS, INITIAL_CAPITAL,
+                              calc_round_trip, DEFAULT_DAYS,
                               _compute_stats)
 from core.logger import log_separator
 
@@ -623,6 +623,99 @@ def holdout_simulate(indexed: dict, holdout_times: list, strategy: str,
     return simulate_fast(period_data, holdout_times, strategy, use_maker, params)
 
 
+FINAL_HOLDOUT_MIN_TRADES = 30
+
+
+def rank_optimizer_candidates(results: list[dict]) -> list[dict]:
+    """Rank candidates using training and inner-validation evidence only.
+
+    Final-holdout fields are deliberately ignored. Once the winner is frozen,
+    holdout failure is a NO-GO rather than a reason to promote the runner-up.
+    """
+    robust = [r for r in results if r.get("kfold", {}).get("robust")]
+    fragile = [r for r in results if not r.get("kfold", {}).get("robust")]
+    robust.sort(key=lambda r: float(r.get("score", float("-inf"))), reverse=True)
+    fragile.sort(
+        key=lambda r: float(r.get("stats", {}).get("net", float("-inf"))),
+        reverse=True,
+    )
+    return robust + fragile
+
+
+def _holdout_cost_stress_pass(stats: dict) -> bool:
+    """Require profitability after doubling every measured execution cost."""
+    trades = stats.get("closed_trades") or []
+    if not trades:
+        return False
+    try:
+        gross = sum(float(trade["gross"]) for trade in trades)
+        costs = sum(float(trade["cost"]) for trade in trades)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return costs >= 0.0 and gross - (2.0 * costs) > 0.0
+
+
+def freeze_and_evaluate_final_holdout(
+    candidates: list[dict], evaluator, *, min_trades: int = FINAL_HOLDOUT_MIN_TRADES
+) -> dict:
+    """Freeze one winner, evaluate it once, and attach fail-closed evidence."""
+    ranked = rank_optimizer_candidates(candidates)
+    if not ranked:
+        raise ValueError("no optimizer candidates to freeze")
+    winner = ranked[0]
+    try:
+        holdout = evaluator(winner["params"])
+    except Exception:
+        holdout = None
+    holdout = holdout if isinstance(holdout, dict) else {}
+    trades = int(holdout.get("trades", 0) or 0)
+    cost_stress_pass = _holdout_cost_stress_pass(holdout)
+    final_pass = bool(
+        not holdout.get("skipped")
+        and float(holdout.get("net", 0.0) or 0.0) > 0.0
+        and trades >= int(min_trades)
+        and cost_stress_pass
+        and winner.get("kfold", {}).get("robust")
+    )
+    winner["holdout"] = holdout
+    winner["holdout_trades"] = trades
+    winner["cost_stress_pass"] = cost_stress_pass
+    winner["final_holdout_pass"] = final_pass
+    winner["deployment_validated"] = final_pass
+    return winner
+
+
+def build_pbo_block_matrix(
+    results: list[dict], *, minimum_blocks: int = 8
+) -> list[list[float]]:
+    """Build aligned, time-ordered return blocks for CSCV/PBO.
+
+    Aggregating each fold to one number leaves only six CSCV partitions with
+    four folds. Split every fold's ordered trade returns into contiguous blocks
+    and exclude candidates without enough observations rather than padding.
+    """
+    matrix = []
+    for result in results:
+        folds = result.get("kfold", {}).get("fold_results") or []
+        if not folds:
+            continue
+        per_fold = max(1, math.ceil(minimum_blocks / len(folds)))
+        blocks = []
+        complete = True
+        for fold in folds:
+            returns = [float(value) for value in (fold.get("net_trades") or [])]
+            if len(returns) < per_fold:
+                complete = False
+                break
+            for block_index in range(per_fold):
+                start = block_index * len(returns) // per_fold
+                end = (block_index + 1) * len(returns) // per_fold
+                blocks.append(sum(returns[start:end]))
+        if complete and len(blocks) >= minimum_blocks:
+            matrix.append(blocks)
+    return matrix
+
+
 #  Sensitivitts-Analyse 
 
 def sensitivity_check(indexed: dict, all_times: list, base_params: dict,
@@ -1061,7 +1154,7 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
     _display_labels = {
         "min_pump": "min_move" if strategy == "FUTURES" else "min_pump",
     }
-    print(f"\n  Suchraum:")
+    print("\n  Suchraum:")
     for k, v in space.items():
         label = _display_labels.get(k, k)
         print(f"    {label:<22} {len(v)} Werte")
@@ -1178,11 +1271,8 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
           f"({elapsed/len(results)*1000:.0f}ms/Config inkl. K-Fold)\n")
 
     # Sortierung: zuerst robuste Configs, dann nach Score
-    robust_cfgs   = [r for r in results if r["kfold"]["robust"]]
-    fragile_cfgs  = [r for r in results if not r["kfold"]["robust"]]
-    robust_cfgs.sort(  key=lambda x: x["score"], reverse=True)
-    fragile_cfgs.sort( key=lambda x: x["stats"].get("net", -9999), reverse=True)
-    sorted_results = robust_cfgs + fragile_cfgs
+    robust_cfgs = [r for r in results if r["kfold"]["robust"]]
+    sorted_results = rank_optimizer_candidates(results)
 
     #  Deep robustness validation on the top candidates 
     # walk_forward / regime_split / outlier / monte_carlo feed robustness_score's
@@ -1210,42 +1300,25 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
             r["regime_split"] = rs
             r["outlier_test"] = ot
             r["monte_carlo"]  = mc
-            # OUT-OF-SAMPLE deployment test on the untouched holdout. A config is
-            # only "deployment-validated" if it is k-fold robust AND still nets
-            # > 0 on data the entire search never saw.
-            hd = (_safe(lambda: holdout_simulate(indexed, holdout_times,
-                                                 strategy, use_maker, p))
-                  if holdout_times else None)
-            r["holdout"] = hd
-            r["deployment_validated"] = bool(
-                r["kfold"]["robust"] and hd and hd.get("net", -9999) > 0)
             # Recompute score WITH the deep modifiers.
             r["score"] = robustness_score(
                 r["stats"], r["kfold"],
                 walk_forward=wf, regime_split=rs,
                 outlier_test=ot, monte_carlo=mc,
             )
-        # Re-rank: holdout survivors first, then by enriched score. A config that
-        # crumbles out-of-sample drops below one that survives, even if its
-        # in-sample score was higher.
-        robust_cfgs.sort(key=lambda x: (x.get("deployment_validated", False),
-                                        x["score"]), reverse=True)
-        sorted_results = robust_cfgs + fragile_cfgs
+        # Deep evidence can change the winner, but holdout evidence cannot.
+        sorted_results = rank_optimizer_candidates(results)
 
-    # Score the TOP configs on the holdout regardless of k-fold robustness
-    # (cheap, 1 sim each) so the report always shows out-of-sample behaviour of
-    # the best available config  even when nothing passed k-fold.
-    if holdout_times:
-        for r in sorted_results[:max(top_n, 10)]:
-            if "holdout" not in r:
-                try:
-                    hd = holdout_simulate(indexed, holdout_times,
-                                          strategy, use_maker, r["params"])
-                except Exception:
-                    hd = None
-                r["holdout"] = hd
-                r["deployment_validated"] = bool(
-                    r["kfold"]["robust"] and hd and hd.get("net", -9999) > 0)
+    # Freeze exactly one winner before touching the final holdout. If it fails,
+    # this optimizer run is a NO-GO; the same holdout is not reused to select a
+    # runner-up.
+    if holdout_times and sorted_results:
+        freeze_and_evaluate_final_holdout(
+            sorted_results,
+            lambda params: holdout_simulate(
+                indexed, holdout_times, strategy, use_maker, params
+            ),
+        )
 
     for r in sorted_results:
         r["cmd"] = _cmd(r["params"], strategy, days, use_maker)
@@ -1331,21 +1404,23 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
     skew_b, kurt_b = _sample_skew_kurt(best_nets)
     dsr = deflated_sharpe_ratio(sr_list, sr_best, n_obs,
                                 skew=skew_b, kurt=kurt_b)
-    # PBO matrix: per-config net across the k folds (already simulated).
-    perf_matrix = [r["kfold"]["fold_nets"] for r in results
-                   if len(r["kfold"].get("fold_nets") or []) == k_folds]
+    # PBO matrix: at least eight time-ordered return blocks. Four aggregate
+    # fold totals yield only six CSCV partitions and are too coarse.
+    perf_matrix = build_pbo_block_matrix(results, minimum_blocks=8)
     pbo = probability_of_backtest_overfitting(perf_matrix)
     dsr_val = dsr.get("dsr")
     pbo_val = pbo.get("pbo")
     deployment_trustworthy = bool(
         bkf["robust"]
+        and best.get("final_holdout_pass") is True
+        and best.get("cost_stress_pass") is True
         and dsr_val is not None and dsr_val >= 0.95
-        and pbo_val is not None and pbo_val <= 0.5)
+        and pbo_val is not None and pbo_val <= 0.25)
     best["dsr"] = dsr
     best["pbo"] = pbo
     best["deployment_trustworthy"] = deployment_trustworthy
 
-    print(f"\n  BESTE KONFIGURATION:")
+    print("\n  BESTE KONFIGURATION:")
     print(f"     {_label(bp, strategy)}")
     print(f"  Avg Netto:  {bkf['avg_net']:+.2f} USDT (ber {k_folds} Folds)")
     print(f"     Konsistenz:   {bkf['consistency']:.0%}  "
@@ -1370,7 +1445,7 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
         print(f"  PBO (CSCV):  ({pbo.get('reason', 'n/a')})")
     print(f"     Trustworthy:  "
           f"{'Ja ' if deployment_trustworthy else 'Nein '} "
-          f"(robust  DSR0.95  PBO0.5)")
+          f"(robust  final holdout  cost stress  DSR0.95  PBO0.25)")
 
     # Deep-validation summary
     wf = best.get("walk_forward") or {}
@@ -1380,12 +1455,12 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
     if wf or rs or mc or ot:
         if wf:
             n_sl = len(wf.get("slice_nets", []))
-            print(f"     Walk-Forward: "
+            print("     Walk-Forward: "
                   + (" alle Slices profitabel"
                      if wf.get("all_profitable")
                      else f" {wf.get('profitable_count','?')}/{n_sl} Slices +"))
         if rs:
-            print(f"     Regime-Test:  "
+            print("     Regime-Test:  "
                   + (" bersteht alle Regimes"
                      if rs.get("survives_all")
                      else f" {rs.get('profitable_count','?')}/"
@@ -1396,7 +1471,7 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
                   + ("  " if mc.get("robust")
                      else "  fragil" if mc.get("concerning") else ""))
         if ot.get("outlier_fragile") is not None:
-            print(f"     Outlier-Dep.: "
+            print("     Outlier-Dep.: "
                   + (" FRAGIL  Edge hngt an Top-Trades"
                      if ot["outlier_fragile"]
                      else " breit verteilte Edge"))
@@ -1438,6 +1513,9 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
         "sharpe":           float(bs.get("sharpe", 0)),
         "robust":           bool(bkf["robust"]),
         "holdout_net":      (float(hd.get("net", 0)) if hd and not hd.get("skipped") else None),
+        "holdout_trades":   int(best.get("holdout_trades", 0) or 0),
+        "cost_stress_pass": bool(best.get("cost_stress_pass", False)),
+        "final_holdout_pass": bool(best.get("final_holdout_pass", False)),
         "deployment_validated": bool(best.get("deployment_validated", False)),
         "dsr":              (float(dsr_val) if dsr_val is not None else None),
         "pbo":              (float(pbo_val) if pbo_val is not None else None),
@@ -1447,7 +1525,7 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
 
     # Sensitivitts-Analyse fr Top 3
     if do_sensitivity and len(sorted_results) > 0:
-        print(f"\n  SENSITIVITTS-ANALYSE (Top 3 Configs):\n")
+        print("\n  SENSITIVITTS-ANALYSE (Top 3 Configs):\n")
         for rank in range(min(3, len(sorted_results))):
             cfg  = sorted_results[rank]
             sens = sensitivity_check(
@@ -1462,7 +1540,7 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
             cfg["sensitivity"] = sens
             print()
 
-    print(f"\n  Validierung der Top-1:")
+    print("\n  Validierung der Top-1:")
     print(f"     {best['cmd']}\n")
 
     # CSV
@@ -1521,34 +1599,46 @@ if __name__ == "__main__":
     top_n   = 10
     k_folds = 4
     if "--top" in args:
-        try: top_n = int(args[args.index("--top") + 1])
-        except (ValueError, IndexError): pass
+        try:
+            top_n = int(args[args.index("--top") + 1])
+        except (ValueError, IndexError):
+            pass
     if "--kfold" in args:
-        try: k_folds = int(args[args.index("--kfold") + 1])
-        except (ValueError, IndexError): pass
+        try:
+            k_folds = int(args[args.index("--kfold") + 1])
+        except (ValueError, IndexError):
+            pass
 
     leverage = None  # None  resolve from bot_config.json inside run_optimizer
     if "--leverage" in args:
-        try: leverage = float(args[args.index("--leverage") + 1])
-        except (ValueError, IndexError): pass
+        try:
+            leverage = float(args[args.index("--leverage") + 1])
+        except (ValueError, IndexError):
+            pass
 
     holdout_frac = 0.2   # fraction of the most-recent data reserved out-of-sample
     if "--holdout" in args:
-        try: holdout_frac = float(args[args.index("--holdout") + 1])
-        except (ValueError, IndexError): pass
+        try:
+            holdout_frac = float(args[args.index("--holdout") + 1])
+        except (ValueError, IndexError):
+            pass
 
     own_momentum = "--own-momentum" in args
     om_window    = 8
     if "--om-window" in args:
-        try: om_window = int(args[args.index("--om-window") + 1])
-        except (ValueError, IndexError): pass
+        try:
+            om_window = int(args[args.index("--om-window") + 1])
+        except (ValueError, IndexError):
+            pass
 
     regime = "--regime" in args
 
     funding_8h = 0.0
     if "--funding" in args:
-        try: funding_8h = float(args[args.index("--funding") + 1])
-        except (ValueError, IndexError): pass
+        try:
+            funding_8h = float(args[args.index("--funding") + 1])
+        except (ValueError, IndexError):
+            pass
 
     run_optimizer(
         strategy, days,

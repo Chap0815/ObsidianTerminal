@@ -17,7 +17,13 @@
                   "MAX_DAILY_LOSS":  -50.0,
                   "LEARNING_DISABLED":  true,
                   "SIMULATION":  true,
-                  "POSITION_SIZE_MAX":  2500
+                  "POSITION_SIZE_MAX":  2500,
+                  "PORTFOLIO_RISK_MODE":  "shadow",
+                  "NET_EXPECTANCY_MODE":  "shadow",
+                  "TIME_DECAY_MODE":  "shadow",
+                  "TIME_DECAY_MAX_AGE_MINUTES":  1440,
+                  "TIME_DECAY_MIN_MFE_PCT":  0.5,
+                  "TREND_VOL_TARGET_MODE":  "shadow"
               },
     "SPOT":  {
                  "MIN_PUMP":  5.0,
@@ -42,7 +48,12 @@
                  "ENTRY_QUALITY_FILTER_ENABLED":  true,
                  "ENTRY_QUALITY_MIN_SCORE":  75.0,
                  "SIMULATION":  true,
-                 "MONITOR_INTERVAL":  20
+                 "MONITOR_INTERVAL":  20,
+                 "PORTFOLIO_RISK_MODE":  "shadow",
+                 "NET_EXPECTANCY_MODE":  "shadow",
+                 "TIME_DECAY_MODE":  "shadow",
+                 "TIME_DECAY_MAX_AGE_MINUTES":  360,
+                 "TIME_DECAY_MIN_MFE_PCT":  0.5
              },
     "FUTURES":  {
                     "MIN_PUMP":  1.0,
@@ -77,7 +88,23 @@
                     "SIMULATION":  true,
                     "OWN_MOMENTUM_MIN_LOSS_PCT":  20.0,
                     "ENTRY_QUALITY_FILTER_ENABLED":  true,
-                    "ENTRY_QUALITY_MIN_SCORE":  75.0
+                    "ENTRY_QUALITY_MIN_SCORE":  75.0,
+                    "PORTFOLIO_RISK_MODE":  "shadow",
+                    "NET_EXPECTANCY_MODE":  "shadow",
+                    "TIME_DECAY_MODE":  "shadow",
+                    "TIME_DECAY_MAX_AGE_MINUTES":  360,
+                    "TIME_DECAY_MIN_MFE_PCT":  0.5,
+                    "MAKER_FIRST_MODE":  "disabled",
+                    "MAKER_FIRST_TTL_SECONDS":  3.0,
+                    "MAKER_FIRST_MARKET_FALLBACK":  false,
+                    "TCA_ENABLED":  true,
+                    "TCA_DEPTH_LEVELS":  20,
+                    "DEPTH_GATE_MODE":  "shadow",
+                    "VENUE_RECORDER_MODE":  "enabled",
+                    "VENUE_RECORDER_MAX_SYMBOLS":  8,
+                    "VENUE_RECORDER_MICRO_INTERVAL_SECONDS":  6.0,
+                    "VENUE_RECORDER_OVERVIEW_INTERVAL_SECONDS":  60.0,
+                    "VENUE_RECORDER_DEPTH_LEVELS":  20
                 },
     "CROSS":  {
                   "XSEC_LOOKBACK_HOURS":  24,
@@ -100,7 +127,15 @@
                   "ENTRY_QUALITY_FILTER_ENABLED":  true,
                   "ENTRY_QUALITY_MIN_SCORE":  75.0,
                   "SIMULATION":  true,
-                  "XSEC_MAX_SPREAD_PCT":  0.5
+                  "XSEC_MAX_SPREAD_PCT":  0.5,
+                  "PORTFOLIO_RISK_MODE":  "shadow",
+                  "NET_EXPECTANCY_MODE":  "shadow",
+                  "TIME_DECAY_MODE":  "shadow",
+                  "TIME_DECAY_MAX_AGE_MINUTES":  720,
+                  "TIME_DECAY_MIN_MFE_PCT":  0.5,
+                  "TCA_ENABLED":  true,
+                  "TCA_DEPTH_LEVELS":  20,
+                  "DEPTH_GATE_MODE":  "shadow"
               },
     "FUTREND":  {
                     "TREND_TIMEFRAME":  "4h",
@@ -131,6 +166,7 @@
                     "SIMULATION":  true,
                     "TREND_VOL_TARGET":  0,
                     "TREND_VOL_TARGET_LOOKBACK":  30,
+                    "TREND_VOL_TARGET_MODE":  "shadow",
                     "ENTRY_QUALITY_FILTER_ENABLED":  true,
                     "ENTRY_QUALITY_MIN_SCORE":  75.0,
                     "MAX_NEW_TRADES_PER_TICK":  1,
@@ -148,7 +184,16 @@
                     "FAILED_ENTRY_LOSS_PCT":  -2.5,
                     "PRE_ACTIVATION_GIVEBACK_STOP_ENABLED":  true,
                     "PRE_ACTIVATION_MIN_MFE_PCT":  0.8,
-                    "PRE_ACTIVATION_GIVEBACK_PCT":  2.75
+                    "PRE_ACTIVATION_GIVEBACK_PCT":  2.75,
+                    "PORTFOLIO_RISK_MODE":  "shadow",
+                    "NET_EXPECTANCY_MODE":  "shadow",
+                    "TIME_DECAY_MODE":  "shadow",
+                    "TIME_DECAY_MAX_AGE_MINUTES":  1440,
+                    "TIME_DECAY_MIN_MFE_PCT":  0.5,
+                    "MAKER_FIRST_MODE":  "disabled",
+                    "TCA_ENABLED":  true,
+                    "TCA_DEPTH_LEVELS":  20,
+                    "DEPTH_GATE_MODE":  "shadow"
                 },
     "UI":  {
                "VISIBLE_BOTS":  [
@@ -169,5 +214,13 @@
                                         "TREND":  true
                                     }
            },
+    "EXPERIMENTS":  {
+                        "VENUE_RECORDER_MODE":  "enabled",
+                        "VENUE_RECORDER_INTERVAL_SECONDS":  60,
+                        "VENUE_RECORDER_DEPTH_LEVELS":  20,
+                        "CARRY_MODE":  "sim",
+                        "CLOCK_ORDERFLOW_MODE":  "shadow",
+                        "CAUSALITY_GATE_REQUIRED":  true
+                    },
     "LLM_MODEL":  "qwen2.5:7b"
 }

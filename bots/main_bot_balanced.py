@@ -19,10 +19,10 @@ prepare_entrypoint(__file__, __name__)
 
 require_portalocker()
 
-from core.trend_bot import TrendBot
-from core.paths import LOG_DIR_TREND
-from config.exchange_config import get_spot_exchange_connection
-from bot_utils.sim_flag import read_simulation_flag
+from core.trend_bot import TrendBot  # noqa: E402
+from core.paths import LOG_DIR_TREND  # noqa: E402
+from config.exchange_config import get_spot_exchange_connection  # noqa: E402
+from bot_utils.sim_flag import read_simulation_flag  # noqa: E402
 
 
 class BalancedBot(TrendBot):
@@ -62,6 +62,12 @@ class BalancedBot(TrendBot):
                                      # fixed basket -> skip Kelly/RSI/blacklist
         "TREND_VOL_TARGET":          0,
         "TREND_VOL_TARGET_LOOKBACK": 30,
+        "TREND_VOL_TARGET_MODE": "shadow",
+        "PORTFOLIO_RISK_MODE": "shadow",
+        "NET_EXPECTANCY_MODE": "shadow",
+        "TIME_DECAY_MODE": "shadow",
+        "TIME_DECAY_MAX_AGE_MINUTES": 1440,
+        "TIME_DECAY_MIN_MFE_PCT": 0.5,
         "SIMULATION":        True,
     }
 

@@ -821,6 +821,71 @@ class TrendFuturesBot(FuturesBot):
                 direction="LONG")
             return
         if not self.simulation:
+            from trading.entry_admission import evaluate_entry_admission
+            from trading.portfolio_risk import PortfolioLimits
+
+            portfolio_mode = str(
+                self.C("PORTFOLIO_RISK_MODE", "shadow") or "shadow"
+            ).strip().lower()
+            expectancy_mode = str(
+                self.C("NET_EXPECTANCY_MODE", "shadow") or "shadow"
+            ).strip().lower()
+            admission = evaluate_entry_admission(
+                exchange=self.ex,
+                intent_id=entry_id,
+                bot_name=self.BOT_NAME,
+                symbol=full,
+                side="LONG",
+                requested_notional=notional,
+                portfolio_mode=portfolio_mode,
+                expectancy_mode=expectancy_mode,
+                features={
+                    "score": float(shadow.get("entry_quality_score") or 0.0),
+                    "spread_bps": float(shadow.get("spread_pct") or 0.0) * 100.0,
+                    "funding_rate_pct": float(
+                        shadow.get("funding_rate_pct") or 0.0
+                    ),
+                    "trend_votes": float(shadow.get("trend_votes") or 0.0),
+                    "realized_vol": float(shadow.get("realized_vol") or 0.0),
+                },
+                limits=PortfolioLimits(
+                    max_gross_pct=float(self.C("PORTFOLIO_MAX_GROSS_PCT", 100.0)),
+                    max_net_pct=float(self.C("PORTFOLIO_MAX_NET_PCT", 75.0)),
+                    min_free_pct=float(self.C("PORTFOLIO_MIN_FREE_PCT", 20.0)),
+                    max_cluster_pct=float(self.C("PORTFOLIO_MAX_CLUSTER_PCT", 35.0)),
+                    max_beta_pct=float(self.C("PORTFOLIO_MAX_BETA_PCT", 75.0)),
+                ),
+            )
+            try:
+                log_struct(
+                    "entry_admission",
+                    bot=self.BOT_NAME,
+                    entry_id=entry_id,
+                    symbol=base,
+                    portfolio_mode=portfolio_mode,
+                    portfolio_allowed=admission.portfolio.allowed,
+                    portfolio_shadow_allowed=admission.portfolio.shadow_allowed,
+                    portfolio_reasons=list(admission.portfolio.reasons),
+                    expectancy_mode=expectancy_mode,
+                    expectancy_allowed=admission.expectancy.allowed,
+                    expectancy_shadow_allowed=admission.expectancy.shadow_allowed,
+                    expected_net_bps=admission.expectancy.expected_net_bps,
+                    model_version=admission.expectancy.model_version,
+                )
+            except Exception:
+                pass
+            if not admission.allowed:
+                emit_entry_lifecycle(
+                    entry_id,
+                    bot=self.BOT_NAME,
+                    symbol=base,
+                    stage="blocked",
+                    mode=entry_mode,
+                    reason="entry_admission",
+                    direction="LONG",
+                )
+                return
+        if not self.simulation:
             try:
                 from bot_utils.balance import safe_fetch_balance_usdt
                 available = safe_fetch_balance_usdt(
@@ -938,13 +1003,18 @@ class TrendFuturesBot(FuturesBot):
                 return
             safe_set_margin_mode(self.ex, margin_mode, full, leverage=lev_cap,
                                  direction="LONG")
-            import hashlib as _h
-            _cid = (f"{self.BUY_PREFIX}-{base}-"
-                    + _h.sha256(f"{self.BOT_NAME}:{base}:{int(time.time()//30)}"
-                                .encode()).hexdigest()[:10])
+            from trading.execution_quality import make_client_order_id
+            _cid = make_client_order_id(entry_id, "entry", self.BUY_PREFIX)
             params = entry_params(position_side="long", margin_mode=margin_mode,
                                   leverage=lev_cap, client_order_id=_cid)
-            if not claim_symbol_for_entry(self.BOT_NAME, full, "LONG"):
+            if not claim_symbol_for_entry(
+                self.BOT_NAME,
+                full,
+                "LONG",
+                intent_id=entry_id,
+                notional_usdt=float(margin) * float(lev_cap),
+                mode=entry_mode,
+            ):
                 log_event(f"[{self.BOT_NAME}] {base}: claimed by another bot "
                           f" skip", "WAIT")
                 emit_entry_lifecycle(
@@ -976,11 +1046,27 @@ class TrendFuturesBot(FuturesBot):
                     entry_id, bot=self.BOT_NAME, symbol=base,
                     stage="order_attempt", mode=entry_mode,
                     direction="LONG")
-                order = create_order_with_retry(
-                    self.ex, full, "buy", contracts, params=params,
-                    shutdown_event=self._shutdown_event,
-                    action_label=f"trend open {base}",
-                    log_event=log_event, log_struct=log_struct)
+                from trading.entry_executor import (
+                    MakerFirstConfig,
+                    execute_entry_order,
+                )
+                order = execute_entry_order(
+                    exchange=self.ex,
+                    symbol=full,
+                    side="buy",
+                    amount=contracts,
+                    intent_id=entry_id,
+                    client_order_id=_cid,
+                    bot_name=self.BOT_NAME,
+                    reference_price=fill,
+                    market_order=lambda: create_order_with_retry(
+                        self.ex, full, "buy", contracts, params=params,
+                        shutdown_event=self._shutdown_event,
+                        action_label=f"trend open {base}",
+                        log_event=log_event, log_struct=log_struct,
+                    ),
+                    config=MakerFirstConfig(mode="disabled"),
+                )
             except Exception as e:
                 emit_entry_lifecycle(
                     entry_id, bot=self.BOT_NAME, symbol=base,
@@ -1078,7 +1164,7 @@ class TrendFuturesBot(FuturesBot):
                 fees = 0.0
         else:
             from bot_utils.fee_math import taker_fee_rate
-            fees = notional * taker_fee_rate(self.ex, full, 0.0006)
+            fees = notional * taker_fee_rate(self.ex, full)
 
         actual_margin, margin_from_fill = filled_margin_usdt(
             amount, cs, fill, eff_lev, margin)
@@ -1524,7 +1610,7 @@ class TrendFuturesBot(FuturesBot):
             from bot_utils.fee_math import taker_fee_rate
             if cs > 0:
                 close_fee += amt * cs * close_price * taker_fee_rate(
-                    self.ex, f"{base}/USDT:USDT", 0.0006)
+                    self.ex, f"{base}/USDT:USDT")
         elif amt > 0 and not live_close_already_verified:
             from bot_utils import (create_order_with_retry,
                                     extract_or_estimate_futures_fee,
@@ -2208,6 +2294,42 @@ class TrendFuturesBot(FuturesBot):
                 return
         except Exception as e:
             self._log_error(f"trend profit safety {base}", e)
+
+        # Low-priority experiment: only after every existing safety/profit exit.
+        try:
+            from trading.profit_experiments import (
+                position_age_minutes,
+                time_decay_decision,
+            )
+
+            age_minutes = position_age_minutes(d.get("buy_time"))
+            if age_minutes is not None:
+                decay = time_decay_decision(
+                    age_minutes=age_minutes,
+                    max_age_minutes=self._f("TIME_DECAY_MAX_AGE_MINUTES", 360.0),
+                    mfe_pct=high_move,
+                    min_mfe_pct=self._f("TIME_DECAY_MIN_MFE_PCT", 0.5),
+                    mode=str(self.C("TIME_DECAY_MODE", "shadow") or "shadow"),
+                )
+                if decay.shadow_should_exit and not d.get("time_decay_shadow_seen"):
+                    from core.logger import log_struct
+
+                    log_struct(
+                        "time_decay_decision",
+                        bot=self.BOT_NAME,
+                        symbol=base,
+                        mode=str(self.C("TIME_DECAY_MODE", "shadow")),
+                        age_minutes=age_minutes,
+                        mfe_pct=high_move,
+                        should_exit=decay.should_exit,
+                    )
+                    d["time_decay_shadow_seen"] = True
+                    self.state.update(base, "time_decay_shadow_seen", True)
+                if decay.should_exit:
+                    self._close_position(base, d, reason="Time-Decay Exit")
+                    return
+        except Exception as e:
+            self._log_error(f"trend time-decay {base}", e)
 
         # 4) Dashboard live-state (best-effort).
         try:

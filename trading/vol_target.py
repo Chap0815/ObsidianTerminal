@@ -28,12 +28,15 @@ def realized_vol(closes: List[float], lookback: int = 30) -> Optional[float]:
 
 def vol_target_multiplier(coin_vol: Optional[float],
                           basket_median_vol: Optional[float],
-                          lo: float = 0.33, hi: float = 3.0) -> float:
+                          lo: float = 0.33, hi: float = 1.0) -> float:
     """Size multiplier = basket_median_vol / coin_vol, clamped to [lo, hi].
     Falls back to 1.0 (flat sizing) on missing/degenerate inputs."""
     if not coin_vol or not basket_median_vol or coin_vol <= 0:
         return 1.0
-    return max(lo, min(hi, basket_median_vol / coin_vol))
+    # Risk overlays may shrink a validated base size, never increase it before
+    # their own OOS promotion gate has passed.
+    safe_hi = min(1.0, float(hi))
+    return max(lo, min(safe_hi, basket_median_vol / coin_vol))
 
 
 def basket_median_vol(vols: List[Optional[float]]) -> Optional[float]:

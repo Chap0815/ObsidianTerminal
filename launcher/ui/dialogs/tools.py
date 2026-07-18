@@ -13,7 +13,6 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-import sys
 import threading
 from collections import deque as _deque
 
@@ -50,6 +49,45 @@ OPTIMIZER_CONFIG_MAPPING = {
     "rsi_max":           "RSI_MAX",
 }
 
+OPTIMIZER_MIN_HOLDOUT_TRADES = 30
+
+
+def optimizer_promotion_reasons(cfg: dict) -> list[str]:
+    """Return fail-closed reasons why an optimizer payload is not promotable."""
+    if not isinstance(cfg, dict):
+        return ["payload is not an object"]
+    reasons = []
+    for key in (
+        "robust",
+        "deployment_validated",
+        "deployment_trustworthy",
+        "final_holdout_pass",
+        "cost_stress_pass",
+    ):
+        if cfg.get(key) is not True:
+            reasons.append(f"{key} is not explicitly true")
+    try:
+        if float(cfg.get("holdout_net")) <= 0.0:
+            reasons.append("holdout_net is not positive")
+    except (TypeError, ValueError):
+        reasons.append("holdout_net is missing")
+    try:
+        if int(cfg.get("holdout_trades")) < OPTIMIZER_MIN_HOLDOUT_TRADES:
+            reasons.append("holdout trade count is below minimum")
+    except (TypeError, ValueError):
+        reasons.append("holdout trade count is missing")
+    try:
+        if float(cfg.get("dsr")) < 0.95:
+            reasons.append("DSR is below 0.95")
+    except (TypeError, ValueError):
+        reasons.append("DSR is missing")
+    try:
+        if float(cfg.get("pbo")) > 0.25:
+            reasons.append("PBO is above 0.25")
+    except (TypeError, ValueError):
+        reasons.append("PBO is missing")
+    return reasons
+
 
 def optimizer_best_config_updates(cfg: dict) -> tuple[dict, list[str]]:
     """Return only config keys explicitly emitted by the optimizer."""
@@ -71,6 +109,9 @@ def apply_optimizer_best_config_to_app(app, strategy: str, cfg: dict) -> list[st
     updates, applied = optimizer_best_config_updates(cfg)
     if not updates:
         return applied
+    reasons = optimizer_promotion_reasons(cfg)
+    if reasons:
+        raise ValueError("optimizer result is not promotable: " + "; ".join(reasons))
     for cfg_key, val in updates.items():
         app.config[strategy][cfg_key] = val
         try:
@@ -695,6 +736,8 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             return
         cfg = parse_state.get("best_config")
         if not cfg:
+            return
+        if optimizer_promotion_reasons(cfg):
             return
 
         apply_btn = ctk.CTkButton(

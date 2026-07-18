@@ -203,7 +203,7 @@ class TrendBot(SpotBot):
                 return
 
     def _trend_buy_pass(self):
-        from core.logger import log_event
+        from core.logger import log_event, log_struct
         if self.safe_mode is not None and self.safe_mode.is_active():
             return
         try:
@@ -312,9 +312,89 @@ class TrendBot(SpotBot):
             # before committing capital  closes any has()->add() window.
             if self.state.has(sym):
                 continue
+            from trading.entry_lifecycle import new_entry_id
+
+            entry_mode = "SIM" if self.simulation else "LIVE"
+            entry_id = new_entry_id(
+                bot=self.BOT_NAME,
+                symbol=sym,
+                mode=entry_mode,
+                direction="BUY",
+            )
+            if not self.simulation:
+                from trading.entry_admission import evaluate_entry_admission
+                from trading.portfolio_risk import PortfolioLimits
+
+                portfolio_mode = str(
+                    self.C("PORTFOLIO_RISK_MODE", "shadow") or "shadow"
+                ).strip().lower()
+                expectancy_mode = str(
+                    self.C("NET_EXPECTANCY_MODE", "shadow") or "shadow"
+                ).strip().lower()
+                admission = evaluate_entry_admission(
+                    exchange=self.ex,
+                    intent_id=entry_id,
+                    bot_name=self.BOT_NAME,
+                    symbol=f"{sym}/USDT",
+                    side="LONG",
+                    requested_notional=coin_size,
+                    portfolio_mode=portfolio_mode,
+                    expectancy_mode=expectancy_mode,
+                    account_type="spot",
+                    features={
+                        "trend_votes": float(votes),
+                        "realized_vol": float(vols.get(sym) or 0.0),
+                        "size_multiplier": float(
+                            vol_target_multiplier(vols.get(sym), med)
+                            if vt_on
+                            else 1.0
+                        ),
+                    },
+                    limits=PortfolioLimits(
+                        max_gross_pct=float(
+                            self.C("PORTFOLIO_MAX_GROSS_PCT", 100.0)
+                        ),
+                        max_net_pct=float(
+                            self.C("PORTFOLIO_MAX_NET_PCT", 100.0)
+                        ),
+                        min_free_pct=float(
+                            self.C("PORTFOLIO_MIN_FREE_PCT", 20.0)
+                        ),
+                        max_cluster_pct=float(
+                            self.C("PORTFOLIO_MAX_CLUSTER_PCT", 35.0)
+                        ),
+                        max_beta_pct=float(
+                            self.C("PORTFOLIO_MAX_BETA_PCT", 100.0)
+                        ),
+                    ),
+                )
+                log_struct(
+                    "entry_admission",
+                    bot=self.BOT_NAME,
+                    entry_id=entry_id,
+                    symbol=sym,
+                    portfolio_mode=portfolio_mode,
+                    portfolio_allowed=admission.portfolio.allowed,
+                    portfolio_shadow_allowed=admission.portfolio.shadow_allowed,
+                    portfolio_reasons=list(admission.portfolio.reasons),
+                    expectancy_mode=expectancy_mode,
+                    expectancy_allowed=admission.expectancy.allowed,
+                    expectancy_shadow_allowed=admission.expectancy.shadow_allowed,
+                    expected_net_bps=admission.expectancy.expected_net_bps,
+                    model_version=admission.expectancy.model_version,
+                )
+                if not admission.allowed:
+                    continue
             if not self.simulation:
                 from core.database import claim_symbol_for_entry
-                if not claim_symbol_for_entry(self.BOT_NAME, sym, "SPOT"):
+                if not claim_symbol_for_entry(
+                    self.BOT_NAME,
+                    sym,
+                    "SPOT",
+                    intent_id=entry_id,
+                    notional_usdt=coin_size,
+                    mode=entry_mode,
+                ):
                     from core.logger import log_event as _lev
                     _lev(f"Trend: {sym} claimed by another bot  skip "
                          f"(coexistence)", "WAIT")
@@ -324,11 +404,19 @@ class TrendBot(SpotBot):
                 entry = self._place_buy_order(sym, {"price": price}, coin_size)
             except Exception as _buy_exc:
                 if _trend_claimed:
-                    self._release_entry_claim_if_untracked(sym)
+                    released = self._release_entry_claim_if_untracked(sym)
+                    if released:
+                        from core.database import release_portfolio_reservation
+
+                        release_portfolio_reservation(entry_id)
                 raise _buy_exc
             if entry is None:
                 if _trend_claimed:
-                    self._release_entry_claim_if_untracked(sym)
+                    released = self._release_entry_claim_if_untracked(sym)
+                    if released:
+                        from core.database import release_portfolio_reservation
+
+                        release_portfolio_reservation(entry_id)
                 continue
             amount, fill_price, gross_amount, invested_usdt, entry_fee = entry
             state_ok = self._add_trend_state(
@@ -370,6 +458,10 @@ class TrendBot(SpotBot):
                     self._log_error(
                         f"trend rollback after state failure {sym}", rb_exc)
                 continue
+            if not self.simulation:
+                from core.database import release_portfolio_reservation
+
+                release_portfolio_reservation(entry_id, status="CONSUMED")
             if free is not None:
                 free = max(0.0, free - coin_size)
             opened += 1

@@ -23,10 +23,10 @@ prepare_entrypoint(__file__, __name__)
 # startup dependency smoke-test  -  failing here is much clearer than failing
 require_portalocker()
 
-from core import SpotBot
-from core.paths import LOG_DIR_SPOT
-from config.exchange_config import get_spot_exchange_connection
-from bot_utils.sim_flag import read_simulation_flag
+from core import SpotBot  # noqa: E402
+from core.paths import LOG_DIR_SPOT  # noqa: E402
+from config.exchange_config import get_spot_exchange_connection  # noqa: E402
+from bot_utils.sim_flag import read_simulation_flag  # noqa: E402
 
 
 class AggressiveBot(SpotBot):
@@ -66,6 +66,11 @@ class AggressiveBot(SpotBot):
         "RSI_MAX":           85.0,
         "ENTRY_QUALITY_FILTER_ENABLED": True,
         "ENTRY_QUALITY_MIN_SCORE": 75.0,
+        "PORTFOLIO_RISK_MODE": "shadow",
+        "NET_EXPECTANCY_MODE": "shadow",
+        "TIME_DECAY_MODE": "shadow",
+        "TIME_DECAY_MAX_AGE_MINUTES": 360,
+        "TIME_DECAY_MIN_MFE_PCT": 0.5,
     }
 
     @staticmethod

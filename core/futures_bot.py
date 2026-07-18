@@ -120,6 +120,8 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         self._monitor_thread: Optional[threading.Thread] = None
         self._scan_thread: Optional[threading.Thread] = None
         self._reconcile_thread: Optional[threading.Thread] = None
+        self._venue_recorder_thread: Optional[threading.Thread] = None
+        self._entry_recovery_blocked = False
 
     # Route through bot_utils.config.get_live_value so that user-edited values
     # in the launcher's settings UI take effect within ~5 s without a bot
@@ -378,6 +380,22 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
 
         #  Startup reconciliation (in mixin) 
         if not self.simulation:
+            try:
+                from trading.entry_executor import recover_nonterminal_order_intents
+
+                unresolved = recover_nonterminal_order_intents(
+                    self.ex, self.BOT_NAME, log_event=log_event
+                )
+                self._entry_recovery_blocked = bool(unresolved)
+                if unresolved:
+                    log_event(
+                        f"[{self.BOT_NAME}] {len(unresolved)} unresolved order "
+                        "intent(s); new entries blocked until reconciliation",
+                        "ERROR",
+                    )
+            except Exception as exc:
+                self._entry_recovery_blocked = True
+                self._log_error("startup order-intent recovery", exc)
             self._startup_reconciliation()
 
         #  Register shutdown handlers 
@@ -403,9 +421,37 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             target=self._reconcile_loop, daemon=True,
             name=f"{self.BOT_NAME}Reconcile",
         )
+        if (
+            self.BOT_NAME == "FUTURES"
+            and str(self.C("VENUE_RECORDER_MODE", "enabled")).lower() == "enabled"
+        ):
+            from core.paths import DATA_DIR
+            from trading.venue_recorder import MexcVenueRecorder
+
+            recorder = MexcVenueRecorder(
+                self.ex,
+                DATA_DIR / "venue_native",
+                max_symbols=int(self.C("VENUE_RECORDER_MAX_SYMBOLS", 8)),
+                depth_levels=int(self.C("VENUE_RECORDER_DEPTH_LEVELS", 20)),
+                micro_interval_seconds=float(
+                    self.C("VENUE_RECORDER_MICRO_INTERVAL_SECONDS", 6.0)
+                ),
+                overview_interval_seconds=float(
+                    self.C("VENUE_RECORDER_OVERVIEW_INTERVAL_SECONDS", 60.0)
+                ),
+                log_event=log_event,
+            )
+            self._venue_recorder_thread = threading.Thread(
+                target=recorder.run,
+                args=(self._shutdown_event,),
+                daemon=True,
+                name="FUTURESVenueRecorder",
+            )
         self._monitor_thread.start()
         self._scan_thread.start()
         self._reconcile_thread.start()
+        if self._venue_recorder_thread is not None:
+            self._venue_recorder_thread.start()
 
         log_event("Three threads running (monitor, scan, reconcile).", "START")
         threads = {
@@ -518,8 +564,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
 
         log_event("Waiting for threads to finish...", "INFO")
         # Short join timeout  daemon threads die at interpreter exit anyway.
-        for t in (self._monitor_thread, self._scan_thread,
-                   self._reconcile_thread):
+        for t in (
+            self._monitor_thread,
+            self._scan_thread,
+            self._reconcile_thread,
+            self._venue_recorder_thread,
+        ):
             if t and t.is_alive():
                 t.join(timeout=2)
         try:

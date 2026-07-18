@@ -688,11 +688,123 @@ def _run_migrations(conn) -> None:
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_bot_open_opened ON bot_open_positions(opened_at)")
     _add_column_if_missing(conn, "bot_open_positions", "state", "TEXT DEFAULT 'OPEN'")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS order_intents (
+        intent_id          TEXT PRIMARY KEY,
+        bot_name           TEXT NOT NULL,
+        symbol             TEXT NOT NULL,
+        direction          TEXT NOT NULL,
+        target_amount      REAL NOT NULL,
+        target_price       REAL,
+        client_order_id    TEXT NOT NULL UNIQUE,
+        exchange_order_id  TEXT,
+        status             TEXT NOT NULL,
+        filled_amount      REAL NOT NULL DEFAULT 0,
+        filled_notional    REAL NOT NULL DEFAULT 0,
+        fee_usdt           REAL NOT NULL DEFAULT 0,
+        last_error         TEXT,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_order_intents_recovery "
+              "ON order_intents(bot_name, status, updated_at)")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS execution_tca (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        intent_id          TEXT NOT NULL,
+        measured_at        TEXT NOT NULL,
+        stage              TEXT NOT NULL,
+        payload_json       TEXT NOT NULL,
+        FOREIGN KEY(intent_id) REFERENCES order_intents(intent_id)
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_execution_tca_intent "
+              "ON execution_tca(intent_id, measured_at)")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS execution_markouts (
+        intent_id          TEXT NOT NULL,
+        horizon_seconds    INTEGER NOT NULL,
+        symbol             TEXT NOT NULL,
+        side               TEXT NOT NULL,
+        reference_price    REAL NOT NULL,
+        due_at             TEXT NOT NULL,
+        status             TEXT NOT NULL DEFAULT 'PENDING',
+        attempts           INTEGER NOT NULL DEFAULT 0,
+        last_error         TEXT,
+        measured_at        TEXT,
+        mark_price         REAL,
+        markout_bps        REAL,
+        PRIMARY KEY(intent_id, horizon_seconds),
+        FOREIGN KEY(intent_id) REFERENCES order_intents(intent_id)
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_execution_markouts_due "
+              "ON execution_markouts(status, due_at)")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS portfolio_snapshot_header (
+        snapshot_id        TEXT PRIMARY KEY,
+        measured_at        TEXT NOT NULL,
+        equity_usdt        REAL,
+        free_usdt          REAL,
+        known              INTEGER NOT NULL,
+        reason             TEXT
+    )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS portfolio_snapshot_positions (
+        snapshot_id        TEXT NOT NULL,
+        symbol             TEXT NOT NULL,
+        side               TEXT NOT NULL,
+        notional_usdt      REAL NOT NULL,
+        cluster_name       TEXT,
+        beta               REAL NOT NULL DEFAULT 1,
+        PRIMARY KEY(snapshot_id, symbol, side),
+        FOREIGN KEY(snapshot_id) REFERENCES portfolio_snapshot_header(snapshot_id)
+    )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS portfolio_reservations (
+        reservation_id     TEXT PRIMARY KEY,
+        intent_id          TEXT NOT NULL UNIQUE,
+        bot_name           TEXT NOT NULL,
+        symbol             TEXT NOT NULL,
+        notional_usdt      REAL NOT NULL,
+        mode               TEXT NOT NULL,
+        status             TEXT NOT NULL,
+        created_at         TEXT NOT NULL,
+        expires_at         TEXT NOT NULL
+    )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS portfolio_decisions (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        intent_id          TEXT NOT NULL,
+        snapshot_id        TEXT,
+        decided_at         TEXT NOT NULL,
+        mode               TEXT NOT NULL,
+        allowed            INTEGER NOT NULL,
+        shadow_allowed     INTEGER NOT NULL,
+        reasons_json       TEXT NOT NULL,
+        requested_usdt     REAL NOT NULL,
+        approved_usdt      REAL NOT NULL
+    )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS experiment_registry (
+        trial_id           TEXT PRIMARY KEY,
+        experiment_name    TEXT NOT NULL,
+        params_json        TEXT NOT NULL,
+        status             TEXT NOT NULL,
+        created_at         TEXT NOT NULL
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_experiment_registry_name "
+              "ON experiment_registry(experiment_name, created_at)")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS carry_campaigns (
+        campaign_id        TEXT PRIMARY KEY,
+        state              TEXT NOT NULL,
+        payload_json       TEXT NOT NULL,
+        updated_at         TEXT NOT NULL
+    )""")
 
     # Record current schema version  every successful migration run leaves a
     # fingerprint, useful for diagnostics ("did the migration run?") and for
     # future versioned migrations.
-    _CURRENT_SCHEMA_VERSION = 1
+    _CURRENT_SCHEMA_VERSION = 2
     try:
         existing = conn.execute(
             "SELECT version FROM schema_versions WHERE version=?",
@@ -2149,7 +2261,8 @@ def try_claim_orphan(bot_name: str, symbol: str, position_type: str = "FUTURES")
 
 
 def _try_claim(bot_name, symbol, position_type, claim_state,
-               allow_existing_owner: bool = False) -> bool:
+               allow_existing_owner: bool = False, *, intent_id: str | None = None,
+               notional_usdt: float = 0.0, reservation_mode: str = "LIVE") -> bool:
     # Swap-guard: a real bot_name is never a market symbol. A market-shaped
     # bot_name means the caller swapped (bot_name, symbol)  refuse so we never
     # write a junk row that blocks coins (the swapped row's symbol would be the
@@ -2171,6 +2284,17 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
                     else "position_type = 'SPOT'")
     try:
         conn = get_connection()
+        if intent_id:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS portfolio_reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    intent_id TEXT NOT NULL UNIQUE,
+                    bot_name TEXT NOT NULL, symbol TEXT NOT NULL,
+                    notional_usdt REAL NOT NULL, mode TEXT NOT NULL,
+                    status TEXT NOT NULL, created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                )""")
+            conn.commit()
         conn.execute("BEGIN IMMEDIATE")
         now_str = _utcnow_str()
         if allow_existing_owner:
@@ -2205,6 +2329,27 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
                      AND {class_clause})""",
             (bot_name, base, position_type, claim_state, now_str,
              base, f"{base}/%", f"{base}:%"))
+        if cur.rowcount > 0 and intent_id:
+            try:
+                reserved = float(notional_usdt)
+            except (TypeError, ValueError):
+                reserved = 0.0
+            if not math.isfinite(reserved) or reserved <= 0.0:
+                conn.rollback()
+                return False
+            expires = (_utcnow() + timedelta(seconds=120)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            conn.execute(
+                """INSERT INTO portfolio_reservations
+                   (reservation_id, intent_id, bot_name, symbol,
+                    notional_usdt, mode, status, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)""",
+                (
+                    f"res:{intent_id}", intent_id, bot_name, base, reserved,
+                    str(reservation_mode).upper(), now_str, expires,
+                ),
+            )
         conn.commit()
         return cur.rowcount > 0
     except Exception:
@@ -2217,7 +2362,10 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
 
 
 def claim_symbol_for_entry(bot_name: str, symbol: str,
-                           position_type: str = "FUTURES") -> bool:
+                           position_type: str = "FUTURES", *,
+                           intent_id: str | None = None,
+                           notional_usdt: float = 0.0,
+                           mode: str = "LIVE") -> bool:
     """Atomic pre-order entry claim (INSERTWHERE NOT EXISTS, symbol+class scoped).
 
     SIM/LIVE design + a KNOWN, ACCEPTED limitation: callers gate this behind
@@ -2231,7 +2379,436 @@ def claim_symbol_for_entry(bot_name: str, symbol: str,
     live benefit. Run SIM bots on disjoint coin sets if exact SIM accounting of
     a contested coin matters.
     """
-    return _try_claim(bot_name, symbol, position_type, "CLAIMING")
+    return _try_claim(
+        bot_name,
+        symbol,
+        position_type,
+        "CLAIMING",
+        intent_id=intent_id,
+        notional_usdt=notional_usdt,
+        reservation_mode=mode,
+    )
+
+
+def release_portfolio_reservation(intent_id: str, status: str = "RELEASED") -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            """UPDATE portfolio_reservations SET status=?
+                 WHERE intent_id=? AND status='ACTIVE'""",
+            (str(status).upper(), intent_id),
+        )
+        conn.commit()
+    except sqlite3.OperationalError as exc:
+        if "no such table: portfolio_reservations" not in str(exc).lower():
+            raise
+
+
+def persist_portfolio_evaluation(
+    snapshot_id: str,
+    snapshot,
+    *,
+    intent_id: str,
+    bot_name: str,
+    decision,
+    mode: str,
+) -> None:
+    """Persist snapshot and admission evidence in one transaction."""
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """INSERT INTO portfolio_snapshot_header
+               (snapshot_id, measured_at, equity_usdt, free_usdt, known, reason)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                snapshot_id,
+                snapshot.asof.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                float(snapshot.equity_usdt),
+                float(snapshot.free_usdt),
+                int(bool(snapshot.known)),
+                str(snapshot.reason or "")[:500],
+            ),
+        )
+        for position in snapshot.positions:
+            conn.execute(
+                """INSERT INTO portfolio_snapshot_positions
+                   (snapshot_id, symbol, side, notional_usdt, cluster_name, beta)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    snapshot_id,
+                    position.symbol,
+                    position.side,
+                    float(position.notional_usdt),
+                    position.cluster,
+                    float(position.beta),
+                ),
+            )
+        conn.execute(
+            """INSERT INTO portfolio_decisions
+               (intent_id, snapshot_id, decided_at, mode, allowed,
+                shadow_allowed, reasons_json, requested_usdt, approved_usdt)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                intent_id,
+                snapshot_id,
+                _utcnow_str(),
+                str(mode),
+                int(bool(decision.allowed)),
+                int(bool(decision.shadow_allowed)),
+                json.dumps(list(decision.reasons), allow_nan=False),
+                float(decision.requested_notional),
+                float(decision.approved_notional),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+_ORDER_INTENT_TRANSITIONS = {
+    "PREPARED": {"SUBMITTING", "RECOVERY_REQUIRED"},
+    "SUBMITTING": {"OPEN", "PARTIAL", "FILLED", "RECOVERY_REQUIRED"},
+    "OPEN": {"PARTIAL", "CANCELING", "FILLED", "RECOVERY_REQUIRED"},
+    "PARTIAL": {"CANCELING", "FILLED", "RECOVERY_REQUIRED"},
+    "CANCELING": {"CANCELED", "RECOVERY_REQUIRED"},
+    "CANCELED": {"FALLBACK_SUBMITTING", "FINALIZED"},
+    "FALLBACK_SUBMITTING": {"FILLED", "RECOVERY_REQUIRED"},
+    "FILLED": {"FINALIZED", "RECOVERY_REQUIRED"},
+    "RECOVERY_REQUIRED": {
+        "OPEN", "PARTIAL", "CANCELING", "CANCELED", "FILLED", "FINALIZED"
+    },
+    "FINALIZED": set(),
+}
+
+
+def create_order_intent(
+    intent_id: str,
+    *,
+    bot_name: str,
+    symbol: str,
+    direction: str,
+    target_amount: float,
+    target_price: float | None,
+    client_order_id: str,
+) -> None:
+    """Persist PREPARED before any exchange order is submitted."""
+    if not intent_id or not client_order_id:
+        raise ValueError("intent_id and client_order_id are required")
+    amount = _sanitize_float(target_amount, -1.0)
+    if amount <= 0.0:
+        raise ValueError("target_amount must be positive")
+    now = _utcnow_str()
+    conn = get_connection()
+
+    def _insert() -> None:
+        conn.execute(
+            """INSERT INTO order_intents
+               (intent_id, bot_name, symbol, direction, target_amount,
+                target_price, client_order_id, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?)""",
+            (
+                str(intent_id), str(bot_name), str(symbol), str(direction).upper(),
+                amount, _sanitize_float(target_price, 0.0), str(client_order_id),
+                now, now,
+            ),
+        )
+        conn.commit()
+    try:
+        _insert()
+    except sqlite3.OperationalError as exc:
+        # Test harnesses and in-place upgrades can retain a thread-local
+        # connection whose init flag predates this migration. Self-heal this
+        # one critical journal table before any exchange submission.
+        if "no such table: order_intents" not in str(exc).lower():
+            raise
+        conn.rollback()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS order_intents (
+                intent_id TEXT PRIMARY KEY, bot_name TEXT NOT NULL,
+                symbol TEXT NOT NULL, direction TEXT NOT NULL,
+                target_amount REAL NOT NULL, target_price REAL,
+                client_order_id TEXT NOT NULL UNIQUE,
+                exchange_order_id TEXT, status TEXT NOT NULL,
+                filled_amount REAL NOT NULL DEFAULT 0,
+                filled_notional REAL NOT NULL DEFAULT 0,
+                fee_usdt REAL NOT NULL DEFAULT 0, last_error TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )""")
+        conn.commit()
+        _insert()
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("order intent or client order id already exists") from exc
+
+
+def transition_order_intent(
+    intent_id: str,
+    status: str,
+    *,
+    exchange_order_id=None,
+    filled_amount=None,
+    filled_notional=None,
+    fee_usdt=None,
+    error=None,
+) -> None:
+    """Atomically apply one valid order-intent state transition."""
+    target = str(status).upper()
+    if target not in _ORDER_INTENT_TRANSITIONS:
+        raise ValueError(f"unknown order intent status: {status!r}")
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM order_intents WHERE intent_id=?", (intent_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("order intent does not exist")
+        current = str(row["status"])
+        if target not in _ORDER_INTENT_TRANSITIONS.get(current, set()):
+            raise ValueError(f"invalid order intent transition {current} -> {target}")
+        conn.execute(
+            """UPDATE order_intents
+                  SET status=?, exchange_order_id=COALESCE(?, exchange_order_id),
+                      filled_amount=COALESCE(?, filled_amount),
+                      filled_notional=COALESCE(?, filled_notional),
+                      fee_usdt=COALESCE(?, fee_usdt), last_error=?, updated_at=?
+                WHERE intent_id=?""",
+            (
+                target,
+                _order_id_text_db(exchange_order_id),
+                _optional_finite_db(filled_amount),
+                _optional_finite_db(filled_notional),
+                _optional_finite_db(fee_usdt),
+                (str(error)[:500] if error is not None else None),
+                _utcnow_str(),
+                intent_id,
+            ),
+        )
+        if target == "FINALIZED":
+            try:
+                conn.execute(
+                    """UPDATE portfolio_reservations SET status='CONSUMED'
+                         WHERE intent_id=? AND status='ACTIVE'""",
+                    (intent_id,),
+                )
+            except sqlite3.OperationalError as exc:
+                if "no such table: portfolio_reservations" not in str(exc).lower():
+                    raise
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _order_id_text_db(value) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_finite_db(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number >= 0.0 else None
+
+
+def list_nonterminal_order_intents(bot_name: str | None = None) -> list[dict]:
+    conn = get_connection()
+    query = "SELECT * FROM order_intents WHERE status != 'FINALIZED'"
+    params: tuple = ()
+    if bot_name is not None:
+        query += " AND bot_name=?"
+        params = (str(bot_name),)
+    query += " ORDER BY created_at, intent_id"
+    return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+
+def record_execution_tca(intent_id: str, stage: str, payload: dict) -> None:
+    try:
+        encoded = json.dumps(payload, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("TCA payload must be finite JSON") from exc
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO execution_tca
+           (intent_id, measured_at, stage, payload_json)
+           VALUES (?, ?, ?, ?)""",
+        (intent_id, _utcnow_str(), str(stage), encoded),
+    )
+    conn.commit()
+
+
+def schedule_execution_markouts(
+    intent_id: str,
+    *,
+    symbol: str,
+    side: str,
+    reference_price: float,
+    horizons: tuple[int, ...] = (1, 10, 60, 300, 900),
+) -> None:
+    """Persist restart-safe post-fill markouts without blocking the order path."""
+    price = float(reference_price)
+    if not math.isfinite(price) or price <= 0.0:
+        raise ValueError("markout reference price must be positive and finite")
+    normalized_side = str(side).strip().lower()
+    if normalized_side not in {"buy", "sell"}:
+        raise ValueError("markout side must be buy or sell")
+    now = _utcnow()
+    rows = []
+    for raw_horizon in horizons:
+        horizon = int(raw_horizon)
+        if horizon <= 0:
+            raise ValueError("markout horizons must be positive")
+        due = (now + timedelta(seconds=horizon)).strftime("%Y-%m-%d %H:%M:%S")
+        rows.append(
+            (
+                intent_id,
+                horizon,
+                str(symbol),
+                normalized_side,
+                price,
+                due,
+            )
+        )
+    conn = get_connection()
+    conn.executemany(
+        """INSERT OR IGNORE INTO execution_markouts
+           (intent_id, horizon_seconds, symbol, side, reference_price,
+            due_at, status)
+           VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
+        rows,
+    )
+    conn.commit()
+
+
+def list_due_execution_markouts(limit: int = 25) -> list[dict]:
+    conn = get_connection()
+    return [
+        dict(row)
+        for row in conn.execute(
+            """SELECT * FROM execution_markouts
+               WHERE status='PENDING' AND due_at <= ?
+               ORDER BY due_at, intent_id, horizon_seconds
+               LIMIT ?""",
+            (_utcnow_str(), max(1, min(250, int(limit)))),
+        ).fetchall()
+    ]
+
+
+def complete_execution_markout(
+    intent_id: str,
+    horizon_seconds: int,
+    *,
+    mark_price: float,
+    markout_bps: float,
+) -> bool:
+    conn = get_connection()
+    cur = conn.execute(
+        """UPDATE execution_markouts
+              SET status='COMPLETE', measured_at=?, mark_price=?,
+                  markout_bps=?, attempts=attempts+1, last_error=NULL
+            WHERE intent_id=? AND horizon_seconds=? AND status='PENDING'""",
+        (
+            _utcnow_str(),
+            float(mark_price),
+            float(markout_bps),
+            intent_id,
+            int(horizon_seconds),
+        ),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def fail_execution_markout(
+    intent_id: str,
+    horizon_seconds: int,
+    error: str,
+    *,
+    max_attempts: int = 5,
+) -> None:
+    conn = get_connection()
+    conn.execute(
+        """UPDATE execution_markouts
+              SET attempts=attempts+1,
+                  status=CASE WHEN attempts+1 >= ? THEN 'FAILED' ELSE status END,
+                  last_error=?
+            WHERE intent_id=? AND horizon_seconds=? AND status='PENDING'""",
+        (max(1, int(max_attempts)), str(error)[:500], intent_id, int(horizon_seconds)),
+    )
+    conn.commit()
+
+
+def register_experiment_trial(
+    trial_id: str, experiment_name: str, params: dict, *, status: str
+) -> None:
+    """Append one immutable trial so rejected searches remain in DSR/PBO counts."""
+    try:
+        payload = json.dumps(params, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("experiment params must be finite JSON") from exc
+    try:
+        conn = get_connection()
+        conn.execute(
+            """INSERT INTO experiment_registry
+               (trial_id, experiment_name, params_json, status, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (trial_id, experiment_name, payload, str(status).upper(), _utcnow_str()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("experiment trial ids are immutable and unique") from exc
+
+
+def list_experiment_trials(experiment_name: str | None = None) -> list[dict]:
+    conn = get_connection()
+    query = "SELECT * FROM experiment_registry"
+    params: tuple = ()
+    if experiment_name is not None:
+        query += " WHERE experiment_name=?"
+        params = (str(experiment_name),)
+    query += " ORDER BY created_at, trial_id"
+    rows = []
+    for row in conn.execute(query, params).fetchall():
+        item = dict(row)
+        item["params"] = json.loads(item.pop("params_json"))
+        rows.append(item)
+    return rows
+
+
+def save_carry_campaign(campaign_id: str, state: str, payload: dict) -> None:
+    try:
+        encoded = json.dumps(payload, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("carry campaign must be finite JSON") from exc
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO carry_campaigns
+           (campaign_id, state, payload_json, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(campaign_id) DO UPDATE SET
+             state=excluded.state,
+             payload_json=excluded.payload_json,
+             updated_at=excluded.updated_at""",
+        (campaign_id, str(state), encoded, _utcnow_str()),
+    )
+    conn.commit()
+
+
+def load_open_carry_campaigns() -> list[dict]:
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT payload_json FROM carry_campaigns
+             WHERE state NOT IN ('REJECTED', 'RECONCILED')
+             ORDER BY updated_at, campaign_id"""
+    ).fetchall()
+    return [json.loads(row["payload_json"]) for row in rows]
 
 
 #  Performance metrics 

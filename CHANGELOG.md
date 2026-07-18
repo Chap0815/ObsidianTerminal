@@ -2,6 +2,32 @@
 
 ## 2026-07-17
 
+- Rebuilt optimizer promotion around one frozen winner and one untouched final
+  holdout. Candidate ranking can no longer inspect holdout results; production
+  apply now fails closed unless holdout, cost stress, DSR and PBO evidence all
+  pass explicit thresholds.
+- Added restart-safe order intents, deterministic MEXC `externalOid` values,
+  private-tier fee truth with a conservative fallback, arrival/fill TCA and
+  persisted 1/10/60/300/900-second execution markouts. Optional FUTURES
+  maker-first execution remains disabled by default and refuses a market
+  fallback unless cancellation is exchange-verified.
+- Added account-wide portfolio snapshots and shadow/enforce admission for all
+  five bots. Gross, net, free-equity, cluster and beta caps use exchange truth;
+  spot valuation includes every non-stable balance. Claims and reservations
+  are committed atomically before live order submission.
+- Added versioned net-expectancy training/runtime gates, conservative
+  volatility scaling, low-priority time-decay experiments and strict manual
+  promotion criteria. All new strategy gates default to shadow; CROSS
+  time-decay stays observation-only to preserve pair neutrality.
+- Added a restart-safe MEXC-native market recorder, causal order-flow feature
+  primitives, future-tail invariance checks and a SIM-only positive-funding
+  long-spot/short-perpetual carry state machine. Raw venue/research data stays
+  outside the release payload.
+- Standardized unverified futures taker fees to the conservative 0.10% fallback
+  while still preferring actual fill fees and fresh private account-tier data.
+- LLM entry/veto behavior remains disabled. These changes create measurable
+  experiments and hard promotion gates; they do not claim a profitable edge
+  before forward shadow evidence passes.
 - Corrected FUTURES entry-quality OI semantics: a missing 12-26h comparison
   baseline is now represented as unknown instead of a measured zero, so it no
   longer receives the stable-OI score bonus. A genuinely measured zero change

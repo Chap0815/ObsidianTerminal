@@ -452,7 +452,7 @@ class ScanMixin:
     def _try_open_trade(self, r, regime: dict, balance: float) -> float | None:
         """Run LLM analysis + quality filters + place order if everything
         passes. Mutates self.state on success and returns reserved USDT."""
-        from core.logger import log_event, log_buy, send_telegram
+        from core.logger import log_event, log_buy, log_struct, send_telegram
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
         sym = r["symbol"].split("/")[0]
@@ -570,6 +570,73 @@ class ScanMixin:
                     reason="insufficient_balance")
                 return None
 
+        if not self.simulation:
+            from trading.entry_admission import evaluate_entry_admission
+            from trading.portfolio_risk import PortfolioLimits
+
+            confidence_feature = {
+                "LOW": 0.0,
+                "MEDIUM": 0.5,
+                "HIGH": 1.0,
+            }.get(str(confidence).strip().upper(), 0.0)
+            portfolio_mode = str(
+                self.C("PORTFOLIO_RISK_MODE", "shadow") or "shadow"
+            ).strip().lower()
+            expectancy_mode = str(
+                self.C("NET_EXPECTANCY_MODE", "shadow") or "shadow"
+            ).strip().lower()
+            admission = evaluate_entry_admission(
+                exchange=self.ex,
+                intent_id=entry_id,
+                bot_name=self.BOT_NAME,
+                symbol=f"{sym}/USDT",
+                side="LONG",
+                requested_notional=trade_usdt,
+                portfolio_mode=portfolio_mode,
+                expectancy_mode=expectancy_mode,
+                account_type="spot",
+                features={
+                    "score": float(quality.score),
+                    "confidence": confidence_feature,
+                    "change_pct": float(r.get("change_percent") or 0.0),
+                    "rsi_15m": float(r.get("rsi_15m") or 0.0),
+                    "rsi_1h": float(r.get("rsi_1h") or 0.0),
+                    "rsi_4h": float(r.get("rsi_4h") or 0.0),
+                },
+                limits=PortfolioLimits(
+                    max_gross_pct=float(self.C("PORTFOLIO_MAX_GROSS_PCT", 100.0)),
+                    max_net_pct=float(self.C("PORTFOLIO_MAX_NET_PCT", 100.0)),
+                    min_free_pct=float(self.C("PORTFOLIO_MIN_FREE_PCT", 20.0)),
+                    max_cluster_pct=float(self.C("PORTFOLIO_MAX_CLUSTER_PCT", 35.0)),
+                    max_beta_pct=float(self.C("PORTFOLIO_MAX_BETA_PCT", 100.0)),
+                ),
+            )
+            log_struct(
+                "entry_admission",
+                bot=self.BOT_NAME,
+                entry_id=entry_id,
+                symbol=sym,
+                portfolio_mode=portfolio_mode,
+                portfolio_allowed=admission.portfolio.allowed,
+                portfolio_shadow_allowed=admission.portfolio.shadow_allowed,
+                portfolio_reasons=list(admission.portfolio.reasons),
+                expectancy_mode=expectancy_mode,
+                expectancy_allowed=admission.expectancy.allowed,
+                expectancy_shadow_allowed=admission.expectancy.shadow_allowed,
+                expected_net_bps=admission.expectancy.expected_net_bps,
+                model_version=admission.expectancy.model_version,
+            )
+            if not admission.allowed:
+                emit_entry_lifecycle(
+                    entry_id,
+                    bot=self.BOT_NAME,
+                    symbol=sym,
+                    stage="blocked",
+                    mode=entry_mode,
+                    reason="entry_admission",
+                )
+                return None
+
         log_buy(
             self.BOT_NAME, sym, signal_price, trade_usdt,
             (r["rsi_15m"], r["rsi_1h"], r["rsi_4h"]),
@@ -579,7 +646,14 @@ class ScanMixin:
         # Place the order (or simulate)
         if not self.simulation:
             from core.database import claim_symbol_for_entry
-            if not claim_symbol_for_entry(self.BOT_NAME, sym, "SPOT"):
+            if not claim_symbol_for_entry(
+                self.BOT_NAME,
+                sym,
+                "SPOT",
+                intent_id=entry_id,
+                notional_usdt=trade_usdt,
+                mode=entry_mode,
+            ):
                 log_event(f"{sym} claimed by another bot  skip "
                           f"(coexistence)", "WAIT")
                 emit_entry_lifecycle(
@@ -599,7 +673,11 @@ class ScanMixin:
                 stage="order_failed", mode=entry_mode,
                 reason=type(_buy_exc).__name__)
             if _claimed:
-                self._release_entry_claim_if_untracked(sym)
+                released = self._release_entry_claim_if_untracked(sym)
+                if released:
+                    from core.database import release_portfolio_reservation
+
+                    release_portfolio_reservation(entry_id)
             raise _buy_exc
         if entry is None:
             emit_entry_lifecycle(
@@ -607,7 +685,11 @@ class ScanMixin:
                 stage="order_failed", mode=entry_mode,
                 reason="no_verified_fill")
             if _claimed:
-                self._release_entry_claim_if_untracked(sym)
+                released = self._release_entry_claim_if_untracked(sym)
+                if released:
+                    from core.database import release_portfolio_reservation
+
+                    release_portfolio_reservation(entry_id)
             return None  # buy failed  already logged
 
         amount, fill_price, gross_amount, invested_usdt, entry_fee = entry
@@ -687,6 +769,10 @@ class ScanMixin:
                 stage="state_failed", mode=entry_mode,
                 reason="post_fill_state_write")
         else:
+            if not self.simulation:
+                from core.database import release_portfolio_reservation
+
+                release_portfolio_reservation(entry_id, status="CONSUMED")
             emit_entry_lifecycle(
                 entry_id, bot=self.BOT_NAME, symbol=sym,
                 stage="opened", mode=entry_mode, fill_price=fill_price,

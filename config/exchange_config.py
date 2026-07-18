@@ -8,8 +8,10 @@ and a global clock-skew self-heal that wraps ex.fetch2().
 """
 
 import os
+import tempfile
 import threading
 import time
+from decimal import Decimal, ROUND_DOWN
 import ccxt
 from typing import Optional, Tuple
 from dotenv import load_dotenv
@@ -119,8 +121,8 @@ def _build_base_config(market_type: str = "spot") -> tuple:
         )
     if not api_key or not api_secret:
         _log_event(
-            f"[exchange] API_KEY/API_SECRET missing  bot will be "
-            f"read-only until credentials are provided.",
+            "[exchange] API_KEY/API_SECRET missing  bot will be "
+            "read-only until credentials are provided.",
             "WARN",
         )
 
@@ -509,15 +511,13 @@ def _is_rate_limited(err_str: str) -> bool:
     return "opentype" in s and "positiontype" in s
 
 
-import threading as _threading
-import tempfile as _tempfile
-_ADMIN_LOCK = _threading.Lock()
+_ADMIN_LOCK = threading.Lock()
 _ADMIN_LAST = [0.0]
 try:
     _ADMIN_MIN_GAP = float(os.getenv("ADMIN_CALL_MIN_GAP_SEC", "0.5"))
 except (TypeError, ValueError):
     _ADMIN_MIN_GAP = 0.5
-_ADMIN_THROTTLE_FILE = os.path.join(_tempfile.gettempdir(),
+_ADMIN_THROTTLE_FILE = os.path.join(tempfile.gettempdir(),
                                     "tradingbot_admin_throttle.lock")
 
 
@@ -807,12 +807,15 @@ def entry_params(ex_name: str = None, position_side: str = None,
             pass
     if client_order_id:
         base["clientOrderId"] = client_order_id
+        if name == "mexc":
+            # MEXC contract endpoints expose this field as ``externalOid``.
+            # Keep the unified alias too so CCXT and venue-native recovery can
+            # both identify the same intent after a lost response.
+            base["externalOid"] = client_order_id
     return base
 
 
 #  Precision-safe amount with fallback chain 
-
-from decimal import Decimal, ROUND_DOWN
 
 # Default fallback step when nothing better is available  8 decimals
 # is BTC's lot size, far stricter than any major asset's actual step.

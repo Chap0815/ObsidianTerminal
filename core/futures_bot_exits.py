@@ -1252,6 +1252,45 @@ class FuturesExitsMixin:
             if not d.get("be_active") and move_pct <= initial_sl:
                 return True, "Stop-Loss"
 
+        # Lowest-priority capital-efficiency experiment. Shadow is the default:
+        # it records what would have exited without changing position handling.
+        from trading.profit_experiments import (
+            position_age_minutes,
+            time_decay_decision,
+        )
+        age_minutes = position_age_minutes(d.get("buy_time"))
+        if age_minutes is not None:
+            decay = time_decay_decision(
+                age_minutes=age_minutes,
+                max_age_minutes=FuturesExitsMixin._safe_finite_float(
+                    self.C("TIME_DECAY_MAX_AGE_MINUTES", 360.0), 360.0
+                ),
+                mfe_pct=FuturesExitsMixin._safe_finite_float(
+                    d.get("max_profit_pct"), move_pct
+                ),
+                min_mfe_pct=FuturesExitsMixin._safe_finite_float(
+                    self.C("TIME_DECAY_MIN_MFE_PCT", 0.5), 0.5
+                ),
+                mode=str(self.C("TIME_DECAY_MODE", "shadow") or "shadow").lower(),
+            )
+            if decay.shadow_should_exit:
+                try:
+                    from core.logger import log_struct
+
+                    log_struct(
+                        "time_decay_decision",
+                        bot=self.BOT_NAME,
+                        symbol=sym,
+                        mode=str(self.C("TIME_DECAY_MODE", "shadow")),
+                        age_minutes=age_minutes,
+                        mfe_pct=d.get("max_profit_pct"),
+                        enforced=decay.should_exit,
+                    )
+                except Exception:
+                    pass
+            if decay.should_exit:
+                return True, "Time Decay"
+
         return False, ""
 
   #  Partial TP 
@@ -1343,7 +1382,7 @@ class FuturesExitsMixin:
         if self.simulation:
             from bot_utils.fee_math import taker_fee_rate
             partial_fee = (raw_partial * contract_size * curr
-                           * taker_fee_rate(self.ex, symbol_full, 0.0006))
+                           * taker_fee_rate(self.ex, symbol_full))
         else:
             try:
                 try:
@@ -1598,7 +1637,7 @@ class FuturesExitsMixin:
                 from bot_utils.fee_math import taker_fee_rate
                 if contract_size > 0:
                     close_fee = (raw_amount * contract_size * fill_price
-                                 * taker_fee_rate(self.ex, symbol_full, 0.0006))
+                                 * taker_fee_rate(self.ex, symbol_full))
 
         if not self.simulation:
             order = None

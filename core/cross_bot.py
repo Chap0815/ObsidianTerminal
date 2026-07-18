@@ -626,9 +626,9 @@ class CrossBot(FuturesBot):
             return 0.0
         try:
             from bot_utils.fee_math import taker_fee_rate
-            rate = taker_fee_rate(self.ex, full_symbol, 0.0006)
+            rate = taker_fee_rate(self.ex, full_symbol)
         except Exception:
-            rate = 0.0006
+            rate = 0.001
         return round(max(0.0, notional * rate * 2.0), 6)
 
     def _telegram_enabled(self) -> bool:
@@ -1585,7 +1585,7 @@ class CrossBot(FuturesBot):
                     reason="invalid_sim_amount", direction=side)
                 return
             from bot_utils.fee_math import taker_fee_rate
-            fees = amount * fill * taker_fee_rate(self.ex, full, 0.0006)
+            fees = amount * fill * taker_fee_rate(self.ex, full)
         else:
             #  LIVE: cross-margin market order 
             from bot_utils import (create_order_with_retry,
@@ -1652,6 +1652,70 @@ class CrossBot(FuturesBot):
                     stage="aborted", mode=entry_mode,
                     reason="precision_amount", direction=side)
                 return
+            from trading.entry_admission import evaluate_entry_admission
+            from trading.portfolio_risk import PortfolioLimits
+
+            cfg = getattr(self, "cfg", {}) or {}
+            portfolio_mode = str(
+                cfg.get("PORTFOLIO_RISK_MODE", "shadow") or "shadow"
+            ).strip().lower()
+            expectancy_mode = str(
+                cfg.get("NET_EXPECTANCY_MODE", "shadow") or "shadow"
+            ).strip().lower()
+            admission = evaluate_entry_admission(
+                exchange=self.ex,
+                intent_id=entry_id,
+                bot_name=self.BOT_NAME,
+                symbol=full,
+                side=side,
+                requested_notional=notional,
+                portfolio_mode=portfolio_mode,
+                expectancy_mode=expectancy_mode,
+                features={
+                    "score": float(quality.score),
+                    "spread_bps": float(spread_pct or 0.0) * 100.0,
+                    "side_sign": 1.0 if side == "LONG" else -1.0,
+                    "target_side_count": float(
+                        (quality_context or {}).get("target_side_count") or 0.0
+                    ),
+                },
+                limits=PortfolioLimits(
+                    max_gross_pct=self._f("PORTFOLIO_MAX_GROSS_PCT", 100.0),
+                    max_net_pct=self._f("PORTFOLIO_MAX_NET_PCT", 75.0),
+                    min_free_pct=self._f("PORTFOLIO_MIN_FREE_PCT", 20.0),
+                    max_cluster_pct=self._f("PORTFOLIO_MAX_CLUSTER_PCT", 35.0),
+                    max_beta_pct=self._f("PORTFOLIO_MAX_BETA_PCT", 75.0),
+                ),
+            )
+            try:
+                log_struct(
+                    "entry_admission",
+                    bot=self.BOT_NAME,
+                    entry_id=entry_id,
+                    symbol=base,
+                    portfolio_mode=portfolio_mode,
+                    portfolio_allowed=admission.portfolio.allowed,
+                    portfolio_shadow_allowed=admission.portfolio.shadow_allowed,
+                    portfolio_reasons=list(admission.portfolio.reasons),
+                    expectancy_mode=expectancy_mode,
+                    expectancy_allowed=admission.expectancy.allowed,
+                    expectancy_shadow_allowed=admission.expectancy.shadow_allowed,
+                    expected_net_bps=admission.expectancy.expected_net_bps,
+                    model_version=admission.expectancy.model_version,
+                )
+            except Exception:
+                pass
+            if not admission.allowed:
+                emit_entry_lifecycle(
+                    entry_id,
+                    bot=self.BOT_NAME,
+                    symbol=base,
+                    stage="blocked",
+                    mode=entry_mode,
+                    reason="entry_admission",
+                    direction=side,
+                )
+                return
             lev_int = max(1, int(__import__("math").ceil(lev)))
             # CROSS margin + leverage. HARD fail -> skip the leg; NEVER open at
             # the account-default leverage (could be 20x -> instant liquidation).
@@ -1669,15 +1733,19 @@ class CrossBot(FuturesBot):
             safe_set_margin_mode(self.ex, "cross", full, leverage=lev_int,
                                  direction=side.upper())
             order_side = "buy" if side == "LONG" else "sell"
-            import hashlib as _h
-            import time as _t
-            _cid = (f"{self.BUY_PREFIX}-{base}-"
-                    + _h.sha256(f"{self.BOT_NAME}:{base}:{int(_t.time()//30)}".encode()
-                                ).hexdigest()[:10])
+            from trading.execution_quality import make_client_order_id
+            _cid = make_client_order_id(entry_id, "entry", self.BUY_PREFIX)
             params = entry_params(
                 position_side="long" if side == "LONG" else "short",
                 margin_mode="cross", leverage=lev_int, client_order_id=_cid)
-            if not claim_symbol_for_entry(self.BOT_NAME, full, side):
+            if not claim_symbol_for_entry(
+                self.BOT_NAME,
+                full,
+                side,
+                intent_id=entry_id,
+                notional_usdt=float(margin) * float(lev),
+                mode=entry_mode,
+            ):
                 log_event(f"[{self.BOT_NAME}] {base}: claimed by another bot "
                           f"- skip", "WAIT")
                 emit_entry_lifecycle(
@@ -1724,11 +1792,27 @@ class CrossBot(FuturesBot):
                     entry_id, bot=self.BOT_NAME, symbol=base,
                     stage="order_attempt", mode=entry_mode,
                     direction=side)
-                order = create_order_with_retry(
-                    self.ex, full, order_side, contracts, params=params,
-                    shutdown_event=self._shutdown_event,
-                    action_label=f"cross open {base}",
-                    log_event=log_event, log_struct=log_struct)
+                from trading.entry_executor import (
+                    MakerFirstConfig,
+                    execute_entry_order,
+                )
+                order = execute_entry_order(
+                    exchange=self.ex,
+                    symbol=full,
+                    side=order_side,
+                    amount=contracts,
+                    intent_id=entry_id,
+                    client_order_id=_cid,
+                    bot_name=self.BOT_NAME,
+                    reference_price=exec_price,
+                    market_order=lambda: create_order_with_retry(
+                        self.ex, full, order_side, contracts, params=params,
+                        shutdown_event=self._shutdown_event,
+                        action_label=f"cross open {base}",
+                        log_event=log_event, log_struct=log_struct,
+                    ),
+                    config=MakerFirstConfig(mode="disabled"),
+                )
             except Exception as e:
                 emit_entry_lifecycle(
                     entry_id, bot=self.BOT_NAME, symbol=base,
@@ -2148,7 +2232,7 @@ class CrossBot(FuturesBot):
             except Exception:
                 pass
             from bot_utils.fee_math import taker_fee_rate
-            close_fee = amt * close_price * taker_fee_rate(self.ex, full, 0.0006)
+            close_fee = amt * close_price * taker_fee_rate(self.ex, full)
         elif amt > 0 and not live_close_already_verified:
             #  LIVE: reduce-only market close 
             from bot_utils import (create_order_with_retry,
@@ -2680,7 +2764,7 @@ class CrossBot(FuturesBot):
                 if entry > 0 and last > 0 and margin > 0:
                     u, _ = calc_unrealized_pnl(entry, last, margin, lev,
                                                 d.get("position_type", "LONG"))
-                    unreal += u - (margin * lev * 0.0006)   # est. taker exit fee
+                    unreal += u - (margin * lev * 0.001)   # conservative exit fee
             total = realized + unreal
             max_loss = self._f("MAX_DAILY_LOSS", -50.0)
             if max_loss < 0 and total <= max_loss:
@@ -2906,6 +2990,50 @@ class CrossBot(FuturesBot):
                 self._last_neutrality_check = 0.0
                 self._neutrality_guard(force=True)
                 continue
+            # CROSS keeps time-decay observational: a unilateral expiry would
+            # break the dollar-neutral basket. Promotion requires a paired
+            # rebalance experiment, not an isolated live leg close.
+            try:
+                from trading.profit_experiments import (
+                    position_age_minutes,
+                    time_decay_decision,
+                )
+
+                age_minutes = position_age_minutes(d.get("buy_time"))
+                if age_minutes is not None:
+                    decay = time_decay_decision(
+                        age_minutes=age_minutes,
+                        max_age_minutes=self._f(
+                            "TIME_DECAY_MAX_AGE_MINUTES", 360.0
+                        ),
+                        mfe_pct=mfe_pct,
+                        min_mfe_pct=self._f("TIME_DECAY_MIN_MFE_PCT", 0.5),
+                        mode="shadow",
+                    )
+                    if (
+                        decay.shadow_should_exit
+                        and not d.get("time_decay_shadow_seen")
+                    ):
+                        from core.logger import log_struct
+
+                        log_struct(
+                            "time_decay_decision",
+                            bot=self.BOT_NAME,
+                            symbol=base,
+                            mode="shadow_cross_pair_required",
+                            configured_mode=str(
+                                self.C("TIME_DECAY_MODE", "shadow")
+                            ),
+                            age_minutes=age_minutes,
+                            mfe_pct=mfe_pct,
+                            should_exit=False,
+                        )
+                        d["time_decay_shadow_seen"] = True
+                        self.state.update(
+                            base, "time_decay_shadow_seen", True
+                        )
+            except Exception:
+                pass
             # Live-state for the UI (reuse futures_state, keyed by bot_name).
             try:
                 lev = lev_state

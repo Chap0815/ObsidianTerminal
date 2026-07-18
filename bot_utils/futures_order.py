@@ -239,6 +239,7 @@ def _is_rate_limit_error(err_str: str) -> bool:
 _CLIENT_ID_INFO_KEYS = (
     "clientOrderId", "clientOid", "client_oid", "newClientOrderId",
     "origClientOrderId", "clientOrderID", "cl_ord_id", "clOrdId",
+    "externalOid", "external_oid",
 )
 
 
@@ -378,6 +379,40 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
         except Exception:
             pass
         return fn()
+    # MEXC exposes an exact, venue-native lookup by externalOid. It is both
+    # faster and safer than scanning a short recent-order window, so use it
+    # before unified fallbacks.
+    if _exchange_id(ex) == "mexc":
+        native = getattr(
+            ex, "contractPrivateGetOrderExternalSymbolExternalOid", None
+        )
+        market = (getattr(ex, "markets", None) or {}).get(symbol_full) or {}
+        market_id = market.get("id")
+        if callable(native) and market_id:
+            try:
+                raw = _budgeted(
+                    "order_recovery_mexc_external_oid",
+                    lambda: native({"symbol": market_id, "externalOid": cid}),
+                )
+                data = raw.get("data") if isinstance(raw, dict) else None
+                if isinstance(data, dict) and _order_id_text(
+                    data.get("externalOid") or data.get("external_oid")
+                ) == _order_id_text(cid):
+                    return {
+                        "id": data.get("orderId") or data.get("id"),
+                        "clientOrderId": cid,
+                        "info": data,
+                    }
+            except Exception as e:
+                if log_event:
+                    try:
+                        log_event(
+                            "MEXC externalOid lookup failed for "
+                            f"{symbol_full}: {type(e).__name__}",
+                            "WARN",
+                        )
+                    except Exception:
+                        pass
     try:
         for o in (_budgeted(
                 "order_recovery_fetch_open_orders",
@@ -825,24 +860,19 @@ def _extract_order_fee_futures_known(order) -> tuple[float, bool]:
     if isinstance(fees_list, list):
         saw_fee = False
         saw_known = False
-        all_known = True
         total = 0.0
         for fee_dict in fees_list:
             if not isinstance(fee_dict, dict):
                 saw_fee = True
-                all_known = False
                 continue
             if "cost" not in fee_dict or fee_dict.get("cost") is None:
                 saw_fee = True
-                all_known = False
                 continue
             saw_fee = True
             fee, known = _convert_fee_to_usdt_futures_known(fee_dict, order)
             if known:
                 saw_known = True
                 total += fee
-            else:
-                all_known = False
         if saw_fee:
             if saw_known:
                 return total if math.isfinite(total) else 0.0, math.isfinite(total)
@@ -854,7 +884,7 @@ def _extract_order_fee_futures_known(order) -> tuple[float, bool]:
     return _convert_fee_to_usdt_futures_known(order.get("fee") or {}, order)
 
 
-FUTURES_DEFAULT_TAKER_FEE = 0.0006
+FUTURES_DEFAULT_TAKER_FEE = 0.001
 
 
 def futures_contract_size(ex, symbol_full: str) -> float:
@@ -1088,6 +1118,15 @@ def extract_or_estimate_futures_fee(ex,
         fp = 0.0
     if not math.isfinite(fp) or filled <= 0 or fp <= 0:
         return 0.0
+    if _is_mexc_swap_symbol(ex, symbol_full):
+        try:
+            from trading.execution_quality import mexc_private_fee_quote
+
+            taker_rate = mexc_private_fee_quote(
+                ex, symbol_full, "taker"
+            ).rate
+        except Exception:
+            taker_rate = FUTURES_DEFAULT_TAKER_FEE
     try:
         if isinstance(taker_rate, bool):
             raise ValueError("boolean taker rate")

@@ -19,10 +19,10 @@ prepare_entrypoint(__file__, __name__)
 
 require_portalocker(exit_on_missing=True)
 
-from core.cross_bot import CrossBot
-from core.paths import LOG_DIR_CROSS
-from config.exchange_config import get_futures_exchange_connection
-from bot_utils.sim_flag import read_simulation_flag
+from core.cross_bot import CrossBot  # noqa: E402
+from core.paths import LOG_DIR_CROSS  # noqa: E402
+from config.exchange_config import get_futures_exchange_connection  # noqa: E402
+from bot_utils.sim_flag import read_simulation_flag  # noqa: E402
 
 
 class CrossMomentumBot(CrossBot):
@@ -72,6 +72,14 @@ class CrossMomentumBot(CrossBot):
         "SIMULATION":            True,
         "ENTRY_QUALITY_FILTER_ENABLED": True,
         "ENTRY_QUALITY_MIN_SCORE": 75.0,
+        "PORTFOLIO_RISK_MODE": "shadow",
+        "NET_EXPECTANCY_MODE": "shadow",
+        "TIME_DECAY_MODE": "shadow",
+        "TIME_DECAY_MAX_AGE_MINUTES": 720,
+        "TIME_DECAY_MIN_MFE_PCT": 0.5,
+        "TCA_ENABLED": True,
+        "TCA_DEPTH_LEVELS": 20,
+        "DEPTH_GATE_MODE": "shadow",
     }
 
     @staticmethod

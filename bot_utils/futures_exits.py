@@ -395,7 +395,7 @@ def _close_single_position_impl(*,
             fill_source = "simulation"
             if amount > 0 and fill_price > 0:
                 close_fee = amount * _cs * fill_price * taker_fee_rate(
-                    ex, symbol_full, 0.0006)
+                    ex, symbol_full)
         else:
             try:
                 close_side = "sell" if pos_type == "LONG" else "buy"

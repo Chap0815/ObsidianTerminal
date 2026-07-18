@@ -327,6 +327,35 @@ def validate_config_or_die(bot_name: str) -> dict:
                     f"[FUTURES] FATAL: invalid MFE fallback config: "
                     f"{fallback_error}. Refusing to start.", "WARN")
                 _fatal_exit(1)
+        for mode_key in (
+            "PORTFOLIO_RISK_MODE",
+            "NET_EXPECTANCY_MODE",
+            "TIME_DECAY_MODE",
+            "DEPTH_GATE_MODE",
+            "MAKER_FIRST_MODE",
+        ):
+            if mode_key in cfg and str(cfg[mode_key]).strip().lower() not in {
+                "disabled",
+                "shadow",
+                "enforce",
+            }:
+                log_event(
+                    f"[{bot_name}] FATAL: {mode_key} has invalid mode "
+                    f"{cfg[mode_key]!r}. Refusing to start.",
+                    "WARN",
+                )
+                _fatal_exit(1)
+        if (
+            "VENUE_RECORDER_MODE" in cfg
+            and str(cfg["VENUE_RECORDER_MODE"]).strip().lower()
+            not in {"disabled", "enabled"}
+        ):
+            log_event(
+                f"[{bot_name}] FATAL: invalid VENUE_RECORDER_MODE. "
+                "Refusing to start.",
+                "WARN",
+            )
+            _fatal_exit(1)
         _checks = (
             ("MONITOR_INTERVAL", 5, 600),
             ("MAX_OPEN_TRADES", 1, 50),
@@ -346,6 +375,14 @@ def validate_config_or_die(bot_name: str) -> dict:
             ("XSEC_UNIVERSE_SIZE", 10, 100),
             ("CRASH_WINDOW", 1, 50),
             ("XSEC_MAX_SPREAD_PCT", 0.01, 10.0),
+            ("TIME_DECAY_MAX_AGE_MINUTES", 5, 10080),
+            ("TIME_DECAY_MIN_MFE_PCT", 0, 20),
+            ("MAKER_FIRST_TTL_SECONDS", 0, 30),
+            ("TCA_DEPTH_LEVELS", 5, 100),
+            ("VENUE_RECORDER_MAX_SYMBOLS", 1, 50),
+            ("VENUE_RECORDER_MICRO_INTERVAL_SECONDS", 1, 600),
+            ("VENUE_RECORDER_OVERVIEW_INTERVAL_SECONDS", 5, 3600),
+            ("VENUE_RECORDER_DEPTH_LEVELS", 5, 100),
         )
         for _key, _lo, _hi in _checks:
             if _key in cfg:
@@ -799,7 +836,7 @@ def _analyze_time_patterns(bot_name: str, trades: list):
     blocked hours make sense in local time  not UTC.
     Manually closed trades are excluded from this analysis.
     """
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timezone
     # Filter out manual closes  they don't reflect the bot's strategy
     auto_trades = [t for t in trades if not _is_manual_close(t)]
     if len(auto_trades) < MIN_TRADES_FOR_LEARNING:
@@ -996,40 +1033,60 @@ def score_trade_quality(
     Multipliziert Position-Size mit size_multiplier."""
     score = 0.0
 
-    if 45 <= rsi_1h <= 65: score += 20
-    elif 35 <= rsi_1h < 45: score += 14
-    elif 65 < rsi_1h <= 75: score += 10
+    if 45 <= rsi_1h <= 65:
+        score += 20
+    elif 35 <= rsi_1h < 45:
+        score += 14
+    elif 65 < rsi_1h <= 75:
+        score += 10
 
-    if vol_surge >= 3.0:   score += 25
-    elif vol_surge >= 2.0: score += 18
-    elif vol_surge >= 1.5: score += 12
-    elif vol_surge >= 1.2: score += 6
+    if vol_surge >= 3.0:
+        score += 25
+    elif vol_surge >= 2.0:
+        score += 18
+    elif vol_surge >= 1.5:
+        score += 12
+    elif vol_surge >= 1.2:
+        score += 6
 
-    if body_ratio >= 0.7:   score += 15
-    elif body_ratio >= 0.5: score += 10
-    elif body_ratio >= 0.3: score += 5
+    if body_ratio >= 0.7:
+        score += 15
+    elif body_ratio >= 0.5:
+        score += 10
+    elif body_ratio >= 0.3:
+        score += 5
 
     if macd_hist > 0 and price > 0:
         macd_pct = (macd_hist / price) * 100.0
-        if   macd_pct >= 0.5:  score += 15
-        elif macd_pct >= 0.2:  score += 10
-        elif macd_pct >= 0.05: score += 5
+        if macd_pct >= 0.5:
+            score += 15
+        elif macd_pct >= 0.2:
+            score += 10
+        elif macd_pct >= 0.05:
+            score += 5
     elif macd_hist > 0:
         score += min(15.0, macd_hist * 1000.0)
 
     regime_str = (regime.value if isinstance(regime, MarketRegime)
                   else str(regime).upper())
-    if   regime_str == MarketRegime.BULL.value:    score += 15
-    elif regime_str == MarketRegime.NEUTRAL.value: score += 8
-    elif regime_str == MarketRegime.BEAR.value:    score -= 10
+    if regime_str == MarketRegime.BULL.value:
+        score += 15
+    elif regime_str == MarketRegime.NEUTRAL.value:
+        score += 8
+    elif regime_str == MarketRegime.BEAR.value:
+        score -= 10
 
     # F&G context
-    if 30 <= fear_greed <= 60: score += 3
-    elif fear_greed > 80:       score -= 5
+    if 30 <= fear_greed <= 60:
+        score += 3
+    elif fear_greed > 80:
+        score -= 5
 
     # Chase penalty
-    if change_pct > 20:  score -= 8
-    elif change_pct > 12: score -= 3
+    if change_pct > 20:
+        score -= 8
+    elif change_pct > 12:
+        score -= 3
 
     try:
         from core.database import get_symbol_winrates
@@ -1040,9 +1097,12 @@ def score_trade_quality(
         score += 5
 
     score = max(0.0, min(100.0, score))
-    if   score >= 60: verdict, size_mult = "PASS", 1.0
-    elif score >= 35: verdict, size_mult = "WARN", 0.6
-    else:             verdict, size_mult = "SKIP", 0.0
+    if score >= 60:
+        verdict, size_mult = "PASS", 1.0
+    elif score >= 35:
+        verdict, size_mult = "WARN", 0.6
+    else:
+        verdict, size_mult = "SKIP", 0.0
 
     return {
         "score": round(score, 1), "verdict": verdict,
