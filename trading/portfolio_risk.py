@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Mapping
 
 
 @dataclass(frozen=True)
@@ -53,8 +54,82 @@ class PortfolioDecision:
     net_after: float
 
 
+@dataclass(frozen=True)
+class CorrelationCrowdingDecision:
+    known: bool
+    shadow_allowed: bool
+    correlated_notional_after: float | None
+    correlated_pct_after: float | None
+    matched_positions: int
+    reasons: tuple[str, ...]
+    changes_orders: bool = False
+
+
 def _side_sign(side: str) -> float:
     return -1.0 if str(side).upper() == "SHORT" else 1.0
+
+
+def evaluate_correlation_crowding(
+    snapshot: PortfolioSnapshot,
+    *,
+    candidate_symbol: str,
+    side: str,
+    requested_notional: float,
+    correlations: Mapping[str, float] | None,
+    maximum_correlated_pct: float = 35.0,
+    minimum_aligned_correlation: float = 0.65,
+) -> CorrelationCrowdingDecision:
+    """Research-only side-aware crowding from measured return correlations."""
+    if not snapshot.known or snapshot.equity_usdt <= 0.0:
+        return CorrelationCrowdingDecision(
+            False, False, None, None, 0,
+            (snapshot.reason or "portfolio snapshot unavailable",),
+        )
+    if correlations is None:
+        return CorrelationCrowdingDecision(
+            False, False, None, None, 0,
+            ("correlation evidence unavailable",),
+        )
+    normalized_candidate = str(candidate_symbol).strip().upper()
+    aligned = max(0.0, float(requested_notional))
+    matched = 0
+    missing = []
+    candidate_sign = _side_sign(side)
+    for position in snapshot.positions:
+        symbol = str(position.symbol).strip().upper()
+        if symbol == normalized_candidate:
+            correlation = 1.0
+        else:
+            raw = correlations.get(symbol)
+            try:
+                correlation = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                missing.append(symbol)
+                continue
+        if not -1.0 <= correlation <= 1.0:
+            missing.append(symbol)
+            continue
+        directionally_aligned = (
+            candidate_sign * _side_sign(position.side) * correlation
+        )
+        if directionally_aligned >= max(0.0, float(minimum_aligned_correlation)):
+            aligned += abs(float(position.notional_usdt))
+            matched += 1
+    if missing:
+        return CorrelationCrowdingDecision(
+            False, False, None, None, matched,
+            ("correlation evidence incomplete",),
+        )
+    percentage = aligned / float(snapshot.equity_usdt) * 100.0
+    allowed = percentage <= max(0.0, float(maximum_correlated_pct))
+    return CorrelationCrowdingDecision(
+        True,
+        allowed,
+        aligned,
+        percentage,
+        matched,
+        () if allowed else ("correlated side exposure limit exceeded",),
+    )
 
 
 def evaluate_entry(

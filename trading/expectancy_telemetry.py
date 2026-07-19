@@ -21,6 +21,32 @@ EXPECTANCY_FEATURES: dict[str, tuple[str, ...]] = {
     "TREND": ("trend_votes", "realized_vol", "size_multiplier"),
 }
 
+# Version 1 remains the runtime-compatible baseline.  New schemas are additive
+# and research tooling must never mix rows from different versions.
+EXPECTANCY_FEATURE_SCHEMAS: dict[str, dict[int, tuple[str, ...]]] = {
+    bot: {1: features} for bot, features in EXPECTANCY_FEATURES.items()
+}
+EXPECTANCY_FEATURE_SCHEMAS["CROSS"][2] = (
+    *EXPECTANCY_FEATURES["CROSS"],
+    "rank_position",
+    "rank_count",
+    "return_pct",
+    "funding_rate_pct",
+    "universe_count",
+    "universe_median_return_pct",
+    "universe_dispersion_pct",
+    "market_breadth_positive_pct",
+    "long_short_separation_pct",
+    "separation_to_dispersion",
+    "btc_return_pct",
+    "btc_realized_vol_24h_pct",
+    "average_pairwise_correlation",
+    "correlation_pair_count",
+    "liquidity_max_symbol_share",
+    "expected_funding_carry_8h_pct",
+    "funding_coverage",
+)
+
 
 def _finite(value) -> float | None:
     if value is None or isinstance(value, bool):
@@ -44,15 +70,24 @@ def emit_expectancy_candidate(
 ) -> bool:
     """Persist the exact causal feature vector later joined to a closed trade."""
     normalized_bot = str(bot).strip().upper()
-    expected = EXPECTANCY_FEATURES.get(normalized_bot)
-    if not expected or not str(entry_id).strip() or not str(symbol).strip():
+    schemas = EXPECTANCY_FEATURE_SCHEMAS.get(normalized_bot)
+    if not schemas or not str(entry_id).strip() or not str(symbol).strip():
         return False
-    normalized_features = {}
-    for name in expected:
-        value = _finite((features or {}).get(name))
-        if value is None:
-            return False
-        normalized_features[name] = value
+    schema_version = None
+    normalized_features = None
+    for version in sorted(schemas, reverse=True):
+        candidate = {}
+        for name in schemas[version]:
+            value = _finite((features or {}).get(name))
+            if value is None:
+                break
+            candidate[name] = value
+        if len(candidate) == len(schemas[version]):
+            schema_version = version
+            normalized_features = candidate
+            break
+    if schema_version is None or normalized_features is None:
+        return False
     candidate_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     persisted = False
     try:
@@ -66,7 +101,7 @@ def emit_expectancy_candidate(
             symbol=str(symbol),
             mode=str(mode).strip().upper(),
             candidate_time=candidate_time,
-            schema_version=1,
+            schema_version=schema_version,
             features=normalized_features,
         ))
     except Exception:
@@ -78,7 +113,7 @@ def emit_expectancy_candidate(
             writer = log_struct
         writer(
             "expectancy_candidate",
-            schema_version=1,
+            schema_version=schema_version,
             bot=normalized_bot,
             entry_id=str(entry_id),
             symbol=str(symbol),

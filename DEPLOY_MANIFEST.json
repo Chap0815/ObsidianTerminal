@@ -1,8 +1,8 @@
 {
-  "build_id": "98239a976fc0646c",
-  "created_at": "2026-07-19 20:08:23",
+  "build_id": "361ed46d023665ee",
+  "created_at": "2026-07-19 20:54:23",
   "source": "update_deploy_manifest.py",
-  "file_count": 169,
+  "file_count": 171,
   "files": [
     {
       "path": "bot_config.default.json",
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "b6dd4e4d6a1ec068b967f380ae0be5f6f1b8e35fefd89606babee9ea8090fa53",
-      "bytes": 58107
+      "sha256": "d62871b6c79453d3c6d32943c5e03d97f2934a1003ee305cd318f7feb95c20fb",
+      "bytes": 59609
     },
     {
       "path": "config/__init__.py",
@@ -231,8 +231,8 @@
     },
     {
       "path": "core/cross_bot.py",
-      "sha256": "43b5f1090837f82b4cb282953dde3124e2958a7d52927f5e421f26e15970a6b4",
-      "bytes": 153891
+      "sha256": "82da6fb552bae1eb59a7d5717b1d01bd927ad645eca86891e32b886b37bc848c",
+      "bytes": 154563
     },
     {
       "path": "core/database.py",
@@ -546,8 +546,8 @@
     },
     {
       "path": "RELEASE.md",
-      "sha256": "0eac6884bfb995f39a3ffbdf11d2dcd8082f3110c896bffd7d2d887f601cb1a0",
-      "bytes": 5480
+      "sha256": "ea08acbb9b15271db26c808f8295dd5b6a9c97c75499dc46291f7f7f638884e4",
+      "bytes": 6545
     },
     {
       "path": "requirements.lock.txt",
@@ -606,8 +606,8 @@
     },
     {
       "path": "tools/profit_research.py",
-      "sha256": "4a5e750dbcf5f7f4615c13249f061d36bb674c35f1c4411d7686d8b57725bf2b",
-      "bytes": 8280
+      "sha256": "e0fbb1a18c7f7981eb6eab4196049899965bcbf254c6f51b0f10ed7141f0dfed",
+      "bytes": 8383
     },
     {
       "path": "tools/release_check.py",
@@ -710,6 +710,11 @@
       "bytes": 9278
     },
     {
+      "path": "trading/execution_policy.py",
+      "sha256": "1e661e67e56be54d1a473487be6a62236831a845b5226409e9572c2793a93ed2",
+      "bytes": 6460
+    },
+    {
       "path": "trading/execution_quality.py",
       "sha256": "42a47d214ef0b6eee1c4afa2a9f14f2f20773b92e493c4a1796ede152a0c58b0",
       "bytes": 10345
@@ -721,8 +726,8 @@
     },
     {
       "path": "trading/expectancy_telemetry.py",
-      "sha256": "4056f6723efbd690c462c14d9268a5ed925b418cf1bcd3a6ae98973bc29b8849",
-      "bytes": 2827
+      "sha256": "1760331fc99eff1c47e21ea43dd70f5e322b7db9d75e88afb8e28a93464dbb4b",
+      "bytes": 4059
     },
     {
       "path": "trading/expectancy_training.py",
@@ -761,13 +766,13 @@
     },
     {
       "path": "trading/portfolio_guard.py",
-      "sha256": "0122e95a5f9336ed13b4c5d8c4c61f7db4ae101ca984adb3e6935ec497af9ea2",
-      "bytes": 11475
+      "sha256": "746da5eca29a8ce668b7e0584baa60c19c6ec6e7fd784540a98160c2934e0ae4",
+      "bytes": 11501
     },
     {
       "path": "trading/portfolio_risk.py",
-      "sha256": "7bbe3687f16b42091d95b524d82f5bcf02c13b000fac966728d9ae60d4c287bd",
-      "bytes": 4130
+      "sha256": "b86d524b64e39aaa1524f8754beb33cac8e7df9c51b8500518a428226ab215d1",
+      "bytes": 6695
     },
     {
       "path": "trading/profit_experiments.py",
@@ -776,8 +781,8 @@
     },
     {
       "path": "trading/profit_research_runner.py",
-      "sha256": "b12d9a2394162e1afd8c1e8f37d008ba22f99d9db1ea01964ace885b71c607d3",
-      "bytes": 26411
+      "sha256": "d5e442451a07efa267843fb49b24eff7639904bb2e7302425508e00b03e5b73d",
+      "bytes": 32974
     },
     {
       "path": "trading/promotion_gate.py",
@@ -785,9 +790,14 @@
       "bytes": 4917
     },
     {
+      "path": "trading/range_grid_research.py",
+      "sha256": "9de13c7805f8f132cab344d6091f7da2697f366c7af1c1a7796aee57b6089012",
+      "bytes": 7791
+    },
+    {
       "path": "trading/research_experiment_suite.py",
-      "sha256": "dff27a15a74943ab8992d59f2aec093319cedc9e3c301ad840b8a06532d7bfb7",
-      "bytes": 37495
+      "sha256": "99b1772be863e33eefb8d5516afeea2474d77efbea56657ec172ac6cbdbcf6ba",
+      "bytes": 50217
     },
     {
       "path": "trading/risk_manager.py",

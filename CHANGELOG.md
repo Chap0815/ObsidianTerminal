@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-07-19
+
+- Added causal, costed CROSS momentum variants: winner long-only, BTC/equal-
+  weight market hedging, liquidity-restricted shorts and dispersion-scaled
+  exposure. Every variant includes turnover and final-liquidation costs.
+- Added a research-only maker/taker/abstention policy based exclusively on
+  sequence-valid cross-through shadow evidence. It reports missed-fill and
+  adverse-selection costs without reconstructing or claiming queue position.
+- Versioned CROSS expectancy telemetry additively. Complete entry-time regime,
+  breadth, dispersion, correlation, liquidity and funding vectors use schema 2;
+  schema 1 remains compatible and training strictly separates versions.
+- Replaced hard-coded portfolio sector labels with exact-symbol defaults and
+  added a pure side-aware correlation crowding evaluation that fails unknown on
+  incomplete evidence.
+- Hardened carry history with observed settlement intervals, interval stability,
+  funding sign flips, p20 funding stress, p95 basis stress, full entry/exit
+  costs, a labelled quote-turnover capacity proxy and liquidation buffer.
+- Added a bounded long-only range-grid simulator with completed-bar signals,
+  next-bar execution, equal-weight timestamp aggregation, gap liquidation and
+  full inventory mark-to-market. It has no leverage, shorts or martingale path.
+- Expanded the immutable research catalog from eight to ten experiments. All
+  new components remain order-neutral, candidate-only and promotion-ineligible.
+
 ## 2026-07-18
 
 - Made causal entry telemetry restart-safe. Candidates are synchronously and

@@ -25,6 +25,11 @@ def _finite(value) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _symbol_cluster(symbol: str) -> str:
+    """Use exact exposure identity until measured clusters are supplied."""
+    return str(symbol).strip().upper().split("/")[0].split(":")[0] or "UNKNOWN"
+
+
 def _balance_value(balance: dict, group: str, currency: str = "USDT") -> float | None:
     direct = balance.get(currency)
     if isinstance(direct, dict):
@@ -172,7 +177,7 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
                     symbol=symbol,
                     side=side,
                     notional_usdt=notional,
-                    cluster="majors" if str(raw.get("symbol", "")).startswith(("BTC/", "ETH/")) else "alts",
+                    cluster=_symbol_cluster(symbol),
                 )
             )
         return PortfolioSnapshot(
@@ -234,9 +239,7 @@ def collect_spot_snapshot(exchange) -> PortfolioSnapshot:
                     symbol=symbol,
                     side="LONG",
                     notional_usdt=notional,
-                    cluster=(
-                        "majors" if normalized_asset in {"BTC", "ETH"} else "alts"
-                    ),
+                    cluster=_symbol_cluster(symbol),
                 )
             )
         free = _finite(free_balances.get("USDT"))
@@ -295,7 +298,7 @@ def evaluate_exchange_entry(
         symbol,
         limits or PortfolioLimits(),
         mode=normalized_mode,
-        cluster="majors" if symbol.startswith(("BTC", "ETH")) else "alts",
+        cluster=_symbol_cluster(symbol),
     )
     writer = persist or _persist_default
     try:

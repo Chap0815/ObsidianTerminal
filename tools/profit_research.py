@@ -81,6 +81,7 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--min-train", type=int, default=1000)
     train.add_argument("--test-size", type=int, default=200)
     train.add_argument("--purge-days", type=int, default=8)
+    train.add_argument("--schema-version", type=int)
 
     carry = sub.add_parser("carry-preview", help="SIM-only carry candidate preview")
     carry.add_argument("--notional", type=float, default=100.0)
@@ -110,7 +111,7 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser(
         "experiment-catalog",
-        help="show the eight research-only experiment definitions",
+        help="show all research-only experiment definitions",
     )
     experiments = sub.add_parser(
         "run-experiments",
@@ -151,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
                     min_train=args.min_train,
                     test_size=args.test_size,
                     purge_days=args.purge_days,
+                    schema_version=args.schema_version,
                 )
             )
             return 0

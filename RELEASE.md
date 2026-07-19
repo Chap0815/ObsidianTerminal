@@ -1,5 +1,25 @@
 # Release Notes
 
+## 2026-07-19 - Expanded causal profit research
+
+The operator now exposes ten research-only experiments. CROSS momentum adds
+long-only, market-hedged, liquid-short and dispersion-scaled variants with
+next-bar fills, turnover costs and final liquidation. A bounded long-only
+range grid marks all inventory to market and cannot short, leverage or
+martingale.
+
+CROSS expectancy telemetry has an additive regime schema. Schema 1 remains
+usable; schema 2 is written only for complete causal vectors and training never
+mixes versions. Execution routing research chooses maker, taker or abstention
+only from sequence-valid shadow samples and never claims public snapshots reveal
+queue position.
+
+Carry readiness now derives the observed funding interval and stresses sign
+flips, p20 funding, p95 basis, costs, turnover capacity proxy and liquidation
+buffer. Portfolio research supports measured, side-aware correlations; absent
+or incomplete correlation evidence stays unknown. None of these additions
+changes orders, enables a strategy, or promotes a model automatically.
+
 ## 2026-07-18 - Research integrity and durable telemetry
 
 This update fixes the data lineage needed for the profit experiments; it does
@@ -30,7 +50,7 @@ is desired. `train-expectancy` writes candidate models under `data/research`;
 it never writes to the runtime `data/models` directory. `carry-preview` is
 simulation-only, and `promotion-check` never deploys a model or changes orders.
 
-The eight scientific experiments are available through the same operator:
+The ten scientific experiments are available through the same operator:
 
 ```powershell
 py -3.12 tools\profit_research.py experiment-catalog

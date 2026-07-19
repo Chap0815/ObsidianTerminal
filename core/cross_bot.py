@@ -1740,6 +1740,19 @@ class CrossBot(FuturesBot):
                 (quality_context or {}).get("target_side_count") or 0.0
             ),
         }
+        for feature_name in (
+            "rank_position", "rank_count", "return_pct", "funding_rate_pct",
+            "universe_count", "universe_median_return_pct",
+            "universe_dispersion_pct", "market_breadth_positive_pct",
+            "long_short_separation_pct", "separation_to_dispersion",
+            "btc_return_pct", "btc_realized_vol_24h_pct",
+            "average_pairwise_correlation", "correlation_pair_count",
+            "liquidity_max_symbol_share", "expected_funding_carry_8h_pct",
+            "funding_coverage",
+        ):
+            expectancy_features[feature_name] = (quality_context or {}).get(
+                feature_name
+            )
         from trading.expectancy_telemetry import emit_expectancy_candidate
 
         emit_expectancy_candidate(

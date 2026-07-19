@@ -54,6 +54,12 @@ EXPERIMENT_CATALOG: tuple[ExperimentDefinition, ...] = (
         "at least 50 paired arrival/fill observations",
     ),
     ExperimentDefinition(
+        "execution_policy",
+        "Dynamic maker, taker, or abstention policy",
+        "Sequence-valid shadow outcomes identify the lowest expected execution cost.",
+        "at least 50 complete cross-through shadow samples",
+    ),
+    ExperimentDefinition(
         "order_flow",
         "Continuous L2 order-flow imbalance",
         "Sequence-valid depth-normalized OFI adds short-horizon net edge.",
@@ -83,6 +89,12 @@ EXPERIMENT_CATALOG: tuple[ExperimentDefinition, ...] = (
         "Past-only shift and calibrated uncertainty identify no-trade conditions.",
         "adequate OHLC history plus purged OOS expectancy predictions",
     ),
+    ExperimentDefinition(
+        "bounded_regime_grid",
+        "Bounded range-regime grid",
+        "A non-levered range grid earns net returns only inside a past-only range regime.",
+        "at least 500 next-bar marked-to-market observations",
+    ),
 )
 
 
@@ -94,6 +106,21 @@ def _finite(value) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _utc_datetime(value) -> datetime | None:
+    try:
+        if isinstance(value, (int, float)) or str(value).strip().isdigit():
+            timestamp = float(value)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000.0
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _performance(returns_bps: Iterable[float]) -> dict:
@@ -310,14 +337,25 @@ def evaluate_momentum_panel(
     origin = timestamps[0] if timestamps else 0
     cross_sectional = []
     cross_hysteresis = []
+    winner_long_only = []
+    winner_market_hedged = []
+    liquid_short = []
+    dispersion_scaled = []
     time_series = []
     guarded_time_series = []
     previous_cross_weights: dict[str, float] = {}
     previous_hysteresis_weights: dict[str, float] = {}
+    previous_long_only_weights: dict[str, float] = {}
+    previous_market_hedged_weights: dict[str, float] = {}
+    previous_liquid_short_weights: dict[str, float] = {}
+    previous_dispersion_weights: dict[str, float] = {}
     previous_time_weights: dict[str, float] = {}
     previous_guarded_weights: dict[str, float] = {}
     cross_turnovers = []
     hysteresis_turnovers = []
+    dispersion_exposures = []
+    liquidity_pool_sizes = []
+    market_hedge_benchmarks = []
     for timestamp in timestamps:
         if (timestamp - origin) % holding_ms:
             continue
@@ -386,6 +424,108 @@ def evaluate_momentum_panel(
             - funding_drag
         )
         previous_cross_weights = cross_weights
+
+        long_only_weights = {row[0]: 1.0 / basket for row in longs}
+        long_only_cost = max(0.0, float(one_way_cost_bps)) * _weight_turnover(
+            previous_long_only_weights, long_only_weights
+        )
+        winner_long_only.append(
+            long_return * 10_000.0 - long_only_cost - funding_drag
+        )
+        previous_long_only_weights = long_only_weights
+
+        btc_rows = [
+            row
+            for row in eligible
+            if str(row[0]).upper().split("/")[0].split("_")[0].startswith("BTC")
+        ]
+        market_hedged_weights = dict(long_only_weights)
+        if btc_rows:
+            benchmark_return = btc_rows[0][4]
+            benchmark_symbol = btc_rows[0][0]
+            market_hedged_weights[benchmark_symbol] = (
+                market_hedged_weights.get(benchmark_symbol, 0.0) - 1.0
+            )
+            market_hedge_benchmarks.append("BTC")
+        else:
+            benchmark_return = statistics.mean(row[4] for row in eligible)
+            for row in eligible:
+                market_hedged_weights[row[0]] = (
+                    market_hedged_weights.get(row[0], 0.0) - 1.0 / len(eligible)
+                )
+            market_hedge_benchmarks.append("eligible_equal_weight")
+        market_hedged_cost = max(
+            0.0, float(one_way_cost_bps)
+        ) * _weight_turnover(previous_market_hedged_weights, market_hedged_weights)
+        winner_market_hedged.append(
+            (long_return - benchmark_return) * 10_000.0 - market_hedged_cost
+        )
+        previous_market_hedged_weights = market_hedged_weights
+
+        liquid_pool_size = min(
+            len(eligible), max(2 * basket + 2, universe_limit // 2)
+        )
+        liquid_pool = eligible[:liquid_pool_size]
+        long_symbols = {row[0] for row in longs}
+        liquid_short_rows = [
+            row
+            for row in sorted(liquid_pool, key=lambda candidate: candidate[2])
+            if row[0] not in long_symbols
+        ][:basket]
+        if len(liquid_short_rows) == basket:
+            liquid_short_weights = {
+                **{row[0]: 0.5 / basket for row in longs},
+                **{row[0]: -0.5 / basket for row in liquid_short_rows},
+            }
+            liquid_short_cost = max(
+                0.0, float(one_way_cost_bps)
+            ) * _weight_turnover(
+                previous_liquid_short_weights, liquid_short_weights
+            )
+            liquid_short.append(
+                0.5
+                * (
+                    long_return
+                    - statistics.mean(row[4] for row in liquid_short_rows)
+                )
+                * 10_000.0
+                - liquid_short_cost
+                - funding_drag
+            )
+            previous_liquid_short_weights = liquid_short_weights
+            liquidity_pool_sizes.append(liquid_pool_size)
+
+        momentum_values = [row[2] for row in eligible]
+        dispersion = (
+            statistics.pstdev(momentum_values)
+            if len(momentum_values) > 1
+            else 0.0
+        )
+        momentum_separation = statistics.mean(row[2] for row in longs) - statistics.mean(
+            row[2] for row in shorts
+        )
+        dispersion_exposure = (
+            min(1.0, max(0.0, momentum_separation / dispersion))
+            if dispersion > 0.0
+            else 0.0
+        )
+        dispersion_weights = {
+            symbol: dispersion_exposure * weight
+            for symbol, weight in cross_weights.items()
+        }
+        dispersion_cost = max(
+            0.0, float(one_way_cost_bps)
+        ) * _weight_turnover(previous_dispersion_weights, dispersion_weights)
+        dispersion_scaled.append(
+            dispersion_exposure
+            * 0.5
+            * (long_return - short_return)
+            * 10_000.0
+            - dispersion_cost
+            - dispersion_exposure * funding_drag
+        )
+        dispersion_exposures.append(dispersion_exposure)
+        previous_dispersion_weights = dispersion_weights
 
         rank_by_symbol = {
             row[0]: rank for rank, row in enumerate(by_momentum)
@@ -484,6 +624,16 @@ def evaluate_momentum_panel(
         cross_hysteresis[-1] -= max(0.0, float(one_way_cost_bps)) * sum(
             abs(weight) for weight in previous_hysteresis_weights.values()
         )
+    for values, weights in (
+        (winner_long_only, previous_long_only_weights),
+        (winner_market_hedged, previous_market_hedged_weights),
+        (liquid_short, previous_liquid_short_weights),
+        (dispersion_scaled, previous_dispersion_weights),
+    ):
+        if values and weights:
+            values[-1] -= max(0.0, float(one_way_cost_bps)) * sum(
+                abs(weight) for weight in weights.values()
+            )
     cross_metrics = _performance(cross_sectional)
     hysteresis_metrics = _performance(cross_hysteresis)
     time_metrics = _performance(time_series)
@@ -519,6 +669,37 @@ def evaluate_momentum_panel(
             "baseline_mean_gross_turnover": (
                 statistics.mean(cross_turnovers) if cross_turnovers else None
             ),
+        },
+        "cross_sectional_variants": {
+            "winner_long_only": _performance(winner_long_only),
+            "winner_market_hedged": {
+                **_performance(winner_market_hedged),
+                "benchmark": (
+                    "BTC"
+                    if market_hedge_benchmarks
+                    and all(value == "BTC" for value in market_hedge_benchmarks)
+                    else "eligible_equal_weight"
+                ),
+            },
+            "liquid_short": {
+                **_performance(liquid_short),
+                "mean_liquidity_pool_size": (
+                    statistics.mean(liquidity_pool_sizes)
+                    if liquidity_pool_sizes
+                    else None
+                ),
+                "liquidity_proxy": "trailing_24h_notional",
+            },
+            "dispersion_scaled": {
+                **_performance(dispersion_scaled),
+                "mean_exposure": (
+                    statistics.mean(dispersion_exposures)
+                    if dispersion_exposures
+                    else 0.0
+                ),
+                "uses_future_dispersion": False,
+                "dispersion_source": "cross_momentum_at_feature_cutoff",
+            },
         },
         "time_series": time_metrics,
         "crash_guard": guarded,
@@ -659,7 +840,7 @@ def evaluate_regime_shift(
 def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
     from trading.carry_sim import CarryEngine, CarryState, CarryTerms
 
-    grouped: dict[str, dict[str, tuple[str, float, bool]]] = {}
+    grouped: dict[str, dict[str, dict]] = {}
     overview_counts: dict[str, int] = {}
     missing_settlement = 0
     folder = root / "data" / "venue_native" / "overview"
@@ -706,11 +887,23 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
                     if not period_key:
                         missing_settlement += 1
                         continue
-                    grouped.setdefault(key, {})[period_key] = (
-                        str(exchange_time),
-                        funding,
-                        market.get("spot_available") is True,
+                    settlement_time = _utc_datetime(period_key)
+                    index_price = _finite(market.get("index_price"))
+                    fair_price = _finite(market.get("fair_price"))
+                    basis_bps = (
+                        abs(fair_price / index_price - 1.0) * 10_000.0
+                        if index_price is not None and index_price > 0.0
+                        and fair_price is not None and fair_price > 0.0
+                        else None
                     )
+                    grouped.setdefault(key, {})[period_key] = {
+                        "exchange_time": str(exchange_time),
+                        "settlement_time": settlement_time,
+                        "funding": funding,
+                        "spot_verified": market.get("spot_available") is True,
+                        "basis_bps": basis_bps,
+                        "quote_volume": _finite(market.get("quote_volume")),
+                    }
         except (OSError, sqlite3.Error):
             continue
         finally:
@@ -720,27 +913,95 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
     qualified = []
     required = max(1, int(minimum_samples))
     for market_id, periods in grouped.items():
-        ordered_periods = sorted(periods.values(), key=lambda row: row[0])
-        values = [row[1] for row in ordered_periods]
+        ordered_periods = sorted(
+            periods.values(), key=lambda row: row["exchange_time"]
+        )
+        values = [row["funding"] for row in ordered_periods]
         positive_fraction = sum(value > 0.0 for value in values) / len(values)
-        verified = sum(row[2] for row in ordered_periods)
+        sign_flips = sum(
+            (left > 0.0) != (right > 0.0)
+            for left, right in zip(values, values[1:])
+        )
+        sign_flip_rate = sign_flips / max(1, len(values) - 1)
+        verified = sum(row["spot_verified"] for row in ordered_periods)
+        settlement_times = sorted(
+            {
+                row["settlement_time"]
+                for row in ordered_periods
+                if row["settlement_time"] is not None
+            }
+        )
+        interval_hours = [
+            (right - left).total_seconds() / 3600.0
+            for left, right in zip(settlement_times, settlement_times[1:])
+            if right > left
+        ]
+        median_interval = statistics.median(interval_hours) if interval_hours else None
+        interval_deviations = (
+            [abs(value - median_interval) for value in interval_hours]
+            if median_interval is not None else []
+        )
+        max_interval_deviation = max(interval_deviations, default=None)
+        interval_stable = bool(
+            median_interval is not None
+            and median_interval > 0.0
+            and len(interval_hours) >= max(1, required - 1)
+            and max_interval_deviation is not None
+            and max_interval_deviation <= median_interval * 0.25
+        )
+        basis_values = [
+            row["basis_bps"] for row in ordered_periods
+            if row["basis_bps"] is not None
+        ]
+        basis_values.sort()
+        basis_p95 = (
+            basis_values[min(len(basis_values) - 1, int(0.95 * len(basis_values)))]
+            if basis_values else None
+        )
+        volumes = [
+            row["quote_volume"] for row in ordered_periods
+            if row["quote_volume"] is not None and row["quote_volume"] > 0.0
+        ]
+        minimum_turnover = min(volumes) if volumes else None
+        # One basis point of observed quote turnover is a conservative capacity
+        # proxy only; it is not claimed as executable market capacity.
+        capacity_proxy = (
+            minimum_turnover / 10_000.0 if minimum_turnover is not None else None
+        )
+        lower_funding = sorted(values)[max(0, int(0.20 * len(values)) - 1)]
+        projected_periods = (
+            max(1, min(3, int(24.0 / median_interval)))
+            if median_interval is not None and median_interval > 0.0 else 1
+        )
         stressed = CarryEngine().start(
             f"history-{market_id}",
             CarryTerms(
                 notional_usdt=100.0,
-                expected_funding_rate=statistics.median(values),
+                expected_funding_rate=lower_funding,
                 taker_fee_rate=0.001,
                 maker_fee_rate=0.0002,
-                expected_funding_periods=3,
+                expected_funding_periods=projected_periods,
                 entry_slippage_bps_per_leg=2.0,
                 exit_slippage_bps_per_leg=2.0,
+                max_basis_adverse_bps=basis_p95 or 0.0,
+                adl_stress_bps=2.0,
+                capacity_usdt=capacity_proxy,
+                liquidation_buffer_pct=25.0,
+                minimum_liquidation_buffer_pct=10.0,
             ),
+        )
+        stress_evidence_complete = bool(
+            len(basis_values) >= math.ceil(len(values) * 0.80)
+            and len(volumes) >= math.ceil(len(values) * 0.80)
         )
         ready = (
             len(periods) >= required
             and verified == len(values)
             and positive_fraction >= 0.80
+            and sign_flip_rate <= 0.20
             and statistics.mean(values) > 0.0
+            and interval_stable
+            and stress_evidence_complete
             and stressed.state == CarryState.CAPITAL_RESERVED
         )
         summaries.append(
@@ -751,8 +1012,23 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
                 "independent_funding_periods": len(periods),
                 "verified_spot_periods": verified,
                 "positive_fraction": positive_fraction,
+                "sign_flips": sign_flips,
+                "sign_flip_rate": sign_flip_rate,
                 "mean_funding_rate": statistics.mean(values),
                 "median_funding_rate": statistics.median(values),
+                "stressed_funding_rate_p20": lower_funding,
+                "median_funding_interval_hours": median_interval,
+                "maximum_interval_deviation_hours": max_interval_deviation,
+                "funding_interval_stable": interval_stable,
+                "projected_funding_periods_24h": projected_periods,
+                "basis_observations": len(basis_values),
+                "basis_adverse_p95_bps": basis_p95,
+                "turnover_observations": len(volumes),
+                "minimum_quote_turnover_usdt": minimum_turnover,
+                "capacity_proxy_usdt_at_1bp_participation": capacity_proxy,
+                "capacity_is_observable_proxy_only": True,
+                "modeled_liquidation_buffer_pct": 25.0,
+                "stress_evidence_complete": stress_evidence_complete,
                 "stressed_state": stressed.state.value,
                 "stressed_projected_net_pnl": stressed.projected_net_pnl,
                 "ready": ready,
@@ -798,18 +1074,21 @@ def run_research_experiments(
     from trading.profit_research_runner import (
         build_carry_preview,
         build_execution_cost_report,
-        build_expectancy_candidates,
+        build_execution_policy_report,
         build_ofi_report,
+        select_expectancy_schema,
     )
 
     project = Path(root)
     normalized_bot = str(bot).strip().upper()
     normalized_mode = str(mode).strip().upper()
-    features = EXPECTANCY_FEATURES.get(normalized_bot)
-    if features is None or normalized_mode not in {"LIVE", "SIM"}:
+    if EXPECTANCY_FEATURES.get(normalized_bot) is None or normalized_mode not in {"LIVE", "SIM"}:
         raise ValueError("unsupported bot or mode")
-    labels = build_expectancy_candidates(
-        project, bot=normalized_bot, mode=normalized_mode
+    selected_schema, features, labels, schema_counts = select_expectancy_schema(
+        project,
+        bot=normalized_bot,
+        mode=normalized_mode,
+        minimum_rows=max(30, int(minimum_expectancy_rows)),
     )
     primary_score = "score" if "score" in features else features[0]
     score_thresholds = (
@@ -827,6 +1106,8 @@ def run_research_experiments(
 
     expectancy_evidence = {
         "closed_labels": len(labels),
+        "schema_version": selected_schema,
+        "closed_labels_by_schema": schema_counts,
         "minimum_rows": max(30, int(minimum_expectancy_rows)),
     }
     abstention = None
@@ -864,6 +1145,9 @@ def run_research_experiments(
         mode=normalized_mode,
         minimum_samples=minimum_cost_samples,
     )
+    execution_policy = build_execution_policy_report(
+        project, minimum_samples=minimum_cost_samples
+    )
     ofi = build_ofi_report(project, max_windows=5_000)
     carry = build_carry_preview(project)
     carry_history = _carry_history_report(project)
@@ -881,6 +1165,9 @@ def run_research_experiments(
         panel, minimum_windows=minimum_momentum_windows
     )
     regime = evaluate_regime_shift(panel)
+    from trading.range_grid_research import evaluate_bounded_range_grid
+
+    grid = evaluate_bounded_range_grid(panel)
     abstention_ready = bool(
         abstention
         and any(row.get("ready") is True for row in abstention.get("rows", []))
@@ -908,6 +1195,13 @@ def run_research_experiments(
             "empirical execution costs are sample-ready"
             if cost["ready"]
             else "insufficient paired arrival/fill observations",
+        ),
+        "execution_policy": _result(
+            bool(execution_policy["ready"]),
+            execution_policy,
+            "sequence-valid execution policy evidence is sample-ready"
+            if execution_policy["ready"]
+            else "sequence-valid maker cross-through evidence is unavailable",
         ),
         "order_flow": _result(
             ofi.get("promotable_windows", 0) >= 1_000,
@@ -956,6 +1250,13 @@ def run_research_experiments(
             "regime and calibrated abstention evidence are available"
             if uncertainty_ready
             else "regime history or calibrated OOS predictions are unavailable",
+        ),
+        "bounded_regime_grid": _result(
+            bool(grid["ready"]),
+            grid,
+            "bounded causal grid simulation is sample-ready"
+            if grid["ready"]
+            else "insufficient contiguous OHLC observations for grid research",
         ),
     }
     ready_count = sum(result["ready"] for result in results.values())

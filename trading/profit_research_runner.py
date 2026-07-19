@@ -12,7 +12,14 @@ from pathlib import Path
 
 from trading.carry_sim import CarryEngine, CarryTerms
 from trading.execution_cost_model import ExecutionCostObservation
-from trading.expectancy_telemetry import EXPECTANCY_FEATURES
+from trading.execution_policy import (
+    ExecutionPolicyEvidence,
+    evaluate_shadow_execution_policy,
+)
+from trading.expectancy_telemetry import (
+    EXPECTANCY_FEATURES,
+    EXPECTANCY_FEATURE_SCHEMAS,
+)
 from trading.expectancy_training import CandidateLabel, expanding_walk_forward_fit
 from trading.orderflow_experiment import build_ofi_window
 from trading.promotion_gate import PromotionEvidence, evaluate_promotion
@@ -64,7 +71,7 @@ def _candidate_events(root: Path, bot: str, mode: str) -> dict[str, dict]:
         try:
             if _table_exists(conn, "expectancy_candidates"):
                 rows = conn.execute(
-                    """SELECT entry_id, candidate_time, features_json
+                    """SELECT entry_id, candidate_time, schema_version, features_json
                          FROM expectancy_candidates
                         WHERE bot_name=? AND mode=?
                         ORDER BY candidate_time, entry_id""",
@@ -74,13 +81,15 @@ def _candidate_events(root: Path, bot: str, mode: str) -> dict[str, dict]:
                     candidate_time = _utc_datetime(row["candidate_time"])
                     try:
                         features = json.loads(row["features_json"])
-                    except (TypeError, ValueError, json.JSONDecodeError):
+                        schema_version = int(row["schema_version"])
+                    except (TypeError, ValueError, json.JSONDecodeError, OverflowError):
                         continue
                     entry_id = str(row["entry_id"] or "").strip()
                     if entry_id and candidate_time is not None and isinstance(features, dict):
                         selected[entry_id] = {
                             "candidate_time": candidate_time,
                             "features": features,
+                            "schema_version": schema_version,
                             "source": "sqlite",
                         }
         finally:
@@ -115,6 +124,10 @@ def _candidate_events(root: Path, bot: str, mode: str) -> dict[str, dict]:
                     event.get("candidate_time") or event.get("ts")
                 )
                 features = event.get("features")
+                try:
+                    schema_version = int(event.get("schema_version") or 1)
+                except (TypeError, ValueError, OverflowError):
+                    continue
                 if not entry_id or candidate_time is None or not isinstance(features, dict):
                     continue
                 current = selected.get(entry_id)
@@ -125,18 +138,20 @@ def _candidate_events(root: Path, bot: str, mode: str) -> dict[str, dict]:
                     selected[entry_id] = {
                         "candidate_time": candidate_time,
                         "features": features,
+                        "schema_version": schema_version,
                         "source": "structured_log_legacy",
                     }
     return selected
 
 
 def build_expectancy_candidates(
-    root: str | Path, *, bot: str, mode: str
+    root: str | Path, *, bot: str, mode: str, schema_version: int = 1
 ) -> list[CandidateLabel]:
     project = Path(root)
     normalized_bot = str(bot).strip().upper()
     normalized_mode = str(mode).strip().upper()
-    feature_order = EXPECTANCY_FEATURES.get(normalized_bot)
+    schemas = EXPECTANCY_FEATURE_SCHEMAS.get(normalized_bot) or {}
+    feature_order = schemas.get(int(schema_version))
     if feature_order is None or normalized_mode not in {"LIVE", "SIM"}:
         raise ValueError("unsupported bot or mode")
     candidates = _candidate_events(project, normalized_bot, normalized_mode)
@@ -164,6 +179,8 @@ def build_expectancy_candidates(
     for entry_id, campaign in grouped.items():
         event = candidates.get(entry_id)
         if event is None or not campaign:
+            continue
+        if int(event.get("schema_version") or 1) != int(schema_version):
             continue
         if not any(int(row["is_partial"] or 0) == 0 for row in campaign):
             continue
@@ -203,6 +220,44 @@ def build_expectancy_candidates(
             )
         )
     return sorted(labels, key=lambda row: row.candidate_time)
+
+
+def select_expectancy_schema(
+    root: str | Path,
+    *,
+    bot: str,
+    mode: str,
+    minimum_rows: int,
+) -> tuple[int, tuple[str, ...], list[CandidateLabel], dict[int, int]]:
+    """Prefer the newest adequately sampled schema, without mixing versions."""
+    normalized_bot = str(bot).strip().upper()
+    schemas = EXPECTANCY_FEATURE_SCHEMAS.get(normalized_bot)
+    if not schemas:
+        raise ValueError("unsupported bot")
+    labels_by_version = {
+        version: build_expectancy_candidates(
+            root, bot=normalized_bot, mode=mode, schema_version=version
+        )
+        for version in sorted(schemas)
+    }
+    required = max(1, int(minimum_rows))
+    adequate = [
+        version for version, rows in labels_by_version.items()
+        if len(rows) >= required
+    ]
+    if adequate:
+        selected = max(adequate)
+    else:
+        selected = max(
+            labels_by_version,
+            key=lambda version: (len(labels_by_version[version]), version == 1),
+        )
+    return (
+        selected,
+        schemas[selected],
+        labels_by_version[selected],
+        {version: len(rows) for version, rows in labels_by_version.items()},
+    )
 
 
 def load_execution_cost_observations(
@@ -314,6 +369,109 @@ def build_execution_cost_report(
         "p75_cost_bps": _quantile(costs, 0.75),
         "p95_cost_bps": _quantile(costs, 0.95),
         "symbol_samples": dict(sorted(by_symbol.items())),
+    }
+
+
+def build_execution_policy_report(
+    root: str | Path,
+    *,
+    minimum_samples: int = 50,
+) -> dict:
+    """Evaluate immutable shadow samples without changing order execution.
+
+    ``execution_shadow`` events must be produced by a sequence-valid replay or
+    recorder.  ``maker_crossed_through`` is deliberately only a conservative
+    fill proxy; it is never presented as reconstructed queue position.
+    """
+    valid: list[dict] = []
+    rejected = Counter()
+    for row in _venue_rows(Path(root), "execution_shadow", limit=50_000):
+        payload = row.get("payload") or {}
+        if row.get("flags"):
+            rejected["quality_flags"] += 1
+            continue
+        if payload.get("sequence_valid") is not True:
+            rejected["sequence_invalid"] += 1
+            continue
+        parsed = {
+            name: _finite(payload.get(name))
+            for name in (
+                "gross_edge_bps",
+                "taker_cost_bps",
+                "maker_fee_bps",
+                "maker_adverse_selection_bps",
+                "missed_fill_cost_bps",
+            )
+        }
+        if any(value is None for value in parsed.values()):
+            rejected["incomplete_cost_fields"] += 1
+            continue
+        if not isinstance(payload.get("maker_crossed_through"), bool):
+            rejected["missing_cross_through_label"] += 1
+            continue
+        if any(
+            parsed[name] < 0.0
+            for name in (
+                "taker_cost_bps",
+                "maker_fee_bps",
+                "maker_adverse_selection_bps",
+                "missed_fill_cost_bps",
+            )
+        ):
+            rejected["negative_cost"] += 1
+            continue
+        valid.append({**parsed, "crossed": bool(payload["maker_crossed_through"])})
+
+    minimum = max(5, int(minimum_samples))
+    evidence = ExecutionPolicyEvidence(
+        gross_edge_bps=(
+            statistics.median([row["gross_edge_bps"] for row in valid])
+            if valid else None
+        ),
+        taker_cost_bps=(
+            statistics.median([row["taker_cost_bps"] for row in valid])
+            if valid else None
+        ),
+        maker_fee_bps=(
+            statistics.median([row["maker_fee_bps"] for row in valid])
+            if valid else None
+        ),
+        maker_adverse_selection_bps=(
+            statistics.median(
+                [row["maker_adverse_selection_bps"] for row in valid]
+            ) if valid else None
+        ),
+        maker_fill_probability=(
+            statistics.mean([float(row["crossed"]) for row in valid])
+            if valid else None
+        ),
+        missed_fill_cost_bps=(
+            statistics.median([row["missed_fill_cost_bps"] for row in valid])
+            if valid else None
+        ),
+        samples=len(valid),
+        sequence_valid=bool(valid),
+    )
+    decision = evaluate_shadow_execution_policy(
+        evidence, minimum_samples=minimum
+    )
+    total = len(valid) + sum(rejected.values())
+    quality_coverage = len(valid) / total if total else 0.0
+    return {
+        "ready": (
+            decision.action != "INSUFFICIENT_DATA" and quality_coverage >= 0.95
+        ),
+        "samples": len(valid),
+        "total_samples": total,
+        "quality_coverage": quality_coverage,
+        "minimum_quality_coverage": 0.95,
+        "minimum_samples": minimum,
+        "rejected": dict(sorted(rejected.items())),
+        "fill_proxy": "opposite_touch_cross_through",
+        "queue_position_reconstructed": False,
+        "decision": asdict(decision),
+        "changes_orders": False,
+        "research_only": True,
     }
 
 
@@ -540,10 +698,17 @@ def build_research_status(
         expectancy[bot] = {}
         for mode in ("LIVE", "SIM"):
             events = _candidate_events(project, bot, mode)
-            labels = build_expectancy_candidates(project, bot=bot, mode=mode)
+            selected, _features, labels, schema_counts = select_expectancy_schema(
+                project,
+                bot=bot,
+                mode=mode,
+                minimum_rows=minimum_expectancy_rows,
+            )
             expectancy[bot][mode] = {
                 "candidate_events": len(events),
                 "closed_labels": len(labels),
+                "schema_version": selected,
+                "closed_labels_by_schema": schema_counts,
                 "minimum_rows": int(minimum_expectancy_rows),
                 "ready": len(labels) >= int(minimum_expectancy_rows),
             }
@@ -573,16 +738,33 @@ def train_expectancy_candidate(
     min_train: int = 1_000,
     test_size: int = 200,
     purge_days: int = 8,
+    schema_version: int | None = None,
 ) -> dict:
     project = Path(root)
     normalized_bot = str(bot).strip().upper()
     normalized_mode = str(mode).strip().upper()
-    feature_order = EXPECTANCY_FEATURES.get(normalized_bot)
-    if feature_order is None:
+    schemas = EXPECTANCY_FEATURE_SCHEMAS.get(normalized_bot)
+    if schemas is None:
         raise ValueError("unsupported bot")
-    labels = build_expectancy_candidates(
-        project, bot=normalized_bot, mode=normalized_mode
-    )
+    if schema_version is None:
+        selected_schema, feature_order, labels, schema_counts = select_expectancy_schema(
+            project,
+            bot=normalized_bot,
+            mode=normalized_mode,
+            minimum_rows=int(min_train) + int(test_size),
+        )
+    else:
+        selected_schema = int(schema_version)
+        feature_order = schemas.get(selected_schema)
+        if feature_order is None:
+            raise ValueError("unsupported expectancy schema version")
+        labels = build_expectancy_candidates(
+            project,
+            bot=normalized_bot,
+            mode=normalized_mode,
+            schema_version=selected_schema,
+        )
+        schema_counts = {selected_schema: len(labels)}
     result = expanding_walk_forward_fit(
         labels,
         feature_order=feature_order,
@@ -592,7 +774,9 @@ def train_expectancy_candidate(
     )
     candidate_dir = project / "data" / "research" / "expectancy"
     candidate_dir.mkdir(parents=True, exist_ok=True)
-    model_path = candidate_dir / f"{normalized_bot.lower()}_{normalized_mode.lower()}.candidate.json"
+    model_path = candidate_dir / (
+        f"{normalized_bot.lower()}_{normalized_mode.lower()}_v{selected_schema}.candidate.json"
+    )
     from trading.expectancy_runtime import save_expectancy_model
 
     save_expectancy_model(model_path, result.final_model)
@@ -600,6 +784,8 @@ def train_expectancy_candidate(
         "bot": normalized_bot,
         "mode": normalized_mode,
         "feature_order": list(feature_order),
+        "schema_version": selected_schema,
+        "closed_labels_by_schema": schema_counts,
         "labels": len(labels),
         "folds": [asdict(fold) for fold in result.folds],
         "predictions": len(result.predictions),
