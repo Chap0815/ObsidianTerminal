@@ -1037,8 +1037,53 @@ class CrossBot(FuturesBot):
                 self._neutrality_guard(force=True)
 
     #  REBALANCE loop (reuses the 'Scan' thread) 
+    def _strategy_runtime_health(self) -> dict:
+        errors = max(0, int(getattr(
+            self, "_cross_scan_consecutive_errors", 0) or 0))
+        return {
+            "ok": errors == 0,
+            "component": "cross_scan",
+            "consecutive_errors": errors,
+            "last_operation": str(getattr(
+                self, "_cross_scan_last_operation", "") or ""),
+            "last_error": str(getattr(
+                self, "_cross_scan_last_error", "") or ""),
+            "last_error_wall_ts": getattr(
+                self, "_cross_scan_last_error_wall_ts", None),
+            "last_success_wall_ts": getattr(
+                self, "_cross_scan_last_success_wall_ts", None),
+        }
+
+    def _record_cross_scan_success(self, operation: str) -> None:
+        self._cross_scan_consecutive_errors = 0
+        self._cross_scan_last_operation = operation
+        self._cross_scan_last_error = ""
+        self._cross_scan_last_error_wall_ts = None
+        self._cross_scan_last_success_wall_ts = time.time()
+
+    def _record_cross_scan_failure(
+        self,
+        operation: str,
+        exc: Exception,
+        *,
+        redact,
+    ) -> None:
+        try:
+            previous = max(0, int(getattr(
+                self, "_cross_scan_consecutive_errors", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            previous = 0
+        self._cross_scan_last_operation = operation
+        self._cross_scan_consecutive_errors = previous + 1
+        try:
+            error_text = redact(f"{type(exc).__name__}: {exc}")[:300]
+        except Exception:
+            error_text = type(exc).__name__
+        self._cross_scan_last_error = error_text
+        self._cross_scan_last_error_wall_ts = time.time()
+
     def _scan_loop(self):
-        from core.logger import log_event
+        from core.logger import log_event, redact
         log_event("Cross rebalance-loop started "
                   f"(every {self._rebalance_interval_sec()//3600}h, anchored)", "INFO")
         # init crash-filter history + slot marker
@@ -1057,6 +1102,11 @@ class CrossBot(FuturesBot):
         self._neutrality_settle_until = 0.0
         self._last_rebalance_attempt = 0.0
         self._last_topup_attempt = 0.0
+        self._cross_scan_consecutive_errors = 0
+        self._cross_scan_last_operation = ""
+        self._cross_scan_last_error = ""
+        self._cross_scan_last_error_wall_ts = None
+        self._cross_scan_last_success_wall_ts = None
         # Top-up: re-attempt filling missing balanced pairs within a slot when
         # the book is under target (coins claimed by other bots / partial adopt).
         self._topup_attempts = 0
@@ -1073,6 +1123,7 @@ class CrossBot(FuturesBot):
             self._force_token_seen = 0.0
         POLL_SEC = 30
         while not self._shutdown_event.is_set():
+            operation = "poll"
             try:
                 forced = self._consume_force_rebalance()
                 now = time.time()
@@ -1085,7 +1136,9 @@ class CrossBot(FuturesBot):
                     if forced:
                         log_event(f"[{self.BOT_NAME}] manual rebalance requested "
                                   f"- rebalancing now", "SCAN")
+                    operation = "rebalance"
                     self._rebalance_tick()
+                    self._record_cross_scan_success(operation)
                 elif (self._should_topup()
                       and (now - self._last_topup_attempt) >= 290.0):
                     # Own throttle so a rebalance-due-but-throttled partial book
@@ -1095,8 +1148,11 @@ class CrossBot(FuturesBot):
                     log_event(f"[{self.BOT_NAME}] top-up {self._topup_attempts}/"
                               f"{self._topup_max}: book has {len(CrossBot._active_legs(self))} "
                               f"leg(s) under target - filling balanced pairs", "SCAN")
+                    operation = "topup"
                     self._topup_tick()
+                    self._record_cross_scan_success(operation)
             except Exception as e:
+                self._record_cross_scan_failure(operation, e, redact=redact)
                 log_event(f"Cross rebalance error: {e}", "WARN")
                 self._log_error("cross rebalance", e)
             if self._shutdown_event.wait(timeout=POLL_SEC):
@@ -1149,6 +1205,12 @@ class CrossBot(FuturesBot):
 
         # 2. target book from the pure signal module
         book = compute_target_book(prices, self._recent_rebalance_returns, params)
+        self._cross_regime_snapshot = CrossBot._cross_market_structure(
+            book,
+            prices,
+            getattr(self, "_cross_quote_volumes", {}),
+            getattr(self, "_cross_funding_pct", {}),
+        )
         self._topup_attempts = 0   # reset in-slot top-up budget on a real rebalance
         log_event(
             f"[{self.BOT_NAME}] Rebalance | exposure x{book.exposure_mult:.0f} | "

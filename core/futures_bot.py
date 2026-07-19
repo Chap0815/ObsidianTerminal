@@ -157,6 +157,33 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 "MFE_FALLBACK_EXIT_MOVE_PCT", -1.5),
         }
 
+    def _strategy_runtime_health(self) -> dict[str, Any]:
+        """Subclass hook for live strategy-loop health beyond thread liveness."""
+        return {}
+
+    def _runtime_status_health(
+        self,
+        threads: dict[str, bool],
+    ) -> tuple[str, dict[str, Any]]:
+        """Combine thread liveness with optional strategy-specific health."""
+        try:
+            strategy_health = self._strategy_runtime_health()
+            if not isinstance(strategy_health, dict):
+                strategy_health = {
+                    "ok": False,
+                    "error_type": "invalid_strategy_health_payload",
+                }
+        except Exception as exc:
+            strategy_health = {
+                "ok": False,
+                "error_type": type(exc).__name__,
+            }
+        strategy_ok = bool(strategy_health.get("ok", True))
+        status = "ready" if all(threads.values()) and strategy_ok else "degraded"
+        extra = ({"strategy_health": strategy_health}
+                 if strategy_health else {})
+        return status, extra
+
     #  Run 
 
     def run(self) -> None:
@@ -465,12 +492,16 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "scan": self._scan_thread.is_alive(),
             "reconcile": self._reconcile_thread.is_alive(),
         }
+        status, strategy_health = self._runtime_status_health(threads)
         write_runtime_status(
             self.LOG_DIR, self.BOT_NAME,
-            "ready" if all(threads.values()) else "degraded",
+            status,
             self.simulation,
             threads=threads,
-            extra={"open_positions": self.state.count()})
+            extra={
+                "open_positions": self.state.count(),
+                **strategy_health,
+            })
 
         #  Main thread: heartbeat + shutdown wait 
         try:
@@ -504,7 +535,8 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                             "scan": self._scan_thread.is_alive(),
                             "reconcile": self._reconcile_thread.is_alive(),
                         }
-                        status = "ready" if all(threads.values()) else "degraded"
+                        status, strategy_health = self._runtime_status_health(
+                            threads)
                         if (not threads["monitor"]
                                 and self.safe_mode is not None
                                 and not self.safe_mode.is_active()):
@@ -518,6 +550,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                                 "open_positions": tc,
                                 "safe_mode": bool(self.safe_mode.is_active()),
                                 **observability,
+                                **strategy_health,
                             })
                     except Exception:
                         pass
@@ -535,7 +568,8 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                             "scan": self._scan_thread.is_alive(),
                             "reconcile": self._reconcile_thread.is_alive(),
                         }
-                        status = "ready" if all(threads.values()) else "degraded"
+                        status, strategy_health = self._runtime_status_health(
+                            threads)
                         if (not threads["monitor"]
                                 and self.safe_mode is not None
                                 and not self.safe_mode.is_active()):
@@ -548,6 +582,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                                 "open_positions": self.state.count(),
                                 "safe_mode": bool(self.safe_mode.is_active()),
                                 **observability,
+                                **strategy_health,
                             })
                     except Exception:
                         pass
