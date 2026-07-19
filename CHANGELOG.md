@@ -2,6 +2,25 @@
 
 ## 2026-07-19
 
+- Hardened dashboard exposure without breaking existing remote access. Fresh
+  installations bind to loopback, existing installations retain their prior
+  LAN binding explicitly, Streamlit XSRF/CORS protections are explicit and a
+  visible warning requires LAN/VPN firewall isolation for remote mode.
+- Made portfolio admission fail closed on non-finite limits, account values,
+  positions, beta, side, multiplier and timestamp inputs. Pre-start validation
+  now rejects invalid account-wide portfolio limits before a bot can start.
+- Restored conservative majors/alts exposure clustering until measured
+  correlation evidence is integrated into the live admission path.
+- Added SHA-256 artifact hashes for all 80 Windows CPython 3.12 dependency
+  wheels. Updates now enforce pip hash checking and release validation rejects
+  unhashed or unpinned dependency locks.
+- Normalized market-hedged momentum to one unit of gross exposure and included
+  funding drag; carry projections now support fractional settlement counts and
+  use observed per-market intervals; grid gap exits now retain the full move to
+  the next observable open.
+- Made the execution-policy producer contract explicit and fail-closed: only
+  externally recorded, sequence-valid L2 shadow events can make it data-ready;
+  bundled REST snapshots are never relabelled as continuous evidence.
 - Added causal, costed CROSS momentum variants: winner long-only, BTC/equal-
   weight market hedging, liquidity-restricted shorts and dispersion-scaled
   exposure. Every variant includes turnover and final-liquidation costs.
@@ -11,15 +30,16 @@
 - Versioned CROSS expectancy telemetry additively. Complete entry-time regime,
   breadth, dispersion, correlation, liquidity and funding vectors use schema 2;
   schema 1 remains compatible and training strictly separates versions.
-- Replaced hard-coded portfolio sector labels with exact-symbol defaults and
-  added a pure side-aware correlation crowding evaluation that fails unknown on
-  incomplete evidence.
+- Added a pure side-aware correlation crowding evaluation that fails unknown on
+  incomplete evidence while the live gate retains conservative fallback
+  clusters.
 - Hardened carry history with observed settlement intervals, interval stability,
   funding sign flips, p20 funding stress, p95 basis stress, full entry/exit
   costs, a labelled quote-turnover capacity proxy and liquidation buffer.
 - Added a bounded long-only range-grid simulator with completed-bar signals,
   next-bar execution, equal-weight timestamp aggregation, gap liquidation and
-  full inventory mark-to-market. It has no leverage, shorts or martingale path.
+  full inventory mark-to-market through the next observable gap-open. It has no
+  leverage, shorts or martingale path.
 - Expanded the immutable research catalog from eight to ten experiments. All
   new components remain order-neutral, candidate-only and promotion-ineligible.
 

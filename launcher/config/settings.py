@@ -34,6 +34,10 @@ DB_PATH      = os.path.join(PROJECT_ROOT, "data", "trading_bot.db")
 CONFIG_FILE  = os.path.join(PROJECT_ROOT, "bot_config.json")
 DEFAULT_CONFIG_FILE = os.path.join(PROJECT_ROOT, "bot_config.default.json")
 
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-standard JSON constant rejected: {value}")
+
 OLLAMA_URL   = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 if not OLLAMA_URL.startswith(("http://", "https://")):
     OLLAMA_URL = "http://" + OLLAMA_URL
@@ -392,6 +396,10 @@ DEFAULT_CONFIG = {
     "UI": {
         "VISIBLE_BOTS":   ["TREND", "SPOT", "FUTURES", "CROSS", "FUTREND"],
         "COLLAPSED_BOTS": [],
+        # Secure default for new installations. Existing installations that
+        # predate this explicit setting retain LAN access during migration and
+        # can later be restricted after their firewall/VPN path is configured.
+        "DASHBOARD_BIND_ADDRESS": "127.0.0.1",
         "params_collapsed": {
             "FUTREND": True,
             "FUTURES": True,
@@ -741,7 +749,7 @@ def effective_default_config() -> dict:
         return json.loads(json.dumps(DEFAULT_CONFIG))
     try:
         with open(DEFAULT_CONFIG_FILE, encoding="utf-8-sig") as f:
-            candidate = json.load(f)
+            candidate = json.load(f, parse_constant=_reject_json_constant)
     except Exception:
         return json.loads(json.dumps(DEFAULT_CONFIG))
     if not isinstance(candidate, dict):
@@ -768,12 +776,19 @@ def load_config() -> dict:
         return json.loads(json.dumps(cfg))
     try:
         with open(CONFIG_FILE, encoding="utf-8-sig") as f:
-            cfg = json.load(f)
+            cfg = json.load(f, parse_constant=_reject_json_constant)
     except Exception as e:
         raise RuntimeError(
             f"bot_config.json corrupt or unreadable: {e}. "
             "Refusing to replace it with defaults."
         ) from e
+    if not isinstance(cfg, dict):
+        raise RuntimeError("bot_config.json root must be an object")
+    existing_ui = cfg.get("UI")
+    legacy_dashboard_binding = not (
+        isinstance(existing_ui, dict)
+        and "DASHBOARD_BIND_ADDRESS" in existing_ui
+    )
     # Fill missing keys from defaults
     for bot, defaults in defaults_cfg.items():
         if not isinstance(defaults, dict):
@@ -790,6 +805,11 @@ def load_config() -> dict:
     else:
         for k, v in defaults_cfg["UI"].items():
             cfg["UI"].setdefault(k, v)
+    if legacy_dashboard_binding:
+        # Before this option existed Streamlit implicitly listened on all
+        # interfaces. Preserve that established remote-access contract for an
+        # existing user config; fresh installs use the loopback-only default.
+        cfg["UI"]["DASHBOARD_BIND_ADDRESS"] = "0.0.0.0"
     return cfg
 
 
@@ -993,7 +1013,7 @@ def _save_config_unlocked(cfg: dict) -> None:
     try:
         tmp = f"{CONFIG_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
+            json.dump(cfg, f, indent=2, allow_nan=False)
             f.flush()
             try:
                 os.fsync(f.fileno())

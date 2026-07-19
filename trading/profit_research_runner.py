@@ -9,6 +9,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Mapping
 
 from trading.carry_sim import CarryEngine, CarryTerms
 from trading.execution_cost_model import ExecutionCostObservation
@@ -458,6 +459,11 @@ def build_execution_policy_report(
     total = len(valid) + sum(rejected.values())
     quality_coverage = len(valid) / total if total else 0.0
     return {
+        # The bundled REST venue recorder cannot prove continuous L2 sequence
+        # validity. Only externally recorded, sequence-valid shadow events may
+        # satisfy this contract; absence remains explicitly fail-closed.
+        "producer": "external_sequence_valid_l2_recorder",
+        "producer_wired": total > 0,
         "ready": (
             decision.action != "INSUFFICIENT_DATA" and quality_coverage >= 0.95
         ),
@@ -598,7 +604,8 @@ def build_carry_preview(
     root: str | Path,
     *,
     notional_usdt: float = 100.0,
-    expected_funding_periods: int = 3,
+    expected_funding_periods: float = 1.0,
+    expected_funding_periods_by_market: Mapping[str, float] | None = None,
     taker_fee_rate: float = 0.001,
     maker_fee_rate: float = 0.0002,
     entry_slippage_bps_per_leg: float = 2.0,
@@ -627,12 +634,17 @@ def build_carry_preview(
                 }
             )
             continue
+        market_periods = float(
+            (expected_funding_periods_by_market or {}).get(
+                str(market_id), expected_funding_periods
+            )
+        )
         terms = CarryTerms(
             notional_usdt=float(notional_usdt),
             expected_funding_rate=funding,
             taker_fee_rate=float(taker_fee_rate),
             maker_fee_rate=float(maker_fee_rate),
-            expected_funding_periods=int(expected_funding_periods),
+            expected_funding_periods=market_periods,
             entry_slippage_bps_per_leg=float(entry_slippage_bps_per_leg),
             exit_slippage_bps_per_leg=float(exit_slippage_bps_per_leg),
         )
@@ -642,6 +654,7 @@ def build_carry_preview(
                 "market_id": str(market_id),
                 "symbol": (market or {}).get("symbol"),
                 "funding_rate": funding,
+                "expected_funding_periods": market_periods,
                 "state": campaign.state.value,
                 "reason": campaign.reason,
                 "projected_net_pnl": campaign.projected_net_pnl,

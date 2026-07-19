@@ -893,7 +893,10 @@ def _install_dependencies_if_present(*, force_active_runtime: bool = False) -> N
     _print("Pruefe/aktualisiere Python-Abhaengigkeiten ...")
     dep_python = _dependency_python()
     r = subprocess.run(
-        [str(dep_python), "-m", "pip", "install", "-r", str(req)],
+        [
+            str(dep_python), "-m", "pip", "install",
+            "--require-hashes", "-r", str(req),
+        ],
         cwd=str(ROOT),
         text=True,
         capture_output=True,

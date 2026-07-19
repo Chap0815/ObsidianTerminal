@@ -21,7 +21,9 @@ class CarryTerms:
     expected_funding_rate: float
     taker_fee_rate: float
     maker_fee_rate: float
-    expected_funding_periods: int = 1
+    # May be fractional for a fixed projection horizon (for example a 48-hour
+    # settlement interval contributes 0.5 expected periods to a 24-hour view).
+    expected_funding_periods: float = 1.0
     entry_slippage_bps_per_leg: float = 0.0
     exit_slippage_bps_per_leg: float = 0.0
     borrow_rate_per_period: float = 0.0
@@ -92,9 +94,11 @@ class CarryEngine:
                 or float(value) < 0.0
                 for value in numeric
             )
+            expected_periods = float(terms.expected_funding_periods)
             invalid_periods = (
                 isinstance(terms.expected_funding_periods, bool)
-                or int(terms.expected_funding_periods) < 1
+                or not math.isfinite(expected_periods)
+                or expected_periods <= 0.0
             )
         except (TypeError, ValueError, OverflowError):
             invalid_numeric = True

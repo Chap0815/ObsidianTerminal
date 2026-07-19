@@ -26,8 +26,14 @@ def _finite(value) -> float | None:
 
 
 def _symbol_cluster(symbol: str) -> str:
-    """Use exact exposure identity until measured clusters are supplied."""
-    return str(symbol).strip().upper().split("/")[0].split(":")[0] or "UNKNOWN"
+    """Conservative fallback until measured clusters reach the live gate.
+
+    Exact-symbol grouping understates correlated crypto exposure. BTC and ETH
+    retain a majors bucket; every other non-cash asset shares the broader alts
+    bucket so the account-wide cap remains protective in ``enforce`` mode.
+    """
+    base = str(symbol).strip().upper().split("/")[0].split(":")[0]
+    return "majors" if base in {"BTC", "ETH"} else "alts"
 
 
 def _balance_value(balance: dict, group: str, currency: str = "USDT") -> float | None:

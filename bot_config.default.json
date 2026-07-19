@@ -208,6 +208,7 @@
                "COLLAPSED_BOTS":  [
 
                                   ],
+               "DASHBOARD_BIND_ADDRESS":  "127.0.0.1",
                "params_collapsed":  {
                                         "FUTREND":  true,
                                         "FUTURES":  true,

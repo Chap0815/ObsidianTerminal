@@ -9,6 +9,7 @@ Tabs:
   Performance  Sharpe, Sortino, Profit Factor, heatmaps, hour/weekday grids
   Bots  Side-by-side comparison, parameter timeline, learning log
 """
+# ruff: noqa: E402  # project root must be inserted before local imports
 
 import os
 import json
@@ -47,6 +48,13 @@ st.set_page_config(
     page_icon="",
     initial_sidebar_state="expanded"
 )
+
+if os.getenv("OBSIDIAN_DASHBOARD_BIND_ADDRESS") == "0.0.0.0":
+    st.warning(
+        "Remote dashboard access is enabled. Restrict port 8501 to your "
+        "trusted LAN or VPN with the host firewall; never forward it directly "
+        "from the internet."
+    )
 
 # Resolve DB and log paths via core.paths (single source of truth), NOT the
 # cwd. Streamlit may run the dashboard from arbitrary working directories

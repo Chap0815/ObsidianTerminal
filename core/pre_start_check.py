@@ -20,6 +20,10 @@ from core.runtime_status import (
 )
 
 
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-standard JSON constant rejected: {value}")
+
+
 POSITION_LIMIT_BY_BOT = {
     "SPOT": 500.0,
     "FUTURES": 500.0,
@@ -50,7 +54,7 @@ def _issue(severity: str, code: str, message: str) -> CheckIssue:
 def _read_config() -> tuple[dict, list[CheckIssue]]:
     try:
         with open(BOT_CONFIG, "r", encoding="utf-8-sig") as fh:
-            cfg = json.load(fh)
+            cfg = json.load(fh, parse_constant=_reject_json_constant)
         if not isinstance(cfg, dict):
             return {}, [_issue("error", "config_type",
                                "bot_config.json root is not an object")]
@@ -413,6 +417,11 @@ def _check_config(bot_name: str | None,
             ("XSEC_UNIVERSE_SIZE", 10.0, 100.0),
             ("CRASH_WINDOW", 1.0, 50.0),
             ("XSEC_MAX_SPREAD_PCT", 0.01, 10.0),
+            ("PORTFOLIO_MAX_GROSS_PCT", 0.0, 1000.0),
+            ("PORTFOLIO_MAX_NET_PCT", 0.0, 1000.0),
+            ("PORTFOLIO_MIN_FREE_PCT", 0.0, 100.0),
+            ("PORTFOLIO_MAX_CLUSTER_PCT", 0.0, 1000.0),
+            ("PORTFOLIO_MAX_BETA_PCT", 0.0, 1000.0),
         )
         for key, lo, hi in bounded_numeric:
             if key not in section:

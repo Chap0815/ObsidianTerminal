@@ -58,6 +58,23 @@ def _series(rows: Iterable[tuple[int, float, float, float]]) -> dict[int, tuple[
     return result
 
 
+def _gap_exit_bps(
+    *,
+    position: float,
+    last_mark: float,
+    next_open: float,
+    one_way_cost_bps: float,
+) -> float:
+    """Mark carried inventory across a data gap and exit when price returns."""
+    exposure = max(0.0, min(1.0, float(position)))
+    if not math.isfinite(last_mark) or not math.isfinite(next_open):
+        raise ValueError("gap marks must be finite")
+    if last_mark <= 0.0 or next_open <= 0.0:
+        raise ValueError("gap marks must be positive")
+    costs = max(0.0, float(one_way_cost_bps))
+    return exposure * (next_open / last_mark - 1.0) * 10_000.0 - exposure * costs
+
+
 def evaluate_bounded_range_grid(
     panel: dict[str, list[tuple[int, float, float, float]]],
     *,
@@ -87,19 +104,27 @@ def evaluate_bounded_range_grid(
         turnover = 0.0
         active = 0
         breaches = 0
+        gap_exits = 0
         last_portfolio_slot: tuple[int, int] | None = None
         for index in range(lookback - 1, len(timestamps) - 2):
             cutoff = timestamps[index]
             entry_time = timestamps[index + 1]
             exit_time = timestamps[index + 2]
             if entry_time - cutoff != hour_ms or exit_time - entry_time != hour_ms:
-                if values and position > 0.0:
-                    liquidation_cost = position * costs
-                    values[-1] -= liquidation_cost
-                    if last_portfolio_slot is not None:
-                        bucket_time, bucket_index = last_portfolio_slot
-                        portfolio_by_time[bucket_time][bucket_index] -= liquidation_cost
+                if position > 0.0:
+                    gap_value = _gap_exit_bps(
+                        position=position,
+                        last_mark=rows[cutoff][1],
+                        next_open=rows[entry_time][0],
+                        one_way_cost_bps=costs,
+                    )
+                    values.append(gap_value)
+                    bucket = portfolio_by_time.setdefault(entry_time, [])
+                    bucket.append(gap_value)
+                    last_portfolio_slot = (entry_time, len(bucket) - 1)
+                    pooled_observations += 1
                     turnover += position
+                    gap_exits += 1
                     position = 0.0
                 continue
             history_times = timestamps[index - lookback + 1 : index + 1]
@@ -107,13 +132,20 @@ def evaluate_bounded_range_grid(
                 right - left != hour_ms
                 for left, right in zip(history_times, history_times[1:])
             ):
-                if values and position > 0.0:
-                    liquidation_cost = position * costs
-                    values[-1] -= liquidation_cost
-                    if last_portfolio_slot is not None:
-                        bucket_time, bucket_index = last_portfolio_slot
-                        portfolio_by_time[bucket_time][bucket_index] -= liquidation_cost
+                if position > 0.0:
+                    gap_value = _gap_exit_bps(
+                        position=position,
+                        last_mark=rows[cutoff][1],
+                        next_open=rows[entry_time][0],
+                        one_way_cost_bps=costs,
+                    )
+                    values.append(gap_value)
+                    bucket = portfolio_by_time.setdefault(entry_time, [])
+                    bucket.append(gap_value)
+                    last_portfolio_slot = (entry_time, len(bucket) - 1)
+                    pooled_observations += 1
                     turnover += position
+                    gap_exits += 1
                     position = 0.0
                 continue
             closes = [rows[timestamp][1] for timestamp in history_times]
@@ -166,6 +198,7 @@ def evaluate_bounded_range_grid(
                 **_metrics(values),
                 "active_windows": active,
                 "range_breaches": breaches,
+                "gap_exits": gap_exits,
                 "gross_turnover": turnover,
                 "final_inventory": position,
             }
@@ -194,6 +227,7 @@ def evaluate_bounded_range_grid(
         "signal_cutoff": "completed_bar_close",
         "execution_price": "next_bar_open",
         "final_liquidation_cost_included": True,
+        "gap_mark_to_market_included": True,
         "changes_orders": False,
         "simulation_only": True,
         "per_symbol": per_symbol[:100],

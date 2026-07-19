@@ -439,26 +439,33 @@ def evaluate_momentum_panel(
             for row in eligible
             if str(row[0]).upper().split("/")[0].split("_")[0].startswith("BTC")
         ]
-        market_hedged_weights = dict(long_only_weights)
+        # Keep every reported variant on one unit of gross capital. The hedge
+        # therefore allocates 0.5 gross long and 0.5 gross short instead of
+        # silently comparing a 2x-gross book with the 1x baselines.
+        market_hedged_weights = {
+            symbol: 0.5 * weight for symbol, weight in long_only_weights.items()
+        }
         if btc_rows:
             benchmark_return = btc_rows[0][4]
             benchmark_symbol = btc_rows[0][0]
             market_hedged_weights[benchmark_symbol] = (
-                market_hedged_weights.get(benchmark_symbol, 0.0) - 1.0
+                market_hedged_weights.get(benchmark_symbol, 0.0) - 0.5
             )
             market_hedge_benchmarks.append("BTC")
         else:
             benchmark_return = statistics.mean(row[4] for row in eligible)
             for row in eligible:
                 market_hedged_weights[row[0]] = (
-                    market_hedged_weights.get(row[0], 0.0) - 1.0 / len(eligible)
+                    market_hedged_weights.get(row[0], 0.0) - 0.5 / len(eligible)
                 )
             market_hedge_benchmarks.append("eligible_equal_weight")
         market_hedged_cost = max(
             0.0, float(one_way_cost_bps)
         ) * _weight_turnover(previous_market_hedged_weights, market_hedged_weights)
         winner_market_hedged.append(
-            (long_return - benchmark_return) * 10_000.0 - market_hedged_cost
+            0.5 * (long_return - benchmark_return) * 10_000.0
+            - market_hedged_cost
+            - funding_drag
         )
         previous_market_hedged_weights = market_hedged_weights
 
@@ -674,6 +681,10 @@ def evaluate_momentum_panel(
             "winner_long_only": _performance(winner_long_only),
             "winner_market_hedged": {
                 **_performance(winner_market_hedged),
+                "target_gross_exposure": 1.0,
+                "long_gross_exposure": 0.5,
+                "short_gross_exposure": 0.5,
+                "funding_drag_included": True,
                 "benchmark": (
                     "BTC"
                     if market_hedge_benchmarks
@@ -837,6 +848,14 @@ def evaluate_regime_shift(
     }
 
 
+def _projected_funding_periods_24h(median_interval_hours: float | None) -> float:
+    """Expected settlement count in 24h, bounded without rounding upward."""
+    interval = _finite(median_interval_hours)
+    if interval is None or interval <= 0.0:
+        return 1.0
+    return min(3.0, 24.0 / interval)
+
+
 def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
     from trading.carry_sim import CarryEngine, CarryState, CarryTerms
 
@@ -969,10 +988,7 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
             minimum_turnover / 10_000.0 if minimum_turnover is not None else None
         )
         lower_funding = sorted(values)[max(0, int(0.20 * len(values)) - 1)]
-        projected_periods = (
-            max(1, min(3, int(24.0 / median_interval)))
-            if median_interval is not None and median_interval > 0.0 else 1
-        )
+        projected_periods = _projected_funding_periods_24h(median_interval)
         stressed = CarryEngine().start(
             f"history-{market_id}",
             CarryTerms(
@@ -1149,8 +1165,16 @@ def run_research_experiments(
         project, minimum_samples=minimum_cost_samples
     )
     ofi = build_ofi_report(project, max_windows=5_000)
-    carry = build_carry_preview(project)
     carry_history = _carry_history_report(project)
+    carry_periods = {
+        str(row["market_id"]): float(row["projected_funding_periods_24h"])
+        for row in carry_history.get("markets", [])
+        if row.get("projected_funding_periods_24h") is not None
+    }
+    carry = build_carry_preview(
+        project,
+        expected_funding_periods_by_market=carry_periods,
+    )
     accepted_markets = {
         str(row.get("market_id"))
         for row in carry.get("rows", [])

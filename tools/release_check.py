@@ -1,4 +1,5 @@
 from __future__ import annotations
+# ruff: noqa: E402  # script bootstraps the project root before local imports
 
 import argparse
 import hashlib
@@ -78,6 +79,7 @@ FORBIDDEN_REL_PATHS = {
     "prompts/futures.txt",
 }
 REQUIRED = REQUIRED_RELEASE_ITEMS
+_SHA256_REQUIREMENT_HASH_RE = re.compile(r"--hash=sha256:[0-9a-fA-F]{64}(?:\s|$)")
 
 
 def _sha256(path: Path) -> str:
@@ -86,6 +88,33 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _requirements_hash_errors(path: Path) -> list[str]:
+    """Return lock-file errors that would weaken pip ``--require-hashes``."""
+    errors: list[str] = []
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        return [f"requirements.lock.txt unreadable: {exc}"]
+    pins = 0
+    for number, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "==" not in line:
+            errors.append(
+                f"requirements.lock.txt line {number} is not exactly pinned"
+            )
+            continue
+        pins += 1
+        if not _SHA256_REQUIREMENT_HASH_RE.search(line):
+            errors.append(
+                f"requirements.lock.txt line {number} has no sha256 artifact hash"
+            )
+    if pins == 0:
+        errors.append("requirements.lock.txt contains no pinned dependencies")
+    return errors
 
 
 def _build_id_from_manifest_files(files: list[dict]) -> str:
@@ -196,7 +225,6 @@ def _is_secret_artifact(path: Path) -> bool:
 
 def _is_forbidden_release_artifact(path: Path, root: Path) -> str | None:
     rel = path.relative_to(root)
-    parts = set(rel.parts)
     parts_lower = {part.lower() for part in rel.parts}
     forbidden_dirs_lower = {part.lower() for part in FORBIDDEN_DIRS}
     forbidden_rel_lower = {part.lower() for part in FORBIDDEN_REL_PATHS}
@@ -231,6 +259,10 @@ def check_release(source: Path, strict_release_name: bool = False) -> tuple[list
     for rel in REQUIRED:
         if not (root / rel).exists():
             errors.append(f"missing required release item: {rel}")
+
+    requirements_path = root / "requirements.lock.txt"
+    if requirements_path.exists():
+        errors.extend(_requirements_hash_errors(requirements_path))
 
     manifest_path = root / "DEPLOY_MANIFEST.json"
     if manifest_path.exists():
@@ -322,7 +354,6 @@ def check_release(source: Path, strict_release_name: bool = False) -> tuple[list
 
     for path in paths:
         rel = path.relative_to(root)
-        parts = set(rel.parts)
         parts_lower = {part.lower() for part in rel.parts}
         forbidden_dirs_lower = {part.lower() for part in FORBIDDEN_DIRS}
         forbidden_rel_lower = {part.lower() for part in FORBIDDEN_REL_PATHS}

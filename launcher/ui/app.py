@@ -11,6 +11,7 @@ thin shims so the dozens of internal call-sites (``self._start_bot``,
 ``self._get_open_futures_positions`` etc.) keep working without
 touching the caller methods.
 """
+# ruff: noqa: E402  # compatibility helpers intentionally precede modular imports
 
 from __future__ import annotations
 
@@ -2257,6 +2258,19 @@ class ObsidianApp(ctk.CTk):
                 return int(sock.getsockname()[1])
         raise OSError("no local dashboard port available")
 
+    def _dashboard_bind_address(self) -> str:
+        """Return an explicit, bounded Streamlit listener address.
+
+        Only loopback and the all-interface LAN/VPN mode are supported. This
+        prevents malformed config from silently binding a public adapter while
+        preserving the established remote-dashboard workflow when explicitly
+        configured.
+        """
+        ui = self.config.get("UI") if isinstance(self.config, dict) else None
+        raw = ui.get("DASHBOARD_BIND_ADDRESS") if isinstance(ui, dict) else None
+        value = str(raw or "127.0.0.1").strip()
+        return value if value in {"127.0.0.1", "0.0.0.0"} else "127.0.0.1"
+
     def _dashboard_url(self) -> str:
         return f"http://127.0.0.1:{int(self._dashboard_port or 8501)}"
 
@@ -2448,12 +2462,16 @@ class ObsidianApp(ctk.CTk):
             env["PYTHONUTF8"] = "1"
             env["OBSIDIAN_DASHBOARD_PORT"] = str(self._dashboard_port)
             env["OBSIDIAN_DASHBOARD_BUILD_ID"] = self._current_dashboard_build_id()
+            env["OBSIDIAN_DASHBOARD_BIND_ADDRESS"] = self._dashboard_bind_address()
 
             try:
                 self.streamlit = subprocess.Popen(
                     [_get_python_exe(), "-m", "streamlit", "run",
                      "tools/dashboard.py",
                      "--server.port", str(self._dashboard_port),
+                     "--server.address", self._dashboard_bind_address(),
+                     "--server.enableXsrfProtection", "true",
+                     "--server.enableCORS", "true",
                      "--server.headless", "true"],
                     env=env, cwd=PROJECT_ROOT, **kw
                 )
