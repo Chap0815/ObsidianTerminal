@@ -630,6 +630,24 @@ class FuturesScanMixin:
                 stage="blocked", mode=entry_mode, reason="entry_quality")
             return
 
+        expectancy_features = {
+            "score": float(quality.score),
+            "spread_bps": float(entry_spread_pct or 0.0) * 100.0,
+            "funding_rate_pct": float(funding_rate or 0.0),
+            "oi_change_pct": float(oi_change or 0.0),
+            "change_pct": float(r.get("change_percent") or 0.0),
+            "btc_change_pct": float(btc_chg or 0.0),
+        }
+        from trading.expectancy_telemetry import emit_expectancy_candidate
+
+        emit_expectancy_candidate(
+            bot=self.BOT_NAME,
+            entry_id=entry_id,
+            symbol=sym,
+            mode=entry_mode,
+            features=expectancy_features,
+        )
+
         from trading.expectancy_runtime import evaluate_runtime_expectancy
 
         expectancy_mode = str(
@@ -638,14 +656,7 @@ class FuturesScanMixin:
         expectancy = evaluate_runtime_expectancy(
             bot_name=self.BOT_NAME,
             mode=expectancy_mode,
-            features={
-                "score": quality.score,
-                "spread_bps": float(entry_spread_pct or 0.0) * 100.0,
-                "funding_rate_pct": float(funding_rate or 0.0),
-                "oi_change_pct": float(oi_change or 0.0),
-                "change_pct": float(r.get("change_percent") or 0.0),
-                "btc_change_pct": float(btc_chg or 0.0),
-            },
+            features=expectancy_features,
         )
         try:
             log_struct(
@@ -1038,6 +1049,7 @@ class FuturesScanMixin:
                     intent_id=entry_id,
                     client_order_id=_cid,
                     bot_name=self.BOT_NAME,
+                    mode=entry_mode,
                     reference_price=entry_price,
                     market_order=lambda: create_order_with_retry(
                         self.ex, symbol_full, side, amount_contracts,

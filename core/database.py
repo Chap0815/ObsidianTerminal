@@ -692,6 +692,7 @@ def _run_migrations(conn) -> None:
     CREATE TABLE IF NOT EXISTS order_intents (
         intent_id          TEXT PRIMARY KEY,
         bot_name           TEXT NOT NULL,
+        mode               TEXT NOT NULL DEFAULT 'UNKNOWN',
         symbol             TEXT NOT NULL,
         direction          TEXT NOT NULL,
         target_amount      REAL NOT NULL,
@@ -706,6 +707,9 @@ def _run_migrations(conn) -> None:
         created_at         TEXT NOT NULL,
         updated_at         TEXT NOT NULL
     )""")
+    _add_column_if_missing(
+        conn, "order_intents", "mode", "TEXT NOT NULL DEFAULT 'UNKNOWN'"
+    )
     c.execute("CREATE INDEX IF NOT EXISTS idx_order_intents_recovery "
               "ON order_intents(bot_name, status, updated_at)")
     c.execute("""
@@ -794,6 +798,19 @@ def _run_migrations(conn) -> None:
     c.execute("CREATE INDEX IF NOT EXISTS idx_experiment_registry_name "
               "ON experiment_registry(experiment_name, created_at)")
     c.execute("""
+    CREATE TABLE IF NOT EXISTS expectancy_candidates (
+        entry_id           TEXT PRIMARY KEY,
+        bot_name           TEXT NOT NULL,
+        symbol             TEXT NOT NULL,
+        mode               TEXT NOT NULL,
+        candidate_time     TEXT NOT NULL,
+        schema_version     INTEGER NOT NULL,
+        features_json      TEXT NOT NULL,
+        created_at         TEXT NOT NULL
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_expectancy_candidates_scope "
+              "ON expectancy_candidates(bot_name, mode, candidate_time)")
+    c.execute("""
     CREATE TABLE IF NOT EXISTS carry_campaigns (
         campaign_id        TEXT PRIMARY KEY,
         state              TEXT NOT NULL,
@@ -804,7 +821,7 @@ def _run_migrations(conn) -> None:
     # Record current schema version  every successful migration run leaves a
     # fingerprint, useful for diagnostics ("did the migration run?") and for
     # future versioned migrations.
-    _CURRENT_SCHEMA_VERSION = 2
+    _CURRENT_SCHEMA_VERSION = 4
     try:
         existing = conn.execute(
             "SELECT version FROM schema_versions WHERE version=?",
@@ -1343,6 +1360,78 @@ def save_trade_db(
                        symbol=symbol, reason=reason, error=str(e))
         except Exception:
             print(f"[DB] save_trade_db error for {symbol}: {e}", flush=True)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def save_expectancy_candidate(
+    *,
+    entry_id: str,
+    bot_name: str,
+    symbol: str,
+    mode: str,
+    candidate_time: str,
+    schema_version: int,
+    features: dict,
+) -> bool:
+    """Persist one immutable causal entry vector, idempotently by entry_id."""
+    if not _INIT_DB_DONE:
+        init_db()
+    normalized_entry_id = str(entry_id or "").strip()[:64]
+    normalized_bot = str(bot_name or "").strip().upper()[:32]
+    normalized_symbol = str(symbol or "").strip()[:64]
+    normalized_mode = str(mode or "").strip().upper()
+    normalized_time = str(candidate_time or "").strip()[:32]
+    try:
+        normalized_schema = int(schema_version)
+        encoded_features = json.dumps(
+            features, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if (
+        not normalized_entry_id
+        or not normalized_bot
+        or not normalized_symbol
+        or normalized_mode not in {"LIVE", "SIM"}
+        or not normalized_time
+        or normalized_schema < 1
+        or not isinstance(features, dict)
+    ):
+        return False
+    conn = get_connection()
+    values = (
+        normalized_entry_id,
+        normalized_bot,
+        normalized_symbol,
+        normalized_mode,
+        normalized_time,
+        normalized_schema,
+        encoded_features,
+    )
+    try:
+        cursor = conn.execute(
+            """INSERT INTO expectancy_candidates
+               (entry_id, bot_name, symbol, mode, candidate_time,
+                schema_version, features_json, created_at)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(entry_id) DO NOTHING""",
+            (*values, _utcnow_str()),
+        )
+        if cursor.rowcount > 0:
+            conn.commit()
+            return True
+        existing = conn.execute(
+            """SELECT entry_id, bot_name, symbol, mode, candidate_time,
+                      schema_version, features_json
+                 FROM expectancy_candidates WHERE entry_id=?""",
+            (normalized_entry_id,),
+        ).fetchone()
+        return existing is not None and tuple(existing) == values
+    except sqlite3.Error:
         try:
             conn.rollback()
         except Exception:
@@ -2487,6 +2576,7 @@ def create_order_intent(
     intent_id: str,
     *,
     bot_name: str,
+    mode: str,
     symbol: str,
     direction: str,
     target_amount: float,
@@ -2499,17 +2589,21 @@ def create_order_intent(
     amount = _sanitize_float(target_amount, -1.0)
     if amount <= 0.0:
         raise ValueError("target_amount must be positive")
+    normalized_mode = str(mode).strip().upper()
+    if normalized_mode not in {"LIVE", "SIM"}:
+        raise ValueError("order intent mode must be LIVE or SIM")
     now = _utcnow_str()
     conn = get_connection()
 
     def _insert() -> None:
         conn.execute(
             """INSERT INTO order_intents
-               (intent_id, bot_name, symbol, direction, target_amount,
-                target_price, client_order_id, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?)""",
+               (intent_id, bot_name, mode, symbol, direction, target_amount,
+                 target_price, client_order_id, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?)""",
             (
-                str(intent_id), str(bot_name), str(symbol), str(direction).upper(),
+                str(intent_id), str(bot_name), normalized_mode,
+                str(symbol), str(direction).upper(),
                 amount, _sanitize_float(target_price, 0.0), str(client_order_id),
                 now, now,
             ),
@@ -2521,21 +2615,31 @@ def create_order_intent(
         # Test harnesses and in-place upgrades can retain a thread-local
         # connection whose init flag predates this migration. Self-heal this
         # one critical journal table before any exchange submission.
-        if "no such table: order_intents" not in str(exc).lower():
+        error_text = str(exc).lower()
+        missing_table = "no such table: order_intents" in error_text
+        missing_mode = "no column named mode" in error_text
+        if not missing_table and not missing_mode:
             raise
         conn.rollback()
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS order_intents (
-                intent_id TEXT PRIMARY KEY, bot_name TEXT NOT NULL,
-                symbol TEXT NOT NULL, direction TEXT NOT NULL,
-                target_amount REAL NOT NULL, target_price REAL,
-                client_order_id TEXT NOT NULL UNIQUE,
-                exchange_order_id TEXT, status TEXT NOT NULL,
-                filled_amount REAL NOT NULL DEFAULT 0,
-                filled_notional REAL NOT NULL DEFAULT 0,
-                fee_usdt REAL NOT NULL DEFAULT 0, last_error TEXT,
-                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-            )""")
+        if missing_table:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS order_intents (
+                    intent_id TEXT PRIMARY KEY, bot_name TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    symbol TEXT NOT NULL, direction TEXT NOT NULL,
+                    target_amount REAL NOT NULL, target_price REAL,
+                    client_order_id TEXT NOT NULL UNIQUE,
+                    exchange_order_id TEXT, status TEXT NOT NULL,
+                    filled_amount REAL NOT NULL DEFAULT 0,
+                    filled_notional REAL NOT NULL DEFAULT 0,
+                    fee_usdt REAL NOT NULL DEFAULT 0, last_error TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                )""")
+        else:
+            conn.execute(
+                "ALTER TABLE order_intents "
+                "ADD COLUMN mode TEXT NOT NULL DEFAULT 'UNKNOWN'"
+            )
         conn.commit()
         _insert()
     except sqlite3.IntegrityError as exc:

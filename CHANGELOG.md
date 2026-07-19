@@ -2,6 +2,48 @@
 
 ## 2026-07-18
 
+- Made causal entry telemetry restart-safe. Candidates are synchronously and
+  idempotently persisted by `entry_id` in SQLite before the structured log is
+  used for observability; the research join prefers the durable store and only
+  falls back to current or rotated legacy logs. Emergency futures/spot closes,
+  pending partial accounting and both spot provisional post-fill states now
+  retain the original `entry_id`.
+- Removed optimistic research timing and readiness assumptions. Momentum
+  signals use completed closes but execute at the next bar open; funding
+  history counts unique exchange settlement periods rather than minute
+  snapshots. Cached universes remain fail-closed for regime and momentum
+  readiness, entry-threshold grids remain exploratory until a frozen holdout,
+  and regime uncertainty additionally requires a sample-ready OOS abstention
+  threshold.
+- Scoped empirical execution-cost evidence by bot and LIVE/SIM mode at the
+  persistent order-intent source. Historical unscoped rows remain `UNKNOWN`
+  and cannot satisfy a scoped readiness gate.
+- Completed model/report reproducibility hardening: model fingerprints now
+  include normalization, ridge and probability-calibration parameters, while
+  status reports use collision-resistant names and exclusive atomic writes.
+- Added one fail-closed operator suite for eight reproducible profit
+  experiments: calibrated expectancy and abstention, entry-selectivity grids,
+  rank-based buy/hold hysteresis with turnover costs, empirical TCA stress,
+  continuous-L2 OFI readiness, causal cross-sectional momentum, time-series
+  momentum with a past-only crash overlay, verified funding carry history, and
+  regime-shift shadow evidence. Every result is
+  explicitly `DATA_READY` or `BLOCKED`, remains promotion-ineligible, and can
+  only write uniquely named research reports outside runtime model paths.
+- Corrected MEXC futures portfolio equity extraction. CCXT currently maps both
+  normalized `free` and `total` to MEXC `availableBalance`; portfolio snapshots
+  now prefer the finite exchange-native `info.data[*].equity` and
+  `availableBalance` pair while retaining a validated normalized fallback.
+- Added a production-safe profit research operator pipeline. Exact causal
+  expectancy feature vectors are logged for all five bots and joined only to
+  fully closed entry campaigns; partial and final slices are aggregated before
+  labeling. The CLI reports empirical TCA readiness, builds REST-snapshot OFI
+  diagnostics, previews cost-stressed carry candidates, trains candidate-only
+  expectancy models, checks fail-closed promotion evidence and explicitly
+  registers immutable trials. It never places orders, changes runtime models or
+  performs automatic promotion.
+- Carry previews now require recorder-confirmed active spot-market availability
+  for the long-spot hedge. Synthetic and perpetual-only markets fail closed
+  even when their displayed funding rate is high.
 - Added bounded post-submit order reconciliation without any resubmission path.
   Delayed MEXC market fills now enrich the persistent intent with filled amount,
   notional and actual fee, then create fill TCA and restart-safe markouts. A

@@ -1670,6 +1670,24 @@ class CrossBot(FuturesBot):
                 direction=side)
             return
 
+        expectancy_features = {
+            "score": float(quality.score),
+            "spread_bps": float(spread_pct or 0.0) * 100.0,
+            "side_sign": 1.0 if side == "LONG" else -1.0,
+            "target_side_count": float(
+                (quality_context or {}).get("target_side_count") or 0.0
+            ),
+        }
+        from trading.expectancy_telemetry import emit_expectancy_candidate
+
+        emit_expectancy_candidate(
+            bot=self.BOT_NAME,
+            entry_id=entry_id,
+            symbol=base,
+            mode=entry_mode,
+            features=expectancy_features,
+        )
+
         if self.simulation:
             fill = exec_price
             # SIM `amount` is in COINS (not exchange CONTRACTS - there is no real
@@ -1769,14 +1787,7 @@ class CrossBot(FuturesBot):
                 requested_notional=notional,
                 portfolio_mode=portfolio_mode,
                 expectancy_mode=expectancy_mode,
-                features={
-                    "score": float(quality.score),
-                    "spread_bps": float(spread_pct or 0.0) * 100.0,
-                    "side_sign": 1.0 if side == "LONG" else -1.0,
-                    "target_side_count": float(
-                        (quality_context or {}).get("target_side_count") or 0.0
-                    ),
-                },
+                features=expectancy_features,
                 limits=PortfolioLimits(
                     max_gross_pct=self._f("PORTFOLIO_MAX_GROSS_PCT", 100.0),
                     max_net_pct=self._f("PORTFOLIO_MAX_NET_PCT", 75.0),
@@ -1902,6 +1913,7 @@ class CrossBot(FuturesBot):
                     intent_id=entry_id,
                     client_order_id=_cid,
                     bot_name=self.BOT_NAME,
+                    mode=entry_mode,
                     reference_price=exec_price,
                     market_order=lambda: create_order_with_retry(
                         self.ex, full, order_side, contracts, params=params,

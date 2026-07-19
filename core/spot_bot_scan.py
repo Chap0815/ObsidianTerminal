@@ -525,6 +525,26 @@ class ScanMixin:
                 stage="blocked", mode=entry_mode, reason="entry_quality")
             return None
 
+        expectancy_features = {
+            "score": float(quality.score),
+            "confidence": {
+                "LOW": 0.0, "MEDIUM": 0.5, "HIGH": 1.0,
+            }.get(str(confidence).strip().upper(), 0.0),
+            "change_pct": float(r.get("change_percent") or 0.0),
+            "rsi_15m": float(r.get("rsi_15m") or 0.0),
+            "rsi_1h": float(r.get("rsi_1h") or 0.0),
+            "rsi_4h": float(r.get("rsi_4h") or 0.0),
+        }
+        from trading.expectancy_telemetry import emit_expectancy_candidate
+
+        emit_expectancy_candidate(
+            bot=self.BOT_NAME,
+            entry_id=entry_id,
+            symbol=sym,
+            mode=entry_mode,
+            features=expectancy_features,
+        )
+
         # Bull/Bear devil's-advocate veto is handled inside
         # news_brain.analyze_sentiment() when direction=="BUY" (it has full
         # prompt context); if it vetoes, direction is "WAIT" and we already
@@ -574,11 +594,6 @@ class ScanMixin:
             from trading.entry_admission import evaluate_entry_admission
             from trading.portfolio_risk import PortfolioLimits
 
-            confidence_feature = {
-                "LOW": 0.0,
-                "MEDIUM": 0.5,
-                "HIGH": 1.0,
-            }.get(str(confidence).strip().upper(), 0.0)
             portfolio_mode = str(
                 self.C("PORTFOLIO_RISK_MODE", "shadow") or "shadow"
             ).strip().lower()
@@ -595,14 +610,7 @@ class ScanMixin:
                 portfolio_mode=portfolio_mode,
                 expectancy_mode=expectancy_mode,
                 account_type="spot",
-                features={
-                    "score": float(quality.score),
-                    "confidence": confidence_feature,
-                    "change_pct": float(r.get("change_percent") or 0.0),
-                    "rsi_15m": float(r.get("rsi_15m") or 0.0),
-                    "rsi_1h": float(r.get("rsi_1h") or 0.0),
-                    "rsi_4h": float(r.get("rsi_4h") or 0.0),
-                },
+                features=expectancy_features,
                 limits=PortfolioLimits(
                     max_gross_pct=float(self.C("PORTFOLIO_MAX_GROSS_PCT", 100.0)),
                     max_net_pct=float(self.C("PORTFOLIO_MAX_NET_PCT", 100.0)),
@@ -666,7 +674,9 @@ class ScanMixin:
             entry_id, bot=self.BOT_NAME, symbol=sym,
             stage="order_attempt", mode=entry_mode)
         try:
-            entry = self._place_buy_order(sym, r, trade_usdt)
+            entry = self._place_buy_order(
+                sym, r, trade_usdt, entry_id=entry_id
+            )
         except Exception as _buy_exc:
             emit_entry_lifecycle(
                 entry_id, bot=self.BOT_NAME, symbol=sym,
@@ -1044,7 +1054,14 @@ class ScanMixin:
         except Exception as e:
             self._log_error(f"record entry slippage {sym}", e)
 
-    def _place_buy_order(self, sym: str, r, trade_usdt: float):
+    def _place_buy_order(
+        self,
+        sym: str,
+        r,
+        trade_usdt: float,
+        *,
+        entry_id: str | None = None,
+    ):
         """Place a market buy. Returns (amount, fill_price, gross_amount,
         invested_usdt, entry_fee) on success, None on failure.
 
@@ -1289,6 +1306,7 @@ class ScanMixin:
                     "break_even": False,
                     "initial_entry_fee": 0.0,
                     "fees_paid": 0.0,
+                    "entry_id": entry_id,
                     "provisional": True,
                 })
                 provisional_written = provisional_ok is not False
@@ -1373,6 +1391,7 @@ class ScanMixin:
                         "break_even": False,
                         "initial_entry_fee": 0.0,
                         "fees_paid": 0.0,
+                        "entry_id": entry_id,
                         "provisional": True,
                     })
                     if provisional_ok is False:

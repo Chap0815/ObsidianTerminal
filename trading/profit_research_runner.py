@@ -1,0 +1,693 @@
+"""Read-only profit research orchestration with explicit promotion boundaries."""
+from __future__ import annotations
+
+import json
+import math
+import sqlite3
+import statistics
+from collections import Counter, defaultdict
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from trading.carry_sim import CarryEngine, CarryTerms
+from trading.execution_cost_model import ExecutionCostObservation
+from trading.expectancy_telemetry import EXPECTANCY_FEATURES
+from trading.expectancy_training import CandidateLabel, expanding_walk_forward_fit
+from trading.orderflow_experiment import build_ofi_window
+from trading.promotion_gate import PromotionEvidence, evaluate_promotion
+
+
+def _finite(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _utc_datetime(value) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _read_connection(path: Path) -> sqlite3.Connection:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=15000")
+    return conn
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone() is not None
+
+
+def _candidate_events(root: Path, bot: str, mode: str) -> dict[str, dict]:
+    selected: dict[str, dict] = {}
+    database = root / "data" / "trading_bot.db"
+    try:
+        conn = _read_connection(database)
+    except FileNotFoundError:
+        conn = None
+    if conn is not None:
+        try:
+            if _table_exists(conn, "expectancy_candidates"):
+                rows = conn.execute(
+                    """SELECT entry_id, candidate_time, features_json
+                         FROM expectancy_candidates
+                        WHERE bot_name=? AND mode=?
+                        ORDER BY candidate_time, entry_id""",
+                    (bot, mode),
+                ).fetchall()
+                for row in rows:
+                    candidate_time = _utc_datetime(row["candidate_time"])
+                    try:
+                        features = json.loads(row["features_json"])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    entry_id = str(row["entry_id"] or "").strip()
+                    if entry_id and candidate_time is not None and isinstance(features, dict):
+                        selected[entry_id] = {
+                            "candidate_time": candidate_time,
+                            "features": features,
+                            "source": "sqlite",
+                        }
+        finally:
+            conn.close()
+    logs = root / "logs"
+    if not logs.is_dir():
+        return selected
+    paths = []
+    for path in logs.glob("*/structured.jsonl*"):
+        suffix = path.name.removeprefix("structured.jsonl")
+        if suffix == "" or (suffix.startswith(".") and suffix[1:].isdigit()):
+            paths.append(path)
+    for path in sorted(paths):
+        try:
+            handle = path.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if event.get("event") != "expectancy_candidate":
+                    continue
+                if str(event.get("bot", "")).strip().upper() != bot:
+                    continue
+                if str(event.get("mode", "")).strip().upper() != mode:
+                    continue
+                entry_id = str(event.get("entry_id") or "").strip()
+                candidate_time = _utc_datetime(
+                    event.get("candidate_time") or event.get("ts")
+                )
+                features = event.get("features")
+                if not entry_id or candidate_time is None or not isinstance(features, dict):
+                    continue
+                current = selected.get(entry_id)
+                if current is None or (
+                    current.get("source") != "sqlite"
+                    and candidate_time < current["candidate_time"]
+                ):
+                    selected[entry_id] = {
+                        "candidate_time": candidate_time,
+                        "features": features,
+                        "source": "structured_log_legacy",
+                    }
+    return selected
+
+
+def build_expectancy_candidates(
+    root: str | Path, *, bot: str, mode: str
+) -> list[CandidateLabel]:
+    project = Path(root)
+    normalized_bot = str(bot).strip().upper()
+    normalized_mode = str(mode).strip().upper()
+    feature_order = EXPECTANCY_FEATURES.get(normalized_bot)
+    if feature_order is None or normalized_mode not in {"LIVE", "SIM"}:
+        raise ValueError("unsupported bot or mode")
+    candidates = _candidate_events(project, normalized_bot, normalized_mode)
+    if not candidates:
+        return []
+    try:
+        conn = _read_connection(project / "data" / "trading_bot.db")
+    except FileNotFoundError:
+        return []
+    try:
+        if not _table_exists(conn, "trades"):
+            return []
+        trade_rows = conn.execute(
+            "SELECT entry_id, sell_time, profit_usdt, invested_usdt, "
+            "COALESCE(is_partial,0) AS is_partial, is_sim "
+            "FROM trades WHERE entry_id IS NOT NULL ORDER BY sell_time"
+        ).fetchall()
+    finally:
+        conn.close()
+    expected_is_sim = 1 if normalized_mode == "SIM" else 0
+    labels = []
+    grouped: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for trade in trade_rows:
+        grouped[str(trade["entry_id"] or "").strip()].append(trade)
+    for entry_id, campaign in grouped.items():
+        event = candidates.get(entry_id)
+        if event is None or not campaign:
+            continue
+        if not any(int(row["is_partial"] or 0) == 0 for row in campaign):
+            continue
+        if any(row["is_sim"] != expected_is_sim for row in campaign):
+            continue
+        closed_values = [_utc_datetime(row["sell_time"]) for row in campaign]
+        profits = [_finite(row["profit_usdt"]) for row in campaign]
+        invested_values = [_finite(row["invested_usdt"]) for row in campaign]
+        if (
+            any(value is None for value in closed_values + profits + invested_values)
+            or any(float(value) < 0.0 for value in invested_values)
+        ):
+            continue
+        closed = max(value for value in closed_values if value is not None)
+        profit = sum(float(value) for value in profits if value is not None)
+        invested = sum(
+            float(value) for value in invested_values if value is not None
+        )
+        if invested <= 0.0:
+            continue
+        if closed < event["candidate_time"]:
+            continue
+        features = {}
+        for name in feature_order:
+            value = _finite(event["features"].get(name))
+            if value is None:
+                break
+            features[name] = value
+        if len(features) != len(feature_order):
+            continue
+        labels.append(
+            CandidateLabel(
+                candidate_time=event["candidate_time"],
+                label_closed_time=closed,
+                features=features,
+                net_return_bps=profit / invested * 10_000.0,
+            )
+        )
+    return sorted(labels, key=lambda row: row.candidate_time)
+
+
+def load_execution_cost_observations(
+    root: str | Path,
+    *,
+    bot: str | None = None,
+    mode: str | None = None,
+    limit: int = 10_000,
+) -> list[ExecutionCostObservation]:
+    if (bot is None) != (mode is None):
+        raise ValueError("bot and mode must be supplied together")
+    normalized_bot = str(bot).strip().upper() if bot is not None else None
+    normalized_mode = str(mode).strip().upper() if mode is not None else None
+    if normalized_mode is not None and normalized_mode not in {"LIVE", "SIM"}:
+        raise ValueError("mode must be LIVE or SIM")
+    path = Path(root) / "data" / "trading_bot.db"
+    try:
+        conn = _read_connection(path)
+    except FileNotFoundError:
+        return []
+    try:
+        if not all(_table_exists(conn, table) for table in ("execution_tca", "order_intents")):
+            return []
+        intent_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(order_intents)")
+        }
+        if normalized_bot is not None and not {"bot_name", "mode"} <= intent_columns:
+            return []
+        scope_sql = ""
+        params: tuple = ()
+        if normalized_bot is not None:
+            scope_sql = "AND UPPER(i.bot_name)=? AND UPPER(i.mode)=? "
+            params = (normalized_bot, normalized_mode)
+        records = conn.execute(
+            "SELECT t.intent_id, t.stage, t.payload_json, i.symbol, "
+            "i.filled_notional FROM execution_tca t JOIN order_intents i "
+            "ON i.intent_id=t.intent_id WHERE t.stage IN ('arrival','fill') "
+            + scope_sql
+            + "ORDER BY t.id DESC LIMIT ?",
+            (*params, max(1, min(100_000, int(limit)))),
+        ).fetchall()
+    finally:
+        conn.close()
+    paired: dict[str, dict[str, dict]] = defaultdict(dict)
+    metadata = {}
+    for row in records:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        paired[str(row["intent_id"])].setdefault(str(row["stage"]), payload)
+        metadata[str(row["intent_id"])] = (row["symbol"], row["filled_notional"])
+    observations = []
+    for intent_id, stages in paired.items():
+        arrival, fill = stages.get("arrival"), stages.get("fill")
+        if not isinstance(arrival, dict) or not isinstance(fill, dict):
+            continue
+        symbol, notional = metadata[intent_id]
+        try:
+            observations.append(
+                ExecutionCostObservation(
+                    symbol=str(symbol),
+                    total_cost_bps=fill["total_cost_bps"],
+                    spread_bps=arrival["spread_bps"],
+                    depth_coverage=arrival["depth_coverage"],
+                    notional_usdt=notional,
+                    regime=str(arrival.get("regime") or "unknown"),
+                    volatility_bps=arrival.get("volatility_bps") or 0.0,
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return observations
+
+
+def _quantile(values: list[float], probability: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * probability
+    lower, upper = math.floor(position), math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def build_execution_cost_report(
+    root: str | Path,
+    *,
+    bot: str | None = None,
+    mode: str | None = None,
+    minimum_samples: int = 50,
+) -> dict:
+    observations = load_execution_cost_observations(root, bot=bot, mode=mode)
+    costs = [max(0.0, row.total_cost_bps) for row in observations]
+    by_symbol = Counter(row.symbol for row in observations)
+    return {
+        "scope": {
+            "bot": str(bot).strip().upper() if bot is not None else None,
+            "mode": str(mode).strip().upper() if mode is not None else None,
+        },
+        "valid_samples": len(observations),
+        "minimum_samples": max(5, int(minimum_samples)),
+        "ready": len(observations) >= max(5, int(minimum_samples)),
+        "median_cost_bps": statistics.median(costs) if costs else None,
+        "p75_cost_bps": _quantile(costs, 0.75),
+        "p95_cost_bps": _quantile(costs, 0.95),
+        "symbol_samples": dict(sorted(by_symbol.items())),
+    }
+
+
+def _venue_rows(root: Path, stream: str, *, limit: int) -> list[dict]:
+    rows = []
+    folder = root / "data" / "venue_native" / stream
+    for path in sorted(folder.glob("*.sqlite3"), reverse=True):
+        if len(rows) >= limit:
+            break
+        conn = None
+        try:
+            conn = _read_connection(path)
+            fetched = conn.execute(
+                "SELECT market_id, exchange_time, quality_flags_json, payload_json "
+                "FROM venue_events ORDER BY exchange_time DESC LIMIT ?",
+                (limit - len(rows),),
+            ).fetchall()
+        except (OSError, sqlite3.Error):
+            continue
+        finally:
+            if conn is not None:
+                conn.close()
+        for row in fetched:
+            try:
+                rows.append(
+                    {
+                        "market_id": str(row["market_id"]),
+                        "exchange_time": str(row["exchange_time"]),
+                        "flags": tuple(json.loads(row["quality_flags_json"])),
+                        "payload": json.loads(row["payload_json"]),
+                    }
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+    return sorted(rows, key=lambda row: row["exchange_time"])
+
+
+def build_ofi_report(
+    root: str | Path, *, max_events: int = 5_000, max_windows: int = 500
+) -> dict:
+    project = Path(root)
+    depth_by_market: dict[str, list[dict]] = defaultdict(list)
+    for row in _venue_rows(project, "depth", limit=max_events):
+        payload = row["payload"]
+        bids, asks = payload.get("bids") or [], payload.get("asks") or []
+        event_time = _utc_datetime(row["exchange_time"])
+        if event_time is None or not bids or not asks or row["flags"]:
+            continue
+        try:
+            observation = {
+                "event_time": event_time,
+                "bid_price": bids[0][0],
+                "bid_size": bids[0][1],
+                "ask_price": asks[0][0],
+                "ask_size": asks[0][1],
+            }
+        except (IndexError, TypeError):
+            continue
+        depth_by_market[row["market_id"]].append(observation)
+    trades_by_market: dict[str, list[dict]] = defaultdict(list)
+    seen_trades = set()
+    for row in _venue_rows(project, "trades", limit=max_events):
+        for trade in (row["payload"].get("trades") or []):
+            key = (
+                row["market_id"], str(trade.get("id") or ""),
+                trade.get("timestamp"), trade.get("price"), trade.get("amount"),
+            )
+            if key in seen_trades:
+                continue
+            seen_trades.add(key)
+            timestamp = _finite(trade.get("timestamp"))
+            if timestamp is None or timestamp <= 0.0:
+                continue
+            trades_by_market[row["market_id"]].append(
+                {
+                    "event_time": datetime.fromtimestamp(
+                        timestamp / 1000.0, tz=timezone.utc
+                    ),
+                    "side": trade.get("side"),
+                    "amount": trade.get("amount"),
+                }
+            )
+    windows = []
+    for market_id, observations in depth_by_market.items():
+        observations.sort(key=lambda item: item["event_time"])
+        for first, second in zip(observations, observations[1:]):
+            gap = (second["event_time"] - first["event_time"]).total_seconds()
+            if gap <= 0.0 or gap > 180.0:
+                continue
+            try:
+                window = build_ofi_window(
+                    exchange_time=first["event_time"],
+                    book_observations=[first, second],
+                    trade_observations=trades_by_market.get(market_id, []),
+                    observation_seconds=max(1, int(math.ceil(gap)) + 1),
+                    continuous_book=False,
+                    max_staleness_seconds=5.0,
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            windows.append(
+                {
+                    "market_id": market_id,
+                    "feature_cutoff": window.feature_cutoff.isoformat(),
+                    "normalized_ofi": window.normalized_ofi,
+                    "trade_imbalance": window.trade_imbalance,
+                    "book_events": window.book_events,
+                    "trade_events": window.trade_events,
+                    "promotable": window.promotable,
+                    "quality_flags": list(window.quality_flags),
+                }
+            )
+    windows.sort(key=lambda item: item["feature_cutoff"])
+    windows = windows[-max(1, int(max_windows)) :]
+    return {
+        "windows": len(windows),
+        "promotable_windows": sum(bool(row["promotable"]) for row in windows),
+        "research_only": True,
+        "latest": windows[-10:],
+    }
+
+
+def build_carry_preview(
+    root: str | Path,
+    *,
+    notional_usdt: float = 100.0,
+    expected_funding_periods: int = 3,
+    taker_fee_rate: float = 0.001,
+    maker_fee_rate: float = 0.0002,
+    entry_slippage_bps_per_leg: float = 2.0,
+    exit_slippage_bps_per_leg: float = 2.0,
+    limit: int = 20,
+) -> dict:
+    overview = _venue_rows(Path(root), "overview", limit=1)
+    if not overview:
+        return {"candidates": 0, "accepted": 0, "rows": [], "simulation_only": True}
+    markets = overview[-1]["payload"].get("markets") or {}
+    engine = CarryEngine()
+    previews = []
+    for market_id, market in markets.items():
+        funding = _finite((market or {}).get("funding_rate"))
+        if funding is None or funding <= 0.0:
+            continue
+        if (market or {}).get("spot_available") is not True:
+            previews.append(
+                {
+                    "market_id": str(market_id),
+                    "symbol": (market or {}).get("symbol"),
+                    "funding_rate": funding,
+                    "state": "REJECTED",
+                    "reason": "spot market availability not verified",
+                    "projected_net_pnl": 0.0,
+                }
+            )
+            continue
+        terms = CarryTerms(
+            notional_usdt=float(notional_usdt),
+            expected_funding_rate=funding,
+            taker_fee_rate=float(taker_fee_rate),
+            maker_fee_rate=float(maker_fee_rate),
+            expected_funding_periods=int(expected_funding_periods),
+            entry_slippage_bps_per_leg=float(entry_slippage_bps_per_leg),
+            exit_slippage_bps_per_leg=float(exit_slippage_bps_per_leg),
+        )
+        campaign = engine.start(f"preview-{market_id}", terms)
+        previews.append(
+            {
+                "market_id": str(market_id),
+                "symbol": (market or {}).get("symbol"),
+                "funding_rate": funding,
+                "state": campaign.state.value,
+                "reason": campaign.reason,
+                "projected_net_pnl": campaign.projected_net_pnl,
+            }
+        )
+    previews.sort(key=lambda row: row["projected_net_pnl"], reverse=True)
+    previews = previews[: max(1, int(limit))]
+    return {
+        "candidates": len(previews),
+        "accepted": sum(row["state"] == "CAPITAL_RESERVED" for row in previews),
+        "rows": previews,
+        "simulation_only": True,
+    }
+
+
+def _registry_status(root: Path) -> dict:
+    path = root / "data" / "trading_bot.db"
+    try:
+        conn = _read_connection(path)
+    except FileNotFoundError:
+        return {"trials": 0, "trial_statuses": {}, "carry_campaigns": 0}
+    try:
+        trial_rows = (
+            conn.execute(
+                "SELECT status, COUNT(*) n FROM experiment_registry GROUP BY status"
+            ).fetchall()
+            if _table_exists(conn, "experiment_registry")
+            else []
+        )
+        carry_count = (
+            conn.execute("SELECT COUNT(*) FROM carry_campaigns").fetchone()[0]
+            if _table_exists(conn, "carry_campaigns")
+            else 0
+        )
+    finally:
+        conn.close()
+    statuses = {str(row["status"]): int(row["n"]) for row in trial_rows}
+    return {
+        "trials": sum(statuses.values()),
+        "trial_statuses": statuses,
+        "carry_campaigns": int(carry_count),
+    }
+
+
+def build_research_status(
+    root: str | Path,
+    *,
+    minimum_cost_samples: int = 50,
+    minimum_expectancy_rows: int = 1_200,
+) -> dict:
+    project = Path(root)
+    expectancy = {}
+    for bot in EXPECTANCY_FEATURES:
+        expectancy[bot] = {}
+        for mode in ("LIVE", "SIM"):
+            events = _candidate_events(project, bot, mode)
+            labels = build_expectancy_candidates(project, bot=bot, mode=mode)
+            expectancy[bot][mode] = {
+                "candidate_events": len(events),
+                "closed_labels": len(labels),
+                "minimum_rows": int(minimum_expectancy_rows),
+                "ready": len(labels) >= int(minimum_expectancy_rows),
+            }
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "root": str(project.resolve()),
+        "execution_cost": build_execution_cost_report(
+            project, minimum_samples=minimum_cost_samples
+        ),
+        "ofi": build_ofi_report(project),
+        "carry": build_carry_preview(project),
+        "expectancy": expectancy,
+        "experiments": _registry_status(project),
+        "safety": {
+            "writes_live_model": False,
+            "changes_orders": False,
+            "automatic_promotion": False,
+        },
+    }
+
+
+def train_expectancy_candidate(
+    root: str | Path,
+    *,
+    bot: str,
+    mode: str,
+    min_train: int = 1_000,
+    test_size: int = 200,
+    purge_days: int = 8,
+) -> dict:
+    project = Path(root)
+    normalized_bot = str(bot).strip().upper()
+    normalized_mode = str(mode).strip().upper()
+    feature_order = EXPECTANCY_FEATURES.get(normalized_bot)
+    if feature_order is None:
+        raise ValueError("unsupported bot")
+    labels = build_expectancy_candidates(
+        project, bot=normalized_bot, mode=normalized_mode
+    )
+    result = expanding_walk_forward_fit(
+        labels,
+        feature_order=feature_order,
+        min_train=int(min_train),
+        test_size=int(test_size),
+        purge=timedelta(days=max(0, int(purge_days))),
+    )
+    candidate_dir = project / "data" / "research" / "expectancy"
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    model_path = candidate_dir / f"{normalized_bot.lower()}_{normalized_mode.lower()}.candidate.json"
+    from trading.expectancy_runtime import save_expectancy_model
+
+    save_expectancy_model(model_path, result.final_model)
+    report = {
+        "bot": normalized_bot,
+        "mode": normalized_mode,
+        "feature_order": list(feature_order),
+        "labels": len(labels),
+        "folds": [asdict(fold) for fold in result.folds],
+        "predictions": len(result.predictions),
+        "calibration": asdict(result.calibration),
+        "candidate_model": str(model_path),
+        "runtime_model_changed": False,
+    }
+    report_path = model_path.with_suffix(".report.json")
+    temp = report_path.with_suffix(".tmp")
+    temp.write_text(
+        json.dumps(report, default=str, sort_keys=True, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+    temp.replace(report_path)
+    report["report"] = str(report_path)
+    return report
+
+
+def check_promotion(
+    evidence: dict,
+    *,
+    minimum_samples: int,
+    manual_live_approval: bool = False,
+) -> dict:
+    decision = evaluate_promotion(
+        PromotionEvidence(**dict(evidence)),
+        minimum_samples=int(minimum_samples),
+        explicit_manual_live_approval=bool(manual_live_approval),
+    )
+    return {
+        "research_passed": decision.research_passed,
+        "live_allowed": decision.live_allowed,
+        "reasons": list(decision.reasons),
+        "deployment_performed": False,
+    }
+
+
+def register_experiment_trial(
+    root: str | Path,
+    *,
+    trial_id: str,
+    experiment_name: str,
+    params: dict,
+    status: str,
+) -> dict:
+    """Explicitly append one immutable research trial; never changes trading."""
+    normalized_status = str(status).strip().upper()
+    if normalized_status not in {"PLANNED", "RUNNING", "REJECTED", "COMPLETE"}:
+        raise ValueError("unsupported experiment status")
+    if not str(trial_id).strip() or not str(experiment_name).strip():
+        raise ValueError("trial id and experiment name are required")
+    try:
+        encoded = json.dumps(params, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("experiment params must be finite JSON") from exc
+    db_path = Path(root) / "data" / "trading_bot.db"
+    if not db_path.is_file():
+        raise FileNotFoundError(db_path)
+    conn = sqlite3.connect(db_path, timeout=15)
+    try:
+        conn.execute("PRAGMA busy_timeout=15000")
+        if not _table_exists(conn, "experiment_registry"):
+            raise ValueError("experiment registry is unavailable")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO experiment_registry "
+            "(trial_id, experiment_name, params_json, status, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (
+                str(trial_id),
+                str(experiment_name),
+                encoded,
+                normalized_status,
+                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise ValueError("experiment trial ids are immutable and unique") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {
+        "trial_id": str(trial_id),
+        "experiment_name": str(experiment_name),
+        "status": normalized_status,
+        "trading_changed": False,
+    }

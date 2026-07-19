@@ -321,6 +321,24 @@ class TrendBot(SpotBot):
                 mode=entry_mode,
                 direction="BUY",
             )
+            expectancy_features = {
+                "trend_votes": float(votes),
+                "realized_vol": float(vols.get(sym) or 0.0),
+                "size_multiplier": float(
+                    vol_target_multiplier(vols.get(sym), med)
+                    if vt_on
+                    else 1.0
+                ),
+            }
+            from trading.expectancy_telemetry import emit_expectancy_candidate
+
+            emit_expectancy_candidate(
+                bot=self.BOT_NAME,
+                entry_id=entry_id,
+                symbol=sym,
+                mode=entry_mode,
+                features=expectancy_features,
+            )
             if not self.simulation:
                 from trading.entry_admission import evaluate_entry_admission
                 from trading.portfolio_risk import PortfolioLimits
@@ -341,15 +359,7 @@ class TrendBot(SpotBot):
                     portfolio_mode=portfolio_mode,
                     expectancy_mode=expectancy_mode,
                     account_type="spot",
-                    features={
-                        "trend_votes": float(votes),
-                        "realized_vol": float(vols.get(sym) or 0.0),
-                        "size_multiplier": float(
-                            vol_target_multiplier(vols.get(sym), med)
-                            if vt_on
-                            else 1.0
-                        ),
-                    },
+                    features=expectancy_features,
                     limits=PortfolioLimits(
                         max_gross_pct=float(
                             self.C("PORTFOLIO_MAX_GROSS_PCT", 100.0)
@@ -421,7 +431,7 @@ class TrendBot(SpotBot):
             amount, fill_price, gross_amount, invested_usdt, entry_fee = entry
             state_ok = self._add_trend_state(
                 sym, fill_price, amount, gross_amount, invested_usdt,
-                entry_fee, votes)
+                entry_fee, votes, entry_id)
             if state_ok is False and not self.simulation:
                 log_event(
                     f"Trend BUY {sym}: state write failed after LIVE fill - "
@@ -474,7 +484,7 @@ class TrendBot(SpotBot):
                   f"holding {self.state.count()}/{max_trades}", "SCAN")
 
     def _add_trend_state(self, sym, fill_price, amount, gross_amount,
-                         invested_usdt, entry_fee, votes):
+                         invested_usdt, entry_fee, votes, entry_id):
         # _place_buy_order already wrote a PROVISIONAL row (zombie protection);
         # patch it in place with the corrected NET amount + fees instead of a
         # second full add. Fall back to add() if the provisional didn't land.
@@ -492,6 +502,7 @@ class TrendBot(SpotBot):
             "fees_paid": entry_fee,
             "strategy": "trend",
             "entry_votes": votes,
+            "entry_id": entry_id,
             "provisional": False,
         }
         if self.state.has(sym):

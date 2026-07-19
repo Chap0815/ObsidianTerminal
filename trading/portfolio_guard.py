@@ -37,6 +37,57 @@ def _balance_value(balance: dict, group: str, currency: str = "USDT") -> float |
     return None
 
 
+def _raw_futures_balance_row(
+    balance: dict, currency: str = "USDT"
+) -> dict | None:
+    """Return an exchange-native currency row when CCXT loses equity fields.
+
+    MEXC contract balance normalization currently maps both ``free`` and
+    ``total`` to ``availableBalance``.  The authoritative account equity is
+    still present under ``info.data[*].equity``.  Keep the parser deliberately
+    shape-bounded so unrelated response metadata can never become money truth.
+    """
+    info = balance.get("info")
+    if not isinstance(info, dict):
+        return None
+    data = info.get("data")
+    candidates = data if isinstance(data, list) else [data]
+    normalized_currency = str(currency).strip().upper()
+    for row in candidates:
+        if not isinstance(row, dict):
+            continue
+        row_currency = row.get("currency") or row.get("currencyCode") or row.get(
+            "asset"
+        )
+        if str(row_currency or "").strip().upper() == normalized_currency:
+            return row
+    return None
+
+
+def _futures_balance_values(
+    balance: dict, currency: str = "USDT"
+) -> tuple[float | None, float | None]:
+    free = _balance_value(balance, "free", currency)
+    equity = _balance_value(balance, "total", currency)
+    raw = _raw_futures_balance_row(balance, currency)
+    if raw is not None:
+        raw_free = _finite(
+            raw.get("availableBalance")
+            if raw.get("availableBalance") is not None
+            else raw.get("available")
+        )
+        raw_equity = _finite(
+            raw.get("equity")
+            if raw.get("equity") is not None
+            else raw.get("accountEquity")
+        )
+        if raw_free is not None and raw_free >= 0.0:
+            free = raw_free
+        if raw_equity is not None and raw_equity > 0.0:
+            equity = raw_equity
+    return free, equity
+
+
 def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
     now = datetime.now(timezone.utc)
     try:
@@ -44,9 +95,14 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
         positions_raw = exchange.fetch_positions()
         if not isinstance(balance, dict) or not isinstance(positions_raw, list):
             raise ValueError("malformed account snapshot")
-        free = _balance_value(balance, "free")
-        equity = _balance_value(balance, "total")
-        if free is None or equity is None or equity <= 0.0:
+        free, equity = _futures_balance_values(balance)
+        if (
+            free is None
+            or equity is None
+            or free < 0.0
+            or equity <= 0.0
+            or free > equity * (1.0 + 1e-9)
+        ):
             raise ValueError("USDT equity unavailable")
         tickers = None
         markets = getattr(exchange, "markets", None) or {}

@@ -623,6 +623,7 @@ def _close_single_position_impl(*,
                 funding_paid=funding_pd,
                 fees_usdt=slice_fees,
                 exchange_order_id=exch_oid,
+                entry_id=d.get("entry_id"),
             ))
             if not accounting_ok:
                 raise RuntimeError("save_trade_db returned False")

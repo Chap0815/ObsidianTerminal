@@ -153,6 +153,7 @@ def execute_entry_order(
     intent_id: str,
     client_order_id: str,
     bot_name: str,
+    mode: str,
     reference_price: float,
     market_order,
     config: MakerFirstConfig,
@@ -164,6 +165,7 @@ def execute_entry_order(
     journal.create(
         intent_id,
         bot_name=bot_name,
+        mode=mode,
         symbol=symbol,
         direction="LONG" if str(side).lower() == "buy" else "SHORT",
         target_amount=amount,

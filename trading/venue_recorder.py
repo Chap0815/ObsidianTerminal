@@ -274,9 +274,24 @@ class MexcVenueRecorder:
         for _volume, symbol, ticker in candidates:
             info = ticker.get("info") if isinstance(ticker, dict) else {}
             info = info if isinstance(info, dict) else {}
+            market = (getattr(self.exchange, "markets", None) or {}).get(symbol) or {}
+            base = str(market.get("base") or "").strip()
+            spot_symbol = f"{base}/USDT" if base else ""
+            spot_market = (
+                (getattr(self.exchange, "markets", None) or {}).get(spot_symbol)
+                if spot_symbol
+                else None
+            )
+            spot_available = bool(
+                isinstance(spot_market, dict)
+                and spot_market.get("spot")
+                and spot_market.get("active") is not False
+            )
             market_id = self._market_id(self.exchange, symbol)
             markets_payload[market_id] = {
                 "symbol": symbol,
+                "spot_symbol": spot_symbol or None,
+                "spot_available": spot_available,
                 "last": ticker.get("last"),
                 "bid": ticker.get("bid"),
                 "ask": ticker.get("ask"),

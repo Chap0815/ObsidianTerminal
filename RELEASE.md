@@ -1,5 +1,47 @@
 # Release Notes
 
+## 2026-07-18 - Research integrity and durable telemetry
+
+This update fixes the data lineage needed for the profit experiments; it does
+not promote any experiment or claim a profitable edge. Entry candidates now
+survive log rotation and hard restarts in a dedicated SQLite table, and
+emergency/provisional accounting keeps the same `entry_id` through closure.
+
+Momentum evaluation now fills at the next bar open, funding carry requires
+independent settlement periods, and execution-cost samples are isolated by bot
+and LIVE/SIM mode. Point-in-time universe proof, a frozen holdout and
+sample-ready OOS abstention evidence remain mandatory, fail-closed boundaries.
+
+After updating and restarting, new candidates and scoped TCA observations must
+accumulate before any readiness result can change. Existing unscoped TCA rows
+and minute-level funding snapshots are intentionally not promoted as evidence.
+
+## 2026-07-18 - Profit research operator
+
+The research pipeline is explicit and fail-closed. A read-only status report is
+available with:
+
+```powershell
+py -3.12 tools\profit_research.py status
+```
+
+Use `--write-report` only when a persisted report under `data/research/reports`
+is desired. `train-expectancy` writes candidate models under `data/research`;
+it never writes to the runtime `data/models` directory. `carry-preview` is
+simulation-only, and `promotion-check` never deploys a model or changes orders.
+
+The eight scientific experiments are available through the same operator:
+
+```powershell
+py -3.12 tools\profit_research.py experiment-catalog
+py -3.12 tools\profit_research.py run-experiments --bot CROSS --mode LIVE
+```
+
+`run-experiments` is read-only unless `--write-report` is supplied. Reports are
+stored with unique names under `data/research/experiments`; old reports are
+never overwritten. `DATA_READY` means only that the experiment has enough data
+to be evaluated. It never means that a strategy is approved for live trading.
+
 ## 2026-07-06 - Build `289c547b8ea26dcc`
 
 Quelle: Trio-Audit fuer Launcher-Fallback-Close, SIM/LIVE-Namespace und Pending-Accounting.

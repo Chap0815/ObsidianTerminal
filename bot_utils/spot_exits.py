@@ -586,7 +586,8 @@ def emergency_close_all_spot(*,
                         rsi_4h=d.get("rsi_4h"), change_pct=d.get("change_pct"),
                         btc_trend=d.get("btc_trend"), fear_greed=d.get("fear_greed"),
                         is_futures=False,
-                        fees_usdt=fees_for_booked_slice
+                        fees_usdt=fees_for_booked_slice,
+                        entry_id=d.get("entry_id"),
                     ))
                     if not accounting_ok:
                         raise RuntimeError("save_trade_db returned False")
@@ -628,6 +629,7 @@ def emergency_close_all_spot(*,
                                 is_partial=True,
                                 fees_usdt=fees_for_booked_slice,
                                 exchange_order_id=exch_oid,
+                                entry_id=d.get("entry_id"),
                             )
                             pending = list(
                                 d.get("accounting_pending_partials") or [])

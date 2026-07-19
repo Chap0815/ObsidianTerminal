@@ -820,6 +820,22 @@ class TrendFuturesBot(FuturesBot):
                 stage="blocked", mode=entry_mode, reason="entry_quality",
                 direction="LONG")
             return
+        expectancy_features = {
+            "score": float(shadow.get("entry_quality_score") or 0.0),
+            "spread_bps": float(shadow.get("spread_pct") or 0.0) * 100.0,
+            "funding_rate_pct": float(shadow.get("funding_rate_pct") or 0.0),
+            "trend_votes": float(shadow.get("trend_votes") or 0.0),
+            "realized_vol": float(shadow.get("realized_vol") or 0.0),
+        }
+        from trading.expectancy_telemetry import emit_expectancy_candidate
+
+        emit_expectancy_candidate(
+            bot=self.BOT_NAME,
+            entry_id=entry_id,
+            symbol=base,
+            mode=entry_mode,
+            features=expectancy_features,
+        )
         if not self.simulation:
             from trading.entry_admission import evaluate_entry_admission
             from trading.portfolio_risk import PortfolioLimits
@@ -839,15 +855,7 @@ class TrendFuturesBot(FuturesBot):
                 requested_notional=notional,
                 portfolio_mode=portfolio_mode,
                 expectancy_mode=expectancy_mode,
-                features={
-                    "score": float(shadow.get("entry_quality_score") or 0.0),
-                    "spread_bps": float(shadow.get("spread_pct") or 0.0) * 100.0,
-                    "funding_rate_pct": float(
-                        shadow.get("funding_rate_pct") or 0.0
-                    ),
-                    "trend_votes": float(shadow.get("trend_votes") or 0.0),
-                    "realized_vol": float(shadow.get("realized_vol") or 0.0),
-                },
+                features=expectancy_features,
                 limits=PortfolioLimits(
                     max_gross_pct=float(self.C("PORTFOLIO_MAX_GROSS_PCT", 100.0)),
                     max_net_pct=float(self.C("PORTFOLIO_MAX_NET_PCT", 75.0)),
@@ -1058,6 +1066,7 @@ class TrendFuturesBot(FuturesBot):
                     intent_id=entry_id,
                     client_order_id=_cid,
                     bot_name=self.BOT_NAME,
+                    mode=entry_mode,
                     reference_price=fill,
                     market_order=lambda: create_order_with_retry(
                         self.ex, full, "buy", contracts, params=params,

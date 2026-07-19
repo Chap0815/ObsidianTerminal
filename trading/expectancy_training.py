@@ -154,6 +154,12 @@ def _fit_model(
                 "cal_n": len(calibration_rows),
                 "last": calibration_rows[-1].label_closed_time.isoformat(),
                 "coef": coefficients.tolist(),
+                "feature_means": means.tolist(),
+                "feature_scales": scales.tolist(),
+                "probability_intercept": platt_intercept,
+                "probability_scale": platt_scale,
+                "ridge": max(0.0, float(ridge)),
+                "fingerprint_schema": 2,
             },
             sort_keys=True,
         ).encode("utf-8")
