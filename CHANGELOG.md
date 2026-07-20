@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-20
+
+- Completed TREND entry lifecycle coverage. The strategy now propagates the
+  same `entry_id` through order placement and position state, records blocked,
+  failed, state-failed and opened terminal stages, and never reports a failed
+  SIM state write as an opened position.
+
 ## 2026-07-19
 
 - Hardened dashboard exposure without breaking existing remote access. Fresh

@@ -312,7 +312,8 @@ class TrendBot(SpotBot):
             # before committing capital  closes any has()->add() window.
             if self.state.has(sym):
                 continue
-            from trading.entry_lifecycle import new_entry_id
+            from trading.entry_lifecycle import (emit_entry_lifecycle,
+                                                 new_entry_id)
 
             entry_mode = "SIM" if self.simulation else "LIVE"
             entry_id = new_entry_id(
@@ -394,6 +395,14 @@ class TrendBot(SpotBot):
                     model_version=admission.expectancy.model_version,
                 )
                 if not admission.allowed:
+                    emit_entry_lifecycle(
+                        entry_id,
+                        bot=self.BOT_NAME,
+                        symbol=sym,
+                        stage="blocked",
+                        mode=entry_mode,
+                        reason="entry_admission",
+                    )
                     continue
             if not self.simulation:
                 from core.database import claim_symbol_for_entry
@@ -408,11 +417,39 @@ class TrendBot(SpotBot):
                     from core.logger import log_event as _lev
                     _lev(f"Trend: {sym} claimed by another bot  skip "
                          f"(coexistence)", "WAIT")
+                    emit_entry_lifecycle(
+                        entry_id,
+                        bot=self.BOT_NAME,
+                        symbol=sym,
+                        stage="blocked",
+                        mode=entry_mode,
+                        reason="claim_conflict",
+                    )
                     continue
             _trend_claimed = not self.simulation
+            emit_entry_lifecycle(
+                entry_id,
+                bot=self.BOT_NAME,
+                symbol=sym,
+                stage="order_attempt",
+                mode=entry_mode,
+            )
             try:
-                entry = self._place_buy_order(sym, {"price": price}, coin_size)
+                entry = self._place_buy_order(
+                    sym,
+                    {"price": price},
+                    coin_size,
+                    entry_id=entry_id,
+                )
             except Exception as _buy_exc:
+                emit_entry_lifecycle(
+                    entry_id,
+                    bot=self.BOT_NAME,
+                    symbol=sym,
+                    stage="order_failed",
+                    mode=entry_mode,
+                    reason=type(_buy_exc).__name__,
+                )
                 if _trend_claimed:
                     released = self._release_entry_claim_if_untracked(sym)
                     if released:
@@ -421,6 +458,14 @@ class TrendBot(SpotBot):
                         release_portfolio_reservation(entry_id)
                 raise _buy_exc
             if entry is None:
+                emit_entry_lifecycle(
+                    entry_id,
+                    bot=self.BOT_NAME,
+                    symbol=sym,
+                    stage="order_failed",
+                    mode=entry_mode,
+                    reason="no_verified_fill",
+                )
                 if _trend_claimed:
                     released = self._release_entry_claim_if_untracked(sym)
                     if released:
@@ -432,6 +477,15 @@ class TrendBot(SpotBot):
             state_ok = self._add_trend_state(
                 sym, fill_price, amount, gross_amount, invested_usdt,
                 entry_fee, votes, entry_id)
+            if state_ok is False:
+                emit_entry_lifecycle(
+                    entry_id,
+                    bot=self.BOT_NAME,
+                    symbol=sym,
+                    stage="state_failed",
+                    mode=entry_mode,
+                    reason="post_fill_state_write",
+                )
             if state_ok is False and not self.simulation:
                 log_event(
                     f"Trend BUY {sym}: state write failed after LIVE fill - "
@@ -468,10 +522,23 @@ class TrendBot(SpotBot):
                     self._log_error(
                         f"trend rollback after state failure {sym}", rb_exc)
                 continue
+            if state_ok is False:
+                # SIM has no exchange position to roll back. Do not report an
+                # opened position when its state was not persisted.
+                continue
             if not self.simulation:
                 from core.database import release_portfolio_reservation
 
                 release_portfolio_reservation(entry_id, status="CONSUMED")
+            emit_entry_lifecycle(
+                entry_id,
+                bot=self.BOT_NAME,
+                symbol=sym,
+                stage="opened",
+                mode=entry_mode,
+                fill_price=fill_price,
+                size_usdt=float(coin_size),
+            )
             if free is not None:
                 free = max(0.0, free - coin_size)
             opened += 1

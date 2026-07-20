@@ -1,6 +1,6 @@
 {
-  "build_id": "2d2999bb5b3ec9b2",
-  "created_at": "2026-07-19 22:19:24",
+  "build_id": "8c94ca0f344faf5e",
+  "created_at": "2026-07-20 08:45:50",
   "source": "update_deploy_manifest.py",
   "file_count": 171,
   "files": [
@@ -186,8 +186,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "0fe57a993a29de134faa1cba2f6cd56f78ae68c19531fd5bd60d41f9d84bf57e",
-      "bytes": 60990
+      "sha256": "4e5e3730fd9713196f876343f77d3860e80a453186a70f8529ce5e25bd250c51",
+      "bytes": 61280
     },
     {
       "path": "config/__init__.py",
@@ -326,8 +326,8 @@
     },
     {
       "path": "core/trend_bot.py",
-      "sha256": "63477f8a2f625be98587fba648a84f800f50f02c4aae177a167c7dfc6badc661",
-      "bytes": 26138
+      "sha256": "6bcd22385aeb355fc56d0457135cc4ea51902881029f171d7dbf2808cbdf23e2",
+      "bytes": 28538
     },
     {
       "path": "core/trend_futures_bot.py",
