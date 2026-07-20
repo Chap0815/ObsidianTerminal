@@ -13,7 +13,10 @@ sys.dont_write_bytecode = True
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools.release_requirements import RELEASE_TOOL_FILES, REQUIRED_RELEASE_ITEMS
+from tools.release_requirements import (  # noqa: E402 - project-root bootstrap
+    RELEASE_TOOL_FILES,
+    REQUIRED_RELEASE_ITEMS,
+)
 
 
 EXCLUDED_DIRS = {
@@ -88,7 +91,11 @@ def _skip(path: Path, root: Path) -> bool:
     excluded_dirs_lower = {part.lower() for part in EXCLUDED_DIRS}
     excluded_rel_lower = {item.lower() for item in EXCLUDED_REL_PATHS}
     excluded_names_lower = {item.lower() for item in EXCLUDED_NAMES}
-    if rel.parts and rel.parts[0].lower() == "tools" and rel_posix not in RELEASE_TOOL_FILES:
+    if (
+        rel.parts
+        and rel.parts[0].lower() == "tools"
+        and rel_posix not in RELEASE_TOOL_FILES
+    ):
         return True
     return (
         rel_posix_lower in excluded_rel_lower
@@ -140,11 +147,15 @@ def build_manifest(root: Path) -> dict:
     root = root.resolve()
     files = []
     if root.name.endswith("_Release"):
-        source_files = sorted(path.resolve() for path in root.rglob("*") if path.is_file())
+        source_files = sorted(
+            path.resolve() for path in root.rglob("*") if path.is_file()
+        )
     else:
         source_files = _git_tracked_files(root)
     if source_files is None:
-        source_files = sorted(path.resolve() for path in root.rglob("*") if path.is_file())
+        source_files = sorted(
+            path.resolve() for path in root.rglob("*") if path.is_file()
+        )
     else:
         required_files = {
             (root / rel).resolve()
@@ -155,11 +166,13 @@ def build_manifest(root: Path) -> dict:
 
     for path in source_files:
         if path.is_file() and not _skip(path, root):
-            files.append({
-                "path": path.relative_to(root).as_posix(),
-                "sha256": _sha256(path),
-                "bytes": path.stat().st_size,
-            })
+            files.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "sha256": _sha256(path),
+                    "bytes": path.stat().st_size,
+                }
+            )
 
     build = hashlib.sha256()
     for item in files:

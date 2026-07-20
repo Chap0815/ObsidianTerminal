@@ -56,7 +56,9 @@ class SQLitePartitionWriter:
         if connection is not None:
             return connection
         path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path, timeout=15.0)
+        # Writes are serialized by ``_lock`` but the recorder's REST and L2
+        # workers legitimately share this connection across two threads.
+        connection = sqlite3.connect(path, timeout=15.0, check_same_thread=False)
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
         connection.execute("PRAGMA busy_timeout=15000")
@@ -175,8 +177,8 @@ class SQLitePartitionWriter:
             self._connections.clear()
 
 
-class MexcVenueRecorder:
-    """Uniform MEXC-native overview plus rotating L2/trade capture."""
+class VenueRecorder:
+    """Exchange-neutral overview, REST microstructure, and shadow L2 capture."""
 
     def __init__(
         self,
@@ -191,6 +193,10 @@ class MexcVenueRecorder:
         max_storage_gib: float = 20.0,
         log_event=None,
         writer=None,
+        l2_mode: str = "disabled",
+        l2_sample_interval_seconds: float = 1.0,
+        l2_stale_after_ms: int = 5_000,
+        l2_collector_factory=None,
     ) -> None:
         self.exchange = exchange
         self.writer = writer or SQLitePartitionWriter(
@@ -206,6 +212,23 @@ class MexcVenueRecorder:
         self._universe: list[str] = []
         self._cursor = 0
         self._next_retention_check = 0.0
+        self.l2_mode = str(l2_mode).strip().lower()
+        self._l2_collector = None
+        if self.l2_mode == "shadow":
+            if l2_collector_factory is None:
+                from trading.l2_stream import L2ShadowCollector
+
+                l2_collector_factory = L2ShadowCollector
+            self._l2_collector = l2_collector_factory(
+                exchange,
+                root,
+                writer=self.writer,
+                max_symbols=self.max_symbols,
+                depth_levels=self.depth_levels,
+                sample_interval_seconds=l2_sample_interval_seconds,
+                stale_after_ms=l2_stale_after_ms,
+                log_event=log_event,
+            )
 
     @staticmethod
     def _iso_now() -> str:
@@ -394,6 +417,8 @@ class MexcVenueRecorder:
     def run(self, shutdown_event: threading.Event) -> None:
         next_overview = 0.0
         try:
+            if self._l2_collector is not None:
+                self._l2_collector.start(shutdown_event)
             while not shutdown_event.is_set():
                 now = time.monotonic()
                 try:
@@ -404,6 +429,8 @@ class MexcVenueRecorder:
                         self._next_retention_check = now + 3600.0
                     if now >= next_overview or not self._universe:
                         self.capture_overview()
+                        if self._l2_collector is not None:
+                            self._l2_collector.update_symbols(self._universe)
                         next_overview = now + self.overview_interval
                     if self._universe:
                         symbol = self._universe[self._cursor % len(self._universe)]
@@ -419,6 +446,12 @@ class MexcVenueRecorder:
                             pass
                 shutdown_event.wait(self.micro_interval)
         finally:
+            if self._l2_collector is not None:
+                self._l2_collector.stop(timeout=5.0)
             close = getattr(self.writer, "close", None)
             if callable(close):
                 close()
+
+
+# Compatibility for older imports and third-party extensions.
+MexcVenueRecorder = VenueRecorder

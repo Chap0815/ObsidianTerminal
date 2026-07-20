@@ -19,55 +19,81 @@ import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config.exchange_config import get_spot_exchange_connection
-from core.clock            import backtest_asof_ms
-from core.logger          import log_event, log_separator
-from tools.ohlcv_cache     import get_series
+from core.clock import backtest_asof_ms
+from core.logger import log_event, log_separator
+from tools.ohlcv_cache import get_series
 from bot_utils.futures_funding import count_funding_settlements
-from bot_utils.indicators       import rsi as ind_rsi, macd_signal as ind_macd_signal
-from core.constants       import (
-    DEFAULT_TAKER_FEE, DEFAULT_MAKER_FEE,
-    BACKTEST_INITIAL_CAPITAL, BACKTEST_POSITION_SIZE,
-    BACKTEST_MAX_OPEN_TRADES, BACKTEST_TOP_N_PER_SCAN,
+from bot_utils.indicators import rsi as ind_rsi, macd_signal as ind_macd_signal
+from core.constants import (
+    DEFAULT_TAKER_FEE,
+    DEFAULT_MAKER_FEE,
+    BACKTEST_INITIAL_CAPITAL,
+    BACKTEST_POSITION_SIZE,
+    BACKTEST_MAX_OPEN_TRADES,
+    BACKTEST_TOP_N_PER_SCAN,
     BACKTEST_SLIPPAGE_PER_SIDE,
-    BACKTEST_SPOT_TAKER_FEE, BACKTEST_FUTURES_TAKER_FEE,
+    BACKTEST_SPOT_TAKER_FEE,
+    BACKTEST_FUTURES_TAKER_FEE,
     BACKTEST_MAKER_FEE as BACKTEST_MAKER_FEE_RATE,
-    MIN_VOLUME_USDT_BACKTEST, MAX_24H_PUMP_PCT,
+    MIN_VOLUME_USDT_BACKTEST,
+    MAX_24H_PUMP_PCT,
     TOP_N_VOLUME_COINS_BACKTEST,
     DEFAULT_MAINT_MARGIN,
 )
 
 
-DEFAULT_DAYS    = 60
+DEFAULT_DAYS = 60
 INITIAL_CAPITAL = BACKTEST_INITIAL_CAPITAL
-POSITION_SIZE   = BACKTEST_POSITION_SIZE
+POSITION_SIZE = BACKTEST_POSITION_SIZE
 MAX_OPEN_TRADES = BACKTEST_MAX_OPEN_TRADES
-TOP_N_PER_SCAN  = BACKTEST_TOP_N_PER_SCAN
+TOP_N_PER_SCAN = BACKTEST_TOP_N_PER_SCAN
 MIN_VOLUME_USDT = MIN_VOLUME_USDT_BACKTEST
-MAX_24H_PUMP    = MAX_24H_PUMP_PCT
-TAKER_FEE         = DEFAULT_TAKER_FEE
-MAKER_FEE         = DEFAULT_MAKER_FEE
+MAX_24H_PUMP = MAX_24H_PUMP_PCT
+TAKER_FEE = DEFAULT_TAKER_FEE
+MAKER_FEE = DEFAULT_MAKER_FEE
 SLIPPAGE_PER_SIDE = BACKTEST_SLIPPAGE_PER_SIDE
 
-SPOT_TAKER_FEE    = BACKTEST_SPOT_TAKER_FEE
+SPOT_TAKER_FEE = BACKTEST_SPOT_TAKER_FEE
 FUTURES_TAKER_FEE = BACKTEST_FUTURES_TAKER_FEE
 
 
 # Single source for per-strategy defaults.
 STRATEGY_DEFAULTS = {
-    "TREND":   {"pump": 2.0, "act": 9.0, "trail": 2.0, "stop": 4.0,
-                   "part": 0.30, "rsi": 65.0, "leverage": 1.0},
-    "SPOT": {"pump": 6.0, "act": 9.0, "trail": 3.0, "stop": 6.0,
-                   "part": 0.60, "rsi": 65.0, "leverage": 1.0},
-    "FUTURES":    {"pump": 4.0, "act": 4.5, "trail": 1.5, "stop": 3.5,
-                   "part": 0.60, "rsi": 75.0, "leverage": 3.0},
+    "TREND": {
+        "pump": 2.0,
+        "act": 9.0,
+        "trail": 2.0,
+        "stop": 4.0,
+        "part": 0.30,
+        "rsi": 65.0,
+        "leverage": 1.0,
+    },
+    "SPOT": {
+        "pump": 6.0,
+        "act": 9.0,
+        "trail": 3.0,
+        "stop": 6.0,
+        "part": 0.60,
+        "rsi": 65.0,
+        "leverage": 1.0,
+    },
+    "FUTURES": {
+        "pump": 4.0,
+        "act": 4.5,
+        "trail": 1.5,
+        "stop": 3.5,
+        "part": 0.60,
+        "rsi": 75.0,
+        "leverage": 3.0,
+    },
 }
 
 
 def calc_round_trip(use_maker: bool = False, strategy: str = "TREND") -> float:
     taker = FUTURES_TAKER_FEE if strategy == "FUTURES" else SPOT_TAKER_FEE
     maker = BACKTEST_MAKER_FEE_RATE
-    buy   = (maker if use_maker else taker) + SLIPPAGE_PER_SIDE
-    sell  = taker + SLIPPAGE_PER_SIDE
+    buy = (maker if use_maker else taker) + SLIPPAGE_PER_SIDE
+    sell = taker + SLIPPAGE_PER_SIDE
     return buy + sell
 
 
@@ -83,13 +109,13 @@ def fetch_history(exchange, symbol: str, days: int) -> pd.DataFrame:
     """
     try:
         timeframe = "1h"
-        tf_ms     = 3_600_000               # 1h in ms
-        needed    = days * 24 + 50          # +50 warmup bars for RSI/MACD
+        tf_ms = 3_600_000  # 1h in ms
+        needed = days * 24 + 50  # +50 warmup bars for RSI/MACD
         try:
             now_ms = exchange.milliseconds()
         except Exception:
             now_ms = int(_time.time() * 1000)
-        asof = backtest_asof_ms()           # IS/OOS wall: cap "now" to cutoff
+        asof = backtest_asof_ms()  # IS/OOS wall: cap "now" to cutoff
         if asof is not None and asof < now_ms:
             now_ms = asof
         since = now_ms - needed * tf_ms
@@ -100,13 +126,15 @@ def fetch_history(exchange, symbol: str, days: int) -> pd.DataFrame:
         if not bars:
             return pd.DataFrame()
 
-        df = pd.DataFrame(bars, columns=["ts","open","high","low","close","volume"])
-        df["dt"]     = pd.to_datetime(df["ts"], unit="ms")
-        # Same native engine the live screener trades on  not pandas_ta 
+        df = pd.DataFrame(
+            bars, columns=["ts", "open", "high", "low", "close", "volume"]
+        )
+        df["dt"] = pd.to_datetime(df["ts"], unit="ms")
+        # Same native engine the live screener trades on  not pandas_ta
         # so backtest entry signals match live bar-for-bar (single source of
         # truth). macd_signal returns the signal line, matching the old
         # df.ta.macd(...).iloc[:, -1] the backtester filtered on.
-        df["rsi"]    = ind_rsi(df["close"], 14)
+        df["rsi"] = ind_rsi(df["close"], 14)
         df["macd_h"] = ind_macd_signal(df["close"], 12, 26, 9)
         return df.dropna()
     except Exception as e:
@@ -176,8 +204,10 @@ def get_top_volume_coins(exchange, n: int = None, days: int = None) -> list:
                 if len(kept) >= n:
                     break
             if dropped:
-                print(f"   [listing-age] dropped {dropped} coin(s) listed after "
-                      f"window start (metadata pre-filter)")
+                print(
+                    f"   [listing-age] dropped {dropped} coin(s) listed after "
+                    f"window start (metadata pre-filter)"
+                )
             return kept[:n]
         return ranked[:n]
     except Exception as e:
@@ -185,8 +215,7 @@ def get_top_volume_coins(exchange, n: int = None, days: int = None) -> list:
         return []
 
 
-def filter_universe_by_history(history: dict, days: int,
-                               now_ms: int = None) -> dict:
+def filter_universe_by_history(history: dict, days: int, now_ms: int = None) -> dict:
     """Drop coins whose FIRST 1h bar is later than the window start  i.e. they
     did not trade for the full `days` window. First-bar timestamp is the reliable
     "first traded" proxy. Coins with unknown/empty history are KEPT (no
@@ -213,12 +242,16 @@ def filter_universe_by_history(history: dict, days: int,
             continue
         kept[sym] = df
     if dropped:
-        print(f"   [listing-age] dropped {len(dropped)} coin(s) with <{days}d "
-              f"history (first bar after window start): "
-              f"{', '.join(sorted(dropped)[:8])}"
-              f"{' ' if len(dropped) > 8 else ''}")
-    print("   [survivorship] residual bias remains: DELISTED coins cannot be "
-          "recovered; universe is still today's survivors.")
+        print(
+            f"   [listing-age] dropped {len(dropped)} coin(s) with <{days}d "
+            f"history (first bar after window start): "
+            f"{', '.join(sorted(dropped)[:8])}"
+            f"{' ' if len(dropped) > 8 else ''}"
+        )
+    print(
+        "   [survivorship] residual bias remains: DELISTED coins cannot be "
+        "recovered; universe is still today's survivors."
+    )
     return kept
 
 
@@ -235,9 +268,10 @@ def connect_exchange():
             _time.sleep(5)
 
 
-# 
+#
 # Pre-indexing
-# 
+#
+
 
 def _to_epoch_sec(t) -> float:
     """Epoch seconds from a backtest time key. precompute_index keys on df['dt']
@@ -249,17 +283,17 @@ def _to_epoch_sec(t) -> float:
 
 
 def precompute_index(history: dict) -> tuple:
-    indexed   = {}
-    all_ts    = set()
+    indexed = {}
+    all_ts = set()
     for sym, df in history.items():
         df = df.sort_values("dt").reset_index(drop=True)
         closes = df["close"].tolist()
-        opens  = df["open"].tolist()
-        highs  = df["high"].tolist()
-        lows   = df["low"].tolist()
-        rsis   = df["rsi"].tolist()
-        macds  = df["macd_h"].tolist()
-        times  = df["dt"].tolist()
+        opens = df["open"].tolist()
+        highs = df["high"].tolist()
+        lows = df["low"].tolist()
+        rsis = df["rsi"].tolist()
+        macds = df["macd_h"].tolist()
+        times = df["dt"].tolist()
         n = len(df)
 
         # EMA50 extension (#2) and volume surge (#5), computed like the live
@@ -269,10 +303,14 @@ def precompute_index(history: dict) -> tuple:
         _ema = df["close"].ewm(span=50, adjust=False).mean()
         ema_ratios = ((df["close"] / _ema - 1.0) * 100).fillna(0.0).tolist()
         if "volume" in df.columns:
-            _vol     = df["volume"]
+            _vol = df["volume"]
             _vol_avg = _vol.rolling(20, min_periods=5).mean()
-            vol_surges = (_vol / _vol_avg).replace(
-                [float("inf"), float("-inf")], 1.0).fillna(1.0).tolist()
+            vol_surges = (
+                (_vol / _vol_avg)
+                .replace([float("inf"), float("-inf")], 1.0)
+                .fillna(1.0)
+                .tolist()
+            )
         else:
             vol_surges = [1.0] * n
 
@@ -284,13 +322,13 @@ def precompute_index(history: dict) -> tuple:
                 change_24h = (closes[i] - closes[i - 24]) / closes[i - 24] * 100
             next_open = opens[i + 1] if i + 1 < n else None
             lookup[t] = {
-                "price":     closes[i],
-                "high":      highs[i],
-                "low":       lows[i],
+                "price": closes[i],
+                "high": highs[i],
+                "low": lows[i],
                 "next_open": next_open,
-                "change":    change_24h,
-                "rsi":       rsis[i],
-                "macd_h":    macds[i],
+                "change": change_24h,
+                "rsi": rsis[i],
+                "macd_h": macds[i],
                 "ema_ratio": ema_ratios[i],
                 "vol_surge": vol_surges[i],
             }
@@ -298,32 +336,32 @@ def precompute_index(history: dict) -> tuple:
     return indexed, sorted(all_ts)
 
 
-# 
+#
 # Liquidation helper
-# 
+#
 
-def _liq_price(side: str, entry: float, leverage: float,
-               maint: float = DEFAULT_MAINT_MARGIN) -> float:
+
+def _liq_price(
+    side: str, entry: float, leverage: float, maint: float = DEFAULT_MAINT_MARGIN
+) -> float:
     lev = max(1.0, leverage)
     if lev <= 1.0:
         # No isolated-margin liquidation at 1x leverage
         return 0.0 if side == "LONG" else 1e18
     if side == "LONG":
-        return entry * (1.0 - 1.0/lev + maint)
-    return entry * (1.0 + 1.0/lev - maint)
+        return entry * (1.0 - 1.0 / lev + maint)
+    return entry * (1.0 + 1.0 / lev - maint)
 
 
-def _bar_excursion_pct(side: str, entry: float, bar_high: float,
-                       bar_low: float) -> tuple[float, float]:
+def _bar_excursion_pct(
+    side: str, entry: float, bar_high: float, bar_low: float
+) -> tuple[float, float]:
     if side == "SHORT":
-        return ((entry - bar_low) / entry * 100,
-                (entry - bar_high) / entry * 100)
-    return ((bar_high - entry) / entry * 100,
-            (bar_low - entry) / entry * 100)
+        return ((entry - bar_low) / entry * 100, (entry - bar_high) / entry * 100)
+    return ((bar_high - entry) / entry * 100, (bar_low - entry) / entry * 100)
 
 
-def _update_excursions(trade: dict, side: str, bar_high: float,
-                       bar_low: float) -> None:
+def _update_excursions(trade: dict, side: str, bar_high: float, bar_low: float) -> None:
     mfe, mae = _bar_excursion_pct(side, trade["buy"], bar_high, bar_low)
     trade["mfe_pct"] = max(trade.get("mfe_pct", 0.0), mfe)
     trade["mae_pct"] = min(trade.get("mae_pct", 0.0), mae)
@@ -333,21 +371,29 @@ def _holding_hours(entry_time, exit_time) -> float:
     return max(0.0, (_to_epoch_sec(exit_time) - _to_epoch_sec(entry_time)) / 3600.0)
 
 
-def _funding_cost(funding_8h: float, side: str, notional: float,
-                  entry_time, exit_time) -> float:
+def _funding_cost(
+    funding_8h: float, side: str, notional: float, entry_time, exit_time
+) -> float:
     if not funding_8h:
         return 0.0
     n_settle = count_funding_settlements(
-        _to_epoch_sec(entry_time),
-        _to_epoch_sec(exit_time))
+        _to_epoch_sec(entry_time), _to_epoch_sec(exit_time)
+    )
     signed_rate = funding_8h if side == "LONG" else -funding_8h
     return signed_rate * n_settle * notional
 
 
-def _closed_trade_record(trade: dict, exit_time, reason: str,
-                         profit_pct: float, gross: float, fees: float,
-                         funding: float, is_partial: bool,
-                         liquidated: bool) -> dict:
+def _closed_trade_record(
+    trade: dict,
+    exit_time,
+    reason: str,
+    profit_pct: float,
+    gross: float,
+    fees: float,
+    funding: float,
+    is_partial: bool,
+    liquidated: bool,
+) -> dict:
     total_cost = fees + funding
     return {
         "profit_pct": profit_pct,
@@ -362,36 +408,41 @@ def _closed_trade_record(trade: dict, exit_time, reason: str,
         "side": trade.get("side", "LONG"),
         "entry_time": trade.get("entry_now"),
         "exit_time": exit_time,
-        "holding_hours": _holding_hours(trade.get("entry_now", exit_time),
-                                        exit_time),
+        "holding_hours": _holding_hours(trade.get("entry_now", exit_time), exit_time),
         "mfe_pct": trade.get("mfe_pct", 0.0),
         "mae_pct": trade.get("mae_pct", 0.0),
     }
 
 
-# 
+#
 # Fast simulation
-# 
+#
 
-def simulate_fast(indexed: dict, all_times: list, strategy: str,
-                  use_maker: bool = False, params: dict = None) -> dict:
-    p          = params or {}
-    RT         = calc_round_trip(use_maker, strategy)
-    defaults   = STRATEGY_DEFAULTS.get(strategy, STRATEGY_DEFAULTS["TREND"])
+
+def simulate_fast(
+    indexed: dict,
+    all_times: list,
+    strategy: str,
+    use_maker: bool = False,
+    params: dict = None,
+) -> dict:
+    p = params or {}
+    RT = calc_round_trip(use_maker, strategy)
+    defaults = STRATEGY_DEFAULTS.get(strategy, STRATEGY_DEFAULTS["TREND"])
 
     leverage = float(p.get("leverage", defaults["leverage"]))
-    min_pump = p.get("min_pump",          defaults["pump"])
-    act      = p.get("activation_profit", defaults["act"])
-    trail    = p.get("trailing_distance", defaults["trail"])
-    stop_loss= p.get("stop_loss",        -abs(defaults["stop"]))
-    part_pct = p.get("partial_pct",       defaults["part"])
-    rsi_max  = p.get("rsi_max",           defaults["rsi"])
+    min_pump = p.get("min_pump", defaults["pump"])
+    act = p.get("activation_profit", defaults["act"])
+    trail = p.get("trailing_distance", defaults["trail"])
+    stop_loss = p.get("stop_loss", -abs(defaults["stop"]))
+    part_pct = p.get("partial_pct", defaults["part"])
+    rsi_max = p.get("rsi_max", defaults["rsi"])
     # Breakeven-Trigger spiegelt die Live-Bot-Logik (BREAKEVEN_TRIGGER):
     # Sobald prof >= be_trig wird der Stop auf den Einstieg gezogen  VOR
     # dem Partial-TP. 0 = aus (Default  Backtester verhlt sich wie bisher,
     # break_even kommt dann nur nach dem Partial-TP wie gehabt). So lsst
     # sich Ist (z.B. 2.0) gegen BE=0 sauber vergleichen.
-    be_trig  = float(p.get("breakeven_trigger", 0.0))
+    be_trig = float(p.get("breakeven_trigger", 0.0))
     try:
         funding_8h = float(p.get("funding_rate_8h", 0.0) or 0.0)
     except (TypeError, ValueError):
@@ -422,8 +473,12 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
     # block NEW entries while the last `om_window` FULL closes are net-negative,
     # so the optimizer can A/B test the live overlay against the OOS holdout.
     def _truthy(v):
-        return v if isinstance(v, bool) else \
-            str(v).strip().lower() in ("1", "true", "yes", "on")
+        return (
+            v
+            if isinstance(v, bool)
+            else str(v).strip().lower() in ("1", "true", "yes", "on")
+        )
+
     om_on = _truthy(p.get("own_momentum_filter", False))
     try:
         om_window = int(float(p.get("own_momentum_window", 8) or 8))
@@ -435,39 +490,41 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
     # (uptrend) and only SHORT when BTC is below it. Momentum-long bleeds in
     # bear regimes; this tests whether "don't fight the macro" creates an edge.
     # Uses BTC's own ema_ratio (price vs EMA50, %) as the trend proxy.
-    regime_on  = _truthy(p.get("regime_filter", False))
+    regime_on = _truthy(p.get("regime_filter", False))
     try:
         regime_min = float(p.get("regime_min", 0.0) or 0.0)
     except (TypeError, ValueError):
         regime_min = 0.0
 
-    #  Entry-signal reworks ported from the live bot (#2/#3/#5) 
+    #  Entry-signal reworks ported from the live bot (#2/#3/#5)
     # FUTURES only  these mirror _assess_entry_signal's HARD gates so the
     # optimizer tests the same entry logic as live. Toggle with the SAME env
     # vars as live (default ON, lenient). #1 (LLM veto) and #4 (funding) cannot
     # be modelled here (no LLM / no funding data) and are simply not applied.
     def _flag_on(_name):
-        return os.getenv(_name, "1").strip().lower() not in ("0","false","no","off")
+        return os.getenv(_name, "1").strip().lower() not in ("0", "false", "no", "off")
+
     def _flag_val(_name, _d):
         try:
             return float(os.getenv(_name, str(_d)))
         except (ValueError, TypeError):
             return _d
-    _is_fut  = strategy == "FUTURES"
-    _ext_on  = _is_fut and _flag_on("FUT_EXT_FILTER")
+
+    _is_fut = strategy == "FUTURES"
+    _ext_on = _is_fut and _flag_on("FUT_EXT_FILTER")
     _ext_max = _flag_val("FUT_MAX_EXT_PCT", 18.0)
-    _vol_on  = _is_fut and _flag_on("FUT_VOL_FILTER")
+    _vol_on = _is_fut and _flag_on("FUT_VOL_FILTER")
     _vol_min = _flag_val("FUT_MIN_VOL_SURGE", 1.0)
-    _rs_on   = _is_fut and _flag_on("FUT_RS_FILTER")
-    _rs_min  = _flag_val("FUT_MIN_RS_PCT", -2.0)
+    _rs_on = _is_fut and _flag_on("FUT_RS_FILTER")
+    _rs_min = _flag_val("FUT_MIN_RS_PCT", -2.0)
     # BTC series for the relative-strength gate (#3)  first BTC/* symbol found.
     _btc_sym = next((s for s in indexed if s.upper().startswith("BTC/")), None)
 
-    open_trades   = {}
+    open_trades = {}
     closed_trades = []
-    total_costs   = 0.0
-    total_gross   = 0.0
-    liquidations  = 0
+    total_costs = 0.0
+    total_gross = 0.0
+    liquidations = 0
     # Rolling NET of fully-closed (non-partial) trades for the own-momentum gate.
     recent_full_nets: list = []
 
@@ -477,11 +534,11 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
             if tick is None:
                 continue
 
-            curr     = tick["price"]
+            curr = tick["price"]
             bar_high = tick.get("high", curr)
-            bar_low  = tick.get("low",  curr)
-            d        = open_trades[sym]
-            side     = d.get("side", "LONG")
+            bar_low = tick.get("low", curr)
+            d = open_trades[sym]
+            side = d.get("side", "LONG")
             _update_excursions(d, side, bar_high, bar_low)
 
             # Liquidation check FIRST (before any other exit logic).
@@ -503,14 +560,22 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
                         # PnL = -margin (full margin loss)
                         notional = d["inv"] * leverage
                         loss_pct = -100.0 / leverage  #  -100% of margin
-                        gross_p  = -d["inv"]          # lose the margin
-                        fees     = notional * RT
+                        gross_p = -d["inv"]  # lose the margin
+                        fees = notional * RT
                         # No funding charged on top of a liquidation: the full
                         # margin wipeout already subsumes funding accrued during
                         # the hold (loss is capped at -margin in reality).
                         rec = _closed_trade_record(
-                            d, now, "liquidation", loss_pct, gross_p,
-                            fees, 0.0, False, True)
+                            d,
+                            now,
+                            "liquidation",
+                            loss_pct,
+                            gross_p,
+                            fees,
+                            0.0,
+                            False,
+                            True,
+                        )
                         closed_trades.append(rec)
                         total_costs += rec["cost"]
                         total_gross += abs(gross_p)
@@ -520,14 +585,18 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
                         continue
 
             prev_highest = d["highest"]
-            prev_lowest  = d.get("lowest", d["buy"])
+            prev_lowest = d.get("lowest", d["buy"])
 
             # Frher Breakeven-Trigger (spiegelt Live-Bot BREAKEVEN_TRIGGER):
             # greift VOR dem Partial-TP. Sobald der Gewinn be_trig erreicht,
             # wird der Stop auf den Einstieg gezogen (break_even=True). Genau
             # dieser Mechanismus wrgt live Trades bei kleinem Plus ab, wenn
             # be_trig << act ist. Bei be_trig=0 bleibt alles wie bisher.
-            if be_trig > 0 and not d.get("break_even") and d.get("mfe_pct", 0.0) >= be_trig:
+            if (
+                be_trig > 0
+                and not d.get("break_even")
+                and d.get("mfe_pct", 0.0) >= be_trig
+            ):
                 d["break_even"] = True
 
             curr_highest = max(prev_highest, bar_high)
@@ -557,21 +626,24 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
                     if bar_low <= trail_level:
                         full_exits.append(("trailing", trail_level))
             if full_exits:
-                def _exit_pct(item):
+
+                def _exit_pct(item, *, position_side=side, trade=d):
                     _reason, _price = item
-                    if side == "SHORT":
-                        return (d["buy"] - _price) / d["buy"] * 100
-                    return (_price - d["buy"]) / d["buy"] * 100
+                    if position_side == "SHORT":
+                        return (trade["buy"] - _price) / trade["buy"] * 100
+                    return (_price - trade["buy"]) / trade["buy"] * 100
+
                 reason, exit_price = min(full_exits, key=_exit_pct)
                 realized_prof = _exit_pct((reason, exit_price))
                 notional = d["inv"] * leverage
-                gross_p  = notional * (realized_prof / 100)
-                fees     = notional * RT
-                funding  = _funding_cost(
-                    funding_8h, side, notional, d.get("entry_now", now), now)
+                gross_p = notional * (realized_prof / 100)
+                fees = notional * RT
+                funding = _funding_cost(
+                    funding_8h, side, notional, d.get("entry_now", now), now
+                )
                 rec = _closed_trade_record(
-                    d, now, reason, realized_prof, gross_p, fees, funding,
-                    False, False)
+                    d, now, reason, realized_prof, gross_p, fees, funding, False, False
+                )
                 closed_trades.append(rec)
                 total_costs += rec["cost"]
                 total_gross += gross_p
@@ -580,23 +652,32 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
                 continue
 
             if not d["partial"] and d.get("mfe_pct", 0.0) >= act:
-                sa       = d["inv"] * part_pct
+                sa = d["inv"] * part_pct
                 notional = sa * leverage
-                gross_p  = notional * (act / 100)
-                fees     = notional * RT
-                funding  = _funding_cost(
-                    funding_8h, side, notional, d.get("entry_now", now), now)
+                gross_p = notional * (act / 100)
+                fees = notional * RT
+                funding = _funding_cost(
+                    funding_8h, side, notional, d.get("entry_now", now), now
+                )
                 rec = _closed_trade_record(
-                    d, now, "partial_take_profit", act, gross_p, fees,
-                    funding, True, False)
+                    d,
+                    now,
+                    "partial_take_profit",
+                    act,
+                    gross_p,
+                    fees,
+                    funding,
+                    True,
+                    False,
+                )
                 closed_trades.append(rec)
                 total_costs += rec["cost"]
                 total_gross += gross_p
-                d["partial"]    = True
-                d["inv"]       -= sa
+                d["partial"] = True
+                d["inv"] -= sa
                 d["break_even"] = True
-                d["highest"]    = curr_highest
-                d["lowest"]     = curr_lowest
+                d["highest"] = curr_highest
+                d["lowest"] = curr_lowest
                 continue
 
             d["highest"] = curr_highest
@@ -608,8 +689,11 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
 
         # Own-momentum overlay (opt-in): exits above already ran; only block
         # NEW entries while the last `om_window` full closes are net-negative.
-        if om_on and len(recent_full_nets) >= om_window \
-                and sum(recent_full_nets[-om_window:]) < 0:
+        if (
+            om_on
+            and len(recent_full_nets) >= om_window
+            and sum(recent_full_nets[-om_window:]) < 0
+        ):
             continue
 
         candidates = []
@@ -630,7 +714,7 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
             if sym in open_trades:
                 continue
 
-            #  Macro-regime gate: don't fight BTC's trend 
+            #  Macro-regime gate: don't fight BTC's trend
             if regime_on and _btc_sym is not None:
                 _bt = indexed[_btc_sym].get(now)
                 if _bt is not None:
@@ -640,11 +724,11 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
                     if side == "SHORT" and _btrend > -regime_min:
                         continue
 
-            #  Ported entry filters (#2/#3/#5)  FUTURES only 
+            #  Ported entry filters (#2/#3/#5)  FUTURES only
             if _is_fut:
                 _is_long = side == "LONG"
                 if _ext_on:
-                    _er  = tick.get("ema_ratio", 0.0)
+                    _er = tick.get("ema_ratio", 0.0)
                     _ext = _er if _is_long else -_er
                     if _ext > _ext_max:
                         continue  # #2 over-extended  skip
@@ -657,7 +741,9 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
                         if _rs < _rs_min:
                             continue  # #3 weak rel-strength  skip
 
-            candidates.append((abs(chg), sym, tick["price"], tick.get("next_open"), side))
+            candidates.append(
+                (abs(chg), sym, tick["price"], tick.get("next_open"), side)
+            )
 
         candidates.sort(reverse=True)
         for _, sym, signal_price, next_open, side in candidates[:top_n_per_scan]:
@@ -667,18 +753,18 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
                 continue
             fill_price = next_open
             open_trades[sym] = {
-                "buy":        fill_price,
-                "highest":    fill_price,
-                "lowest":     fill_price,
-                "inv":        position_size,
-                "side":       side,
-                "partial":    False,
+                "buy": fill_price,
+                "highest": fill_price,
+                "lowest": fill_price,
+                "inv": position_size,
+                "side": side,
+                "partial": False,
                 "break_even": False,
-                "entry_now":  now,
-                "mfe_pct":    0.0,
-                "mae_pct":    0.0,
+                "entry_now": now,
+                "mfe_pct": 0.0,
+                "mae_pct": 0.0,
                 # precompute liquidation price at open
-                "liq_price":  _liq_price(side, fill_price, leverage),
+                "liq_price": _liq_price(side, fill_price, leverage),
             }
 
     if all_times and open_trades:
@@ -705,10 +791,19 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
             gross_p = notional * (profit_pct / 100.0)
             fees = notional * RT
             funding = _funding_cost(
-                funding_8h, side, notional, d.get("entry_now", end_time), end_time)
+                funding_8h, side, notional, d.get("entry_now", end_time), end_time
+            )
             rec = _closed_trade_record(
-                d, end_time, "end_of_test", profit_pct, gross_p, fees,
-                funding, False, False)
+                d,
+                end_time,
+                "end_of_test",
+                profit_pct,
+                gross_p,
+                fees,
+                funding,
+                False,
+                False,
+            )
             closed_trades.append(rec)
             total_costs += rec["cost"]
             total_gross += gross_p
@@ -719,41 +814,54 @@ def simulate_fast(indexed: dict, all_times: list, strategy: str,
     return stats
 
 
-def simulate_strategy(history: dict, strategy: str,
-                      use_maker: bool = False, params: dict = None) -> dict:
+def simulate_strategy(
+    history: dict, strategy: str, use_maker: bool = False, params: dict = None
+) -> dict:
     indexed, all_times = precompute_index(history)
     return simulate_fast(indexed, all_times, strategy, use_maker, params)
 
 
 def _compute_stats(trades: list, total_costs: float, total_gross: float) -> dict:
     if not trades:
-        return {"trades": 0, "edge": False, "net": -9999, "roi": -9999,
-                "win_rate": 0, "sharpe": -9999, "max_dd": 99, "cost_pct": 99,
-                "liquidation_count": 0,
-                # Keys consumed by the optimizer's deep-validation suite
-                # (outlier / monte-carlo). Additive  no existing reader.
-                "trade_count": 0, "best_trade": 0.0,
-                "avg_profit_pct": 0.0, "std_profit_pct": 0.0,
-                "total_fees": 0.0, "total_funding": 0.0,
-                "net_trades": [], "closed_trades": []}
+        return {
+            "trades": 0,
+            "edge": False,
+            "net": -9999,
+            "roi": -9999,
+            "win_rate": 0,
+            "sharpe": -9999,
+            "max_dd": 99,
+            "cost_pct": 99,
+            "liquidation_count": 0,
+            # Keys consumed by the optimizer's deep-validation suite
+            # (outlier / monte-carlo). Additive  no existing reader.
+            "trade_count": 0,
+            "best_trade": 0.0,
+            "avg_profit_pct": 0.0,
+            "std_profit_pct": 0.0,
+            "total_fees": 0.0,
+            "total_funding": 0.0,
+            "net_trades": [],
+            "closed_trades": [],
+        }
 
     full = [t for t in trades if not t["is_partial"]] or trades
     pcts = [t["profit_pct"] for t in full]
     wins = [p for p in pcts if p >= 0]
     loss = [p for p in pcts if p < 0]
 
-    wr       = len(wins) / len(full) if full else 0
-    avg_win  = statistics.mean(wins)  if wins else 0
+    wr = len(wins) / len(full) if full else 0
+    avg_win = statistics.mean(wins) if wins else 0
     avg_loss = abs(statistics.mean(loss)) if loss else 0.01
-    payoff   = avg_win / avg_loss
-    exp_val  = (wr * avg_win) - ((1 - wr) * avg_loss)
+    payoff = avg_win / avg_loss
+    exp_val = (wr * avg_win) - ((1 - wr) * avg_loss)
 
     total_net = sum(t["net"] for t in trades)
     total_fees = sum(t.get("fees", t.get("cost", 0.0)) for t in trades)
     total_funding = sum(t.get("funding", 0.0) for t in trades)
     gross_basis = sum(abs(t.get("gross", 0.0)) for t in trades)
-    cost_pct  = (total_costs / gross_basis * 100) if gross_basis > 0 else 0
-    roi       = (total_net / INITIAL_CAPITAL) * 100
+    cost_pct = (total_costs / gross_basis * 100) if gross_basis > 0 else 0
+    roi = (total_net / INITIAL_CAPITAL) * 100
 
     curve = [INITIAL_CAPITAL]
     for p in [t["net"] for t in trades]:
@@ -767,7 +875,7 @@ def _compute_stats(trades: list, total_costs: float, total_gross: float) -> dict
             max_dd = dd
 
     all_nets = [t["net"] for t in trades]
-    sharpe   = 0.0
+    sharpe = 0.0
     if len(all_nets) > 1:
         sd = statistics.stdev(all_nets)
         if sd > 0:
@@ -776,19 +884,28 @@ def _compute_stats(trades: list, total_costs: float, total_gross: float) -> dict
     # Distribution stats consumed by the optimizer's deep-validation suite
     # (regime-split / outlier-dependency / monte-carlo). Additive keys  no
     # existing reader depends on them, so this can't change current behaviour.
-    best_trade     = max(pcts) if pcts else 0.0
+    best_trade = max(pcts) if pcts else 0.0
     avg_profit_pct = statistics.mean(pcts) if pcts else 0.0
     std_profit_pct = statistics.stdev(pcts) if len(pcts) > 1 else 0.0
 
     return {
-        "trades": len(trades), "full_trades": len(full),
-        "trade_count": len(full),          # alias used by deep-validation
-        "win_rate": wr, "avg_win": avg_win, "avg_loss": avg_loss,
-        "payoff": payoff, "exp_val": exp_val,
-        "gross": total_gross, "costs": total_costs, "net": total_net,
-        "total_fees": total_fees, "total_funding": total_funding,
-        "cost_pct": cost_pct, "roi": roi,
-        "max_dd": max_dd, "sharpe": sharpe,
+        "trades": len(trades),
+        "full_trades": len(full),
+        "trade_count": len(full),  # alias used by deep-validation
+        "win_rate": wr,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "payoff": payoff,
+        "exp_val": exp_val,
+        "gross": total_gross,
+        "costs": total_costs,
+        "net": total_net,
+        "total_fees": total_fees,
+        "total_funding": total_funding,
+        "cost_pct": cost_pct,
+        "roi": roi,
+        "max_dd": max_dd,
+        "sharpe": sharpe,
         "best_trade": best_trade,
         "avg_profit_pct": avg_profit_pct,
         "std_profit_pct": std_profit_pct,
@@ -806,14 +923,16 @@ def print_report(s, strategy, days, use_maker, params):
     pump_label = "Move" if strategy == "FUTURES" else "Pump"
     log_separator("=", 70)
     print(f"  BACKTEST REPORT  {strategy} ({days} days | Fees + Slippage)")
-    print(f"  {pump_label}:{params.get('min_pump',defaults['pump']):.1f}% | "
-          f"TP:{params.get('activation_profit',defaults['act']):.1f}% | "
-          f"Trail:{params.get('trailing_distance',defaults['trail']):.1f}% | "
-          f"Stop:{params.get('stop_loss',-defaults['stop']):.1f}% | "
-          f"Partial:{params.get('partial_pct',defaults['part']):.0%} | "
-          f"BE:{params.get('breakeven_trigger',0.0):.1f}% | "
-          f"RSI-Max:{params.get('rsi_max',defaults['rsi']):.0f} | "
-          f"RT:{rt*100:.2f}%")
+    print(
+        f"  {pump_label}:{params.get('min_pump', defaults['pump']):.1f}% | "
+        f"TP:{params.get('activation_profit', defaults['act']):.1f}% | "
+        f"Trail:{params.get('trailing_distance', defaults['trail']):.1f}% | "
+        f"Stop:{params.get('stop_loss', -defaults['stop']):.1f}% | "
+        f"Partial:{params.get('partial_pct', defaults['part']):.0%} | "
+        f"BE:{params.get('breakeven_trigger', 0.0):.1f}% | "
+        f"RSI-Max:{params.get('rsi_max', defaults['rsi']):.0f} | "
+        f"RT:{rt * 100:.2f}%"
+    )
     log_separator("=", 70)
     if not s.get("trades"):
         print("  No trades simulated")
@@ -828,7 +947,7 @@ def print_report(s, strategy, days, use_maker, params):
     print()
     print(f"  Gross PnL:            {s['gross']:+.2f} USDT")
     print(f"  Trading costs:        -{s['costs']:.2f} USDT  ({s['cost_pct']:.1f}%)")
-    print(f"  ")
+    print("  ")
     print(f"  Net PnL:              {s['net']:+.2f} USDT")
     print(f"  ROI ({INITIAL_CAPITAL:.0f} USDT base): {s['roi']:+.2f}%")
     print()
@@ -847,10 +966,14 @@ def print_report(s, strategy, days, use_maker, params):
 def run_backtest(strategy, days=DEFAULT_DAYS, use_maker=False, params=None):
     params = params or {}
     if strategy == "FUTURES" and not float(params.get("funding_rate_8h", 0.0) or 0.0):
-        print("  FUNDING NOT MODELLED  perpetual funding is 0 for this run. "
-              "Real leveraged FUTURES pays funding every 8h; reported edge is "
-              "OPTIMISTIC. Pass --funding R (e.g. --funding 0.0001) to include it.\n")
-    print(f"Backtest {strategy} | {days} days | RT {calc_round_trip(use_maker, strategy)*100:.2f}%\n")
+        print(
+            "  FUNDING NOT MODELLED  perpetual funding is 0 for this run. "
+            "Real leveraged FUTURES pays funding every 8h; reported edge is "
+            "OPTIMISTIC. Pass --funding R (e.g. --funding 0.0001) to include it.\n"
+        )
+    print(
+        f"Backtest {strategy} | {days} days | RT {calc_round_trip(use_maker, strategy) * 100:.2f}%\n"
+    )
     ex = connect_exchange()
     print("Loading coins...")
     coins = get_top_volume_coins(ex, days=days)
@@ -890,11 +1013,12 @@ if __name__ == "__main__":
         # the momentum entry below  route to the validator that runs the real
         # live signal so the backtest matches what the bot actually trades.
         from tools import trend_check
+
         _days = args[1] if len(args) > 1 and args[1].isdigit() else str(DEFAULT_DAYS)
         sys.argv = ["trend_check", _days] + (["--sweep"] if "--sweep" in args else [])
         trend_check.main()
         sys.exit(0)
-    days  = int(args[1]) if len(args) > 1 and args[1].isdigit() else DEFAULT_DAYS
+    days = int(args[1]) if len(args) > 1 and args[1].isdigit() else DEFAULT_DAYS
     maker = "--maker" in args
 
     def _a(flag, default):
@@ -905,14 +1029,14 @@ if __name__ == "__main__":
 
     d = STRATEGY_DEFAULTS[strat]
     p = {
-        "min_pump":          _a("--pump",        d["pump"]),
-        "activation_profit": _a("--activation",  d["act"]),
-        "trailing_distance": _a("--trailing",    d["trail"]),
-        "stop_loss":        -abs(_a("--stop",    d["stop"])),
-        "partial_pct":       _a("--partial",     d["part"]),
-        "rsi_max":           _a("--rsimax",      d["rsi"]),
-        "leverage":          _a("--leverage",    d["leverage"]),
-        "breakeven_trigger": _a("--breakeven",   0.0),
-        "funding_rate_8h":   _a("--funding",     0.0),
+        "min_pump": _a("--pump", d["pump"]),
+        "activation_profit": _a("--activation", d["act"]),
+        "trailing_distance": _a("--trailing", d["trail"]),
+        "stop_loss": -abs(_a("--stop", d["stop"])),
+        "partial_pct": _a("--partial", d["part"]),
+        "rsi_max": _a("--rsimax", d["rsi"]),
+        "leverage": _a("--leverage", d["leverage"]),
+        "breakeven_trigger": _a("--breakeven", 0.0),
+        "funding_rate_8h": _a("--funding", 0.0),
     }
     run_backtest(strat, days, use_maker=maker, params=p)

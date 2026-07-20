@@ -43,26 +43,31 @@ except Exception:
     _scipy_norm = None
 
 from config.exchange_config import get_spot_exchange_connection
-from tools.backtester import (fetch_history, get_top_volume_coins,
-                              filter_universe_by_history,
-                              precompute_index, simulate_fast,
-                              calc_round_trip, DEFAULT_DAYS,
-                              _compute_stats)
+from tools.backtester import (
+    fetch_history,
+    get_top_volume_coins,
+    filter_universe_by_history,
+    precompute_index,
+    simulate_fast,
+    calc_round_trip,
+    DEFAULT_DAYS,
+    _compute_stats,
+)
 from core.logger import log_separator
 
-#  Deterministic optimizer runs (fixed seed) 
+#  Deterministic optimizer runs (fixed seed)
 # monte_carlo_perturbation seeds its RNG with this so runs are reproducible.
 # Override via OPTIMIZER_SEED env.
 _OPTIMIZER_SEED = int(os.getenv("OPTIMIZER_SEED", "42"))
 
 
-#  Lpez de Prado anti-overfit constants 
+#  Lpez de Prado anti-overfit constants
 # Indicators (RSI14, MACD 12/26/9, EMA50, 24h change) are computed over the FULL
 # per-symbol series in the backtester, so the indicator state at a fold's first
 # bars is warmed by the PREVIOUS fold. PURGE_BARS drops each fold's leading
 # timestamps so its signals are warmed from WITHIN the fold; EMBARGO_FRAC adds a
 # gap between adjacent folds. PURGE_BARS = max indicator lookback in bars (EMA50).
-PURGE_BARS   = 50
+PURGE_BARS = 50
 EMBARGO_FRAC = 0.01
 _EULER_GAMMA = 0.5772156649015329
 
@@ -83,31 +88,58 @@ def _norm_ppf(p: float) -> float:
         return -math.inf
     if p >= 1.0:
         return math.inf
-    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
-         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
-    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
-         6.680131188771972e+01, -1.328068155288572e+01]
-    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
-         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
-    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
-         3.754408661907416e+00]
+    a = [
+        -3.969683028665376e01,
+        2.209460984245205e02,
+        -2.759285104469687e02,
+        1.383577518672690e02,
+        -3.066479806614716e01,
+        2.506628277459239e00,
+    ]
+    b = [
+        -5.447609879822406e01,
+        1.615858368580409e02,
+        -1.556989798598866e02,
+        6.680131188771972e01,
+        -1.328068155288572e01,
+    ]
+    c = [
+        -7.784894002430293e-03,
+        -3.223964580411365e-01,
+        -2.400758277161838e00,
+        -2.549732539343734e00,
+        4.374664141464968e00,
+        2.938163982698783e00,
+    ]
+    d = [
+        7.784695709041462e-03,
+        3.224671290700398e-01,
+        2.445134137142996e00,
+        3.754408661907416e00,
+    ]
     plow, phigh = 0.02425, 1.0 - 0.02425
     if p < plow:
         q = math.sqrt(-2.0 * math.log(p))
-        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
-               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0)
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / (
+            (((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0
+        )
     if p > phigh:
         q = math.sqrt(-2.0 * math.log(1.0 - p))
-        return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
-                ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0)
+        return -(
+            ((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]
+        ) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
     q = p - 0.5
     r = q * q
-    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5]) * q / \
-           (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1.0)
+    return (
+        (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5])
+        * q
+        / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+    )
 
 
-def deflated_sharpe_ratio(sr_list: list, sr_best: float, n_obs: int,
-                          skew: float = 0.0, kurt: float = 3.0) -> dict:
+def deflated_sharpe_ratio(
+    sr_list: list, sr_best: float, n_obs: int, skew: float = 0.0, kurt: float = 3.0
+) -> dict:
     """Deflated Sharpe Ratio (Lpez de Prado / Bailey).
 
     sr_list : per-trade Sharpe of EVERY tested config (selection universe)
@@ -123,19 +155,21 @@ def deflated_sharpe_ratio(sr_list: list, sr_best: float, n_obs: int,
     finite = [s for s in sr_list if s is not None and math.isfinite(s)]
     n = len(finite)
     if n < 2 or n_obs is None or n_obs < 2:
-        return {"dsr": None, "sr0": None, "n_trials": n,
-                "reason": "insufficient_stats"}
+        return {"dsr": None, "sr0": None, "n_trials": n, "reason": "insufficient_stats"}
     var_sr = statistics.variance(finite)
     if var_sr <= 0.0:
-        return {"dsr": None, "sr0": None, "n_trials": n,
-                "reason": "zero_variance"}
+        return {"dsr": None, "sr0": None, "n_trials": n, "reason": "zero_variance"}
     z1 = _norm_ppf(1.0 - 1.0 / n)
     z2 = _norm_ppf(1.0 - 1.0 / (n * math.e))
     sr0 = math.sqrt(var_sr) * ((1.0 - _EULER_GAMMA) * z1 + _EULER_GAMMA * z2)
     denom = 1.0 - skew * sr_best + ((kurt - 1.0) / 4.0) * sr_best * sr_best
     if denom <= 0.0:
-        return {"dsr": None, "sr0": sr0, "n_trials": n,
-                "reason": "nonpositive_denominator"}
+        return {
+            "dsr": None,
+            "sr0": sr0,
+            "n_trials": n,
+            "reason": "nonpositive_denominator",
+        }
     z = (sr_best - sr0) * math.sqrt(n_obs - 1) / math.sqrt(denom)
     return {"dsr": _norm_cdf(z), "sr0": sr0, "n_trials": n, "n_obs": n_obs}
 
@@ -172,10 +206,12 @@ def probability_of_backtest_overfitting(perf_matrix: list) -> dict:
     for is_idx in itertools.combinations(all_folds, half):
         is_set = set(is_idx)
         oos_idx = [j for j in all_folds if j not in is_set]
-        is_perf = [statistics.mean(perf_matrix[c][j] for j in is_idx)
-                   for c in range(n_cfg)]
-        oos_perf = [statistics.mean(perf_matrix[c][j] for j in oos_idx)
-                    for c in range(n_cfg)]
+        is_perf = [
+            statistics.mean(perf_matrix[c][j] for j in is_idx) for c in range(n_cfg)
+        ]
+        oos_perf = [
+            statistics.mean(perf_matrix[c][j] for j in oos_idx) for c in range(n_cfg)
+        ]
         best_c = max(range(n_cfg), key=lambda c: is_perf[c])
         ranked = sorted(range(n_cfg), key=lambda c: oos_perf[c])
         oos_rank = ranked.index(best_c)  # 0 = worst OOS
@@ -187,7 +223,7 @@ def probability_of_backtest_overfitting(perf_matrix: list) -> dict:
     if n_part == 0:
         return {"pbo": None, "n_partitions": 0, "reason": "no_partitions"}
     return {
-        "pbo":          below_median / n_part,
+        "pbo": below_median / n_part,
         "n_partitions": n_part,
         "median_logit": statistics.median(logits),
     }
@@ -206,12 +242,12 @@ def _sample_skew_kurt(xs: list) -> tuple:
         return 0.0, 3.0
     m3 = sum((x - mean) ** 3 for x in xs) / n
     m4 = sum((x - mean) ** 4 for x in xs) / n
-    skew = m3 / (m2 ** 1.5)
-    kurt = m4 / (m2 ** 2)
+    skew = m3 / (m2**1.5)
+    kurt = m4 / (m2**2)
     return skew, kurt
 
 
-#  Incremental result persistence 
+#  Incremental result persistence
 # The optimizer is a long job (30-90 min). Each completed result is streamed to
 # a JSONL file as it's computed so a Ctrl+C / OOM never loses partial progress.
 _INCREMENTAL_PATH = None
@@ -227,7 +263,8 @@ def _set_incremental_path(strategy: str, days: int) -> None:
     except OSError:
         log_dir = base
     _INCREMENTAL_PATH = os.path.join(
-        log_dir, f"optimizer_{strategy}_{days}d_{ts}.jsonl")
+        log_dir, f"optimizer_{strategy}_{days}d_{ts}.jsonl"
+    )
 
 
 def _persist_result(record: dict) -> None:
@@ -250,36 +287,36 @@ def _persist_result(record: dict) -> None:
         pass
 
 
-#  Suchrume 
+#  Suchrume
 
 FULL_SPACE = {
     "TREND": {
-        "min_pump":          [2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+        "min_pump": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
         "activation_profit": [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
         "trailing_distance": [0.8, 1.0, 1.5, 2.0, 2.5, 3.0],
-        "stop_loss":         [-1.0, -1.5, -2.0, -2.5, -3.0, -4.0],
-        "partial_pct":       [0.30, 0.40, 0.50, 0.60],
-        "rsi_max":           [60.0, 65.0, 70.0, 75.0, 80.0],
+        "stop_loss": [-1.0, -1.5, -2.0, -2.5, -3.0, -4.0],
+        "partial_pct": [0.30, 0.40, 0.50, 0.60],
+        "rsi_max": [60.0, 65.0, 70.0, 75.0, 80.0],
     },
     "SPOT": {
-        "min_pump":          [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+        "min_pump": [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
         "activation_profit": [4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
         "trailing_distance": [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0],
         # stop_loss is a searched dimension (wide range  spot is unleveraged
         # with 4-10% targets). NOTE: +6x grid size; use --quick for a fast scan.
-        "stop_loss":         [-3.0, -4.0, -6.0, -8.0, -10.0, -12.0],
-        "partial_pct":       [0.25, 0.30, 0.40, 0.50, 0.60],
-        "rsi_max":           [65.0, 70.0, 75.0, 80.0, 85.0],
+        "stop_loss": [-3.0, -4.0, -6.0, -8.0, -10.0, -12.0],
+        "partial_pct": [0.25, 0.30, 0.40, 0.50, 0.60],
+        "rsi_max": [65.0, 70.0, 75.0, 80.0, 85.0],
     },
     # FUTURES strategy  uses spot data as proxy (perpetual data is more
     # limited and often shorter history). Results are indicative.
     "FUTURES": {
-        "min_pump":          [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0],
+        "min_pump": [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0],
         "activation_profit": [3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0],
         "trailing_distance": [1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-        "stop_loss":         [-2.0, -2.5, -3.0, -3.5, -4.0, -5.0],
-        "partial_pct":       [0.30, 0.40, 0.50, 0.60],
-        "rsi_max":           [60.0, 65.0, 70.0, 75.0, 80.0],
+        "stop_loss": [-2.0, -2.5, -3.0, -3.5, -4.0, -5.0],
+        "partial_pct": [0.30, 0.40, 0.50, 0.60],
+        "rsi_max": [60.0, 65.0, 70.0, 75.0, 80.0],
     },
 }
 
@@ -289,7 +326,7 @@ QUICK_SPACE = {
 }
 
 
-#  Walk-Forward Validation 
+#  Walk-Forward Validation
 # Walk-forward beats normal K-Fold for time-series strategy testing because
 # financial data is NOT IID  regimes, trends, volatility clusters mean a
 # random validation slice "leaks" the future into training. Walk-forward
@@ -303,9 +340,14 @@ QUICK_SPACE = {
 # each forward segment. A robust config is profitable on every test slice.
 
 
-def walk_forward_simulate(indexed: dict, all_times: list, strategy: str,
-                            use_maker: bool, params: dict,
-                            n_steps: int = 4) -> dict:
+def walk_forward_simulate(
+    indexed: dict,
+    all_times: list,
+    strategy: str,
+    use_maker: bool,
+    params: dict,
+    n_steps: int = 4,
+) -> dict:
     """Walk-forward validation: split timeline chronologically, test
     same config on each forward slice. Returns per-slice nets + summary."""
     if n_steps < 2:
@@ -316,11 +358,11 @@ def walk_forward_simulate(indexed: dict, all_times: list, strategy: str,
         # Not enough data  fall back to single backtest
         s = simulate_fast(indexed, all_times, strategy, use_maker, params)
         return {
-            "slices":       [s],
-            "slice_nets":   [s.get("net", 0)],
-            "consistency":  1.0 if s.get("net", 0) > 0 else 0.0,
+            "slices": [s],
+            "slice_nets": [s.get("net", 0)],
+            "consistency": 1.0 if s.get("net", 0) > 0 else 0.0,
             "all_profitable": s.get("net", 0) > 0,
-            "fragility":    "single-slice (data too short)",
+            "fragility": "single-slice (data too short)",
         }
 
     embargo = int(total * EMBARGO_FRAC) if EMBARGO_FRAC > 0 else 0
@@ -329,14 +371,14 @@ def walk_forward_simulate(indexed: dict, all_times: list, strategy: str,
     for step in range(n_steps):
         # Forward test slice: position (step+1) of (n_steps+1) total
         start = (step + 1) * slice_len
-        end   = (step + 2) * slice_len if step < n_steps - 1 else total
+        end = (step + 2) * slice_len if step < n_steps - 1 else total
         # Purge leading lookback bars + embargo gap so each forward slice's
         # signals are warmed from WITHIN the slice (no cross-fold leakage).
         purged_start = min(end, start + embargo + max(0, PURGE_BARS))
         period_times = all_times[purged_start:end]
         if len(period_times) < 10:
             period_times = all_times[start:end]
-        period_data  = filter_to_period(indexed, set(period_times))
+        period_data = filter_to_period(indexed, set(period_times))
         s = simulate_fast(period_data, period_times, strategy, use_maker, params)
         slice_nets.append(s.get("net", 0))
         slice_results.append(s)
@@ -344,24 +386,22 @@ def walk_forward_simulate(indexed: dict, all_times: list, strategy: str,
     profitable_count = sum(1 for n in slice_nets if n > 0)
     avg = statistics.mean(slice_nets)
     std = statistics.stdev(slice_nets) if len(slice_nets) > 1 else 0
-    consistency = max(0.0, min(1.0,
-        1 - (std / abs(avg)) if avg != 0 else 0.0
-    ))
+    consistency = max(0.0, min(1.0, 1 - (std / abs(avg)) if avg != 0 else 0.0))
     # Walk-forward "passes" if every forward slice was profitable AND the
     # variance across slices is moderate (consistency > 0.3)
     return {
-        "slices":         slice_results,
-        "slice_nets":     slice_nets,
-        "avg_net":        avg,
-        "std_net":        std,
-        "consistency":    consistency,
+        "slices": slice_results,
+        "slice_nets": slice_nets,
+        "avg_net": avg,
+        "std_net": std,
+        "consistency": consistency,
         "profitable_count": profitable_count,
         "all_profitable": profitable_count == n_steps,
-        "robust":         profitable_count == n_steps and consistency > 0.3,
+        "robust": profitable_count == n_steps and consistency > 0.3,
     }
 
 
-#  Regime Splitting 
+#  Regime Splitting
 # Split the timeline by detected market regime and test the config
 # separately on each. A "good" strategy on overall data can be a complete
 # disaster in one specific regime (e.g. momentum works in bull, dies in chop).
@@ -399,8 +439,9 @@ def detect_regimes(indexed: dict, all_times: list) -> dict:
     return buckets
 
 
-def regime_split_simulate(indexed: dict, all_times: list, strategy: str,
-                           use_maker: bool, params: dict) -> dict:
+def regime_split_simulate(
+    indexed: dict, all_times: list, strategy: str, use_maker: bool, params: dict
+) -> dict:
     """Test BULL / BEAR / CHOP without cutting holes into the timeline.
 
     The simulation must run on continuous bars so stops, liquidation and trailing
@@ -419,12 +460,13 @@ def regime_split_simulate(indexed: dict, all_times: list, strategy: str,
     for regime_name, regime_times in regimes.items():
         if len(regime_times) < 10:
             results[regime_name] = {
-                "net": 0, "trades": 0, "skipped": "insufficient_data"
+                "net": 0,
+                "trades": 0,
+                "skipped": "insufficient_data",
             }
             continue
         regime_trades = [
-            t for t in closed
-            if regime_by_time.get(t.get("entry_time")) == regime_name
+            t for t in closed if regime_by_time.get(t.get("entry_time")) == regime_name
         ]
         if regime_trades:
             s = _compute_stats(
@@ -435,35 +477,39 @@ def regime_split_simulate(indexed: dict, all_times: list, strategy: str,
         else:
             s = {"net": 0.0, "trade_count": 0, "edge": False}
         results[regime_name] = {
-            "net":    s.get("net", 0),
+            "net": s.get("net", 0),
             "trades": s.get("trade_count", 0),
-            "edge":   s.get("edge", False),
-            "ratio":  len(regime_times) / max(1, len(all_times)),
+            "edge": s.get("edge", False),
+            "ratio": len(regime_times) / max(1, len(all_times)),
         }
     # "Survives all regimes" = profitable in every regime with sufficient data
     profitable_regimes = sum(
-        1 for r in results.values()
-        if r.get("net", 0) > 0 and "skipped" not in r
+        1 for r in results.values() if r.get("net", 0) > 0 and "skipped" not in r
     )
     tested_regimes = sum(1 for r in results.values() if "skipped" not in r)
     return {
-        "regimes":           results,
-        "profitable_count":  profitable_regimes,
-        "tested_count":      tested_regimes,
-        "survives_all":      profitable_regimes == tested_regimes and tested_regimes >= 2,
+        "regimes": results,
+        "profitable_count": profitable_regimes,
+        "tested_count": tested_regimes,
+        "survives_all": profitable_regimes == tested_regimes and tested_regimes >= 2,
     }
 
 
-#  Outlier-Dependency Test 
+#  Outlier-Dependency Test
 # A strategy whose entire edge comes from 1-2 lucky home-run trades is
 # fragile  in live trading those same outliers may never occur again.
 # Test: remove the top N trades and recompute net. If the strategy still
 # profits, the edge is broadly distributed.
 
 
-def outlier_dependency_test(indexed: dict, all_times: list, strategy: str,
-                              use_maker: bool, params: dict,
-                              top_n_to_remove: list = (1, 5, 10)) -> dict:
+def outlier_dependency_test(
+    indexed: dict,
+    all_times: list,
+    strategy: str,
+    use_maker: bool,
+    params: dict,
+    top_n_to_remove: list = (1, 5, 10),
+) -> dict:
     """Re-simulate while excluding the top N most-profitable trades."""
     s_full = simulate_fast(indexed, all_times, strategy, use_maker, params)
     full_net = s_full.get("net", 0)
@@ -479,9 +525,9 @@ def outlier_dependency_test(indexed: dict, all_times: list, strategy: str,
         removed = sum(nets[:n])
         adjusted_net = full_net - removed
         results[f"remove_top_{n}"] = {
-            "removed_net":    removed,
-            "adjusted_net":   adjusted_net,
-            "drop_pct":       (removed / abs(full_net) * 100) if full_net else 0,
+            "removed_net": removed,
+            "adjusted_net": adjusted_net,
+            "drop_pct": (removed / abs(full_net) * 100) if full_net else 0,
             "still_positive": adjusted_net > 0,
         }
 
@@ -489,14 +535,14 @@ def outlier_dependency_test(indexed: dict, all_times: list, strategy: str,
     outlier_fragile = r1.get("still_positive") is False if "skipped" not in r1 else None
 
     return {
-        "full_net":         full_net,
-        "trade_count":      trade_count,
-        "scenarios":        results,
-        "outlier_fragile":  outlier_fragile,
+        "full_net": full_net,
+        "trade_count": trade_count,
+        "scenarios": results,
+        "outlier_fragile": outlier_fragile,
     }
 
 
-#  Monte-Carlo Equity Perturbation 
+#  Monte-Carlo Equity Perturbation
 # Test if equity holds up when trade order/timing is shuffled. Many bad
 # strategies only profit due to a lucky sequence; Monte Carlo destroys
 # that illusion. We use the published net as the anchor and synthesize
@@ -515,8 +561,12 @@ def monte_carlo_perturbation(s_full: dict, n_runs: int = 100) -> dict:
     nets = list(s_full.get("net_trades") or [])
     trade_count = len(nets)
     if trade_count < 5:
-        return {"runs": 0, "positive_share": None,
-                "robust": None, "reason": "insufficient_stats"}
+        return {
+            "runs": 0,
+            "positive_share": None,
+            "robust": None,
+            "reason": "insufficient_stats",
+        }
 
     rng = _random.Random(_OPTIMIZER_SEED)  # deterministic for reproducibility
     block = max(1, min(10, trade_count // 5))
@@ -526,7 +576,7 @@ def monte_carlo_perturbation(s_full: dict, n_runs: int = 100) -> dict:
         seq = []
         while len(seq) < trade_count:
             start = rng.randrange(trade_count)
-            seq.extend(nets[start:start + block])
+            seq.extend(nets[start : start + block])
         eq = sum(seq[:trade_count])
         final_equities.append(eq)
         if eq > 0:
@@ -534,21 +584,25 @@ def monte_carlo_perturbation(s_full: dict, n_runs: int = 100) -> dict:
     share = positive_runs / n_runs
     final_equities.sort()
     return {
-        "runs":             n_runs,
-        "positive_share":   share,
-        "median_final":     final_equities[n_runs // 2],
-        "worst_decile":     final_equities[max(0, n_runs // 10 - 1)],
-        "robust":           share >= 0.90,
-        "concerning":       share < 0.70,
-        "method":           "block_bootstrap",
+        "runs": n_runs,
+        "positive_share": share,
+        "median_final": final_equities[n_runs // 2],
+        "worst_decile": final_equities[max(0, n_runs // 10 - 1)],
+        "robust": share >= 0.90,
+        "concerning": share < 0.70,
+        "method": "block_bootstrap",
     }
 
 
-#  K-Fold Validation 
+#  K-Fold Validation
 
-def split_into_folds(all_times: list, k: int = 4,
-                     purge_bars: int = PURGE_BARS,
-                     embargo_frac: float = EMBARGO_FRAC) -> list:
+
+def split_into_folds(
+    all_times: list,
+    k: int = 4,
+    purge_bars: int = PURGE_BARS,
+    embargo_frac: float = EMBARGO_FRAC,
+) -> list:
     """Teilt Zeitstempel in K gleich groe, sortierte, PURGED+EMBARGOED Perioden.
 
     Each raw fold is a chronological slice. To kill cross-fold indicator leakage
@@ -557,13 +611,13 @@ def split_into_folds(all_times: list, k: int = 4,
     warmed from WITHIN the fold, and an EMBARGO gap of `embargo_frac` of the
     total length is dropped from the FRONT of each fold (except the first) to
     separate adjacent folds. Resulting fold time-sets are disjoint with a gap."""
-    n        = len(all_times)
+    n = len(all_times)
     fold_len = n // k
-    embargo  = int(n * embargo_frac) if embargo_frac > 0 else 0
-    folds    = []
+    embargo = int(n * embargo_frac) if embargo_frac > 0 else 0
+    folds = []
     for i in range(k):
         start = i * fold_len
-        end   = (i + 1) * fold_len if i < k - 1 else n
+        end = (i + 1) * fold_len if i < k - 1 else n
         # Embargo gap before every fold after the first.
         purged_start = start + (embargo if i > 0 else 0) + max(0, purge_bars)
         if purged_start < end:
@@ -581,8 +635,9 @@ def filter_to_period(indexed: dict, time_set: set) -> dict:
     }
 
 
-def kfold_simulate(indexed: dict, folds: list, strategy: str,
-                   use_maker: bool, params: dict) -> dict:
+def kfold_simulate(
+    indexed: dict, folds: list, strategy: str, use_maker: bool, params: dict
+) -> dict:
     """
     Testet die Config auf K unabhngigen Perioden.
     Eine Config gilt als robust wenn sie in ALLEN Folds profitabel ist.
@@ -590,31 +645,32 @@ def kfold_simulate(indexed: dict, folds: list, strategy: str,
     fold_results = []
     for period_times in folds:
         period_data = filter_to_period(indexed, set(period_times))
-        s           = simulate_fast(period_data, period_times, strategy, use_maker, params)
+        s = simulate_fast(period_data, period_times, strategy, use_maker, params)
         fold_results.append(s)
 
-    nets        = [s.get("net", -9999) for s in fold_results]
-    edge_count  = sum(1 for s in fold_results if s.get("edge"))
-    profit_cnt  = sum(1 for n in nets if n > 0)
-    avg_net     = statistics.mean(nets)
-    std_net     = statistics.stdev(nets) if len(nets) > 1 else 0
+    nets = [s.get("net", -9999) for s in fold_results]
+    edge_count = sum(1 for s in fold_results if s.get("edge"))
+    profit_cnt = sum(1 for n in nets if n > 0)
+    avg_net = statistics.mean(nets)
+    std_net = statistics.stdev(nets) if len(nets) > 1 else 0
     consistency = 1 - (std_net / abs(avg_net)) if avg_net != 0 else 0
     consistency = max(0, min(1, consistency))  # auf [0,1] beschrnken
 
     return {
-        "fold_nets":      nets,
-        "fold_results":   fold_results,
-        "edge_count":     edge_count,
-        "profit_count":   profit_cnt,
-        "avg_net":        avg_net,
-        "std_net":        std_net,
-        "consistency":    consistency,
-        "robust":         profit_cnt == len(folds),
+        "fold_nets": nets,
+        "fold_results": fold_results,
+        "edge_count": edge_count,
+        "profit_count": profit_cnt,
+        "avg_net": avg_net,
+        "std_net": std_net,
+        "consistency": consistency,
+        "robust": profit_cnt == len(folds),
     }
 
 
-def holdout_simulate(indexed: dict, holdout_times: list, strategy: str,
-                     use_maker: bool, params: dict) -> dict:
+def holdout_simulate(
+    indexed: dict, holdout_times: list, strategy: str, use_maker: bool, params: dict
+) -> dict:
     """Single OUT-OF-SAMPLE run on the reserved holdout slice  data the search
     never saw during tuning. Same engine as one K-fold period."""
     if not holdout_times:
@@ -716,11 +772,17 @@ def build_pbo_block_matrix(
     return matrix
 
 
-#  Sensitivitts-Analyse 
+#  Sensitivitts-Analyse
 
-def sensitivity_check(indexed: dict, all_times: list, base_params: dict,
-                      strategy: str, use_maker: bool,
-                      search_space: dict) -> dict:
+
+def sensitivity_check(
+    indexed: dict,
+    all_times: list,
+    base_params: dict,
+    strategy: str,
+    use_maker: bool,
+    search_space: dict,
+) -> dict:
     """
     Variiert jeden Parameter um 1 Schritt im Suchraum.
     Berechnet wie stark sich Netto-PnL dabei ndert.
@@ -728,7 +790,7 @@ def sensitivity_check(indexed: dict, all_times: list, base_params: dict,
     Niedrige Standardabweichung = robust
     Hohe Standardabweichung     = fragil (overfit)
     """
-    base_s   = simulate_fast(indexed, all_times, strategy, use_maker, base_params)
+    base_s = simulate_fast(indexed, all_times, strategy, use_maker, base_params)
     base_net = base_s.get("net", 0)
 
     perturbations = []  # (param_name, delta, new_net, change_pct)
@@ -748,27 +810,36 @@ def sensitivity_check(indexed: dict, all_times: list, base_params: dict,
             new_idx = idx + delta
             if not (0 <= new_idx < len(values)):
                 continue
-            new_params      = dict(base_params)
+            new_params = dict(base_params)
             new_params[param] = values[new_idx]
             s = simulate_fast(indexed, all_times, strategy, use_maker, new_params)
             new_net = s.get("net", 0)
-            change_pct = ((new_net - base_net) / abs(base_net) * 100) if base_net != 0 else 0
-            perturbations.append({
-                "param":     param,
-                "from":      base_val,
-                "to":        values[new_idx],
-                "delta":     delta,
-                "new_net":   new_net,
-                "change_pct": change_pct,
-            })
+            change_pct = (
+                ((new_net - base_net) / abs(base_net) * 100) if base_net != 0 else 0
+            )
+            perturbations.append(
+                {
+                    "param": param,
+                    "from": base_val,
+                    "to": values[new_idx],
+                    "delta": delta,
+                    "new_net": new_net,
+                    "change_pct": change_pct,
+                }
+            )
 
     if not perturbations:
-        return {"perturbations": [], "max_change": 0, "avg_change": 0,
-                "robust": False, "rating": ""}
+        return {
+            "perturbations": [],
+            "max_change": 0,
+            "avg_change": 0,
+            "robust": False,
+            "rating": "",
+        }
 
-    changes        = [abs(p["change_pct"]) for p in perturbations]
-    max_change     = max(changes)
-    avg_change     = statistics.mean(changes)
+    changes = [abs(p["change_pct"]) for p in perturbations]
+    max_change = max(changes)
+    avg_change = statistics.mean(changes)
 
     # Bewertung:
     #  < 15% durchschnittliche nderung  ROBUST
@@ -782,22 +853,26 @@ def sensitivity_check(indexed: dict, all_times: list, base_params: dict,
         rating = " FRAGIL"
 
     return {
-        "base_net":      base_net,
+        "base_net": base_net,
         "perturbations": perturbations,
-        "max_change":    max_change,
-        "avg_change":    avg_change,
-        "rating":        rating,
-        "robust":        avg_change < 15,
+        "max_change": max_change,
+        "avg_change": avg_change,
+        "rating": rating,
+        "robust": avg_change < 15,
     }
 
 
-#  Robustness Score 
+#  Robustness Score
 
-def robustness_score(s_full: dict, kfold: dict,
-                       walk_forward: dict = None,
-                       regime_split: dict = None,
-                       outlier_test: dict = None,
-                       monte_carlo: dict = None) -> float:
+
+def robustness_score(
+    s_full: dict,
+    kfold: dict,
+    walk_forward: dict = None,
+    regime_split: dict = None,
+    outlier_test: dict = None,
+    monte_carlo: dict = None,
+) -> float:
     """Composite score that punishes profit-but-fragile strategies.
 
     Base term: avg_net  consistency  (1+sharpe)  (1 - dd/100)
@@ -814,10 +889,10 @@ def robustness_score(s_full: dict, kfold: dict,
         # Configs die nicht in allen Folds profitabel sind: starkes Penalty
         return s_full.get("net", -9999) * 0.1
 
-    avg_net  = kfold["avg_net"]
-    consist  = kfold["consistency"]
-    sharpe   = max(0, s_full.get("sharpe", 0))
-    dd       = max(0.1, s_full.get("max_dd", 99))
+    avg_net = kfold["avg_net"]
+    consist = kfold["consistency"]
+    sharpe = max(0, s_full.get("sharpe", 0))
+    dd = max(0.1, s_full.get("max_dd", 99))
 
     score = avg_net * consist * (1 + sharpe) * (1 - dd / 100)
 
@@ -851,20 +926,23 @@ def robustness_score(s_full: dict, kfold: dict,
     return score
 
 
-#  Hilfsfunktionen 
+#  Hilfsfunktionen
+
 
 def _label(p, strategy):
     pump_label = "move" if strategy == "FUTURES" else "pump"
-    s = (f"{pump_label}={p['min_pump']:.0f}%  TP={p['activation_profit']:.1f}%  "
-         f"trail={p['trailing_distance']:.1f}%  partial={p['partial_pct']:.0%}  "
-         f"rsi{p['rsi_max']:.0f}")
+    s = (
+        f"{pump_label}={p['min_pump']:.0f}%  TP={p['activation_profit']:.1f}%  "
+        f"trail={p['trailing_distance']:.1f}%  partial={p['partial_pct']:.0%}  "
+        f"rsi{p['rsi_max']:.0f}"
+    )
     if strategy in ("TREND", "FUTURES"):
         s += f"  stop={p.get('stop_loss', -2):.1f}%"
     return s
 
 
 def _cmd(p, strategy, days, use_maker):
-    c  = f"python backtester.py {strategy} {days}"
+    c = f"python backtester.py {strategy} {days}"
     c += f" --pump {p['min_pump']:.0f}"
     c += f" --activation {p['activation_profit']:.1f}"
     c += f" --trailing {p['trailing_distance']:.1f}"
@@ -882,19 +960,21 @@ def _cmd(p, strategy, days, use_maker):
     return c
 
 
-#  CSV-Export 
+#  CSV-Export
+
 
 def export_csv(results, strategy, days, k_folds):
-    ts          = datetime.now().strftime("%Y%m%d_%H%M")
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
     # optimizer_results/ lives at PROJECT ROOT (read by the launcher UI), not
     # inside tools/.
     try:
         from core.paths import OPT_RESULTS
+
         results_dir = str(OPT_RESULTS)
     except Exception:
         results_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "optimizer_results"
+            "optimizer_results",
         )
     os.makedirs(results_dir, exist_ok=True)
 
@@ -902,8 +982,12 @@ def export_csv(results, strategy, days, k_folds):
     try:
         prefix = f"optimizer_{strategy.lower()}_"
         existing = sorted(
-            [f for f in os.listdir(results_dir) if f.startswith(prefix) and f.endswith(".csv")],
-            reverse=True
+            [
+                f
+                for f in os.listdir(results_dir)
+                if f.startswith(prefix) and f.endswith(".csv")
+            ],
+            reverse=True,
         )
         for old in existing[19:]:  # behalte 19 (+ neue = 20)
             try:
@@ -913,58 +997,84 @@ def export_csv(results, strategy, days, k_folds):
     except Exception:
         pass
 
-    filename = os.path.join(results_dir,
-                              f"optimizer_{strategy.lower()}_{days}d_{ts}.csv")
-    fields   = [
-        "rank", "robust", "deployment_validated", "holdout_net",
-        "avg_net", "std_net", "consistency",
-        "score", "fold_profitable_count",
-        "full_net", "full_roi", "win_rate", "sharpe", "max_dd", "cost_pct", "trades",
-        "min_pump", "activation_profit", "trailing_distance",
-        "stop_loss", "partial_pct", "rsi_max",
-        "fold_nets", "cli_command",
+    filename = os.path.join(
+        results_dir, f"optimizer_{strategy.lower()}_{days}d_{ts}.csv"
+    )
+    fields = [
+        "rank",
+        "robust",
+        "deployment_validated",
+        "holdout_net",
+        "avg_net",
+        "std_net",
+        "consistency",
+        "score",
+        "fold_profitable_count",
+        "full_net",
+        "full_roi",
+        "win_rate",
+        "sharpe",
+        "max_dd",
+        "cost_pct",
+        "trades",
+        "min_pump",
+        "activation_profit",
+        "trailing_distance",
+        "stop_loss",
+        "partial_pct",
+        "rsi_max",
+        "fold_nets",
+        "cli_command",
     ]
     with open(filename, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for i, r in enumerate(results):
-            s  = r["stats"]
-            p  = r["params"]
+            s = r["stats"]
+            p = r["params"]
             kf = r["kfold"]
-            w.writerow({
-                "rank":                  i + 1,
-                "robust":                "Ja" if kf["robust"] else "Nein",
-                "deployment_validated":  "Ja" if r.get("deployment_validated") else "Nein",
-                "holdout_net":           (round((r.get("holdout") or {}).get("net", 0), 2)
-                                          if r.get("holdout") and not (r.get("holdout") or {}).get("skipped")
-                                          else ""),
-                "avg_net":               round(kf["avg_net"], 2),
-                "std_net":               round(kf["std_net"], 2),
-                "consistency":           round(kf["consistency"], 3),
-                "score":                 round(r["score"], 4),
-                "fold_profitable_count": f"{kf['profit_count']}/{k_folds}",
-                "full_net":              round(s.get("net", 0), 2),
-                "full_roi":              round(s.get("roi", 0), 2),
-                "win_rate":              round(s.get("win_rate", 0), 3),
-                "sharpe":                round(s.get("sharpe", 0), 3),
-                "max_dd":                round(s.get("max_dd", 0), 1),
-                "cost_pct":              round(s.get("cost_pct", 0), 1),
-                "trades":                s.get("trades", 0),
-                "min_pump":              p.get("min_pump"),
-                "activation_profit":     p.get("activation_profit"),
-                "trailing_distance":     p.get("trailing_distance"),
-                "stop_loss":             p.get("stop_loss", ""),
-                "partial_pct":           p.get("partial_pct"),
-                "rsi_max":               p.get("rsi_max"),
-                "fold_nets":             ";".join(f"{n:.2f}" for n in kf["fold_nets"]),
-                "cli_command":           r.get("cmd", ""),
-            })
+            w.writerow(
+                {
+                    "rank": i + 1,
+                    "robust": "Ja" if kf["robust"] else "Nein",
+                    "deployment_validated": "Ja"
+                    if r.get("deployment_validated")
+                    else "Nein",
+                    "holdout_net": (
+                        round((r.get("holdout") or {}).get("net", 0), 2)
+                        if r.get("holdout")
+                        and not (r.get("holdout") or {}).get("skipped")
+                        else ""
+                    ),
+                    "avg_net": round(kf["avg_net"], 2),
+                    "std_net": round(kf["std_net"], 2),
+                    "consistency": round(kf["consistency"], 3),
+                    "score": round(r["score"], 4),
+                    "fold_profitable_count": f"{kf['profit_count']}/{k_folds}",
+                    "full_net": round(s.get("net", 0), 2),
+                    "full_roi": round(s.get("roi", 0), 2),
+                    "win_rate": round(s.get("win_rate", 0), 3),
+                    "sharpe": round(s.get("sharpe", 0), 3),
+                    "max_dd": round(s.get("max_dd", 0), 1),
+                    "cost_pct": round(s.get("cost_pct", 0), 1),
+                    "trades": s.get("trades", 0),
+                    "min_pump": p.get("min_pump"),
+                    "activation_profit": p.get("activation_profit"),
+                    "trailing_distance": p.get("trailing_distance"),
+                    "stop_loss": p.get("stop_loss", ""),
+                    "partial_pct": p.get("partial_pct"),
+                    "rsi_max": p.get("rsi_max"),
+                    "fold_nets": ";".join(f"{n:.2f}" for n in kf["fold_nets"]),
+                    "cli_command": r.get("cmd", ""),
+                }
+            )
     rel_filename = os.path.relpath(filename)
     print(f"  Ergebnisse gespeichert: {rel_filename}")
     return filename
 
 
-#  Fortschrittsbalken 
+#  Fortschrittsbalken
+
 
 class Progress:
     """Progress tracker for the optimizer. Emits TWO kinds of output:
@@ -979,23 +1089,23 @@ class Progress:
 
     def __init__(self, total, label="Sim"):
         self.total = total
-        self.done  = 0
+        self.done = 0
         self.start = time.time()
-        self.best  = None
+        self.best = None
         self.label = label
         # Emit ticks at every 1% OR every 5 seconds  whichever comes first
         self._last_emit = 0.0
-        self._last_pct  = -1
+        self._last_pct = -1
 
     def update(self, net):
         self.done += 1
         if self.best is None or net > self.best:
             self.best = net
         elapsed = time.time() - self.start
-        eta     = elapsed / self.done * (self.total - self.done) if self.done else 0
-        pct     = self.done / self.total
-        bar  = "" * int(pct * 26) + "" * (26 - int(pct * 26))
-        best_s  = f"+{self.best:.2f}" if self.best else ""
+        eta = elapsed / self.done * (self.total - self.done) if self.done else 0
+        pct = self.done / self.total
+        bar = "" * int(pct * 26) + "" * (26 - int(pct * 26))
+        best_s = f"+{self.best:.2f}" if self.best else ""
 
         # Terminal-friendly live bar (stderr  bypasses the launcher's line reader)
         sys.stderr.write(
@@ -1005,29 +1115,32 @@ class Progress:
         sys.stderr.flush()
 
         # Launcher-parseable markers  emit on each 1% step OR every 5s
-        now      = time.time()
-        pct_int  = int(pct * 100)
+        now = time.time()
+        pct_int = int(pct * 100)
         emit_now = (
-            pct_int != self._last_pct or
-            (now - self._last_emit) >= 5.0 or
-            self.done == self.total
+            pct_int != self._last_pct
+            or (now - self._last_emit) >= 5.0
+            or self.done == self.total
         )
         if emit_now:
-            payload = _json.dumps({
-                "label": self.label,
-                "done":  self.done,
-                "total": self.total,
-                "pct":   round(pct, 4),
-                "best":  round(self.best, 4) if self.best is not None else None,
-                "eta_s": int(eta),
-                "elapsed_s": int(elapsed),
-            })
+            payload = _json.dumps(
+                {
+                    "label": self.label,
+                    "done": self.done,
+                    "total": self.total,
+                    "pct": round(pct, 4),
+                    "best": round(self.best, 4) if self.best is not None else None,
+                    "eta_s": int(eta),
+                    "elapsed_s": int(elapsed),
+                }
+            )
             print(f"<<<PROGRESS>>>{payload}<<<END>>>", flush=True)
             self._last_emit = now
-            self._last_pct  = pct_int
+            self._last_pct = pct_int
 
 
-#  Haupt-Optimizer 
+#  Haupt-Optimizer
+
 
 def _resolve_leverage(strategy: str, override: float = None) -> float:
     """Determine the leverage the backtest should use.
@@ -1056,6 +1169,7 @@ def _resolve_leverage(strategy: str, override: float = None) -> float:
         pass
     try:
         from tools.backtester import STRATEGY_DEFAULTS
+
         return max(1.0, float(STRATEGY_DEFAULTS.get(strategy, {}).get("leverage", 1.0)))
     except Exception:
         return 1.0
@@ -1092,35 +1206,49 @@ def _resolve_live_risk_params(strategy: str) -> dict:
     return out
 
 
-def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
-                  use_maker: bool = False, top_n: int = 10,
-                  k_folds: int = 4, quick: bool = False,
-                  do_sensitivity: bool = True, leverage: float = None,
-                  holdout_frac: float = 0.2,
-                  own_momentum: bool = False, om_window: int = 8,
-                  regime: bool = False, funding_8h: float = 0.0):
+def run_optimizer(
+    strategy: str,
+    days: int = DEFAULT_DAYS,
+    use_maker: bool = False,
+    top_n: int = 10,
+    k_folds: int = 4,
+    quick: bool = False,
+    do_sensitivity: bool = True,
+    leverage: float = None,
+    holdout_frac: float = 0.2,
+    own_momentum: bool = False,
+    om_window: int = 8,
+    regime: bool = False,
+    funding_8h: float = 0.0,
+):
 
-    rt    = calc_round_trip(use_maker, strategy)
+    rt = calc_round_trip(use_maker, strategy)
     space = QUICK_SPACE[strategy] if quick else FULL_SPACE[strategy]
-    lev   = _resolve_leverage(strategy, leverage)
+    lev = _resolve_leverage(strategy, leverage)
     live_risk_params = _resolve_live_risk_params(strategy)
 
     log_separator("", 78, color="\033[96m")
     print(f"  STRATEGIE-OPTIMIZER v3  {strategy}")
-    print(f"  {days} Tage | RT {rt*100:.2f}% | Hebel: x{lev:g} | "
-          f"K-Fold: {k_folds} Perioden | "
-          f"Sensitivitt: {'Ja' if do_sensitivity else 'Nein'} | "
-          f"Modus: {'Quick' if quick else 'Voll'}")
+    print(
+        f"  {days} Tage | RT {rt * 100:.2f}% | Hebel: x{lev:g} | "
+        f"K-Fold: {k_folds} Perioden | "
+        f"Sensitivitt: {'Ja' if do_sensitivity else 'Nein'} | "
+        f"Modus: {'Quick' if quick else 'Voll'}"
+    )
     if strategy == "FUTURES":
         _src = "CLI" if leverage is not None else "bot_config.json"
-        print(f"  Hebel x{lev:g} aus {_src}  Stop/TP-% sind PREIS-Bewegungen, "
-               f"Margin-Wirkung = %  {lev:g}")
+        print(
+            f"  Hebel x{lev:g} aus {_src}  Stop/TP-% sind PREIS-Bewegungen, "
+            f"Margin-Wirkung = %  {lev:g}"
+        )
     if live_risk_params:
-        print("  Live-Risk-Sizing im Backtest: " + ", ".join(
-            f"{k}={v:g}" for k, v in sorted(live_risk_params.items())))
+        print(
+            "  Live-Risk-Sizing im Backtest: "
+            + ", ".join(f"{k}={v:g}" for k, v in sorted(live_risk_params.items()))
+        )
     log_separator("", 78, color="\033[96m")
 
-    keys   = list(space.keys())
+    keys = list(space.keys())
     combos = list(itertools.product(*[space[k] for k in keys]))
     p_list = [dict(zip(keys, c)) for c in combos]
     # Inject the resolved leverage into EVERY config so simulate_fast uses it
@@ -1137,16 +1265,22 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
         if funding_8h:
             _p["funding_rate_8h"] = funding_8h
     if funding_8h:
-        print(f"  Funding-Sensitivitt AKTIV  {funding_8h*100:.4f}%/8h auf das "
-              f"Notional pro Hold-Dauer (Kosten, beide Seiten)")
+        print(
+            f"  Funding-Sensitivitt AKTIV  {funding_8h * 100:.4f}%/8h auf das "
+            f"Notional pro Hold-Dauer (Kosten, beide Seiten)"
+        )
     elif strategy == "FUTURES":
-        print("  FUNDING NICHT MODELLIERT (0%/8h)  echtes Leveraged-FUTURES "
-              "zahlt alle 8h Funding; gemeldete Edge ist OPTIMISTISCH. Mit "
-              "--funding R (z.B. 0.0001) realistisch rechnen, sonst kann eine "
-              "net-negative Config als 'deployment_validated' durchrutschen.")
+        print(
+            "  FUNDING NICHT MODELLIERT (0%/8h)  echtes Leveraged-FUTURES "
+            "zahlt alle 8h Funding; gemeldete Edge ist OPTIMISTISCH. Mit "
+            "--funding R (z.B. 0.0001) realistisch rechnen, sonst kann eine "
+            "net-negative Config als 'deployment_validated' durchrutschen."
+        )
     if own_momentum:
-        print(f"  Own-Momentum-Overlay AKTIV (Fenster {om_window})  blockt "
-              f"Entries solange die letzten {om_window} Closes net-negativ sind")
+        print(
+            f"  Own-Momentum-Overlay AKTIV (Fenster {om_window})  blockt "
+            f"Entries solange die letzten {om_window} Closes net-negativ sind"
+        )
     if regime:
         print("  Regime-Gate AKTIV  LONG nur wenn BTC>EMA50, SHORT nur wenn BTC<EMA50")
 
@@ -1184,11 +1318,13 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
     coins = get_top_volume_coins(ex, n=30, days=days)
     print(f"   {len(coins)} Coins")
     print("  SURVIVORSHIP BIAS (reduziert): Universum = HEUTIGE Top-Volumen-Coins.")
-    print(f"     Listing-Age-Filter entfernt Coins die VOR {days}d noch nicht handelten,")
+    print(
+        f"     Listing-Age-Filter entfernt Coins die VOR {days}d noch nicht handelten,"
+    )
     print("  aber DELISTETE Coins fehlen weiterhin  NICHT vollstndig unverzerrt.\n")
 
     print(f" Lade {days}-Tage-Historie...")
-    t_load  = time.time()
+    t_load = time.time()
     history = {}
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(fetch_history, ex, c, days): c for c in coins}
@@ -1201,30 +1337,32 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
             except Exception as e:
                 print(f"   [WARN] {coin}: {type(e).__name__}: {e}")
     history = filter_universe_by_history(history, days)
-    print(f"   {len(history)} Coins in {time.time()-t_load:.1f}s\n")
+    print(f"   {len(history)} Coins in {time.time() - t_load:.1f}s\n")
 
     # Vorindexierung
     print(" Vorindexierung...")
     t_idx = time.time()
     indexed, all_times = precompute_index(history)
-    print(f"   {len(all_times):,} Zeitstempel in {time.time()-t_idx:.1f}s\n")
+    print(f"   {len(all_times):,} Zeitstempel in {time.time() - t_idx:.1f}s\n")
 
-    #  Out-of-sample HOLDOUT split 
+    #  Out-of-sample HOLDOUT split
     # Reserve the most RECENT holdout_frac of the timeline. It is excluded from
     # EVERY tuning step (folds, walk-forward, regime-split, full-period score,
     # monte-carlo, sensitivity) and only the finally-selected configs are scored
     # on it  an honest "deployment test" on data the search never saw. Without
     # it, K-fold/walk-forward can still collectively overfit the sampled period.
     holdout_times: list = []
-    tune_times          = all_times
+    tune_times = all_times
     if 0.0 < holdout_frac < 0.9 and len(all_times) >= 50:
-        cut          = int(len(all_times) * (1.0 - holdout_frac))
-        tune_times   = all_times[:cut]
+        cut = int(len(all_times) * (1.0 - holdout_frac))
+        tune_times = all_times[:cut]
         holdout_times = all_times[cut:]
-        print(f"  Holdout (out-of-sample, NICHT im Tuning): "
-              f"{len(holdout_times):,} Stempel "
-              f"({holdout_times[0].strftime('%Y-%m-%d')}  "
-              f"{holdout_times[-1].strftime('%Y-%m-%d')})\n")
+        print(
+            f"  Holdout (out-of-sample, NICHT im Tuning): "
+            f"{len(holdout_times):,} Stempel "
+            f"({holdout_times[0].strftime('%Y-%m-%d')}  "
+            f"{holdout_times[-1].strftime('%Y-%m-%d')})\n"
+        )
     else:
         print("  Holdout uebersprungen (zu wenig Daten oder --holdout 0)\n")
 
@@ -1233,8 +1371,10 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
     print(f"  K-Fold Split ({k_folds} Perioden):")
     for i, fold in enumerate(folds, 1):
         if fold:
-            print(f"    Fold {i}: {len(fold):,} Stempel "
-                  f"({fold[0].strftime('%Y-%m-%d')}  {fold[-1].strftime('%Y-%m-%d')})")
+            print(
+                f"    Fold {i}: {len(fold):,} Stempel "
+                f"({fold[0].strftime('%Y-%m-%d')}  {fold[-1].strftime('%Y-%m-%d')})"
+            )
     print()
 
     # Open a per-run JSONL where every config result is appended incrementally
@@ -1244,17 +1384,19 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
         print(f"   Incremental log: {_INCREMENTAL_PATH}")
 
     # Hauptsimulation
-    print(f"  Simuliere {len(p_list):,} Configs  {k_folds} Folds = "
-          f"{len(p_list) * k_folds:,} Sims...\n")
-    t_sim    = time.time()
+    print(
+        f"  Simuliere {len(p_list):,} Configs  {k_folds} Folds = "
+        f"{len(p_list) * k_folds:,} Sims...\n"
+    )
+    t_sim = time.time()
     progress = Progress(len(p_list), label="Optimize")
-    results  = []
+    results = []
 
     def _run(params):
         # Tuning window only  the holdout slice never enters selection.
         s_full = simulate_fast(indexed, tune_times, strategy, use_maker, params)
-        kf     = kfold_simulate(indexed, folds, strategy, use_maker, params)
-        sc     = robustness_score(s_full, kf)
+        kf = kfold_simulate(indexed, folds, strategy, use_maker, params)
+        sc = robustness_score(s_full, kf)
         progress.update(s_full.get("net", -9999))
         rec = {"params": params, "stats": s_full, "kfold": kf, "score": sc}
         # persist this result immediately
@@ -1267,44 +1409,65 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
             results.append(f.result())
 
     elapsed = time.time() - t_sim
-    print(f"\n\n  {len(results):,} Configs in {elapsed:.0f}s "
-          f"({elapsed/len(results)*1000:.0f}ms/Config inkl. K-Fold)\n")
+    print(
+        f"\n\n  {len(results):,} Configs in {elapsed:.0f}s "
+        f"({elapsed / len(results) * 1000:.0f}ms/Config inkl. K-Fold)\n"
+    )
 
     # Sortierung: zuerst robuste Configs, dann nach Score
     robust_cfgs = [r for r in results if r["kfold"]["robust"]]
     sorted_results = rank_optimizer_candidates(results)
 
-    #  Deep robustness validation on the top candidates 
+    #  Deep robustness validation on the top candidates
     # walk_forward / regime_split / outlier / monte_carlo feed robustness_score's
     # modifiers. Running them on the FULL grid would 2-3 the runtime; instead we
-    # validate only the top-K already-robust k-fold winners (~8 extra sims each 
+    # validate only the top-K already-robust k-fold winners (~8 extra sims each
     # negligible beside the grid). The enriched score feeds back into the ranking
     # so a config that survives out-of-sample outranks a k-fold winner that
     # crumbles.
     deep_k = min(len(robust_cfgs), max(top_n, 10))
     if deep_k > 0:
-        print(f"\n Deep-validating top {deep_k} robust config(s) "
-              f"(walk-forward  regime  outlier  monte-carlo)")
+        print(
+            f"\n Deep-validating top {deep_k} robust config(s) "
+            f"(walk-forward  regime  outlier  monte-carlo)"
+        )
         for r in robust_cfgs[:deep_k]:
             p = r["params"]
+
             def _safe(fn):
                 try:
                     return fn()
                 except Exception:
                     return None
-            wf = _safe(lambda: walk_forward_simulate(indexed, tune_times, strategy, use_maker, p))
-            rs = _safe(lambda: regime_split_simulate(indexed, tune_times, strategy, use_maker, p))
-            ot = _safe(lambda: outlier_dependency_test(indexed, tune_times, strategy, use_maker, p))
-            mc = _safe(lambda: monte_carlo_perturbation(r["stats"]))
+
+            wf = _safe(
+                lambda params=p: walk_forward_simulate(
+                    indexed, tune_times, strategy, use_maker, params
+                )
+            )
+            rs = _safe(
+                lambda params=p: regime_split_simulate(
+                    indexed, tune_times, strategy, use_maker, params
+                )
+            )
+            ot = _safe(
+                lambda params=p: outlier_dependency_test(
+                    indexed, tune_times, strategy, use_maker, params
+                )
+            )
+            mc = _safe(lambda result=r: monte_carlo_perturbation(result["stats"]))
             r["walk_forward"] = wf
             r["regime_split"] = rs
             r["outlier_test"] = ot
-            r["monte_carlo"]  = mc
+            r["monte_carlo"] = mc
             # Recompute score WITH the deep modifiers.
             r["score"] = robustness_score(
-                r["stats"], r["kfold"],
-                walk_forward=wf, regime_split=rs,
-                outlier_test=ot, monte_carlo=mc,
+                r["stats"],
+                r["kfold"],
+                walk_forward=wf,
+                regime_split=rs,
+                outlier_test=ot,
+                monte_carlo=mc,
             )
         # Deep evidence can change the winner, but holdout evidence cannot.
         sorted_results = rank_optimizer_candidates(results)
@@ -1325,40 +1488,47 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
 
     # Top-Tabelle
     log_separator("", 78, color="\033[96m")
-    print(f"  TOP {top_n}  {strategy}  "
-          f"|  Robust ({k_folds}/{k_folds} Folds): {len(robust_cfgs)}/{len(p_list)}")
+    print(
+        f"  TOP {top_n}  {strategy}  "
+        f"|  Robust ({k_folds}/{k_folds} Folds): {len(robust_cfgs)}/{len(p_list)}"
+    )
     log_separator("", 78, color="\033[96m")
 
-    hdr = (f"  {'#':>3}  {'Pump':>5}  {'TP':>6}  {'Trl':>5}  "
-           f"{'Pt':>4}  {'RSI':>4}  ")
+    hdr = f"  {'#':>3}  {'Pump':>5}  {'TP':>6}  {'Trl':>5}  {'Pt':>4}  {'RSI':>4}  "
     if strategy in ("TREND", "FUTURES"):
         hdr += f"{'Stop':>5}  "
-    hdr += f"{'AvgNet':>8}  {'StdNet':>7}  {'Cons':>5}  {'WR':>5}  {'DD':>5}  {'Folds':>5}"
+    hdr += (
+        f"{'AvgNet':>8}  {'StdNet':>7}  {'Cons':>5}  {'WR':>5}  {'DD':>5}  {'Folds':>5}"
+    )
     print(hdr)
     log_separator("", 78)
 
     for i, r in enumerate(sorted_results[:top_n]):
-        s  = r["stats"]
-        p  = r["params"]
+        s = r["stats"]
+        p = r["params"]
         kf = r["kfold"]
         if not s.get("trades"):
             continue
         robust_mark = "" if kf["robust"] else "  "
-        row = (f"  {i+1:>3}  "
-               f"{p['min_pump']:>4.0f}%  "
-               f"{p['activation_profit']:>5.1f}%  "
-               f"{p['trailing_distance']:>4.1f}%  "
-               f"{p['partial_pct']:>3.0%}  "
-               f"{p['rsi_max']:>3.0f}  ")
+        row = (
+            f"  {i + 1:>3}  "
+            f"{p['min_pump']:>4.0f}%  "
+            f"{p['activation_profit']:>5.1f}%  "
+            f"{p['trailing_distance']:>4.1f}%  "
+            f"{p['partial_pct']:>3.0%}  "
+            f"{p['rsi_max']:>3.0f}  "
+        )
         if strategy in ("TREND", "FUTURES"):
-            row += f"{p.get('stop_loss',-2):>4.1f}%  "
-        row += (f"{kf['avg_net']:>+7.2f}  "
-                f"{kf['std_net']:>6.2f}  "
-                f"{kf['consistency']:>5.0%}  "
-                f"{s['win_rate']:>4.0%}  "
-                f"{s['max_dd']:>4.1f}%  "
-                f"{kf['profit_count']}/{k_folds}  "
-                f"{robust_mark}")
+            row += f"{p.get('stop_loss', -2):>4.1f}%  "
+        row += (
+            f"{kf['avg_net']:>+7.2f}  "
+            f"{kf['std_net']:>6.2f}  "
+            f"{kf['consistency']:>5.0%}  "
+            f"{s['win_rate']:>4.0%}  "
+            f"{s['max_dd']:>4.1f}%  "
+            f"{kf['profit_count']}/{k_folds}  "
+            f"{robust_mark}"
+        )
         print(row)
 
     log_separator("", 78, color="\033[96m")
@@ -1366,14 +1536,17 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
     # Near-miss report: configs profitable in exactly k_folds-1 folds
     near_miss_threshold = k_folds - 1
     near_misses = [
-        r for r in results
+        r
+        for r in results
         if not r["kfold"]["robust"]
         and r["kfold"]["profit_count"] == near_miss_threshold
     ]
     near_misses.sort(key=lambda x: x["kfold"]["avg_net"], reverse=True)
     if near_misses:
-        print(f"\n  NEAR-MISS ({near_miss_threshold}/{k_folds} folds profitable, "
-              f"{len(near_misses)} config(s)):")
+        print(
+            f"\n  NEAR-MISS ({near_miss_threshold}/{k_folds} folds profitable, "
+            f"{len(near_misses)} config(s)):"
+        )
         for nm in near_misses[:5]:
             nkf = nm["kfold"]
             np_ = nm["params"]
@@ -1387,23 +1560,23 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
         return []
 
     best = sorted_results[0]
-    bs   = best["stats"]
-    bp   = best["params"]
-    bkf  = best["kfold"]
+    bs = best["stats"]
+    bp = best["params"]
+    bkf = best["kfold"]
 
-    #  Lpez de Prado trust diagnostics: DSR + PBO 
+    #  Lpez de Prado trust diagnostics: DSR + PBO
     # The best Sharpe is the MAX over all tested configs  selection-inflated.
     # DSR deflates it by the expected max under the null; PBO (via CSCV over the
     # k folds) estimates the probability the apparent edge is overfit. Both are
     # diagnostics layered ON TOP of the robust gate  they do NOT change it.
-    sr_list = [r["stats"].get("sharpe", 0.0) for r in results
-               if r["stats"].get("trades")]
+    sr_list = [
+        r["stats"].get("sharpe", 0.0) for r in results if r["stats"].get("trades")
+    ]
     sr_best = bs.get("sharpe", 0.0)
     best_nets = list(bs.get("net_trades") or [])
     n_obs = len(best_nets)
     skew_b, kurt_b = _sample_skew_kurt(best_nets)
-    dsr = deflated_sharpe_ratio(sr_list, sr_best, n_obs,
-                                skew=skew_b, kurt=kurt_b)
+    dsr = deflated_sharpe_ratio(sr_list, sr_best, n_obs, skew=skew_b, kurt=kurt_b)
     # PBO matrix: at least eight time-ordered return blocks. Four aggregate
     # fold totals yield only six CSCV partitions and are too coarse.
     perf_matrix = build_pbo_block_matrix(results, minimum_blocks=8)
@@ -1414,8 +1587,11 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
         bkf["robust"]
         and best.get("final_holdout_pass") is True
         and best.get("cost_stress_pass") is True
-        and dsr_val is not None and dsr_val >= 0.95
-        and pbo_val is not None and pbo_val <= 0.25)
+        and dsr_val is not None
+        and dsr_val >= 0.95
+        and pbo_val is not None
+        and pbo_val <= 0.25
+    )
     best["dsr"] = dsr
     best["pbo"] = pbo
     best["deployment_trustworthy"] = deployment_trustworthy
@@ -1423,68 +1599,101 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
     print("\n  BESTE KONFIGURATION:")
     print(f"     {_label(bp, strategy)}")
     print(f"  Avg Netto:  {bkf['avg_net']:+.2f} USDT (ber {k_folds} Folds)")
-    print(f"     Konsistenz:   {bkf['consistency']:.0%}  "
-          f"(StdAbw: {bkf['std_net']:.2f} USDT)")
-    print(f"     Folds:        {bkf['profit_count']}/{k_folds} profitabel | "
-          f"Robust: {'Ja ' if bkf['robust'] else 'Nein '}")
-    print(f"     Vollperiode:  Netto {bs['net']:+.2f} USDT | "
-          f"WR {bs['win_rate']:.1%} | Sharpe {bs['sharpe']:.3f}")
+    print(
+        f"     Konsistenz:   {bkf['consistency']:.0%}  "
+        f"(StdAbw: {bkf['std_net']:.2f} USDT)"
+    )
+    print(
+        f"     Folds:        {bkf['profit_count']}/{k_folds} profitabel | "
+        f"Robust: {'Ja ' if bkf['robust'] else 'Nein '}"
+    )
+    print(
+        f"     Vollperiode:  Netto {bs['net']:+.2f} USDT | "
+        f"WR {bs['win_rate']:.1%} | Sharpe {bs['sharpe']:.3f}"
+    )
 
     # Lpez de Prado trust diagnostics
     if dsr_val is not None:
-        print(f"     DSR:          {dsr_val:.3f}  "
-              f"({' 0.95' if dsr_val >= 0.95 else ' <0.95  Edge womglich Selektionsrauschen'})"
-              f"  [{dsr.get('n_trials', 0)} Trials, {dsr.get('n_obs', 0)} Trades]")
+        print(
+            f"     DSR:          {dsr_val:.3f}  "
+            f"({' 0.95' if dsr_val >= 0.95 else ' <0.95  Edge womglich Selektionsrauschen'})"
+            f"  [{dsr.get('n_trials', 0)} Trials, {dsr.get('n_obs', 0)} Trades]"
+        )
     else:
         print(f"  DSR:  ({dsr.get('reason', 'n/a')})")
     if pbo_val is not None:
-        print(f"     PBO (CSCV):   {pbo_val:.3f}  "
-              f"({' 0.5' if pbo_val <= 0.5 else ' >0.5  overfit'})"
-              f"  [{pbo.get('n_partitions', 0)} Partitionen]")
+        print(
+            f"     PBO (CSCV):   {pbo_val:.3f}  "
+            f"({' 0.5' if pbo_val <= 0.5 else ' >0.5  overfit'})"
+            f"  [{pbo.get('n_partitions', 0)} Partitionen]"
+        )
     else:
         print(f"  PBO (CSCV):  ({pbo.get('reason', 'n/a')})")
-    print(f"     Trustworthy:  "
-          f"{'Ja ' if deployment_trustworthy else 'Nein '} "
-          f"(robust  final holdout  cost stress  DSR0.95  PBO0.25)")
+    print(
+        f"     Trustworthy:  "
+        f"{'Ja ' if deployment_trustworthy else 'Nein '} "
+        f"(robust  final holdout  cost stress  DSR0.95  PBO0.25)"
+    )
 
     # Deep-validation summary
     wf = best.get("walk_forward") or {}
     rs = best.get("regime_split") or {}
-    mc = best.get("monte_carlo")  or {}
+    mc = best.get("monte_carlo") or {}
     ot = best.get("outlier_test") or {}
     if wf or rs or mc or ot:
         if wf:
             n_sl = len(wf.get("slice_nets", []))
-            print("     Walk-Forward: "
-                  + (" alle Slices profitabel"
-                     if wf.get("all_profitable")
-                     else f" {wf.get('profitable_count','?')}/{n_sl} Slices +"))
+            print(
+                "     Walk-Forward: "
+                + (
+                    " alle Slices profitabel"
+                    if wf.get("all_profitable")
+                    else f" {wf.get('profitable_count', '?')}/{n_sl} Slices +"
+                )
+            )
         if rs:
-            print("     Regime-Test:  "
-                  + (" bersteht alle Regimes"
-                     if rs.get("survives_all")
-                     else f" {rs.get('profitable_count','?')}/"
-                          f"{rs.get('tested_count','?')} Regimes +"))
+            print(
+                "     Regime-Test:  "
+                + (
+                    " bersteht alle Regimes"
+                    if rs.get("survives_all")
+                    else f" {rs.get('profitable_count', '?')}/"
+                    f"{rs.get('tested_count', '?')} Regimes +"
+                )
+            )
         if mc.get("positive_share") is not None:
-            print(f"     Monte-Carlo:  {mc['positive_share']*100:.0f}% der "
-                  f"Lufe positiv"
-                  + ("  " if mc.get("robust")
-                     else "  fragil" if mc.get("concerning") else ""))
+            print(
+                f"     Monte-Carlo:  {mc['positive_share'] * 100:.0f}% der "
+                f"Lufe positiv"
+                + (
+                    "  "
+                    if mc.get("robust")
+                    else "  fragil"
+                    if mc.get("concerning")
+                    else ""
+                )
+            )
         if ot.get("outlier_fragile") is not None:
-            print("     Outlier-Dep.: "
-                  + (" FRAGIL  Edge hngt an Top-Trades"
-                     if ot["outlier_fragile"]
-                     else " breit verteilte Edge"))
+            print(
+                "     Outlier-Dep.: "
+                + (
+                    " FRAGIL  Edge hngt an Top-Trades"
+                    if ot["outlier_fragile"]
+                    else " breit verteilte Edge"
+                )
+            )
 
     # Out-of-sample holdout  the honest deployment test.
     hd = best.get("holdout")
     if holdout_times:
         if hd and not hd.get("skipped"):
             _ok = hd.get("net", 0) > 0
-            print(f"  Holdout (OOS): {'' if _ok else ''} Netto "
-                  f"{hd.get('net', 0):+.2f} USDT | WR {hd.get('win_rate', 0):.1%} | "
-                  f"{hd.get('trades', 0)} Trades  "
-                  f"{'DEPLOYMENT-VALIDATED' if best.get('deployment_validated') else 'NICHT besttigt (out-of-sample fragil)'}")
+            print(
+                f"  Holdout (OOS): {'' if _ok else ''} Netto "
+                f"{hd.get('net', 0):+.2f} USDT | WR {hd.get('win_rate', 0):.1%} | "
+                f"{hd.get('trades', 0)} Trades  "
+                f"{'DEPLOYMENT-VALIDATED' if best.get('deployment_validated') else 'NICHT besttigt (out-of-sample fragil)'}"
+            )
         else:
             print("  Holdout (OOS):  (keine Trades / uebersprungen)")
 
@@ -1500,25 +1709,27 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
         _grid = sorted(g for g in space.get("stop_loss", []) if g < 0)
         _stop_out = _grid[len(_grid) // 2] if _grid else -2.0
     best_payload = {
-        "strategy":         strategy,
-        "min_pump":         float(bp.get("min_pump", 0)),
+        "strategy": strategy,
+        "min_pump": float(bp.get("min_pump", 0)),
         "activation_profit": float(bp.get("activation_profit", 0)),
         "trailing_distance": float(bp.get("trailing_distance", 0)),
-        "stop_loss":        _stop_out,
-        "partial_pct":      float(bp.get("partial_pct", 0)),
-        "rsi_max":          float(bp.get("rsi_max", 0)),
-        "avg_net":          float(bkf["avg_net"]),
-        "consistency":      float(bkf["consistency"]),
-        "win_rate":         float(bs.get("win_rate", 0)),
-        "sharpe":           float(bs.get("sharpe", 0)),
-        "robust":           bool(bkf["robust"]),
-        "holdout_net":      (float(hd.get("net", 0)) if hd and not hd.get("skipped") else None),
-        "holdout_trades":   int(best.get("holdout_trades", 0) or 0),
+        "stop_loss": _stop_out,
+        "partial_pct": float(bp.get("partial_pct", 0)),
+        "rsi_max": float(bp.get("rsi_max", 0)),
+        "avg_net": float(bkf["avg_net"]),
+        "consistency": float(bkf["consistency"]),
+        "win_rate": float(bs.get("win_rate", 0)),
+        "sharpe": float(bs.get("sharpe", 0)),
+        "robust": bool(bkf["robust"]),
+        "holdout_net": (
+            float(hd.get("net", 0)) if hd and not hd.get("skipped") else None
+        ),
+        "holdout_trades": int(best.get("holdout_trades", 0) or 0),
         "cost_stress_pass": bool(best.get("cost_stress_pass", False)),
         "final_holdout_pass": bool(best.get("final_holdout_pass", False)),
         "deployment_validated": bool(best.get("deployment_validated", False)),
-        "dsr":              (float(dsr_val) if dsr_val is not None else None),
-        "pbo":              (float(pbo_val) if pbo_val is not None else None),
+        "dsr": (float(dsr_val) if dsr_val is not None else None),
+        "pbo": (float(pbo_val) if pbo_val is not None else None),
         "deployment_trustworthy": bool(deployment_trustworthy),
     }
     print(f"\n<<<BEST_CONFIG>>>{_json.dumps(best_payload)}<<<END_BEST_CONFIG>>>\n")
@@ -1527,15 +1738,16 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
     if do_sensitivity and len(sorted_results) > 0:
         print("\n  SENSITIVITTS-ANALYSE (Top 3 Configs):\n")
         for rank in range(min(3, len(sorted_results))):
-            cfg  = sorted_results[rank]
+            cfg = sorted_results[rank]
             sens = sensitivity_check(
-                indexed, tune_times, cfg["params"],
-                strategy, use_maker, space
+                indexed, tune_times, cfg["params"], strategy, use_maker, space
             )
-            print(f"  Rang {rank+1}: {_label(cfg['params'], strategy)}")
+            print(f"  Rang {rank + 1}: {_label(cfg['params'], strategy)}")
             print(f"    Bewertung:        {sens['rating']}")
-            print(f"  Avg nderung:  {sens['avg_change']:.1f}%  "
-                  f"(Max: {sens['max_change']:.1f}%)")
+            print(
+                f"  Avg nderung:  {sens['avg_change']:.1f}%  "
+                f"(Max: {sens['max_change']:.1f}%)"
+            )
             print(f"    Basis-Netto:      {sens['base_net']:+.2f} USDT")
             cfg["sensitivity"] = sens
             print()
@@ -1547,16 +1759,18 @@ def run_optimizer(strategy: str, days: int = DEFAULT_DAYS,
     export_csv(sorted_results, strategy, days, k_folds)
 
     # Footer
-    print(f"\n  Simulationen: {len(p_list)*k_folds:,} | "
-          f"Robuste Configs: {len(robust_cfgs)} | "
-          f"Zeit: {time.time()-t_sim:.0f}s")
+    print(
+        f"\n  Simulationen: {len(p_list) * k_folds:,} | "
+        f"Robuste Configs: {len(robust_cfgs)} | "
+        f"Zeit: {time.time() - t_sim:.0f}s"
+    )
     print(f"  Analyse: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log_separator("", 78, color="\033[96m")
 
     return sorted_results
 
 
-#  CLI 
+#  CLI
 
 if __name__ == "__main__":
     args = sys.argv[1:]
@@ -1565,12 +1779,18 @@ if __name__ == "__main__":
         print("       [--maker] [--top N] [--kfold K] [--leverage N]")
         print("       [--no-sensitivity] [--quick] [--holdout F]")
         print("       [--own-momentum] [--om-window N] [--regime] [--funding R]")
-        print("  --funding R     : model funding R per 8h (e.g. 0.0003) as a "
-              "cost sweep on the notional per hold-duration (default 0 = off)")
-        print("  --holdout F     : reserve most-recent fraction F out-of-sample "
-              "(default 0.2; 0 disables)")
-        print("  --own-momentum  : A/B test the own-momentum overlay "
-              "(block entries after N net-negative closes)")
+        print(
+            "  --funding R     : model funding R per 8h (e.g. 0.0003) as a "
+            "cost sweep on the notional per hold-duration (default 0 = off)"
+        )
+        print(
+            "  --holdout F     : reserve most-recent fraction F out-of-sample "
+            "(default 0.2; 0 disables)"
+        )
+        print(
+            "  --own-momentum  : A/B test the own-momentum overlay "
+            "(block entries after N net-negative closes)"
+        )
         print("  --leverage N : override leverage (default: read from bot_config.json)")
         print()
         print("  Beispiele:")
@@ -1582,21 +1802,22 @@ if __name__ == "__main__":
         print("    python optimizer.py TREND --no-sensitivity  # ohne Robustheits-Test")
         sys.exit(1)
 
-    strategy       = args[0]
+    strategy = args[0]
     if strategy == "TREND":
         # TREND trades the SMA-ensemble, not the momentum grid below  route to
         # the validator's robustness sweep so tuning reflects the live signal.
         from tools import trend_check
+
         _days = args[1] if len(args) > 1 and args[1].isdigit() else str(DEFAULT_DAYS)
         sys.argv = ["trend_check", _days, "--sweep"]
         trend_check.main()
         sys.exit(0)
-    days           = int(args[1]) if len(args) > 1 and args[1].isdigit() else DEFAULT_DAYS
-    use_maker      = "--maker"          in args
-    quick          = "--quick"          in args
+    days = int(args[1]) if len(args) > 1 and args[1].isdigit() else DEFAULT_DAYS
+    use_maker = "--maker" in args
+    quick = "--quick" in args
     do_sensitivity = "--no-sensitivity" not in args
 
-    top_n   = 10
+    top_n = 10
     k_folds = 4
     if "--top" in args:
         try:
@@ -1616,7 +1837,7 @@ if __name__ == "__main__":
         except (ValueError, IndexError):
             pass
 
-    holdout_frac = 0.2   # fraction of the most-recent data reserved out-of-sample
+    holdout_frac = 0.2  # fraction of the most-recent data reserved out-of-sample
     if "--holdout" in args:
         try:
             holdout_frac = float(args[args.index("--holdout") + 1])
@@ -1624,7 +1845,7 @@ if __name__ == "__main__":
             pass
 
     own_momentum = "--own-momentum" in args
-    om_window    = 8
+    om_window = 8
     if "--om-window" in args:
         try:
             om_window = int(args[args.index("--om-window") + 1])
@@ -1641,11 +1862,17 @@ if __name__ == "__main__":
             pass
 
     run_optimizer(
-        strategy, days,
-        use_maker=use_maker, top_n=top_n,
-        k_folds=k_folds, quick=quick,
-        do_sensitivity=do_sensitivity, leverage=leverage,
+        strategy,
+        days,
+        use_maker=use_maker,
+        top_n=top_n,
+        k_folds=k_folds,
+        quick=quick,
+        do_sensitivity=do_sensitivity,
+        leverage=leverage,
         holdout_frac=holdout_frac,
-        own_momentum=own_momentum, om_window=om_window,
-        regime=regime, funding_8h=funding_8h,
+        own_momentum=own_momentum,
+        om_window=om_window,
+        regime=regime,
+        funding_8h=funding_8h,
     )

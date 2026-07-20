@@ -14,7 +14,7 @@ import shutil
 import sqlite3
 import threading
 import time
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 
 from core.models import Position
 

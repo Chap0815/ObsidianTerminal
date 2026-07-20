@@ -11,8 +11,8 @@ Was es macht:
   1. Prueft Python-Version (empfohlen: 3.12.10; erlaubt 3.10 - 3.12)
   2. Erstellt/benutzt .venv im Projektordner
   3. Aktualisiert pip/setuptools/wheel im .venv
-  4. Installiert alle Pflicht-Pakete aus requirements.txt im .venv
-     (gepinnte, kompatible Versionen; Indikatoren laufen nativ)
+  4. Installiert alle Pflicht-Pakete hashgeprueft aus requirements.lock.txt
+     im .venv (exakt gepinnte, freigegebene Versionen)
   5. VERIFIZIERT jeden Pflicht-Import in einem frischen Subprozess
      (alle Pflicht-Module importierbar)
   6. Prueft Git for Windows; installiert es bei Bedarf via winget
@@ -25,6 +25,7 @@ Was es macht:
 Mehrfach ausfuehrbar  -  ueberspringt bereits Erledigtes.
 
 """
+
 from __future__ import annotations
 
 import base64
@@ -37,53 +38,79 @@ import sys
 from pathlib import Path
 
 
-#  Konsole / Farben 
+#  Konsole / Farben
 class C:
-    G = "\033[92m"; Y = "\033[93m"; R = "\033[91m"; B = "\033[96m"
-    BOLD = "\033[1m"; END = "\033[0m"
+    G = "\033[92m"
+    Y = "\033[93m"
+    R = "\033[91m"
+    B = "\033[96m"
+    BOLD = "\033[1m"
+    END = "\033[0m"
 
 
 if platform.system() == "Windows":
-    os.system("")          # ANSI-Farben im klassischen cmd aktivieren
+    os.system("")  # ANSI-Farben im klassischen cmd aktivieren
 
 
-def ok(m):   print(f"  {C.G}{C.END} {m}")
-def warn(m): print(f"  {C.Y}!{C.END} {m}")
-def err(m):  print(f"  {C.R}{C.END} {m}")
-def info(m): print(f"  {C.B}-{C.END} {m}")
-def head(m): print(f"\n{C.BOLD}{C.B}{m}{C.END}")
+def ok(m):
+    print(f"  {C.G}{C.END} {m}")
+
+
+def warn(m):
+    print(f"  {C.Y}!{C.END} {m}")
+
+
+def err(m):
+    print(f"  {C.R}{C.END} {m}")
+
+
+def info(m):
+    print(f"  {C.B}-{C.END} {m}")
+
+
+def head(m):
+    print(f"\n{C.BOLD}{C.B}{m}{C.END}")
 
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
-REQ_FILE = PROJECT_ROOT / "requirements.txt"
+REQ_FILE = PROJECT_ROOT / "requirements.lock.txt"
 VENV_DIR = PROJECT_ROOT / ".venv"
 
 # Empfohlene Zielversion
 TARGET_PY = (3, 12, 10)
 
 #  Pflicht-Pakete (PyPI-Name, Import-Name)  -  Fallback, falls die
-#    requirements-Datei fehlt. Indikatoren laufen nativ (kein pandas-ta). 
+#    requirements-Datei fehlt. Indikatoren laufen nativ (kein pandas-ta).
 REQUIRED = [
-    ("numpy<2",            "numpy"),
-    ("pandas==2.2.2",      "pandas"),
+    ("numpy<2", "numpy"),
+    ("pandas==2.2.2", "pandas"),
     ("ccxt>=4.3.0,<5.0.0", "ccxt"),
-    ("requests>=2.31.0",   "requests"),
+    ("requests>=2.31.0", "requests"),
     ("python-dotenv>=1.0.1", "dotenv"),
     ("portalocker>=2.8.2", "portalocker"),
-    ("ollama>=0.3.0",      "ollama"),
+    ("ollama>=0.3.0", "ollama"),
     ("customtkinter>=5.2.2", "customtkinter"),
-    ("streamlit>=1.36.0",  "streamlit"),
-    ("plotly>=5.22.0",     "plotly"),
-    ("psutil>=5.9.8",      "psutil"),
-    ("tzdata>=2024.1",     "tzdata"),
+    ("streamlit>=1.36.0", "streamlit"),
+    ("plotly>=5.22.0", "plotly"),
+    ("psutil>=5.9.8", "psutil"),
+    ("tzdata>=2024.1", "tzdata"),
+]
+
+# Public CCXT-Pro WebSockets ship inside ``ccxt`` rather than as a separate
+# PyPI package. Verify both the submodule and its async transport explicitly so
+# an installation cannot report success while L2 collection is unusable.
+REQUIRED_IMPORTS = [import_name for _spec, import_name in REQUIRED] + [
+    "ccxt.pro",
+    "aiohttp",
 ]
 
 DEFAULT_MODEL = "qwen2.5:14b"
 
 
-# 
+#
 # Schritte
-# 
+#
+
 
 def _venv_python() -> Path:
     if platform.system() == "Windows":
@@ -116,7 +143,9 @@ def ensure_project_venv() -> None:
         ok(f"nutze .venv: {sys.executable}")
         return
     if os.getenv("OBSIDIAN_INSTALL_VENV") == "1":
-        err("Installer wurde im .venv neu gestartet, laeuft aber nicht daraus. Abbruch gegen Neustart-Schleife.")
+        err(
+            "Installer wurde im .venv neu gestartet, laeuft aber nicht daraus. Abbruch gegen Neustart-Schleife."
+        )
         sys.exit(1)
 
     py = _venv_python()
@@ -165,7 +194,8 @@ def _can_import(module_name: str) -> tuple[bool, str]:
     """Importiert das Modul in einem FRISCHEN Subprozess (echte Verifikation)."""
     r = subprocess.run(
         [sys.executable, "-c", f"import {module_name}"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     return r.returncode == 0, (r.stderr or "").strip()
 
@@ -183,37 +213,27 @@ def upgrade_pip() -> bool:
 
 def install_packages() -> bool:
     head("[4/10] Pflicht-Pakete installieren")
-    if REQ_FILE.exists():
-        info(f"installiere aus {REQ_FILE.name} (gepinnte, kompatible Versionen) ...")
-        r = _pip("install", "-r", str(REQ_FILE), capture=False)
-        if r.returncode == 0:
-            ok("Alle Pakete aus requirements.txt installiert")
-            return True
-        warn("requirements-Datei-Installation unvollstaendig  -  versuche Einzel-Pakete ...")
-
-    # Fallback: Einzelinstallation
-    failed = []
-    for spec, import_name in REQUIRED:
-        info(f"{spec} ...")
-        r = _pip("install", spec, "--quiet")
-        if r.returncode == 0:
-            ok(f"{spec}")
-        else:
-            err(f"{spec}  -  FEHLER")
-            tail = (r.stderr or "")[-200:].strip()
-            if tail:
-                print(f"      {tail}")
-            failed.append(spec)
-    if failed:
-        warn(f"{len(failed)} Paket(e) fehlgeschlagen: {', '.join(failed)}")
+    if not REQ_FILE.exists():
+        err(f"{REQ_FILE.name} fehlt  -  Release ist unvollstaendig.")
         return False
+    info(f"installiere aus {REQ_FILE.name} (exakt gepinnt + Hashpruefung) ...")
+    r = _pip(
+        "install",
+        "--require-hashes", "-r", str(REQ_FILE),
+        capture=False,
+    )
+    if r.returncode != 0:
+        err("Hash-gepruefte Paketinstallation fehlgeschlagen.")
+        err("Kein Fallback auf ungepruefte oder abweichende Versionen.")
+        return False
+    ok("Alle Pakete aus requirements.lock.txt installiert")
     return True
 
 
 def verify_imports() -> bool:
     head("[5/10] Pflicht-Importe verifizieren (frischer Subprozess)")
     all_ok = True
-    for _, import_name in REQUIRED:
+    for import_name in REQUIRED_IMPORTS:
         good, errtxt = _can_import(import_name)
         if good:
             ok(f"import {import_name}")
@@ -223,12 +243,15 @@ def verify_imports() -> bool:
             if errtxt:
                 print(f"      {errtxt.splitlines()[-1][:200]}")
     if not all_ok:
-        err("Mindestens ein Pflicht-Import scheitert  -  der Bot wuerde NICHT "
-            "korrekt laufen. Bitte Hinweise oben befolgen und erneut starten.")
+        err(
+            "Mindestens ein Pflicht-Import scheitert  -  der Bot wuerde NICHT "
+            "korrekt laufen. Bitte Hinweise oben befolgen und erneut starten."
+        )
     return all_ok
 
 
-#  Ollama 
+#  Ollama
+
 
 def _confirm(question: str) -> bool:
     try:
@@ -246,10 +269,12 @@ def offer_desktop_shortcut() -> None:
         return
     if not _confirm("Desktop-Verknuepfung mit Obsidian-Icon anlegen"):
         return
-    lnk = os.path.join(os.path.expanduser("~"), "Desktop",
-                       "Obsidian Trading Terminal.lnk")
+    lnk = os.path.join(
+        os.path.expanduser("~"), "Desktop", "Obsidian Trading Terminal.lnk"
+    )
     vbs = os.path.join(PROJECT_ROOT, "OBSIDIAN.vbs")
     ico = os.path.join(PROJECT_ROOT, "launcher", "ui", "components", "obsidian.ico")
+
     def ps_quote(value: str | Path) -> str:
         return "'" + str(value).replace("'", "''") + "'"
 
@@ -262,8 +287,11 @@ def offer_desktop_shortcut() -> None:
     )
     encoded = base64.b64encode(ps.encode("utf-16le")).decode("ascii")
     try:
-        subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
-                        "-EncodedCommand", encoded], check=True, capture_output=True)
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            check=True,
+            capture_output=True,
+        )
         ok(f"Verknuepfung angelegt: {lnk}")
     except Exception as e:
         warn(f"Verknuepfung konnte nicht angelegt werden: {e}")
@@ -280,18 +308,29 @@ def _install_ollama() -> bool:
             if shutil.which("winget"):
                 info("installiere Ollama via winget ...")
                 r = subprocess.run(
-                    ["winget", "install", "-e", "--id", "Ollama.Ollama",
-                     "--accept-source-agreements", "--accept-package-agreements"],
+                    [
+                        "winget",
+                        "install",
+                        "-e",
+                        "--id",
+                        "Ollama.Ollama",
+                        "--accept-source-agreements",
+                        "--accept-package-agreements",
+                    ],
                 )
                 return r.returncode == 0
-            warn("winget nicht gefunden  -  bitte manuell installieren: "
-                 "https://ollama.com/download")
+            warn(
+                "winget nicht gefunden  -  bitte manuell installieren: "
+                "https://ollama.com/download"
+            )
             return False
         if system == "Darwin":
             if shutil.which("brew"):
                 info("installiere Ollama via Homebrew ...")
                 return subprocess.run(["brew", "install", "ollama"]).returncode == 0
-            warn("Homebrew nicht gefunden - bitte Ollama manuell installieren: https://ollama.com/download")
+            warn(
+                "Homebrew nicht gefunden - bitte Ollama manuell installieren: https://ollama.com/download"
+            )
             return False
         warn("Bitte Ollama manuell installieren: https://ollama.com/download")
         return False
@@ -310,13 +349,16 @@ def check_ollama() -> bool:
             return False
     ok(f"Ollama gefunden: {shutil.which('ollama')}")
     try:
-        r = subprocess.run(["ollama", "list"], capture_output=True,
-                           text=True, timeout=15)
+        r = subprocess.run(
+            ["ollama", "list"], capture_output=True, text=True, timeout=15
+        )
         if r.returncode == 0:
             ok("Ollama-Daemon antwortet")
             return True
-        warn("Ollama installiert, aber Daemon antwortet nicht  -  starte die "
-             "Ollama-App bzw. 'ollama serve' und fuehre install.py erneut aus.")
+        warn(
+            "Ollama installiert, aber Daemon antwortet nicht  -  starte die "
+            "Ollama-App bzw. 'ollama serve' und fuehre install.py erneut aus."
+        )
         return False
     except Exception as e:
         warn(f"Ollama-Check fehlgeschlagen: {e}")
@@ -366,8 +408,9 @@ def pull_model(ollama_ready: bool) -> bool:
     model = _model_from_config()
     info(f"Modell laut bot_config.json: {model}")
     try:
-        r = subprocess.run(["ollama", "list"], capture_output=True,
-                           text=True, timeout=15)
+        r = subprocess.run(
+            ["ollama", "list"], capture_output=True, text=True, timeout=15
+        )
         installed = {
             line.split()[0]
             for line in (r.stdout or "").splitlines()
@@ -420,17 +463,19 @@ def check_env() -> bool:
         for ln in lines
     )
     tz_present = any(
-        ln.startswith("BOT_TIMEZONE=") and ln.split("=", 1)[1].strip()
-        for ln in lines
+        ln.startswith("BOT_TIMEZONE=") and ln.split("=", 1)[1].strip() for ln in lines
     )
     (ok if api_present else warn)(
-        f"Exchange API-Key {'gesetzt' if api_present else 'fehlt/leer'}")
+        f"Exchange API-Key {'gesetzt' if api_present else 'fehlt/leer'}"
+    )
     (ok if tz_present else warn)(
-        f"Zeitzone {'gesetzt' if tz_present else 'fehlt/leer'}")
+        f"Zeitzone {'gesetzt' if tz_present else 'fehlt/leer'}"
+    )
     return True
 
 
-# 
+#
+
 
 def main() -> None:
     print(f"""
@@ -467,15 +512,23 @@ def main() -> None:
 
     print()
     if hard_fail:
-        print(f"{C.R}{C.BOLD}   Installation unvollstaendig  -  Pakete/Importe "
-              f"fehlgeschlagen. Bitte Hinweise oben befolgen.{C.END}")
+        print(
+            f"{C.R}{C.BOLD}   Installation unvollstaendig  -  Pakete/Importe "
+            f"fehlgeschlagen. Bitte Hinweise oben befolgen.{C.END}"
+        )
     elif all(s for _, s in steps):
-        print(f"{C.G}{C.BOLD}   Alles bereit! Start:  Doppelklick auf OBSIDIAN.vbs "
-              f"(oder launcher.pyw){C.END}")
+        print(
+            f"{C.G}{C.BOLD}   Alles bereit! Start:  Doppelklick auf OBSIDIAN.vbs "
+            f"(oder launcher.pyw){C.END}"
+        )
     else:
-        print(f"{C.Y}{C.BOLD}  ! Kern installiert; einzelne optionale Schritte "
-              f"offen (z. B. Ollama/Modell). Bot ist startfaehig.{C.END}")
-        print(f"{C.Y}    Start:  Doppelklick auf OBSIDIAN.vbs (oder launcher.pyw){C.END}")
+        print(
+            f"{C.Y}{C.BOLD}  ! Kern installiert; einzelne optionale Schritte "
+            f"offen (z. B. Ollama/Modell). Bot ist startfaehig.{C.END}"
+        )
+        print(
+            f"{C.Y}    Start:  Doppelklick auf OBSIDIAN.vbs (oder launcher.pyw){C.END}"
+        )
 
     if not hard_fail:
         print()

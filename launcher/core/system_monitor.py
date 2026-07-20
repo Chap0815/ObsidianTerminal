@@ -9,7 +9,6 @@ result cache attached to :func:`_query_nvidia_smi`.
 from __future__ import annotations
 
 import subprocess
-import sys
 import time
 
 try:

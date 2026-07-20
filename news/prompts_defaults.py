@@ -71,8 +71,9 @@ Do NOT output any text outside the JSON.
 """
 
 
-#  Self-healing helper (called by launcher.pyw) 
-import os as _os
+#  Self-healing helper (called by launcher.pyw)
+import os as _os  # noqa: E402 - kept beside the self-healing helper
+
 
 def write_all_defaults(prompts_dir: str) -> list:
     """Write the default prompt files into `prompts_dir`.
@@ -89,9 +90,9 @@ def write_all_defaults(prompts_dir: str) -> list:
     """
     _os.makedirs(prompts_dir, exist_ok=True)
     targets = {
-        "spot.txt":            SPOT_DEFAULT,
-        "spot_default.txt":    SPOT_DEFAULT,
-        "futures.txt":         FUTURES_DEFAULT,
+        "spot.txt": SPOT_DEFAULT,
+        "spot_default.txt": SPOT_DEFAULT,
+        "futures.txt": FUTURES_DEFAULT,
         "futures_default.txt": FUTURES_DEFAULT,
     }
     written = []

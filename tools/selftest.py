@@ -10,6 +10,7 @@ The suite pins the money-path invariants (verify-before-book, phantom-fill
 guard, multi-bot claim separation, indicator/fee/funding math). It runs fully
 offline against a throwaway temp DB  it never touches data/trading_bot.db.
 """
+
 from __future__ import annotations
 
 import os
@@ -30,7 +31,7 @@ TESTS_DIR = os.path.join(PROJECT_ROOT, "tests")
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from tools.release_requirements import REQUIRED_RELEASE_ITEMS
+from tools.release_requirements import REQUIRED_RELEASE_ITEMS  # noqa: E402
 
 
 class _Counter:
@@ -47,7 +48,7 @@ class _Counter:
                 self.passed += 1
             elif report.failed:
                 self.failed += 1
-        elif report.failed:          # setup/teardown error
+        elif report.failed:  # setup/teardown error
             self.errors += 1
 
 
@@ -62,7 +63,16 @@ def _smoke_without_tests() -> int:
         return 1
 
     failed = []
-    for folder in ("bot_utils", "bots", "config", "core", "launcher", "news", "tools", "trading"):
+    for folder in (
+        "bot_utils",
+        "bots",
+        "config",
+        "core",
+        "launcher",
+        "news",
+        "tools",
+        "trading",
+    ):
         root = os.path.join(PROJECT_ROOT, folder)
         if not os.path.isdir(root):
             failed.append(f"{folder}/ missing")
@@ -115,8 +125,10 @@ def main() -> int:
         print(f" ALL PASSED ({counter.passed}/{total})")
     else:
         bad = counter.failed + counter.errors
-        print(f" FAILED ({bad} of {total}  "
-              f"{counter.failed} failed, {counter.errors} errors)")
+        print(
+            f" FAILED ({bad} of {total}  "
+            f"{counter.failed} failed, {counter.errors} errors)"
+        )
     print("=" * 60)
     return 0 if rc == 0 else 1
 

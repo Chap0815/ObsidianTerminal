@@ -501,8 +501,8 @@ def _ping_loop():
                 elif (new_status == LLM_STATUS_MODEL_COLD
                       and prev_status == LLM_STATUS_MODEL_HOT):
                     # Normal idle eviction  info only, NOT a failure
-                    log_msg = (f"LLM model evicted from memory (idle timeout) "
-                               f" will auto-reload on next request")
+                    log_msg = ("LLM model evicted from memory (idle timeout) "
+                               " will auto-reload on next request")
                     log_lvl = "INFO"
 
             if log_msg:

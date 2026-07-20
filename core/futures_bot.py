@@ -453,9 +453,9 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             and str(self.C("VENUE_RECORDER_MODE", "enabled")).lower() == "enabled"
         ):
             from core.paths import DATA_DIR
-            from trading.venue_recorder import MexcVenueRecorder
+            from trading.venue_recorder import VenueRecorder
 
-            recorder = MexcVenueRecorder(
+            recorder = VenueRecorder(
                 self.ex,
                 DATA_DIR / "venue_native",
                 max_symbols=int(self.C("VENUE_RECORDER_MAX_SYMBOLS", 8)),
@@ -473,6 +473,13 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     self.C("VENUE_RECORDER_MAX_STORAGE_GIB", 20.0)
                 ),
                 log_event=log_event,
+                l2_mode=str(self.C("VENUE_L2_MODE", "shadow")),
+                l2_sample_interval_seconds=float(
+                    self.C("VENUE_L2_SAMPLE_INTERVAL_SECONDS", 1.0)
+                ),
+                l2_stale_after_ms=int(
+                    self.C("VENUE_L2_STALE_AFTER_MS", 5_000)
+                ),
             )
             self._venue_recorder_thread = threading.Thread(
                 target=recorder.run,

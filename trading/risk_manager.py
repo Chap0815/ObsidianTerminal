@@ -356,6 +356,17 @@ def validate_config_or_die(bot_name: str) -> dict:
                 "WARN",
             )
             _fatal_exit(1)
+        if (
+            "VENUE_L2_MODE" in cfg
+            and str(cfg["VENUE_L2_MODE"]).strip().lower()
+            not in {"disabled", "shadow"}
+        ):
+            log_event(
+                f"[{bot_name}] FATAL: invalid VENUE_L2_MODE. "
+                "Only disabled or shadow is allowed. Refusing to start.",
+                "WARN",
+            )
+            _fatal_exit(1)
         _checks = (
             ("MONITOR_INTERVAL", 5, 600),
             ("MAX_OPEN_TRADES", 1, 50),
@@ -385,6 +396,8 @@ def validate_config_or_die(bot_name: str) -> dict:
             ("VENUE_RECORDER_DEPTH_LEVELS", 5, 100),
             ("VENUE_RECORDER_RETENTION_DAYS", 1, 3650),
             ("VENUE_RECORDER_MAX_STORAGE_GIB", 0.1, 1000),
+            ("VENUE_L2_SAMPLE_INTERVAL_SECONDS", 0.25, 60),
+            ("VENUE_L2_STALE_AFTER_MS", 250, 60000),
         )
         for _key, _lo, _hi in _checks:
             if _key in cfg:

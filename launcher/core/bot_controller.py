@@ -21,7 +21,6 @@ from launcher.config.settings import (
     BOT_META,
     audit_event,
     effective_default_config,
-    load_config,
     save_config_merge,
 )
 from launcher.core.positions import (
@@ -463,7 +462,6 @@ def restart_bot(app, name: str) -> None:
 
 def apply_simulation(app, bot_name: str, sim: bool, card: dict) -> None:
     """Persist the SIM/LIVE flag and re-style the pill button accordingly."""
-    from launcher.config.settings import COLORS
 
     bot = app.bots.get(bot_name)
     if bot is not None and bot.is_running():

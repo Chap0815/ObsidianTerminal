@@ -297,6 +297,9 @@ DEFAULT_CONFIG = {
         "VENUE_RECORDER_DEPTH_LEVELS": 20,
         "VENUE_RECORDER_RETENTION_DAYS": 30,
         "VENUE_RECORDER_MAX_STORAGE_GIB": 20.0,
+        "VENUE_L2_MODE": "shadow",
+        "VENUE_L2_SAMPLE_INTERVAL_SECONDS": 1.0,
+        "VENUE_L2_STALE_AFTER_MS": 5000,
         "SIMULATION":        True,
     },
     # Cross-sectional momentum  market-neutral, cross-margin, experimental.

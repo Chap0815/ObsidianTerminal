@@ -17,7 +17,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 from typing import Dict, List, Optional, Set
 
 from bot_utils.safe_numeric import safe_positive_float
-from core.constants import TICKER_CACHE_TTL_SEC, TICKER_STALE_MAX_SEC
+from core.constants import TICKER_STALE_MAX_SEC
+from trading.l2_stream import build_public_async_config
 
 CACHE_STALE_SEC    = TICKER_STALE_MAX_SEC
 REST_POLL_INTERVAL = 5.0
@@ -234,13 +235,10 @@ class WebSocketFeed:
         import ccxt.pro as ccxt_pro
         ex_name  = type(self._exchange).__name__.lower()
         ex_class = getattr(ccxt_pro, ex_name)
-        config   = {
-            "apiKey":          self._exchange.apiKey,
-            "secret":          self._exchange.secret,
-            "enableRateLimit": True,
-        }
-        if getattr(self._exchange, "password", None):
-            config["password"] = self._exchange.password
+        # Tickers are public data.  Preserve the configured futures type,
+        # timeout and proxy while deliberately keeping credentials out of the
+        # additional async client.
+        config = build_public_async_config(self._exchange)
 
         backoff = _WS_BASE_BACKOFF
         while self._running:

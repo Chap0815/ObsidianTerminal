@@ -7,6 +7,7 @@ pool). Brand-new coins get a 24h grace period via symbol_tracker to suppress
 WARN-spam, and the CCXT clone pool is cached at module level (resized to the
 largest n_workers seen, closed via atexit) to avoid per-scan socket churn.
 """
+
 from __future__ import annotations
 
 import atexit
@@ -14,6 +15,7 @@ import copy
 import json as _json
 import math
 import os
+import re as _re_internal
 import threading
 import time
 import pandas as pd
@@ -21,11 +23,20 @@ import pandas as pd
 # RSI/MACD/ATR/EMA werden nativ in reinem pandas gerechnet (keine
 # pandas_ta-Abhngigkeit), damit der Screener unabhngig von einer Lib ist,
 # die jederzeit von PyPI verschwinden kann.
-from bot_utils.indicators import rsi as _ta_rsi, macd_signal as _ta_macd_signal, \
-    atr as _ta_atr, ema as _ta_ema
+from bot_utils.indicators import (
+    rsi as _ta_rsi,
+    macd_signal as _ta_macd_signal,
+    atr as _ta_atr,
+    ema as _ta_ema,
+)
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    as_completed,
+    TimeoutError as FuturesTimeout,
+)
 from core.logger import log_event
+from core.paths import INDICATOR_FAILURES_STR as _FAIL_CACHE_FILE
 from bot_utils.safe_numeric import safe_positive_float
 
 from core.constants import (
@@ -46,17 +57,22 @@ from core.constants import (
 # symbol-tracker for grace period
 try:
     from trading.symbol_tracker import record_seen, is_in_grace_period
+
     _HAS_TRACKER = True
 except ImportError:
     _HAS_TRACKER = False
-    def record_seen(symbol): pass
-    def is_in_grace_period(symbol): return False
+
+    def record_seen(symbol):
+        pass
+
+    def is_in_grace_period(symbol):
+        return False
 
 
-MIN_VOLUME_USDT_SPOT    = MIN_VOLUME_USDT_SPOT_LIVE
+MIN_VOLUME_USDT_SPOT = MIN_VOLUME_USDT_SPOT_LIVE
 MIN_VOLUME_USDT_FUTURES = MIN_VOLUME_USDT_FUTURES_LIVE
-MAX_24H_PUMP            = MAX_24H_PUMP_PCT
-MAX_PARALLEL_WORKERS    = SCREENER_MAX_PARALLEL_WORKERS
+MAX_24H_PUMP = MAX_24H_PUMP_PCT
+MAX_PARALLEL_WORKERS = SCREENER_MAX_PARALLEL_WORKERS
 
 
 #  Bounded failure cache
@@ -87,7 +103,6 @@ _symbol_failure_cache = _BoundedFailureCache(maxsize=2048)
 _HARD_FAILURE_TTL = HARD_FAILURE_TTL_SEC
 _SOFT_FAILURE_TTL = SOFT_FAILURE_TTL_SEC
 
-from core.paths import INDICATOR_FAILURES_STR as _FAIL_CACHE_FILE
 _fail_cache_lock = threading.Lock()
 _fail_cache: dict = {}
 
@@ -104,8 +119,11 @@ def _load_fail_cache():
             with open(_FAIL_CACHE_FILE, "r", encoding="utf-8") as f:
                 raw = _json.load(f)
             now = time.time()
-            _fail_cache = {k: v for k, v in raw.items()
-                           if v.get("hard_until", 0) > now or v.get("count", 0) > 0}
+            _fail_cache = {
+                k: v
+                for k, v in raw.items()
+                if v.get("hard_until", 0) > now or v.get("count", 0) > 0
+            }
     except Exception:
         _fail_cache = {}
 
@@ -176,16 +194,31 @@ _load_fail_cache()
 
 # Per-bot scan-fail counter: {(bot_name, base_sym): count}
 _sym_scan_fails: dict = {}
-_sym_scan_lock  = threading.Lock()
+_sym_scan_lock = threading.Lock()
 
 
 _HARD_ERROR_MARKERS = (
-    "does not exist", "invalid symbol", "not found", "no data",
-    "symbol not", "invalid market", "400", "404", "market not",
-    "trading pair", "pair not",
-    "40018", "40107", "40401", "43112",
-    "suspend", "not support", "not available", "contract not",
-    "pair information", "illegal symbol",
+    "does not exist",
+    "invalid symbol",
+    "not found",
+    "no data",
+    "symbol not",
+    "invalid market",
+    "400",
+    "404",
+    "market not",
+    "trading pair",
+    "pair not",
+    "40018",
+    "40107",
+    "40401",
+    "43112",
+    "suspend",
+    "not support",
+    "not available",
+    "contract not",
+    "pair information",
+    "illegal symbol",
 )
 
 # Precise regex-based detection of "really gone" symbol errors. Uses word
@@ -193,7 +226,6 @@ _HARD_ERROR_MARKERS = (
 # avoiding false positives (e.g. "400" inside an order-id, "not found" from a
 # CCXT-internal cache warning). The substring tuple above is kept for any other
 # module that reads it; this regex is the detection path.
-import re as _re_internal
 _HARD_ERROR_RE = _re_internal.compile(
     r"\b(?:"
     r"does not exist|invalid\s+symbol|symbol\s+not\s+(?:found|available)|"
@@ -231,7 +263,7 @@ def _is_futures_symbol(symbol: str) -> bool:
     return symbol.endswith(":USDT")
 
 
-_MIN_LISTING_AGE_H  = 24
+_MIN_LISTING_AGE_H = 24
 _MIN_LISTING_AGE_MS = _MIN_LISTING_AGE_H * 3600 * 1000
 
 
@@ -296,9 +328,9 @@ def _compute_indicators(bars) -> dict:
     auf der letzten GESCHLOSSENEN Kerze (``LAST = -2``) gerechnet  passend zu
     Volumen/Body.
     """
-    df = pd.DataFrame(bars, columns=[
-        "timestamp", "open", "high", "low", "close", "volume"
-    ])
+    df = pd.DataFrame(
+        bars, columns=["timestamp", "open", "high", "low", "close", "volume"]
+    )
 
     # Brauchen mindestens 2 Zeilen, damit eine geschlossene Kerze existiert.
     if len(df) < 2:
@@ -306,7 +338,12 @@ def _compute_indicators(bars) -> dict:
     LAST = -2  # letzte GESCHLOSSENE Kerze (fetch_ohlcv[-1] ist noch offen)
 
     rsi_raw = _ta_rsi(df["close"], length=14)
-    if rsi_raw is None or rsi_raw.empty or len(rsi_raw) < 2 or pd.isna(rsi_raw.iloc[LAST]):
+    if (
+        rsi_raw is None
+        or rsi_raw.empty
+        or len(rsi_raw) < 2
+        or pd.isna(rsi_raw.iloc[LAST])
+    ):
         return {}
     rsi = float(rsi_raw.iloc[LAST])
 
@@ -323,8 +360,11 @@ def _compute_indicators(bars) -> dict:
 
     try:
         atr_series = _ta_atr(df["high"], df["low"], df["close"], length=14)
-        atr_last = (atr_series.iloc[LAST]
-                    if atr_series is not None and len(atr_series) >= 2 else None)
+        atr_last = (
+            atr_series.iloc[LAST]
+            if atr_series is not None and len(atr_series) >= 2
+            else None
+        )
         if atr_last is None or pd.isna(atr_last):
             atr_pct = 0.0
         else:
@@ -335,9 +375,12 @@ def _compute_indicators(bars) -> dict:
 
     try:
         ema_series = _ta_ema(df["close"], length=50)
-        ema_last = (ema_series.iloc[LAST]
-                    if ema_series is not None and len(ema_series) >= 2 else None)
-        curr_pr  = float(df["close"].iloc[LAST])
+        ema_last = (
+            ema_series.iloc[LAST]
+            if ema_series is not None and len(ema_series) >= 2
+            else None
+        )
+        curr_pr = float(df["close"].iloc[LAST])
         if ema_last is None or pd.isna(ema_last) or float(ema_last) <= 0:
             ema_ratio = 0.0
         else:
@@ -347,7 +390,7 @@ def _compute_indicators(bars) -> dict:
 
     try:
         if len(df) >= 22:
-            vol_curr  = float(df["volume"].iloc[-2])
+            vol_curr = float(df["volume"].iloc[-2])
             vol_avg20 = float(df["volume"].iloc[-22:-2].mean())
             if vol_avg20 > 0 and not pd.isna(vol_avg20) and not pd.isna(vol_curr):
                 vol_surge = vol_curr / vol_avg20
@@ -361,22 +404,22 @@ def _compute_indicators(bars) -> dict:
     try:
         o = float(df["open"].iloc[-2])
         h = float(df["high"].iloc[-2])
-        l = float(df["low"].iloc[-2])
+        low = float(df["low"].iloc[-2])
         c = float(df["close"].iloc[-2])
-        candle_range = h - l
-        body         = abs(c - o)
-        body_ratio   = (body / candle_range) if candle_range > 0 else 1.0
-        candle_dir   = -1.0 if c < o else (1.0 if c > o else 0.0)
+        candle_range = h - low
+        body = abs(c - o)
+        body_ratio = (body / candle_range) if candle_range > 0 else 1.0
+        candle_dir = -1.0 if c < o else (1.0 if c > o else 0.0)
     except Exception:
         body_ratio = 1.0
         candle_dir = 0.0
 
     return {
-        "rsi":        rsi,
-        "macd_hist":  macd_h,
-        "atr_pct":    atr_pct,
-        "ema_ratio":  ema_ratio,
-        "vol_surge":  vol_surge,
+        "rsi": rsi,
+        "macd_hist": macd_h,
+        "atr_pct": atr_pct,
+        "ema_ratio": ema_ratio,
+        "vol_surge": vol_surge,
         "body_ratio": body_ratio,
         "candle_dir": candle_dir,
     }
@@ -389,31 +432,35 @@ def _handle_ohlcv_exception(symbol, timeframe, e, bot_name):
 
     # 1. Hard errors  Symbol existiert nicht
     if _is_hard_error(err_str):
-        _symbol_failure_cache.set(
-            (symbol, timeframe), time.time() + _HARD_FAILURE_TTL)
+        _symbol_failure_cache.set((symbol, timeframe), time.time() + _HARD_FAILURE_TTL)
         entry = _fail_cache.get(f"{symbol}|{timeframe}", {})
         if entry.get("count", 0) == 0:
             _record_indicator_fail(symbol, timeframe)
             log_event(
-                f"Symbol {symbol} not tradeable on {timeframe}  silenced for 1h",
-                "INFO"
+                f"Symbol {symbol} not tradeable on {timeframe}  silenced for 1h", "INFO"
             )
         return
 
     # 2. Rate-limit
     if any(m in err_str for m in _RATE_LIMIT_MARKERS):
-        _symbol_failure_cache.set(
-            (symbol, timeframe), time.time() + _SOFT_FAILURE_TTL)
+        _symbol_failure_cache.set((symbol, timeframe), time.time() + _SOFT_FAILURE_TTL)
         return
 
     # 3. Network errors
-    is_network = any(t in exc_type for t in (
-        "networkerror", "requesttimeout", "ddos",
-        "connectionerror", "connecttimeout"
-    ))
+    is_network = any(
+        t in exc_type
+        for t in (
+            "networkerror",
+            "requesttimeout",
+            "ddos",
+            "connectionerror",
+            "connecttimeout",
+        )
+    )
     if is_network:
         _symbol_failure_cache.set(
-            (symbol, timeframe), time.time() + _SOFT_FAILURE_TTL // 2)
+            (symbol, timeframe), time.time() + _SOFT_FAILURE_TTL // 2
+        )
         return
 
     # 4. Andere API errors  catch-all AFTER hard-errors, rate-limits and
@@ -435,8 +482,7 @@ def _handle_ohlcv_exception(symbol, timeframe, e, bot_name):
     # 2+ timeframes fail  likely new listing or dead
     if tf_fails >= 2:
         for _tf in ("15m", "1h", "4h"):
-            _symbol_failure_cache.set(
-                (symbol, _tf), time.time() + _HARD_FAILURE_TTL)
+            _symbol_failure_cache.set((symbol, _tf), time.time() + _HARD_FAILURE_TTL)
             for _ in range(3):
                 _record_indicator_fail(symbol, _tf)
         with _sym_scan_lock:
@@ -445,18 +491,16 @@ def _handle_ohlcv_exception(symbol, timeframe, e, bot_name):
             log_event(
                 f"Symbol {symbol}: no candle data on multiple timeframes "
                 f" silenced for 1h",
-                "INFO"
+                "INFO",
             )
         return
 
     hard = _record_indicator_fail(symbol, timeframe)
     if hard:
-        _symbol_failure_cache.set(
-            (symbol, timeframe), time.time() + _HARD_FAILURE_TTL)
+        _symbol_failure_cache.set((symbol, timeframe), time.time() + _HARD_FAILURE_TTL)
         if not in_grace:
             log_event(
-                f"Symbol {symbol} {timeframe}: 3rd failure  silenced for 1h",
-                "INFO"
+                f"Symbol {symbol} {timeframe}: 3rd failure  silenced for 1h", "INFO"
             )
     else:
         entry = _fail_cache.get(f"{symbol}|{timeframe}", {})
@@ -466,8 +510,9 @@ def _handle_ohlcv_exception(symbol, timeframe, e, bot_name):
         # KEIN WARN-LOG bei erster/zweiter Failure  kein WARN-Spam mehr
 
 
-def _safe_get_indicators(exchange, symbol: str, timeframe: str,
-                         bot_name: str = "") -> dict:
+def _safe_get_indicators(
+    exchange, symbol: str, timeframe: str, bot_name: str = ""
+) -> dict:
     cache_key = (symbol, timeframe)
     expiry = _symbol_failure_cache.get(cache_key)
     if expiry is not None:
@@ -480,6 +525,7 @@ def _safe_get_indicators(exchange, symbol: str, timeframe: str,
 
     try:
         from core.database import check_and_consume_global_api
+
         if not check_and_consume_global_api(
             bot_name or "SCREENER",
             endpoint=f"fetch_ohlcv/{timeframe}",
@@ -489,8 +535,9 @@ def _safe_get_indicators(exchange, symbol: str, timeframe: str,
         pass
 
     try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe,
-                                    limit=SCREENER_OHLCV_LIMIT)
+        bars = exchange.fetch_ohlcv(
+            symbol, timeframe=timeframe, limit=SCREENER_OHLCV_LIMIT
+        )
     except Exception as e:
         _handle_ohlcv_exception(symbol, timeframe, e, bot_name)
         return {}
@@ -509,10 +556,7 @@ def _safe_get_indicators(exchange, symbol: str, timeframe: str,
     except Exception as e:
         _symbol_failure_cache.set(cache_key, time.time() + _SOFT_FAILURE_TTL)
         # Computation failure ist real-Bug-Indikator  WARN beibehalten
-        log_event(
-            f"Indicator computation failed for {symbol} {timeframe}: {e}",
-            "WARN"
-        )
+        log_event(f"Indicator computation failed for {symbol} {timeframe}: {e}", "WARN")
         return {}
 
 
@@ -540,8 +584,8 @@ def _clone_exchange(exchange):
     try:
         cls = type(src)
         cfg = {
-            "apiKey":          getattr(src, "apiKey",  None),
-            "secret":          getattr(src, "secret",  None),
+            "apiKey": getattr(src, "apiKey", None),
+            "secret": getattr(src, "secret", None),
             "enableRateLimit": True,
         }
         if getattr(src, "password", None):
@@ -596,7 +640,7 @@ def _close_clone(clone) -> None:
 # (each clone holds its own HTTP connection pool).
 _CLONE_POOL: list = []
 _CLONE_POOL_LOCK = threading.Lock()
-_CLONE_POOL_KEY  = {"id": None}   # id of the source exchange we cloned from
+_CLONE_POOL_KEY = {"id": None}  # id of the source exchange we cloned from
 
 
 @atexit.register
@@ -671,25 +715,25 @@ def _apply_quality_filters(
     rsi_15, rsi_1h, rsi_4h = [], [], []
     macd_1h, atr_1h, ema_1h, vsurge_1h, body_1h, cdir_1h = [], [], [], [], [], []
     for sym in candidates["symbol"]:
-        rsi_15.append   (results.get((sym, "15m"), {}).get("rsi",        50.0))
-        rsi_1h.append   (results.get((sym, "1h"),  {}).get("rsi",        50.0))
-        rsi_4h.append   (results.get((sym, "4h"),  {}).get("rsi",        50.0))
+        rsi_15.append(results.get((sym, "15m"), {}).get("rsi", 50.0))
+        rsi_1h.append(results.get((sym, "1h"), {}).get("rsi", 50.0))
+        rsi_4h.append(results.get((sym, "4h"), {}).get("rsi", 50.0))
         r1h = results.get((sym, "1h"), {})
-        macd_1h.append  (r1h.get("macd_hist",  0.0))
-        atr_1h.append   (r1h.get("atr_pct",    0.0))
-        ema_1h.append   (r1h.get("ema_ratio",  0.0))
-        vsurge_1h.append(r1h.get("vol_surge",  1.0))
-        body_1h.append  (r1h.get("body_ratio", 1.0))
-        cdir_1h.append  (r1h.get("candle_dir", 0.0))
+        macd_1h.append(r1h.get("macd_hist", 0.0))
+        atr_1h.append(r1h.get("atr_pct", 0.0))
+        ema_1h.append(r1h.get("ema_ratio", 0.0))
+        vsurge_1h.append(r1h.get("vol_surge", 1.0))
+        body_1h.append(r1h.get("body_ratio", 1.0))
+        cdir_1h.append(r1h.get("candle_dir", 0.0))
 
     candidates = candidates.copy()
-    candidates["rsi_15m"]    = rsi_15
-    candidates["rsi_1h"]     = rsi_1h
-    candidates["rsi_4h"]     = rsi_4h
-    candidates["macd_hist"]  = macd_1h
-    candidates["atr_pct"]    = atr_1h
-    candidates["ema_ratio"]  = ema_1h
-    candidates["vol_surge"]  = vsurge_1h
+    candidates["rsi_15m"] = rsi_15
+    candidates["rsi_1h"] = rsi_1h
+    candidates["rsi_4h"] = rsi_4h
+    candidates["macd_hist"] = macd_1h
+    candidates["atr_pct"] = atr_1h
+    candidates["ema_ratio"] = ema_1h
+    candidates["vol_surge"] = vsurge_1h
     candidates["body_ratio"] = body_1h
     candidates["candle_dir"] = cdir_1h
 
@@ -701,12 +745,12 @@ def _apply_quality_filters(
         top = top[top["macd_hist"] > 0].copy()
         after_macd = len(top)
         top = top[top["vol_surge"] >= vol_threshold].copy()
-        after_vol  = len(top)
+        after_vol = len(top)
         top = top[(top["atr_pct"] >= 1.0) & (top["atr_pct"] <= 8.0)].copy()
-        after_atr  = len(top)
+        after_atr = len(top)
         if not is_futures_market:
             top = top[top["ema_ratio"] >= -1.0].copy()
-        after_ema  = len(top)
+        after_ema = len(top)
         top = top[top["body_ratio"] >= 0.30].copy()
         after_body = len(top)
 
@@ -725,22 +769,20 @@ def _apply_quality_filters(
         # Never make SHORT stricter than LONG  clamp to the LONG threshold.
         short_vol = min(short_vol, vol_threshold)
         top = top[top["vol_surge"] >= short_vol].copy()
-        after_vol  = len(top)
+        after_vol = len(top)
         # ATR range: same (need reasonable volatility to trade)
         top = top[(top["atr_pct"] >= 1.0) & (top["atr_pct"] <= 8.0)].copy()
-        after_atr  = len(top)
+        after_atr = len(top)
         # EMA  1% : price at or below 1h EMA = bearish structural context.
         top = top[top["ema_ratio"] <= 1.0].copy()
-        after_ema  = len(top)
+        after_ema = len(top)
         # body_ratio  0.30 + red close: real red candle, not just a wick
         top = top[(top["body_ratio"] >= 0.30) & (top["candle_dir"] < 0)].copy()
         after_body = len(top)
         # RSI guard: don't short already-oversold coins (extreme
         # capitulation-bounce candidates, poor SHORT entries). OR-logic:
         # reject if RSI < 30 on 1h OR < 25 on 15m.
-        top = top[
-            ~((top["rsi_1h"] < 30) | (top["rsi_15m"] < 25))
-        ].copy()
+        top = top[~((top["rsi_1h"] < 30) | (top["rsi_15m"] < 25))].copy()
         after_rsi = len(top)
         # Additional 24h change guard for SHORTs: don't short coins that have
         # ALREADY dumped heavily  they're more likely to bounce than keep
@@ -760,14 +802,16 @@ def _apply_quality_filters(
                 f"Quality filters [{label}]: {before} -> MACD:{after_macd} -> "
                 f"Vol:{after_vol} -> ATR:{after_atr} -> EMA:{after_ema} -> "
                 f"Body:{after_body}",
-                "INFO")
+                "INFO",
+            )
         else:
             log_event(
                 f"Quality filters [{label}]: {before} -> MACD:{after_macd} -> "
                 f"Vol:{after_vol} -> ATR:{after_atr} -> EMA:{after_ema} -> "
                 f"Body:{after_body} -> RSI-guard:{after_rsi} -> "
                 f"Dump-guard:{after_dump}",
-                "INFO")
+                "INFO",
+            )
 
     return top
 
@@ -783,45 +827,55 @@ def _score_candidates(
         hist_wr: dict = {}
         if bot_name:
             from core.database import get_symbol_winrates
+
             # Pass direction so the win-rate query only counts past trades
             # of the SAME side. Mixing LONG and SHORT history for the
             # same coin produced misleading composite scores  a BTC
             # that wins 70% of shorts and loses 70% of longs would
             # otherwise score 50% for both directions.
             hist_wr = get_symbol_winrates(
-                bot_name, list(top_coins["symbol"]), days=30,
-                direction=direction.upper())
+                bot_name,
+                list(top_coins["symbol"]),
+                days=30,
+                direction=direction.upper(),
+            )
 
         if direction == "long":
+
             def _rsi_score(rsi: float) -> float:
-                if 45 <= rsi <= 65: return 1.0
-                if 65 < rsi <= 75:  return 0.5
-                if 30 <= rsi < 45:  return 0.75
+                if 45 <= rsi <= 65:
+                    return 1.0
+                if 65 < rsi <= 75:
+                    return 0.5
+                if 30 <= rsi < 45:
+                    return 0.75
                 return 0.0
         else:  # short: ideal RSI is overextended (55-80 range)
+
             def _rsi_score(rsi: float) -> float:
-                if 55 <= rsi <= 75: return 1.0  # overbought  prime short
-                if 75 < rsi <= 85:  return 0.7   # very overbought
-                if 40 <= rsi < 55:  return 0.5   # neutral, acceptable
+                if 55 <= rsi <= 75:
+                    return 1.0  # overbought  prime short
+                if 75 < rsi <= 85:
+                    return 0.7  # very overbought
+                if 40 <= rsi < 55:
+                    return 0.5  # neutral, acceptable
                 return 0.0
 
-        vol_norm    = top_coins["vol_surge"].clip(upper=6) / 6
-        rsi_scores  = top_coins["rsi_1h"].apply(_rsi_score)
-        hist_scores = top_coins["symbol"].map(
-            lambda s: hist_wr.get(s, 0.5))
+        vol_norm = top_coins["vol_surge"].clip(upper=6) / 6
+        rsi_scores = top_coins["rsi_1h"].apply(_rsi_score)
+        hist_scores = top_coins["symbol"].map(lambda s: hist_wr.get(s, 0.5))
 
         top_coins = top_coins.copy()
         top_coins["composite_score"] = (
-            vol_norm    * 0.40 +
-            rsi_scores  * 0.30 +
-            hist_scores * 0.30
+            vol_norm * 0.40 + rsi_scores * 0.30 + hist_scores * 0.30
         )
         top_coins = top_coins.sort_values("composite_score", ascending=False)
         top_syms = list(top_coins["symbol"].head(3))
         log_event(
             f"Symbol scoring [{direction.upper()}]: "
             f"vol 40% + RSI 30% + history 30% -> top picks: {top_syms}",
-            "INFO")
+            "INFO",
+        )
     except Exception as score_err:
         log_event(f"Symbol scoring skipped ({score_err})", "WARN")
 
@@ -829,8 +883,10 @@ def _score_candidates(
 
 
 def get_top_momentum_coins(
-    limit: int = 5, exchange=None,
-    min_pump: float = 3.0, bot_name: str = "",
+    limit: int = 5,
+    exchange=None,
+    min_pump: float = 3.0,
+    bot_name: str = "",
     direction: str = "long",
     quiet_market: bool = False,
 ) -> "pd.DataFrame":
@@ -854,6 +910,7 @@ def get_top_momentum_coins(
     """
     if exchange is None:
         from config.exchange_config import get_spot_exchange_connection
+
         exchange = get_spot_exchange_connection()
 
     # Reset per-scan per-bot fail counter
@@ -862,14 +919,14 @@ def get_top_momentum_coins(
         for k in keys_to_drop:
             _sym_scan_fails.pop(k, None)
 
-    directions = (["long", "short"] if direction == "both"
-                  else [direction])
+    directions = ["long", "short"] if direction == "both" else [direction]
 
     move_sign = "" if direction == "both" else ("+" if "long" in directions else "-")
     log_event(
         f"Scanning market (15m, 1h, 4h) | Min move: {move_sign}{min_pump}% "
         f"| Direction: {direction.upper()} ...",
-        "SCAN")
+        "SCAN",
+    )
 
     try:
         tickers = exchange.fetch_tickers()
@@ -878,18 +935,17 @@ def get_top_momentum_coins(
         return pd.DataFrame()
 
     is_futures_market = any(_is_futures_symbol(s) for s in tickers)
-    min_volume = (MIN_VOLUME_USDT_FUTURES if is_futures_market
-                  else MIN_VOLUME_USDT_SPOT)
+    min_volume = MIN_VOLUME_USDT_FUTURES if is_futures_market else MIN_VOLUME_USDT_SPOT
 
     if is_futures_market:
         log_event(
-            f"Futures market detected (vol-threshold: {min_volume:,} USDT)",
-            "INFO")
+            f"Futures market detected (vol-threshold: {min_volume:,} USDT)", "INFO"
+        )
 
     markets = getattr(exchange, "markets", None) or {}
 
     #  Collect raw ticker data, direction-filtered
-    long_data:  list = []
+    long_data: list = []
     short_data: list = []
     seen_total = seen_usdt = 0
     rej_no_vol = rej_no_pct = rej_volume = rej_stock = rej_new = 0
@@ -938,8 +994,7 @@ def get_top_momentum_coins(
             rej_volume += 1
             continue
 
-        entry = {"symbol": symbol, "change_percent": chg,
-                 "price": last, "volume": vol}
+        entry = {"symbol": symbol, "change_percent": chg, "price": last, "volume": vol}
 
         if "long" in directions:
             if min_pump <= chg <= MAX_24H_PUMP:
@@ -960,19 +1015,19 @@ def get_top_momentum_coins(
         if not coin_data:
             return pd.DataFrame()
         df = pd.DataFrame(coin_data)
-        return (df.sort_values("change_percent", ascending=asc)
-                  .head(pre_limit).copy())
+        return df.sort_values("change_percent", ascending=asc).head(pre_limit).copy()
 
-    long_candidates  = _make_candidates(long_data,  asc=False)  # top pumpers
-    short_candidates = _make_candidates(short_data, asc=True)   # top dumpers
+    long_candidates = _make_candidates(long_data, asc=False)  # top pumpers
+    short_candidates = _make_candidates(short_data, asc=True)  # top dumpers
 
     if long_candidates.empty and short_candidates.empty:
         log_event(
             f"No candidates found ({min_pump}% threshold). "
             f"Diagnostic: total={seen_total}, USDT={seen_usdt}, "
             f"rej stock={rej_stock}, rej new={rej_new}, "
-            f"rej vol={rej_volume}, rej no_data={rej_no_vol+rej_no_pct}",
-            "WAIT")
+            f"rej vol={rej_volume}, rej no_data={rej_no_vol + rej_no_pct}",
+            "WAIT",
+        )
         return pd.DataFrame()
 
     #  Fetch indicators for ALL unique symbols in ONE parallel pass
@@ -986,11 +1041,11 @@ def get_top_momentum_coins(
     tasks = [(sym, tf) for sym in all_syms for tf in timeframes]
 
     n_workers = min(MAX_PARALLEL_WORKERS, max(1, len(tasks)))
-    clones    = _get_clone_pool(exchange, n_workers)
+    clones = _get_clone_pool(exchange, n_workers)
 
     _tls = threading.local()
     _clone_counter = [0]
-    _counter_lock  = threading.Lock()
+    _counter_lock = threading.Lock()
 
     def _my_clone():
         c = getattr(_tls, "clone", None)
@@ -1014,28 +1069,28 @@ def get_top_momentum_coins(
     )
     try:
         future_map = {
-            pool.submit(_fetch_with_clone, sym, tf): (sym, tf)
-            for sym, tf in tasks
+            pool.submit(_fetch_with_clone, sym, tf): (sym, tf) for sym, tf in tasks
         }
         try:
-            for future in as_completed(future_map,
-                                       timeout=_GATHER_TIMEOUT_SEC):
+            for future in as_completed(future_map, timeout=_GATHER_TIMEOUT_SEC):
                 sym, tf = future_map[future]
                 try:
-                    results[(sym, tf)] = future.result(
-                        timeout=_PER_FUTURE_TIMEOUT_SEC)
+                    results[(sym, tf)] = future.result(timeout=_PER_FUTURE_TIMEOUT_SEC)
                 except FuturesTimeout:
                     results[(sym, tf)] = {}
                     log_event(
                         f"Indicator fetch timed out for {sym} {tf} "
                         f"(>{_PER_FUTURE_TIMEOUT_SEC:.0f}s)  using empty",
-                        "WARN")
+                        "WARN",
+                    )
                 except Exception:
                     results[(sym, tf)] = {}
         except FuturesTimeout:
             log_event(
                 f"Screener gather hit {_GATHER_TIMEOUT_SEC:.0f}s limit "
-                f" some indicators empty", "WARN")
+                f" some indicators empty",
+                "WARN",
+            )
             for fut, (sym, tf) in future_map.items():
                 if (sym, tf) not in results:
                     if fut.done():
@@ -1068,8 +1123,12 @@ def get_top_momentum_coins(
 
     if not long_candidates.empty:
         top_long = _apply_quality_filters(
-            long_candidates, results, "long", is_futures_market,
-            quiet_market=quiet_market)
+            long_candidates,
+            results,
+            "long",
+            is_futures_market,
+            quiet_market=quiet_market,
+        )
         if not top_long.empty:
             top_long = _score_candidates(top_long, bot_name, "long")
             top_long = top_long.head(limit).copy()
@@ -1078,8 +1137,12 @@ def get_top_momentum_coins(
 
     if not short_candidates.empty:
         top_short = _apply_quality_filters(
-            short_candidates, results, "short", is_futures_market,
-            quiet_market=quiet_market)
+            short_candidates,
+            results,
+            "short",
+            is_futures_market,
+            quiet_market=quiet_market,
+        )
         if not top_short.empty:
             top_short = _score_candidates(top_short, bot_name, "short")
             top_short = top_short.head(limit).copy()

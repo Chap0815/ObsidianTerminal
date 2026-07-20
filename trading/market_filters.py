@@ -5,6 +5,7 @@ Provides BTC-trend / dump detection (fail-closed when BTC data is
 unavailable), Fear & Greed sourcing with circuit breaker, market-regime
 detection, spread/correlation checks, and the combined can_buy_now() gate.
 """
+
 from __future__ import annotations
 
 import os
@@ -20,13 +21,16 @@ from bot_utils.safe_numeric import safe_positive_float
 load_dotenv()
 
 
-#  Proxy config 
-_USE_PROXY    = os.getenv("USE_PROXY", "false").lower() == "true"
-_PROXY_PORT   = os.getenv("PROXY_PORT", "10808")
+#  Proxy config
+_USE_PROXY = os.getenv("USE_PROXY", "false").lower() == "true"
+_PROXY_PORT = os.getenv("PROXY_PORT", "10808")
 _HTTP_PROXIES = (
-    {"http":  f"http://127.0.0.1:{_PROXY_PORT}",
-     "https": f"http://127.0.0.1:{_PROXY_PORT}"}
-    if _USE_PROXY else None
+    {
+        "http": f"http://127.0.0.1:{_PROXY_PORT}",
+        "https": f"http://127.0.0.1:{_PROXY_PORT}",
+    }
+    if _USE_PROXY
+    else None
 )
 
 
@@ -37,21 +41,23 @@ def _http_get(url, timeout=15, **kwargs):
 def _filter_log(msg: str, level: str = "INFO") -> None:
     try:
         from core.logger import log_event
+
         log_event(msg, level)
     except Exception:
         print(msg, flush=True)
 
 
-#  Bounded LRU Cache 
+#  Bounded LRU Cache
 _CACHE_MAXSIZE = 32
-CACHE_TTL      = 300
+CACHE_TTL = 300
 
 
 class _LRUCache:
     """Thread-safe bounded LRU cache."""
+
     def __init__(self, maxsize: int = 32):
-        self._d    = OrderedDict()
-        self._max  = maxsize
+        self._d = OrderedDict()
+        self._max = maxsize
         self._lock = threading.Lock()
 
     def get(self, key: str):
@@ -74,7 +80,7 @@ class _LRUCache:
             return key in self._d
 
 
-_lru          = _LRUCache(maxsize=_CACHE_MAXSIZE)
+_lru = _LRUCache(maxsize=_CACHE_MAXSIZE)
 _spread_cache = _LRUCache(maxsize=128)
 
 
@@ -108,11 +114,12 @@ def check_tradability(exchange, symbol_full: str) -> tuple[bool, str]:
         return False, f"market metadata error ({type(exc).__name__})"
     return True, ""
 
+
 # Progressive backoff state per cache key
 _STALE_BACKOFF: dict = {}
 _STALE_BACKOFF_LOCK = threading.Lock()
-_STALE_GRACE_BASE   = 60     # initial grace seconds
-_STALE_GRACE_MAX    = 300    # cap
+_STALE_GRACE_BASE = 60  # initial grace seconds
+_STALE_GRACE_MAX = 300  # cap
 
 
 def _next_stale_grace(key: str) -> int:
@@ -136,37 +143,44 @@ def _cached(key: str, fetch_fn):
         return entry["value"]
     try:
         value = fetch_fn()
-        _lru.set(key, {
-            "value":   value,
-            "stale":   value,
-            "expires": time.time() + CACHE_TTL,
-        })
+        _lru.set(
+            key,
+            {
+                "value": value,
+                "stale": value,
+                "expires": time.time() + CACHE_TTL,
+            },
+        )
         _reset_stale_grace(key)
         return value
     except Exception:
         if entry and "stale" in entry:
             grace = _next_stale_grace(key)
             from core.logger import log_event
+
             log_event(
                 f"[cache] {key}: fetch failed, serving stale value for "
                 f"up to {grace}s (progressive)",
                 "WARN",
             )
-            _lru.set(key, {
-                "value":   entry["stale"],
-                "stale":   entry["stale"],
-                "expires": time.time() + grace,
-            })
+            _lru.set(
+                key,
+                {
+                    "value": entry["stale"],
+                    "stale": entry["stale"],
+                    "expires": time.time() + grace,
+                },
+            )
             return entry["stale"]
         raise
 
 
-#  BTC price unavailable sentinel 
+#  BTC price unavailable sentinel
 class BTCPriceUnavailable(Exception):
     """Raised when BTC data fetch fails entirely."""
 
 
-#  F&G Circuit Breaker 
+#  F&G Circuit Breaker
 _FG_CIRCUIT_LOCK = threading.Lock()
 _FG_CIRCUIT = {"failures": 0, "open_until": 0.0, "last_value": 50}
 _FG_FAILURE_THRESHOLD = 3
@@ -189,12 +203,14 @@ def _btc_symbol_for(exchange) -> str:
     return "BTC/USDT"
 
 
-# 
+#
 # BTC correlation  fail-CLOSED
-# 
+#
 
-def get_btc_change(exchange, hours: int = 1, raise_on_failure: bool = False,
-                   closed_only: bool = False) -> float:
+
+def get_btc_change(
+    exchange, hours: int = 1, raise_on_failure: bool = False, closed_only: bool = False
+) -> float:
     """Return BTC price change % over the last X hours.
 
     Callers needing a safety decision set raise_on_failure=True. Safety/flatten
@@ -226,26 +242,28 @@ def get_btc_change(exchange, hours: int = 1, raise_on_failure: bool = False,
             bars = exchange.fetch_ohlcv(primary_symbol, "1h", limit=limit)
             result = _calc(bars)
             if result is None:
-                raise BTCPriceUnavailable(
-                    f"insufficient BTC history for {hours}h")
+                raise BTCPriceUnavailable(f"insufficient BTC history for {hours}h")
             return result
         except Exception as exc:
             e_primary = exc
 
         fallback_symbol = (
-            "BTC/USDT:USDT" if primary_symbol == "BTC/USDT" else "BTC/USDT")
+            "BTC/USDT:USDT" if primary_symbol == "BTC/USDT" else "BTC/USDT"
+        )
         try:
             bars = exchange.fetch_ohlcv(fallback_symbol, "1h", limit=limit)
             result = _calc(bars)
             if result is None:
-                raise BTCPriceUnavailable(
-                    f"insufficient BTC history for {hours}h")
+                raise BTCPriceUnavailable(f"insufficient BTC history for {hours}h")
             return result
         except Exception as e_fallback:
             from core.logger import log_event
+
             log_event(
                 f"BTC trend fetch failed: {e_primary} | "
-                f"fallback ({fallback_symbol}): {e_fallback}", "WARN")
+                f"fallback ({fallback_symbol}): {e_fallback}",
+                "WARN",
+            )
             raise BTCPriceUnavailable(
                 f"primary={e_primary}, fallback={e_fallback}"
             ) from e_fallback
@@ -274,13 +292,15 @@ def is_btc_dumping(exchange, threshold: float = -2.0) -> bool:
         return chg <= threshold
     except BTCPriceUnavailable:
         from core.logger import log_event
+
         log_event("BTC data unavailable  treating as dumping (fail-closed)", "WARN")
         return True
 
 
-# 
+#
 # Fear & Greed
-# 
+#
+
 
 def _fetch_fg_from_cmc() -> Optional[int]:
     """Fetch Fear & Greed from CoinMarketCap.
@@ -298,7 +318,7 @@ def _fetch_fg_from_cmc() -> Optional[int]:
     is more stable long-term but requires user signup at
     coinmarketcap.com/api/. The user prioritises CMC as the truth source.
     """
-    #  Path 1: Official API (requires API key) 
+    #  Path 1: Official API (requires API key)
     api_key = os.getenv("CMC_API_KEY", "").strip()
     if api_key:
         try:
@@ -332,8 +352,9 @@ def _fetch_fg_from_cmc() -> Optional[int]:
                 "WARN",
             )
 
-    #  Path 2: Unofficial data-api (no key needed) 
+    #  Path 2: Unofficial data-api (no key needed)
     from datetime import datetime as _dt, timezone as _tz
+
     try:
         # timezone-aware UTC; a naive datetime's .timestamp() would assume
         # local time.
@@ -347,16 +368,19 @@ def _fetch_fg_from_cmc() -> Optional[int]:
         r.raise_for_status()
         payload = r.json()
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
-        dl = (data.get("dataList") or data.get("points")
-              or data.get("history") or [])
+        dl = data.get("dataList") or data.get("points") or data.get("history") or []
         if not dl or not isinstance(dl, list):
             return None
         candidates = [dl[-1], dl[0]] if len(dl) > 1 else [dl[0]]
         for entry in candidates:
             if not isinstance(entry, dict):
                 continue
-            score = (entry.get("score") or entry.get("value")
-                     or entry.get("fgi") or entry.get("index"))
+            score = (
+                entry.get("score")
+                or entry.get("value")
+                or entry.get("fgi")
+                or entry.get("index")
+            )
             if score is None:
                 continue
             try:
@@ -366,8 +390,7 @@ def _fetch_fg_from_cmc() -> Optional[int]:
             except (TypeError, ValueError):
                 continue
     except Exception as e:
-        _filter_log(f"[Filter] CMC data-api failed: {type(e).__name__}: {e}",
-                    "WARN")
+        _filter_log(f"[Filter] CMC data-api failed: {type(e).__name__}: {e}", "WARN")
     return None
 
 
@@ -398,7 +421,7 @@ def get_fear_greed() -> int:
     def fetch():
         now = time.time()
         with _FG_CIRCUIT_LOCK:
-            failures   = _FG_CIRCUIT["failures"]
+            failures = _FG_CIRCUIT["failures"]
             open_until = _FG_CIRCUIT["open_until"]
             last_value = _FG_CIRCUIT["last_value"]
 
@@ -412,10 +435,11 @@ def get_fear_greed() -> int:
         # Try the DB cache first (refreshed every 5 min by this function)
         try:
             from core.database import get_cached_fear_greed
+
             cached = get_cached_fear_greed(max_age_sec=290)
             if cached is not None:
                 with _FG_CIRCUIT_LOCK:
-                    _FG_CIRCUIT["failures"]   = 0
+                    _FG_CIRCUIT["failures"] = 0
                     _FG_CIRCUIT["last_value"] = cached
                 return cached
         except Exception:
@@ -426,9 +450,9 @@ def get_fear_greed() -> int:
         # 2. alternative.me  established backup, different methodology
         # 3. coinybubble  alternative.me mirror
         sources = [
-            ("CMC",          _fetch_fg_from_cmc),
-            ("alternative",  _fetch_fg_from_alternative_me),
-            ("coinybubble",  _fetch_fg_from_coinybubble),
+            ("CMC", _fetch_fg_from_cmc),
+            ("alternative", _fetch_fg_from_alternative_me),
+            ("coinybubble", _fetch_fg_from_coinybubble),
         ]
         for source_name, fetch_fn in sources:
             value = fetch_fn()
@@ -436,11 +460,12 @@ def get_fear_greed() -> int:
                 continue
             try:
                 from core.database import set_fear_greed_cache
+
                 set_fear_greed_cache(value)
             except Exception:
                 pass
             with _FG_CIRCUIT_LOCK:
-                _FG_CIRCUIT["failures"]   = 0
+                _FG_CIRCUIT["failures"] = 0
                 _FG_CIRCUIT["last_value"] = value
             _filter_log(f"[Filter] F&G from {source_name}: {value}", "INFO")
             return value
@@ -449,10 +474,10 @@ def get_fear_greed() -> int:
         # Better to trade on a 1h-old F&G than to default to "50 neutral".
         try:
             from core.database import get_cached_fear_greed
-            stale = get_cached_fear_greed(max_age_sec=24*3600)  # 24h tolerance
+
+            stale = get_cached_fear_greed(max_age_sec=24 * 3600)  # 24h tolerance
             if stale is not None:
-                _filter_log(f"[Filter] using stale cached F&G value: {stale}",
-                            "INFO")
+                _filter_log(f"[Filter] using stale cached F&G value: {stale}", "INFO")
                 with _FG_CIRCUIT_LOCK:
                     _FG_CIRCUIT["last_value"] = stale
                 return stale
@@ -463,8 +488,10 @@ def get_fear_greed() -> int:
             _FG_CIRCUIT["failures"] += 1
             if _FG_CIRCUIT["failures"] >= _FG_FAILURE_THRESHOLD:
                 _FG_CIRCUIT["open_until"] = time.time() + _FG_OPEN_DURATION_SEC
-                _filter_log(f"[Filter] F&G circuit breaker OPEN for "
-                            f"{_FG_OPEN_DURATION_SEC}s", "WARN")
+                _filter_log(
+                    f"[Filter] F&G circuit breaker OPEN for {_FG_OPEN_DURATION_SEC}s",
+                    "WARN",
+                )
             last = _FG_CIRCUIT["last_value"]
         return last
 
@@ -473,16 +500,21 @@ def get_fear_greed() -> int:
 
 def fg_label(value: int) -> str:
     """Human-readable Fear & Greed label."""
-    if value <= 25:  return "Extreme Fear"
-    if value <= 45:  return "Fear"
-    if value <= 55:  return "Neutral"
-    if value <= 75:  return "Greed"
+    if value <= 25:
+        return "Extreme Fear"
+    if value <= 45:
+        return "Fear"
+    if value <= 55:
+        return "Neutral"
+    if value <= 75:
+        return "Greed"
     return "Extreme Greed"
 
 
-# 
+#
 # Market-regime detection
-# 
+#
+
 
 def _closed_daily_bars(bars: list) -> list:
     """Return only completed 1d candles.
@@ -509,10 +541,11 @@ def _closed_daily_bars(bars: list) -> list:
 def get_market_regime(exchange) -> dict:
     def fetch():
         from core.database import log_market_regime
+
         try:
-            symbol     = _btc_symbol_for(exchange)
+            symbol = _btc_symbol_for(exchange)
             ticker_24h = exchange.fetch_ticker(symbol)
-            btc_24h    = float(ticker_24h.get("percentage", 0) or 0)
+            btc_24h = float(ticker_24h.get("percentage", 0) or 0)
 
             bars = exchange.fetch_ohlcv(symbol, "1d", limit=9)
             closed_bars = _closed_daily_bars(bars)
@@ -532,7 +565,9 @@ def get_market_regime(exchange) -> dict:
                     pass  # bleibt 0.0 wenn auch das nicht klappt
 
             if len(closed_bars) >= 8:
-                btc_7d = ((closed_bars[-1][4] - closed_bars[-8][4]) / closed_bars[-8][4]) * 100
+                btc_7d = (
+                    (closed_bars[-1][4] - closed_bars[-8][4]) / closed_bars[-8][4]
+                ) * 100
             else:
                 btc_7d = 0.0
 
@@ -557,9 +592,9 @@ def get_market_regime(exchange) -> dict:
 
             # Signal 3: sentiment, only as TIEBREAKER (extremes only)
             # F&G in normal Fear range (20-40) does NOT flip the regime alone
-            if fg >= 65:           # Greed
+            if fg >= 65:  # Greed
                 vote += 1
-            elif fg <= 20:         # Extreme Fear (capitulation)
+            elif fg <= 20:  # Extreme Fear (capitulation)
                 vote -= 1
 
             if vote >= 2:
@@ -576,34 +611,43 @@ def get_market_regime(exchange) -> dict:
                 "INFO",
             )
 
-            result = {"regime": regime, "btc_24h": round(btc_24h, 2),
-                      "btc_7d": round(btc_7d, 2), "fear_greed": fg}
+            result = {
+                "regime": regime,
+                "btc_24h": round(btc_24h, 2),
+                "btc_7d": round(btc_7d, 2),
+                "fear_greed": fg,
+            }
             log_market_regime(regime, btc_24h, btc_7d, fg)
             return result
         except Exception as e:
-            _filter_log(f"[Filter] Market phase analysis failed: {e}",
-                        "WARN")
-            return {"regime": "NEUTRAL", "btc_24h": 0.0, "btc_7d": 0.0,
-                    "fear_greed": 50}
+            _filter_log(f"[Filter] Market phase analysis failed: {e}", "WARN")
+            return {
+                "regime": "NEUTRAL",
+                "btc_24h": 0.0,
+                "btc_7d": 0.0,
+                "fear_greed": 50,
+            }
 
     return _cached("regime", fetch)
 
 
-# 
+#
 # Price validation
-# 
+#
+
 
 def is_price_valid(price) -> bool:
     return safe_positive_float(price, 0.0) > 0
 
 
-# 
+#
 # Spread Quality
-# 
+#
 
-def check_spread_quality(exchange, symbol: str,
-                         max_spread_pct: float = 0.3,
-                         fail_closed: bool = True) -> tuple:
+
+def check_spread_quality(
+    exchange, symbol: str, max_spread_pct: float = 0.3, fail_closed: bool = True
+) -> tuple:
     cache_key = f"spread_{symbol}_{float(max_spread_pct):.6f}_{int(bool(fail_closed))}"
     now = time.time()
     entry = _spread_cache.get(cache_key)
@@ -611,69 +655,101 @@ def check_spread_quality(exchange, symbol: str,
         return entry["value"]
 
     try:
-        ob   = exchange.fetch_order_book(symbol, limit=1)
+        ob = exchange.fetch_order_book(symbol, limit=1)
         bids = ob.get("bids") or []
         asks = ob.get("asks") or []
         if not bids or not asks:
-            result = ((False, f"{symbol}: order book missing bids/asks")
-                      if fail_closed else (True, "OK"))
+            result = (
+                (False, f"{symbol}: order book missing bids/asks")
+                if fail_closed
+                else (True, "OK")
+            )
         else:
             best_bid = float(bids[0][0])
             best_ask = float(asks[0][0])
             if best_bid <= 0 or best_ask <= 0:
-                result = ((False, f"{symbol}: invalid order book quotes")
-                          if fail_closed else (True, "OK"))
+                result = (
+                    (False, f"{symbol}: invalid order book quotes")
+                    if fail_closed
+                    else (True, "OK")
+                )
             else:
                 mid = (best_bid + best_ask) / 2
                 spread_pct = (best_ask - best_bid) / mid * 100
                 if spread_pct > max_spread_pct:
-                    result = (False,
-                              f"Spread {spread_pct:.2f}% > "
-                              f"{max_spread_pct}%  slippage too high")
+                    result = (
+                        False,
+                        f"Spread {spread_pct:.2f}% > "
+                        f"{max_spread_pct}%  slippage too high",
+                    )
                 else:
                     result = (True, "OK")
     except Exception as exc:
-        result = ((False, f"{symbol}: spread check unavailable "
-                   f"({type(exc).__name__})")
-                  if fail_closed else (True, "OK"))
+        result = (
+            (False, f"{symbol}: spread check unavailable ({type(exc).__name__})")
+            if fail_closed
+            else (True, "OK")
+        )
 
     _spread_cache.set(cache_key, {"value": result, "expires": now + 30})
     return result
 
 
-# 
+#
 # Correlation Exposure
-# 
+#
 
 _HIGH_BTC_CORRELATION = {
-    "BTC", "ETH", "SOL", "AVAX", "ARB", "OP", "MATIC", "LINK",
-    "ATOM", "DOT", "ADA", "BNB", "TRX",
+    "BTC",
+    "ETH",
+    "SOL",
+    "AVAX",
+    "ARB",
+    "OP",
+    "MATIC",
+    "LINK",
+    "ATOM",
+    "DOT",
+    "ADA",
+    "BNB",
+    "TRX",
 }
 
 
-def check_correlation_exposure(open_symbols: list, candidate_symbol: str,
-                               max_correlated: int = 2) -> tuple:
+def check_correlation_exposure(
+    open_symbols: list, candidate_symbol: str, max_correlated: int = 2
+) -> tuple:
     def _base(sym: str) -> str:
         return sym.split("/")[0].upper()
+
     candidate_base = _base(candidate_symbol)
     open_correlated = [s for s in open_symbols if _base(s) in _HIGH_BTC_CORRELATION]
     if candidate_base not in _HIGH_BTC_CORRELATION:
         return True, "OK"
     if len(open_correlated) >= max_correlated:
-        return (False,
-                f"Correlation exposure: {len(open_correlated)} BTC-correlated "
-                f"positions already open (max {max_correlated})  "
-                f"adding {candidate_base} would over-concentrate risk")
+        return (
+            False,
+            f"Correlation exposure: {len(open_correlated)} BTC-correlated "
+            f"positions already open (max {max_correlated})  "
+            f"adding {candidate_base} would over-concentrate risk",
+        )
     return True, "OK"
 
 
-# 
+#
 # Combined buy filter
-# 
+#
 
-def can_buy_now(exchange, bot_name: str = "", open_symbols: list = None,
-                candidate_symbol: str = "", check_spread: bool = False,
-                allow_shorts: bool = False, known_price: float = None) -> tuple:
+
+def can_buy_now(
+    exchange,
+    bot_name: str = "",
+    open_symbols: list = None,
+    candidate_symbol: str = "",
+    check_spread: bool = False,
+    allow_shorts: bool = False,
+    known_price: float = None,
+) -> tuple:
     """Gate check before opening a new position.
 
     ``allow_shorts=True`` inverts some filters for futures bots that can
@@ -700,20 +776,22 @@ def can_buy_now(exchange, bot_name: str = "", open_symbols: list = None,
         if allow_shorts:
             # Only block extreme panic  regular dumps are SHORT signals
             if change <= -8.0:
-                return (False,
-                        f"BTC extreme dump ({change:.2f}% in 1h) "
-                        f" fills unreliable, pausing all entries")
+                return (
+                    False,
+                    f"BTC extreme dump ({change:.2f}% in 1h) "
+                    f" fills unreliable, pausing all entries",
+                )
         else:
             if change <= -2.0:
                 return False, f"BTC dumping ({change:.2f}% in 1h)"
     except BTCPriceUnavailable:
-        return (False,
-                "BTC data unavailable  fail-closed (pausing new entries "
-                "until BTC price feed recovers)")
+        return (
+            False,
+            "BTC data unavailable  fail-closed (pausing new entries "
+            "until BTC price feed recovers)",
+        )
     except Exception as exc:
-        return (False,
-                f"BTC trend check error ({type(exc).__name__})  "
-                f"fail-closed")
+        return (False, f"BTC trend check error ({type(exc).__name__})  fail-closed")
 
     fg = get_fear_greed()
     if allow_shorts:
@@ -724,9 +802,11 @@ def can_buy_now(exchange, bot_name: str = "", open_symbols: list = None,
             extreme_fear_block = 10
         extreme_fear_block = max(0, min(50, extreme_fear_block))
         if fg <= extreme_fear_block:
-            return (False,
-                    f"Extreme Fear (F&G={fg})  pausing all entries "
-                    f"(capitulation whipsaw risk for both directions)")
+            return (
+                False,
+                f"Extreme Fear (F&G={fg})  pausing all entries "
+                f"(capitulation whipsaw risk for both directions)",
+            )
     else:
         if fg >= 85:
             return False, f"Extreme Greed (F&G={fg})  top risk"
@@ -746,8 +826,7 @@ def can_buy_now(exchange, bot_name: str = "", open_symbols: list = None,
             except Exception:
                 price = None
         if price is not None and not is_price_valid(price):
-            return (False,
-                    f"Invalid price ({price!r}) for {candidate_symbol}")
+            return (False, f"Invalid price ({price!r}) for {candidate_symbol}")
 
     if check_spread and candidate_symbol:
         ok, reason = check_spread_quality(exchange, candidate_symbol)
@@ -766,9 +845,11 @@ def can_buy_now(exchange, bot_name: str = "", open_symbols: list = None,
             pass
         else:
             btc_24h = regime_data.get("btc_24h", 0)
-            btc_7d  = regime_data.get("btc_7d",  0)
-            return (False,
-                    f"BEAR market regime (BTC 24h={btc_24h:+.1f}%, "
-                    f"7d={btc_7d:+.1f}%, F&G={fg})  pausing new entries")
+            btc_7d = regime_data.get("btc_7d", 0)
+            return (
+                False,
+                f"BEAR market regime (BTC 24h={btc_24h:+.1f}%, "
+                f"7d={btc_7d:+.1f}%, F&G={fg})  pausing new entries",
+            )
 
     return True, "OK"

@@ -30,22 +30,21 @@ Run
   python trend_check.py 540                 # ~18 months
   python trend_check.py 365 BTC ETH SOL     # custom universe
 """
+
 from __future__ import annotations
 
 import os
 import sys
-import time
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
-from config.exchange_config import (get_exchange_connection,
-                                      get_active_exchange_name)
+from config.exchange_config import get_exchange_connection, get_active_exchange_name
 from core.clock import backtest_asof_ms
 from tools.ohlcv_cache import get_series
 
-DEFAULT_DAYS  = 365
+DEFAULT_DAYS = 365
 DEFAULT_COINS = ["BTC", "ETH", "BNB", "XRP", "SOL"]
 # Cost per position switch (one side), spot-taker-ish. Round trip = 2. Few
 # trades on daily trend, so this is minor. Override TREND_COST_PCT.
@@ -54,12 +53,12 @@ COST = float(os.getenv("TREND_COST_PCT", "0.10")) / 100.0
 
 def _fetch_ohlc(ex, symbol: str, days: int) -> list:
     """Cache-backed, rate-limit-safe DAILY OHLC  list of [ts,o,h,l,c,...]."""
-    tf_ms  = 86_400_000
+    tf_ms = 86_400_000
     now_ms = ex.milliseconds()
-    asof = backtest_asof_ms()              # IS/OOS wall: cap "now" to cutoff
+    asof = backtest_asof_ms()  # IS/OOS wall: cap "now" to cutoff
     if asof is not None and asof < now_ms:
         now_ms = asof
-    since  = now_ms - (days + 5) * tf_ms
+    since = now_ms - (days + 5) * tf_ms
     try:
         series = get_series(ex, symbol, "1d", since)
     except Exception as e:
@@ -72,29 +71,29 @@ def _sma(a: np.ndarray, n: int) -> np.ndarray:
     out = np.full(len(a), np.nan)
     if len(a) >= n:
         c = np.cumsum(np.insert(a, 0, 0.0))
-        out[n - 1:] = (c[n:] - c[:-n]) / n
+        out[n - 1 :] = (c[n:] - c[:-n]) / n
     return out
 
 
-def _sig_price_ma(c, h, l, n):
+def _sig_price_ma(c, h, low, n):
     ma = _sma(c, n)
     return (c > ma) & ~np.isnan(ma)
 
 
-def _sig_cross(c, h, l, f, s):
+def _sig_cross(c, h, low, f, s):
     sf, ss = _sma(c, f), _sma(c, s)
     return (sf > ss) & ~np.isnan(ss)
 
 
-def _sig_donchian(c, h, l, nb, ns):
+def _sig_donchian(c, h, low, nb, ns):
     n = len(c)
     inm = np.zeros(n, dtype=bool)
     state = False
     for i in range(n):
         if i < nb:
             continue
-        hh = h[i - nb:i].max()
-        ll = l[max(0, i - ns):i].min()
+        hh = h[i - nb : i].max()
+        ll = low[max(0, i - ns) : i].min()
         if not state and c[i] > hh:
             state = True
         elif state and c[i] < ll:
@@ -104,11 +103,11 @@ def _sig_donchian(c, h, l, nb, ns):
 
 
 CONFIGS = [
-    ("P>SMA50",    lambda c, h, l: _sig_price_ma(c, h, l, 50)),
-    ("P>SMA100",   lambda c, h, l: _sig_price_ma(c, h, l, 100)),
-    ("SMA20>50",   lambda c, h, l: _sig_cross(c, h, l, 20, 50)),
-    ("SMA50>200",  lambda c, h, l: _sig_cross(c, h, l, 50, 200)),
-    ("Donchian20", lambda c, h, l: _sig_donchian(c, h, l, 20, 10)),
+    ("P>SMA50", lambda c, h, low: _sig_price_ma(c, h, low, 50)),
+    ("P>SMA100", lambda c, h, low: _sig_price_ma(c, h, low, 100)),
+    ("SMA20>50", lambda c, h, low: _sig_cross(c, h, low, 20, 50)),
+    ("SMA50>200", lambda c, h, low: _sig_cross(c, h, low, 50, 200)),
+    ("Donchian20", lambda c, h, low: _sig_donchian(c, h, low, 20, 10)),
 ]
 
 
@@ -132,7 +131,7 @@ def _backtest_trend(closes, highs, lows, signal_fn):
             days_in += 1
         new = 1 if in_mkt[i] else 0
         if new != held:
-            e *= (1 - COST)                       # pay the switch
+            e *= 1 - COST  # pay the switch
             if held == 1 and new == 0 and entry_eq:
                 tr = e / entry_eq - 1
                 trades.append(tr)
@@ -144,13 +143,15 @@ def _backtest_trend(closes, highs, lows, signal_fn):
 
     bh = closes / closes[0]
     strat_ret = (eq[-1] - 1) * 100.0
-    bh_ret    = (bh[-1] - 1) * 100.0
+    bh_ret = (bh[-1] - 1) * 100.0
     return {
-        "strat_ret": strat_ret, "bh_ret": bh_ret,
-        "strat_dd": _max_dd(eq), "bh_dd": _max_dd(bh),
+        "strat_ret": strat_ret,
+        "bh_ret": bh_ret,
+        "strat_dd": _max_dd(eq),
+        "bh_dd": _max_dd(bh),
         "n_trades": len(trades),
         "win_rate": (100.0 * wins / len(trades)) if trades else 0.0,
-        "pct_in":   100.0 * days_in / max(1, n - 1),
+        "pct_in": 100.0 * days_in / max(1, n - 1),
     }
 
 
@@ -165,12 +166,14 @@ def _verdict(s_ret, b_ret, s_dd, b_dd) -> str:
     return "WORSE"
 
 
-def _sig_ensemble(c, h, l):
+def _sig_ensemble(c, h, low):
     """Long when a MAJORITY of the fast rules agree  more robust than any one
     moving-average length (reduces overfit to a single parameter)."""
-    votes = (_sig_price_ma(c, h, l, 50).astype(int)
-             + _sig_price_ma(c, h, l, 100).astype(int)
-             + _sig_cross(c, h, l, 20, 50).astype(int))
+    votes = (
+        _sig_price_ma(c, h, low, 50).astype(int)
+        + _sig_price_ma(c, h, low, 100).astype(int)
+        + _sig_cross(c, h, low, 20, 50).astype(int)
+    )
     return votes >= 2
 
 
@@ -179,59 +182,81 @@ def _print_sweep(data):
     on one value (overfit)? Plus an ensemble + per-coin breadth check."""
     lengths = [30, 40, 50, 60, 80, 100, 120]
     print("\n  PARAMETER SWEEP  P > SMA(n)  (plateau = robust, spike = overfit)")
-    print(f"  {'n':>5}{'Strat%':>10}{'B&H%':>9}{'StratDD':>9}{'B&HDD':>8}"
-          f"{'Trades':>8}  Verdict")
+    print(
+        f"  {'n':>5}{'Strat%':>10}{'B&H%':>9}{'StratDD':>9}{'B&HDD':>8}"
+        f"{'Trades':>8}  Verdict"
+    )
     print("  " + "-" * 66)
     beat = 0
     for n in lengths:
-        fn = lambda c, h, l, n=n: _sig_price_ma(c, h, l, n)
-        per = [_backtest_trend(c, h, l, fn) for c, h, l in data.values()]
+
+        def signal_for_length(c, h, low, length=n):
+            return _sig_price_ma(c, h, low, length)
+
+        per = [
+            _backtest_trend(c, h, low, signal_for_length) for c, h, low in data.values()
+        ]
         avg = {k: float(np.mean([p[k] for p in per])) for k in per[0]}
         v = _verdict(avg["strat_ret"], avg["bh_ret"], avg["strat_dd"], avg["bh_dd"])
         if v in ("BEATS B&H", "SAFER", "HIGHER RET"):
             beat += 1
-        print(f"  {n:>5}{avg['strat_ret']:>9.1f}%{avg['bh_ret']:>8.1f}%"
-              f"{avg['strat_dd']:>8.1f}%{avg['bh_dd']:>7.1f}%{avg['n_trades']:>8.0f}"
-              f"  {v}")
-    tag = ("PLATEAU  robust" if beat >= len(lengths) - 1
-           else "mostly robust" if beat >= len(lengths) - 2 else "FRAGILE")
+        print(
+            f"  {n:>5}{avg['strat_ret']:>9.1f}%{avg['bh_ret']:>8.1f}%"
+            f"{avg['strat_dd']:>8.1f}%{avg['bh_dd']:>7.1f}%{avg['n_trades']:>8.0f}"
+            f"  {v}"
+        )
+    tag = (
+        "PLATEAU  robust"
+        if beat >= len(lengths) - 1
+        else "mostly robust"
+        if beat >= len(lengths) - 2
+        else "FRAGILE"
+    )
     print(f"  -> {beat}/{len(lengths)} SMA lengths beat/de-risked B&H  ({tag})")
 
-    per = [_backtest_trend(c, h, l, _sig_ensemble) for c, h, l in data.values()]
+    per = [_backtest_trend(c, h, low, _sig_ensemble) for c, h, low in data.values()]
     avg = {k: float(np.mean([p[k] for p in per])) for k in per[0]}
     print("\n  ENSEMBLE  (long when >=2 of P>SMA50 / P>SMA100 / SMA20>50 agree)")
-    print(f"    Strat {avg['strat_ret']:+.1f}%  vs  B&H {avg['bh_ret']:+.1f}%   "
-          f"DD {avg['strat_dd']:.0f}% vs {avg['bh_dd']:.0f}%   "
-          f"trades {avg['n_trades']:.0f}   in-market {avg['pct_in']:.0f}%")
+    print(
+        f"    Strat {avg['strat_ret']:+.1f}%  vs  B&H {avg['bh_ret']:+.1f}%   "
+        f"DD {avg['strat_dd']:.0f}% vs {avg['bh_dd']:.0f}%   "
+        f"trades {avg['n_trades']:.0f}   in-market {avg['pct_in']:.0f}%"
+    )
 
     print("\n  PER-COIN (ensemble)  broad, or driven by one coin?")
     bc = 0
-    for coin, (c, h, l) in data.items():
-        r = _backtest_trend(c, h, l, _sig_ensemble)
+    for coin, (c, h, low) in data.items():
+        r = _backtest_trend(c, h, low, _sig_ensemble)
         win = r["strat_ret"] > r["bh_ret"]
         bc += 1 if win else 0
-        print(f"    {coin:<6} strat {r['strat_ret']:+8.1f}%   "
-              f"B&H {r['bh_ret']:+8.1f}%   DD {r['strat_dd']:.0f}%   "
-              f"{'beat' if win else '-'}")
+        print(
+            f"    {coin:<6} strat {r['strat_ret']:+8.1f}%   "
+            f"B&H {r['bh_ret']:+8.1f}%   DD {r['strat_dd']:.0f}%   "
+            f"{'beat' if win else '-'}"
+        )
     print(f"  -> ensemble beats B&H on {bc}/{len(data)} coins")
 
 
 def main():
-    args     = sys.argv[1:]
+    args = sys.argv[1:]
     do_sweep = "--sweep" in args
-    pos      = [a for a in args if not a.startswith("--")]
-    days     = int(pos[0]) if pos and pos[0].isdigit() else DEFAULT_DAYS
-    coins    = [a.upper() for a in pos[1:]] if len(pos) > 1 else DEFAULT_COINS
+    pos = [a for a in args if not a.startswith("--")]
+    days = int(pos[0]) if pos and pos[0].isdigit() else DEFAULT_DAYS
+    coins = [a.upper() for a in pos[1:]] if len(pos) > 1 else DEFAULT_COINS
 
     print("=" * 90)
     print("  TREND-FOLLOWING EDGE CHECK (long/flat, vs buy-and-hold)")
-    print(f"  {days}d daily | cost {COST*100:.2f}%/switch | "
-          f"rules: {', '.join(n for n, _ in CONFIGS)}")
+    print(
+        f"  {days}d daily | cost {COST * 100:.2f}%/switch | "
+        f"rules: {', '.join(n for n, _ in CONFIGS)}"
+    )
     print("=" * 90)
 
-    print(f"\n  Connecting to {get_active_exchange_name().upper()} (SPOT, for "
-          f"long history) ...")
-    ex = get_exchange_connection()                       # spot = years of data
+    print(
+        f"\n  Connecting to {get_active_exchange_name().upper()} (SPOT, for "
+        f"long history) ..."
+    )
+    ex = get_exchange_connection()  # spot = years of data
     ex.timeout = 30000
     try:
         ex.load_markets()
@@ -242,40 +267,49 @@ def main():
 
     data = {}
     for coin in coins:
-        sym = f"{coin}/USDT"                              # spot symbol
+        sym = f"{coin}/USDT"  # spot symbol
         if sym not in ex.markets:
-            print(f"  {coin}: no spot market  skipped"); continue
+            print(f"  {coin}: no spot market  skipped")
+            continue
         ohlc = _fetch_ohlc(ex, sym, days)
         if len(ohlc) < 120:
-            print(f"  {coin}: only {len(ohlc)} daily bars  skipped"); continue
+            print(f"  {coin}: only {len(ohlc)} daily bars  skipped")
+            continue
         arr = np.array(ohlc, dtype=float)
-        data[coin] = (arr[:, 4], arr[:, 2], arr[:, 3])   # close, high, low
+        data[coin] = (arr[:, 4], arr[:, 2], arr[:, 3])  # close, high, low
         print(f"   {coin}: {len(ohlc)} daily bars")
 
     if not data:
-        print("\n  No data  aborting.\n"); return
+        print("\n  No data  aborting.\n")
+        return
 
     # Per config: average metrics across coins (equal weight).
-    print(f"\n  {'Rule':<12}{'Strat%':>9}{'B&H%':>9}{'StratDD':>9}{'B&HDD':>8}"
-          f"{'Trades':>8}{'%InMkt':>8}  Verdict")
+    print(
+        f"\n  {'Rule':<12}{'Strat%':>9}{'B&H%':>9}{'StratDD':>9}{'B&HDD':>8}"
+        f"{'Trades':>8}{'%InMkt':>8}  Verdict"
+    )
     print("  " + "-" * 86)
 
     summary = []
     for name, fn in CONFIGS:
-        per = [_backtest_trend(c, h, l, fn) for c, h, l in data.values()]
+        per = [_backtest_trend(c, h, low, fn) for c, h, low in data.values()]
         avg = {k: float(np.mean([p[k] for p in per])) for k in per[0]}
         v = _verdict(avg["strat_ret"], avg["bh_ret"], avg["strat_dd"], avg["bh_dd"])
         summary.append((name, avg, v))
-        print(f"  {name:<12}{avg['strat_ret']:>8.1f}%{avg['bh_ret']:>8.1f}%"
-              f"{avg['strat_dd']:>8.1f}%{avg['bh_dd']:>7.1f}%"
-              f"{avg['n_trades']:>8.0f}{avg['pct_in']:>7.0f}%  {v}")
+        print(
+            f"  {name:<12}{avg['strat_ret']:>8.1f}%{avg['bh_ret']:>8.1f}%"
+            f"{avg['strat_dd']:>8.1f}%{avg['bh_dd']:>7.1f}%"
+            f"{avg['n_trades']:>8.0f}{avg['pct_in']:>7.0f}%  {v}"
+        )
     print("  " + "-" * 86)
 
     beats = [s for s in summary if s[2] in ("BEATS B&H", "SAFER", "HIGHER RET")]
     print("\n  READ-OUT")
     if len(beats) >= 3:
-        print(f"  Trend-following looks PROMISING: {len(beats)}/{len(summary)} "
-              f"rules beat or de-risked buy-and-hold ROBUSTLY (not one cherry-")
+        print(
+            f"  Trend-following looks PROMISING: {len(beats)}/{len(summary)} "
+            f"rules beat or de-risked buy-and-hold ROBUSTLY (not one cherry-"
+        )
         print("    picked setting). Next step: build the long/flat trend bot on")
         print("    the majors, validate in SIM. This is a real candidate.")
     elif beats:

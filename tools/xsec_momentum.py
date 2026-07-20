@@ -8,6 +8,7 @@ pro Namens-Rotation).
 
 Run: PYTHONIOENCODING=utf-8 python -m tools.xsec_momentum [days]
 """
+
 import sys
 import statistics
 import math
@@ -18,7 +19,7 @@ import pandas as pd
 from tools.backtester import connect_exchange, get_top_volume_coins, fetch_history
 
 DAYS = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 180
-FEE_ONE_WAY = 0.0006   # futures taker 0.01% + slippage 0.05% per side
+FEE_ONE_WAY = 0.0006  # futures taker 0.01% + slippage 0.05% per side
 
 
 def load_panel(ex, coins):
@@ -42,8 +43,8 @@ def run(prices, L, reb, K, fee=FEE_ONE_WAY, fund_day=0.0):
     fee=one-way Kosten, fund_day=Funding-Drag pro Tag auf dem Buch."""
     n = len(prices)
     prev_long, prev_short = set(), set()
-    ls_rets, lo_rets = [], []      # long-short (neutral) und long-only
-    funding = fund_day * (reb / 24.0)   # Drag pro Hold-Periode
+    ls_rets, lo_rets = [], []  # long-short (neutral) und long-only
+    funding = fund_day * (reb / 24.0)  # Drag pro Hold-Periode
     i = L
     while i + reb < n:
         past = (prices.iloc[i] / prices.iloc[i - L] - 1).dropna()
@@ -76,7 +77,7 @@ GRID = [(L, reb, K) for L in (24, 72, 168) for reb in (24, 72) for K in (5, 8)]
 def best_config(seg, fee, fund_day):
     """Whle die Config mit hchstem Sharpe AUF DIESEM Segment (= Training)."""
     best = None
-    for (L, reb, K) in GRID:
+    for L, reb, K in GRID:
         s = stats(run(seg, L, reb, K, fee, fund_day)[0])
         if s and (best is None or s[4] > best[1]):
             best = ((L, reb, K), s[4])
@@ -88,7 +89,7 @@ def stats(rets):
         return None
     eq = 1.0
     for r in rets:
-        eq *= (1 + r)
+        eq *= 1 + r
     total = (eq - 1) * 100
     wr = 100 * sum(1 for r in rets if r > 0) / len(rets)
     mean = statistics.mean(rets)
@@ -99,8 +100,10 @@ def stats(rets):
 
 def grid(prices, label):
     print(f"\n#### {label}  ({prices.shape[1]} coins  {prices.shape[0]} bars) ####")
-    hdr = (f"{'L(h)':>5} {'reb(h)':>6} {'K':>3} | "
-           f"{'LS tot%':>8} {'LS WR':>6} {'LS %':>7} {'LS Sharpe':>9} {'reb#':>5}")
+    hdr = (
+        f"{'L(h)':>5} {'reb(h)':>6} {'K':>3} | "
+        f"{'LS tot%':>8} {'LS WR':>6} {'LS %':>7} {'LS Sharpe':>9} {'reb#':>5}"
+    )
     print(hdr)
     print("-" * len(hdr))
     best = None
@@ -113,8 +116,10 @@ def grid(prices, label):
                     continue
                 lt, lwr, lmu, ln, lsh = s
                 star = " *" if lt > 0 and lsh > 0.3 else ""
-                print(f"{L:>5} {reb:>6} {K:>3} | "
-                      f"{lt:>+7.1f}% {lwr:>5.0f}% {lmu:>+6.2f}% {lsh:>+9.2f} {ln:>5d}{star}")
+                print(
+                    f"{L:>5} {reb:>6} {K:>3} | "
+                    f"{lt:>+7.1f}% {lwr:>5.0f}% {lmu:>+6.2f}% {lsh:>+9.2f} {ln:>5d}{star}"
+                )
                 if best is None or lsh > best[0]:
                     best = (lsh, L, reb, K)
     return best
@@ -127,7 +132,7 @@ def equity_stats(rets):
     eq = peak = 1.0
     mdd = 0.0
     for r in rets:
-        eq *= (1 + r)
+        eq *= 1 + r
         peak = max(peak, eq)
         mdd = max(mdd, (peak - eq) / peak)
     sd = statistics.stdev(rets) if len(rets) > 1 else 0
@@ -144,8 +149,9 @@ def apply_filter(rets, kind, W=4, target=0.04):
     out = []
     for t in range(len(rets)):
         if t < W:
-            out.append(rets[t]); continue
-        past = rets[t - W:t]
+            out.append(rets[t])
+            continue
+        past = rets[t - W : t]
         exp = 1.0
         if kind in ("voltarget", "combo"):
             sd = statistics.stdev(past) or 1e-9
@@ -159,58 +165,70 @@ def apply_filter(rets, kind, W=4, target=0.04):
 
 def main():
     ex = connect_exchange()
-    coins = get_top_volume_coins(ex, n=120)          # breiteres Universum
+    coins = get_top_volume_coins(ex, n=120)  # breiteres Universum
     print(f"Coins angefragt: {len(coins)} | loading {DAYS}d ...")
     prices = load_panel(ex, coins)
 
     if "BTC" in prices.columns:
         b = prices["BTC"].dropna()
-        print(f"Benchmark BTC B&H: {(b.iloc[-1]/b.iloc[0]-1)*100:+.1f}%")
+        print(f"Benchmark BTC B&H: {(b.iloc[-1] / b.iloc[0] - 1) * 100:+.1f}%")
 
-    #  De-Bias: nur Coins mit VOLLER Historie (am Anfang UND Ende vorhanden) 
+    #  De-Bias: nur Coins mit VOLLER Historie (am Anfang UND Ende vorhanden)
     head = prices.iloc[:48].notna().all()
     tail = prices.iloc[-48:].notna().all()
     stable = prices.loc[:, head & tail]
-    print(f"Voll-Historie-Universum: {stable.shape[1]} von {prices.shape[1]} Coins "
-          f"(frisch gelistete Pumper entfernt)")
+    print(
+        f"Voll-Historie-Universum: {stable.shape[1]} von {prices.shape[1]} Coins "
+        f"(frisch gelistete Pumper entfernt)"
+    )
 
     REAL_FEE, REAL_FUND = 0.0006, 0.0006
     L, reb, K = 24, 72, 8
 
-    #  B) CRASH-FILTER: Vergleich auf dem GANZEN Fenster 
+    #  B) CRASH-FILTER: Vergleich auf dem GANZEN Fenster
     base = run(stable, L, reb, K, REAL_FEE, REAL_FUND)[0]
-    print(f"\n#### B) CRASH-FILTER  (Config L={L} reb={reb} K={K}, "
-          f"fee {REAL_FEE*100:.2f}% + funding {REAL_FUND*100:.2f}%/d) ####")
+    print(
+        f"\n#### B) CRASH-FILTER  (Config L={L} reb={reb} K={K}, "
+        f"fee {REAL_FEE * 100:.2f}% + funding {REAL_FUND * 100:.2f}%/d) ####"
+    )
     print(f"{'Filter':>12} | {'total%':>8} {'maxDD%':>7} {'Sharpe':>7}")
     print("-" * 42)
     for kind in ("none", "voltarget", "ownmom", "combo"):
         t, dd, sh, _ = equity_stats(apply_filter(base, kind))
         print(f"{kind:>12} | {t:>+7.1f}% {dd:>6.1f}% {sh:>+6.2f}")
 
-    #  Walk-Forward mit dem besten Filter (combo) vs ohne 
+    #  Walk-Forward mit dem besten Filter (combo) vs ohne
     n = stable.shape[0]
-    nwin = max(4, n // (45 * 24))      # ~45d je Fenster
+    nwin = max(4, n // (45 * 24))  # ~45d je Fenster
     seg = n // nwin
-    print(f"\n#### WALK-FORWARD  (~{seg//24}d/Fenster, baseline vs combo-Filter) ####")
+    print(
+        f"\n#### WALK-FORWARD  (~{seg // 24}d/Fenster, baseline vs combo-Filter) ####"
+    )
     eq_b = eq_f = 1.0
     all_b, all_f = [], []
     for w in range(1, nwin):
-        tr = stable.iloc[(w - 1) * seg: w * seg]
-        te = stable.iloc[w * seg:(w + 1) * seg]
+        tr = stable.iloc[(w - 1) * seg : w * seg]
+        te = stable.iloc[w * seg : (w + 1) * seg]
         cfg = best_config(tr, REAL_FEE, REAL_FUND)
         if cfg is None:
             continue
         raw = run(te, *cfg, REAL_FEE, REAL_FUND)[0]
         filt = apply_filter(raw, "combo")
         sb, sf = equity_stats(raw), equity_stats(filt)
-        all_b += raw; all_f += filt
-        eq_b *= (1 + sb[0] / 100); eq_f *= (1 + sf[0] / 100)
-        print(f"  Fenster {w} (cfg L={cfg[0]} reb={cfg[1]} K={cfg[2]}):  "
-              f"baseline {sb[0]:>+6.1f}% (DD {sb[1]:.0f}%)   "
-              f"combo-Filter {sf[0]:>+6.1f}% (DD {sf[1]:.0f}%)")
+        all_b += raw
+        all_f += filt
+        eq_b *= 1 + sb[0] / 100
+        eq_f *= 1 + sf[0] / 100
+        print(
+            f"  Fenster {w} (cfg L={cfg[0]} reb={cfg[1]} K={cfg[2]}):  "
+            f"baseline {sb[0]:>+6.1f}% (DD {sb[1]:.0f}%)   "
+            f"combo-Filter {sf[0]:>+6.1f}% (DD {sf[1]:.0f}%)"
+        )
     tb, tf = equity_stats(all_b), equity_stats(all_f)
-    print(f"  kombiniert OOS:  baseline {(eq_b-1)*100:+.1f}% (maxDD {tb[1]:.0f}%)  "
-          f"combo-Filter {(eq_f-1)*100:+.1f}% (maxDD {tf[1]:.0f}%)")
+    print(
+        f"  kombiniert OOS:  baseline {(eq_b - 1) * 100:+.1f}% (maxDD {tb[1]:.0f}%)  "
+        f"combo-Filter {(eq_f - 1) * 100:+.1f}% (maxDD {tf[1]:.0f}%)"
+    )
 
 
 if __name__ == "__main__":

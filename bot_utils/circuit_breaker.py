@@ -11,6 +11,7 @@ the API itself errors. This module watches:
 In SAFE_MODE the bot stops opening new entries but continues monitoring
 and closing existing positions. State is reset by restarting the bot.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -24,9 +25,12 @@ from typing import Callable, Optional
 # Fallback values only if constants isn't importable.
 try:
     from core.constants import (
-        MAX_SLIPPAGE_PCT, MAX_SPREAD_PCT,
-        SLIPPAGE_TRIP_COUNT, SLIPPAGE_WINDOW_SEC,
-        SPREAD_TRIP_COUNT, SPREAD_WINDOW_SEC,
+        MAX_SLIPPAGE_PCT,
+        MAX_SPREAD_PCT,
+        SLIPPAGE_TRIP_COUNT,
+        SLIPPAGE_WINDOW_SEC,
+        SPREAD_TRIP_COUNT,
+        SPREAD_WINDOW_SEC,
     )
 except Exception:
     MAX_SLIPPAGE_PCT = 0.5
@@ -37,17 +41,21 @@ except Exception:
     SPREAD_WINDOW_SEC = 180
 
 
-#  Slippage tracking (legacy module-level fallback) 
+#  Slippage tracking (legacy module-level fallback)
 
 _slippage_observations: list = []
 _slippage_lock = threading.Lock()
 
 
-def record_slippage(expected_price: float, actual_fill: float,
-                     symbol: str = "", side: str = "buy",
-                     trigger_safe_mode: Optional[Callable] = None,
-                     log_event: Optional[Callable] = None,
-                     safe_mode_instance: Optional["SafeMode"] = None) -> float:
+def record_slippage(
+    expected_price: float,
+    actual_fill: float,
+    symbol: str = "",
+    side: str = "buy",
+    trigger_safe_mode: Optional[Callable] = None,
+    log_event: Optional[Callable] = None,
+    safe_mode_instance: Optional["SafeMode"] = None,
+) -> float:
     """Record one slippage measurement. Returns abs slippage %.
 
     Auto-triggers SAFE_MODE via `trigger_safe_mode` callback when
@@ -58,18 +66,30 @@ def record_slippage(expected_price: float, actual_fill: float,
     """
     if safe_mode_instance is not None:
         return safe_mode_instance.record_slippage(
-            expected_price, actual_fill, symbol, side, trigger_safe_mode, log_event)
+            expected_price, actual_fill, symbol, side, trigger_safe_mode, log_event
+        )
     return _record_slippage_into(
-        _slippage_observations, _slippage_lock,
-        expected_price, actual_fill, symbol, side,
-        trigger_safe_mode, log_event)
+        _slippage_observations,
+        _slippage_lock,
+        expected_price,
+        actual_fill,
+        symbol,
+        side,
+        trigger_safe_mode,
+        log_event,
+    )
 
 
-def _record_slippage_into(observations: list, lock: threading.Lock,
-                            expected_price: float, actual_fill: float,
-                            symbol: str, side: str,
-                            trigger_safe_mode: Optional[Callable],
-                            log_event: Optional[Callable]) -> float:
+def _record_slippage_into(
+    observations: list,
+    lock: threading.Lock,
+    expected_price: float,
+    actual_fill: float,
+    symbol: str,
+    side: str,
+    trigger_safe_mode: Optional[Callable],
+    log_event: Optional[Callable],
+) -> float:
     if expected_price <= 0 or actual_fill <= 0:
         return 0.0
     slippage_pct = abs(actual_fill - expected_price) / expected_price * 100
@@ -80,9 +100,7 @@ def _record_slippage_into(observations: list, lock: threading.Lock,
         observations.append((now, slippage_pct))
         cutoff = now - SLIPPAGE_WINDOW_SEC
         observations[:] = [(t, p) for t, p in observations if t >= cutoff]
-        recent_abnormal = sum(
-            1 for _, p in observations if p > MAX_SLIPPAGE_PCT
-        )
+        recent_abnormal = sum(1 for _, p in observations if p > MAX_SLIPPAGE_PCT)
 
     if abnormal and log_event:
         log_event(
@@ -101,14 +119,17 @@ def _record_slippage_into(observations: list, lock: threading.Lock,
     return slippage_pct
 
 
-#  Spread check 
+#  Spread check
 
-def check_spread_ok(ticker: dict,
-                     log_event: Optional[Callable] = None,
-                     symbol: str = "",
-                     safe_mode_instance: Optional["SafeMode"] = None,
-                     max_spread_pct: Optional[float] = None,
-                     missing_ok: bool = True) -> bool:
+
+def check_spread_ok(
+    ticker: dict,
+    log_event: Optional[Callable] = None,
+    symbol: str = "",
+    safe_mode_instance: Optional["SafeMode"] = None,
+    max_spread_pct: Optional[float] = None,
+    missing_ok: bool = True,
+) -> bool:
     """Return True if the bid/ask spread is acceptable for entry.
 
     By default, missing bid/ask is tolerated for legacy spot callers. Futures
@@ -139,7 +160,7 @@ def check_spread_ok(ticker: dict,
                 log_event(
                     f" Spread check: {spread_pct:.3f}% > {threshold}% "
                     f"max (bid={bid_f}, ask={ask_f})  blocking entry",
-                    "WARN"
+                    "WARN",
                 )
             # record the bad reading and possibly trip
             if safe_mode_instance is not None:
@@ -154,7 +175,8 @@ def check_spread_ok(ticker: dict,
     return True
 
 
-#  Safe mode 
+#  Safe mode
+
 
 class SafeMode:
     """Per-bot SAFE_MODE state holder.
@@ -168,15 +190,17 @@ class SafeMode:
     bot_name don't overwrite each other.
     """
 
-    def __init__(self,
-                 bot_name: str = "BOT",
-                 telegram_send: Optional[Callable] = None,
-                 telegram_token: Optional[str] = None,
-                 telegram_chat_id: Optional[str] = None,
-                 log_event: Optional[Callable] = None,
-                 log_struct: Optional[Callable] = None,
-                 state_dir: Optional[str] = None,
-                 instance_id: Optional[str] = None):
+    def __init__(
+        self,
+        bot_name: str = "BOT",
+        telegram_send: Optional[Callable] = None,
+        telegram_token: Optional[str] = None,
+        telegram_chat_id: Optional[str] = None,
+        log_event: Optional[Callable] = None,
+        log_struct: Optional[Callable] = None,
+        state_dir: Optional[str] = None,
+        instance_id: Optional[str] = None,
+    ):
         self._event = threading.Event()
         self._reason = "normal"
         self._alert_sent = False
@@ -200,8 +224,7 @@ class SafeMode:
                 os.makedirs(state_dir, exist_ok=True)
                 suffix = self._compute_instance_suffix(instance_id)
                 self._alert_state_file = os.path.join(
-                    state_dir,
-                    f"safe_mode_{bot_name.lower()}_{suffix}.json"
+                    state_dir, f"safe_mode_{bot_name.lower()}_{suffix}.json"
                 )
                 self._load_alert_state()
             except Exception:
@@ -216,10 +239,9 @@ class SafeMode:
           3. PID (last resort  changes on restart, but at least
              distinguishes co-running instances)
         """
-        seed = (instance_id
-                 or os.getenv("BOT_ACCOUNT_ID")
-                 or f"pid{os.getpid()}")
-        return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
+        seed = instance_id or os.getenv("BOT_ACCOUNT_ID") or f"pid{os.getpid()}"
+        # Stable filename suffix only, never a signature or secret hash.
+        return hashlib.sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
 
     def _load_alert_state(self) -> None:
         """Load persisted alert state  sets _alert_sent if last alert
@@ -229,6 +251,7 @@ class SafeMode:
         try:
             import json as _json
             from datetime import datetime as _dt, timezone as _tz
+
             if not os.path.exists(self._alert_state_file):
                 return
             with open(self._alert_state_file, encoding="utf-8") as f:
@@ -247,30 +270,41 @@ class SafeMode:
         try:
             import json as _json
             from datetime import datetime as _dt, timezone as _tz
+
             today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
             with open(self._alert_state_file, "w", encoding="utf-8") as f:
-                _json.dump({"alert_sent_day": today,
-                             "reason": self._reason}, f)
+                _json.dump({"alert_sent_day": today, "reason": self._reason}, f)
         except Exception:
             pass
 
-    def record_slippage(self, expected_price: float, actual_fill: float,
-                          symbol: str = "", side: str = "buy",
-                          trigger_safe_mode: Optional[Callable] = None,
-                          log_event: Optional[Callable] = None) -> float:
+    def record_slippage(
+        self,
+        expected_price: float,
+        actual_fill: float,
+        symbol: str = "",
+        side: str = "buy",
+        trigger_safe_mode: Optional[Callable] = None,
+        log_event: Optional[Callable] = None,
+    ) -> float:
         """Per-instance slippage recording."""
         if trigger_safe_mode is None:
             trigger_safe_mode = self.trigger
         if log_event is None:
             log_event = self._log_event
         return _record_slippage_into(
-            self._slippage_observations, self._slippage_lock,
-            expected_price, actual_fill, symbol, side,
-            trigger_safe_mode, log_event)
+            self._slippage_observations,
+            self._slippage_lock,
+            expected_price,
+            actual_fill,
+            symbol,
+            side,
+            trigger_safe_mode,
+            log_event,
+        )
 
-    def record_spread_abnormal(self, spread_pct: float,
-                                  symbol: str = "",
-                                  log_event: Optional[Callable] = None) -> None:
+    def record_spread_abnormal(
+        self, spread_pct: float, symbol: str = "", log_event: Optional[Callable] = None
+    ) -> None:
         """Record an abnormal spread reading. Trips SAFE_MODE when
         SPREAD_TRIP_COUNT abnormal readings occur in SPREAD_WINDOW_SEC."""
         if log_event is None:
@@ -305,8 +339,9 @@ class SafeMode:
             self._reason = reason
         if self._log_struct:
             try:
-                self._log_struct("safe_mode_triggered",
-                                  reason=reason, bot=self.bot_name)
+                self._log_struct(
+                    "safe_mode_triggered", reason=reason, bot=self.bot_name
+                )
             except Exception:
                 pass
         if self._log_event:
@@ -314,7 +349,7 @@ class SafeMode:
                 self._log_event(
                     f" SAFE_MODE activated: {reason}. New entries "
                     f"DISABLED, monitoring & closing continues.",
-                    "WARN"
+                    "WARN",
                 )
             except Exception:
                 pass
@@ -323,11 +358,12 @@ class SafeMode:
             self._save_alert_state()
             try:
                 self._telegram_send(
-                    self._telegram_token, self._telegram_chat_id,
+                    self._telegram_token,
+                    self._telegram_chat_id,
                     f" [{self.bot_name}] SAFE_MODE activated\n"
                     f"Reason: {reason}\n\n"
                     f"No new entries until bot is restarted.\n"
-                    f"Existing positions are still being monitored & closed."
+                    f"Existing positions are still being monitored & closed.",
                 )
             except Exception:
                 pass
