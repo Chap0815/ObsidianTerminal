@@ -43,7 +43,15 @@ except ImportError:
 
 
 #  Color support 
-_NO_COLOR = os.getenv("NO_COLOR", "").strip() != "" or not sys.stdout.isatty()
+def _stdout_isatty() -> bool:
+    """Return False for pythonw/missing or hostile standard streams."""
+    try:
+        return sys.stdout is not None and bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+_NO_COLOR = os.getenv("NO_COLOR", "").strip() != "" or not _stdout_isatty()
 if _NO_COLOR:
     R = G = Y = B = C = W = DIM = RST = ""
 else:

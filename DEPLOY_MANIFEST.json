@@ -1,6 +1,6 @@
 {
-  "build_id": "4aa71da3e18e6a41",
-  "created_at": "2026-07-21 08:46:46",
+  "build_id": "eb7fe5fd84ce9d66",
+  "created_at": "2026-07-21 09:13:30",
   "source": "update_deploy_manifest.py",
   "file_count": 174,
   "files": [
@@ -266,8 +266,8 @@
     },
     {
       "path": "core/logger.py",
-      "sha256": "eb967198e52a000182e8c44fed55c13725bef91156c469a4470be13db82d394b",
-      "bytes": 38936
+      "sha256": "862082e93fbb5d1ee1f58df0e54ed13f9a2fd4566ab73ec2833cf4d7dfcd69c9",
+      "bytes": 39157
     },
     {
       "path": "core/models.py",
