@@ -57,7 +57,7 @@ def _finite_float_or_none(value) -> Optional[float]:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -91,7 +91,10 @@ def _normalize_position_row(data: dict) -> tuple[Optional[dict], str]:
     if amount is None or amount <= 0:
         return None, "invalid amount=0.0"
 
-    normalized = copy.deepcopy(data)
+    try:
+        normalized = copy.deepcopy(data)
+    except Exception:
+        return None, "uncopyable-state"
     if "buy_price" in normalized:
         normalized["buy_price"] = buy_val
     if "buy" in normalized:
@@ -168,6 +171,9 @@ class TradeState:
         self._db_file = db_file
         self._lock = threading.Lock()
         self._persist_lock = threading.Lock()
+        # Registry callbacks/tests can synchronously trigger a newer state
+        # update; reentrancy preserves ordering without self-deadlocking.
+        self._registry_lock = threading.RLock()
         self._rev = 0
         self._persisted_rev = 0
         self._is_futures = is_futures
@@ -245,6 +251,18 @@ class TradeState:
             )
             return False
 
+    def _registry_upsert_current(self, sym: str) -> bool:
+        """Serialize registry mirrors and upsert only the current state row."""
+        if not self._bot_name:
+            return True
+        with self._registry_lock:
+            with self._lock:
+                current = self._trades.get(sym)
+                data = copy.deepcopy(current) if current is not None else None
+            if data is None:
+                return True
+            return self._registry_upsert(sym, data)
+
     def _registry_remove(self, sym: str) -> bool:
         if not self._bot_name:
             return True
@@ -292,6 +310,16 @@ class TradeState:
             rev, snapshot = self._snapshot_locked()
         return self._persist_snapshot(rev, snapshot) in ("persisted", "stale")
 
+    def _clear_registry_retry_if_absent(self, sym: str) -> None:
+        """Drop retry metadata only after the position is still absent."""
+        with self._lock:
+            if sym in self._trades:
+                return
+            self._registry_retry_pending.pop(sym, None)
+            self._registry_retry_generation.pop(sym, None)
+            if not self._registry_retry_pending:
+                self._registry_retry_next_at = 0.0
+
     def _resync_registry(self, clean: Dict[str, Dict[str, Any]]) -> None:
         """Re-claim locally loaded positions at startup.
 
@@ -305,7 +333,7 @@ class TradeState:
         conflicted = []
         pending = []
         for sym, data in clean.items():
-            if self._registry_upsert(sym, data):
+            if self._registry_upsert_current(sym):
                 continue
             try:
                 from core.database import get_all_claimed_bases, _base_symbol
@@ -384,8 +412,8 @@ class TradeState:
         next_retry_at = time.monotonic() + self._registry_retry_interval_sec
         repaired = []
         conflicted = []
-        for sym, data in pending.items():
-            if self._registry_upsert(sym, data):
+        for sym in pending:
+            if self._registry_upsert_current(sym):
                 repaired.append(sym)
                 continue
             try:
@@ -502,11 +530,13 @@ class TradeState:
         if normalized is not None:
             data = normalized
             rejection_reason = None
+        source = data if isinstance(data, dict) else {}
         buy_val = _finite_float(
-            data.get("buy_price") if data and data.get("buy_price") is not None
-            else data.get("buy") if data else None
+            source.get("buy_price")
+            if source.get("buy_price") is not None
+            else source.get("buy")
         )
-        amt_val = _finite_float(data.get("amount") if data else None)
+        amt_val = _finite_float(source.get("amount"))
 
         if rejection_reason is not None:
             import sys as _sys
@@ -536,7 +566,7 @@ class TradeState:
         # Claim the coin in the shared multi-bot registry (outside the lock,
         # like the JSON write). This is what makes is_claimed_by_other() work
         # so another bot won't open the SAME perp and net against us.
-        registry_ok = self._registry_upsert(sym, data)
+        registry_ok = self._registry_upsert_current(sym)
         state_ok = status in ("persisted", "stale")
         if not registry_ok and status in ("persisted", "stale"):
             registry_ok = self._mark_registry_pending(
@@ -548,7 +578,15 @@ class TradeState:
         snapshot = None
         claim_row = None
         locked_reject_reason = None
-        reject_reason = _reject_update_reason({key: value})
+        try:
+            safe_value = copy.deepcopy(value)
+        except Exception:
+            self._log_registry_warning(
+                f"update rejected uncopyable value for "
+                f"{self._bot_name or '-'}:{sym}:{key}"
+            )
+            return False
+        reject_reason = _reject_update_reason({key: safe_value})
         if reject_reason is not None:
             self._log_registry_warning(
                 f"update rejected invalid numeric field for "
@@ -559,7 +597,7 @@ class TradeState:
             if sym in self._trades:
                 if key in _CLAIM_FIELDS:
                     candidate = copy.deepcopy(self._trades[sym])
-                    candidate[key] = value
+                    candidate[key] = safe_value
                     normalized, reason = _normalize_position_row(candidate)
                     if normalized is None:
                         locked_reject_reason = reason
@@ -568,7 +606,7 @@ class TradeState:
                         claim_row = copy.deepcopy(normalized)
                         rev, snapshot = self._snapshot_locked()
                 else:
-                    self._trades[sym][key] = value
+                    self._trades[sym][key] = safe_value
                     rev, snapshot = self._snapshot_locked()
         if locked_reject_reason is not None:
             self._log_registry_warning(
@@ -583,7 +621,7 @@ class TradeState:
             # frequent last_price/highest updates avoids hammering the DB.
             registry_ok = True
             if claim_row is not None:
-                registry_ok = self._registry_upsert(sym, claim_row)
+                registry_ok = self._registry_upsert_current(sym)
                 if not registry_ok:
                     registry_ok = self._mark_registry_pending(
                         sym, "registry_update_failed")
@@ -598,10 +636,18 @@ class TradeState:
                 f"{self._bot_name or '-'}:{sym}"
             )
             return False
+        try:
+            safe_fields = copy.deepcopy(fields)
+        except Exception:
+            self._log_registry_warning(
+                f"update_many rejected uncopyable fields for "
+                f"{self._bot_name or '-'}:{sym}"
+            )
+            return False
         snapshot = None
         claim_row = None
         locked_reject_reason = None
-        reject_reason = _reject_update_reason(fields)
+        reject_reason = _reject_update_reason(safe_fields)
         if reject_reason is not None:
             self._log_registry_warning(
                 f"update_many rejected invalid numeric field for "
@@ -610,9 +656,9 @@ class TradeState:
             return False
         with self._lock:
             if sym in self._trades:
-                if _CLAIM_FIELDS.intersection(fields):
+                if _CLAIM_FIELDS.intersection(safe_fields):
                     candidate = copy.deepcopy(self._trades[sym])
-                    candidate.update(fields)
+                    candidate.update(safe_fields)
                     normalized, reason = _normalize_position_row(candidate)
                     if normalized is None:
                         locked_reject_reason = reason
@@ -621,7 +667,7 @@ class TradeState:
                         claim_row = copy.deepcopy(normalized)
                         rev, snapshot = self._snapshot_locked()
                 else:
-                    self._trades[sym].update(fields)
+                    self._trades[sym].update(safe_fields)
                     rev, snapshot = self._snapshot_locked()
         if locked_reject_reason is not None:
             self._log_registry_warning(
@@ -633,7 +679,7 @@ class TradeState:
             status = self._persist_snapshot(rev, snapshot)
             registry_ok = True
             if claim_row is not None:
-                registry_ok = self._registry_upsert(sym, claim_row)
+                registry_ok = self._registry_upsert_current(sym)
                 if not registry_ok:
                     registry_ok = self._mark_registry_pending(
                         sym, "registry_update_failed")
@@ -648,29 +694,68 @@ class TradeState:
         a verified-flat row as already accounted so reconcile will not book it
         a second time while the state file is still locked.
         """
+        safe_restore_fields = None
+        if restore_fields is not None:
+            if not isinstance(restore_fields, dict):
+                self._log_registry_warning(
+                    f"remove rejected non-dict restore fields for "
+                    f"{self._bot_name or '-'}:{sym}"
+                )
+                return False
+            try:
+                safe_restore_fields = copy.deepcopy(restore_fields)
+            except Exception:
+                self._log_registry_warning(
+                    f"remove rejected uncopyable restore fields for "
+                    f"{self._bot_name or '-'}:{sym}"
+                )
+                return False
         snapshot = None
         removed = None
         with self._lock:
             if sym in self._trades:
                 removed = self._trades.pop(sym)
                 rev, snapshot = self._snapshot_locked()
+        if snapshot is None:
+            # Idempotent state removal must also heal a stale coordination
+            # mirror. Serialize with add/update registry writes and re-check
+            # the current row so a concurrent re-add cannot lose its claim.
+            with self._registry_lock:
+                with self._lock:
+                    if sym in self._trades:
+                        return True
+                if not self._registry_remove(sym):
+                    return False
+                self._clear_registry_retry_if_absent(sym)
+                return True
         if snapshot is not None:
             status = self._persist_snapshot(rev, snapshot)
-            if status == "persisted":
-                # Release the claim so other bots can trade this coin again.
-                if self._registry_remove(sym):
-                    return True
-                with self._lock:
-                    restore_snapshot = None
-                    if sym not in self._trades and removed is not None:
-                        restored = copy.deepcopy(removed)
-                        if restore_fields:
-                            restored.update(restore_fields)
-                        restored["claim_release_pending"] = True
-                        self._trades[sym] = restored
-                        restore_rev, restore_snapshot = self._snapshot_locked()
-                if restore_snapshot is not None:
-                    self._persist_snapshot(restore_rev, restore_snapshot)
+            if status in ("persisted", "stale"):
+                # A newer durable snapshot may already include this removal,
+                # so stale is successful too. Do not release the claim if a
+                # concurrent add has since recreated the symbol.
+                with self._registry_lock:
+                    with self._lock:
+                        symbol_still_absent = sym not in self._trades
+                    if not symbol_still_absent:
+                        return True
+                    # Release the claim so other bots can trade this coin.
+                    if self._registry_remove(sym):
+                        self._clear_registry_retry_if_absent(sym)
+                        return True
+                    with self._lock:
+                        restore_snapshot = None
+                        if sym not in self._trades and removed is not None:
+                            restored = copy.deepcopy(removed)
+                            if safe_restore_fields:
+                                restored.update(safe_restore_fields)
+                            restored["claim_release_pending"] = True
+                            self._trades[sym] = restored
+                            restore_rev, restore_snapshot = (
+                                self._snapshot_locked()
+                            )
+                    if restore_snapshot is not None:
+                        self._persist_snapshot(restore_rev, restore_snapshot)
                 try:
                     from bot_utils.silent_log import silent_log
                     silent_log(
@@ -683,9 +768,9 @@ class TradeState:
             elif status == "failed":
                 with self._lock:
                     if sym not in self._trades and removed is not None:
-                        if restore_fields:
+                        if safe_restore_fields:
                             removed = copy.deepcopy(removed)
-                            removed.update(restore_fields)
+                            removed.update(safe_restore_fields)
                         self._trades[sym] = removed
                 try:
                     from bot_utils.silent_log import silent_log

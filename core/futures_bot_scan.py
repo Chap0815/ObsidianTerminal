@@ -28,6 +28,7 @@ from core.logger import _date as _utc_now_str
 import math
 import os
 
+from shared_limits import normalize_gate_mode
 from bot_utils import (
     budget_exhausted,
     get_funding_info,
@@ -521,11 +522,9 @@ class FuturesScanMixin:
             _reg = regime["regime"]
             _btc7 = float(regime.get("btc_7d", 0.0))
             _conf = str(confidence).upper()
-            try:
-                _bear_7d = float(os.getenv("FUT_REGIME_BEAR_7D", "-5.0"))
-                _bull_7d = float(os.getenv("FUT_REGIME_BULL_7D", "5.0"))
-            except ValueError:
-                _bear_7d, _bull_7d = -5.0, 5.0
+            from core.constants import FUT_REGIME_BEAR_7D, FUT_REGIME_BULL_7D
+            _bear_7d = FUT_REGIME_BEAR_7D
+            _bull_7d = FUT_REGIME_BULL_7D
             # A "clear" trend = explicit regime OR 7d move past the threshold.
             # The milder -3%..-5% zone is handled by the existing margin-
             # damping below (dampen, don't block) so the bot still trades in
@@ -650,9 +649,9 @@ class FuturesScanMixin:
 
         from trading.expectancy_runtime import evaluate_runtime_expectancy
 
-        expectancy_mode = str(
-            self.C("NET_EXPECTANCY_MODE", "shadow") or "shadow"
-        ).strip().lower()
+        expectancy_mode = normalize_gate_mode(
+            self.C("NET_EXPECTANCY_MODE", "shadow")
+        )
         expectancy = evaluate_runtime_expectancy(
             bot_name=self.BOT_NAME,
             mode=expectancy_mode,
@@ -928,10 +927,10 @@ class FuturesScanMixin:
                     return
 
                 from trading.portfolio_guard import evaluate_exchange_entry
-                from trading.portfolio_risk import PortfolioLimits
-                portfolio_mode = str(
-                    self.C("PORTFOLIO_RISK_MODE", "shadow") or "shadow"
-                ).strip().lower()
+                from trading.portfolio_risk import portfolio_limits_from_config
+                portfolio_mode = normalize_gate_mode(
+                    self.C("PORTFOLIO_RISK_MODE", "shadow")
+                )
                 portfolio_decision = evaluate_exchange_entry(
                     exchange=self.ex,
                     intent_id=entry_id,
@@ -940,13 +939,7 @@ class FuturesScanMixin:
                     side=direction,
                     requested_notional=notional,
                     mode=portfolio_mode,
-                    limits=PortfolioLimits(
-                        max_gross_pct=float(self.C("PORTFOLIO_MAX_GROSS_PCT", 100.0)),
-                        max_net_pct=float(self.C("PORTFOLIO_MAX_NET_PCT", 75.0)),
-                        min_free_pct=float(self.C("PORTFOLIO_MIN_FREE_PCT", 20.0)),
-                        max_cluster_pct=float(self.C("PORTFOLIO_MAX_CLUSTER_PCT", 35.0)),
-                        max_beta_pct=float(self.C("PORTFOLIO_MAX_BETA_PCT", 75.0)),
-                    ),
+                    limits=portfolio_limits_from_config(self.C),
                 )
                 try:
                     log_struct(
@@ -1009,10 +1002,31 @@ class FuturesScanMixin:
                 # Stable across process restarts and within MEXC's 32-char cap.
                 from trading.execution_quality import make_client_order_id
                 _cid = make_client_order_id(entry_id, "entry", self.BUY_PREFIX)
-                _entry_params = entry_params(
-                    position_side="long" if direction == "LONG" else "short",
-                    margin_mode=margin_mode, leverage=_lev_int,
-                    client_order_id=_cid)
+                def _entry_order_params(order_client_id):
+                    return entry_params(
+                        position_side=(
+                            "long" if direction == "LONG" else "short"
+                        ),
+                        margin_mode=margin_mode,
+                        leverage=_lev_int,
+                        client_order_id=order_client_id,
+                    )
+
+                def _submit_market_entry(
+                    order_amount=amount_contracts,
+                    order_client_id=_cid,
+                ):
+                    return create_order_with_retry(
+                        self.ex,
+                        symbol_full,
+                        side,
+                        order_amount,
+                        params=_entry_order_params(order_client_id),
+                        shutdown_event=self._shutdown_event,
+                        action_label=f"open {sym}",
+                        log_event=log_event,
+                        log_struct=log_struct,
+                    )
                 from core.database import (claim_symbol_for_entry,
                                            remove_open_position)
                 if not claim_symbol_for_entry(
@@ -1051,13 +1065,8 @@ class FuturesScanMixin:
                     bot_name=self.BOT_NAME,
                     mode=entry_mode,
                     reference_price=entry_price,
-                    market_order=lambda: create_order_with_retry(
-                        self.ex, symbol_full, side, amount_contracts,
-                        params=_entry_params,
-                        shutdown_event=self._shutdown_event,
-                        action_label=f"open {sym}",
-                        log_event=log_event, log_struct=log_struct,
-                    ),
+                    market_order=_submit_market_entry,
+                    maker_order_params=_entry_order_params(_cid),
                     config=MakerFirstConfig(
                         mode=maker_mode,
                         ttl_seconds=float(self.C("MAKER_FIRST_TTL_SECONDS", 3.0)),
@@ -1515,12 +1524,28 @@ class FuturesScanMixin:
                 return
 
         #  Persist full trade record (overwrites provisional) 
-        log_buy(
-            self.BOT_NAME, f"{sym} [{direction}@{leverage}x]",
-            fill_price, margin_usdt,
-            (r["rsi_15m"], r["rsi_1h"], r["rsi_4h"]),
-            news, ans
-        )
+        try:
+            log_buy(
+                self.BOT_NAME, f"{sym} [{direction}@{leverage}x]",
+                fill_price, margin_usdt,
+                (r["rsi_15m"], r["rsi_1h"], r["rsi_4h"]),
+                news, ans
+            )
+        except Exception as log_exc:
+            # The exchange order already landed and provisional state exists.
+            # A broken console/logger must not interrupt durable state upgrade.
+            try:
+                log_event(
+                    f"{sym}: buy log failed ({type(log_exc).__name__}); "
+                    f"continuing state persistence",
+                    "WARN",
+                )
+            except Exception:
+                pass
+            try:
+                self._log_error(f"futures buy log {sym}", log_exc)
+            except Exception:
+                pass
 
         # Actual margin from the filled position. A partial entry fill must not
         # keep the intended margin, otherwise open PnL and risk gates scale too

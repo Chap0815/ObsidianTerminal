@@ -6,6 +6,7 @@ import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
 
+from shared_limits import normalize_gate_mode
 from trading.portfolio_risk import (
     PortfolioDecision,
     PortfolioLimits,
@@ -23,6 +24,37 @@ def _finite(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def _safe_lower_text(value) -> str:
+    try:
+        return str(value).strip().lower()
+    except Exception:
+        return ""
+
+
+def _position_side(raw: dict) -> str | None:
+    info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+    candidates = (
+        raw.get("side"),
+        raw.get("positionSide"),
+        info.get("side"),
+        info.get("positionSide"),
+        info.get("posSide"),
+        info.get("holdSide"),
+    )
+    saw_unknown = False
+    for candidate in candidates:
+        normalized = _safe_lower_text(candidate)
+        if normalized in {"long", "buy"}:
+            return "LONG"
+        if normalized in {"short", "sell"}:
+            return "SHORT"
+        saw_unknown = saw_unknown or bool(normalized)
+    if saw_unknown:
+        return None
+    signed_contracts = _finite(raw.get("contracts"))
+    return "SHORT" if signed_contracts is not None and signed_contracts < 0 else None
 
 
 def _symbol_cluster(symbol: str) -> str:
@@ -177,7 +209,9 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
                     valuation_notes.append(f"entry-price fallback for {symbol}")
             if notional <= 0.0:
                 raise ValueError(f"valuation unavailable for {symbol}")
-            side = "SHORT" if str(raw.get("side", "")).lower() == "short" else "LONG"
+            side = _position_side(raw)
+            if side is None:
+                raise ValueError("position side unavailable")
             positions.append(
                 PortfolioPosition(
                     symbol=symbol,
@@ -289,9 +323,7 @@ def evaluate_exchange_entry(
     account_type: str = "futures",
     persist=None,
 ) -> PortfolioDecision:
-    normalized_mode = str(mode).strip().lower()
-    if normalized_mode not in {"disabled", "shadow", "enforce"}:
-        normalized_mode = "enforce"
+    normalized_mode = normalize_gate_mode(mode)
     snapshot = (
         collect_spot_snapshot(exchange)
         if str(account_type).strip().lower() == "spot"

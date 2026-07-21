@@ -247,11 +247,182 @@ def _sanitize_float(v, default: float = 0.0) -> float:
         return default
     try:
         f = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     if math.isnan(f) or math.isinf(f):
         return default
     return f
+
+
+def _optional_fear_greed_db(value) -> int | None:
+    """Return a valid 0..100 Fear & Greed index or NULL-safe ``None``."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number) or not number.is_integer():
+        return None
+    normalized = int(number)
+    return normalized if 0 <= normalized <= 100 else None
+
+
+def _trade_exchange_order_id_db(value) -> str | None:
+    """Normalize an optional exchange ID used as an accounting identity key."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("exchange_order_id must not be boolean")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError("exchange_order_id integer must be non-negative")
+        text = str(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+    else:
+        raise ValueError("exchange_order_id must be text or integer")
+    if len(text) > 256:
+        raise ValueError("exchange_order_id exceeds 256 characters")
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        raise ValueError("exchange_order_id contains control characters")
+    return text
+
+
+def _trade_timestamp_db(value, field_name: str) -> tuple[str, datetime]:
+    """Validate one canonical naive-UTC trade timestamp."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be UTC timestamp text")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"{field_name} contains control characters")
+    text = value.strip()
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must use YYYY-MM-DD HH:MM:SS UTC"
+        ) from exc
+    if parsed.strftime("%Y-%m-%d %H:%M:%S") != text:
+        raise ValueError(f"{field_name} must be a canonical UTC timestamp")
+    return text, parsed
+
+
+def _causal_entry_id_db(value, *, required: bool) -> str | None:
+    """Normalize an entry lifecycle ID without truncation or coercion."""
+    if value is None:
+        if required:
+            raise ValueError("entry_id is required")
+        return None
+    if not isinstance(value, str):
+        raise ValueError("entry_id must be text")
+    text = value.strip()
+    if not text:
+        if required:
+            raise ValueError("entry_id is required")
+        return None
+    if len(text) > 64:
+        raise ValueError("entry_id exceeds 64 characters")
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        raise ValueError("entry_id contains control characters")
+    return text
+
+
+def _bounded_text_db(
+    value, field_name: str, *, max_length: int, allow_empty: bool = False
+) -> str:
+    """Validate bounded identity/metadata text without lossy coercion."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be text")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"{field_name} contains control characters")
+    text = value.strip()
+    if not text and not allow_empty:
+        raise ValueError(f"{field_name} is required")
+    if len(text) > max_length:
+        raise ValueError(f"{field_name} exceeds {max_length} characters")
+    return text
+
+
+def _required_text_db(value, field_name: str, *, max_length: int) -> str:
+    return _bounded_text_db(value, field_name, max_length=max_length)
+
+
+def _canonical_bot_name_db(value) -> str:
+    normalized = _required_text_db(
+        value, "bot_name", max_length=32
+    ).upper()
+    if normalized not in _CANONICAL_BOTS:
+        raise ValueError(f"unknown bot_name: {normalized}")
+    return normalized
+
+
+def _canonical_or_sim_bot_name_db(value) -> str:
+    normalized = _required_text_db(
+        value, "bot_name", max_length=38
+    ).upper()
+    if normalized.endswith(_SIM_TAG):
+        base = normalized[:-len(_SIM_TAG)].strip()
+        return f"{_canonical_bot_name_db(base)}{_SIM_TAG}"
+    return _canonical_bot_name_db(normalized)
+
+
+def _required_finite_float_db(
+    value,
+    field_name: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a finite number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} must be a finite number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} must be a finite number")
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{field_name} is below its minimum")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{field_name} exceeds its maximum")
+    return number
+
+
+def _optional_bounded_float_db(
+    value, *, minimum: float, maximum: float
+) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number) or not minimum <= number <= maximum:
+        return None
+    return number
+
+
+def _optional_bounded_text_db(
+    value,
+    *,
+    max_length: int,
+    uppercase: bool = False,
+    allowed: set[str] | None = None,
+) -> str | None:
+    if value is None or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > max_length:
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        return None
+    if uppercase:
+        text = text.upper()
+    if allowed is not None and text not in allowed:
+        return None
+    return text
 
 
 # 
@@ -321,14 +492,14 @@ def _safe_ident(s: str) -> str:
     where identifiers must be interpolated into SQL (PRAGMA, ALTER TABLE)
     because they can't be parametrized.
     """
-    if not isinstance(s, str) or not _SQL_IDENT_RE.match(s):
+    if not isinstance(s, str) or not _SQL_IDENT_RE.fullmatch(s):
         raise ValueError(f"Unsafe SQL identifier: {s!r}")
     return s
 
 
 def _safe_ddl(s: str) -> str:
     """Very narrow whitelist for DDL fragments like 'INTEGER DEFAULT 0'."""
-    if not isinstance(s, str) or not _SQL_DDL_RE.match(s):
+    if not isinstance(s, str) or not _SQL_DDL_RE.fullmatch(s):
         raise ValueError(f"Unsafe DDL fragment: {s!r}")
     return s
 
@@ -363,6 +534,24 @@ _SCHEMA_LOCK_NAME = "schema_migration"
 _VACUUM_LOCK_NAME = "vacuum_coordinator"
 
 
+def _validated_advisory_lock_db(
+    lock_name, holder_id, ttl_sec=None, *, validate_ttl: bool = False
+) -> tuple[str, str, int | float | None]:
+    validated_lock = _required_text_db(
+        lock_name, "lock_name", max_length=128
+    )
+    validated_holder = _required_text_db(
+        holder_id, "holder_id", max_length=128
+    )
+    if not validate_ttl:
+        return validated_lock, validated_holder, None
+    if isinstance(ttl_sec, bool) or not isinstance(ttl_sec, (int, float)):
+        raise ValueError("ttl_sec must be a finite number")
+    if not math.isfinite(ttl_sec) or not 0 < ttl_sec <= 86_400:
+        raise ValueError("ttl_sec must be above 0 and at most 86400")
+    return validated_lock, validated_holder, ttl_sec
+
+
 def _try_advisory_lock(conn, lock_name: str, holder_id: str,
                         ttl_sec: int = 60,
                         raise_operational: bool = False) -> bool:
@@ -373,6 +562,11 @@ def _try_advisory_lock(conn, lock_name: str, holder_id: str,
     Generalised so the vacuum scheduler and any future cross-process
     coordinator can reuse the same mechanism instead of per-process timers.
     """
+    lock_name, holder_id, validated_ttl = _validated_advisory_lock_db(
+        lock_name, holder_id, ttl_sec, validate_ttl=True
+    )
+    assert validated_ttl is not None
+    ttl_sec = validated_ttl
     now_str = _utcnow_str()
     expires_at = (_utcnow() + timedelta(seconds=ttl_sec)).strftime(
         "%Y-%m-%d %H:%M:%S")
@@ -400,6 +594,12 @@ def _try_advisory_lock(conn, lock_name: str, holder_id: str,
         if raise_operational:
             raise
         return False
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
 
 
 def _release_advisory_lock(conn, lock_name: str, holder_id: str) -> None:
@@ -698,6 +898,7 @@ def _run_migrations(conn) -> None:
         target_amount      REAL NOT NULL,
         target_price       REAL,
         client_order_id    TEXT NOT NULL UNIQUE,
+        fallback_client_order_id TEXT,
         exchange_order_id  TEXT,
         status             TEXT NOT NULL,
         filled_amount      REAL NOT NULL DEFAULT 0,
@@ -709,6 +910,14 @@ def _run_migrations(conn) -> None:
     )""")
     _add_column_if_missing(
         conn, "order_intents", "mode", "TEXT NOT NULL DEFAULT 'UNKNOWN'"
+    )
+    _add_column_if_missing(
+        conn, "order_intents", "fallback_client_order_id", "TEXT"
+    )
+    c.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_order_intents_fallback_client_id "
+        "ON order_intents(fallback_client_order_id) "
+        "WHERE fallback_client_order_id IS NOT NULL"
     )
     c.execute("CREATE INDEX IF NOT EXISTS idx_order_intents_recovery "
               "ON order_intents(bot_name, status, updated_at)")
@@ -898,10 +1107,18 @@ def _start_maintenance_thread() -> None:
 
 def _gc_api_rate_global() -> None:
     try:
-        cutoff = (_utcnow() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        now = _utcnow()
+        cutoff = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        latest_plausible = (now + timedelta(minutes=5)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
         conn = sqlite3.connect(DB_PATH, timeout=10.0)
         try:
-            conn.execute("DELETE FROM api_rate_global WHERE called_at < ?", (cutoff,))
+            conn.execute(
+                "DELETE FROM api_rate_global "
+                "WHERE called_at < ? OR called_at > ?",
+                (cutoff, latest_plausible),
+            )
             conn.commit()
         finally:
             conn.close()
@@ -1116,10 +1333,107 @@ def save_trade_db(
     mode_is_sim=None, entry_quality_score=None, entry_quality_label=None,
     entry_quality_reasons=None, entry_id=None,
 ) -> bool:
+    metadata_error = None
+    if not isinstance(bot_name, str) or not bot_name.strip():
+        metadata_error = "bot_name must be non-empty text"
+    else:
+        bot_name = bot_name.strip()
+        if "/" in bot_name or ":" in bot_name:
+            metadata_error = "bot_name looks like a market symbol"
+    if metadata_error is None:
+        if not isinstance(symbol, str) or not symbol.strip():
+            metadata_error = "symbol must be non-empty text"
+        else:
+            symbol = symbol.strip()
+    if metadata_error is None and not isinstance(is_futures, bool):
+        metadata_error = "is_futures must be boolean"
+    if metadata_error is None and not isinstance(is_partial, bool):
+        metadata_error = "is_partial must be boolean"
+
+    normalized_reason = None
+    if metadata_error is None:
+        try:
+            normalized_reason = _required_text_db(
+                reason, "reason", max_length=256
+            )
+        except ValueError as exc:
+            metadata_error = str(exc)
+
+    normalized_buy_time = None
+    normalized_sell_time = None
+    if metadata_error is None:
+        try:
+            normalized_buy_time, parsed_buy_time = _trade_timestamp_db(
+                buy_time, "buy_time"
+            )
+            normalized_sell_time, parsed_sell_time = _trade_timestamp_db(
+                sell_time, "sell_time"
+            )
+            if parsed_sell_time < parsed_buy_time:
+                raise ValueError("sell_time must not precede buy_time")
+        except ValueError as exc:
+            metadata_error = str(exc)
+
+    normalized_exchange_order_id = None
+    if metadata_error is None:
+        try:
+            normalized_exchange_order_id = _trade_exchange_order_id_db(
+                exchange_order_id
+            )
+        except ValueError as exc:
+            metadata_error = str(exc)
+
+    normalized_entry_id = None
+    if metadata_error is None:
+        try:
+            normalized_entry_id = _causal_entry_id_db(
+                entry_id, required=False
+            )
+        except ValueError as exc:
+            metadata_error = str(exc)
+
+    explicit_mode = _coerce_mode_is_sim(mode_is_sim)
+    if metadata_error is None and mode_is_sim is not None and explicit_mode is None:
+        metadata_error = "mode_is_sim is invalid"
+    if (
+        metadata_error is None
+        and bot_name.endswith(_SIM_TAG)
+        and explicit_mode is False
+    ):
+        metadata_error = "SIM bot_name conflicts with explicit LIVE mode"
+
+    normalized_position_type = None
+    if metadata_error is None and position_type is not None:
+        if not isinstance(position_type, str) or not position_type.strip():
+            metadata_error = "position_type must be known text"
+        else:
+            normalized_position_type = position_type.strip().upper()
+            if normalized_position_type not in {"SPOT", "FUTURES", "LONG", "SHORT"}:
+                metadata_error = "position_type is unknown"
+            elif is_futures and normalized_position_type == "SPOT":
+                metadata_error = "futures trade cannot use SPOT position_type"
+            elif not is_futures and normalized_position_type != "SPOT":
+                metadata_error = "spot trade cannot use futures position_type"
+    if metadata_error is not None:
+        try:
+            from core.logger import log_event
+            log_event(
+                f"[DB] Refusing to save trade {symbol!r}: {metadata_error}",
+                "WARN",
+            )
+        except Exception:
+            pass
+        return False
+    position_type = normalized_position_type
+    exchange_order_id = normalized_exchange_order_id
+    buy_time = normalized_buy_time
+    sell_time = normalized_sell_time
+    entry_id = normalized_entry_id
+    reason = normalized_reason
+
     if not _INIT_DB_DONE:
         init_db()
     raw_bot_name = bot_name
-    explicit_mode = _coerce_mode_is_sim(mode_is_sim)
     trade_is_sim = 1 if str(raw_bot_name or "").endswith(_SIM_TAG) else (
         (1 if explicit_mode else 0)
         if explicit_mode is not None else
@@ -1161,20 +1475,27 @@ def save_trade_db(
     invested_usdt = _sanitize_float(invested_usdt, 0.0)
     funding_paid  = _sanitize_float(funding_paid, 0.0)
     fees_usdt     = _sanitize_float(fees_usdt, 0.0)
-    entry_quality_score = (
-        _sanitize_float(entry_quality_score, None)
-        if entry_quality_score is not None else None
+    entry_quality_score = _optional_bounded_float_db(
+        entry_quality_score, minimum=0.0, maximum=100.0
     )
-    entry_quality_label = (
-        str(entry_quality_label)[:16]
-        if entry_quality_label is not None else None
+    entry_quality_label = _optional_bounded_text_db(
+        entry_quality_label,
+        max_length=16,
+        uppercase=True,
+        allowed={"LOW", "MID", "HIGH", "UNKNOWN"},
     )
-    entry_quality_reasons = (
-        str(entry_quality_reasons)[:512]
-        if entry_quality_reasons is not None else None
+    entry_quality_reasons = _optional_bounded_text_db(
+        entry_quality_reasons, max_length=512
     )
-    entry_id = str(entry_id)[:64] if entry_id is not None else None
-
+    mfe_pct = _optional_bounded_float_db(
+        mfe_pct, minimum=0.0, maximum=float("inf")
+    )
+    mae_pct = _optional_bounded_float_db(
+        mae_pct, minimum=float("-inf"), maximum=0.0
+    )
+    giveback_pct = _optional_bounded_float_db(
+        giveback_pct, minimum=0.0, maximum=float("inf")
+    )
     if buy_price <= 0 or sell_price <= 0:
         try:
             from core.logger import log_event
@@ -1226,6 +1547,10 @@ def save_trade_db(
 
     conn = get_connection()
     try:
+        # The read-before-insert idempotency checks must be one cross-process
+        # critical section. Without an IMMEDIATE transaction, two bot/reconcile
+        # workers can both observe "missing" and book the same exchange fill.
+        conn.execute("BEGIN IMMEDIATE")
         if is_partial and exchange_order_id is not None:
             existing_partial = conn.execute("""
             SELECT 1 FROM trades
@@ -1251,13 +1576,12 @@ def save_trade_db(
                  WHERE bot_name = ?
                    AND symbol = ?
                    AND buy_time = ?
-                   AND sell_time = ?
                    AND COALESCE(is_partial, 0) = 0
                    AND COALESCE(is_futures, 0) = ?
                    AND COALESCE(exchange_order_id, '') = COALESCE(?, '')
                  LIMIT 1
                 """, (
-                    bot_name, symbol, buy_time, sell_time,
+                    bot_name, symbol, buy_time,
                     1 if is_futures else 0,
                     str(exchange_order_id),
                 )).fetchone()
@@ -1302,15 +1626,13 @@ def save_trade_db(
             1 if profit_usdt >= 0 else 0,
             1 if is_partial else 0,
             _sanitize_float(btc_trend, None) if btc_trend is not None else None,
-            int(fear_greed) if fear_greed is not None else None,
+            _optional_fear_greed_db(fear_greed),
             1 if is_futures else 0,
             position_type, _sanitize_float(leverage, None) if leverage is not None else None,
             _sanitize_float(liquidation_price, None) if liquidation_price is not None else None,
             funding_paid, fees_usdt,
             str(exchange_order_id) if exchange_order_id is not None else None,
-            _sanitize_float(mfe_pct, None) if mfe_pct is not None else None,
-            _sanitize_float(mae_pct, None) if mae_pct is not None else None,
-            _sanitize_float(giveback_pct, None) if giveback_pct is not None else None,
+            mfe_pct, mae_pct, giveback_pct,
             trade_is_sim, mode_source, entry_quality_score, entry_quality_label,
             entry_quality_reasons, entry_id,
         ))
@@ -1378,30 +1700,39 @@ def save_expectancy_candidate(
     features: dict,
 ) -> bool:
     """Persist one immutable causal entry vector, idempotently by entry_id."""
-    if not _INIT_DB_DONE:
-        init_db()
-    normalized_entry_id = str(entry_id or "").strip()[:64]
-    normalized_bot = str(bot_name or "").strip().upper()[:32]
-    normalized_symbol = str(symbol or "").strip()[:64]
-    normalized_mode = str(mode or "").strip().upper()
-    normalized_time = str(candidate_time or "").strip()[:32]
     try:
-        normalized_schema = int(schema_version)
+        normalized_entry_id = _causal_entry_id_db(entry_id, required=True)
+        normalized_bot = _required_text_db(
+            bot_name, "bot_name", max_length=32
+        ).upper()
+        if normalized_bot not in _CANONICAL_BOTS:
+            raise ValueError("bot_name is unknown")
+        normalized_symbol = _required_text_db(
+            symbol, "symbol", max_length=64
+        )
+        normalized_mode = _required_text_db(
+            mode, "mode", max_length=8
+        ).upper()
+        if normalized_mode not in {"LIVE", "SIM"}:
+            raise ValueError("mode is unknown")
+        normalized_time, _ = _trade_timestamp_db(
+            candidate_time, "candidate_time"
+        )
+        normalized_schema = _positive_integer_db(
+            schema_version, "schema_version"
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not isinstance(features, dict):
+        return False
+    try:
         encoded_features = json.dumps(
             features, sort_keys=True, separators=(",", ":"), allow_nan=False
         )
     except (TypeError, ValueError, OverflowError):
         return False
-    if (
-        not normalized_entry_id
-        or not normalized_bot
-        or not normalized_symbol
-        or normalized_mode not in {"LIVE", "SIM"}
-        or not normalized_time
-        or normalized_schema < 1
-        or not isinstance(features, dict)
-    ):
-        return False
+    if not _INIT_DB_DONE:
+        init_db()
     conn = get_connection()
     values = (
         normalized_entry_id,
@@ -1461,45 +1792,104 @@ def get_recent_trades(bot_name: str, limit: int = 60,
 
 #  Futures state 
 
+def _validated_futures_state_bot_db(bot_name, mode_is_sim) -> str:
+    validated_bot = _required_text_db(
+        bot_name, "bot_name", max_length=32
+    ).upper()
+    if validated_bot not in _CANONICAL_BOTS:
+        raise ValueError("futures state bot_name is unknown")
+    parsed_mode = _coerce_mode_is_sim(mode_is_sim)
+    if mode_is_sim is not None and parsed_mode is None:
+        raise ValueError("futures state mode must be LIVE or SIM")
+    return _metric_bot_for_mode(validated_bot, parsed_mode)
+
+
 def upsert_futures_state(symbol, bot_name, position_type, entry_price,
                           current_price, leverage, margin_usdt,
                           position_size_usdt, unrealized_pnl, unrealized_pct,
                           liquidation_price, liq_distance_pct, funding_paid,
                           opened_at, mode_is_sim=None) -> None:
-    bot_name = _metric_bot_for_mode(bot_name, mode_is_sim)
+    validated_symbol = _required_text_db(symbol, "symbol", max_length=64)
+    namespaced_bot = _validated_futures_state_bot_db(bot_name, mode_is_sim)
+    validated_position_type = _required_text_db(
+        position_type, "position_type", max_length=5
+    ).upper()
+    if validated_position_type not in {"LONG", "SHORT"}:
+        raise ValueError("futures state position_type must be LONG or SHORT")
+    normalized_entry_price = _required_finite_float_db(
+        entry_price, "entry_price"
+    )
+    normalized_current_price = _required_finite_float_db(
+        current_price, "current_price"
+    )
+    normalized_leverage = _required_finite_float_db(leverage, "leverage")
+    normalized_margin = _required_finite_float_db(margin_usdt, "margin_usdt")
+    normalized_size = _required_finite_float_db(
+        position_size_usdt, "position_size_usdt"
+    )
+    for field_name, number in (
+        ("entry_price", normalized_entry_price),
+        ("current_price", normalized_current_price),
+        ("leverage", normalized_leverage),
+        ("margin_usdt", normalized_margin),
+        ("position_size_usdt", normalized_size),
+    ):
+        if number <= 0.0:
+            raise ValueError(f"{field_name} must be positive")
+    normalized_unrealized_pnl = _required_finite_float_db(
+        unrealized_pnl, "unrealized_pnl"
+    )
+    normalized_unrealized_pct = _required_finite_float_db(
+        unrealized_pct, "unrealized_pct"
+    )
+    normalized_liquidation_price = _required_finite_float_db(
+        liquidation_price, "liquidation_price", minimum=0.0
+    )
+    normalized_liq_distance = _required_finite_float_db(
+        liq_distance_pct, "liq_distance_pct"
+    )
+    normalized_funding = _required_finite_float_db(
+        funding_paid, "funding_paid"
+    )
+    normalized_opened_at, _opened_at_dt = _trade_timestamp_db(
+        opened_at, "opened_at"
+    )
     conn = get_connection()
     now = _utcnow_str()
-    conn.execute("""
-    INSERT INTO futures_state
-        (symbol, bot_name, position_type, entry_price, current_price,
-         leverage, margin_usdt, position_size_usdt,
-         unrealized_pnl, unrealized_pct,
-         liquidation_price, liq_distance_pct, funding_paid,
-         opened_at, last_update)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(symbol, bot_name) DO UPDATE SET
-        position_type      = excluded.position_type,
-        entry_price        = excluded.entry_price,
-        current_price      = excluded.current_price,
-        leverage           = excluded.leverage,
-        margin_usdt        = excluded.margin_usdt,
-        position_size_usdt = excluded.position_size_usdt,
-        unrealized_pnl     = excluded.unrealized_pnl,
-        unrealized_pct     = excluded.unrealized_pct,
-        liquidation_price  = excluded.liquidation_price,
-        liq_distance_pct   = excluded.liq_distance_pct,
-        funding_paid       = excluded.funding_paid,
-        opened_at          = excluded.opened_at,
-        last_update        = excluded.last_update""", (
-        symbol, bot_name, position_type,
-        _sanitize_float(entry_price), _sanitize_float(current_price),
-        _sanitize_float(leverage, 1.0), _sanitize_float(margin_usdt),
-        _sanitize_float(position_size_usdt), _sanitize_float(unrealized_pnl),
-        _sanitize_float(unrealized_pct), _sanitize_float(liquidation_price),
-        _sanitize_float(liq_distance_pct), _sanitize_float(funding_paid),
-        opened_at, now,
-    ))
-    conn.commit()
+    try:
+        conn.execute("""
+        INSERT INTO futures_state
+            (symbol, bot_name, position_type, entry_price, current_price,
+             leverage, margin_usdt, position_size_usdt,
+             unrealized_pnl, unrealized_pct,
+             liquidation_price, liq_distance_pct, funding_paid,
+             opened_at, last_update)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(symbol, bot_name) DO UPDATE SET
+            position_type      = excluded.position_type,
+            entry_price        = excluded.entry_price,
+            current_price      = excluded.current_price,
+            leverage           = excluded.leverage,
+            margin_usdt        = excluded.margin_usdt,
+            position_size_usdt = excluded.position_size_usdt,
+            unrealized_pnl     = excluded.unrealized_pnl,
+            unrealized_pct     = excluded.unrealized_pct,
+            liquidation_price  = excluded.liquidation_price,
+            liq_distance_pct   = excluded.liq_distance_pct,
+            funding_paid       = excluded.funding_paid,
+            opened_at          = excluded.opened_at,
+            last_update        = excluded.last_update""", (
+            validated_symbol, namespaced_bot, validated_position_type,
+            normalized_entry_price, normalized_current_price,
+            normalized_leverage, normalized_margin, normalized_size,
+            normalized_unrealized_pnl, normalized_unrealized_pct,
+            normalized_liquidation_price, normalized_liq_distance,
+            normalized_funding, normalized_opened_at, now,
+        ))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def remove_futures_state(symbol: str, bot_name: str, mode_is_sim=None) -> None:
@@ -1513,15 +1903,18 @@ def remove_futures_state(symbol: str, bot_name: str, mode_is_sim=None) -> None:
     dangerous unscoped path can never be reintroduced by accident. Skipping a
     delete (stale row, healed next tick) is far safer than wiping a live row.
     """
-    if not bot_name:
-        raise ValueError(
-            "remove_futures_state requires bot_name  an unscoped delete would "
-            "wipe other bots' rows for the same base coin")
-    bot_name = _metric_bot_for_mode(bot_name, mode_is_sim)
+    validated_symbol = _required_text_db(symbol, "symbol", max_length=64)
+    namespaced_bot = _validated_futures_state_bot_db(bot_name, mode_is_sim)
     conn = get_connection()
-    conn.execute("DELETE FROM futures_state WHERE symbol=? AND bot_name=?",
-                 (symbol, bot_name))
-    conn.commit()
+    try:
+        conn.execute(
+            "DELETE FROM futures_state WHERE symbol=? AND bot_name=?",
+            (validated_symbol, namespaced_bot),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def get_futures_state(bot_name: str = None, mode_is_sim=None) -> list:
@@ -1533,12 +1926,21 @@ def get_futures_state(bot_name: str = None, mode_is_sim=None) -> list:
     CROSS bot's coins. metrics_service / poller already scope; this is the
     matching fix for the stop/close path.
     """
-    bot_name = _metric_bot_for_mode(bot_name, mode_is_sim)
+    if bot_name is None:
+        if mode_is_sim is not None:
+            raise ValueError(
+                "futures state mode requires an explicit bot_name"
+            )
+        namespaced_bot = None
+    else:
+        namespaced_bot = _validated_futures_state_bot_db(
+            bot_name, mode_is_sim
+        )
     conn = get_connection()
-    if bot_name:
+    if namespaced_bot is not None:
         rows = conn.execute(
             "SELECT * FROM futures_state WHERE bot_name=? ORDER BY opened_at DESC",
-            (bot_name,)).fetchall()
+            (namespaced_bot,)).fetchall()
     else:
         rows = conn.execute(
             "SELECT * FROM futures_state ORDER BY opened_at DESC").fetchall()
@@ -1546,6 +1948,20 @@ def get_futures_state(bot_name: str = None, mode_is_sim=None) -> list:
 
 
 #  Drawdown 
+
+def _validated_metrics_bot_for_mode_db(bot_name, mode_is_sim) -> str:
+    validated_bot = _canonical_bot_name_db(bot_name)
+    if mode_is_sim is None:
+        return _metric_bot(validated_bot)
+    parsed_mode = _coerce_mode_is_sim(mode_is_sim)
+    if parsed_mode is None:
+        raise ValueError("mode_is_sim must identify LIVE or SIM explicitly")
+    return _metric_bot_for_mode(validated_bot, parsed_mode)
+
+
+def _paused_daily_pnl_db() -> dict:
+    return {"total_profit": 0.0, "trade_count": 0, "is_paused": 1}
+
 
 def get_today_pnl(bot_name: str, mode_is_sim=None) -> dict:
     """Returns today's realized PnL for `bot_name`.
@@ -1557,31 +1973,68 @@ def get_today_pnl(bot_name: str, mode_is_sim=None) -> dict:
     hour_of_day/day_of_week learning fields follow local time. TZ resolution
     failure falls back to UTC.
     """
-    bot_name = _metric_bot_for_mode(bot_name, mode_is_sim)
+    validated_bot = _validated_metrics_bot_for_mode_db(
+        bot_name, mode_is_sim
+    )
     today = _local_today_str()   # lokal-konsistent mit Bad-Hours
-    conn = get_connection()
-    row = conn.execute("""
-    SELECT total_profit, trade_count, is_paused FROM daily_pnl
-    WHERE bot_name=? AND trade_date=?""", (bot_name, today)).fetchone()
-    if row:
-        return dict(row)
-    return {"total_profit": 0.0, "trade_count": 0, "is_paused": 0}
+    try:
+        row = get_connection().execute("""
+        SELECT total_profit, trade_count, is_paused FROM daily_pnl
+        WHERE bot_name=? AND trade_date=?""", (
+            validated_bot, today)).fetchone()
+    except Exception:
+        return _paused_daily_pnl_db()
+    if not row:
+        return {"total_profit": 0.0, "trade_count": 0, "is_paused": 0}
+    try:
+        total_profit = _required_finite_float_db(
+            row["total_profit"], "total_profit"
+        )
+    except ValueError:
+        return _paused_daily_pnl_db()
+    trade_count = row["trade_count"]
+    is_paused = row["is_paused"]
+    if (
+        isinstance(trade_count, bool)
+        or not isinstance(trade_count, int)
+        or trade_count < 0
+        or isinstance(is_paused, bool)
+        or not isinstance(is_paused, int)
+        or is_paused not in (0, 1)
+    ):
+        return _paused_daily_pnl_db()
+    return {
+        "total_profit": total_profit,
+        "trade_count": trade_count,
+        "is_paused": is_paused,
+    }
 
 
 def pause_bot_today(bot_name: str, reason: str = "") -> None:
-    bot_name = _metric_bot(bot_name)
+    validated_bot = _canonical_bot_name_db(bot_name)
+    validated_reason = _bounded_text_db(
+        reason, "reason", max_length=500, allow_empty=True
+    )
+    namespaced_bot = _metric_bot(validated_bot)
     today = _local_today_str()   # lokal-konsistent mit Bad-Hours
     conn = get_connection()
-    cur = conn.execute(
-        "UPDATE daily_pnl SET is_paused=1 WHERE bot_name=? AND trade_date=?",
-        (bot_name, today))
-    if cur.rowcount == 0:
+    try:
         conn.execute("""
-        INSERT OR IGNORE INTO daily_pnl
+        INSERT INTO daily_pnl
             (bot_name, trade_date, total_profit, trade_count, is_paused)
-        VALUES (?, ?, 0.0, 0, 1)""", (bot_name, today))
-    conn.commit()
-    log_learning(bot_name, "BOT_PAUSED", "drawdown", None, "1", reason, 0)
+        VALUES (?, ?, 0.0, 0, 1)
+        ON CONFLICT(bot_name, trade_date) DO UPDATE SET is_paused=1
+        """, (namespaced_bot, today))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    # The safety pause is committed before its audit row deliberately: a
+    # transient logging failure must never roll back the kill switch.
+    log_learning(
+        namespaced_bot, "BOT_PAUSED", "drawdown", None, "1",
+        validated_reason, 0,
+    )
 
 
 #  Params 
@@ -1591,8 +2044,41 @@ _PARAM_CACHE_TTL  = 60.0
 _PARAM_CACHE_LOCK = threading.Lock()
 
 
+def _validated_param_key_db(bot_name, param_name) -> tuple[str, str]:
+    """Return the canonical, bounded identity of a persisted bot parameter."""
+    validated_bot = _canonical_bot_name_db(bot_name)
+    validated_param = _required_text_db(
+        param_name, "param_name", max_length=64
+    )
+    return validated_bot, validated_param
+
+
+def _param_value_text_db(value) -> str:
+    """Serialize supported parameter values without persisting invalid floats."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError("param value must be finite numeric or text")
+    if isinstance(value, (int, float)):
+        _required_finite_float_db(value, "param value")
+        return str(value)
+    text = _bounded_text_db(
+        value, "param value", max_length=1024, allow_empty=True
+    )
+    if text:
+        try:
+            numeric = float(text)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if not math.isfinite(numeric):
+                raise ValueError("param value must be finite numeric or text")
+    return text
+
+
 def _get_param_raw(bot_name: str, param_name: str):
-    key = (bot_name, param_name)
+    validated_bot, validated_param = _validated_param_key_db(
+        bot_name, param_name
+    )
+    key = (validated_bot, validated_param)
     now = _time.monotonic()
     with _PARAM_CACHE_LOCK:
         cached = _PARAM_CACHE.get(key)
@@ -1601,7 +2087,7 @@ def _get_param_raw(bot_name: str, param_name: str):
     conn = get_connection()
     row = conn.execute(
         "SELECT param_value FROM bot_params WHERE bot_name=? AND param_name=?",
-        (bot_name, param_name)).fetchone()
+        key).fetchone()
     val = row["param_value"] if row else None
     with _PARAM_CACHE_LOCK:
         _PARAM_CACHE[key] = (val, _time.monotonic())
@@ -1613,45 +2099,85 @@ def get_param(bot_name: str, param_name: str, default: float) -> float:
     if raw is None:
         return default
     try:
-        return float(raw)
-    except (TypeError, ValueError):
+        parsed = float(raw)
+    except (TypeError, ValueError, OverflowError):
         return default
+    return parsed if math.isfinite(parsed) else default
 
 
 def get_param_text(bot_name: str, param_name: str, default: str = "") -> str:
     raw = _get_param_raw(bot_name, param_name)
-    return default if raw is None else str(raw)
+    if raw is None:
+        return default
+    try:
+        return _param_value_text_db(raw)
+    except ValueError:
+        return default
 
 
 def set_param(bot_name: str, param_name: str, value, reason: str = "") -> None:
-    with _PARAM_CACHE_LOCK:
-        _PARAM_CACHE.pop((bot_name, param_name), None)
+    validated_bot, validated_param = _validated_param_key_db(
+        bot_name, param_name
+    )
+    validated_value = _param_value_text_db(value)
+    validated_reason = _bounded_text_db(
+        reason, "reason", max_length=500, allow_empty=True
+    )
     conn = get_connection()
-    conn.execute("""
-    INSERT INTO bot_params (bot_name, param_name, param_value, updated_at, reason)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(bot_name, param_name) DO UPDATE SET
-        param_value = excluded.param_value,
-        updated_at  = excluded.updated_at,
-        reason      = excluded.reason""", (
-        bot_name, param_name, str(value), _utcnow_str(), reason))
-    conn.commit()
+    try:
+        conn.execute("""
+        INSERT INTO bot_params (bot_name, param_name, param_value, updated_at, reason)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(bot_name, param_name) DO UPDATE SET
+            param_value = excluded.param_value,
+            updated_at  = excluded.updated_at,
+            reason      = excluded.reason""", (
+            validated_bot, validated_param, validated_value,
+            _utcnow_str(), validated_reason))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    with _PARAM_CACHE_LOCK:
+        _PARAM_CACHE.pop((validated_bot, validated_param), None)
 
 
 #  Blacklist 
 
+_MAX_BLACKLIST_HOURS = 87_600
+
+
+def _validated_blacklist_key_db(symbol, bot_name) -> tuple[str, str]:
+    validated_symbol = _required_text_db(
+        symbol, "symbol", max_length=64
+    ).upper()
+    validated_bot = _canonical_bot_name_db(bot_name)
+    return validated_symbol, validated_bot
+
+
 def is_blacklisted(symbol: str, bot_name: str) -> bool:
+    validated_symbol, validated_bot = _validated_blacklist_key_db(
+        symbol, bot_name
+    )
     conn = get_connection()
-    row = conn.execute("""
+    rows = conn.execute("""
     SELECT blacklisted_until FROM coin_blacklist
-    WHERE symbol=? AND bot_name=?""", (symbol, bot_name)).fetchone()
-    if not row:
+    WHERE UPPER(TRIM(symbol))=? AND UPPER(TRIM(bot_name))=?""", (
+        validated_symbol, validated_bot)).fetchall()
+    if not rows:
         return False
-    try:
-        until = datetime.strptime(row["blacklisted_until"], "%Y-%m-%d %H:%M:%S")
-        return _utcnow() < until
-    except Exception:
-        return False
+    now = _utcnow()
+    for row in rows:
+        try:
+            until = datetime.strptime(
+                row["blacklisted_until"], "%Y-%m-%d %H:%M:%S"
+            )
+        except (TypeError, ValueError):
+            # A corrupt active-risk record must never silently re-enable entries.
+            return True
+        if now < until:
+            return True
+    return False
 
 
 def cleanup_expired_blacklist() -> int:
@@ -1669,81 +2195,167 @@ def add_to_blacklist(symbol: str, bot_name: str, loss_usdt: float,
     """incremental=True (default): counts as ONE additional loss event.
     incremental=False: replaces total_loss_usdt with the given value (used for
     risk_manager-summed totals)."""
+    validated_symbol, validated_bot = _validated_blacklist_key_db(
+        symbol, bot_name
+    )
+    loss_clean = abs(_required_finite_float_db(loss_usdt, "loss_usdt"))
+    if isinstance(hours, bool) or not isinstance(hours, int):
+        raise ValueError("hours must be an integer")
+    if not 1 <= hours <= _MAX_BLACKLIST_HOURS:
+        raise ValueError(
+            f"hours must be between 1 and {_MAX_BLACKLIST_HOURS}"
+        )
+    validated_reason = _bounded_text_db(
+        reason, "reason", max_length=500, allow_empty=True
+    )
+    if not isinstance(incremental, bool):
+        raise ValueError("incremental must be boolean")
     now = _utcnow()
     until = (now + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     now_s = now.strftime("%Y-%m-%d %H:%M:%S")
-    loss_clean = abs(_sanitize_float(loss_usdt))
     conn = get_connection()
-    if incremental:
-        conn.execute("""
-        INSERT INTO coin_blacklist
-            (symbol, bot_name, loss_count, total_loss_usdt,
-             blacklisted_at, blacklisted_until, reason)
-        VALUES (?, ?, 1, ?, ?, ?, ?)
-        ON CONFLICT(symbol, bot_name) DO UPDATE SET
-            loss_count        = loss_count + 1,
-            total_loss_usdt   = total_loss_usdt + excluded.total_loss_usdt,
-            blacklisted_at    = excluded.blacklisted_at,
-            blacklisted_until = MAX(blacklisted_until, excluded.blacklisted_until),
-            reason            = excluded.reason
-        """, (symbol, bot_name, loss_clean, now_s, until, reason))
-    else:
-        conn.execute("""
-        INSERT INTO coin_blacklist
-            (symbol, bot_name, loss_count, total_loss_usdt,
-             blacklisted_at, blacklisted_until, reason)
-        VALUES (?, ?, 1, ?, ?, ?, ?)
-        ON CONFLICT(symbol, bot_name) DO UPDATE SET
-            total_loss_usdt   = excluded.total_loss_usdt,
-            blacklisted_at    = excluded.blacklisted_at,
-            blacklisted_until = MAX(blacklisted_until, excluded.blacklisted_until),
-            reason            = excluded.reason
-        """, (symbol, bot_name, loss_clean, now_s, until, reason))
-    conn.commit()
+    try:
+        if incremental:
+            conn.execute("""
+            INSERT INTO coin_blacklist
+                (symbol, bot_name, loss_count, total_loss_usdt,
+                 blacklisted_at, blacklisted_until, reason)
+            VALUES (?, ?, 1, ?, ?, ?, ?)
+            ON CONFLICT(symbol, bot_name) DO UPDATE SET
+                loss_count        = loss_count + 1,
+                total_loss_usdt   = total_loss_usdt + excluded.total_loss_usdt,
+                blacklisted_at    = excluded.blacklisted_at,
+                blacklisted_until = MAX(blacklisted_until, excluded.blacklisted_until),
+                reason            = excluded.reason
+            """, (validated_symbol, validated_bot, loss_clean, now_s, until,
+                  validated_reason))
+        else:
+            conn.execute("""
+            INSERT INTO coin_blacklist
+                (symbol, bot_name, loss_count, total_loss_usdt,
+                 blacklisted_at, blacklisted_until, reason)
+            VALUES (?, ?, 1, ?, ?, ?, ?)
+            ON CONFLICT(symbol, bot_name) DO UPDATE SET
+                total_loss_usdt   = excluded.total_loss_usdt,
+                blacklisted_at    = excluded.blacklisted_at,
+                blacklisted_until = MAX(blacklisted_until, excluded.blacklisted_until),
+                reason            = excluded.reason
+            """, (validated_symbol, validated_bot, loss_clean, now_s, until,
+                  validated_reason))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 #  Market regime 
 
+_MARKET_REGIMES = frozenset({"BULL", "BEAR", "NEUTRAL", "CACHED_FG"})
+
+
 def log_market_regime(regime: str, btc_24h=None, btc_7d=None,
                       fear_greed=None) -> None:
+    validated_regime = _required_text_db(
+        regime, "regime", max_length=32
+    ).upper()
+    if validated_regime not in _MARKET_REGIMES:
+        raise ValueError(f"unknown market regime: {validated_regime}")
     conn = get_connection()
-    conn.execute("""
-    INSERT INTO market_regime (timestamp, regime, btc_24h, btc_7d, fear_greed)
-    VALUES (?, ?, ?, ?, ?)""", (
-        _utcnow_str(), regime,
-        _sanitize_float(btc_24h, None) if btc_24h is not None else None,
-        _sanitize_float(btc_7d, None) if btc_7d is not None else None,
-        int(fear_greed) if fear_greed is not None else None,
-    ))
-    conn.commit()
+    try:
+        conn.execute("""
+        INSERT INTO market_regime (timestamp, regime, btc_24h, btc_7d, fear_greed)
+        VALUES (?, ?, ?, ?, ?)""", (
+            _utcnow_str(), validated_regime,
+            _sanitize_float(btc_24h, None) if btc_24h is not None else None,
+            _sanitize_float(btc_7d, None) if btc_7d is not None else None,
+            _optional_fear_greed_db(fear_greed),
+        ))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def cleanup_old_market_regime(days: int = 7) -> None:
+    if isinstance(days, bool) or not isinstance(days, int):
+        raise ValueError("days must be an integer")
+    if not 1 <= days <= 3_650:
+        raise ValueError("days must be between 1 and 3650")
     cutoff = (_utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     conn = get_connection()
-    conn.execute("DELETE FROM market_regime WHERE timestamp < ?", (cutoff,))
-    conn.commit()
+    try:
+        conn.execute("DELETE FROM market_regime WHERE timestamp < ?", (cutoff,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 #  Learning log 
 
+def _optional_learning_value_db(value) -> str | None:
+    if value is None:
+        return None
+    return _param_value_text_db(value)
+
+
 def log_learning(bot_name, action, param_name=None, old_value=None,
                  new_value=None, reason="", trades_analyzed=0) -> None:
+    validated_bot = _canonical_or_sim_bot_name_db(bot_name)
+    validated_action = _required_text_db(
+        action, "action", max_length=64
+    ).upper()
+    validated_param = (
+        None
+        if param_name is None
+        else _required_text_db(param_name, "param_name", max_length=64)
+    )
+    validated_old = _optional_learning_value_db(old_value)
+    validated_new = _optional_learning_value_db(new_value)
+    validated_reason = _bounded_text_db(
+        reason, "reason", max_length=500, allow_empty=True
+    )
+    if isinstance(trades_analyzed, bool) or not isinstance(
+        trades_analyzed, int
+    ):
+        raise ValueError("trades_analyzed must be an integer")
+    if not 0 <= trades_analyzed <= 2_147_483_647:
+        raise ValueError("trades_analyzed is outside the supported range")
     conn = get_connection()
-    conn.execute("""
-    INSERT INTO learning_log
-        (timestamp, bot_name, action, param_name,
-         old_value, new_value, reason, trades_analyzed)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (
-        _utcnow_str(), bot_name, action, param_name,
-        str(old_value) if old_value is not None else None,
-        str(new_value) if new_value is not None else None,
-        reason, trades_analyzed,
-    ))
-    conn.commit()
+    try:
+        conn.execute("""
+        INSERT INTO learning_log
+            (timestamp, bot_name, action, param_name,
+             old_value, new_value, reason, trades_analyzed)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (
+            _utcnow_str(), validated_bot, validated_action, validated_param,
+            validated_old, validated_new, validated_reason, trades_analyzed,
+        ))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 #  Win-rates 
+
+def _validated_metric_bot_db(bot_name) -> str:
+    normalized = _canonical_or_sim_bot_name_db(bot_name)
+    if normalized.endswith(_SIM_TAG):
+        return normalized
+    return _metric_bot(normalized)
+
+
+def _validated_history_direction_db(direction) -> str | None:
+    if direction is None:
+        return None
+    normalized = _required_text_db(
+        direction, "direction", max_length=5
+    ).upper()
+    if normalized not in {"LONG", "SHORT"}:
+        raise ValueError(f"unknown direction: {normalized}")
+    return normalized
+
 
 def get_symbol_winrates(bot_name: str, symbols: list, days: int = 30,
                           direction: str = None) -> dict:
@@ -1765,43 +2377,61 @@ def get_symbol_winrates(bot_name: str, symbols: list, days: int = 30,
         no-op for them (the SPOT trades are included). They can also
         leave direction=None  same result.
     """
-    if not symbols:
+    validated_bot = _validated_metric_bot_db(bot_name)
+    if not isinstance(symbols, (list, tuple)):
+        raise ValueError("symbols must be a list or tuple")
+    if len(symbols) > 1_000:
+        raise ValueError("symbols exceeds 1000 items")
+    validated_symbols = [
+        _required_text_db(symbol, "symbol", max_length=64)
+        for symbol in symbols
+    ]
+    if isinstance(days, bool) or not isinstance(days, int):
+        raise ValueError("days must be an integer")
+    if not 1 <= days <= 3_650:
+        raise ValueError("days must be between 1 and 3650")
+    validated_direction = _validated_history_direction_db(direction)
+    if not validated_symbols:
         return {}
-    bot_name = _metric_bot(bot_name)
-    conn = get_connection()
+
+    base_map = {
+        symbol: symbol.split("/")[0].split(":")[0].strip().upper()
+        for symbol in validated_symbols
+    }
+    if any(not base for base in base_map.values()):
+        raise ValueError("symbol must contain a base asset")
+    result = {symbol: 0.5 for symbol in validated_symbols}
     cutoff = (_utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
-    result = {}
+    bases = sorted(set(base_map.values()))
+    placeholders = ",".join("?" for _ in bases)
+
+    dir_sql = ""
+    if validated_direction == "LONG":
+        dir_sql = " AND position_type IN ('SPOT', 'LONG')"
+    elif validated_direction == "SHORT":
+        dir_sql = " AND position_type = 'SHORT'"
+
     try:
-        base_map = {sym: sym.split("/")[0].split(":")[0].upper() for sym in symbols}
-        bases = list(set(base_map.values()))
-        placeholders = ",".join("?" * len(bases))
-
-        # Build the optional direction filter
-        dir_sql = ""
-        dir_params: tuple = ()
-        if direction == "LONG":
-            dir_sql = " AND position_type IN ('SPOT', 'LONG')"
-        elif direction == "SHORT":
-            dir_sql = " AND position_type = 'SHORT'"
-        # direction is None or unrecognised  no extra filter
-
-        rows = conn.execute(f"""
+        rows = get_connection().execute(f"""
         SELECT symbol, is_win FROM trades
         WHERE bot_name=? AND symbol IN ({placeholders})
           AND DATE(sell_time) >= ? AND is_partial=0{dir_sql}""",
-            (bot_name, *bases, cutoff, *dir_params)).fetchall()
+            (validated_bot, *bases, cutoff)).fetchall()
         counts = {}
         for r in rows:
-            b = r["symbol"]
+            b = str(r["symbol"]).upper()
+            is_win = r["is_win"]
+            if is_win not in (0, 1):
+                return result
             if b not in counts:
                 counts[b] = [0, 0]
             counts[b][0] += 1
-            counts[b][1] += int(r["is_win"])
+            counts[b][1] += int(is_win)
         for sym, base in base_map.items():
             total, wins = counts.get(base, [0, 0])
             result[sym] = (wins / total) if total >= 3 else 0.5
     except Exception:
-        pass
+        return result
     return result
 
 
@@ -1818,38 +2448,74 @@ def get_historical_winrate_for_setup(bot_name: str, rsi_1h_bucket: int,
         so a SHORT setup is evaluated against past SHORT history only.
         Default None = backwards-compatible (all directions counted).
     """
-    conn = get_connection()
-    rsi_ranges = [(0,40), (40,55), (55,70), (70,85), (85,200)]
-    chg_ranges = [(0,3), (3,8), (8,15), (15,25), (25,1000)]
-    rsi_lo, rsi_hi = rsi_ranges[max(0, min(4, rsi_1h_bucket))]
-    chg_lo, chg_hi = chg_ranges[max(0, min(4, change_pct_bucket))]
-    is_fut_filter = "1" if bot_name == "FUTURES" else "0"
-    bot_name = _metric_bot(bot_name)
+    validated_bot = _validated_metric_bot_db(bot_name)
+    for value, field_name in (
+        (rsi_1h_bucket, "rsi_1h_bucket"),
+        (change_pct_bucket, "change_pct_bucket"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field_name} must be an integer")
+        if not 0 <= value <= 4:
+            raise ValueError(f"{field_name} must be between 0 and 4")
+    if isinstance(min_sample, bool) or not isinstance(min_sample, int):
+        raise ValueError("min_sample must be an integer")
+    if not 1 <= min_sample <= 10_000:
+        raise ValueError("min_sample must be between 1 and 10000")
+    validated_direction = _validated_history_direction_db(direction)
 
-    # Direction filter (optional)
+    rsi_ranges = [(0, 40), (40, 55), (55, 70), (70, 85), (85, 200)]
+    chg_ranges = [(0, 3), (3, 8), (8, 15), (15, 25), (25, 1000)]
+    rsi_lo, rsi_hi = rsi_ranges[rsi_1h_bucket]
+    chg_lo, chg_hi = chg_ranges[change_pct_bucket]
+    base_bot = (
+        validated_bot[:-len(_SIM_TAG)]
+        if validated_bot.endswith(_SIM_TAG)
+        else validated_bot
+    )
+    is_fut_filter = int(base_bot in {"FUTURES", "FUTREND", "CROSS"})
+
     dir_sql = ""
-    if direction == "LONG":
+    if validated_direction == "LONG":
         dir_sql = " AND position_type IN ('SPOT', 'LONG')"
-    elif direction == "SHORT":
+    elif validated_direction == "SHORT":
         dir_sql = " AND position_type = 'SHORT'"
 
-    cur = conn.execute(f"""
-    SELECT COUNT(*) AS n,
-           AVG(CASE WHEN profit_pct >= 0 THEN 1.0 ELSE 0.0 END) AS wr,
-           AVG(profit_pct) AS avg_pnl
-    FROM trades
-    WHERE bot_name=? AND COALESCE(is_futures, 0)=?
-      AND COALESCE(is_partial, 0)=0
-      AND rsi_1h >= ? AND rsi_1h < ?
-      AND change_pct >= ? AND change_pct < ?{dir_sql}""",
-        (bot_name, int(is_fut_filter), rsi_lo, rsi_hi, chg_lo, chg_hi))
-    row = cur.fetchone()
-    n = int(row["n"] or 0)
+    neutral = {"winrate": None, "avg_pnl": 0.0, "trade_count": 0}
+    try:
+        row = get_connection().execute(f"""
+        SELECT COUNT(*) AS n,
+               AVG(CASE WHEN profit_pct >= 0 THEN 1.0 ELSE 0.0 END) AS wr,
+               AVG(profit_pct) AS avg_pnl
+        FROM trades
+        WHERE bot_name=? AND COALESCE(is_futures, 0)=?
+          AND COALESCE(is_partial, 0)=0
+          AND rsi_1h >= ? AND rsi_1h < ?
+          AND change_pct >= ? AND change_pct < ?{dir_sql}""",
+            (validated_bot, is_fut_filter, rsi_lo, rsi_hi, chg_lo, chg_hi)
+        ).fetchone()
+    except Exception:
+        return neutral
+    if row is None or isinstance(row["n"], bool) or not isinstance(row["n"], int):
+        return neutral
+    n = row["n"]
+    if n < 0:
+        return neutral
     if n < min_sample:
         return {"winrate": None, "avg_pnl": 0.0, "trade_count": n}
+    try:
+        winrate = float(row["wr"])
+        avg_pnl = float(row["avg_pnl"])
+    except (TypeError, ValueError, OverflowError):
+        return neutral
+    if not (
+        math.isfinite(winrate)
+        and 0.0 <= winrate <= 1.0
+        and math.isfinite(avg_pnl)
+    ):
+        return neutral
     return {
-        "winrate":     float(row["wr"] or 0.0),
-        "avg_pnl":     float(row["avg_pnl"] or 0.0),
+        "winrate": winrate,
+        "avg_pnl": avg_pnl,
         "trade_count": n,
     }
 
@@ -1857,20 +2523,29 @@ def get_historical_winrate_for_setup(bot_name: str, rsi_1h_bucket: int,
 #  F&G cache 
 
 def get_cached_fear_greed(max_age_sec: int = 290) -> Optional[int]:
-    conn = get_connection()
-    row = conn.execute("""
-    SELECT fear_greed, timestamp FROM market_regime
-    WHERE fear_greed IS NOT NULL
-    ORDER BY timestamp DESC LIMIT 1""").fetchone()
+    if isinstance(max_age_sec, bool) or not isinstance(max_age_sec, int):
+        raise ValueError("max_age_sec must be an integer")
+    if not 1 <= max_age_sec <= 7 * 24 * 3600:
+        raise ValueError("max_age_sec must be between 1 and 604800")
+    try:
+        row = get_connection().execute("""
+        SELECT fear_greed, timestamp FROM market_regime
+        WHERE fear_greed IS NOT NULL
+        ORDER BY timestamp DESC LIMIT 1""").fetchone()
+    except Exception:
+        return None
     if not row:
         return None
     try:
         ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S")
         age = (_utcnow() - ts).total_seconds()
-        if age > max_age_sec:
+        value = row["fear_greed"]
+        if age < 0 or age > max_age_sec:
             return None
-        return int(row["fear_greed"])
-    except Exception:
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value if 0 <= value <= 100 else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -1881,13 +2556,19 @@ def set_fear_greed_cache(value: int) -> None:
 #  Heatmap 
 
 def get_winloss_heatmap(bot_name: str = None, days: int = 30) -> dict:
-    bot_name = _metric_bot(bot_name)
+    validated_bot = (
+        None if bot_name is None else _validated_metric_bot_db(bot_name)
+    )
+    if isinstance(days, bool) or not isinstance(days, int):
+        raise ValueError("days must be an integer")
+    if not 1 <= days <= 3_650:
+        raise ValueError("days must be between 1 and 3650")
     conn = get_connection()
     bot_filter = ""
     params = []
-    if bot_name:
+    if validated_bot is not None:
         bot_filter = "AND bot_name=?"
-        params.append(bot_name)
+        params.append(validated_bot)
     cutoff = (_utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     params.append(cutoff)
     cur = conn.execute(f"""
@@ -1901,11 +2582,24 @@ def get_winloss_heatmap(bot_name: str = None, days: int = 30) -> dict:
     GROUP BY hour_of_day, day_of_week""", params)
     by_hour, by_dow, by_hour_dow = {}, {}, {}
     for row in cur.fetchall():
-        h = int(row["hour_of_day"] or 0)
-        d = int(row["day_of_week"] or 0)
-        n = int(row["n"])
-        wr = float(row["wr"] or 0.0)
-        avg = float(row["avg_pnl"] or 0.0)
+        h = row["hour_of_day"]
+        d = row["day_of_week"]
+        n = row["n"]
+        if (
+            isinstance(h, bool) or not isinstance(h, int) or not 0 <= h <= 23
+            or isinstance(d, bool) or not isinstance(d, int) or not 0 <= d <= 6
+            or isinstance(n, bool) or not isinstance(n, int) or n <= 0
+        ):
+            raise ValueError("heatmap contains an invalid time bucket")
+        try:
+            wr = float(row["wr"])
+            avg = float(row["avg_pnl"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("heatmap contains invalid aggregates") from exc
+        if not (
+            math.isfinite(wr) and 0.0 <= wr <= 1.0 and math.isfinite(avg)
+        ):
+            raise ValueError("heatmap contains invalid aggregates")
         for store, key in ((by_hour, h), (by_dow, d)):
             if key not in store:
                 store[key] = {"wr_sum": 0.0, "n": 0, "pnl_sum": 0.0}
@@ -1913,26 +2607,41 @@ def get_winloss_heatmap(bot_name: str = None, days: int = 30) -> dict:
             store[key]["n"]       += n
             store[key]["pnl_sum"] += avg * n
         by_hour_dow[(d, h)] = {"wr": wr, "n": n, "avg_pnl": avg}
-    for v in by_hour.values():
-        v["wr"]      = v["wr_sum"]  / v["n"] if v["n"] else 0.0
-        v["avg_pnl"] = v["pnl_sum"] / v["n"] if v["n"] else 0.0
-    for v in by_dow.values():
-        v["wr"]      = v["wr_sum"]  / v["n"] if v["n"] else 0.0
-        v["avg_pnl"] = v["pnl_sum"] / v["n"] if v["n"] else 0.0
-    return {"by_hour": by_hour, "by_dow": by_dow, "by_hour_dow": by_hour_dow}
+    def public_summary(source: dict) -> dict:
+        return {
+            key: {
+                "wr": value["wr_sum"] / value["n"],
+                "n": value["n"],
+                "avg_pnl": value["pnl_sum"] / value["n"],
+            }
+            for key, value in source.items()
+        }
+
+    return {
+        "by_hour": public_summary(by_hour),
+        "by_dow": public_summary(by_dow),
+        "by_hour_dow": by_hour_dow,
+    }
 
 
 #  Advisory locks 
 
 def acquire_advisory_lock(lock_name: str, holder_id: str,
                           ttl_sec: int = 30) -> bool:
+    lock_name, holder_id, validated_ttl = _validated_advisory_lock_db(
+        lock_name, holder_id, ttl_sec, validate_ttl=True
+    )
+    assert validated_ttl is not None
     return _try_advisory_lock(
-        get_connection(), lock_name, holder_id, ttl_sec,
+        get_connection(), lock_name, holder_id, validated_ttl,
         raise_operational=True,
     )
 
 
 def release_advisory_lock(lock_name: str, holder_id: str) -> bool:
+    lock_name, holder_id, _ = _validated_advisory_lock_db(
+        lock_name, holder_id
+    )
     conn = None
     try:
         conn = get_connection()
@@ -1952,14 +2661,21 @@ def release_advisory_lock(lock_name: str, holder_id: str) -> bool:
 
 def release_advisory_locks_for_dead_pid(pid: int, lock_prefix: str = "close:") -> int:
     """Release close advisory locks owned by an already stopped process."""
-    if not pid or pid <= 0:
-        return 0
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        raise ValueError("pid must be an integer")
+    if not 1 <= pid <= 2_147_483_647:
+        raise ValueError("pid is outside the supported range")
+    validated_prefix = _required_text_db(
+        lock_prefix, "lock_prefix", max_length=64
+    )
+    if any(char in validated_prefix for char in ("%", "_", "\\")):
+        raise ValueError("lock_prefix contains SQL pattern characters")
     conn = None
     try:
         conn = get_connection()
         cur = conn.execute(
             "DELETE FROM advisory_locks WHERE lock_name LIKE ? AND holder_id LIKE ?",
-            (f"{lock_prefix}%", f"{int(pid)}-%"),
+            (f"{validated_prefix}%", f"{pid}-%"),
         )
         conn.commit()
         return int(cur.rowcount or 0)
@@ -1976,10 +2692,14 @@ def release_advisory_locks_for_dead_pid(pid: int, lock_prefix: str = "close:") -
 
 def renew_advisory_lock(lock_name: str, holder_id: str,
                         ttl_sec: int = 30) -> bool:
+    lock_name, holder_id, validated_ttl = _validated_advisory_lock_db(
+        lock_name, holder_id, ttl_sec, validate_ttl=True
+    )
+    assert validated_ttl is not None
     try:
         conn = get_connection()
         now = _utcnow()
-        expires_at = (now + timedelta(seconds=ttl_sec)).strftime(
+        expires_at = (now + timedelta(seconds=validated_ttl)).strftime(
             "%Y-%m-%d %H:%M:%S")
         cur = conn.execute(
             "UPDATE advisory_locks SET expires_at=? "
@@ -2005,10 +2725,9 @@ _API_GATE_ERR_LOG_AT   = 0.0
 def _log_api_gate_error(exc) -> None:
     """Surface a non-lock failure of the global rate-limit gate (throttled).
 
-    The gate keeps fail-OPEN on error (it degrades to each bot's own ccxt
-    rate-limit, not to unbounded calls, and a glitch must never block a
-    position CLOSE). But a SILENT fail-open is how a persistently broken gate
-    goes unnoticed until an IP-ban (M-2)  so log it loudly, once a minute."""
+    The database gate fails closed because an uncounted request can breach the
+    cross-process cap. Exit-critical callers own their explicit bypass policy;
+    this lower-level ledger must never silently permit an uncounted call."""
     global _API_GATE_ERR_LOG_AT
     now = _time.time()
     if now - _API_GATE_ERR_LOG_AT < 60.0:
@@ -2016,8 +2735,10 @@ def _log_api_gate_error(exc) -> None:
     _API_GATE_ERR_LOG_AT = now
     try:
         from core.logger import log_event
-        log_event(f"[api-gate] global rate-limit gate error  failing OPEN "
-                  f"(degraded to per-bot ccxt rate-limit): {exc}", "WARN")
+        log_event(
+            f"[api-gate] global rate-limit gate error; request blocked: {exc}",
+            "WARN",
+        )
     except Exception:
         pass
 
@@ -2025,24 +2746,47 @@ def _log_api_gate_error(exc) -> None:
 def check_and_consume_global_api(bot_name: str, endpoint: str = "",
                                  max_per_minute: int = 900,
                                  ok: int = 1) -> bool:
+    from core.constants import API_RATE_HARD_MAX_PER_MINUTE
+
+    validated_bot = _required_text_db(
+        bot_name, "bot_name", max_length=64
+    ).upper()
+    if len(validated_bot) > 64:
+        raise ValueError("bot_name exceeds 64 characters after normalization")
+    validated_endpoint = _bounded_text_db(
+        endpoint, "endpoint", max_length=256, allow_empty=True
+    )
+    if isinstance(max_per_minute, bool) or not isinstance(max_per_minute, int):
+        raise ValueError("max_per_minute must be an integer")
+    if not 1 <= max_per_minute <= API_RATE_HARD_MAX_PER_MINUTE:
+        raise ValueError(
+            f"max_per_minute must be between 1 and "
+            f"{API_RATE_HARD_MAX_PER_MINUTE}"
+        )
+    if isinstance(ok, bool) or not isinstance(ok, int) or ok not in (0, 1):
+        raise ValueError("ok must be 0 or 1")
+
     global _API_PRUNE_COUNTER
     try:
         conn = _tight_connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            cutoff = (_utcnow() - timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S")
+            now = _utcnow()
+            now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+            cutoff = (now - timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S")
             row = conn.execute(
-                "SELECT COUNT(*) FROM api_rate_global WHERE called_at >= ?",
-                (cutoff,)).fetchone()
+                "SELECT COUNT(*) FROM api_rate_global "
+                "WHERE called_at >= ? AND called_at <= ?",
+                (cutoff, now_str),
+            ).fetchone()
             count = row[0] if row else 0
             if count >= max_per_minute:
                 conn.execute("ROLLBACK")
                 return False
-            now_str = _utcnow_str()
             conn.execute(
                 "INSERT INTO api_rate_global "
                 "(called_at, bot_name, endpoint, ok) VALUES (?,?,?,?)",
-                (now_str, bot_name, endpoint, ok))
+                (now_str, validated_bot, validated_endpoint, ok))
             with _API_PRUNE_COUNTER_LCK:
                 _API_PRUNE_COUNTER += 1
                 should_prune = (_API_PRUNE_COUNTER % _API_PRUNE_EVERY_N == 0)
@@ -2051,10 +2795,17 @@ def check_and_consume_global_api(bot_name: str, endpoint: str = "",
                 # in risk_manager.check_kill_switches, so the window doesn't slide
                 # closed while a query is computing. (A separate background
                 # _gc_api_rate_global() also prunes with a 1h cutoff.)
-                prune_cut = (_utcnow() - timedelta(minutes=65)).strftime("%Y-%m-%d %H:%M:%S")
+                prune_cut = (now - timedelta(minutes=65)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                latest_plausible = (now + timedelta(minutes=5)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
                 conn.execute(
-                    "DELETE FROM api_rate_global WHERE called_at < ?",
-                    (prune_cut,))
+                    "DELETE FROM api_rate_global "
+                    "WHERE called_at < ? OR called_at > ?",
+                    (prune_cut, latest_plausible),
+                )
             conn.commit()
             return True
         except sqlite3.OperationalError:
@@ -2099,38 +2850,85 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
     guarded under BEGIN IMMEDIATE so resync/direct mirror writes cannot race
     another bot's claim check.
     """
-    conn = get_connection()
+    if not isinstance(bot_name, str) or not bot_name.strip():
+        return False
+    normalized_bot = bot_name.strip()
+    if "/" in normalized_bot or ":" in normalized_bot:
+        return False
+    if not isinstance(symbol, str) or not symbol.strip():
+        return False
+    normalized_symbol = symbol.strip()
+    if not _base_symbol(normalized_symbol):
+        return False
+    if not isinstance(position_type, str):
+        return False
+    normalized_position_type = position_type.strip().upper()
+    if normalized_position_type not in {"SPOT", "FUTURES", "LONG", "SHORT"}:
+        return False
+    if not isinstance(state, str):
+        return False
+    state_norm = state.strip().upper()
+    if state_norm not in {"OPEN", "CLOSED", "FLAT"}:
+        return False
+    if not isinstance(buy_time, str):
+        return False
+    if extra is not None and not isinstance(extra, dict):
+        return False
+
+    safe_buy = _optional_finite_db(buy_price)
+    safe_amount = _optional_finite_db(amount)
+    safe_invested = _optional_finite_db(invested_usdt)
+    safe_leverage = _optional_finite_db(leverage)
+    if None in (safe_buy, safe_amount, safe_invested, safe_leverage):
+        return False
+    if safe_leverage <= 0.0:
+        return False
+    if state_norm == "OPEN" and (safe_buy <= 0.0 or safe_amount <= 0.0):
+        return False
+
+    safe_metrics = tuple(
+        _optional_signed_finite_db(value)
+        for value in (rsi_15m, rsi_1h, rsi_4h, change_pct, btc_trend)
+    ) + (_optional_fear_greed_db(fear_greed),)
     try:
-        state_norm = str(state or "OPEN").upper()
-        safe_buy = _sanitize_float(buy_price)
-        safe_amount = _sanitize_float(amount)
-        safe_invested = _sanitize_float(invested_usdt)
-        safe_leverage = _sanitize_float(leverage, 1.0)
+        extra_json = json.dumps(extra or {}, allow_nan=False)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+    conn = None
+    try:
+        conn = get_connection()
         opened_at = _utcnow_str()
 
         conn.execute("BEGIN IMMEDIATE")
         if state_norm not in {"CLOSED", "FLAT"}:
-            base = _base_symbol(symbol)
+            base = _base_symbol(normalized_symbol)
             class_clause = (
                 "position_type != 'SPOT'"
-                if _is_futures_ptype(position_type)
+                if _is_futures_ptype(normalized_position_type)
                 else "position_type = 'SPOT'"
             )
             conflict = conn.execute(
                 f"""SELECT bot_name FROM bot_open_positions
                     WHERE bot_name != ?
-                      AND (symbol = ? OR symbol LIKE ? OR symbol LIKE ?)
+                      AND (symbol = ?
+                           OR symbol LIKE ? ESCAPE '!'
+                           OR symbol LIKE ? ESCAPE '!')
                       AND {class_clause}
                     LIMIT 1""",
-                (bot_name, base, f"{base}/%", f"{base}:%"),
+                (normalized_bot, *_literal_symbol_match_params(base)),
             ).fetchone()
             if conflict is not None:
                 from core.logger import log_event, log_struct
                 log_event(
-                    f"[DB] upsert_open_position blocked: {symbol} "
+                    f"[DB] upsert_open_position blocked: {normalized_symbol} "
                     f"already owned by another bot", "WARN")
-                log_struct("db_upsert_position_blocked", bot_name=bot_name,
-                           symbol=symbol, position_type=position_type)
+                log_struct(
+                    "db_upsert_position_blocked",
+                    bot_name=normalized_bot,
+                    symbol=normalized_symbol,
+                    position_type=normalized_position_type,
+                )
                 conn.execute("ROLLBACK")
                 return False
         conn.execute("""
@@ -2161,11 +2959,10 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
             extra_json    = excluded.extra_json
             -- Keep opened_at stable.
             """, (
-            bot_name, symbol, safe_buy, buy_time,
+            normalized_bot, normalized_symbol, safe_buy, buy_time,
             safe_amount, safe_invested,
-            position_type, safe_leverage, state,
-            rsi_15m, rsi_1h, rsi_4h, change_pct, btc_trend, fear_greed,
-            json.dumps(extra or {}, allow_nan=False, default=str), opened_at,
+            normalized_position_type, safe_leverage, state_norm,
+            *safe_metrics, extra_json, opened_at,
         ))
         conn.commit()
         return True
@@ -2177,14 +2974,18 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
         # write makes them diverge from reality. Log loudly + roll back.
         try:
             from core.logger import log_event, log_struct
-            log_event(f"[DB] upsert_open_position FAILED for {symbol}: {e} "
+            log_event(f"[DB] upsert_open_position FAILED for {normalized_symbol}: {e} "
                       f"(SQLite mirror now divergent from JSON truth)", "WARN")
-            log_struct("db_upsert_position_error", bot_name=bot_name,
-                       symbol=symbol, error=str(e))
+            log_struct("db_upsert_position_error", bot_name=normalized_bot,
+                       symbol=normalized_symbol, error=str(e))
         except Exception:
-            print(f"[DB] upsert_open_position {symbol}: {e}", flush=True)
+            print(
+                f"[DB] upsert_open_position {normalized_symbol}: {e}",
+                flush=True,
+            )
         try:
-            conn.rollback()
+            if conn is not None:
+                conn.rollback()
         except Exception:
             pass
         return False
@@ -2199,14 +3000,18 @@ def remove_open_position(bot_name: str, symbol: str) -> bool:
         conn.execute(
             """DELETE FROM bot_open_positions
                WHERE bot_name=?
-                 AND (symbol = ? OR symbol LIKE ? OR symbol LIKE ?)""",
-            (bot_name, base, f"{base}/%", f"{base}:%"))
+                 AND (symbol = ?
+                      OR symbol LIKE ? ESCAPE '!'
+                      OR symbol LIKE ? ESCAPE '!')""",
+            (bot_name, *_literal_symbol_match_params(base)))
         remaining = conn.execute(
             """SELECT 1 FROM bot_open_positions
                WHERE bot_name=?
-                 AND (symbol = ? OR symbol LIKE ? OR symbol LIKE ?)
+                 AND (symbol = ?
+                      OR symbol LIKE ? ESCAPE '!'
+                      OR symbol LIKE ? ESCAPE '!')
                LIMIT 1""",
-            (bot_name, base, f"{base}/%", f"{base}:%")).fetchone()
+            (bot_name, *_literal_symbol_match_params(base))).fetchone()
         conn.commit()
         return remaining is None
     except Exception as e:
@@ -2259,6 +3064,12 @@ def get_open_positions_db(bot_name: str) -> list:
 def _base_symbol(symbol: str) -> str:
     """Normalize any symbol form to its base coin: 'SOL/USDT:USDT' -> 'SOL'."""
     return str(symbol or "").split("/")[0].split(":")[0].strip().upper()
+
+
+def _literal_symbol_match_params(base: str) -> tuple[str, str, str]:
+    """Build LIKE patterns without treating exchange symbol text as wildcards."""
+    escaped = base.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+    return base, f"{escaped}/%", f"{escaped}:%"
 
 
 def _is_futures_ptype(position_type) -> bool:
@@ -2352,6 +3163,33 @@ def try_claim_orphan(bot_name: str, symbol: str, position_type: str = "FUTURES")
 def _try_claim(bot_name, symbol, position_type, claim_state,
                allow_existing_owner: bool = False, *, intent_id: str | None = None,
                notional_usdt: float = 0.0, reservation_mode: str = "LIVE") -> bool:
+    if not isinstance(bot_name, str) or not bot_name.strip():
+        return False
+    if not isinstance(symbol, str) or not symbol.strip():
+        return False
+    if not isinstance(position_type, str):
+        return False
+    normalized_position_type = position_type.strip().upper()
+    if normalized_position_type not in {"SPOT", "FUTURES", "LONG", "SHORT"}:
+        return False
+    bot_name = bot_name.strip()
+    symbol = symbol.strip()
+    validated_intent_id = None
+    reserved = 0.0
+    normalized_reservation_mode = "LIVE"
+    if intent_id is not None:
+        if not isinstance(intent_id, str) or not intent_id.strip():
+            return False
+        validated_intent_id = intent_id.strip()
+        reserved_value = _optional_finite_db(notional_usdt)
+        if reserved_value is None or reserved_value <= 0.0:
+            return False
+        if not isinstance(reservation_mode, str):
+            return False
+        normalized_reservation_mode = reservation_mode.strip().upper()
+        if normalized_reservation_mode != "LIVE":
+            return False
+        reserved = reserved_value
     # Swap-guard: a real bot_name is never a market symbol. A market-shaped
     # bot_name means the caller swapped (bot_name, symbol)  refuse so we never
     # write a junk row that blocks coins (the swapped row's symbol would be the
@@ -2369,11 +3207,11 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
         return False
     # Only conflict with same-class claims  spot and futures use separate
     # wallets, so a spot claim must not block a futures claim of the same base.
-    class_clause = ("position_type != 'SPOT'" if _is_futures_ptype(position_type)
+    class_clause = ("position_type != 'SPOT'" if _is_futures_ptype(normalized_position_type)
                     else "position_type = 'SPOT'")
     try:
         conn = get_connection()
-        if intent_id:
+        if validated_intent_id is not None:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS portfolio_reservations (
                     reservation_id TEXT PRIMARY KEY,
@@ -2389,9 +3227,11 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
         if allow_existing_owner:
             rows = conn.execute(
                 f"""SELECT bot_name FROM bot_open_positions
-                    WHERE (symbol = ? OR symbol LIKE ? OR symbol LIKE ?)
+                    WHERE (symbol = ?
+                           OR symbol LIKE ? ESCAPE '!'
+                           OR symbol LIKE ? ESCAPE '!')
                       AND {class_clause}""",
-                (base, f"{base}/%", f"{base}:%")).fetchall()
+                _literal_symbol_match_params(base)).fetchall()
             owners = {dict(r).get("bot_name") for r in rows}
             if owners:
                 if owners == {bot_name}:
@@ -2400,9 +3240,11 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
                               SET state=?, opened_at=?
                             WHERE bot_name=?
                               AND (state IN ('CLAIMING','ADOPTING') OR amount <= 0)
-                              AND (symbol = ? OR symbol LIKE ? OR symbol LIKE ?)""",
+                              AND (symbol = ?
+                                   OR symbol LIKE ? ESCAPE '!'
+                                   OR symbol LIKE ? ESCAPE '!')""",
                         (claim_state, now_str, bot_name,
-                         base, f"{base}/%", f"{base}:%"))
+                         *_literal_symbol_match_params(base)))
                     conn.commit()
                     return True
                 conn.rollback()
@@ -2414,18 +3256,13 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
                SELECT ?, ?, 0, '', 0, 0, ?, 1, ?, ?
                WHERE NOT EXISTS (
                    SELECT 1 FROM bot_open_positions
-                   WHERE (symbol = ? OR symbol LIKE ? OR symbol LIKE ?)
+                   WHERE (symbol = ?
+                          OR symbol LIKE ? ESCAPE '!'
+                          OR symbol LIKE ? ESCAPE '!')
                      AND {class_clause})""",
-            (bot_name, base, position_type, claim_state, now_str,
-             base, f"{base}/%", f"{base}:%"))
-        if cur.rowcount > 0 and intent_id:
-            try:
-                reserved = float(notional_usdt)
-            except (TypeError, ValueError):
-                reserved = 0.0
-            if not math.isfinite(reserved) or reserved <= 0.0:
-                conn.rollback()
-                return False
+            (bot_name, base, normalized_position_type, claim_state, now_str,
+             *_literal_symbol_match_params(base)))
+        if cur.rowcount > 0 and validated_intent_id is not None:
             expires = (_utcnow() + timedelta(seconds=120)).strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
@@ -2435,8 +3272,9 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
                     notional_usdt, mode, status, created_at, expires_at)
                    VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)""",
                 (
-                    f"res:{intent_id}", intent_id, bot_name, base, reserved,
-                    str(reservation_mode).upper(), now_str, expires,
+                    f"res:{validated_intent_id}", validated_intent_id,
+                    bot_name, base, reserved, normalized_reservation_mode,
+                    now_str, expires,
                 ),
             )
         conn.commit()
@@ -2468,6 +3306,8 @@ def claim_symbol_for_entry(bot_name: str, symbol: str,
     live benefit. Run SIM bots on disjoint coin sets if exact SIM accounting of
     a contested coin matters.
     """
+    if not isinstance(mode, str) or mode.strip().upper() != "LIVE":
+        return False
     return _try_claim(
         bot_name,
         symbol,
@@ -2480,17 +3320,29 @@ def claim_symbol_for_entry(bot_name: str, symbol: str,
 
 
 def release_portfolio_reservation(intent_id: str, status: str = "RELEASED") -> None:
+    validated_intent_id = _order_id_text_db(intent_id)
+    if validated_intent_id is None:
+        raise ValueError("portfolio reservation intent id is required")
+    if not isinstance(status, str):
+        raise ValueError("portfolio reservation status is invalid")
+    normalized_status = status.strip().upper()
+    if normalized_status not in {"RELEASED", "CONSUMED"}:
+        raise ValueError("portfolio reservation status must be RELEASED or CONSUMED")
     conn = get_connection()
     try:
         conn.execute(
             """UPDATE portfolio_reservations SET status=?
                  WHERE intent_id=? AND status='ACTIVE'""",
-            (str(status).upper(), intent_id),
+            (normalized_status, validated_intent_id),
         )
         conn.commit()
     except sqlite3.OperationalError as exc:
+        conn.rollback()
         if "no such table: portfolio_reservations" not in str(exc).lower():
             raise
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def persist_portfolio_evaluation(
@@ -2503,6 +3355,101 @@ def persist_portfolio_evaluation(
     mode: str,
 ) -> None:
     """Persist snapshot and admission evidence in one transaction."""
+    validated_snapshot_id = _required_text_db(
+        snapshot_id, "snapshot_id", max_length=64
+    )
+    validated_intent_id = _required_text_db(
+        intent_id, "intent_id", max_length=64
+    )
+    validated_bot = _required_text_db(
+        bot_name, "bot_name", max_length=32
+    ).upper()
+    if validated_bot not in _CANONICAL_BOTS:
+        raise ValueError("bot_name is unknown")
+    validated_mode = _required_text_db(mode, "mode", max_length=8).lower()
+    if validated_mode not in {"disabled", "shadow", "enforce"}:
+        raise ValueError("portfolio mode is unknown")
+
+    if not isinstance(snapshot.known, bool):
+        raise ValueError("snapshot known flag must be boolean")
+    equity = _required_finite_float_db(
+        snapshot.equity_usdt, "snapshot equity", minimum=0.0
+    )
+    free = _required_finite_float_db(
+        snapshot.free_usdt, "snapshot free equity", minimum=0.0
+    )
+    if snapshot.known and equity <= 0.0:
+        raise ValueError("known snapshot equity must be positive")
+    if free > equity * (1.0 + 1e-9):
+        raise ValueError("snapshot free equity exceeds total equity")
+    if not isinstance(snapshot.asof, datetime):
+        raise ValueError("snapshot timestamp must be a datetime")
+    measured_at = snapshot.asof
+    if measured_at.tzinfo is None:
+        measured_at = measured_at.replace(tzinfo=timezone.utc)
+    else:
+        measured_at = measured_at.astimezone(timezone.utc)
+    measured_at_text = measured_at.strftime("%Y-%m-%d %H:%M:%S")
+    snapshot_reason = _bounded_text_db(
+        snapshot.reason, "snapshot reason", max_length=500, allow_empty=True
+    )
+
+    try:
+        raw_positions = tuple(snapshot.positions)
+    except TypeError as exc:
+        raise ValueError("snapshot positions must be iterable") from exc
+    position_rows = []
+    for position in raw_positions:
+        symbol = _required_text_db(
+            position.symbol, "position symbol", max_length=64
+        )
+        side = _required_text_db(
+            position.side, "position side", max_length=8
+        ).upper()
+        if side not in {"LONG", "SHORT"}:
+            raise ValueError("position side is unknown")
+        notional = _required_finite_float_db(
+            position.notional_usdt, "position notional", minimum=0.0
+        )
+        if notional <= 0.0:
+            raise ValueError("position notional must be positive")
+        cluster = _required_text_db(
+            position.cluster, "position cluster", max_length=64
+        )
+        beta = _required_finite_float_db(position.beta, "position beta")
+        position_rows.append(
+            (validated_snapshot_id, symbol, side, notional, cluster, beta)
+        )
+
+    if not isinstance(decision.allowed, bool):
+        raise ValueError("decision allowed flag must be boolean")
+    if not isinstance(decision.shadow_allowed, bool):
+        raise ValueError("decision shadow flag must be boolean")
+    try:
+        raw_reasons = tuple(decision.reasons)
+    except TypeError as exc:
+        raise ValueError("decision reasons must be iterable") from exc
+    if isinstance(decision.reasons, (str, bytes)):
+        raise ValueError("decision reasons must be a sequence of text values")
+    reasons = tuple(
+        _required_text_db(reason, "decision reason", max_length=256)
+        for reason in raw_reasons
+    )
+    requested = _required_finite_float_db(
+        decision.requested_notional, "requested notional", minimum=0.0
+    )
+    approved = _required_finite_float_db(
+        decision.approved_notional, "approved notional", minimum=0.0
+    )
+    if approved > requested * (1.0 + 1e-9):
+        raise ValueError("approved notional exceeds requested notional")
+    if not decision.allowed and approved > 0.0:
+        raise ValueError("blocked decision cannot approve notional")
+    if validated_mode == "enforce" and decision.allowed != decision.shadow_allowed:
+        raise ValueError("enforced decision conflicts with shadow decision")
+    if validated_mode != "enforce" and not decision.allowed:
+        raise ValueError("non-enforced decision must remain allowed")
+
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -2511,27 +3458,20 @@ def persist_portfolio_evaluation(
                (snapshot_id, measured_at, equity_usdt, free_usdt, known, reason)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (
-                snapshot_id,
-                snapshot.asof.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                float(snapshot.equity_usdt),
-                float(snapshot.free_usdt),
-                int(bool(snapshot.known)),
-                str(snapshot.reason or "")[:500],
+                validated_snapshot_id,
+                measured_at_text,
+                equity,
+                free,
+                int(snapshot.known),
+                snapshot_reason,
             ),
         )
-        for position in snapshot.positions:
+        for position_row in position_rows:
             conn.execute(
                 """INSERT INTO portfolio_snapshot_positions
                    (snapshot_id, symbol, side, notional_usdt, cluster_name, beta)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    snapshot_id,
-                    position.symbol,
-                    position.side,
-                    float(position.notional_usdt),
-                    position.cluster,
-                    float(position.beta),
-                ),
+                position_row,
             )
         conn.execute(
             """INSERT INTO portfolio_decisions
@@ -2539,15 +3479,15 @@ def persist_portfolio_evaluation(
                 shadow_allowed, reasons_json, requested_usdt, approved_usdt)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                intent_id,
-                snapshot_id,
+                validated_intent_id,
+                validated_snapshot_id,
                 _utcnow_str(),
-                str(mode),
-                int(bool(decision.allowed)),
-                int(bool(decision.shadow_allowed)),
-                json.dumps(list(decision.reasons), allow_nan=False),
-                float(decision.requested_notional),
-                float(decision.approved_notional),
+                validated_mode,
+                int(decision.allowed),
+                int(decision.shadow_allowed),
+                json.dumps(list(reasons), allow_nan=False),
+                requested,
+                approved,
             ),
         )
         conn.commit()
@@ -2572,6 +3512,25 @@ _ORDER_INTENT_TRANSITIONS = {
 }
 
 
+def _optional_order_reference_db(
+    value,
+    field_name: str,
+    *,
+    max_length: int,
+) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError(f"{field_name} must be text or an integer")
+    return _required_text_db(str(value), field_name, max_length=max_length)
+
+
+def _optional_nonnegative_finite_db(value, field_name: str) -> float | None:
+    if value is None:
+        return None
+    return _required_finite_float_db(value, field_name, minimum=0.0)
+
+
 def create_order_intent(
     intent_id: str,
     *,
@@ -2584,31 +3543,72 @@ def create_order_intent(
     client_order_id: str,
 ) -> None:
     """Persist PREPARED before any exchange order is submitted."""
-    if not intent_id or not client_order_id:
-        raise ValueError("intent_id and client_order_id are required")
-    amount = _sanitize_float(target_amount, -1.0)
-    if amount <= 0.0:
-        raise ValueError("target_amount must be positive")
-    normalized_mode = str(mode).strip().upper()
+    validated_intent_id = _required_text_db(
+        intent_id, "intent_id", max_length=64
+    )
+    validated_bot = _required_text_db(
+        bot_name, "bot_name", max_length=32
+    ).upper()
+    if validated_bot not in _CANONICAL_BOTS:
+        raise ValueError("order intent bot_name is unknown")
+    normalized_mode = _required_text_db(
+        mode, "mode", max_length=8
+    ).upper()
     if normalized_mode not in {"LIVE", "SIM"}:
         raise ValueError("order intent mode must be LIVE or SIM")
+    validated_symbol = _required_text_db(symbol, "symbol", max_length=64)
+    validated_direction = _required_text_db(
+        direction, "direction", max_length=5
+    ).upper()
+    if validated_direction not in {"LONG", "SHORT"}:
+        raise ValueError("order intent direction must be LONG or SHORT")
+    amount = _required_finite_float_db(target_amount, "target_amount")
+    if amount <= 0.0:
+        raise ValueError("target_amount must be positive")
+    if target_price is None:
+        normalized_target_price = None
+    else:
+        normalized_target_price = _required_finite_float_db(
+            target_price, "target_price"
+        )
+        if normalized_target_price <= 0.0:
+            raise ValueError("target_price must be positive when provided")
+    validated_client_order_id = _required_text_db(
+        client_order_id, "client_order_id", max_length=32
+    )
     now = _utcnow_str()
     conn = get_connection()
 
     def _insert() -> None:
-        conn.execute(
-            """INSERT INTO order_intents
-               (intent_id, bot_name, mode, symbol, direction, target_amount,
-                 target_price, client_order_id, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?)""",
-            (
-                str(intent_id), str(bot_name), normalized_mode,
-                str(symbol), str(direction).upper(),
-                amount, _sanitize_float(target_price, 0.0), str(client_order_id),
-                now, now,
-            ),
-        )
-        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            collision = conn.execute(
+                """SELECT 1 FROM order_intents
+                     WHERE client_order_id=? OR fallback_client_order_id=?
+                     LIMIT 1""",
+                (validated_client_order_id, validated_client_order_id),
+            ).fetchone()
+            if collision is not None:
+                raise ValueError(
+                    "order intent or client order id already exists"
+                )
+            conn.execute(
+                """INSERT INTO order_intents
+                   (intent_id, bot_name, mode, symbol, direction, target_amount,
+                     target_price, client_order_id, fallback_client_order_id,
+                     status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'PREPARED', ?, ?)""",
+                (
+                    validated_intent_id, validated_bot, normalized_mode,
+                    validated_symbol, validated_direction,
+                    amount, normalized_target_price, validated_client_order_id,
+                    now, now,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     try:
         _insert()
     except sqlite3.OperationalError as exc:
@@ -2618,7 +3618,11 @@ def create_order_intent(
         error_text = str(exc).lower()
         missing_table = "no such table: order_intents" in error_text
         missing_mode = "no column named mode" in error_text
-        if not missing_table and not missing_mode:
+        missing_fallback = (
+            "no column named fallback_client_order_id" in error_text
+            or "no such column: fallback_client_order_id" in error_text
+        )
+        if not missing_table and not missing_mode and not missing_fallback:
             raise
         conn.rollback()
         if missing_table:
@@ -2629,6 +3633,7 @@ def create_order_intent(
                     symbol TEXT NOT NULL, direction TEXT NOT NULL,
                     target_amount REAL NOT NULL, target_price REAL,
                     client_order_id TEXT NOT NULL UNIQUE,
+                    fallback_client_order_id TEXT,
                     exchange_order_id TEXT, status TEXT NOT NULL,
                     filled_amount REAL NOT NULL DEFAULT 0,
                     filled_notional REAL NOT NULL DEFAULT 0,
@@ -2636,12 +3641,33 @@ def create_order_intent(
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 )""")
         else:
-            conn.execute(
-                "ALTER TABLE order_intents "
-                "ADD COLUMN mode TEXT NOT NULL DEFAULT 'UNKNOWN'"
-            )
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(order_intents)")
+            }
+            if "mode" not in columns:
+                conn.execute(
+                    "ALTER TABLE order_intents "
+                    "ADD COLUMN mode TEXT NOT NULL DEFAULT 'UNKNOWN'"
+                )
+            if "fallback_client_order_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE order_intents "
+                    "ADD COLUMN fallback_client_order_id TEXT"
+                )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_order_intents_fallback_client_id "
+            "ON order_intents(fallback_client_order_id) "
+            "WHERE fallback_client_order_id IS NOT NULL"
+        )
         conn.commit()
-        _insert()
+        try:
+            _insert()
+        except sqlite3.IntegrityError as duplicate_exc:
+            raise ValueError(
+                "order intent or client order id already exists"
+            ) from duplicate_exc
     except sqlite3.IntegrityError as exc:
         raise ValueError("order intent or client order id already exists") from exc
 
@@ -2655,38 +3681,83 @@ def transition_order_intent(
     filled_notional=None,
     fee_usdt=None,
     error=None,
+    fallback_client_order_id=None,
 ) -> None:
     """Atomically apply one valid order-intent state transition."""
-    target = str(status).upper()
+    validated_intent_id = _required_text_db(
+        intent_id, "intent_id", max_length=64
+    )
+    target = _required_text_db(status, "status", max_length=32).upper()
     if target not in _ORDER_INTENT_TRANSITIONS:
         raise ValueError(f"unknown order intent status: {status!r}")
+    exchange_id = _optional_order_reference_db(
+        exchange_order_id,
+        "exchange_order_id",
+        max_length=128,
+    )
+    if fallback_client_order_id is None:
+        fallback_id = None
+    else:
+        fallback_id = _required_text_db(
+            fallback_client_order_id,
+            "fallback_client_order_id",
+            max_length=32,
+        )
+    if target == "FALLBACK_SUBMITTING" and fallback_id is None:
+        raise ValueError("fallback client order id is required")
+    if fallback_id is not None and target != "FALLBACK_SUBMITTING":
+        raise ValueError(
+            "fallback client order id may only be set when fallback starts"
+        )
+    normalized_filled_amount = _optional_nonnegative_finite_db(
+        filled_amount, "filled_amount"
+    )
+    normalized_filled_notional = _optional_nonnegative_finite_db(
+        filled_notional, "filled_notional"
+    )
+    normalized_fee_usdt = _optional_nonnegative_finite_db(
+        fee_usdt, "fee_usdt"
+    )
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT * FROM order_intents WHERE intent_id=?", (intent_id,)
+            "SELECT * FROM order_intents WHERE intent_id=?", (validated_intent_id,)
         ).fetchone()
         if row is None:
             raise ValueError("order intent does not exist")
         current = str(row["status"])
         if target not in _ORDER_INTENT_TRANSITIONS.get(current, set()):
             raise ValueError(f"invalid order intent transition {current} -> {target}")
+        if fallback_id is not None:
+            collision = conn.execute(
+                """SELECT 1 FROM order_intents
+                     WHERE client_order_id=? OR fallback_client_order_id=?
+                     LIMIT 1""",
+                (fallback_id, fallback_id),
+            ).fetchone()
+            if collision is not None:
+                raise ValueError("fallback client order id already exists")
         conn.execute(
             """UPDATE order_intents
                   SET status=?, exchange_order_id=COALESCE(?, exchange_order_id),
+                      fallback_client_order_id=COALESCE(
+                          ?, fallback_client_order_id
+                      ),
                       filled_amount=COALESCE(?, filled_amount),
                       filled_notional=COALESCE(?, filled_notional),
                       fee_usdt=COALESCE(?, fee_usdt), last_error=?, updated_at=?
                 WHERE intent_id=?""",
             (
                 target,
-                _order_id_text_db(exchange_order_id),
-                _optional_finite_db(filled_amount),
-                _optional_finite_db(filled_notional),
-                _optional_finite_db(fee_usdt),
+                exchange_id,
+                fallback_id,
+                normalized_filled_amount,
+                normalized_filled_notional,
+                normalized_fee_usdt,
                 (str(error)[:500] if error is not None else None),
                 _utcnow_str(),
-                intent_id,
+                validated_intent_id,
             ),
         )
         if target == "FINALIZED":
@@ -2694,12 +3765,15 @@ def transition_order_intent(
                 conn.execute(
                     """UPDATE portfolio_reservations SET status='CONSUMED'
                          WHERE intent_id=? AND status='ACTIVE'""",
-                    (intent_id,),
+                    (validated_intent_id,),
                 )
             except sqlite3.OperationalError as exc:
                 if "no such table: portfolio_reservations" not in str(exc).lower():
                     raise
         conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise ValueError("order intent identifiers conflict") from exc
     except Exception:
         conn.rollback()
         raise
@@ -2722,6 +3796,28 @@ def _optional_finite_db(value) -> float | None:
     return number if math.isfinite(number) and number >= 0.0 else None
 
 
+def _optional_signed_finite_db(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _positive_integer_db(value, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} must be a positive integer") from exc
+    if parsed <= 0 or parsed != value:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return parsed
+
+
 def list_nonterminal_order_intents(bot_name: str | None = None) -> list[dict]:
     conn = get_connection()
     query = "SELECT * FROM order_intents WHERE status != 'FINALIZED'"
@@ -2734,18 +3830,30 @@ def list_nonterminal_order_intents(bot_name: str | None = None) -> list[dict]:
 
 
 def record_execution_tca(intent_id: str, stage: str, payload: dict) -> None:
+    validated_intent_id = _order_id_text_db(intent_id)
+    if validated_intent_id is None:
+        raise ValueError("TCA intent id is required")
+    if not isinstance(stage, str) or not stage.strip():
+        raise ValueError("TCA stage is required")
+    validated_stage = stage.strip()
+    if not isinstance(payload, dict):
+        raise ValueError("TCA payload must be a dictionary")
     try:
         encoded = json.dumps(payload, sort_keys=True, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise ValueError("TCA payload must be finite JSON") from exc
     conn = get_connection()
-    conn.execute(
-        """INSERT INTO execution_tca
-           (intent_id, measured_at, stage, payload_json)
-           VALUES (?, ?, ?, ?)""",
-        (intent_id, _utcnow_str(), str(stage), encoded),
-    )
-    conn.commit()
+    try:
+        conn.execute(
+            """INSERT INTO execution_tca
+               (intent_id, measured_at, stage, payload_json)
+               VALUES (?, ?, ?, ?)""",
+            (validated_intent_id, _utcnow_str(), validated_stage, encoded),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def get_latest_execution_tca_payload(intent_id: str, stage: str) -> dict | None:
@@ -2774,38 +3882,66 @@ def schedule_execution_markouts(
     horizons: tuple[int, ...] = (1, 10, 60, 300, 900),
 ) -> None:
     """Persist restart-safe post-fill markouts without blocking the order path."""
-    price = float(reference_price)
-    if not math.isfinite(price) or price <= 0.0:
+    validated_intent_id = _order_id_text_db(intent_id)
+    validated_symbol = _order_id_text_db(symbol)
+    if validated_intent_id is None:
+        raise ValueError("markout intent id is required")
+    if validated_symbol is None:
+        raise ValueError("markout symbol is required")
+    price = _optional_finite_db(reference_price)
+    if price is None or price <= 0.0:
         raise ValueError("markout reference price must be positive and finite")
     normalized_side = str(side).strip().lower()
     if normalized_side not in {"buy", "sell"}:
         raise ValueError("markout side must be buy or sell")
+    try:
+        raw_horizons = tuple(horizons)
+    except TypeError as exc:
+        raise ValueError("markout horizons must be a non-empty iterable") from exc
+    if not raw_horizons:
+        raise ValueError("at least one markout horizon is required")
     now = _utcnow()
     rows = []
-    for raw_horizon in horizons:
-        horizon = int(raw_horizon)
-        if horizon <= 0:
-            raise ValueError("markout horizons must be positive")
-        due = (now + timedelta(seconds=horizon)).strftime("%Y-%m-%d %H:%M:%S")
+    seen_horizons: set[int] = set()
+    for raw_horizon in raw_horizons:
+        if isinstance(raw_horizon, bool):
+            raise ValueError("markout horizons must be positive integers")
+        try:
+            horizon = int(raw_horizon)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("markout horizons must be positive integers") from exc
+        if horizon <= 0 or horizon != raw_horizon:
+            raise ValueError("markout horizons must be positive integers")
+        if horizon in seen_horizons:
+            raise ValueError("markout horizons must be unique")
+        seen_horizons.add(horizon)
+        try:
+            due = (now + timedelta(seconds=horizon)).strftime("%Y-%m-%d %H:%M:%S")
+        except OverflowError as exc:
+            raise ValueError("markout horizon is out of range") from exc
         rows.append(
             (
-                intent_id,
+                validated_intent_id,
                 horizon,
-                str(symbol),
+                validated_symbol,
                 normalized_side,
                 price,
                 due,
             )
         )
     conn = get_connection()
-    conn.executemany(
-        """INSERT OR IGNORE INTO execution_markouts
-           (intent_id, horizon_seconds, symbol, side, reference_price,
-            due_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
-        rows,
-    )
-    conn.commit()
+    try:
+        conn.executemany(
+            """INSERT OR IGNORE INTO execution_markouts
+               (intent_id, horizon_seconds, symbol, side, reference_price,
+                due_at, status)
+               VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
+            rows,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def list_due_execution_markouts(limit: int = 25) -> list[dict]:
@@ -2828,23 +3964,57 @@ def complete_execution_markout(
     *,
     mark_price: float,
     markout_bps: float,
+    tca_stage: str,
+    tca_payload: dict,
 ) -> bool:
+    if isinstance(mark_price, bool) or isinstance(markout_bps, bool):
+        raise ValueError("markout values must be finite numbers")
+    try:
+        price = float(mark_price)
+        bps = float(markout_bps)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("markout values must be finite numbers") from exc
+    if not math.isfinite(price) or price <= 0.0 or not math.isfinite(bps):
+        raise ValueError("markout values must be finite and price must be positive")
+    if isinstance(horizon_seconds, bool):
+        raise ValueError("markout horizon must be a positive integer")
+    try:
+        horizon = int(horizon_seconds)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("markout horizon must be a positive integer") from exc
+    if horizon <= 0 or horizon != horizon_seconds:
+        raise ValueError("markout horizon must be a positive integer")
+    stage = str(tca_stage).strip()
+    if not stage or not isinstance(tca_payload, dict):
+        raise ValueError("markout TCA stage and payload are required")
+    try:
+        encoded = json.dumps(tca_payload, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("markout TCA payload must be finite JSON") from exc
+
     conn = get_connection()
-    cur = conn.execute(
-        """UPDATE execution_markouts
-              SET status='COMPLETE', measured_at=?, mark_price=?,
-                  markout_bps=?, attempts=attempts+1, last_error=NULL
-            WHERE intent_id=? AND horizon_seconds=? AND status='PENDING'""",
-        (
-            _utcnow_str(),
-            float(mark_price),
-            float(markout_bps),
-            intent_id,
-            int(horizon_seconds),
-        ),
-    )
-    conn.commit()
-    return cur.rowcount == 1
+    measured_at = _utcnow_str()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            """UPDATE execution_markouts
+                  SET status='COMPLETE', measured_at=?, mark_price=?,
+                      markout_bps=?, attempts=attempts+1, last_error=NULL
+                WHERE intent_id=? AND horizon_seconds=? AND status='PENDING'""",
+            (measured_at, price, bps, str(intent_id), horizon),
+        )
+        if cur.rowcount == 1:
+            conn.execute(
+                """INSERT INTO execution_tca
+                   (intent_id, measured_at, stage, payload_json)
+                   VALUES (?, ?, ?, ?)""",
+                (str(intent_id), measured_at, stage, encoded),
+            )
+        conn.commit()
+        return cur.rowcount == 1
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def fail_execution_markout(
@@ -2854,16 +4024,28 @@ def fail_execution_markout(
     *,
     max_attempts: int = 5,
 ) -> None:
+    validated_intent_id = _order_id_text_db(intent_id)
+    if validated_intent_id is None:
+        raise ValueError("markout intent id is required")
+    horizon = _positive_integer_db(horizon_seconds, "markout horizon")
+    attempt_limit = _positive_integer_db(max_attempts, "markout max attempts")
+    if not isinstance(error, str) or not error.strip():
+        raise ValueError("markout failure reason is required")
+    failure_reason = error.strip()[:500]
     conn = get_connection()
-    conn.execute(
-        """UPDATE execution_markouts
-              SET attempts=attempts+1,
-                  status=CASE WHEN attempts+1 >= ? THEN 'FAILED' ELSE status END,
-                  last_error=?
-            WHERE intent_id=? AND horizon_seconds=? AND status='PENDING'""",
-        (max(1, int(max_attempts)), str(error)[:500], intent_id, int(horizon_seconds)),
-    )
-    conn.commit()
+    try:
+        conn.execute(
+            """UPDATE execution_markouts
+                  SET attempts=attempts+1,
+                      status=CASE WHEN attempts+1 >= ? THEN 'FAILED' ELSE status END,
+                      last_error=?
+                WHERE intent_id=? AND horizon_seconds=? AND status='PENDING'""",
+            (attempt_limit, failure_reason, validated_intent_id, horizon),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def register_experiment_trial(
@@ -2935,9 +4117,12 @@ def load_open_carry_campaigns() -> list[dict]:
 #  Performance metrics 
 
 def get_performance_metrics(bot_name: str, days: int = 30) -> dict:
-    bot_name = _metric_bot(bot_name)
+    validated_bot = _validated_metric_bot_db(bot_name)
+    if isinstance(days, bool) or not isinstance(days, int):
+        raise ValueError("days must be an integer")
+    if not 1 <= days <= 3_650:
+        raise ValueError("days must be between 1 and 3650")
     import statistics as _stat
-    import datetime as _dt
     _empty = {
         "sharpe_ratio": None, "sortino_ratio": None, "profit_factor": None,
         "expectancy_usdt": None, "max_drawdown_pct": None, "win_rate": None,
@@ -2945,18 +4130,36 @@ def get_performance_metrics(bot_name: str, days: int = 30) -> dict:
         "trade_count": 0, "exposure_pct": None,
     }
     conn = get_connection()
-    cutoff = (_utcnow() - _dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    now = _utcnow()
+    cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     rows = conn.execute("""
-    SELECT profit_usdt, profit_pct, is_win, buy_time, sell_time
+    SELECT profit_usdt, profit_pct, buy_time, sell_time
     FROM trades
     WHERE bot_name=? AND COALESCE(is_partial,0)=0 AND sell_time >= ?
-    ORDER BY sell_time ASC""", (bot_name, cutoff)).fetchall()
-    n = len(rows)
+    ORDER BY sell_time ASC""", (validated_bot, cutoff)).fetchall()
+
+    validated_rows = []
+    latest_allowed = now + timedelta(minutes=5)
+    for row in rows:
+        pnl = _required_finite_float_db(row["profit_usdt"], "profit_usdt")
+        return_pct = _required_finite_float_db(
+            row["profit_pct"], "profit_pct"
+        )
+        _, buy_dt = _trade_timestamp_db(row["buy_time"], "buy_time")
+        _, sell_dt = _trade_timestamp_db(row["sell_time"], "sell_time")
+        if sell_dt < buy_dt:
+            raise ValueError("sell_time must not precede buy_time")
+        if sell_dt > latest_allowed:
+            raise ValueError("sell_time is materially in the future")
+        validated_rows.append((pnl, return_pct, buy_dt, sell_dt))
+
+    n = len(validated_rows)
     if n < 5:
         _empty["trade_count"] = n
         return _empty
 
-    pnls = [_sanitize_float(r["profit_usdt"]) for r in rows]
+    pnls = [row[0] for row in validated_rows]
+    returns = [row[1] for row in validated_rows]
     wins   = [p for p in pnls if p >= 0]
     losses = [p for p in pnls if p < 0]
     win_rate     = len(wins) / n
@@ -2967,45 +4170,64 @@ def get_performance_metrics(bot_name: str, days: int = 30) -> dict:
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
     expectancy   = _stat.mean(pnls)
 
-    try:
-        std_all = _stat.stdev(pnls) if n > 1 else 0.0
-        sharpe  = (expectancy / std_all * math.sqrt(365)
-                   if std_all > 0 else None)
-    except Exception:
-        sharpe = None
-    try:
-        neg_dev = _stat.stdev(losses) if len(losses) > 1 else 0.0
-        sortino = (expectancy / neg_dev * math.sqrt(365)
-                   if neg_dev > 0 else None)
-    except Exception:
-        sortino = None
+    mean_return = _stat.mean(returns)
+    annualization = math.sqrt(n / days * 365.0)
+    std_all = _stat.stdev(returns) if n > 1 else 0.0
+    sharpe = (
+        mean_return / std_all * annualization
+        if std_all > 0 else None
+    )
+    negative_returns = [value for value in returns if value < 0]
+    neg_dev = (
+        _stat.stdev(negative_returns)
+        if len(negative_returns) > 1 else 0.0
+    )
+    sortino = (
+        mean_return / neg_dev * annualization
+        if neg_dev > 0 else None
+    )
 
-    cum, peak, max_dd = 0.0, 0.0, 0.0
-    for p in pnls:
-        cum += p
-        peak = max(peak, cum)
-        max_dd = max(max_dd, peak - cum)
-    max_dd_pct = (max_dd / peak * 100) if peak > 0 else None
+    equity, equity_peak, max_dd_pct = 1.0, 1.0, 0.0
+    for return_pct in returns:
+        equity *= max(0.0, 1.0 + return_pct / 100.0)
+        if not math.isfinite(equity):
+            raise ValueError("return series produces non-finite equity")
+        equity_peak = max(equity_peak, equity)
+        drawdown_pct = (equity_peak - equity) / equity_peak * 100.0
+        max_dd_pct = max(max_dd_pct, drawdown_pct)
 
-    try:
-        fmt = "%Y-%m-%d %H:%M:%S"
-        held = sum(
-            max(0.0, (_dt.datetime.strptime(r["sell_time"], fmt) -
-                      _dt.datetime.strptime(r["buy_time"], fmt)).total_seconds())
-            for r in rows)
-        exposure_pct = min(100.0, held / (days * 86400.0) * 100)
-    except Exception:
-        exposure_pct = None
+    held = sum(
+        (sell_dt - buy_dt).total_seconds()
+        for _, _, buy_dt, sell_dt in validated_rows
+    )
+    exposure_pct = min(100.0, held / (days * 86400.0) * 100)
+
+    for value, field_name in (
+        (win_rate, "win_rate"),
+        (avg_win, "avg_win_usdt"),
+        (avg_loss, "avg_loss_usdt"),
+        (expectancy, "expectancy_usdt"),
+        (exposure_pct, "exposure_pct"),
+    ):
+        _required_finite_float_db(value, field_name)
+    for value, field_name in (
+        (profit_factor, "profit_factor"),
+        (sharpe, "sharpe_ratio"),
+        (sortino, "sortino_ratio"),
+        (max_dd_pct, "max_drawdown_pct"),
+    ):
+        if value is not None:
+            _required_finite_float_db(value, field_name)
 
     return {
-        "sharpe_ratio":     round(sharpe, 3) if sharpe else None,
-        "sortino_ratio":    round(sortino, 3) if sortino else None,
-        "profit_factor":    round(profit_factor, 3) if profit_factor else None,
+        "sharpe_ratio":     round(sharpe, 3) if sharpe is not None else None,
+        "sortino_ratio":    round(sortino, 3) if sortino is not None else None,
+        "profit_factor":    round(profit_factor, 3) if profit_factor is not None else None,
         "expectancy_usdt":  round(expectancy, 4),
-        "max_drawdown_pct": round(max_dd_pct, 2) if max_dd_pct else None,
+        "max_drawdown_pct": round(max_dd_pct, 2) if max_dd_pct is not None else None,
         "win_rate":         round(win_rate, 4),
         "avg_win_usdt":     round(avg_win, 4),
         "avg_loss_usdt":    round(avg_loss, 4),
         "trade_count":      n,
-        "exposure_pct":     round(exposure_pct, 2) if exposure_pct else None,
+        "exposure_pct":     round(exposure_pct, 2),
     }

@@ -8,7 +8,9 @@ path; the legacy history.json is rebuilt on a background thread, throttled
 to once per hour.
 """
 
+import atexit
 import json
+import math
 import os
 import queue
 import re
@@ -77,8 +79,36 @@ def _date():
 
 #  Console 
 
+_CONSOLE_FAILURE_REPORTED = [False]
+_CONSOLE_FAILURE_LOCK = threading.Lock()
+
+
+def _safe_console_print(*args, **kwargs) -> None:
+    """Best-effort console output that never breaks trading control flow."""
+    try:
+        print(*args, **kwargs)
+        return
+    except Exception as exc:
+        error_type = type(exc).__name__
+    should_report = False
+    try:
+        with _CONSOLE_FAILURE_LOCK:
+            if not _CONSOLE_FAILURE_REPORTED[0]:
+                _CONSOLE_FAILURE_REPORTED[0] = True
+                should_report = True
+    except Exception:
+        pass
+    if should_report:
+        try:
+            sys.stderr.write(
+                f"[logger] console output unavailable ({error_type})\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+
 def log_separator(char="-", width=60, color=DIM):
-    print(_c(char * width, color))
+    _safe_console_print(_c(char * width, color))
 
 
 _USER_TEXT_TRANSLATION = {
@@ -107,10 +137,26 @@ _USER_TEXT_TRANSLATION = {
 }
 
 
-def clean_user_text(value) -> str:
+_USER_TEXT_TRUNCATION_SUFFIX = "\n...[truncated]"
+
+
+def clean_user_text(value, *, max_chars: int | None = None) -> str:
     """Return text safe for Windows console, launcher panes and Telegram."""
-    text = "" if value is None else str(value)
-    if not any(ord(ch) > 127 or 0x80 <= ord(ch) <= 0x9F for ch in text):
+    try:
+        text = "" if value is None else str(value)
+    except Exception:
+        try:
+            type_name = type(value).__name__
+        except Exception:
+            type_name = "unknown"
+        text = f"[UNRENDERABLE:{type_name}]"
+    if max_chars is not None and len(text) > max_chars:
+        suffix = _USER_TEXT_TRUNCATION_SUFFIX
+        if max_chars <= len(suffix):
+            text = text[:max_chars]
+        else:
+            text = text[:max_chars - len(suffix)] + suffix
+    if all(ch in "\r\n\t" or 32 <= ord(ch) <= 126 for ch in text):
         return text
     out = []
     for ch in text:
@@ -126,6 +172,9 @@ def clean_user_text(value) -> str:
     return re.sub(r"[ \t]{3,}", "  ", cleaned)
 
 
+_LOG_EVENT_MAX_CHARS = 8192
+
+
 def log_event(msg, level="INFO"):
     levels = {
         "INFO":  ("INFO",  W),  "BUY":   ("BUY",   G),
@@ -134,17 +183,20 @@ def log_event(msg, level="INFO"):
         "START": ("START", C),  "SCAN":  ("SCAN",  B),
         "WAIT":  ("WAIT",  DIM),
     }
-    icon, color = levels.get(level, (str(level or "INFO").upper(), W))
+    level_text = clean_user_text(level, max_chars=32).upper() or "INFO"
+    if level_text.startswith("[UNRENDERABLE:"):
+        level_text = "INFO"
+    icon, color = levels.get(level_text, (level_text, W))
     ts = _c(f"[{_now()}]", DIM)
     # Scrub secrets from every console line (a ccxt exception echoed via
     # log_event can leak request params / the api key). redact() strips
     # env-secret values + token-shaped substrings; never raises.
-    try:
-        msg = redact(str(msg))
-    except Exception:
-        msg = str(msg)
-    msg = clean_user_text(msg)
-    print(f"{ts} {_c(icon, color)}  {_c(msg, color)}")
+    msg = clean_user_text(msg, max_chars=_LOG_EVENT_MAX_CHARS)
+    msg = clean_user_text(
+        redact(msg),
+        max_chars=_LOG_EVENT_MAX_CHARS,
+    )
+    _safe_console_print(f"{ts} {_c(icon, color)}  {_c(msg, color)}")
 
 
 # 
@@ -188,7 +240,8 @@ def _struct_log_writer() -> None:
                     try:
                         sys.stderr.write(
                             f"[logger] structured-log write FAILED "
-                            f"({count} consecutive): {type(e).__name__}: {e}\n")
+                            f"({count} consecutive): {type(e).__name__}: "
+                            f"{_safe_log_text(e)}\n")
                         sys.stderr.flush()
                     except Exception:
                         pass
@@ -218,6 +271,45 @@ def _ensure_struct_writer() -> None:
         _STRUCT_WRITER_THREAD = threading.Thread(
             target=_struct_log_writer, daemon=True, name="struct-log-writer")
         _STRUCT_WRITER_THREAD.start()
+
+
+def flush_structured_logs(timeout: float = 2.0) -> bool:
+    """Wait boundedly until every accepted structured record is durable.
+
+    The writer intentionally remains a daemon because logging must never keep
+    a bot process alive indefinitely. This bounded flush closes the opposite
+    failure mode: silently dropping the final audit records on a clean process
+    exit. Returns ``False`` on timeout or an unusable writer/queue.
+    """
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(budget):
+        return False
+    deadline = time.monotonic() + max(0.0, budget)
+
+    while True:
+        try:
+            if _STRUCT_LOG_QUEUE.unfinished_tasks == 0:
+                return True
+            _ensure_struct_writer()
+        except Exception:
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        time.sleep(min(0.01, remaining))
+
+
+def _flush_structured_logs_at_exit() -> None:
+    try:
+        flush_structured_logs(timeout=2.0)
+    except Exception:
+        pass
+
+
+atexit.register(_flush_structured_logs_at_exit)
 
 
 def set_structured_log_dir(log_dir: str) -> None:
@@ -275,14 +367,57 @@ def redact(s: str) -> str:
         return "[REDACTION_FAILED]"
 
 
-def _redact_value(v):
+_SECRET_FIELD_NAME_PARTS = (
+    "apikey",
+    "apisecret",
+    "secret",
+    "password",
+    "passphrase",
+    "token",
+    "credential",
+    "privatekey",
+    "accesskey",
+    "authkey",
+    "authorization",
+    "signature",
+    "chatid",
+    "proxyurl",
+    "proxyuser",
+    "proxypass",
+)
+
+
+def _is_secret_field_name(name: object) -> bool:
+    try:
+        normalized = "".join(
+            char for char in str(name).lower() if char.isalnum()
+        )
+    except Exception:
+        return False
+    return any(part in normalized for part in _SECRET_FIELD_NAME_PARTS)
+
+
+def _safe_log_text(value) -> str:
+    try:
+        return str(value)
+    except Exception:
+        try:
+            type_name = type(value).__name__
+        except Exception:
+            type_name = "unknown"
+        return f"[UNSERIALIZABLE:{type_name}]"
+
+
+def _redact_value(v, field_name: object = None):
+    if field_name is not None and _is_secret_field_name(field_name):
+        return "***REDACTED***"
     if isinstance(v, str):
         try:
             return redact(v)
         except Exception:
             return v
     if isinstance(v, dict):
-        return {k: _redact_value(x) for k, x in v.items()}
+        return {k: _redact_value(x, k) for k, x in v.items()}
     if isinstance(v, (list, tuple)):
         return [_redact_value(x) for x in v]
     return v
@@ -389,29 +524,26 @@ def _rotate_jsonl_if_needed(path: str) -> None:
 
 def log_struct(event: str, **fields) -> None:
     _ensure_struct_writer()
-    record = {"ts": _date(), "event": event}
+    record = {"ts": _date(), "event": _safe_log_text(event)}
     for k, v in fields.items():
-        if isinstance(v, (str, int, float, bool, type(None))):
-            record[k] = _redact_value(v)
-        elif isinstance(v, (list, tuple)):
-            try:
+        try:
+            if isinstance(v, (str, int, float, bool, type(None))):
+                record[k] = _redact_value(v, k)
+            elif isinstance(v, (list, tuple)):
                 json.dumps(v)
-                record[k] = _redact_value(list(v))
-            except (TypeError, ValueError):
-                record[k] = _redact_value(str(v))
-        elif isinstance(v, dict):
-            try:
+                record[k] = _redact_value(list(v), k)
+            elif isinstance(v, dict):
                 json.dumps(v)
-                record[k] = _redact_value(v)
-            except (TypeError, ValueError):
-                record[k] = _redact_value(str(v))
-        else:
-            record[k] = _redact_value(str(v))
+                record[k] = _redact_value(v, k)
+            else:
+                record[k] = _redact_value(_safe_log_text(v), k)
+        except Exception:
+            record[k] = _redact_value(_safe_log_text(v), k)
 
     path = _struct_log_path()
     try:
         line = json.dumps(record, ensure_ascii=False, allow_nan=False)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         safe_record = {"ts": record.get("ts"), "event": record.get("event")}
         for k, v in record.items():
             if k in safe_record:
@@ -419,8 +551,8 @@ def log_struct(event: str, **fields) -> None:
             try:
                 json.dumps(v, allow_nan=False)
                 safe_record[k] = v
-            except (TypeError, ValueError):
-                safe_record[k] = _redact_value(str(v))
+            except (TypeError, ValueError, OverflowError):
+                safe_record[k] = _redact_value(_safe_log_text(v), k)
         line = json.dumps(safe_record, ensure_ascii=False, allow_nan=False)
     try:
         _STRUCT_LOG_QUEUE.put_nowait((line, path))
@@ -476,7 +608,11 @@ class measure_latency:
                   **self.context}
         if not ok:
             fields["error_type"] = exc_type.__name__ if exc_type else None
-            fields["error_msg"]  = str(exc_val)[:200] if exc_val else ""
+            fields["error_msg"] = (
+                _safe_log_text(exc_val)[:200]
+                if exc_val is not None
+                else ""
+            )
         log_struct("api_latency", **fields)
         return False
 
@@ -490,33 +626,78 @@ def _rsi_safe(rsi):
     if rsi is None:
         return tuple(out)
     try:
-        for i in range(min(3, len(rsi))):
-            v = rsi[i]
-            out[i] = float(v) if v is not None else 0.0
-    except (TypeError, ValueError):
-        pass
+        length = min(3, len(rsi))
+    except Exception:
+        return tuple(out)
+    for i in range(length):
+        try:
+            value = rsi[i]
+            if isinstance(value, bool) or value is None:
+                continue
+            parsed = float(value)
+            if math.isfinite(parsed) and 0.0 <= parsed <= 100.0:
+                out[i] = parsed
+        except Exception:
+            continue
     return tuple(out)
+
+
+def _finite_log_number(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _log_number_text(value, format_spec: str) -> str:
+    parsed = _finite_log_number(value)
+    if parsed is None:
+        return "?"
+    try:
+        return format(parsed, format_spec)
+    except (TypeError, ValueError, OverflowError):
+        return "?"
 
 
 def log_buy(bot, sym, price, amt, rsi, news, analysis):
     rsi_safe = _rsi_safe(rsi)
+    bot_text = clean_user_text(bot, max_chars=80)
+    sym_text = clean_user_text(sym, max_chars=120)
+    price_text = _log_number_text(price, ".6f")
+    amount_text = _log_number_text(amt, ".2f")
     log_separator("-", color=G)
-    print(f"  {_c('BUY', G)}  {_c(f'[{bot}]', DIM)}  "
-          f"{_c(sym, W)}  {_c(_now(), DIM)}")
-    print(f"  {_c('Price:    ', DIM)} {_c(f'{price:.6f} USDT', W)}")
-    print(f"  {_c('Margin:   ', DIM)} {_c(f'{amt:.2f} USDT', Y)}")
+    _safe_console_print(
+        f"  {_c('BUY', G)}  {_c(f'[{bot_text}]', DIM)}  "
+        f"{_c(sym_text, W)}  {_c(_now(), DIM)}"
+    )
+    _safe_console_print(
+        f"  {_c('Price:    ', DIM)} {_c(f'{price_text} USDT', W)}"
+    )
+    _safe_console_print(
+        f"  {_c('Margin:   ', DIM)} {_c(f'{amount_text} USDT', Y)}"
+    )
     def rsi_col(v):
         return _c(f"{v:.1f}", R if v > 80 else G if v < 50 else Y)
-    print(f"  {_c('RSI:      ', DIM)} 15m {rsi_col(rsi_safe[0])}  |  "
-          f"1h {rsi_col(rsi_safe[1])}  |  4h {rsi_col(rsi_safe[2])}")
-    news_clean = clean_user_text((news or "").replace("\n", " ").strip())
+    _safe_console_print(
+        f"  {_c('RSI:      ', DIM)} 15m {rsi_col(rsi_safe[0])}  |  "
+        f"1h {rsi_col(rsi_safe[1])}  |  4h {rsi_col(rsi_safe[2])}"
+    )
+    news_clean = clean_user_text(news, max_chars=1000).replace("\n", " ").strip()
     if len(news_clean) > 200:
         news_clean = news_clean[:197] + "..."
     if news_clean:
-        print(f"  {_c('News:     ', DIM)} {_c(news_clean, DIM)}")
+        _safe_console_print(
+            f"  {_c('News:     ', DIM)} {_c(news_clean, DIM)}"
+        )
     # Compact AI line: the raw rationale/steelman JSON is a wall of text in the
     # log. Show the actionable verdict + a short rationale snippet.
-    ki_raw = clean_user_text((analysis or "").replace("\n", " ").strip())
+    ki_raw = clean_user_text(
+        analysis,
+        max_chars=4000,
+    ).replace("\n", " ").strip()
     if not ki_raw:
         log_separator("-", color=G)
         return
@@ -535,32 +716,47 @@ def log_buy(bot, sym, price, amt, rsi, news, analysis):
     except Exception:
         if len(ki) > 160:
             ki = ki[:157] + "..."
-    print(f"  {_c('AI:       ', DIM)} {_c(ki, DIM)}")
+    _safe_console_print(f"  {_c('AI:       ', DIM)} {_c(ki, DIM)}")
     log_separator("-", color=G)
 
 
 def log_sell(bot, sym, profit_pct, profit_usdt, reason):
-    is_win = profit_pct >= 0
-    color  = G if is_win else R
-    sign   = "+" if is_win else ""
-    label  = "WIN" if is_win else "LOSS"
+    pct_value = _finite_log_number(profit_pct)
+    usdt_value = _finite_log_number(profit_usdt)
+    is_win = pct_value is not None and pct_value >= 0
+    color = G if is_win else R if pct_value is not None else W
+    sign = "+" if is_win else ""
+    label = "WIN" if is_win else "LOSS" if pct_value is not None else "CLOSE"
+    pct_text = f"{pct_value:.2f}" if pct_value is not None else "?"
+    usdt_text = f"{usdt_value:.2f}" if usdt_value is not None else "?"
+    bot_text = clean_user_text(bot, max_chars=80)
+    sym_text = clean_user_text(sym, max_chars=120)
     log_separator(color=color)
-    reason = clean_user_text(reason)
-    print(f"  {_c(label, color)}  {_c(f'[{bot}]', DIM)}  {_c(sym, W)}  "
-          f"{_c(f'{sign}{profit_pct:.2f}%', color)}  "
-          f"{_c(f'({sign}{profit_usdt:.2f} USDT)', color)}  "
-          f"{_c(f'[{reason}]', DIM)}")
+    reason = clean_user_text(reason, max_chars=500)
+    _safe_console_print(
+        f"  {_c(label, color)}  {_c(f'[{bot_text}]', DIM)}  "
+        f"{_c(sym_text, W)}  "
+        f"{_c(f'{sign}{pct_text}%', color)}  "
+        f"{_c(f'({sign}{usdt_text} USDT)', color)}  "
+        f"{_c(f'[{reason}]', DIM)}"
+    )
     log_separator(color=color)
 
 
 def log_status(bot, open_trades, balance, next_scan_sec):
     sep = "-" * 60
-    print(f"\n{_c(sep, DIM)}")
-    print(f"  {_c(f'[{clean_user_text(bot)}]', C)}  "
-          f"Open trades: {_c(str(open_trades), Y)}  |  "
-          f"Balance: {_c(f'{balance:.2f} USDT', W)}  |  "
-          f"Next scan: {_c(f'{next_scan_sec}s', DIM)}")
-    print(f"{_c(sep, DIM)}\n")
+    bot_text = clean_user_text(bot, max_chars=80)
+    open_trades_text = clean_user_text(open_trades, max_chars=80)
+    balance_text = _log_number_text(balance, ".2f")
+    next_scan_text = clean_user_text(next_scan_sec, max_chars=40)
+    _safe_console_print(f"\n{_c(sep, DIM)}")
+    _safe_console_print(
+        f"  {_c(f'[{bot_text}]', C)}  "
+        f"Open trades: {_c(open_trades_text, Y)}  |  "
+        f"Balance: {_c(f'{balance_text} USDT', W)}  |  "
+        f"Next scan: {_c(f'{next_scan_text}s', DIM)}"
+    )
+    _safe_console_print(f"{_c(sep, DIM)}\n")
 
 
 # 
@@ -575,7 +771,10 @@ def load_j(f, default=None):
             with open(f, "r", encoding="utf-8-sig") as fh:
                 return json.load(fh)
         except Exception as e:
-            log_event(f"Read error ({f}): {e}", "WARN")
+            log_event(
+                f"Read error ({_safe_log_text(f)}): {_safe_log_text(e)}",
+                "WARN",
+            )
     return default
 
 
@@ -587,7 +786,13 @@ def save_j(f, d):
     tmp = f"{f}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(d, fh, indent=2, ensure_ascii=False)
+            json.dump(
+                d,
+                fh,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
             fh.flush()
             try:
                 os.fsync(fh.fileno())
@@ -603,7 +808,10 @@ def save_j(f, d):
                 else:
                     raise
     except Exception as e:
-        log_event(f"Write error ({f}): {e}", "WARN")
+        log_event(
+            f"Write error ({_safe_log_text(f)}): {_safe_log_text(e)}",
+            "WARN",
+        )
         if os.path.exists(tmp):
             try:
                 os.remove(tmp)
@@ -701,31 +909,59 @@ def save_trade(log_dir, symbol, buy_price, buy_time, sell_price,
                profit_pct, profit_usdt, reason):
     """Append to JSONL on hot path. Legacy JSON rebuild runs on background
     thread, throttled to once per hour."""
-    _ensure_dir(log_dir)
-    jsonl_path = os.path.join(log_dir, "history.jsonl")
-    legacy_path = os.path.join(log_dir, "history.json")
+    try:
+        _ensure_dir(log_dir)
+        jsonl_path = os.path.join(log_dir, "history.jsonl")
+        legacy_path = os.path.join(log_dir, "history.json")
+        entry = {
+            "symbol":         symbol,
+            "buy_price":      round(buy_price, 8),
+            "buy_time":       buy_time,
+            "sell_price":     round(sell_price, 8),
+            "sell_time":      _date(),
+            "profit_percent": round(profit_pct, 2),
+            "profit_usdt":    round(profit_usdt, 2),
+            "reason":         reason,
+        }
+    except Exception as e:
+        log_event(
+            f"history.jsonl preparation error: {_safe_log_text(e)}",
+            "WARN",
+        )
+        return
+    try:
+        encoded_entry = json.dumps(
+            entry,
+            ensure_ascii=False,
+            allow_nan=False,
+        ) + "\n"
+    except (TypeError, ValueError, OverflowError) as e:
+        log_event(
+            f"history.jsonl serialization error: {_safe_log_text(e)}",
+            "WARN",
+        )
+        return
 
-    entry = {
-        "symbol":         symbol,
-        "buy_price":      round(buy_price, 8),
-        "buy_time":       buy_time,
-        "sell_price":     round(sell_price, 8),
-        "sell_time":      _date(),
-        "profit_percent": round(profit_pct, 2),
-        "profit_usdt":    round(profit_usdt, 2),
-        "reason":         reason,
-    }
     with _TRADE_LOG_LOCK:
         try:
             _rotate_jsonl_if_needed(jsonl_path)
             with open(jsonl_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                fh.write(encoded_entry)
                 fh.flush()
         except Exception as e:
-            log_event(f"history.jsonl append error: {e}", "WARN")
+            log_event(
+                f"history.jsonl append error: {_safe_log_text(e)}",
+                "WARN",
+            )
             return
 
-    _maybe_rebuild_legacy(jsonl_path, legacy_path)
+    try:
+        _maybe_rebuild_legacy(jsonl_path, legacy_path)
+    except Exception as e:
+        log_event(
+            f"history.json legacy rebuild start error: {_safe_log_text(e)}",
+            "WARN",
+        )
 
 
 # 
@@ -741,6 +977,22 @@ _TG_PROXIES = (
 )
 
 _TG_QUEUE: queue.Queue = queue.Queue(maxsize=100)
+_TELEGRAM_MESSAGE_MAX_CHARS = 4096
+_TELEGRAM_TOKEN_MAX_CHARS = 256
+_TELEGRAM_CHAT_IDS_MAX_CHARS = 4096
+
+
+def _telegram_config_text(value, *, max_chars: int) -> str:
+    """Render bounded Telegram credentials without ever raising or truncating."""
+    if value is None:
+        return ""
+    try:
+        text = str(value).strip()
+    except Exception:
+        return ""
+    if not text or len(text) > max_chars:
+        return ""
+    return text
 
 
 def _telegram_overflow_log_path() -> str:
@@ -875,7 +1127,7 @@ def _rotate_overflow_if_needed() -> None:
 
 
 def _write_telegram_overflow(cid: str, msg: str) -> None:
-    safe_cid = str(cid)
+    safe_cid = _telegram_config_text(cid, max_chars=256) or "[invalid]"
     if len(safe_cid) > 4:
         safe_cid = "***" + safe_cid[-4:]
     os.makedirs(os.path.dirname(_TG_OVERFLOW_LOG), exist_ok=True)
@@ -883,26 +1135,40 @@ def _write_telegram_overflow(cid: str, msg: str) -> None:
         fh.write(json.dumps({
             "ts": _date(),
             "chat_id": safe_cid,
-            "msg": redact(msg)[:500],
+            "msg": redact(clean_user_text(msg, max_chars=500))[:500],
         }) + "\n")
 
 
 def send_telegram(token, chat_id, msg) -> None:
     global _TG_OVERFLOW_LAST_WARN
-    if not token or not chat_id:
+    token_text = _telegram_config_text(
+        token,
+        max_chars=_TELEGRAM_TOKEN_MAX_CHARS,
+    )
+    chat_ids_text = _telegram_config_text(
+        chat_id,
+        max_chars=_TELEGRAM_CHAT_IDS_MAX_CHARS,
+    )
+    if not token_text or not chat_ids_text:
         return
-    msg = clean_user_text(msg)
+    msg = clean_user_text(msg, max_chars=_TELEGRAM_MESSAGE_MAX_CHARS)
+    msg = clean_user_text(
+        redact(msg),
+        max_chars=_TELEGRAM_MESSAGE_MAX_CHARS,
+    )
+    if not msg:
+        return
     _ensure_tg_worker()
     # Multi-recipient: TELEGRAM_CHAT_ID may list several ids separated by
     # comma / semicolon / whitespace. Fan out one queue item per id so every
     # caller (all pass the single TELEGRAM_CHAT_ID value) reaches all chats.
-    raw = str(chat_id).replace(";", " ").replace(",", " ")
+    raw = chat_ids_text.replace(";", " ").replace(",", " ")
     ids = [c for c in raw.split() if c]
     if not ids:
         return
     for cid in ids:
         try:
-            _TG_QUEUE.put_nowait((token, cid, msg))
+            _TG_QUEUE.put_nowait((token_text, cid, msg))
         except queue.Full:
             # Surface telegram queue overflow to the visible log (rate-limited)
             # so the user notices when alerts stop arriving.

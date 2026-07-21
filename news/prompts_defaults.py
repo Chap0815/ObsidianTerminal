@@ -73,6 +73,7 @@ Do NOT output any text outside the JSON.
 
 #  Self-healing helper (called by launcher.pyw)
 import os as _os  # noqa: E402 - kept beside the self-healing helper
+import tempfile as _tempfile  # noqa: E402
 
 
 def write_all_defaults(prompts_dir: str) -> list:
@@ -100,12 +101,32 @@ def write_all_defaults(prompts_dir: str) -> list:
         path = _os.path.join(prompts_dir, fname)
         if _os.path.exists(path):
             continue
+        tmp = ""
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            fd, tmp = _tempfile.mkstemp(
+                prefix=f"{fname}.tmp.",
+                dir=prompts_dir,
+            )
+            with _os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(content)
+                f.flush()
+                try:
+                    _os.fsync(f.fileno())
+                except (AttributeError, OSError):
+                    pass
+            # Hard-link commit is atomic and create-only: unlike replace(),
+            # it cannot overwrite a user prompt that appeared after the
+            # exists check. Removing tmp afterwards leaves the target intact.
+            _os.link(tmp, path)
             written.append(fname)
         except Exception:
             # Best-effort: skip files we cant write (permissions, disk full)
             # rather than raising up to the launcher.
             continue
+        finally:
+            if tmp:
+                try:
+                    _os.remove(tmp)
+                except OSError:
+                    pass
     return written

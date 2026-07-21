@@ -23,6 +23,7 @@ EXCLUDED_DIRS = {
     ".git",
     ".pytest_cache",
     ".pytest_tmp_review",
+    ".ruff_cache",
     "__pycache__",
     "backups",
     "data",

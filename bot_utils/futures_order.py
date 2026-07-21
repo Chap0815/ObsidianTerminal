@@ -55,6 +55,20 @@ def _finite_nonnegative_order_value(value) -> float:
     return parsed if math.isfinite(parsed) and parsed >= 0 else 0.0
 
 
+def _finite_order_telemetry_value(value, *, positive: bool = False):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    if positive and parsed <= 0:
+        return None
+    return parsed
+
+
 def _normalize_order_symbol(symbol_full) -> str:
     if not isinstance(symbol_full, str):
         return ""
@@ -577,9 +591,20 @@ def create_order_with_retry(ex,
                         amount=order_amount,
                         attempts=attempt, latency_ms=latency_ms,
                         state=order_state,
-                        order_id=order.get("id") if isinstance(order, dict) else None,
-                        filled=order.get("filled") if isinstance(order, dict) else None,
-                        avg_price=order.get("average") if isinstance(order, dict) else None,
+                        order_id=(
+                            _first_order_id_text(
+                                order.get("id"),
+                                order.get("orderId"),
+                                order.get("order_id"),
+                                order.get("orderID"),
+                            ) or None
+                        ) if isinstance(order, dict) else None,
+                        filled=_finite_order_telemetry_value(
+                            order.get("filled")
+                        ) if isinstance(order, dict) else None,
+                        avg_price=_finite_order_telemetry_value(
+                            order.get("average"), positive=True
+                        ) if isinstance(order, dict) else None,
                         action=action_label,
                     )
                 except Exception:

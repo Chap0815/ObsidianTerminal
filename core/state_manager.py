@@ -8,6 +8,7 @@ per path; reconciliation is robust against schema drift.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -172,7 +173,13 @@ class _SingleWriterJSON:
         )
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2, ensure_ascii=False)
+                json.dump(
+                    payload,
+                    fh,
+                    indent=2,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
                 fh.flush()
                 try:
                     os.fsync(fh.fileno())
@@ -488,6 +495,13 @@ class StateManager:
                 d.update(extra)
                 try:
                     pos = Position.from_dict({**d, "bot_name": self.bot_name})
+                    money_error = self._normalize_required_money(pos)
+                    if money_error is not None:
+                        self._warn(
+                            f"Skip malformed SQLite position {sym}: "
+                            f"{money_error}"
+                        )
+                        continue
                     result[sym] = pos
                 except Exception as e:
                     self._warn(f"Skip malformed SQLite position {sym}: {e}")
@@ -533,7 +547,45 @@ class StateManager:
                 return True
         return False
 
+    @staticmethod
+    def _normalize_required_money(pos: Position) -> str | None:
+        parsed = {}
+        for field_name in ("buy_price", "amount", "invested_usdt", "leverage"):
+            raw = getattr(pos, field_name)
+            if isinstance(raw, bool):
+                return f"{field_name} is boolean"
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                return f"{field_name} is not numeric"
+            if not math.isfinite(value):
+                return f"{field_name} is not finite"
+            parsed[field_name] = value
+        if parsed["buy_price"] <= 0.0:
+            return "buy_price must be positive"
+        if parsed["amount"] <= 0.0:
+            return "amount must be positive"
+        if parsed["invested_usdt"] < 0.0:
+            return "invested_usdt must be non-negative"
+        if parsed["leverage"] <= 0.0:
+            return "leverage must be positive"
+        for field_name, value in parsed.items():
+            setattr(pos, field_name, value)
+        return None
+
     def _upsert_row(self, conn, pos: Position) -> bool:
+        if pos.bot_name != self.bot_name:
+            self._warn(
+                f"SQLite write blocked: position owner {pos.bot_name!r} "
+                f"does not match manager owner {self.bot_name!r}"
+            )
+            return False
+        money_error = self._normalize_required_money(pos)
+        if money_error is not None:
+            self._warn(
+                f"SQLite write blocked for {pos.symbol}: {money_error}"
+            )
+            return False
         if self._blocked_by_other_owner(conn, pos):
             return False
         d     = pos.to_dict()

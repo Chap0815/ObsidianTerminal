@@ -5,9 +5,26 @@ Alle Module die einen Default-Threshold haben, lesen ihn HIER aus.
 Bei nderungen reicht es, hier zu editieren.
 """
 from __future__ import annotations
+import math as _math
 import multiprocessing as _mp
 import os as _os
 from enum import Enum
+
+from shared_limits import (
+    API_RATE_HARD_MAX_PER_MINUTE as API_RATE_HARD_MAX_PER_MINUTE,
+)
+
+
+def _bounded_env_float(
+    name: str, default: float, *, minimum: float, maximum: float
+) -> float:
+    try:
+        value = float(_os.getenv(name, str(default)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not _math.isfinite(value) or not minimum <= value <= maximum:
+        return default
+    return value
 
 
 #  Dust / Precision Thresholds 
@@ -31,10 +48,21 @@ MAX_SLIPPAGE_PCT        = 0.5
 MAX_SPREAD_PCT  = 0.3  # FUTURES gate  tight (Activation ~1%, eng)
 # SPOT gate: wider than futures. Spot targets are larger and pump entries can
 # widen spreads at exactly the entry moment. 0.6% still filters illiquid junk.
-try:
-    MAX_SPREAD_PCT_SPOT = float(_os.getenv("MAX_SPREAD_PCT_SPOT", "0.6"))
-except (ValueError, TypeError):
-    MAX_SPREAD_PCT_SPOT = 0.6
+MAX_SPREAD_PCT_SPOT = _bounded_env_float(
+    "MAX_SPREAD_PCT_SPOT", 0.6, minimum=0.000_001, maximum=5.0
+)
+SPOT_MAX_CHASE_PCT = _bounded_env_float(
+    "SPOT_MAX_CHASE_PCT", 2.0, minimum=0.000_001, maximum=10.0
+)
+FUT_SHORT_VOL_SURGE = _bounded_env_float(
+    "FUT_SHORT_VOL_SURGE", 1.0, minimum=0.0, maximum=10.0
+)
+FUT_REGIME_BEAR_7D = _bounded_env_float(
+    "FUT_REGIME_BEAR_7D", -5.0, minimum=-100.0, maximum=0.0
+)
+FUT_REGIME_BULL_7D = _bounded_env_float(
+    "FUT_REGIME_BULL_7D", 5.0, minimum=0.0, maximum=100.0
+)
 SLIPPAGE_TRIP_COUNT     = 3
 SLIPPAGE_WINDOW_SEC     = 300
 # Spread CB
@@ -70,6 +98,15 @@ HISTORY_JSONL_MAX_BYTES = 10 * 1024 * 1024
 HISTORY_JSONL_BACKUPS   = 2
 ERROR_LOG_MAX_BYTES     = 10 * 1024 * 1024
 ERROR_LOG_BACKUPS       = 3
+SILENT_LOG_MAX_BYTES    = 10 * 1024 * 1024
+SILENT_LOG_BACKUPS      = 2
+CONFIG_AUDIT_MAX_BYTES  = 5 * 1024 * 1024
+CONFIG_AUDIT_BACKUPS    = 2
+UPDATE_LOG_MAX_BYTES    = 10 * 1024 * 1024
+UPDATE_LOG_BACKUPS      = 2
+LAUNCHER_STDIO_MAX_BYTES = 10 * 1024 * 1024
+OPS_SNAPSHOT_MAX_BYTES  = 20 * 1024 * 1024
+OPS_SNAPSHOT_BACKUPS    = 2
 TG_OVERFLOW_MAX_BYTES   = 10 * 1024 * 1024
 TG_OVERFLOW_BACKUPS     = 2
 

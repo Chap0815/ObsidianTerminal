@@ -7,6 +7,7 @@ with news_brain_futures.py.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 from news.llm_utils import (
@@ -45,6 +46,18 @@ _FALLBACK_PROMPT = (
 )
 
 
+def _finite_metric(value) -> float | None:
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
 def analyze_sentiment(
     symbol, change, rsi_15m, rsi_1h, rsi_4h, news, market_regime: dict = None
 ):
@@ -55,6 +68,23 @@ def analyze_sentiment(
 
     if market_regime is None:
         market_regime = {"regime": "NEUTRAL", "btc_24h": 0.0, "btc_7d": 0.0}
+    if not isinstance(market_regime, dict):
+        return keyword_fallback(symbol, news, strategy="SPOT")
+
+    metrics = tuple(
+        _finite_metric(value)
+        for value in (
+            change,
+            rsi_15m,
+            rsi_1h,
+            rsi_4h,
+            market_regime.get("btc_24h"),
+            market_regime.get("btc_7d"),
+        )
+    )
+    if any(value is None for value in metrics):
+        return keyword_fallback(symbol, news, strategy="SPOT")
+    change_value, rsi_15m_value, rsi_1h_value, rsi_4h_value, btc_24h, btc_7d = metrics
 
     template = load_prompt_template(
         _PROMPT_FILE, _DEFAULT_FILE, fallback=_FALLBACK_PROMPT
@@ -69,14 +99,14 @@ def analyze_sentiment(
 
     fill_data = {
         "symbol": symbol,
-        "change": change,
-        "rsi_15m": float(rsi_15m or 0),
-        "rsi_1h": float(rsi_1h or 0),
-        "rsi_4h": float(rsi_4h or 0),
-        "news": news,
+        "change": change_value,
+        "rsi_15m": rsi_15m_value,
+        "rsi_1h": rsi_1h_value,
+        "rsi_4h": rsi_4h_value,
+        "news": news if isinstance(news, str) else "",
         "regime": market_regime.get("regime", "NEUTRAL"),
-        "btc_24h": float(market_regime.get("btc_24h", 0.0) or 0),
-        "btc_7d": float(market_regime.get("btc_7d", 0.0) or 0),
+        "btc_24h": btc_24h,
+        "btc_7d": btc_7d,
         # Fields required by user's detailed spot.txt prompt
         "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "vol_24h_usdt": 0.0,
@@ -127,6 +157,8 @@ def analyze_sentiment(
                 if verdict == "OVERRIDE_WAIT":
                     parsed["direction"] = "WAIT"
                     _r = parsed.get("rationale", "")
+                    if not isinstance(_r, str):
+                        _r = ""
                     parsed["rationale"] = (
                         (_r + " | ") if _r else ""
                     ) + "Bull/Bear override: risks outweigh setup"
@@ -176,7 +208,7 @@ def parse_direction_and_confidence(llm_response: str):
     """Returns (direction, confidence). Handles JSON and old free-text.
     Spot bots return BUY/WAIT.
     """
-    if not llm_response:
+    if not isinstance(llm_response, str) or not llm_response:
         return ("WAIT", "LOW")
     import json as _json
 

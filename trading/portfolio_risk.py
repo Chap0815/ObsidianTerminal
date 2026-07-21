@@ -4,7 +4,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Mapping
+from typing import Callable, Mapping
+
+from shared_limits import normalize_gate_mode
+
+_SNAPSHOT_FUTURE_TOLERANCE_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -30,7 +34,13 @@ class PortfolioSnapshot:
         asof = self.asof
         if asof.tzinfo is None:
             asof = asof.replace(tzinfo=timezone.utc)
-        return max(0.0, (current - asof).total_seconds())
+        age = (current - asof).total_seconds()
+        if (
+            not math.isfinite(age)
+            or age < -_SNAPSHOT_FUTURE_TOLERANCE_SECONDS
+        ):
+            return math.inf
+        return max(0.0, age)
 
 
 @dataclass(frozen=True)
@@ -41,6 +51,28 @@ class PortfolioLimits:
     max_cluster_pct: float = 35.0
     max_beta_pct: float = 75.0
     snapshot_max_age_seconds: float = 45.0
+
+
+def portfolio_limits_from_config(
+    config_get: Callable,
+    *,
+    max_net_default: float = 75.0,
+    max_beta_default: float = 75.0,
+) -> PortfolioLimits:
+    """Keep malformed config values visible so the risk engine fails closed."""
+    def _read(key: str, default: float):
+        try:
+            return config_get(key, default)
+        except Exception:
+            return None
+
+    return PortfolioLimits(
+        max_gross_pct=_read("PORTFOLIO_MAX_GROSS_PCT", 100.0),
+        max_net_pct=_read("PORTFOLIO_MAX_NET_PCT", max_net_default),
+        min_free_pct=_read("PORTFOLIO_MIN_FREE_PCT", 20.0),
+        max_cluster_pct=_read("PORTFOLIO_MAX_CLUSTER_PCT", 35.0),
+        max_beta_pct=_read("PORTFOLIO_MAX_BETA_PCT", max_beta_default),
+    )
 
 
 @dataclass(frozen=True)
@@ -66,8 +98,15 @@ class CorrelationCrowdingDecision:
     changes_orders: bool = False
 
 
+def _safe_upper_text(value) -> str:
+    try:
+        return str(value).strip().upper()
+    except Exception:
+        return ""
+
+
 def _side_sign(side: str) -> float:
-    return -1.0 if str(side).upper() == "SHORT" else 1.0
+    return -1.0 if _safe_upper_text(side) == "SHORT" else 1.0
 
 
 def _finite_number(value) -> float | None:
@@ -91,7 +130,8 @@ def evaluate_correlation_crowding(
     minimum_aligned_correlation: float = 0.65,
 ) -> CorrelationCrowdingDecision:
     """Research-only side-aware crowding from measured return correlations."""
-    if not snapshot.known or snapshot.equity_usdt <= 0.0:
+    equity = _finite_number(snapshot.equity_usdt)
+    if not snapshot.known or equity is None or equity <= 0.0:
         return CorrelationCrowdingDecision(
             False, False, None, None, 0,
             (snapshot.reason or "portfolio snapshot unavailable",),
@@ -101,38 +141,64 @@ def evaluate_correlation_crowding(
             False, False, None, None, 0,
             ("correlation evidence unavailable",),
         )
-    normalized_candidate = str(candidate_symbol).strip().upper()
-    aligned = max(0.0, float(requested_notional))
+    normalized_candidate = _safe_upper_text(candidate_symbol)
+    normalized_side = _safe_upper_text(side)
+    requested = _finite_number(requested_notional)
+    maximum_pct = _finite_number(maximum_correlated_pct)
+    minimum_correlation = _finite_number(minimum_aligned_correlation)
+    if (
+        not normalized_candidate
+        or normalized_side not in {"LONG", "SHORT"}
+        or requested is None
+        or requested < 0.0
+        or maximum_pct is None
+        or maximum_pct < 0.0
+        or minimum_correlation is None
+        or not 0.0 <= minimum_correlation <= 1.0
+    ):
+        return CorrelationCrowdingDecision(
+            False, False, None, None, 0, ("correlation inputs invalid",)
+        )
+    aligned = requested
     matched = 0
     missing = []
-    candidate_sign = _side_sign(side)
+    candidate_sign = _side_sign(normalized_side)
     for position in snapshot.positions:
-        symbol = str(position.symbol).strip().upper()
+        symbol = _safe_upper_text(position.symbol)
+        position_side = _safe_upper_text(position.side)
+        position_notional = _finite_number(position.notional_usdt)
+        if (
+            not symbol
+            or position_side not in {"LONG", "SHORT"}
+            or position_notional is None
+            or position_notional < 0.0
+        ):
+            missing.append(symbol)
+            continue
         if symbol == normalized_candidate:
             correlation = 1.0
         else:
             raw = correlations.get(symbol)
-            try:
-                correlation = float(raw)
-            except (TypeError, ValueError, OverflowError):
+            correlation = _finite_number(raw)
+            if correlation is None:
                 missing.append(symbol)
                 continue
         if not -1.0 <= correlation <= 1.0:
             missing.append(symbol)
             continue
         directionally_aligned = (
-            candidate_sign * _side_sign(position.side) * correlation
+            candidate_sign * _side_sign(position_side) * correlation
         )
-        if directionally_aligned >= max(0.0, float(minimum_aligned_correlation)):
-            aligned += abs(float(position.notional_usdt))
+        if directionally_aligned >= minimum_correlation:
+            aligned += position_notional
             matched += 1
     if missing:
         return CorrelationCrowdingDecision(
             False, False, None, None, matched,
             ("correlation evidence incomplete",),
         )
-    percentage = aligned / float(snapshot.equity_usdt) * 100.0
-    allowed = percentage <= max(0.0, float(maximum_correlated_pct))
+    percentage = aligned / equity * 100.0
+    allowed = percentage <= maximum_pct
     return CorrelationCrowdingDecision(
         True,
         allowed,
@@ -171,7 +237,7 @@ def evaluate_entry(
     if beta_value is None:
         reasons.append("candidate beta is invalid")
         beta_value = 0.0
-    normalized_side = str(side).strip().upper()
+    normalized_side = _safe_upper_text(side)
     if normalized_side not in {"LONG", "SHORT"}:
         reasons.append("candidate side is invalid")
 
@@ -212,7 +278,7 @@ def evaluate_entry(
     for position in snapshot.positions:
         notional = _finite_number(position.notional_usdt)
         position_beta = _finite_number(position.beta)
-        position_side = str(position.side).strip().upper()
+        position_side = _safe_upper_text(position.side)
         if (
             notional is None
             or notional < 0.0
@@ -262,9 +328,7 @@ def evaluate_entry(
         if abs(beta_after) / equity * 100.0 > max_beta:
             reasons.append("beta exposure limit exceeded")
     shadow_allowed = not reasons
-    normalized_mode = str(mode).strip().lower()
-    if normalized_mode not in {"disabled", "shadow", "enforce"}:
-        normalized_mode = "enforce"
+    normalized_mode = normalize_gate_mode(mode)
     allowed = shadow_allowed if normalized_mode == "enforce" else True
     return PortfolioDecision(
         allowed=allowed,

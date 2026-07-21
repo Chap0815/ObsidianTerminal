@@ -14,6 +14,7 @@ from threading import Lock
 from typing import Callable, Optional, Tuple
 
 from bot_utils.futures_order import (
+    _order_id_text,
     create_order_with_retry,
     extract_or_estimate_futures_fee,
     futures_contract_size,
@@ -23,6 +24,7 @@ from bot_utils.futures_order import (
 from bot_utils.futures_math import calc_unrealized_pnl, price_move_pct
 from bot_utils.futures_funding import fetch_or_estimate_funding
 from bot_utils.fee_math import taker_fee_rate
+from bot_utils.order_utils import order_id_text_or_none
 
 
 _MAX_PARALLEL_CLOSES = 3
@@ -123,7 +125,7 @@ def _is_mexc_swap_symbol(ex, symbol_full: str) -> bool:
 
 def _order_id_is_fetchable(ex, symbol_full: str, order_id) -> bool:
     """MEXC swap fetch_order only accepts the numeric exchange order_id."""
-    oid = str(order_id or "").strip()
+    oid = _order_id_text(order_id)
     if not oid:
         return False
     if _is_mexc_swap_symbol(ex, symbol_full):
@@ -141,7 +143,10 @@ def _resolve_fill_price(ex,
     if fp is not None:
         return fp, "order"
 
-    order_id = order.get("id") if isinstance(order, dict) else None
+    raw_order_id = order.get("id") if isinstance(order, dict) else None
+    order_id = _order_id_text(raw_order_id) or None
+    if raw_order_id is not None and order_id is None:
+        return _positive_finite_or_zero(fallback_price), "fallback"
 
     if _order_id_is_fetchable(ex, symbol_full, order_id):
         for attempt in range(_FILL_RESOLVE_MAX_RETRIES):
@@ -171,8 +176,9 @@ def _resolve_fill_price(ex,
     try:
         trades = ex.fetch_my_trades(symbol_full, limit=10) or []
         if isinstance(trades, list) and trades:
+            trades = [trade for trade in trades if isinstance(trade, dict)]
             same_order = [t for t in trades
-                            if order_id and str(t.get("order") or "") == str(order_id)]
+                            if order_id and _order_id_text(t.get("order")) == order_id]
             if order_id and not same_order:
                 return _positive_finite_or_zero(fallback_price), "fallback"
             pool = same_order if order_id else trades
@@ -452,7 +458,10 @@ def _close_single_position_impl(*,
                     abort_on_shutdown=False,
                 )
 
-                exch_oid = order.get("id") or order.get("orderId")
+                exch_oid = (
+                    order_id_text_or_none(order.get("id"))
+                    or order_id_text_or_none(order.get("orderId"))
+                )
                 resolved, fill_source = _resolve_fill_price(
                     ex, symbol_full, order, curr, log_event
                 )

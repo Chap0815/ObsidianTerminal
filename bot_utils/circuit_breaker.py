@@ -236,10 +236,10 @@ class SafeMode:
         instances. Priority:
           1. explicit instance_id arg
           2. BOT_ACCOUNT_ID env var (e.g. account UUID)
-          3. PID (last resort  changes on restart, but at least
-             distinguishes co-running instances)
+          3. stable default (the pre-start guard prevents duplicate bot
+             processes; a PID here would defeat restart persistence)
         """
-        seed = instance_id or os.getenv("BOT_ACCOUNT_ID") or f"pid{os.getpid()}"
+        seed = instance_id or os.getenv("BOT_ACCOUNT_ID") or "default-instance"
         # Stable filename suffix only, never a signature or secret hash.
         return hashlib.sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
 
@@ -268,12 +268,14 @@ class SafeMode:
         if not self._alert_state_file:
             return
         try:
-            import json as _json
             from datetime import datetime as _dt, timezone as _tz
+            from bot_utils.state_persist import atomic_save_json
 
             today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
-            with open(self._alert_state_file, "w", encoding="utf-8") as f:
-                _json.dump({"alert_sent_day": today, "reason": self._reason}, f)
+            atomic_save_json(
+                self._alert_state_file,
+                {"alert_sent_day": today, "reason": self._reason},
+            )
         except Exception:
             pass
 

@@ -253,20 +253,24 @@ class Position:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Position":
-        """Rejects inf/nan numeric coercion to keep math safe."""
+        """Reject invalid enums and inf/nan numeric coercion fail-closed."""
         global _WARNED_UNKNOWN_FIELDS
         d = dict(d)
 
         pt_raw = d.pop("position_type", "SPOT")
         st_raw = d.pop("state", "OPEN")
+        pt_value = pt_raw.strip().upper() if isinstance(pt_raw, str) else pt_raw
+        st_value = st_raw.strip().upper() if isinstance(st_raw, str) else st_raw
         try:
-            pt = PositionType(pt_raw)
-        except ValueError:
-            pt = PositionType.SPOT
+            pt = PositionType(pt_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid position_type: {pt_raw!r}"
+            ) from exc
         try:
-            st = TradeState(st_raw)
-        except ValueError:
-            st = TradeState.OPEN
+            st = TradeState(st_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid state: {st_raw!r}") from exc
 
         # Backward-compat aliases
         if "buy" in d and "buy_price" not in d:
@@ -286,10 +290,12 @@ class Position:
             if fld not in d:
                 continue
             v = d[fld]
+            if isinstance(v, bool):
+                raise ValueError(f"{fld} is boolean")
             if isinstance(v, str):
                 try:
                     v = float(v)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     d.pop(fld, None)
                     continue
             if v is not None:
@@ -299,7 +305,7 @@ class Position:
                         d.pop(fld, None)
                         continue
                     d[fld] = fv
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     d.pop(fld, None)
 
         clean = {k: v for k, v in d.items() if k in known}

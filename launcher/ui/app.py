@@ -2356,18 +2356,67 @@ class ObsidianApp(ctk.CTk):
     def _terminate_dashboard_process(pid: int) -> None:
         if not pid:
             return
+        psutil = None
         try:
             import psutil  # type: ignore
-            psutil.Process(int(pid)).terminate()
-        except Exception:
-            with suppress(Exception):
-                subprocess.run(
-                    ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                    **subprocess_no_window_kwargs(),
+            proc = psutil.Process(int(pid))
+            proc.terminate()
+            try:
+                proc.wait(timeout=3.0)
+            except psutil.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
+            return
+        except Exception as exc:
+            # A process that disappeared is already successfully stopped.
+            no_such_types = tuple(
+                cls
+                for cls in (
+                    getattr(psutil, "NoSuchProcess", None),
+                    getattr(psutil, "ZombieProcess", None),
                 )
+                if isinstance(cls, type)
+            )
+            if no_such_types and isinstance(exc, no_such_types):
+                return
+        with suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                **subprocess_no_window_kwargs(),
+            )
+
+    @staticmethod
+    def _stop_owned_dashboard_process(proc) -> None:
+        """Bounded stop and reap for the launcher's own Streamlit child."""
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+        finally:
+            for stream_name in ("stdin", "stdout", "stderr"):
+                stream = getattr(proc, stream_name, None)
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
 
     def _write_dashboard_process_status(self) -> None:
         if self.streamlit is None or not getattr(self.streamlit, "pid", None):
@@ -4114,9 +4163,11 @@ class ObsidianApp(ctk.CTk):
             pass
         try:
             if self.streamlit:
-                self.streamlit.terminate()
+                ObsidianApp._stop_owned_dashboard_process(self.streamlit)
         except Exception:
             pass
+        finally:
+            self.streamlit = None
         self.destroy()
 
     def _show_quit_no_positions_dialog(self):

@@ -32,7 +32,7 @@ def _finite_float(value: Any) -> float | None:
         if value is None or value == "":
             return None
         out = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return out if math.isfinite(out) else None
 

@@ -9,6 +9,7 @@ Public API:
 """
 from __future__ import annotations
 
+import math
 import os
 import socket
 import threading
@@ -62,6 +63,19 @@ def should_cooldown_after_exit(reason: str, profit_usdt: float) -> bool:
 
 
 _COOLDOWN_LOCK = threading.Lock()
+_MAX_COOLDOWN_MINUTES = 366 * 24 * 60
+
+
+def _normalize_cooldown_minutes(value) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed > _MAX_COOLDOWN_MINUTES:
+        return None
+    return max(0, int(parsed))
 
 
 def _boot_fingerprint() -> str:
@@ -188,15 +202,15 @@ def _file_lock(path: str, timeout: float = 5.0):
 def set_cooldown(cool: dict, symbol: str, minutes: int,
                  cooldown_file: str) -> bool:
     """Set a cooldown for ``minutes`` minutes from now."""
-    minutes = max(0, int(minutes))
+    minutes = _normalize_cooldown_minutes(minutes)
+    if minutes is None:
+        return False
     if minutes == 0:
         return True
     expiry_iso = (_utcnow() + timedelta(minutes=minutes)).isoformat()
-    snapshot = None
     with _COOLDOWN_LOCK:
         cool[symbol] = expiry_iso
-        snapshot = dict(cool)
-    return _persist(cooldown_file, snapshot)
+        return _persist(cooldown_file, cool)
 
 
 def check_in_cooldown(cool: dict, symbol: str) -> bool:
@@ -217,8 +231,6 @@ def check_in_cooldown(cool: dict, symbol: str) -> bool:
 def is_in_cooldown(cool: dict, symbol: str, cooldown_file: str) -> bool:
     """Legacy: read AND auto-purge expired entries. Schreibt die Datei
     on expired hits; do not use in hot paths."""
-    needs_persist = False
-    snapshot = None
     with _COOLDOWN_LOCK:
         raw = cool.get(symbol)
         if raw is None:
@@ -230,15 +242,9 @@ def is_in_cooldown(cool: dict, symbol: str, cooldown_file: str) -> bool:
             if _utcnow() < expiry:
                 return True
             cool.pop(symbol, None)
-            snapshot = dict(cool)
-            needs_persist = True
         except (TypeError, ValueError):
             cool.pop(symbol, None)
-            snapshot = dict(cool)
-            needs_persist = True
-
-    if needs_persist and snapshot is not None:
-        _persist(cooldown_file, snapshot)
+        _persist(cooldown_file, cool)
     return False
 
 
@@ -246,7 +252,6 @@ def purge_expired(cool: dict, cooldown_file: str) -> int:
     """Explizit alle expired entries entfernen. Returns # removed."""
     now = _utcnow()
     removed = 0
-    snapshot = None
     with _COOLDOWN_LOCK:
         for sym in list(cool.keys()):
             raw = cool[sym]
@@ -260,20 +265,57 @@ def purge_expired(cool: dict, cooldown_file: str) -> int:
             except (TypeError, ValueError):
                 cool.pop(sym, None)
                 removed += 1
-        snapshot = dict(cool)
-    if removed > 0 and snapshot is not None:
-        _persist(cooldown_file, snapshot)
+        if removed > 0:
+            _persist(cooldown_file, cool)
     return removed
 
 
 #  Persistence 
 
+def _active_cooldowns(data, now: datetime) -> dict[str, datetime]:
+    if not isinstance(data, dict):
+        return {}
+    active: dict[str, datetime] = {}
+    for symbol, raw_expiry in data.items():
+        if not isinstance(symbol, str) or not symbol:
+            continue
+        try:
+            expiry = datetime.fromisoformat(raw_expiry)
+        except (TypeError, ValueError):
+            continue
+        if expiry.tzinfo is not None:
+            expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
+        if expiry > now:
+            active[symbol] = expiry
+    return active
+
+
 def _persist(path: str, data: dict) -> bool:
-    if not path:
+    if not path or not isinstance(data, dict):
         return False
     try:
         with _file_lock(path):
-            _atomic_write_json(path, data)
+            now = _utcnow()
+            merged = _active_cooldowns(data, now)
+            try:
+                import json
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8-sig") as fh:
+                        disk = _active_cooldowns(json.load(fh), now)
+                    for symbol, expiry in disk.items():
+                        current = merged.get(symbol)
+                        if current is None or expiry > current:
+                            merged[symbol] = expiry
+            except Exception:
+                pass
+
+            snapshot = {
+                symbol: expiry.isoformat()
+                for symbol, expiry in merged.items()
+            }
+            _atomic_write_json(path, snapshot)
+            data.clear()
+            data.update(snapshot)
         return True
     except Exception:
         try:
@@ -291,7 +333,13 @@ def _atomic_write_json(path: str, data: dict) -> None:
     tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
+            json.dump(
+                data,
+                fh,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
             fh.flush()
             try:
                 os.fsync(fh.fileno())

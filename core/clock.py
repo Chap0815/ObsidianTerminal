@@ -15,6 +15,7 @@ cancels out, so drift can't affect them.
 """
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -31,9 +32,20 @@ def set_exchange_offset_ms(offset_ms: float) -> None:
     Called by the exchange layer after each (re)sync. Ignores non-numeric input
     so a bad value can never poison the clock."""
     global _offset_ms, _have_offset
+    if isinstance(offset_ms, bool):
+        return
     try:
         off = float(offset_ms)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return
+    if not math.isfinite(off):
+        return
+    try:
+        datetime.fromtimestamp(
+            (time.time() * 1000.0 + off) / 1000.0,
+            tz=timezone.utc,
+        )
+    except (OSError, OverflowError, ValueError):
         return
     with _lock:
         _offset_ms = off

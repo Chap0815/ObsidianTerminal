@@ -20,7 +20,6 @@ Flow per tick:
 from __future__ import annotations
 
 import math
-import os
 
 from bot_utils import (
     safe_fetch_balance_usdt,
@@ -48,6 +47,25 @@ class ScanMixin:
         except (TypeError, ValueError, OverflowError):
             return float(default)
         return parsed if math.isfinite(parsed) and parsed > 0 else float(default)
+
+    @staticmethod
+    def _finite_float(value) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
+    def _rsi_triplet(self, row) -> tuple[float, float, float] | None:
+        values = tuple(
+            self._finite_float(row.get(key))
+            for key in ("rsi_15m", "rsi_1h", "rsi_4h")
+        )
+        if any(value is None for value in values):
+            return None
+        return values
 
     def _entry_quality_min_score(self) -> float:
         try:
@@ -182,12 +200,24 @@ class ScanMixin:
         return False
 
     def _assess_spot_entry_signal(self, r, regime: dict):
-        rsi_15, rsi_h, rsi_4 = r["rsi_15m"], r["rsi_1h"], r["rsi_4h"]
+        rsi_values = self._rsi_triplet(r)
+        if rsi_values is None:
+            return "LOW"
+        rsi_15, rsi_h, rsi_4 = rsi_values
         tf_score = sum(1 for v in (rsi_15, rsi_h, rsi_4) if 50 <= v <= 75)
-        vol_ok = float(r.get("vol_surge", 1.0) or 1.0) >= 1.15
-        macd_ok = float(r.get("macd_hist", 0.0) or 0.0) >= 0.0
-        body_ok = float(r.get("body_ratio", 1.0) or 1.0) >= 0.35
-        pump_ok = float(r.get("change_percent", 0.0) or 0.0) > 0.0
+        indicators = (
+            self._finite_float(r.get("vol_surge", 1.0)),
+            self._finite_float(r.get("macd_hist", 0.0)),
+            self._finite_float(r.get("body_ratio", 1.0)),
+            self._finite_float(r.get("change_percent", 0.0)),
+        )
+        if any(value is None for value in indicators):
+            return "LOW"
+        vol_surge, macd_hist, body_ratio, change_percent = indicators
+        vol_ok = vol_surge >= 1.15
+        macd_ok = macd_hist >= 0.0
+        body_ok = body_ratio >= 0.35
+        pump_ok = change_percent > 0.0
 
         score = tf_score + int(vol_ok) + int(macd_ok) + int(body_ok) + int(pump_ok)
         if tf_score >= 2 and score >= 5:
@@ -419,7 +449,10 @@ class ScanMixin:
                     continue
 
             # Multi-RSI gate
-            rsi_values = [r["rsi_15m"], r["rsi_1h"], r["rsi_4h"]]
+            rsi_values = self._rsi_triplet(r)
+            if rsi_values is None:
+                log_event(f"{sym} skipped  invalid RSI payload", "WARN")
+                continue
             rsi_too_high = sum(1 for v in rsi_values if v > rsi_max)
             if rsi_too_high >= 2:
                 log_event(
@@ -592,14 +625,15 @@ class ScanMixin:
 
         if not self.simulation:
             from trading.entry_admission import evaluate_entry_admission
-            from trading.portfolio_risk import PortfolioLimits
+            from trading.portfolio_risk import portfolio_limits_from_config
 
-            portfolio_mode = str(
-                self.C("PORTFOLIO_RISK_MODE", "shadow") or "shadow"
-            ).strip().lower()
-            expectancy_mode = str(
-                self.C("NET_EXPECTANCY_MODE", "shadow") or "shadow"
-            ).strip().lower()
+            from shared_limits import normalize_gate_mode
+            portfolio_mode = normalize_gate_mode(
+                self.C("PORTFOLIO_RISK_MODE", "shadow")
+            )
+            expectancy_mode = normalize_gate_mode(
+                self.C("NET_EXPECTANCY_MODE", "shadow")
+            )
             admission = evaluate_entry_admission(
                 exchange=self.ex,
                 intent_id=entry_id,
@@ -611,12 +645,8 @@ class ScanMixin:
                 expectancy_mode=expectancy_mode,
                 account_type="spot",
                 features=expectancy_features,
-                limits=PortfolioLimits(
-                    max_gross_pct=float(self.C("PORTFOLIO_MAX_GROSS_PCT", 100.0)),
-                    max_net_pct=float(self.C("PORTFOLIO_MAX_NET_PCT", 100.0)),
-                    min_free_pct=float(self.C("PORTFOLIO_MIN_FREE_PCT", 20.0)),
-                    max_cluster_pct=float(self.C("PORTFOLIO_MAX_CLUSTER_PCT", 35.0)),
-                    max_beta_pct=float(self.C("PORTFOLIO_MAX_BETA_PCT", 100.0)),
+                limits=portfolio_limits_from_config(
+                    self.C, max_net_default=100.0, max_beta_default=100.0
                 ),
             )
             log_struct(
@@ -1120,10 +1150,8 @@ class ScanMixin:
         # signal price against the live ORDER-BOOK ASK and abort if the ask ran
         # past SPOT_MAX_CHASE_PCT; otherwise adopt the ask as the buy basis so
         # amount/slippage math reflect what we actually pay.
-        try:
-            _chase_max = float(os.getenv("SPOT_MAX_CHASE_PCT", "2.0"))
-        except (ValueError, TypeError):
-            _chase_max = 2.0
+        from core.constants import SPOT_MAX_CHASE_PCT
+        _chase_max = SPOT_MAX_CHASE_PCT
         try:
             _ob = self.ex.fetch_order_book(f"{sym}/USDT", limit=5)
             _asks = (_ob or {}).get("asks") or []

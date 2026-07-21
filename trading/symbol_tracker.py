@@ -7,12 +7,15 @@ indicator failures during that window.
 """
 from __future__ import annotations
 import json
+import math
 import os
 import threading
 import time
 from typing import Dict
 
+import portalocker
 
+from bot_utils.state_persist import atomic_save_json
 from core.paths import SYMBOL_FIRST_SEEN_STR as _TRACKER_FILE
 _GRACE_PERIOD_SEC     = 24 * 3600    # 24 Stunden Stille nach erster Sichtung
 _PERSIST_INTERVAL_SEC = 60.0          # max. einmal pro Minute auf Disk schreiben
@@ -25,6 +28,22 @@ _last_persist: float = 0.0
 _dirty = False
 
 
+def _validated_data(raw, now: float) -> Dict[str, float]:
+    if not isinstance(raw, dict):
+        return {}
+    clean: Dict[str, float] = {}
+    for symbol, raw_ts in raw.items():
+        if not isinstance(symbol, str) or isinstance(raw_ts, bool):
+            continue
+        try:
+            timestamp = float(raw_ts)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(timestamp) and 0 < timestamp < now + 86400:
+            clean[symbol] = timestamp
+    return clean
+
+
 def _load() -> None:
     """Ldt die persistierten Daten beim Import. Fehlertolerant."""
     global _data
@@ -32,14 +51,7 @@ def _load() -> None:
         if os.path.exists(_TRACKER_FILE):
             with open(_TRACKER_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            if isinstance(raw, dict):
-                now = time.time()
-                _data = {
-                    str(s): float(ts)
-                    for s, ts in raw.items()
-                    if isinstance(s, str) and isinstance(ts, (int, float))
-                    and 0 < float(ts) < now + 86400
-                }
+            _data = _validated_data(raw, time.time())
     except Exception:
         _data = {}
 
@@ -53,23 +65,46 @@ def _persist_locked() -> None:
     if (now - _last_persist) < _PERSIST_INTERVAL_SEC:
         return
     try:
-        cutoff = now - _RETENTION_SEC
-        snapshot = {s: ts for s, ts in _data.items() if ts >= cutoff}
-
-        if len(snapshot) > _MAX_TRACKED:
-            # LRU prune: behalte die NEWESTEN N
-            sorted_items = sorted(snapshot.items(), key=lambda kv: kv[1], reverse=True)
-            snapshot = dict(sorted_items[:_MAX_TRACKED])
-
-        tmp = _TRACKER_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, indent=1)
-            f.flush()
+        os.makedirs(os.path.dirname(_TRACKER_FILE) or ".", exist_ok=True)
+        with portalocker.Lock(
+            _TRACKER_FILE + ".lock",
+            mode="a",
+            timeout=5.0,
+            check_interval=0.05,
+            fail_when_locked=False,
+        ):
+            disk_data: Dict[str, float] = {}
             try:
-                os.fsync(f.fileno())
-            except (AttributeError, OSError):
-                pass
-        os.replace(tmp, _TRACKER_FILE)
+                if os.path.exists(_TRACKER_FILE):
+                    with open(_TRACKER_FILE, "r", encoding="utf-8-sig") as f:
+                        disk_data = _validated_data(json.load(f), now)
+            except Exception:
+                disk_data = {}
+
+            merged = _validated_data(_data, now)
+            for symbol, timestamp in disk_data.items():
+                current = merged.get(symbol)
+                if current is None or timestamp < current:
+                    merged[symbol] = timestamp
+
+            cutoff = now - _RETENTION_SEC
+            snapshot = {
+                symbol: timestamp
+                for symbol, timestamp in merged.items()
+                if timestamp >= cutoff
+            }
+
+            if len(snapshot) > _MAX_TRACKED:
+                # LRU prune: behalte die NEWESTEN N
+                sorted_items = sorted(
+                    snapshot.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+                snapshot = dict(sorted_items[:_MAX_TRACKED])
+
+            if not atomic_save_json(_TRACKER_FILE, snapshot):
+                return
 
         _data.clear()
         _data.update(snapshot)

@@ -32,6 +32,7 @@ _SUPPRESS_FROM_HISTORY  = frozenset({"TICKER_UPDATED"})
 _CRITICAL_PUT_TIMEOUT = 2.0
 # cap stored payload size in history (chars in JSON-dumped form)
 _HISTORY_PAYLOAD_MAX_CHARS = 2048
+_WORKER_STOP = object()
 
 
 def _log_handler_error(context: str, exc: Exception) -> None:
@@ -59,9 +60,13 @@ class Event:
             self.seq = Event._seq_counter
 
     def to_dict(self) -> dict:
+        try:
+            payload = copy.deepcopy(self.payload)
+        except Exception:
+            payload = dict(self.payload)
         return {
             "event_type": self.event_type,
-            "payload":    dict(self.payload),
+            "payload":    payload,
             "timestamp":  self.timestamp,
             "emitted_by": self.emitted_by,
             "seq":        self.seq,
@@ -71,9 +76,11 @@ class Event:
 def _truncate_for_history(payload: dict) -> dict:
     """Shrink large payloads to keep memory bounded."""
     try:
-        s = json.dumps(payload, default=str)
+        s = json.dumps(payload, default=str, allow_nan=False)
         if len(s) <= _HISTORY_PAYLOAD_MAX_CHARS:
-            return payload
+            # Round-tripping creates an immutable history snapshot instead of
+            # retaining nested references owned by the emitter.
+            return json.loads(s)
         # Keep only top-level scalar fields
         scalar_only = {
             k: v for k, v in payload.items()
@@ -82,8 +89,27 @@ def _truncate_for_history(payload: dict) -> dict:
         scalar_only["_truncated"] = True
         scalar_only["_orig_chars"] = len(s)
         return scalar_only
-    except (TypeError, ValueError):
+    except Exception:
         return {"_unserializable": True}
+
+
+def _payload_for_handler(event_type: str, payload: dict) -> dict:
+    """Isolate critical handlers so one cannot corrupt another's view."""
+    if event_type not in _CRITICAL_EVENTS:
+        return payload
+    try:
+        return copy.deepcopy(payload)
+    except Exception:
+        return dict(payload)
+
+
+def _coerce_payload(payload: Any) -> dict:
+    if payload is None:
+        return {}
+    try:
+        return dict(payload)
+    except Exception:
+        return {"_invalid_payload_type": type(payload).__name__}
 
 
 class EventBus:
@@ -94,6 +120,9 @@ class EventBus:
         self._work_queue   = queue.Queue(maxsize=2000)
         self._history      = deque(maxlen=history_size)
         self._history_lock = threading.Lock()
+        self._publish_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_event = threading.Event()
         self._stopped      = False
         self._n_workers    = worker_threads
         self._worker_threads: List[threading.Thread] = []
@@ -144,68 +173,76 @@ class EventBus:
         before dispatch so one handler can't mutate another handler's view of a
         nested field.
         """
-        if self._stopped:
-            return
-
         # Deep-copy payload for critical events so handlers can't mutate each
         # other's view. Non-critical events keep a shallow copy (cheaper) 
         # those are usually high-frequency and the handlers are read-only.
+        base_payload = _coerce_payload(payload)
         if event_type in _CRITICAL_EVENTS:
             try:
-                safe_payload = copy.deepcopy(payload or {})
+                safe_payload = copy.deepcopy(base_payload)
             except Exception:
                 # Some payload contained an unpicklable object (e.g.
                 # an exchange handle). Fall back to shallow.
-                safe_payload = dict(payload or {})
+                safe_payload = dict(base_payload)
         else:
-            safe_payload = dict(payload or {})
+            safe_payload = base_payload
 
         event = Event(event_type, safe_payload, emitted_by)
 
-        # don't pollute history with high-frequency events
-        if event_type not in _SUPPRESS_FROM_HISTORY:
-            stored_payload = _truncate_for_history(safe_payload)
-            stored_event = Event(event_type, stored_payload, emitted_by)
-            stored_event.seq = event.seq
-            with self._history_lock:
-                self._history.append(stored_event)
+        # Serialize the final admission check with shutdown. An emitter that
+        # passed an earlier boolean check must never enqueue after every worker
+        # has already exited.
+        with self._publish_lock:
+            if self._stopped:
+                return
 
-        with self._lock:
-            specific = list(self._handlers.get(event_type, []))
-            if event_type in _SUPPRESS_FROM_WILDCARD:
-                handlers = specific
+            # don't pollute history with high-frequency events
+            if event_type not in _SUPPRESS_FROM_HISTORY:
+                stored_payload = _truncate_for_history(safe_payload)
+                # History is a view of the same emission, not a second event.
+                # A shallow Event copy preserves timestamp/sequence without
+                # consuming a hidden global sequence number.
+                stored_event = copy.copy(event)
+                stored_event.payload = stored_payload
+                with self._history_lock:
+                    self._history.append(stored_event)
+
+            with self._lock:
+                specific = list(self._handlers.get(event_type, []))
+                if event_type in _SUPPRESS_FROM_WILDCARD:
+                    handlers = specific
+                else:
+                    handlers = specific + list(self._wildcard)
+
+            if not handlers:
+                return
+
+            is_critical = event_type in _CRITICAL_EVENTS
+            if is_critical:
+                # Per-handler deadline so one slow/full slot doesn't starve the
+                # next. Each handler gets up to _CRITICAL_PUT_TIMEOUT seconds;
+                # queue.Full on one handler is recorded via _emergency_log but
+                # does NOT skip the remaining handlers.
+                for handler in handlers:
+                    try:
+                        self._work_queue.put(
+                            (handler, event), timeout=_CRITICAL_PUT_TIMEOUT)
+                    except queue.Full:
+                        # Record AND keep going  losing the DB-logger
+                        # handler shouldn't lose the Telegram-alert one.
+                        self._emergency_log(event)
             else:
-                handlers = specific + list(self._wildcard)
-
-        if not handlers:
-            return
-
-        is_critical = event_type in _CRITICAL_EVENTS
-        if is_critical:
-            # Per-handler deadline so one slow/full slot doesn't starve the
-            # next. Each handler gets up to _CRITICAL_PUT_TIMEOUT seconds;
-            # queue.Full on one handler is recorded via _emergency_log but
-            # does NOT skip the remaining handlers.
-            for handler in handlers:
-                try:
-                    self._work_queue.put(
-                        (handler, event), timeout=_CRITICAL_PUT_TIMEOUT)
-                except queue.Full:
-                    # Record AND keep going  losing the DB-logger
-                    # handler shouldn't lose the Telegram-alert one.
-                    self._emergency_log(event)
-        else:
-            for handler in handlers:
-                try:
-                    self._work_queue.put_nowait((handler, event))
-                except queue.Full:
-                    pass
+                for handler in handlers:
+                    try:
+                        self._work_queue.put_nowait((handler, event))
+                    except queue.Full:
+                        pass
 
     def emit_sync(self, event_type: str, payload: dict = None,
                   emitted_by: str = "") -> None:
         if self._stopped:
             return
-        safe_payload = dict(payload or {})
+        safe_payload = _coerce_payload(payload)
         event = Event(event_type, safe_payload, emitted_by)
 
         with self._lock:
@@ -217,7 +254,10 @@ class EventBus:
 
         for handler in handlers:
             try:
-                handler(event.event_type, event.payload)
+                handler(
+                    event.event_type,
+                    _payload_for_handler(event.event_type, event.payload),
+                )
             except Exception as exc:
                 _log_handler_error(f"event_bus emit_sync {event.event_type}", exc)
 
@@ -235,14 +275,23 @@ class EventBus:
         t.start()
 
     def _worker(self) -> None:
-        while not self._stopped:
+        while True:
             try:
                 try:
-                    handler, event = self._work_queue.get(timeout=1.0)
+                    work_item = self._work_queue.get(timeout=1.0)
                 except queue.Empty:
+                    if self._stopped:
+                        return
                     continue
+                if work_item is _WORKER_STOP:
+                    self._work_queue.task_done()
+                    return
+                handler, event = work_item
                 try:
-                    handler(event.event_type, event.payload)
+                    handler(
+                        event.event_type,
+                        _payload_for_handler(event.event_type, event.payload),
+                    )
                 except Exception as exc:
                     _log_handler_error(f"event_bus worker {event.event_type}", exc)
                 finally:
@@ -255,11 +304,11 @@ class EventBus:
                 time.sleep(0.1)
 
     def _watchdog_loop(self) -> None:
-        while not self._stopped:
-            time.sleep(5.0)
+        while not self._shutdown_event.wait(5.0):
             alive = [t for t in self._worker_threads if t.is_alive()]
             missing = self._n_workers - len(alive)
-            if missing > 0 and not self._stopped:
+            if (missing > 0 and not self._stopped
+                    and not self._shutdown_event.is_set()):
                 self._worker_threads = alive
                 for _ in range(missing):
                     self._spawn_worker(len(self._worker_threads))
@@ -280,15 +329,53 @@ class EventBus:
             pass
 
     def shutdown(self, timeout: float = 5.0) -> None:
-        self._stopped = True
         deadline = time.monotonic() + max(0.0, float(timeout))
-        while time.monotonic() < deadline:
-            try:
-                if self._work_queue.unfinished_tasks == 0:
-                    return
-            except Exception:
-                return
-            time.sleep(0.05)
+        with self._shutdown_lock:
+            workers = list(self._worker_threads)
+            if not self._stopped:
+                # Stop the watchdog first, then place one FIFO sentinel behind
+                # all accepted work while publication is excluded. Workers do
+                # not observe ``_stopped`` until every wakeup is queued, so an
+                # idle worker cannot exit in the admission/sentinel gap.
+                with self._publish_lock:
+                    self._shutdown_event.set()
+                    workers = [thread for thread in self._worker_threads
+                               if thread.is_alive()]
+                    for _ in workers:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0.0:
+                            break
+                        try:
+                            self._work_queue.put(_WORKER_STOP, timeout=remaining)
+                        except queue.Full:
+                            break
+                    self._stopped = True
+
+            # Workers keep consuming already accepted work until the queue is
+            # drained or the caller's shutdown budget is exhausted.
+            current = threading.current_thread()
+            called_from_worker = current in workers
+            if not called_from_worker:
+                while time.monotonic() < deadline:
+                    try:
+                        if self._work_queue.unfinished_tasks == 0:
+                            break
+                    except Exception:
+                        break
+                    time.sleep(0.05)
+
+            self._shutdown_event.set()
+
+            for thread in workers + [self._watchdog]:
+                if thread is current:
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                try:
+                    thread.join(timeout=remaining)
+                except (RuntimeError, AttributeError):
+                    pass
 
     def __repr__(self) -> str:
         with self._lock:

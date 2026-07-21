@@ -180,6 +180,8 @@ def _aggregate_spot_sell_trades(bot, pair: str, target_amount: float) -> tuple[f
     fee_usdt = 0.0
     fees_known = True
     for t in reversed(trades):
+        if not isinstance(t, dict):
+            continue
         if _trade_side(t) != "sell":
             continue
         amt = _trade_amount(t)

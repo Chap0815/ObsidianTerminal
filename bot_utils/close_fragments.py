@@ -21,18 +21,28 @@ def _f(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _order_id_text_or_none(value: Any) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+    return text or None
+
+
 def pending_close_values(state: dict) -> tuple[float, float, float, str | None]:
     amount = max(0.0, _f(state.get("pending_close_filled_amount")))
     notional = max(0.0, _f(state.get("pending_close_notional_sum")))
     fee = _f(state.get("pending_close_fee"))
     fallback_price = max(0.0, _f(state.get("pending_close_price")))
-    price = (
-        (notional / amount)
-        if amount > 0 and notional > 0
-        else fallback_price
-    )
-    oid = state.get("pending_close_order_id")
-    return amount, price, fee, str(oid) if oid else None
+    price = (notional / amount) if amount > 0 and notional > 0 else fallback_price
+    if not math.isfinite(price):
+        amount = 0.0
+        price = 0.0
+        fee = 0.0
+    oid = _order_id_text_or_none(state.get("pending_close_order_id"))
+    return amount, price, fee, oid
 
 
 def add_close_fragment_update(
@@ -47,23 +57,48 @@ def add_close_fragment_update(
     price = max(0.0, _f(price))
     fee = _f(fee)
     prev_amount, _prev_price, prev_fee, prev_oid = pending_close_values(state)
-    prev_notional = max(0.0, _f(state.get("pending_close_notional_sum")))
+    prev_notional = (
+        max(0.0, _f(state.get("pending_close_notional_sum")))
+        if prev_amount > 0
+        else 0.0
+    )
     if prev_notional <= 0.0 and prev_amount > 0 and _prev_price > 0:
         prev_notional = prev_amount * _prev_price
+        if not math.isfinite(prev_notional):
+            prev_notional = 0.0
+            prev_amount = 0.0
+            prev_fee = 0.0
+            prev_oid = None
     elif prev_notional <= 0.0 and prev_amount > 0:
         prev_amount = 0.0
         prev_fee = 0.0
         prev_oid = None
 
+    fragment_notional = amount * price if amount > 0 else 0.0
+    if not math.isfinite(fragment_notional):
+        amount = 0.0
+        price = 0.0
+        fee = 0.0
+        fragment_notional = 0.0
+
     new_amount = prev_amount + amount
-    new_notional = prev_notional + (amount * price if amount > 0 else 0.0)
+    new_notional = prev_notional + fragment_notional
     new_fee = prev_fee + fee
+    if not all(math.isfinite(v) for v in (new_amount, new_notional, new_fee)):
+        new_amount = prev_amount
+        new_notional = prev_notional
+        new_fee = prev_fee
     avg_price = (new_notional / new_amount) if new_amount > 0 else price
-    oid = order_id or prev_oid
+    if not math.isfinite(avg_price):
+        new_amount = prev_amount
+        new_notional = prev_notional
+        new_fee = prev_fee
+        avg_price = _prev_price if prev_amount > 0 else 0.0
+    oid = _order_id_text_or_none(order_id) or prev_oid
     return {
         "pending_close_filled_amount": new_amount,
         "pending_close_notional_sum": new_notional,
         "pending_close_price": avg_price,
         "pending_close_fee": new_fee,
-        "pending_close_order_id": str(oid) if oid else None,
+        "pending_close_order_id": oid,
     }

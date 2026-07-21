@@ -14,15 +14,27 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from core.constants import UPDATE_LOG_BACKUPS, UPDATE_LOG_MAX_BYTES
+except Exception:
+    # Keep the external updater self-contained during partial/legacy updates.
+    UPDATE_LOG_MAX_BYTES = 10 * 1024 * 1024
+    UPDATE_LOG_BACKUPS = 2
+
 LOG_DIR = ROOT / "logs"
 LOG_PATH = LOG_DIR / "update_last.log"
 STATUS_PATH = LOG_DIR / "update_status.json"
+_UPDATE_LOG_LOCK = threading.Lock()
 
 
 def _now() -> str:
@@ -50,9 +62,32 @@ def _redact_text(value: object) -> str:
 
 
 def _append_log(message: str) -> None:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    with LOG_PATH.open("a", encoding="utf-8") as fh:
-        fh.write(f"[{_now()}] {_redact_text(message)}\n")
+    """Append a bounded diagnostic record without blocking the update path."""
+    try:
+        line = f"[{_now()}] {_redact_text(message)}\n"
+        try:
+            from core.logger import _rotate_if_needed
+        except Exception:
+            _rotate_if_needed = None
+        with _UPDATE_LOG_LOCK:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            if _rotate_if_needed is not None:
+                try:
+                    _rotate_if_needed(
+                        str(LOG_PATH),
+                        UPDATE_LOG_MAX_BYTES,
+                        UPDATE_LOG_BACKUPS,
+                    )
+                except Exception:
+                    # A maintenance failure must not suppress diagnostics or
+                    # turn an otherwise valid software update into a failure.
+                    pass
+            with LOG_PATH.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+    except Exception:
+        # Status JSON remains the authoritative UI signal if logging is not
+        # writable (read-only install, full disk, antivirus lock, etc.).
+        return
 
 
 def _write_status(
@@ -299,7 +334,13 @@ def _main_impl(args: argparse.Namespace) -> int:
         return rc
     except Exception as exc:
         _append_log(f"FEHLER: {exc}")
-        _write_status("failed", str(exc), 1)
+        try:
+            _write_status("failed", str(exc), 1)
+        except Exception as status_exc:
+            _append_log(
+                "Fehlerstatus konnte nicht geschrieben werden: "
+                f"{type(status_exc).__name__}: {status_exc}"
+            )
         return 1
     finally:
         if args.restart:

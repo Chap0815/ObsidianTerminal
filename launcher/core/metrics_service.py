@@ -316,33 +316,72 @@ def get_market_info():
     directly from alternative.me). The regime itself comes only from real
     scan rows (not CACHED_FG rows), so phase and btc_24h stay accurate.
     """
+    latest_plausible = (
+        datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=5)
+    ).strftime("%Y-%m-%d %H:%M:%S")
     # Regime + BTC from last real scan (not a CACHED_FG row)
     rows = query_db(
         "SELECT regime, btc_24h, fear_greed, timestamp "
         "FROM market_regime "
         "WHERE regime != 'CACHED_FG' AND btc_24h IS NOT NULL "
-        "ORDER BY timestamp DESC LIMIT 1"
+        "AND timestamp <= ? ORDER BY timestamp DESC LIMIT 25",
+        (latest_plausible,),
     )
     if not rows:
         return None
 
-    regime = rows[0][0]
-    btc_24h = float(rows[0][1])
-    fg_fallback = int(rows[0][2])
-    ts = rows[0][3]
+    market_row = None
+    for candidate in rows:
+        try:
+            regime, raw_btc, raw_fg, ts = candidate
+            if regime not in {"BULL", "BEAR", "NEUTRAL"}:
+                continue
+            if isinstance(raw_btc, bool) or not isinstance(raw_btc, (int, float)):
+                continue
+            btc_24h = float(raw_btc)
+            if not math.isfinite(btc_24h):
+                continue
+            if not isinstance(ts, str):
+                continue
+            parsed_ts = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+            if parsed_ts.strftime("%Y-%m-%d %H:%M:%S") != ts:
+                continue
+            fg_fallback = (
+                raw_fg
+                if type(raw_fg) is int and 0 <= raw_fg <= 100
+                else None
+            )
+            market_row = (regime, btc_24h, fg_fallback, ts)
+            break
+        except (TypeError, ValueError):
+            continue
+    if market_row is None:
+        return None
+    regime, btc_24h, fg_fallback, ts = market_row
 
     # Most current F&G from ANY market_regime row (incl. CACHED_FG)
     try:
         fg_rows = query_db(
             "SELECT fear_greed FROM market_regime "
-            "WHERE fear_greed IS NOT NULL "
-            "ORDER BY timestamp DESC LIMIT 1"
+            "WHERE fear_greed IS NOT NULL AND timestamp <= ? "
+            "ORDER BY timestamp DESC LIMIT 25",
+            (latest_plausible,),
         )
-        fg = int(fg_rows[0][0]) if fg_rows else fg_fallback
+        fg = next(
+            (
+                row[0]
+                for row in fg_rows
+                if row and type(row[0]) is int and 0 <= row[0] <= 100
+            ),
+            fg_fallback,
+        )
     except MetricsDbReadError:
         raise
     except Exception:
         fg = fg_fallback
+
+    if fg is None:
+        return None
 
     return {"regime": regime, "btc_24h": btc_24h, "fg": fg, "timestamp": ts}
 
@@ -475,16 +514,24 @@ def get_exchange_status() -> dict:
     'Bitget  Active' oder 'Binance  Idle (3m)'.
     """
     exch = _exchange_display_name()
+    status_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    latest_plausible = (status_now + timedelta(minutes=5)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
     def _delta_sec(ts_str: str) -> float:
         """Seconds since ``ts_str`` (UTC). Raises on parse error."""
         ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-        return (now_utc - ts).total_seconds()
+        delta = (status_now - ts).total_seconds()
+        if delta < -300.0:
+            raise ValueError("liveness timestamp is materially in the future")
+        return delta
 
     #  Primary: api_rate_global (written every scan cycle) 
     rows = query_db(
-        "SELECT called_at FROM api_rate_global ORDER BY called_at DESC LIMIT 1"
+        "SELECT called_at FROM api_rate_global WHERE called_at <= ? "
+        "ORDER BY called_at DESC LIMIT 1",
+        (latest_plausible,),
     )
     if rows:
         try:
@@ -499,7 +546,9 @@ def get_exchange_status() -> dict:
 
     #  Fallback: market_regime 
     rows = query_db(
-        "SELECT timestamp FROM market_regime ORDER BY timestamp DESC LIMIT 1"
+        "SELECT timestamp FROM market_regime WHERE timestamp <= ? "
+        "ORDER BY timestamp DESC LIMIT 1",
+        (latest_plausible,),
     )
     if not rows:
         return {"active": False, "label": f"{exch}  No data"}

@@ -15,11 +15,125 @@ Responsibilities:
 
 from __future__ import annotations
 
+import io
 import os
+import shutil
 import subprocess
 import sys
+import threading
 
+from core.constants import LAUNCHER_STDIO_MAX_BYTES
 from launcher.config.settings import PROJECT_ROOT, _get_python_exe
+
+
+class _BoundedTextStream:
+    """Line-buffered UTF-8 stream with in-session size rotation.
+
+    The open handle is truncated after copying its contents to ``.1``. This
+    avoids Windows rename failures caused by trying to rotate our own open
+    stdout/stderr handle.
+    """
+
+    encoding = "utf-8"
+    errors = "replace"
+
+    def __init__(self, path, *, max_bytes: int = LAUNCHER_STDIO_MAX_BYTES):
+        self.name = os.fspath(path)
+        self.mode = "a"
+        self._max_bytes = max(1, int(max_bytes))
+        self._lock = threading.RLock()
+        self._fh = open(
+            self.name,
+            self.mode,
+            buffering=1,
+            encoding=self.encoding,
+            errors=self.errors,
+        )
+        try:
+            self._size = os.path.getsize(self.name)
+        except OSError:
+            self._size = 0
+
+    @property
+    def closed(self) -> bool:
+        return self._fh.closed
+
+    def _rotate_open_file(self) -> None:
+        try:
+            self._fh.flush()
+        except OSError:
+            pass
+        try:
+            shutil.copyfile(self.name, self.name + ".1")
+        except OSError:
+            pass
+        try:
+            self._fh.seek(0)
+            self._fh.truncate(0)
+            self._size = 0
+        except OSError:
+            try:
+                self._size = os.path.getsize(self.name)
+            except OSError:
+                pass
+
+    def write(self, value: str) -> int:
+        if not isinstance(value, str):
+            raise TypeError(f"write() argument must be str, not {type(value).__name__}")
+        requested_chars = len(value)
+        encoded = value.encode(self.encoding, errors=self.errors)
+        truncated = len(encoded) > self._max_bytes
+        if truncated:
+            start = len(encoded) - self._max_bytes
+            # Move to the next UTF-8 code-point boundary. Retaining the newest
+            # complete suffix keeps the sink bounded without creating an
+            # undecodable log file.
+            while start < len(encoded) and encoded[start] & 0xC0 == 0x80:
+                start += 1
+            encoded = encoded[start:]
+            value = encoded.decode(self.encoding)
+        encoded_size = len(encoded)
+        with self._lock:
+            if self._size and self._size + encoded_size > self._max_bytes:
+                self._rotate_open_file()
+            try:
+                written = self._fh.write(value)
+                self._size += encoded_size
+                return requested_chars if truncated else written
+            except OSError:
+                # A diagnostic sink must not crash the launcher on a full or
+                # temporarily locked volume.
+                return requested_chars
+
+    def flush(self) -> None:
+        with self._lock:
+            try:
+                self._fh.flush()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._fh.closed:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+
+    def fileno(self) -> int:
+        return self._fh.fileno()
+
+    def isatty(self) -> bool:
+        return False
+
+    def readable(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
 
 
 def _ensure_std_streams() -> None:
@@ -28,14 +142,10 @@ def _ensure_std_streams() -> None:
     Under ``pythonw.exe`` there is no console, so ``sys.stderr`` and
     ``sys.stdout`` are ``None``  any later ``sys.stderr.write(...)`` would
     crash. This runs BEFORE anything else that might log and points both
-    streams at ``logs/launcher_stdio.log``, rotating that file to ``.1``
-    once it grows past 10 MB (best-effort rename on Windows, truncate on
-    failure) so it can't fill the disk over a long-running session.
+    streams at ``logs/launcher_stdio.log``. Startup rotation handles an old
+    oversized file; the bounded stream also rotates during the same process,
+    so one long-running launcher cannot grow the file indefinitely.
     """
-    import io
-
-    from launcher.config.settings import PROJECT_ROOT
-
     log_dir = os.path.join(PROJECT_ROOT, "logs")
     try:
         os.makedirs(log_dir, exist_ok=True)
@@ -44,9 +154,11 @@ def _ensure_std_streams() -> None:
     log_path = os.path.join(log_dir, "launcher_stdio.log")
 
     # rotate if oversized (keep one backup)
-    _MAX_BYTES = 10 * 1024 * 1024  # 10 MB
     try:
-        if os.path.exists(log_path) and os.path.getsize(log_path) > _MAX_BYTES:
+        if (
+            os.path.exists(log_path)
+            and os.path.getsize(log_path) > LAUNCHER_STDIO_MAX_BYTES
+        ):
             backup = log_path + ".1"
             try:
                 if os.path.exists(backup):
@@ -68,18 +180,18 @@ def _ensure_std_streams() -> None:
 
     def _open_fallback():
         try:
-            # Line-buffered, append, UTF-8 with error replacement so a
-            # bad byte in an upstream exception message never poisons
-            # the stream.
-            return open(log_path, "a", buffering=1,
-                          encoding="utf-8", errors="replace")
+            return _BoundedTextStream(log_path)
         except Exception:
             return io.StringIO()  # last-resort in-memory sink
 
-    if sys.stderr is None:
-        sys.stderr = _open_fallback()
-    if sys.stdout is None:
-        sys.stdout = _open_fallback()
+    if sys.stderr is None or sys.stdout is None:
+        # One shared handle avoids Windows rotation/truncation races between
+        # independently opened stdout and stderr streams.
+        fallback = _open_fallback()
+        if sys.stderr is None:
+            sys.stderr = fallback
+        if sys.stdout is None:
+            sys.stdout = fallback
 
 
 def _relaunch_windowless() -> bool:

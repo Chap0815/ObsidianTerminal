@@ -28,8 +28,10 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+from shared_limits import normalize_gate_mode
 from core.futures_bot import FuturesBot
 from core.cross_bot import _is_crypto_base   # shared crypto-only perp filter
+from bot_utils.order_utils import order_id_text_or_none
 from trading.trend_signal import is_in_trend, params_from_cfg, has_full_history
 from trading.entry_quality import EntryQuality, score_futrend_entry
 from trading.vol_target import (realized_vol, vol_target_multiplier,
@@ -49,14 +51,15 @@ class TrendFuturesBot(FuturesBot):
     #  Config helpers 
     def _f(self, key, default):
         try:
-            return float(self.C(key, default))
-        except (TypeError, ValueError):
+            value = float(self.C(key, default))
+        except (TypeError, ValueError, OverflowError):
             return default
+        return value if math.isfinite(value) else default
 
     def _i(self, key, default):
         try:
-            return int(float(self.C(key, default)))
-        except (TypeError, ValueError):
+            return int(self._f(key, float(default)))
+        except (TypeError, ValueError, OverflowError):
             return default
 
     def _entry_quality_min_score(self) -> float:
@@ -838,14 +841,14 @@ class TrendFuturesBot(FuturesBot):
         )
         if not self.simulation:
             from trading.entry_admission import evaluate_entry_admission
-            from trading.portfolio_risk import PortfolioLimits
+            from trading.portfolio_risk import portfolio_limits_from_config
 
-            portfolio_mode = str(
-                self.C("PORTFOLIO_RISK_MODE", "shadow") or "shadow"
-            ).strip().lower()
-            expectancy_mode = str(
-                self.C("NET_EXPECTANCY_MODE", "shadow") or "shadow"
-            ).strip().lower()
+            portfolio_mode = normalize_gate_mode(
+                self.C("PORTFOLIO_RISK_MODE", "shadow")
+            )
+            expectancy_mode = normalize_gate_mode(
+                self.C("NET_EXPECTANCY_MODE", "shadow")
+            )
             admission = evaluate_entry_admission(
                 exchange=self.ex,
                 intent_id=entry_id,
@@ -856,13 +859,7 @@ class TrendFuturesBot(FuturesBot):
                 portfolio_mode=portfolio_mode,
                 expectancy_mode=expectancy_mode,
                 features=expectancy_features,
-                limits=PortfolioLimits(
-                    max_gross_pct=float(self.C("PORTFOLIO_MAX_GROSS_PCT", 100.0)),
-                    max_net_pct=float(self.C("PORTFOLIO_MAX_NET_PCT", 75.0)),
-                    min_free_pct=float(self.C("PORTFOLIO_MIN_FREE_PCT", 20.0)),
-                    max_cluster_pct=float(self.C("PORTFOLIO_MAX_CLUSTER_PCT", 35.0)),
-                    max_beta_pct=float(self.C("PORTFOLIO_MAX_BETA_PCT", 75.0)),
-                ),
+                limits=portfolio_limits_from_config(self.C),
             )
             try:
                 log_struct(
@@ -1246,12 +1243,15 @@ class TrendFuturesBot(FuturesBot):
         if amount > 0:
             return amount, fill, False, "order"
 
-        oid = (order or {}).get("id") or (order or {}).get("orderId")
+        oid = (
+            order_id_text_or_none((order or {}).get("id"))
+            or order_id_text_or_none((order or {}).get("orderId"))
+        )
         if oid:
             for attempt in range(2):
                 time.sleep(0.4 * (1 + attempt))
                 try:
-                    refreshed = self.ex.fetch_order(str(oid), full) or {}
+                    refreshed = self.ex.fetch_order(oid, full) or {}
                 except Exception:
                     continue
                 rf = self._safe_float(refreshed.get("filled"), 0.0)
@@ -1719,7 +1719,10 @@ class TrendFuturesBot(FuturesBot):
                     self._log_error(f"trend close {base}", e)
                     return
             if not live_close_already_verified:
-                exch_oid = order.get("id") or order.get("orderId")
+                exch_oid = (
+                    order_id_text_or_none(order.get("id"))
+                    or order_id_text_or_none(order.get("orderId"))
+                )
                 try:
                     from bot_utils.futures_exits import _resolve_fill_price
                     close_price, _fill_src = _resolve_fill_price(

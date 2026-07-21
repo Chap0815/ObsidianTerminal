@@ -8,6 +8,8 @@ to the same vocabulary.
 
 from __future__ import annotations
 
+import math
+
 from trading.market_filters import get_fear_greed
 from news.llm_utils import (
     llm_available,
@@ -46,12 +48,34 @@ _FALLBACK_PROMPT = (
 )
 
 
+def _finite_float(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _finite_metric(value, default: float = 0.0) -> float | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    return _finite_float(value)
+
+
+def _invalid_market_data_result() -> str:
+    return "[Input Validation] Invalid numeric market data.\nRESULT: WAIT"
+
+
 def _futures_keyword_fallback(symbol, news, change, rsi_1h):
     """Keyword fallback for futures  picks LONG / SHORT / WAIT.
 
     Uses the shared BEARISH_KEYWORDS vocabulary so a hack event triggers the
     same response across all bots."""
-    news_lower = (news or "").lower()
+    news_lower = news.lower() if isinstance(news, str) else ""
+    change = _finite_float(change)
+    rsi_1h = _finite_float(rsi_1h)
     found_bearish = [kw for kw in BEARISH_KEYWORDS if kw in news_lower]
 
     if found_bearish:
@@ -61,6 +85,8 @@ def _futures_keyword_fallback(symbol, news, change, rsi_1h):
             f"RESULT: SHORT"
         )
 
+    if change is None or rsi_1h is None:
+        return "[Keyword Fallback] Invalid indicators.\nRESULT: WAIT"
     if change > 20 and rsi_1h > 75:
         return (
             "[Keyword Fallback] Large pump + overbought RSI  "
@@ -104,6 +130,46 @@ def analyze_sentiment(
     fg = get_fear_greed()
     if market_regime is None:
         market_regime = {"regime": "NEUTRAL", "btc_24h": 0.0, "btc_7d": 0.0}
+    if not isinstance(market_regime, dict):
+        return _invalid_market_data_result()
+
+    metrics = tuple(
+        _finite_metric(value)
+        for value in (
+            price,
+            change,
+            rsi_15m,
+            rsi_1h,
+            rsi_4h,
+            funding_rate,
+            oi_change,
+            market_regime.get("btc_24h"),
+            market_regime.get("btc_7d"),
+            open_interest_usdt,
+        )
+    )
+    if any(value is None for value in metrics):
+        return _invalid_market_data_result()
+    (
+        price_value,
+        change_value,
+        rsi_15m_value,
+        rsi_1h_value,
+        rsi_4h_value,
+        funding_rate_value,
+        oi_change_pct,
+        btc_24h,
+        btc_7d,
+        open_interest_value,
+    ) = metrics
+    if isinstance(leverage, bool):
+        return _invalid_market_data_result()
+    try:
+        leverage_value = int(leverage or 1)
+    except (TypeError, ValueError, OverflowError):
+        return _invalid_market_data_result()
+    if leverage_value <= 0:
+        return _invalid_market_data_result()
 
     template = load_prompt_template(
         _PROMPT_FILE, _DEFAULT_FILE, fallback=_FALLBACK_PROMPT
@@ -115,11 +181,6 @@ def analyze_sentiment(
         reflection = get_reflection_context(_BOT_NAME)
     except Exception:
         reflection = ""
-
-    try:
-        oi_change_pct = float(oi_change or 0)
-    except (TypeError, ValueError):
-        oi_change_pct = 0.0
 
     if screener_direction in ("LONG", "SHORT"):
         opposite = "SHORT" if screener_direction == "LONG" else "LONG"
@@ -138,23 +199,23 @@ def analyze_sentiment(
 
     fill_data = {
         "symbol": symbol,
-        "price": float(price or 0),
-        "change": f"{float(change or 0):+.2f}",
-        "rsi_15m": f"{float(rsi_15m or 0):.1f}",
-        "rsi_1h": f"{float(rsi_1h or 0):.1f}",
-        "rsi_4h": f"{float(rsi_4h or 0):.1f}",
-        "funding_rate": float(funding_rate or 0),
+        "price": price_value,
+        "change": f"{change_value:+.2f}",
+        "rsi_15m": f"{rsi_15m_value:.1f}",
+        "rsi_1h": f"{rsi_1h_value:.1f}",
+        "rsi_4h": f"{rsi_4h_value:.1f}",
+        "funding_rate": funding_rate_value,
         "oi_change": oi_change_pct,
-        "news": news or "No news available.",
+        "news": news if isinstance(news, str) and news else "No news available.",
         "regime": market_regime.get("regime", "NEUTRAL"),
-        "btc_24h": float(market_regime.get("btc_24h", 0.0) or 0),
+        "btc_24h": btc_24h,
         "screener_context": screener_context,
         # Legacy keys for old prompts that still have these placeholders
-        "leverage": int(leverage or 1),
-        "btc_7d": float(market_regime.get("btc_7d", 0.0) or 0),
+        "leverage": leverage_value,
+        "btc_7d": btc_7d,
         "fg": fg,
         "fg_label": str(market_regime.get("fg_label", "Neutral")),
-        "open_interest_usdt": float(open_interest_usdt or 0),
+        "open_interest_usdt": open_interest_value,
         "liq_long_pct": 0.0,
         "liq_short_pct": 0.0,
     }
@@ -211,9 +272,11 @@ def analyze_sentiment(
                     verdict = "PROCEED"
                 if verdict == "OVERRIDE_WAIT":
                     parsed["direction"] = "WAIT"
-                    parsed.setdefault("rationale", "")
+                    current_rationale = parsed.get("rationale")
+                    if not isinstance(current_rationale, str):
+                        current_rationale = ""
                     parsed["rationale"] = (
-                        (parsed["rationale"] + " | ") if parsed["rationale"] else ""
+                        (current_rationale + " | ") if current_rationale else ""
                     ) + "Bull/Bear override: risks outweigh setup"
                     log_event(
                         f"[{symbol}] LLM decision: WAIT (Bull/Bear override)", "INFO"
@@ -276,7 +339,7 @@ def parse_direction_and_confidence(llm_response: str):
     1. New simple JSON: {"direction": "LONG", "confidence": "HIGH", ...}
     2. Old free-text:   ends with "RESULT: LONG"
     """
-    if not llm_response:
+    if not isinstance(llm_response, str) or not llm_response:
         return ("WAIT", "LOW")
 
     # Try new JSON format first

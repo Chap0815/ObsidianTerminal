@@ -110,7 +110,7 @@ class BotProcess:
             else:
                 argv = [_get_python_exe(), "-u", self.script]
 
-            self.proc = subprocess.Popen(
+            spawned_proc = subprocess.Popen(
                 argv,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 # Python 3.13: bufsize=1 (line-buffered) raises RuntimeWarning
@@ -119,8 +119,20 @@ class BotProcess:
                 text=True, bufsize=-1, encoding="utf-8", errors="replace",
                 env=env, cwd=PROJECT_ROOT, **kw
             )
+            self.proc = spawned_proc
             self.start_config = current_config_snapshot
-            threading.Thread(target=self._reader, daemon=True).start()
+            try:
+                threading.Thread(
+                    target=self._reader,
+                    args=(spawned_proc,),
+                    daemon=True,
+                ).start()
+            except Exception:
+                self._rollback_failed_start(spawned_proc)
+                if self.proc is spawned_proc:
+                    self.proc = None
+                self.run_id = None
+                raise
 
     # Graceful-close budget breakdown (must exceed bot.SHUTDOWN_DEADLINE_SEC):
     #  45s  bot's emergency-close deadline (closing positions)
@@ -129,6 +141,25 @@ class BotProcess:
     # Total budget: 75s.
     _GRACEFUL_TIMEOUT_SEC: float = 75.0
     _FORCE_KILL_TIMEOUT_SEC: float = 5.0
+
+    def _rollback_failed_start(self, proc: subprocess.Popen) -> None:
+        """Reap a child whose stdout reader could not be started."""
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=self._FORCE_KILL_TIMEOUT_SEC)
+            except Exception:
+                pass
+        finally:
+            stdout = getattr(proc, "stdout", None)
+            if stdout is not None:
+                try:
+                    stdout.close()
+                except Exception:
+                    pass
 
     def _mark_runtime_stopped(self, returncode=None, *,
                               expected_run_id: str | None = None,
@@ -308,22 +339,28 @@ class BotProcess:
 
     #  Stdout reader 
 
-    def _reader(self) -> None:
-        proc = self.proc
+    def _reader(self, proc: subprocess.Popen) -> None:
         if not proc or not proc.stdout:
             return
-        for line in proc.stdout:
-            line = line.rstrip("\n").rstrip("\r")
-            if line and "\r" not in line:
-                # Drop-oldest policy: if the queue is full, ditch the
-                # oldest line and append the new one. Without this the
-                # reader could block forever and new logs would stop
-                # appearing in the UI.
-                try:
-                    self.log_queue.put_nowait(line)
-                except queue.Full:
+        stdout = proc.stdout
+        try:
+            for line in stdout:
+                line = line.rstrip("\n").rstrip("\r")
+                if line and "\r" not in line:
+                    # Drop-oldest policy: if the queue is full, ditch the
+                    # oldest line and append the new one. Without this the
+                    # reader could block forever and new logs would stop
+                    # appearing in the UI.
                     try:
-                        self.log_queue.get_nowait()   # drop oldest
                         self.log_queue.put_nowait(line)
-                    except (queue.Empty, queue.Full):
-                        pass
+                    except queue.Full:
+                        try:
+                            self.log_queue.get_nowait()   # drop oldest
+                            self.log_queue.put_nowait(line)
+                        except (queue.Empty, queue.Full):
+                            pass
+        finally:
+            try:
+                stdout.close()
+            except Exception:
+                pass

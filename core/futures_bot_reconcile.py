@@ -70,7 +70,10 @@ def _is_true_bool(value) -> bool:
 
 
 def _is_reduce_only_trade(t: dict) -> bool:
-    info = t.get("info", {}) or {}
+    if not isinstance(t, dict):
+        return False
+    raw_info = t.get("info")
+    info = raw_info if isinstance(raw_info, dict) else {}
     raw_reduce_only = (
         info.get("reduceOnly")
         if "reduceOnly" in info else info.get("reduce_only")
@@ -82,7 +85,10 @@ def _is_reduce_only_trade(t: dict) -> bool:
 
 
 def _trade_side(t: dict) -> str:
-    info = t.get("info", {}) or {}
+    if not isinstance(t, dict):
+        return ""
+    raw_info = t.get("info")
+    info = raw_info if isinstance(raw_info, dict) else {}
     return str(t.get("side") or info.get("side") or "").strip().lower()
 
 
@@ -177,6 +183,8 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
     fees_known = True
     used_side_fallback = False
     for t in reversed(trades):
+        if not isinstance(t, dict):
+            continue
         is_reduce = _is_reduce_only_trade(t)
         if not _is_close_trade_for_position(t, pos_type):
             continue
@@ -561,7 +569,12 @@ class FuturesReconcileMixin:
                 contracts = _position_contracts_or_none(p)
                 if contracts is None or contracts <= 0:
                     continue
-                full_sym = p.get("symbol", "")
+                full_sym = p.get("symbol")
+                if not isinstance(full_sym, str):
+                    continue
+                full_sym = full_sym.strip()
+                if not full_sym:
+                    continue
                 base = full_sym.split("/")[0] if "/" in full_sym else full_sym
                 if base:
                     exchange_open[base] = p
@@ -1009,7 +1022,12 @@ class FuturesReconcileMixin:
             self._log_error(f"reconcile re-fetch {sym}", e)
             return True  # can't confirm closed  conservative: defer
         for p in poss or []:
-            if (p.get("symbol") or "") != full:
+            if not isinstance(p, dict):
+                return True
+            position_symbol = p.get("symbol")
+            if not isinstance(position_symbol, str):
+                return True
+            if position_symbol != full:
                 continue
             contracts = _position_contracts_or_none(p)
             if contracts is None:

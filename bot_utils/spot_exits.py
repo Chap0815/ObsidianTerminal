@@ -8,7 +8,11 @@ import math
 from decimal import Decimal, ROUND_DOWN
 from typing import Tuple, Callable, Optional
 
-from bot_utils.order_utils import extract_fill_price, extract_order_fee
+from bot_utils.order_utils import (
+    extract_fill_price,
+    extract_order_fee,
+    order_id_text_or_none,
+)
 
 _EMERGENCY_RESIDUAL_DUST_USDT = 1.0
 
@@ -28,6 +32,13 @@ def _finite_float(value, default: float = 0.0) -> float:
 def _positive_finite(value, default: float = 0.0) -> float:
     parsed = _finite_float(value, default)
     return parsed if parsed > 0 else default
+
+
+def _external_text(value) -> str:
+    try:
+        return str(value).strip().lower()
+    except Exception:
+        return ""
 
 
 def _positive_finite_decimal(value) -> Optional[Decimal]:
@@ -212,7 +223,7 @@ def _remove_accounted_state(state, sym: str, restore_fields: dict) -> bool:
 def _order_has_open_remainder(order) -> bool:
     if not isinstance(order, dict):
         return False
-    status = str(order.get("status") or "").strip().lower()
+    status = _external_text(order.get("status"))
     if status in ("closed", "canceled", "cancelled", "expired", "rejected"):
         return False
     if status in ("open", "new", "partially_filled", "partiallyfilled"):
@@ -535,7 +546,10 @@ def emergency_close_all_spot(*,
                                 f"  [LIVE] {sym}: sell order did NOT fill "
                                 f"(still in wallet)  sell MANUALLY!", "WARN")
                             continue
-                        exch_oid = order.get("id") or order.get("orderId")
+                        exch_oid = (
+                            order_id_text_or_none(order.get("id"))
+                            or order_id_text_or_none(order.get("orderId"))
+                        )
                         sold_amount = _filled_base_amount(order, _sold, amount)
                         fill_price = _positive_finite(
                             extract_fill_price(order, curr), curr)
@@ -591,14 +605,6 @@ def emergency_close_all_spot(*,
                     ))
                     if not accounting_ok:
                         raise RuntimeError("save_trade_db returned False")
-                    save_trade(
-                        log_dir=log_dir, symbol=sym,
-                        buy_price=buy_price, buy_time=buy_time,
-                        sell_price=fill_price, profit_pct=profit_pct,
-                        profit_usdt=profit_usdt,
-                        reason=f"Emergency Close ({reason})"
-                    )
-                    log_sell(bot_name, sym, profit_pct, profit_usdt, "Emergency Close")
                 except Exception as e:
                     log_event(
                         f"  DB accounting for {sym} failed after close: {e}. "
@@ -662,6 +668,48 @@ def emergency_close_all_spot(*,
                             "WARN")
                     failed.append(f"{sym}: accounting failed after close")
                     continue
+
+                # The canonical DB booking is authoritative. Optional file and
+                # console logs must never turn an already-booked close into a
+                # false accounting_pending retry.
+                try:
+                    save_trade(
+                        log_dir=log_dir, symbol=sym,
+                        buy_price=buy_price, buy_time=buy_time,
+                        sell_price=fill_price, profit_pct=profit_pct,
+                        profit_usdt=profit_usdt,
+                        reason=f"Emergency Close ({reason})"
+                    )
+                except Exception as e:
+                    log_event(
+                        f"  File trade log for {sym} could not be saved "
+                        f"({type(e).__name__})",
+                        "WARN",
+                    )
+                    if error_logger:
+                        try:
+                            error_logger(f"emergency file log {sym}", e)
+                        except Exception:
+                            pass
+                try:
+                    log_sell(
+                        bot_name,
+                        sym,
+                        profit_pct,
+                        profit_usdt,
+                        "Emergency Close",
+                    )
+                except Exception as e:
+                    log_event(
+                        f"  Sell log for {sym} could not be written "
+                        f"({type(e).__name__})",
+                        "WARN",
+                    )
+                    if error_logger:
+                        try:
+                            error_logger(f"emergency sell log {sym}", e)
+                        except Exception:
+                            pass
 
                 # A balance-capped emergency sell can partial-fill. Keep a
                 # meaningful remainder in state with its original cost basis.

@@ -32,6 +32,8 @@ import threading
 import time
 from typing import Optional
 
+from shared_limits import API_RATE_HARD_MAX_PER_MINUTE
+
 
 def _read_limit_from_env(default: int = 300) -> int:
     raw = os.getenv("API_BUDGET_PER_MINUTE", "").strip()
@@ -39,14 +41,40 @@ def _read_limit_from_env(default: int = 300) -> int:
         return default
     try:
         v = int(raw)
-        if v < 10:
+        if not 10 <= v <= API_RATE_HARD_MAX_PER_MINUTE:
             return default
         return v
     except (TypeError, ValueError):
         return default
 
 
+def _read_expected_bot_count(default: int = 3) -> int:
+    try:
+        count = int(os.environ.get("API_EXPECTED_BOT_COUNT", str(default)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return count if count >= 1 else default
+
+
 MAX_API_CALLS_PER_MINUTE = _read_limit_from_env()
+
+
+def _validated_endpoint(value) -> str:
+    if not isinstance(value, str):
+        raise ValueError("endpoint must be text")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("endpoint contains control characters")
+    endpoint = value.strip()
+    if len(endpoint) > 256:
+        raise ValueError("endpoint exceeds 256 characters")
+    return endpoint
+
+
+def _validated_ok(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value not in (0, 1):
+        raise ValueError("ok must be 0 or 1")
+    return value
+
 
 # Process-local fallback counter  used only if SQLite is unreachable.
 _call_log_fallback: list = []
@@ -64,7 +92,15 @@ def _resolve_bot_name() -> str:
     """Read BOT_NAME from env once (set by the launcher per subprocess)."""
     global _bot_name_cache
     if _bot_name_cache is None:
-        _bot_name_cache = os.getenv("BOT_NAME", "unknown")
+        raw = os.getenv("BOT_NAME", "")
+        candidate = raw.strip().upper()
+        if (
+            not candidate
+            or len(candidate) > 64
+            or any(ord(char) < 32 or ord(char) == 127 for char in raw)
+        ):
+            candidate = "UNKNOWN"
+        _bot_name_cache = candidate
     return _bot_name_cache
 
 
@@ -97,6 +133,7 @@ def record_api_call(endpoint: str = "") -> None:
     launcher see a unified count. Falls back to a process-local counter only if
     SQLite is unreachable for >30s.
     """
+    endpoint = _validated_endpoint(endpoint)
     now_mono = time.monotonic()
     _fallback_record(now_mono)
 
@@ -111,7 +148,7 @@ def record_api_call(endpoint: str = "") -> None:
         # two bots both pass the gate and both consume.
         check_and_consume_global_api(
             _resolve_bot_name(),
-            endpoint=endpoint or "",
+            endpoint=endpoint,
             max_per_minute=10_000_000,
             ok=1,
         )
@@ -121,6 +158,7 @@ def record_api_call(endpoint: str = "") -> None:
 
 def record_api_error(endpoint: str = "") -> None:
     """Like ``record_api_call`` but ``ok=0`` for error-rate tracking."""
+    endpoint = _validated_endpoint(endpoint)
     now_mono = time.monotonic()
     _fallback_record(now_mono)
 
@@ -131,7 +169,7 @@ def record_api_error(endpoint: str = "") -> None:
         from core.database import check_and_consume_global_api
         check_and_consume_global_api(
             _resolve_bot_name(),
-            endpoint=endpoint or "",
+            endpoint=endpoint,
             max_per_minute=10_000_000,
             ok=0,
         )
@@ -163,11 +201,13 @@ def budget_remaining() -> int:
             _win_now = datetime.now(timezone.utc)
         cutoff = (_win_now - timedelta(seconds=60)
                    ).strftime("%Y-%m-%d %H:%M:%S")
+        now_str = _win_now.strftime("%Y-%m-%d %H:%M:%S")
         conn = _tight_connection()
         try:
             row = conn.execute(
-                "SELECT COUNT(*) FROM api_rate_global WHERE called_at >= ?",
-                (cutoff,)
+                "SELECT COUNT(*) FROM api_rate_global "
+                "WHERE called_at >= ? AND called_at <= ?",
+                (cutoff, now_str),
             ).fetchone()
             count = row[0] if row else 0
             return max(0, MAX_API_CALLS_PER_MINUTE - count)
@@ -204,20 +244,22 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
     outage; this is intentional  we'd rather refuse some calls than
     over-fire and trigger an IP ban.
     """
+    endpoint = _validated_endpoint(endpoint)
+    ok = _validated_ok(ok)
+    if not isinstance(critical, bool):
+        raise ValueError("critical must be boolean")
+
     now_mono = time.monotonic()
 
     # Per-process fallback divisor: bot count from API_EXPECTED_BOT_COUNT env
     # (default 3) so the per-process cap matches how many bots actually run.
-    try:
-        _N_BOTS = max(1, int(os.environ.get("API_EXPECTED_BOT_COUNT", "3")))
-    except (TypeError, ValueError):
-        _N_BOTS = 3
+    expected_bot_count = _read_expected_bot_count()
 
     if not _db_available():
         # Process-local fallback. Conservative: each process enforces
         # its OWN budget so N bots at MAX/N each  MAX global.
         used = _fallback_count(now_mono)
-        per_proc_cap = max(1, MAX_API_CALLS_PER_MINUTE // _N_BOTS)
+        per_proc_cap = max(1, MAX_API_CALLS_PER_MINUTE // expected_bot_count)
         if used >= per_proc_cap:
             # exit-critical calls (price for an OPEN position, close/verify)
             # must NOT be starved by the budget  a missed stop-loss is far
@@ -254,7 +296,7 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
         # On unexpected exception, prefer fail-open with a per-proc
         # cap so trading continues during transient DB issues.
         used = _fallback_count(now_mono)
-        per_proc_cap = max(1, MAX_API_CALLS_PER_MINUTE // _N_BOTS)
+        per_proc_cap = max(1, MAX_API_CALLS_PER_MINUTE // expected_bot_count)
         if used >= per_proc_cap:
             if critical:   # never starve exit-critical calls
                 _fallback_record(now_mono)
@@ -262,4 +304,3 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
             return False
         _fallback_record(now_mono)
         return True
-

@@ -24,7 +24,9 @@ import math
 import time
 from typing import Dict, List, Optional, Tuple
 
+from shared_limits import normalize_gate_mode
 from core.futures_bot import FuturesBot
+from bot_utils.order_utils import order_id_text_or_none
 from trading.xsec_signal import XSecParams, compute_target_book
 
 
@@ -75,8 +77,11 @@ class CrossBot(FuturesBot):
         # denominator track 2xK so "Open: 8/8" (not a misleading "8/12") for K=4.
         if key == "MAX_OPEN_TRADES":
             try:
-                return 2 * int(float(super().C("XSEC_K", 6)))
-            except (TypeError, ValueError):
+                raw_k = float(super().C("XSEC_K", 6))
+                if not math.isfinite(raw_k):
+                    raise ValueError("XSEC_K must be finite")
+                return 2 * int(raw_k)
+            except (TypeError, ValueError, OverflowError):
                 return 12
         return super().C(key, default)
 
@@ -84,8 +89,11 @@ class CrossBot(FuturesBot):
     def _xsec_params(self) -> XSecParams:
         def _i(k, d):
             try:
-                return int(float(self.C(k, d)))
-            except (TypeError, ValueError):
+                value = float(self.C(k, d))
+                if not math.isfinite(value):
+                    return d
+                return int(value)
+            except (TypeError, ValueError, OverflowError):
                 return d
         def _b(k, d):
             v = self.C(k, d)
@@ -99,9 +107,10 @@ class CrossBot(FuturesBot):
 
     def _f(self, key, default):
         try:
-            return float(self.C(key, default))
-        except (TypeError, ValueError):
+            value = float(self.C(key, default))
+        except (TypeError, ValueError, OverflowError):
             return default
+        return value if math.isfinite(value) else default
 
     def _entry_quality_min_score(self) -> float:
         raw = self._f("ENTRY_QUALITY_MIN_SCORE", 75.0)
@@ -433,6 +442,13 @@ class CrossBot(FuturesBot):
             return default
 
     @staticmethod
+    def _safe_exchange_text(value) -> str:
+        try:
+            return str(value).strip().lower()
+        except Exception:
+            return ""
+
+    @staticmethod
     def _precision_amount_or_none(value):
         if isinstance(value, bool):
             return None
@@ -495,15 +511,18 @@ class CrossBot(FuturesBot):
     def _exchange_position_type(self, pos: dict) -> str:
         info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
         for key in ("side", "positionSide", "posSide", "holdSide", "direction"):
-            value = str(pos.get(key) or info.get(key) or "").strip().lower()
-            if value in {"long", "buy"}:
-                return "LONG"
-            if value in {"short", "sell"}:
-                return "SHORT"
-        try:
-            raw = float(pos.get("contracts") or pos.get("size") or 0.0)
-        except (TypeError, ValueError):
-            raw = 0.0
+            for raw_value in (pos.get(key), info.get(key)):
+                value = CrossBot._safe_exchange_text(raw_value)
+                if value in {"long", "buy"}:
+                    return "LONG"
+                if value in {"short", "sell"}:
+                    return "SHORT"
+        raw = 0.0
+        for field in ("contracts", "size"):
+            parsed = CrossBot._safe_float(self, pos.get(field), 0.0)
+            if parsed != 0.0:
+                raw = parsed
+                break
         if raw < 0:
             return "SHORT"
         return ""
@@ -520,12 +539,15 @@ class CrossBot(FuturesBot):
         if amount > 0:
             return amount, fill, False, "order"
 
-        oid = (order or {}).get("id") or (order or {}).get("orderId")
+        oid = (
+            order_id_text_or_none((order or {}).get("id"))
+            or order_id_text_or_none((order or {}).get("orderId"))
+        )
         if oid:
             for attempt in range(2):
                 time.sleep(0.4 * (1 + attempt))
                 try:
-                    refreshed = self.ex.fetch_order(str(oid), full) or {}
+                    refreshed = self.ex.fetch_order(oid, full) or {}
                 except Exception:
                     continue
                 rf = self._safe_float(refreshed.get("filled"), 0.0)
@@ -655,7 +677,9 @@ class CrossBot(FuturesBot):
                 remove_open_position(self.BOT_NAME, base)
             return False
 
-        expected_side = str(d.get("position_type") or "").upper()
+        expected_side = CrossBot._safe_exchange_text(
+            d.get("position_type")
+        ).upper()
         actual_side = self._exchange_position_type(pos)
         if expected_side in {"LONG", "SHORT"}:
             if not actual_side:
@@ -1844,15 +1868,15 @@ class CrossBot(FuturesBot):
                     reason="precision_amount", direction=side)
                 return
             from trading.entry_admission import evaluate_entry_admission
-            from trading.portfolio_risk import PortfolioLimits
+            from trading.portfolio_risk import portfolio_limits_from_config
 
             cfg = getattr(self, "cfg", {}) or {}
-            portfolio_mode = str(
-                cfg.get("PORTFOLIO_RISK_MODE", "shadow") or "shadow"
-            ).strip().lower()
-            expectancy_mode = str(
-                cfg.get("NET_EXPECTANCY_MODE", "shadow") or "shadow"
-            ).strip().lower()
+            portfolio_mode = normalize_gate_mode(
+                cfg.get("PORTFOLIO_RISK_MODE", "shadow")
+            )
+            expectancy_mode = normalize_gate_mode(
+                cfg.get("NET_EXPECTANCY_MODE", "shadow")
+            )
             admission = evaluate_entry_admission(
                 exchange=self.ex,
                 intent_id=entry_id,
@@ -1863,13 +1887,7 @@ class CrossBot(FuturesBot):
                 portfolio_mode=portfolio_mode,
                 expectancy_mode=expectancy_mode,
                 features=expectancy_features,
-                limits=PortfolioLimits(
-                    max_gross_pct=self._f("PORTFOLIO_MAX_GROSS_PCT", 100.0),
-                    max_net_pct=self._f("PORTFOLIO_MAX_NET_PCT", 75.0),
-                    min_free_pct=self._f("PORTFOLIO_MIN_FREE_PCT", 20.0),
-                    max_cluster_pct=self._f("PORTFOLIO_MAX_CLUSTER_PCT", 35.0),
-                    max_beta_pct=self._f("PORTFOLIO_MAX_BETA_PCT", 75.0),
-                ),
+                limits=portfolio_limits_from_config(self.C),
             )
             try:
                 log_struct(
@@ -2527,7 +2545,10 @@ class CrossBot(FuturesBot):
             if live_close_already_verified:
                 order = {}
             else:
-                exch_oid = order.get("id") or order.get("orderId")
+                exch_oid = (
+                    order_id_text_or_none(order.get("id"))
+                    or order_id_text_or_none(order.get("orderId"))
+                )
                 try:
                     from bot_utils.futures_exits import _resolve_fill_price
                     close_price, _fill_src = _resolve_fill_price(

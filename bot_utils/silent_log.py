@@ -25,6 +25,12 @@ import time
 from collections import OrderedDict
 from typing import Callable, Optional
 
+try:
+    from core.constants import SILENT_LOG_BACKUPS, SILENT_LOG_MAX_BYTES
+except Exception:
+    SILENT_LOG_MAX_BYTES = 10 * 1024 * 1024
+    SILENT_LOG_BACKUPS = 2
+
 
 # Bounded LRU: OrderedDict with move_to_end + popitem(last=False) gives O(1)
 # eviction so a dynamic ctx (order IDs, symbols, timestamps) can't leak RAM.
@@ -32,6 +38,15 @@ _FAIL_LOCK = threading.RLock()           # RLock: a re-entrant call (signal hand
 _LAST_LOGGED: "OrderedDict[tuple, float]" = OrderedDict()
 _DEFAULT_INTERVAL = 60.0                 # seconds
 _MAX_KEYS = 4096                          # ~256 KB worst-case for key+ts
+_PERSIST_LOCK = threading.Lock()
+
+
+def _safe_text(value, max_chars: int) -> str:
+    try:
+        rendered = str(value)
+    except Exception:
+        rendered = f"[UNRENDERABLE:{type(value).__name__}]"
+    return rendered[:max_chars]
 
 
 def silent_log(ctx: str, exc: Exception,
@@ -51,7 +66,8 @@ def silent_log(ctx: str, exc: Exception,
         Custom write function for testing. Default is ``sys.stderr.write``.
     """
     now = time.monotonic()
-    key = (ctx, type(exc).__name__)
+    safe_ctx = _safe_text(ctx, 240)
+    key = (safe_ctx, type(exc).__name__)
     with _FAIL_LOCK:
         last = _LAST_LOGGED.get(key, 0.0)
         if (now - last) < interval:
@@ -65,7 +81,10 @@ def silent_log(ctx: str, exc: Exception,
         while len(_LAST_LOGGED) > _MAX_KEYS:
             _LAST_LOGGED.popitem(last=False)
 
-    msg = f"[silent] {ctx}: {type(exc).__name__}: {str(exc)[:160]}\n"
+    msg = (
+        f"[silent] {safe_ctx}: {type(exc).__name__}: "
+        f"{_safe_text(exc, 160)}\n"
+    )
     # Redact before it touches stderr ( launcher activity feed) or disk
     # (logs/silent_errors.log, which users attach to bug reports). ccxt/auth
     # exceptions echo api_key/signature/proxy creds; every OTHER log sink scrubs
@@ -118,8 +137,24 @@ def _persist(msg: str) -> None:
             return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         line = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()) + " " + msg
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line)
+        try:
+            from core.logger import _rotate_if_needed
+        except Exception:
+            _rotate_if_needed = None
+        with _PERSIST_LOCK:
+            if _rotate_if_needed is not None:
+                try:
+                    _rotate_if_needed(
+                        path,
+                        SILENT_LOG_MAX_BYTES,
+                        SILENT_LOG_BACKUPS,
+                    )
+                except Exception:
+                    # Rotation is maintenance; never let it suppress the
+                    # diagnostic entry that this sink exists to preserve.
+                    pass
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line)
     except Exception:
         pass
 

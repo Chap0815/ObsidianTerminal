@@ -11,10 +11,23 @@ already booked a proportional slice). This module centralizes the safe pattern.
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
 DEFAULT_TAKER_FEE_RATE = 0.001
+
+
+def _finite_number(value: Any) -> float | None:
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def taker_fee_rate(ex: Any, symbol: str, default: float = DEFAULT_TAKER_FEE_RATE) -> float:
@@ -29,10 +42,10 @@ def taker_fee_rate(ex: Any, symbol: str, default: float = DEFAULT_TAKER_FEE_RATE
         m = markets.get(symbol) or {}
         t = m.get("taker")
         if t is not None:
-            tv = float(t)
-            if tv > 0:
+            tv = _finite_number(t)
+            if tv is not None and tv > 0:
                 return tv
-    except (TypeError, ValueError, AttributeError):
+    except (TypeError, ValueError, OverflowError, AttributeError):
         pass
     return default
 
@@ -77,11 +90,10 @@ def safe_proportional_fee(initial_fee: Any,
           by a few cents than to double-deduct the full entry fee, which
           would silently distort PnL accounting.
     """
-    try:
-        init = float(initial_fee or 0)
-        curr = float(current_amount or 0)
-        orig = float(original_amount or 0)
-    except (TypeError, ValueError):
+    init = _finite_number(initial_fee)
+    curr = _finite_number(current_amount)
+    orig = _finite_number(original_amount)
+    if init is None or curr is None or orig is None:
         return 0.0
 
     if init <= 0 or curr <= 0:
@@ -114,11 +126,10 @@ def safe_funding_scale(funding_total: Any,
     Returns the funding portion attributable to the remaining slice.
     Behavior mirrors ``safe_proportional_fee``  see its docstring.
     """
-    try:
-        f = float(funding_total or 0)
-        curr = float(current_amount or 0)
-        orig = float(original_amount or 0)
-    except (TypeError, ValueError):
+    f = _finite_number(funding_total)
+    curr = _finite_number(current_amount)
+    orig = _finite_number(original_amount)
+    if f is None or curr is None or orig is None:
         return 0.0
 
     if curr <= 0:
@@ -151,14 +162,12 @@ def safe_remaining_funding(funding_total: Any,
         funding_total, current_amount, original_amount,
         partial_sold=partial_sold,
     )
-    try:
-        booked = float(booked_on_partials or 0.0)
-    except (TypeError, ValueError):
+    booked = _finite_number(booked_on_partials)
+    if booked is None:
         booked = 0.0
     if not partial_sold or abs(booked) <= 1e-12:
         return scaled
-    try:
-        total = float(funding_total or 0.0)
-    except (TypeError, ValueError):
+    total = _finite_number(funding_total)
+    if total is None:
         return scaled
     return round(total - booked, 6)

@@ -29,6 +29,7 @@ Why not use bal['USDT']['used']?
   works everywhere.
 """
 from __future__ import annotations
+from functools import wraps
 import math
 from typing import Optional
 
@@ -37,15 +38,46 @@ LIVE_FUTURES_BOTS = {"FUTURES", "CROSS", "FUTREND"}
 
 #  Helpers 
 
-def _safe_float(value, default: float = 0.0) -> float:
-    """Convert to float, swallow all conversion errors."""
+def _finite_float_or_none(value) -> Optional[float]:
     if value is None or isinstance(value, bool):
-        return default
+        return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    """Convert to float, swallow all conversion errors."""
+    parsed = _finite_float_or_none(value)
+    return default if parsed is None else parsed
+
+
+def _finite_add(total: float, value: float) -> float:
+    candidate = total + value
+    return candidate if math.isfinite(candidate) else total
+
+
+def _safe_label(value, default: str = "?", max_length: int = 128) -> str:
+    if value is None:
         return default
-    return parsed if math.isfinite(parsed) else default
+    try:
+        rendered = str(value).strip()
+    except Exception:
+        return default
+    return rendered[:max_length] if rendered else default
+
+
+def _never_raises_none(func):
+    """Keep dashboard-only equity probes isolated from malformed APIs."""
+    @wraps(func)
+    def guarded(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            return None
+    return guarded
 
 
 def _read_usdt_free(bal: dict) -> Optional[float]:
@@ -128,24 +160,29 @@ def _sum_position_margin_and_upnl(positions: list) -> tuple[float, float, int, l
         count += 1
 
         # Margin: try ccxt-standard fields in priority order
-        margin = (_safe_float(p.get("initialMargin"))
-                  or _safe_float(p.get("collateral"))
-                  or _safe_float(p.get("margin"))
-                  or 0.0)
-        total_margin += margin
+        margin = 0.0
+        for field in ("initialMargin", "collateral", "margin"):
+            candidate = _finite_float_or_none(p.get(field))
+            if candidate is not None and candidate > 0.0:
+                margin = candidate
+                break
+        total_margin = _finite_add(total_margin, margin)
 
         # Unrealized PnL: ccxt mostly normalizes to unrealizedPnl
-        upnl = (_safe_float(p.get("unrealizedPnl"))
-                or _safe_float(p.get("unrealized_pnl"))
-                or 0.0)
-        total_unrealized += upnl
+        upnl = 0.0
+        for field in ("unrealizedPnl", "unrealized_pnl"):
+            candidate = _finite_float_or_none(p.get(field))
+            if candidate is not None:
+                upnl = candidate
+                break
+        total_unrealized = _finite_add(total_unrealized, upnl)
 
         # Per-position breakdown for the dashboard tooltip.
         # Symbol stripped to base (BRETT/USDT:USDT  BRETT) for short
         # display; full symbol kept around in case a caller wants it.
-        sym_full = p.get("symbol") or "?"
+        sym_full = _safe_label(p.get("symbol"))
         base = sym_full.split("/")[0] if "/" in sym_full else sym_full
-        side = (p.get("side") or "?").lower()
+        side = _safe_label(p.get("side")).lower()
         details.append({
             "symbol":     base,
             "symbol_full": sym_full,
@@ -178,13 +215,15 @@ def _live_futures_state_by_symbol(db_rows: list,
     for row in db_rows:
         if not isinstance(row, dict):
             continue
-        bot_name = str(row.get("bot_name") or "")
+        bot_name = _safe_label(row.get("bot_name"), "")
         if bot_name not in live_bots:
             continue
         sym = row.get("symbol")
         if not sym:
             continue
-        base = str(sym).split("/")[0].split(":")[0]
+        base = _safe_label(sym, "").split("/")[0].split(":")[0]
+        if not base:
+            continue
         db_by_sym[base] = {
             "unrealized":      _safe_float(row.get("unrealized_pnl")),
             "unrealized_pct":  _safe_float(row.get("unrealized_pct")),
@@ -196,6 +235,7 @@ def _live_futures_state_by_symbol(db_rows: list,
 
 #  Public API: Futures 
 
+@_never_raises_none
 def compute_futures_equity(ex) -> Optional[dict]:
     """Compute futures equity breakdown.
 
@@ -274,11 +314,14 @@ def compute_futures_equity(ex) -> Optional[dict]:
             # exchange's zeroes. Better than crashing.
             pass
 
+    equity_total = free + margin_sum + upnl_sum
+    if not math.isfinite(equity_total):
+        return None
     return {
         "free":         round(free, 4),
         "in_positions": round(margin_sum, 4),
         "unrealized":   round(upnl_sum, 4),
-        "equity":       round(free + margin_sum + upnl_sum, 4),
+        "equity":       round(equity_total, 4),
         "open_count":   count,
         "positions":    details,
         "source":       ("balance.free + positions.margin + positions.uPnL"
@@ -299,6 +342,7 @@ _QUOTE_ASSETS_AS_USDT = frozenset({
 _DUST_USDT_THRESHOLD = 0.5
 
 
+@_never_raises_none
 def compute_spot_equity(ex) -> Optional[dict]:
     """Compute spot equity breakdown.
 
@@ -339,7 +383,10 @@ def compute_spot_equity(ex) -> Optional[dict]:
     # keys like 'info', 'free', 'used', 'total' which mirror everything).
     skip_keys = {"info", "free", "used", "total", "timestamp", "datetime"}
 
-    for symbol, data in bal.items():
+    for raw_symbol, data in bal.items():
+        symbol = _safe_label(raw_symbol, "")
+        if not symbol:
+            continue
         if symbol in skip_keys:
             continue
         if not isinstance(data, dict):
@@ -348,8 +395,8 @@ def compute_spot_equity(ex) -> Optional[dict]:
             free_amount = _read_currency_free(data)
             equity_amount = _read_currency_total_or_free(data)
             if free_amount > 0 or equity_amount > 0:
-                stable_free += free_amount
-                stable_equity += equity_amount
+                stable_free = _finite_add(stable_free, free_amount)
+                stable_equity = _finite_add(stable_equity, equity_amount)
         else:
             total = _safe_float(data.get("total"))
             if total <= 0:
@@ -406,13 +453,21 @@ def compute_spot_equity(ex) -> Optional[dict]:
                 continue
 
             value_usdt = amount * price
-            if value_usdt < _DUST_USDT_THRESHOLD:
+            if (
+                not math.isfinite(value_usdt)
+                or value_usdt < _DUST_USDT_THRESHOLD
+            ):
                 continue  # dust filter
 
-            in_positions_value += value_usdt
+            next_positions_value = in_positions_value + value_usdt
+            if not math.isfinite(next_positions_value):
+                continue
+            in_positions_value = next_positions_value
             open_count += 1
 
     equity = stable_equity + in_positions_value
+    if not math.isfinite(equity):
+        return None
 
     return {
         "free":         round(stable_free, 4),
@@ -449,6 +504,7 @@ def compute_combined_equity(spot_ex=None, futures_ex=None) -> dict:
     if fut is not None:
         parts.append(fut["equity"])
     if parts:
-        grand = round(sum(parts), 4)
+        total = sum(parts)
+        grand = round(total, 4) if math.isfinite(total) else None
 
     return {"spot": spot, "futures": fut, "grand_total": grand}

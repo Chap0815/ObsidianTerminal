@@ -100,29 +100,52 @@ def cross_liquidation_price(entry: float, qty_signed: float, mm_rate: float,
     approximation). NOTE: only this bot's legs are modelled; on a SHARED live
     account the exchange's own liq price (account-wide) stays authoritative.
     """
-    q = float(qty_signed)
-    if q == 0.0 or not math.isfinite(q):
-        return None
-    e = float(entry)
-    mm = float(mm_rate)
-    mk = float(mark)
-    # NaN fails every ordered comparison, so a NaN input would slip past the
-    # p<=0 / wrong-side guards and return NaN (poisoning the dashboard liq price).
-    # Reject non-finite inputs up front.
-    if not (math.isfinite(e) and math.isfinite(mm) and math.isfinite(mk)
-            and math.isfinite(float(collateral))):
+    e = _finite_float(entry)
+    q = _finite_float(qty_signed)
+    mm = _finite_float(mm_rate)
+    mk = _finite_float(mark)
+    collateral_value = _finite_float(collateral)
+    if (
+        e is None
+        or q is None
+        or mm is None
+        or mk is None
+        or collateral_value is None
+        or e <= 0.0
+        or q == 0.0
+        or mm < 0.0
+        or mk <= 0.0
+        or collateral_value <= 0.0
+    ):
         return None
     other_sum = 0.0
-    for (e_i, q_i, mm_i, mk_i) in others:
-        q_i = float(q_i)
-        e_i = float(e_i)
-        mm_i = float(mm_i)
-        mk_i = float(mk_i)
-        other_sum += q_i * (mk_i - e_i) - mm_i * abs(q_i) * mk_i  # uPnL_i  MM_i
-    denom = mm * abs(q) - q
-    if denom == 0.0:
+    try:
+        for row in others:
+            e_i, q_i, mm_i, mk_i = row
+            e_i = _finite_float(e_i)
+            q_i = _finite_float(q_i)
+            mm_i = _finite_float(mm_i)
+            mk_i = _finite_float(mk_i)
+            if (
+                e_i is None
+                or q_i is None
+                or mm_i is None
+                or mk_i is None
+                or e_i <= 0.0
+                or mm_i < 0.0
+                or mk_i <= 0.0
+            ):
+                return None
+            contribution = q_i * (mk_i - e_i) - mm_i * abs(q_i) * mk_i
+            other_sum += contribution
+            if not math.isfinite(other_sum):
+                return None
+    except (TypeError, ValueError):
         return None
-    p = (float(collateral) + other_sum - q * e) / denom
+    denom = mm * abs(q) - q
+    if denom == 0.0 or not math.isfinite(denom):
+        return None
+    p = (collateral_value + other_sum - q * e) / denom
     if not math.isfinite(p) or p <= 0.0:
         return None
     if (q > 0.0 and p >= mk) or (q < 0.0 and p <= mk):
@@ -296,11 +319,8 @@ def funding_oi_filter(direction: str,
     # stored entry params. Coerce to a neutral 0.0 (no crowding signal): the
     # trade is still allowed (keep-trades-flowing), but explicitly, not by NaN.
     def _finite(x: float) -> float:
-        try:
-            x = float(x)
-        except (TypeError, ValueError):
-            return 0.0
-        return x if math.isfinite(x) else 0.0
+        parsed = _finite_float(x)
+        return parsed if parsed is not None else 0.0
     funding_pct = _finite(funding_pct)
     oi_change_pct = _finite(oi_change_pct)
     if direction == "LONG":

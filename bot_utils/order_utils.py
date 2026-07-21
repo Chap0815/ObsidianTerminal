@@ -30,13 +30,18 @@ def _upper_text(value) -> str:
     return value.upper() if isinstance(value, str) else ""
 
 
-def _order_id_text(value) -> str:
+def order_id_text_or_none(value) -> str | None:
     if value is None or isinstance(value, bool):
-        return ""
+        return None
     try:
-        return str(value).strip()
+        text = str(value).strip()
     except Exception:
-        return ""
+        return None
+    return text or None
+
+
+def _order_id_text(value) -> str:
+    return order_id_text_or_none(value) or ""
 
 
 def _safe_positive_price(value) -> float:

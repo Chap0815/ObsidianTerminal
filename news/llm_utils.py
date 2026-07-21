@@ -78,7 +78,18 @@ def _get_model_name() -> str:
         if os.path.exists(config_path):
             with open(config_path, encoding="utf-8") as f:
                 cfg = json.load(f)
-                return cfg.get("LLM_MODEL", LLM_MODEL_DEFAULT)
+                if not isinstance(cfg, dict):
+                    return LLM_MODEL_DEFAULT
+                model = cfg.get("LLM_MODEL")
+                if not isinstance(model, str):
+                    return LLM_MODEL_DEFAULT
+                model = model.strip()
+                if (
+                    not 1 <= len(model) <= 200
+                    or any(not ch.isprintable() or ch.isspace() for ch in model)
+                ):
+                    return LLM_MODEL_DEFAULT
+                return model
     except Exception:
         pass
     return LLM_MODEL_DEFAULT
@@ -169,10 +180,10 @@ def _acquire_llm_slot():
         )
         return None
 
-    deadline = time.time() + LLM_SLOT_WAIT_SEC
+    deadline = time.monotonic() + LLM_SLOT_WAIT_SEC
     my_payload = f"{os.getpid()}:{_BOOT_FP}:{time.time():.3f}".encode()
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         for slot in range(LLM_MAX_CONCURRENT):
             lock_path = os.path.join(LLM_LOCK_DIR, f"slot_{slot}.lock")
             try:
@@ -181,7 +192,7 @@ def _acquire_llm_slot():
                     os.write(fd, my_payload)
                 finally:
                     os.close(fd)
-                return lock_path
+                return (lock_path, my_payload)
             except FileExistsError:
                 try:
                     with open(lock_path, "r") as lf:
@@ -213,12 +224,20 @@ def _acquire_llm_slot():
     return None
 
 
-def _release_llm_slot(lock_path):
-    if lock_path:
-        try:
-            os.remove(lock_path)
-        except Exception:
-            pass
+def _release_llm_slot(lease):
+    if not isinstance(lease, tuple) or len(lease) != 2:
+        return
+    lock_path, owned_payload = lease
+    if not isinstance(lock_path, str) or not isinstance(owned_payload, bytes):
+        return
+    try:
+        with open(lock_path, "rb") as lock_file:
+            current_payload = lock_file.read(4096)
+        if current_payload != owned_payload:
+            return
+        os.remove(lock_path)
+    except Exception:
+        pass
 
 
 _LAST_USED_MODEL: list  = [None]   # [0] = last model name generate() used
@@ -388,14 +407,46 @@ _PING_LOCK    = threading.Lock()
 def _normalise_model_name(name: str) -> str:
     """Normalise a model name for fuzzy matching.
 
-    Ollama returns names in various formats depending on the endpoint:
-      /api/tags  "qwen2.5:14b"
-      /api/ps  "qwen2.5:14b" OR "qwen2.5:14b:7cdf5a0187d5" (with digest)
-
-    We match on the base name (before first colon) so all variants of
-    "qwen2.5:14b" are recognised regardless of digest suffix.
+    Preserve the tag because different tags may be different model sizes.
+    Ollama's implicit tag is ``latest``.
     """
-    return name.lower().split(":")[0].strip()
+    if not isinstance(name, str):
+        return ""
+    normalized = name.strip().lower()
+    if not normalized or any(ch.isspace() for ch in normalized):
+        return ""
+    leaf = normalized.rsplit("/", 1)[-1]
+    if ":" not in leaf:
+        normalized += ":latest"
+    return normalized
+
+
+def _model_name_matches(configured: str, candidate: str) -> bool:
+    cfg = _normalise_model_name(configured)
+    found = _normalise_model_name(candidate)
+    if not cfg or not found:
+        return False
+    return (
+        cfg == found
+        or found.endswith("/" + cfg)
+        or cfg.endswith("/" + found)
+    )
+
+
+def _model_names_from_payload(payload) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return []
+    names = []
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        name = model.get("name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return names
 
 
 def _do_one_ping() -> str:
@@ -414,10 +465,7 @@ def _do_one_ping() -> str:
         try:
             r = requests.get(f"{base_url}/api/tags", timeout=PING_TIMEOUT_SEC)
             if r.status_code == 200:
-                installed = [
-                    m.get("name", "")
-                    for m in (r.json().get("models") or [])
-                ]
+                installed = _model_names_from_payload(r.json())
                 break
         except Exception:
             installed = None
@@ -430,11 +478,8 @@ def _do_one_ping() -> str:
         return LLM_STATUS_DAEMON_DOWN
 
     #  Step 2: check configured model is installed 
-    cfg_norm = _normalise_model_name(model_cfg)
     model_installed = any(
-        cfg_norm in _normalise_model_name(n) or
-        _normalise_model_name(n) in cfg_norm
-        for n in installed
+        _model_name_matches(model_cfg, name) for name in installed
     )
     if not model_installed:
         return LLM_STATUS_MODEL_MISSING
@@ -443,16 +488,9 @@ def _do_one_ping() -> str:
     try:
         r2 = requests.get(f"{base_url}/api/ps", timeout=PING_TIMEOUT_SEC)
         if r2.status_code == 200:
-            loaded = [
-                m.get("name", "")
-                for m in (r2.json().get("models") or [])
-            ]
-            # Match: both sides normalised to base-name before ":"
-            # e.g. cfg="qwen2.5:14b"  cfg_norm="qwen2.5"
-            #  loaded may be "qwen2.5:14b:digest"  norm="qwen2.5"
+            loaded = _model_names_from_payload(r2.json())
             is_hot = any(
-                cfg_norm == _normalise_model_name(n)
-                for n in loaded
+                _model_name_matches(model_cfg, name) for name in loaded
             )
             return LLM_STATUS_MODEL_HOT if is_hot else LLM_STATUS_MODEL_COLD
     except Exception:
@@ -578,6 +616,21 @@ _CHALLENGE_TEMPLATE = (
 )
 
 
+def _challenge_text(value, *, fallback: str, limit: int) -> str:
+    if not isinstance(value, str):
+        return fallback
+    clean = value.replace("\U0001f4ad", "").strip()
+    if "</think>" in clean:
+        clean = clean.split("</think>", 1)[-1].strip()
+    clean = "".join(ch if ch >= " " else " " for ch in clean)
+    clean = " ".join(clean.split())
+    if not clean:
+        return fallback
+    if len(clean) > limit:
+        clean = "..." + clean[-(limit - 3):]
+    return clean
+
+
 def _interpret_challenge(resp, label: str) -> str:
     """Map a challenge response to OVERRIDE_WAIT / PROCEED.
 
@@ -586,7 +639,9 @@ def _interpret_challenge(resp, label: str) -> str:
     like the error path (honours _BULL_BEAR_FAIL_CLOSED)."""
     text = ""
     if isinstance(resp, dict):
-        text = resp.get("response") or ""
+        candidate = resp.get("response")
+        if isinstance(candidate, str):
+            text = candidate
     elif isinstance(resp, str):
         text = resp
     verdict = text.upper()
@@ -608,14 +663,17 @@ def bull_bear_challenge(symbol, bull_analysis, context_brief="", confidence=""):
         return "PROCEED"
     if str(confidence).upper() == "LOW":
         return "PROCEED"
-    clean = bull_analysis.replace("\U0001f4ad", "").strip()
-    if "</think>" in clean:
-        clean = clean.split("</think>", 1)[-1].strip()
-    if len(clean) > 500:
-        clean = "..." + clean[-450:]
+    clean = _challenge_text(
+        bull_analysis, fallback="No valid analysis supplied.", limit=500
+    )
+    brief = _challenge_text(
+        context_brief,
+        fallback="momentum coin, positive news scan passed",
+        limit=300,
+    )
     prompt = _CHALLENGE_TEMPLATE.format(
         action="BUY", symbol=symbol,
-        brief=context_brief or "momentum coin, positive news scan passed",
+        brief=brief,
         analysis=clean,
     )
     try:
@@ -636,11 +694,9 @@ def futures_bull_bear_challenge(symbol, direction, analysis, context_brief=""):
         return "PROCEED"
     if direction not in ("LONG", "SHORT"):
         return "PROCEED"
-    clean = analysis.replace("\U0001f4ad", "").strip()
-    if "</think>" in clean:
-        clean = clean.split("</think>", 1)[-1].strip()
-    if len(clean) > 500:
-        clean = "..." + clean[-450:]
+    clean = _challenge_text(
+        analysis, fallback="No valid analysis supplied.", limit=500
+    )
     if direction == "LONG":
         action = "go LONG on"
         extra  = "Consider: squeeze risk, funding rate pressure, late entry, RSI overextension."
@@ -649,7 +705,10 @@ def futures_bull_bear_challenge(symbol, direction, analysis, context_brief=""):
         extra  = "Consider: short squeeze risk, bullish catalyst, low float, cover rally."
     prompt = _CHALLENGE_TEMPLATE.format(
         action=action, symbol=symbol,
-        brief=(context_brief or "") + " " + extra, analysis=clean,
+        brief=(
+            _challenge_text(context_brief, fallback="", limit=300) + " " + extra
+        ).strip(),
+        analysis=clean,
     )
     try:
         resp = generate_with_timeout(get_model_name(), prompt,
@@ -666,7 +725,7 @@ def futures_bull_bear_challenge(symbol, direction, analysis, context_brief=""):
 
 def keyword_fallback(symbol: str, news: str, strategy: str = "TREND") -> str:
     """Simple keyword analysis when LLM is offline."""
-    news_lower = (news or "").lower()
+    news_lower = news.lower() if isinstance(news, str) else ""
     found_negative = [kw for kw in NEGATIVE_KEYWORDS if kw in news_lower]
     if found_negative:
         reason = ", ".join(found_negative[:3])

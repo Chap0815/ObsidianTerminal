@@ -9,6 +9,8 @@ from __future__ import annotations
 import math
 from typing import Optional
 
+from bot_utils.order_utils import order_id_text_or_none
+
 try:
     from core.constants import STABLECOIN_EQUIVALENTS, DEFAULT_TAKER_FEE
 except ImportError:
@@ -95,8 +97,17 @@ def extract_fee_usdt(order: dict, base_override: str = "") -> float:
     """Extract total fees from a CCXT order dict, in USDT.
     Avoids double-counting by using `fees` list only when non-empty
     with valid entries (else falls back to singular `fee`)."""
+    fee, _known = extract_fee_usdt_known(order, base_override)
+    return fee
+
+
+def extract_fee_usdt_known(
+    order: dict,
+    base_override: str = "",
+) -> tuple[float, bool]:
+    """Return the fee and whether the exchange payload proves that value."""
     if not isinstance(order, dict):
-        return 0.0
+        return 0.0, False
 
     fees_list = order.get("fees") or []
     if isinstance(fees_list, list):
@@ -115,9 +126,9 @@ def extract_fee_usdt(order: dict, base_override: str = "") -> float:
                     saw_known = True
                     total += fee
             if saw_known:
-                return total if math.isfinite(total) else 0.0
+                return (total, True) if math.isfinite(total) else (0.0, False)
 
-    return fee_to_usdt(order.get("fee"), order, base_override)
+    return _fee_to_usdt_known(order.get("fee"), order, base_override)
 
 
 def estimate_fee_usdt(amount_coins: float, fill_price: float,
@@ -177,14 +188,15 @@ def extract_or_estimate_with_refetch(ex, order: dict, symbol_full: str,
         return real
 
     # Re-fetch once the exchange has had time to attach fee details.
-    order_id = order.get("id") or order.get("orderId")
-    if isinstance(order_id, bool):
-        order_id = None
+    order_id = (
+        order_id_text_or_none(order.get("id"))
+        or order_id_text_or_none(order.get("orderId"))
+    )
     if order_id and ex is not None and symbol_full:
         for attempt in range(max_attempts):
             try:
                 _time.sleep(retry_delay)
-                refreshed = ex.fetch_order(str(order_id), symbol_full)
+                refreshed = ex.fetch_order(order_id, symbol_full)
                 if refreshed:
                     real = extract_fee_usdt(refreshed, base_override)
                     if real > 0:

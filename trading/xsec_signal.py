@@ -15,6 +15,7 @@ realized rebalance returns.
 """
 from __future__ import annotations
 
+import math
 import statistics
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -47,13 +48,21 @@ def lookback_return(prices: List[float], lookback: int) -> Optional[float]:
         return None
     p_now = prices[-1]
     p_then = prices[-1 - lookback]
+    if isinstance(p_now, bool) or isinstance(p_then, bool):
+        return None
     try:
         p_now, p_then = float(p_now), float(p_then)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    if p_now <= 0 or p_then <= 0:
+    if (
+        not math.isfinite(p_now)
+        or not math.isfinite(p_then)
+        or p_now <= 0
+        or p_then <= 0
+    ):
         return None
-    return p_now / p_then - 1.0
+    result = p_now / p_then - 1.0
+    return result if math.isfinite(result) else None
 
 
 def rank_and_select(returns: Dict[str, float], k: int) -> Tuple[List[str], List[str]]:
@@ -63,7 +72,16 @@ def rank_and_select(returns: Dict[str, float], k: int) -> Tuple[List[str], List[
     NON-OVERLAPPING split: if fewer than 2k symbols are available, shrink k
     symmetrically so the two legs stay equal-sized and never share a symbol.
     """
-    valid = {s: r for s, r in returns.items() if r is not None}
+    valid = {}
+    for symbol, raw_return in returns.items():
+        if raw_return is None or isinstance(raw_return, bool):
+            continue
+        try:
+            value = float(raw_return)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value):
+            valid[symbol] = value
     n = len(valid)
     if n < 2 or k <= 0:
         return [], []
@@ -84,10 +102,24 @@ def crash_exposure(recent_rebalance_returns: List[float],
     """
     if not params.crash_filter:
         return 1.0
-    w = max(1, params.crash_window)
+    try:
+        w = max(1, int(params.crash_window))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
     if len(recent_rebalance_returns) < w:
         return 1.0
-    return 0.0 if statistics.mean(recent_rebalance_returns[-w:]) < 0.0 else 1.0
+    window = []
+    for raw_return in recent_rebalance_returns[-w:]:
+        if isinstance(raw_return, bool):
+            return 0.0
+        try:
+            value = float(raw_return)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if not math.isfinite(value):
+            return 0.0
+        window.append(value)
+    return 0.0 if statistics.mean(window) < 0.0 else 1.0
 
 
 def compute_target_book(prices_by_symbol: Dict[str, List[float]],
@@ -113,11 +145,32 @@ def leg_notional(equity: float, leverage: float, exposure_mult: float,
     gross = equity  leverage  exposure_mult, split 50/50 long/short, then
     divided across ``k_per_side`` coins per leg. Returns 0 on degenerate input.
     """
-    if k_per_side <= 0 or equity <= 0 or leverage <= 0:
+    if any(
+        isinstance(value, bool)
+        for value in (equity, leverage, exposure_mult, k_per_side)
+    ):
         return 0.0
-    mult = max(0.0, min(1.0, exposure_mult))
-    gross = equity * leverage * mult
-    return (gross / 2.0) / k_per_side
+    try:
+        equity_value = float(equity)
+        leverage_value = float(leverage)
+        exposure_value = float(exposure_mult)
+        k_value = int(k_per_side)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if (
+        k_value <= 0
+        or k_value != k_per_side
+        or not math.isfinite(equity_value)
+        or not math.isfinite(leverage_value)
+        or not math.isfinite(exposure_value)
+        or equity_value <= 0
+        or leverage_value <= 0
+    ):
+        return 0.0
+    mult = max(0.0, min(1.0, exposure_value))
+    gross = equity_value * leverage_value * mult
+    result = (gross / 2.0) / k_value
+    return result if math.isfinite(result) else 0.0
 
 
 #  Self-test (no pytest dir in this project  run directly) 

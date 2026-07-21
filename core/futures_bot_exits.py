@@ -35,6 +35,7 @@ from bot_utils import (
     safe_funding_scale,
     safe_remaining_funding,
 )
+from bot_utils.order_utils import order_id_text_or_none
 
 
 class FuturesExitsMixin:
@@ -1413,7 +1414,10 @@ class FuturesExitsMixin:
                     action_label=f"partial-TP {sym}",
                     log_event=log_event,
                 )
-                exch_oid = order.get("id") or order.get("orderId")
+                exch_oid = (
+                    order_id_text_or_none(order.get("id"))
+                    or order_id_text_or_none(order.get("orderId"))
+                )
                 actual_filled = 0.0
                 actual_filled = FuturesExitsMixin._safe_nonnegative_amount(
                     order.get("filled") if isinstance(order, dict) else None)
@@ -1674,7 +1678,10 @@ class FuturesExitsMixin:
                     log_event=log_event,
                     log_struct=log_struct,
                 )
-                exch_oid = order.get("id") or order.get("orderId")
+                exch_oid = (
+                    order_id_text_or_none(order.get("id"))
+                    or order_id_text_or_none(order.get("orderId"))
+                )
                 order_filled = FuturesExitsMixin._safe_nonnegative_amount(
                     order.get("filled") if isinstance(order, dict) else None)
                 try:

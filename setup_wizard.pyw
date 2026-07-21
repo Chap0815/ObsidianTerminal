@@ -14,9 +14,7 @@ import sys
 import os
 import json
 import customtkinter as ctk
-import tkinter as tk
 import threading
-import requests
 from tkinter import font as tkfont
 
 # -- Design (matches launcher.pyw) ---------------------------------------------
@@ -264,10 +262,14 @@ class SetupWizard(ctk.CTk):
         self.progress_lbl.configure(text=f"Step {n} / {self.total_steps}")
         self.progress_bar.set(n / self.total_steps)
 
-        if n == 1:   self._build_step1_exchange()
-        elif n == 2: self._build_step2_credentials()
-        elif n == 3: self._build_step3_proxy()
-        elif n == 4: self._build_step4_optional()
+        if n == 1:
+            self._build_step1_exchange()
+        elif n == 2:
+            self._build_step2_credentials()
+        elif n == 3:
+            self._build_step3_proxy()
+        elif n == 4:
+            self._build_step4_optional()
 
         self.btn_back.configure(state="disabled" if n == 1 else "normal")
         if n == self.total_steps:

@@ -47,6 +47,14 @@ _PERSIST_RETRY_SLEEP = _read_persist_retry_sleep()
 
 #  Atomic write 
 
+def _log_atomic_save_failure(path: str, exc: Exception) -> None:
+    try:
+        from bot_utils.silent_log import silent_log
+        silent_log(f"atomic_save_json({path})", exc)
+    except Exception:
+        pass
+
+
 def atomic_save_json(path: str, data) -> bool:
     """Crash-safe JSON write: tmp + fsync(file) + atomic rename + fsync(dir).
 
@@ -63,8 +71,18 @@ def atomic_save_json(path: str, data) -> bool:
     _max_retries = _PERSIST_RETRIES
     _retry_sleep = _PERSIST_RETRY_SLEEP
     try:
+        serialized = json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
+    except Exception as exc:
+        _log_atomic_save_failure(path, exc)
+        return False
+    try:
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write(serialized)
             f.flush()
             try:
                 os.fsync(f.fileno())
@@ -107,11 +125,7 @@ def atomic_save_json(path: str, data) -> bool:
     except Exception as exc:
         # Log instead of silent drop. Disk-full / permission errors otherwise
         # leave state divergent from disk indefinitely.
-        try:
-            from bot_utils.silent_log import silent_log
-            silent_log(f"atomic_save_json({path})", exc)
-        except Exception:
-            pass
+        _log_atomic_save_failure(path, exc)
         # Fallback  better non-atomic than nothing
         try:
             from core.logger import save_j
@@ -136,9 +150,10 @@ def _finite_float_or_none(value):
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     return parsed if math.isfinite(parsed) else None
+
 
 def _validate_state(trades: dict,
                      require_position_type: bool,
@@ -171,7 +186,11 @@ def _validate_state(trades: dict,
         if not isinstance(d, dict):
             rejected.append(f"{sym}(not-dict)")
             continue
-        d = copy.deepcopy(d)
+        try:
+            d = copy.deepcopy(d)
+        except Exception:
+            rejected.append(f"{sym}(uncopyable)")
+            continue
 
         raw_buy = d.get("buy_price")
         buy = _finite_float_or_none(raw_buy)
@@ -215,7 +234,11 @@ def _validate_state(trades: dict,
         if raw_invested is not None:
             invested = _finite_float_or_none(raw_invested)
             if invested is None or invested < 0:
-                d["invested_usdt"] = buy * amt / leverage
+                reconstructed = buy * amt / leverage
+                if not math.isfinite(reconstructed):
+                    rejected.append(f"{sym}(invested-overflow)")
+                    continue
+                d["invested_usdt"] = reconstructed
 
         # Heal NaN/Inf in optional numeric fields
         for field in ("highest", "fees_paid",

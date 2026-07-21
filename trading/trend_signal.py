@@ -21,6 +21,7 @@ NO leverage anywhere here  this is a long/flat spot signal by design.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
 
@@ -98,8 +99,11 @@ def params_from_cfg(cfg_get) -> TrendParams:
     field names."""
     def _i(key, default):
         try:
-            return int(float(cfg_get(key, default)))
-        except (TypeError, ValueError):
+            value = float(cfg_get(key, default))
+            if not math.isfinite(value):
+                return default
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
             return default
     return TrendParams(
         sma_fast=_i("TREND_SMA_FAST", 50),

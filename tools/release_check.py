@@ -28,6 +28,7 @@ FORBIDDEN_DIRS = {
     ".git",
     ".pytest_cache",
     ".pytest_tmp_review",
+    ".ruff_cache",
     "__pycache__",
     "backups",
     "data",
@@ -412,7 +413,8 @@ def main(argv: list[str] | None = None) -> int:
                 source,
                 dst,
                 ignore=shutil.ignore_patterns(
-                    ".git", ".pytest_cache", "__pycache__", "data", "logs",
+                    ".git", ".pytest_cache", ".ruff_cache", "__pycache__",
+                    "data", "logs",
                     "optimizer_results", "research_kitraining", "research_run2",
                     "staging", "Output", "tests", "backups",
                 ),

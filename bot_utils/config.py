@@ -20,6 +20,7 @@ Hot-reload covers ONLY numeric trading parameters.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import threading
@@ -153,8 +154,13 @@ def _clamp(key, value):
         return value
     lo, hi, cast = spec
     try:
-        return max(lo, min(hi, cast(value)))
-    except (TypeError, ValueError):
+        if isinstance(value, bool):
+            raise ValueError("boolean is not a numeric config value")
+        converted = cast(value)
+        if isinstance(converted, float) and not math.isfinite(converted):
+            raise ValueError("non-finite numeric config value")
+        return max(lo, min(hi, converted))
+    except (TypeError, ValueError, OverflowError):
         return _CLAMP_DEFAULTS.get(key, lo)
 
 
@@ -162,7 +168,15 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
-        return bool(value)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return bool(default)
+        if math.isfinite(numeric) and numeric == 1.0:
+            return True
+        if math.isfinite(numeric) and numeric == 0.0:
+            return False
+        return bool(default)
     if isinstance(value, str):
         text = value.strip().lower()
         if text in ("1", "true", "yes", "on"):
@@ -182,7 +196,7 @@ def _live_position_cap(bot_name: str,
     cap = _clamp("POSITION_SIZE_MAX", raw_cap)
     try:
         cap = float(cap)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         cap = float(fallback_cap or hard_limit)
     return max(0.01, min(hard_limit, cap))
 
@@ -197,7 +211,7 @@ def _clamp_live_sizing(bot_name: str,
     val = _clamp(key, raw)
     try:
         val = float(val)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         val = float(fallback_cfg.get(key, default) or 0.0)
     val = max(0.01, min(hard_limit, val))
     if key == "POSITION_SIZE":
@@ -217,7 +231,7 @@ def _enforce_invariants(cfg: Dict[str, Any]) -> None:
             cfg["POST_PARTIAL_TRAILING_DISTANCE"] = max(0.25, trailing)
         elif activation > 0 and post_partial >= activation:
             cfg["POST_PARTIAL_TRAILING_DISTANCE"] = max(0.25, activation * 0.5)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         pass
 
 
@@ -253,7 +267,12 @@ def load_runtime_config(bot_name: str, defaults: Dict[str, Any]) -> Dict[str, An
     if os.path.exists(config_path):
         try:
             with open(config_path, encoding="utf-8-sig") as f:
-                user_cfg = json.load(f).get(bot_name, {})
+                root_cfg = json.load(f)
+            if not isinstance(root_cfg, dict):
+                raise ValueError("config root must be an object")
+            user_cfg = root_cfg.get(bot_name, {})
+            if not isinstance(user_cfg, dict):
+                raise ValueError(f"{bot_name} section must be an object")
         except Exception as e:
             raise RuntimeError(
                 f"bot_config.json corrupt or unreadable: {e}. "
@@ -278,7 +297,7 @@ def load_runtime_config(bot_name: str, defaults: Dict[str, Any]) -> Dict[str, An
                     cfg[k] = v
                 else:
                     cfg[k] = float(v)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 cfg[k] = v
 
     for _k in _CLAMPS:
@@ -335,20 +354,27 @@ class _ConfigCache:
             return
         try:
             with open(self._path, encoding="utf-8-sig") as fh:
-                self._raw = json.load(fh) or {}
+                candidate = json.load(fh)
+            if not isinstance(candidate, dict):
+                raise ValueError("bot_config.json root must be an object")
+            self._raw = candidate
             self._mtime = st_mtime
         except Exception as e:
             if (now_mono - self._last_err_log_mono) > 60.0:
-                sys.stderr.write(
-                    f"[config] hot-reload parse failed ({e}); "
-                    f"keeping previous values.\n"
-                )
                 self._last_err_log_mono = now_mono
+                try:
+                    sys.stderr.write(
+                        f"[config] hot-reload parse failed ({e}); "
+                        f"keeping previous values.\n"
+                    )
+                except Exception:
+                    pass
 
     def get_section(self, bot_name: str) -> dict:
         with self._lock:
             self._maybe_reload()
-            return dict(self._raw.get(bot_name, {}))
+            section = self._raw.get(bot_name)
+            return dict(section) if isinstance(section, dict) else {}
 
 
 _CACHE = _ConfigCache()
@@ -399,11 +425,11 @@ def get_live_value(bot_name: str, key: str, default: Any = None,
                         fallback_cfg.get("ACTIVATION_PROFIT", 0.0)) or 0.0)
                     if activation > 0 and float(val) >= activation:
                         return max(0.25, activation * 0.5)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     pass
             return val
         return _clamp(key, raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return fallback_cfg.get(key, default)
 
 

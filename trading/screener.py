@@ -19,6 +19,7 @@ import re as _re_internal
 import threading
 import time
 import pandas as pd
+import portalocker
 
 # RSI/MACD/ATR/EMA werden nativ in reinem pandas gerechnet (keine
 # pandas_ta-Abhngigkeit), damit der Screener unabhngig von einer Lib ist,
@@ -38,6 +39,7 @@ from concurrent.futures import (
 from core.logger import log_event
 from core.paths import INDICATOR_FAILURES_STR as _FAIL_CACHE_FILE
 from bot_utils.safe_numeric import safe_positive_float
+from bot_utils.state_persist import atomic_save_json
 
 from core.constants import (
     MIN_VOLUME_USDT_SPOT_LIVE,
@@ -52,6 +54,7 @@ from core.constants import (
     NONCRYPTO_BASES,
     SOFT_FAILURE_TTL_SEC,
     HARD_FAILURE_TTL_SEC,
+    FUT_SHORT_VOL_SURGE,
 )
 
 # symbol-tracker for grace period
@@ -112,18 +115,38 @@ _fail_cache_dirty = False
 _fail_cache_last_persist = 0.0
 
 
+def _validated_fail_cache(raw, now: float) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    clean = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        raw_count = value.get("count", 0)
+        raw_hard_until = value.get("hard_until", 0)
+        if isinstance(raw_count, bool) or isinstance(raw_hard_until, bool):
+            continue
+        try:
+            count = int(raw_count)
+            hard_until = float(raw_hard_until)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if count < 0 or not math.isfinite(hard_until) or hard_until < 0:
+            continue
+        if hard_until > now:
+            clean[key] = {"count": 0, "hard_until": hard_until}
+        elif count > 0:
+            clean[key] = {"count": min(count, 2), "hard_until": 0.0}
+    return clean
+
+
 def _load_fail_cache():
     global _fail_cache
     try:
         if os.path.exists(_FAIL_CACHE_FILE):
             with open(_FAIL_CACHE_FILE, "r", encoding="utf-8") as f:
                 raw = _json.load(f)
-            now = time.time()
-            _fail_cache = {
-                k: v
-                for k, v in raw.items()
-                if v.get("hard_until", 0) > now or v.get("count", 0) > 0
-            }
+            _fail_cache = _validated_fail_cache(raw, time.time())
     except Exception:
         _fail_cache = {}
 
@@ -137,15 +160,57 @@ def _save_fail_cache_locked(force: bool = False):
     if not force and (now - _fail_cache_last_persist) < _FAIL_CACHE_PERSIST_INTERVAL:
         return
     try:
-        tmp = _FAIL_CACHE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            _json.dump(_fail_cache, f, indent=2)
-            f.flush()
+        os.makedirs(os.path.dirname(_FAIL_CACHE_FILE) or ".", exist_ok=True)
+        with portalocker.Lock(
+            _FAIL_CACHE_FILE + ".lock",
+            mode="a",
+            timeout=5.0,
+            check_interval=0.05,
+            fail_when_locked=False,
+        ):
+            disk_cache = {}
             try:
-                os.fsync(f.fileno())
-            except (AttributeError, OSError):
-                pass
-        os.replace(tmp, _FAIL_CACHE_FILE)
+                if os.path.exists(_FAIL_CACHE_FILE):
+                    with open(
+                        _FAIL_CACHE_FILE,
+                        "r",
+                        encoding="utf-8-sig",
+                    ) as f:
+                        disk_cache = _validated_fail_cache(
+                            _json.load(f), now
+                        )
+            except Exception:
+                disk_cache = {}
+
+            merged = _validated_fail_cache(_fail_cache, now)
+            for key, disk_entry in disk_cache.items():
+                local_entry = merged.get(key, {
+                    "count": 0,
+                    "hard_until": 0.0,
+                })
+                hard_until = max(
+                    local_entry["hard_until"],
+                    disk_entry["hard_until"],
+                )
+                if hard_until > now:
+                    merged[key] = {
+                        "count": 0,
+                        "hard_until": hard_until,
+                    }
+                else:
+                    merged[key] = {
+                        "count": max(
+                            local_entry["count"],
+                            disk_entry["count"],
+                        ),
+                        "hard_until": 0.0,
+                    }
+
+            if not atomic_save_json(_FAIL_CACHE_FILE, merged):
+                return
+
+        _fail_cache.clear()
+        _fail_cache.update(merged)
         _fail_cache_last_persist = now
         _fail_cache_dirty = False
     except Exception:
@@ -762,12 +827,8 @@ def _apply_quality_filters(
         # NO volume spike  they bleed down, unlike pumps. So SHORT uses a
         # separate, lower threshold, tunable via FUT_SHORT_VOL_SURGE (default
         # 1.0 = no spike required, just non-declining volume). LONG is untouched.
-        try:
-            short_vol = float(os.getenv("FUT_SHORT_VOL_SURGE", "1.0"))
-        except ValueError:
-            short_vol = 1.0
         # Never make SHORT stricter than LONG  clamp to the LONG threshold.
-        short_vol = min(short_vol, vol_threshold)
+        short_vol = min(FUT_SHORT_VOL_SURGE, vol_threshold)
         top = top[top["vol_surge"] >= short_vol].copy()
         after_vol = len(top)
         # ATR range: same (need reasonable volatility to trade)

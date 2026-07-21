@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 
 import customtkinter as ctk
 import tkinter as tk
@@ -20,6 +21,30 @@ from bot_utils.silent_log import silent_log
 from launcher.config.settings import BOT_META, COLORS, FONT_BODY, PROJECT_ROOT
 from launcher.ui.components.widgets import safe_geometry
 from launcher.ui.theme import force_dark_titlebar
+
+
+def _atomic_write_prompt(path: str, content: str) -> None:
+    prompt_dir = os.path.dirname(path) or "."
+    os.makedirs(prompt_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".tmp.",
+        dir=prompt_dir,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except Exception as exc:
+                silent_log(f"prompt_editor fsync({path})", exc)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 class PromptEditor(ctk.CTkToplevel):
@@ -577,22 +602,8 @@ class PromptEditor(ctk.CTkToplevel):
             self._show_toast(err, color=COLORS["danger"])
             return
 
-        # Ensure the prompts/ directory exists. Without this the write
-        # fails silently on a fresh install where prompts/ doesn't exist
-        # yet (os.makedirs needs the DIRECTORY, not the file path).
-        prompt_dir = os.path.dirname(self.prompt_path)
-        if prompt_dir:
-            os.makedirs(prompt_dir, exist_ok=True)
         try:
-            tmp = self.prompt_path + f".tmp.{os.getpid()}"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(content)
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except Exception as e:
-                    silent_log(f"prompt_editor fsync({self.prompt_path})", e)
-            os.replace(tmp, self.prompt_path)
+            _atomic_write_prompt(self.prompt_path, content)
             self._dirty = False
             self.status_lbl.configure(
                 text=f" Saved  {os.path.basename(self.prompt_path)}",

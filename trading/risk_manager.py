@@ -34,6 +34,13 @@ def _finite_float_or_none(value) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+def _require_finite_float(value, field_name: str) -> float:
+    parsed = _finite_float_or_none(value)
+    if parsed is None:
+        raise ValueError(f"{field_name} must be a finite number")
+    return parsed
+
+
 def _fatal_exit(code: int = 1) -> None:
     """Terminate the PROCESS deterministically.
 
@@ -124,6 +131,7 @@ _KILL_SWITCH_LOCK         = threading.RLock()
 _DIAG_CACHE: dict         = {}
 _DIAG_LOCK                = threading.RLock()
 _DIAG_TTL_SEC             = 1800
+_DIAG_FAILURE_MULTIPLIER  = 0.5
 
 
 def _load_bot_config(bot_name: str) -> dict:
@@ -162,11 +170,9 @@ def get_base_capital(bot_name: str) -> float:
     """Per-bot BASE_CAPITAL override aus bot_config.json."""
     try:
         cfg = _load_bot_config(bot_name)
-        v = cfg.get("BASE_CAPITAL_USDT")
-        if v is not None:
-            fv = float(v)
-            if fv > 0:
-                return fv
+        value = _finite_float_or_none(cfg.get("BASE_CAPITAL_USDT"))
+        if value is not None and value > 0.0:
+            return value
     except Exception:
         pass
     return DEFAULT_BASE_CAPITAL
@@ -191,11 +197,11 @@ def validate_config_or_die(bot_name: str) -> dict:
             f"{missing}. Refusing to start.", "WARN")
         _fatal_exit(1)
     try:
-        mdl = float(cfg["MAX_DAILY_LOSS"])
+        mdl = _require_finite_float(cfg["MAX_DAILY_LOSS"], "MAX_DAILY_LOSS")
         if mdl > 0 or mdl < -1000:
             log_event(f"[{bot_name}] FATAL: MAX_DAILY_LOSS={mdl} out of safe range", "WARN")
             _fatal_exit(1)
-        ps = float(cfg["POSITION_SIZE"])
+        ps = _require_finite_float(cfg["POSITION_SIZE"], "POSITION_SIZE")
         max_position_limit = _max_position_limit(bot_name)
         if ps <= 0 or ps > max_position_limit:
             log_event(
@@ -203,7 +209,9 @@ def validate_config_or_die(bot_name: str) -> dict:
                 f"(max {max_position_limit})", "WARN")
             _fatal_exit(1)
         if "POSITION_SIZE_MAX" in cfg:
-            ps_max = float(cfg["POSITION_SIZE_MAX"])
+            ps_max = _require_finite_float(
+                cfg["POSITION_SIZE_MAX"], "POSITION_SIZE_MAX"
+            )
             if ps_max <= 0 or ps_max > max_position_limit:
                 log_event(
                     f"[{bot_name}] FATAL: POSITION_SIZE_MAX={ps_max} "
@@ -216,7 +224,7 @@ def validate_config_or_die(bot_name: str) -> dict:
                 _fatal_exit(1)
         lev_limits = _leverage_limits(bot_name)
         if lev_limits and "LEVERAGE" in cfg:
-            lev = float(cfg["LEVERAGE"])
+            lev = _require_finite_float(cfg["LEVERAGE"], "LEVERAGE")
             lo, hi = lev_limits
             if not (lo <= lev <= hi):
                 log_event(
@@ -233,7 +241,9 @@ def validate_config_or_die(bot_name: str) -> dict:
         # positive value (e.g. user types 3.5 instead of -3.5) makes the exit
         # check `profit_pct <= initial_sl` true immediately  every trade stops
         # out at entry.
-        isl = float(cfg["INITIAL_STOP_LOSS"])
+        isl = _require_finite_float(
+            cfg["INITIAL_STOP_LOSS"], "INITIAL_STOP_LOSS"
+        )
         if not (-100.0 < isl < 0.0):
             log_event(
                 f"[{bot_name}] FATAL: INITIAL_STOP_LOSS={isl} must be "
@@ -248,10 +258,7 @@ def validate_config_or_die(bot_name: str) -> dict:
         # price-stop to sit at most 90% of the way to liquidation. Only applies
         # when a real leverage (>1) is configured; unleveraged spot/trend bots
         # are unaffected (L=1  bound -90).
-        try:
-            lev = float(cfg.get("LEVERAGE", 1) or 1)
-        except (TypeError, ValueError):
-            lev = 1.0
+        lev = _require_finite_float(cfg.get("LEVERAGE", 1), "LEVERAGE")
         if lev > 1.0:
             liq_move_pct = 100.0 / lev          # approx price move to liquidation
             safe_floor = -(liq_move_pct * 0.9)  # 90% of the way, still negative
@@ -267,14 +274,20 @@ def validate_config_or_die(bot_name: str) -> dict:
         # PER_LEG_DISASTER_STOP (CROSS) is a negative price-move stop like
         # INITIAL_STOP_LOSS; a positive value stops every leg out at entry.
         if "PER_LEG_DISASTER_STOP" in cfg:
-            pds = float(cfg["PER_LEG_DISASTER_STOP"])
+            pds = _require_finite_float(
+                cfg["PER_LEG_DISASTER_STOP"], "PER_LEG_DISASTER_STOP"
+            )
             if pds >= 0.0:
                 log_event(f"[{bot_name}] FATAL: PER_LEG_DISASTER_STOP={pds} must be "
                           f"negative (e.g. -25). Refusing to start.", "WARN")
                 _fatal_exit(1)
         if ("ACTIVATION_PROFIT" in cfg and "TRAILING_DISTANCE" in cfg):
-            _ap = float(cfg["ACTIVATION_PROFIT"])
-            _td = float(cfg["TRAILING_DISTANCE"])
+            _ap = _require_finite_float(
+                cfg["ACTIVATION_PROFIT"], "ACTIVATION_PROFIT"
+            )
+            _td = _require_finite_float(
+                cfg["TRAILING_DISTANCE"], "TRAILING_DISTANCE"
+            )
             if _ap > 0 and _td >= _ap:
                 log_event(
                     f"[{bot_name}] FATAL: TRAILING_DISTANCE={_td} >= "
@@ -282,7 +295,10 @@ def validate_config_or_die(bot_name: str) -> dict:
                     f"at/below entry on activation. Refusing to start.", "WARN")
                 _fatal_exit(1)
             if "POST_PARTIAL_TRAILING_DISTANCE" in cfg:
-                _ptd = float(cfg["POST_PARTIAL_TRAILING_DISTANCE"])
+                _ptd = _require_finite_float(
+                    cfg["POST_PARTIAL_TRAILING_DISTANCE"],
+                    "POST_PARTIAL_TRAILING_DISTANCE",
+                )
                 if _ptd <= 0.0:
                     log_event(
                         f"[{bot_name}] FATAL: POST_PARTIAL_TRAILING_DISTANCE="
@@ -401,7 +417,7 @@ def validate_config_or_die(bot_name: str) -> dict:
         )
         for _key, _lo, _hi in _checks:
             if _key in cfg:
-                _v = float(cfg[_key])
+                _v = _require_finite_float(cfg[_key], _key)
                 if not (_lo <= _v <= _hi):
                     log_event(
                         f"[{bot_name}] FATAL: {_key}={cfg[_key]} out of "
@@ -421,8 +437,9 @@ def get_max_daily_loss(bot_name: str) -> float:
     try:
         cfg = _load_bot_config(bot_name)
         if "MAX_DAILY_LOSS" in cfg:
-            v = float(cfg["MAX_DAILY_LOSS"])
-            return -abs(v) if v != 0 else MAX_DAILY_LOSS_USDT
+            value = _finite_float_or_none(cfg["MAX_DAILY_LOSS"])
+            if value is not None and value != 0.0 and abs(value) <= 1000.0:
+                return -abs(value)
     except Exception:
         pass
     return MAX_DAILY_LOSS_USDT
@@ -431,11 +448,16 @@ def get_max_daily_loss(bot_name: str) -> float:
 def _read_position_config(bot_name: str) -> tuple:
     try:
         cfg  = _load_bot_config(bot_name)
-        base = float(cfg.get("POSITION_SIZE",     DEFAULT_POSITION_USDT))
-        maxv = float(cfg.get("POSITION_SIZE_MAX", MAX_POSITION_USDT))
+        base = _finite_float_or_none(
+            cfg.get("POSITION_SIZE", DEFAULT_POSITION_USDT)
+        )
+        maxv = _finite_float_or_none(
+            cfg.get("POSITION_SIZE_MAX", MAX_POSITION_USDT)
+        )
+        if base is None or maxv is None or base <= 0.0 or maxv <= 0.0:
+            raise ValueError("position sizing config must be finite and positive")
         minv = max(1.0, base * 0.5)
-        if maxv > 0:
-            minv = min(minv, maxv)
+        minv = min(minv, maxv)
         return base, minv, maxv
     except Exception:
         return DEFAULT_POSITION_USDT, MIN_POSITION_USDT, MAX_POSITION_USDT
@@ -443,10 +465,12 @@ def _read_position_config(bot_name: str) -> tuple:
 
 def get_position_size(bot_name: str) -> float:
     base, min_size, max_size = _read_position_config(bot_name)
-    kelly_size = get_param(bot_name, "position_size", None)
+    kelly_size = _finite_float_or_none(
+        get_param(bot_name, "position_size", None)
+    )
     if kelly_size is None:
         return round(min(base, max_size), 2)
-    return round(max(min_size, min(max_size, float(kelly_size))), 2)
+    return round(max(min_size, min(max_size, kelly_size)), 2)
 
 
 def get_rsi_max(bot_name: str) -> float:
@@ -454,10 +478,13 @@ def get_rsi_max(bot_name: str) -> float:
     try:
         cfg = _load_bot_config(bot_name)
         if "RSI_MAX" in cfg:
-            return float(cfg["RSI_MAX"])
+            configured = _finite_float_or_none(cfg["RSI_MAX"])
+            if configured is not None:
+                return configured
     except Exception:
         pass
-    return get_param(bot_name, "rsi_max", default)
+    learned = _finite_float_or_none(get_param(bot_name, "rsi_max", default))
+    return learned if learned is not None else default
 
 
 def check_blacklist(symbol: str, bot_name: str) -> bool:
@@ -917,14 +944,15 @@ ILLIQUID_ATR_PCT = 0.1
 def get_volatility_adjusted_size(bot_name: str, atr_pct: float) -> float:
     base = get_position_size(bot_name)
     _, min_s, max_s = _read_position_config(bot_name)
-    if atr_pct is None or atr_pct <= 0:
+    atr_value = _finite_float_or_none(atr_pct)
+    if atr_value is None or atr_value <= 0:
         return base
-    if atr_pct < ILLIQUID_ATR_PCT:
+    if atr_value < ILLIQUID_ATR_PCT:
         log_event(
-            f"[{bot_name}] ATR={atr_pct:.3f}% < {ILLIQUID_ATR_PCT}%  illiquid, "
+            f"[{bot_name}] ATR={atr_value:.3f}% < {ILLIQUID_ATR_PCT}%  illiquid, "
             f"capping at min_size={min_s}", "WAIT")
         return round(min_s, 2)
-    scale = NEUTRAL_ATR_PCT / atr_pct
+    scale = NEUTRAL_ATR_PCT / atr_value
     scale = max(MIN_SIZE_SCALE, min(MAX_SIZE_SCALE, scale))
     return round(max(min_s, min(max_s, base * scale)), 2)
 
@@ -978,8 +1006,12 @@ def self_diagnose(bot_name: str) -> dict:
         return result
     except Exception as exc:
         log_event(f"[{bot_name}] self_diagnose error: {exc}", "WARN")
-        fallback = {"healthy": True, "multiplier": 1.0,
-                    "reason": "diagnosis error  using full sizing", "metrics": {}}
+        fallback = {
+            "healthy": False,
+            "multiplier": _DIAG_FAILURE_MULTIPLIER,
+            "reason": "diagnosis unavailable - conservative sizing",
+            "metrics": {},
+        }
         with _DIAG_LOCK:
             _DIAG_CACHE[bot_name] = (now, fallback)
         return fallback
@@ -1237,12 +1269,13 @@ def check_kill_switches(bot_name: str, exchange=None,
         except Exception:
             _win_now = datetime.now(timezone.utc).replace(tzinfo=None)
         one_hour_ago = (_win_now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        now_str = _win_now.strftime("%Y-%m-%d %H:%M:%S")
         row = conn.execute("""
             SELECT COUNT(*) AS total,
                    SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END) AS errors
             FROM api_rate_global
-            WHERE called_at >= ?
-        """, (one_hour_ago,)).fetchone()
+            WHERE called_at >= ? AND called_at <= ? AND ok IN (0, 1)
+        """, (one_hour_ago, now_str)).fetchone()
         if row and row[0] and row[0] > 10:
             err_rate = (row[1] or 0) / row[0]
             # Threshold read from constants.py (editable in one place).

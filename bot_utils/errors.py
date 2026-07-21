@@ -29,9 +29,17 @@ _RETRY_ATTEMPTS = 5
 _RETRY_BASE_SLEEP = 0.05
 
 
+def _safe_text(value, max_chars: int = 4000) -> str:
+    try:
+        rendered = str(value)
+    except Exception:
+        rendered = f"[UNRENDERABLE:{type(value).__name__}]"
+    return rendered[:max_chars]
+
+
 def _fallback_redact(text: str) -> str:
     """Small local redactor used if core.logger cannot be imported yet."""
-    s = str(text)
+    s = _safe_text(text)
     s = re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b", "[REDACTED_TELEGRAM]", s)
     s = re.sub(
         r"(?i)\b(api[_-]?key|secret|passphrase|password|token)"
@@ -72,7 +80,7 @@ def log_error(bot_name: str, context: str, exc: Exception) -> None:
     try:
         from core.logger import redact, _rotate_if_needed
         from core.constants import ERROR_LOG_MAX_BYTES, ERROR_LOG_BACKUPS
-    except ImportError:
+    except Exception:
         redact = _fallback_redact
         def _rotate_if_needed(*a, **kw): pass
         ERROR_LOG_MAX_BYTES = 10 * 1024 * 1024
@@ -81,10 +89,12 @@ def log_error(bot_name: str, context: str, exc: Exception) -> None:
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         tb = _traceback.format_exc()
-        tb_safe = redact(tb)
-        exc_safe = redact(str(exc))
+        tb_safe = redact(_safe_text(tb, 20_000))
+        exc_safe = redact(_safe_text(exc))
+        bot_safe = redact(_safe_text(bot_name, 200))
+        context_safe = redact(_safe_text(context, 500))
         line = (
-            f"\n[{ts}] {bot_name} | {context}\n"
+            f"\n[{ts}] {bot_safe} | {context_safe}\n"
             f"Error: {exc_safe}\n"
             f"{tb_safe}\n"
             f"{'=' * 20}\n"
@@ -92,7 +102,7 @@ def log_error(bot_name: str, context: str, exc: Exception) -> None:
         try:
             from core.paths import PROJECT_ROOT
             error_log_path = str(PROJECT_ROOT / "error_log.txt")
-        except ImportError:
+        except Exception:
             error_log_path = "error_log.txt"
 
         # Serialize within-process writers so rotateopen is a single
@@ -127,14 +137,14 @@ def log_error(bot_name: str, context: str, exc: Exception) -> None:
             # All retries exhausted or hard error  at least scream to stderr.
             _stderr_fallback(
                 f"[errors.log_error] disk write failed after retries "
-                f"({type(last_exc).__name__}: {last_exc})\n{line}"
+                f"({type(last_exc).__name__}: {_safe_text(last_exc)})\n{line}"
             )
     except Exception as fatal:
         # Absolutely last line of defense: stderr only.
         try:
             _stderr_fallback(
                 f"[errors.log_error] CATASTROPHIC: log_error itself raised "
-                f"{type(fatal).__name__}: {fatal}\n"
+                f"{type(fatal).__name__}: {_safe_text(fatal)}\n"
             )
         except Exception:
             pass

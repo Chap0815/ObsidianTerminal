@@ -18,6 +18,8 @@ import time            # retry sleep between os.replace attempts
 from contextlib import contextmanager
 from tkinter import font as tkfont
 
+from core.constants import CONFIG_AUDIT_BACKUPS, CONFIG_AUDIT_MAX_BYTES
+
 
 #  Path anchors 
 #
@@ -817,7 +819,7 @@ def load_config() -> dict:
 
 
 def _audit_log_path() -> str:
-    """Append-only config audit trail. Resolved via core.paths if available."""
+    """Bounded config audit trail. Resolved via core.paths if available."""
     try:
         from core.paths import LOGS_DIR
         return os.path.join(str(LOGS_DIR), "config_audit.jsonl")
@@ -858,10 +860,102 @@ def _read_config_for_audit() -> dict:
     return {}
 
 
+_CONFIG_AUDIT_LOCK = threading.Lock()
+_CONFIG_AUDIT_SECRET_KEY_PARTS = (
+    "apikey",
+    "apisecret",
+    "secret",
+    "password",
+    "passphrase",
+    "token",
+    "credential",
+    "privatekey",
+    "accesskey",
+    "authkey",
+    "authorization",
+    "signature",
+    "chatid",
+    "proxyurl",
+    "proxyuser",
+    "proxypass",
+)
+
+
+def _scrub_config_audit_structure(value):
+    if isinstance(value, dict):
+        scrubbed = {}
+        for key, item in value.items():
+            normalized = "".join(
+                char for char in str(key).lower() if char.isalnum()
+            )
+            if any(part in normalized for part in _CONFIG_AUDIT_SECRET_KEY_PARTS):
+                scrubbed[key] = "***REDACTED***"
+            else:
+                scrubbed[key] = _scrub_config_audit_structure(item)
+        return scrubbed
+    if isinstance(value, (list, tuple)):
+        return [_scrub_config_audit_structure(item) for item in value]
+    return value
+
+
+def _redact_config_audit_fields(fields: dict) -> tuple[dict, bool]:
+    """Return redacted fields, dropping payload data if redaction is unsafe."""
+    try:
+        from core.logger import redact
+        structurally_scrubbed = _scrub_config_audit_structure(fields)
+        redacted = json.loads(
+            redact(json.dumps(
+                structurally_scrubbed,
+                ensure_ascii=False,
+                allow_nan=False,
+            ))
+        )
+        if not isinstance(redacted, dict):
+            raise ValueError("redacted audit fields are not an object")
+        return redacted, False
+    except Exception:
+        # Audit metadata is still useful, but raw config/event fields may
+        # contain API keys, tokens or proxy credentials and must never be the
+        # fallback when the sanitizer is unavailable.
+        return {}, True
+
+
+def _append_config_audit(record: dict) -> None:
+    """Rotate and append one audit record. Best-effort; never raises."""
+    try:
+        path = _audit_log_path()
+        line = json.dumps(
+            record,
+            ensure_ascii=False,
+            allow_nan=False,
+        ) + "\n"
+        try:
+            from core.logger import _rotate_if_needed
+        except Exception:
+            _rotate_if_needed = None
+        with _CONFIG_AUDIT_LOCK:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if _rotate_if_needed is not None:
+                try:
+                    _rotate_if_needed(
+                        path,
+                        CONFIG_AUDIT_MAX_BYTES,
+                        CONFIG_AUDIT_BACKUPS,
+                    )
+                except Exception:
+                    # Rotation is maintenance; the audit record remains more
+                    # important than enforcing the size bound on this write.
+                    pass
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
 def _write_config_audit(new_cfg: dict, previous_cfg: dict | None = None) -> None:
     """Append a compact record of what changed vs the previous on-disk config.
 
-    Best-effort and append-only  never raises, never blocks save_config.
+    Best-effort and bounded; never raises, never blocks save_config.
     Secret-looking values are redacted before writing.
     """
     try:
@@ -874,16 +968,11 @@ def _write_config_audit(new_cfg: dict, previous_cfg: dict | None = None) -> None
             ts = now_utc().strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-        try:
-            from core.logger import redact
-            diff = json.loads(redact(json.dumps(diff, ensure_ascii=False)))
-        except Exception:
-            pass
+        diff, redaction_failed = _redact_config_audit_fields(diff)
         record = {"ts": ts, "source": "save_config", "changes": diff}
-        path = _audit_log_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if redaction_failed:
+            record["redaction_failed"] = True
+        _append_config_audit(record)
     except Exception:
         pass
 
@@ -891,7 +980,7 @@ def _write_config_audit(new_cfg: dict, previous_cfg: dict | None = None) -> None
 def audit_event(source: str, **fields) -> None:
     """Append a non-diff audit record (e.g. a restart applying new params).
 
-    Best-effort, append-only, redacted; never raises.
+    Best-effort, bounded, redacted; never raises.
     """
     try:
         try:
@@ -899,16 +988,13 @@ def audit_event(source: str, **fields) -> None:
             ts = now_utc().strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-        try:
-            from core.logger import redact
-            fields = json.loads(redact(json.dumps(fields, ensure_ascii=False)))
-        except Exception:
-            pass
-        record = {"ts": ts, "source": source, **fields}
-        path = _audit_log_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        fields, redaction_failed = _redact_config_audit_fields(fields)
+        # Caller fields are context only; canonical audit metadata must not be
+        # replaceable by an accidental or untrusted ``ts``/``source`` key.
+        record = {**fields, "ts": ts, "source": source}
+        if redaction_failed:
+            record["redaction_failed"] = True
+        _append_config_audit(record)
     except Exception:
         pass
 
@@ -987,7 +1073,8 @@ def save_config(cfg: dict) -> None:
     clobber each other's tmp file before ``os.replace``. Failure is
     logged (rate-limited) rather than silently dropped. A compact diff
     vs the previous on-disk config is appended to logs/config_audit.jsonl
-    (best-effort, before the overwrite so the diff is accurate).
+    after the atomic replace succeeds. The previous snapshot is captured
+    before the overwrite so the diff remains accurate.
     """
     with _CONFIG_WRITE_LOCK:
         with _config_process_lock():

@@ -44,6 +44,15 @@ from launcher.core.system_monitor import get_system_stats
 _RUNTIME_MODE_MAX_AGE_SEC = 180.0
 
 
+def _safe_error_text(exc: BaseException, limit: int = 200) -> str:
+    """Bound one-line diagnostics without trusting exception rendering."""
+    try:
+        rendered = str(exc)
+    except Exception:
+        rendered = f"<unrenderable {type(exc).__name__}>"
+    return rendered.replace("\r", " ").replace("\n", " ")[:max(0, limit)]
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         from core.process_identity import pid_alive
@@ -114,56 +123,93 @@ class _ErrorLogCounter:
     """Incremental separator-count that tail-reads only when the file grows.
 
     Cached for the common case (no new errors since last tick):
-      cur_size == cached_size  return cached_count (0 I/O)
+      unchanged identity/size/mtime  return cached_count (0 file read)
       cur_size  > cached_size  read delta only + count new separators
-      cur_size  < cached_size  file rotated  full recount
+      rotated/truncated/rewritten file  full recount
     """
     SEPARATOR = "=" * 20
+    SEPARATOR_BYTES = SEPARATOR.encode("ascii")
 
     def __init__(self, path: str = "error_log.txt"):
         self.path = path
         self._cached_size  = 0
         self._cached_count = 0
+        self._cached_file_id: tuple[int, int] | None = None
+        self._cached_mtime_ns = 0
 
     def count(self) -> int:
         import os as _os
         try:
-            if not _os.path.exists(self.path):
-                self._cached_size  = 0
-                self._cached_count = 0
-                return 0
-            cur_size = _os.path.getsize(self.path)
+            stat = _os.stat(self.path)
+        except FileNotFoundError:
+            self._cached_size = 0
+            self._cached_count = 0
+            self._cached_file_id = None
+            self._cached_mtime_ns = 0
+            return 0
         except OSError:
             return self._cached_count  # transient  keep last
 
-        if cur_size == self._cached_size:
+        cur_size = stat.st_size
+        file_id = (stat.st_dev, stat.st_ino)
+        mtime_ns = stat.st_mtime_ns
+        if (
+            cur_size == self._cached_size
+            and file_id == self._cached_file_id
+            and mtime_ns == self._cached_mtime_ns
+        ):
             return self._cached_count
 
-        if cur_size < self._cached_size:
-            # Rotated / truncated  recount from scratch
+        replaced = (
+            self._cached_file_id is not None
+            and file_id != self._cached_file_id
+        )
+        same_size_rewritten = (
+            cur_size == self._cached_size
+            and mtime_ns != self._cached_mtime_ns
+        )
+
+        if replaced or cur_size < self._cached_size or same_size_rewritten:
+            # Rotated, truncated, or rewritten in place  recount from scratch.
             try:
-                with open(self.path, encoding="utf-8-sig") as f:
-                    content = f.read()
-                self._cached_count = content.count(self.SEPARATOR)
-                self._cached_size  = cur_size
+                with open(self.path, "rb") as f:
+                    content = f.read(cur_size)
+                self._cached_count = content.count(self.SEPARATOR_BYTES)
+                self._cached_size = cur_size
+                self._cached_file_id = file_id
+                self._cached_mtime_ns = mtime_ns
             except Exception:
                 pass
             return self._cached_count
 
+        if cur_size == 0:
+            # First observation of an empty file.
+            self._cached_size = 0
+            self._cached_count = 0
+            self._cached_file_id = file_id
+            self._cached_mtime_ns = mtime_ns
+            return 0
+
         # cur_size > cached_size  read only new bytes (tail).
         # Use a small overlap to catch separators spanning the boundary.
-        delta_start = max(0, self._cached_size - (len(self.SEPARATOR) - 1))
+        delta_start = max(
+            0, self._cached_size - (len(self.SEPARATOR_BYTES) - 1)
+        )
         try:
-            with open(self.path, encoding="utf-8-sig") as f:
+            # File sizes and seek offsets are bytes. Binary reads keep those
+            # units consistent and cannot land inside a UTF-8 code point.
+            with open(self.path, "rb") as f:
                 f.seek(delta_start)
-                tail = f.read()
-            new_seps = tail.count(self.SEPARATOR)
+                tail = f.read(cur_size - delta_start)
+            new_seps = tail.count(self.SEPARATOR_BYTES)
             # Subtract separators already counted in the overlap region.
             if delta_start < self._cached_size:
                 overlap     = tail[:self._cached_size - delta_start]
-                new_seps   -= overlap.count(self.SEPARATOR)
+                new_seps   -= overlap.count(self.SEPARATOR_BYTES)
             self._cached_count += new_seps
             self._cached_size   = cur_size
+            self._cached_file_id = file_id
+            self._cached_mtime_ns = mtime_ns
         except Exception:
             pass  # keep last known on read failure
         return self._cached_count
@@ -212,7 +258,12 @@ class DataPoller:
 
         self._spot_exchange   = None   # cached connection for unrealized fetch
         self._error_counter   = _ErrorLogCounter("error_log.txt")
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thread = threading.Thread(
+            target=self._loop,
+            daemon=True,
+            name="launcher-data-poller",
+        )
+        self._thread.start()
 
     def _log_diag(self, msg: str) -> None:
         """Print a one-line diagnostic to stderr, throttled to once/60s
@@ -251,10 +302,12 @@ class DataPoller:
                     new_data["market"] = get_market_info()
                     new_data["exchange"] = get_exchange_status()
                 except MetricsDbReadError as exc:
-                    self._log_diag(f"market/exchange DB read failed: {exc}")
+                    self._log_diag(
+                        f"market/exchange DB read failed: {_safe_error_text(exc)}"
+                    )
                     new_data["market"] = self.cache.get("market")
                     new_data["exchange"] = {"active": False, "label": "DB Error"}
-                    new_data["metrics_error"] = str(exc)[:160]
+                    new_data["metrics_error"] = _safe_error_text(exc, 160)
                 cfg_snapshot = None
                 try:
                     if os.path.exists(CONFIG_FILE):
@@ -291,12 +344,14 @@ class DataPoller:
                     )
                     new_data.setdefault("metrics_error", "")
                 except MetricsDbReadError as exc:
-                    self._log_diag(f"metrics DB read failed: {exc}")
+                    self._log_diag(
+                        f"metrics DB read failed: {_safe_error_text(exc)}"
+                    )
                     new_data["stats"] = self.cache.get("stats", {})
                     new_data["open"] = self.cache.get("open", {})
                     new_data["futures_positions"] = self.cache.get(
                         "futures_positions", 0)
-                    new_data["metrics_error"] = str(exc)[:160]
+                    new_data["metrics_error"] = _safe_error_text(exc, 160)
 
                 #  Sparkline (PnL trend, last ~30 closed trades) 
                 # Refresh every 30s  sparklines only change when a trade
@@ -308,8 +363,13 @@ class DataPoller:
                             spark[bot] = get_pnl_sparkline(
                                 bot, limit=30, mode_is_sim=mode_is_sim[bot])
                         except MetricsDbReadError as exc:
-                            self._log_diag(f"sparkline DB read failed: {exc}")
-                            new_data["metrics_error"] = str(exc)[:160]
+                            self._log_diag(
+                                f"sparkline DB read failed: "
+                                f"{_safe_error_text(exc)}"
+                            )
+                            new_data["metrics_error"] = _safe_error_text(
+                                exc, 160
+                            )
                             spark[bot] = self.cache.get("sparkline", {}).get(bot, [])
                         except Exception:
                             # Keep the previous values rather than wiping
@@ -335,10 +395,13 @@ class DataPoller:
                                     fut_bot, mode_is_sim=mode_is_sim[fut_bot])
                             except MetricsDbReadError as exc:
                                 self._log_diag(
-                                    f"unrealized DB read failed: {exc}")
+                                    f"unrealized DB read failed: "
+                                    f"{_safe_error_text(exc)}")
                                 unr[fut_bot] = self.cache.get(
                                     "unrealized", {}).get(fut_bot, 0.0)
-                                new_data["metrics_error"] = str(exc)[:160]
+                                new_data["metrics_error"] = _safe_error_text(
+                                    exc, 160
+                                )
                     # SPOT bots: live ticker prices (one batch call per bot)
                     for spot_bot in ("TREND", "SPOT"):
                         try:
@@ -365,9 +428,11 @@ class DataPoller:
                     rows = query_db("SELECT COUNT(*) FROM trades WHERE is_partial=0")
                     new_data["trades_total"] = rows[0][0] if rows else 0
                 except MetricsDbReadError as exc:
-                    self._log_diag(f"trade-count DB read failed: {exc}")
+                    self._log_diag(
+                        f"trade-count DB read failed: {_safe_error_text(exc)}"
+                    )
                     new_data["trades_total"] = self.cache.get("trades_total", 0)
-                    new_data["metrics_error"] = str(exc)[:160]
+                    new_data["metrics_error"] = _safe_error_text(exc, 160)
 
                 # Incremental read via _ErrorLogCounter  O(1) when no new errors.
                 new_data["error_count"] = self._error_counter.count()
@@ -482,7 +547,8 @@ class DataPoller:
                                 except Exception as _e_spot:
                                     spot_equity = None
                                     self._log_diag(
-                                        f"spot equity: {type(_e_spot).__name__}: {_e_spot}"
+                                        f"spot equity: {type(_e_spot).__name__}: "
+                                        f"{_safe_error_text(_e_spot)}"
                                     )
 
                             if live_futures:
@@ -507,7 +573,8 @@ class DataPoller:
                                 except Exception as _e_fut:
                                     futures_equity = None
                                     self._log_diag(
-                                        f"futures equity: {type(_e_fut).__name__}: {_e_fut}"
+                                        f"futures equity: {type(_e_fut).__name__}: "
+                                        f"{_safe_error_text(_e_fut)}"
                                     )
 
                             # Format strings for the sidebar.
@@ -585,10 +652,13 @@ class DataPoller:
                 key = type(e).__name__
                 now = time.time()
                 if (now - last_error_log.get(key, 0)) >= 60.0:
-                    import sys as _sys
-                    _sys.stderr.write(
-                        f"[Poller] {key}: {str(e)[:200]}\n"
-                    )
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"[Poller] {key}: {_safe_error_text(e)}\n"
+                        )
+                    except Exception:
+                        pass
                     last_error_log[key] = now
             # Cancellable sleep  react to .stop() within <100ms instead of
             # blocking the full 1.5s.
@@ -613,3 +683,11 @@ class DataPoller:
     def stop(self) -> None:
         self.running = False
         self._stop_event.set()
+        thread = getattr(self, "_thread", None)
+        if thread is None or thread is threading.current_thread():
+            return
+        try:
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+        except Exception:
+            pass

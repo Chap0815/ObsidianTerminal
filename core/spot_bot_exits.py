@@ -29,6 +29,7 @@ from bot_utils import (
     safe_proportional_fee,
 )
 from bot_utils.safe_numeric import safe_positive_float
+from bot_utils.order_utils import order_id_text_or_none
 
 
 # Minimum notional safety margin  exchanges reject sells below this.
@@ -966,7 +967,10 @@ class ExitsMixin:
                         f"(status={_st})  NOT booking, retry next tick", "WARN")
                     return False
                 sold_amount = _filled_base_amount(order, sold_amount, sold_amount)
-                exch_oid = order.get("id") or order.get("orderId")
+                exch_oid = (
+                    order_id_text_or_none(order.get("id"))
+                    or order_id_text_or_none(order.get("orderId"))
+                )
                 fill_price = _positive_finite(
                     extract_fill_price(order, curr), curr)
                 try:
@@ -1185,7 +1189,10 @@ class ExitsMixin:
                     except Exception as ce:
                         self._log_error(f"sell-unfilled cooldown set {sym}", ce)
                     return
-                exch_oid = order.get("id") or order.get("orderId")
+                exch_oid = (
+                    order_id_text_or_none(order.get("id"))
+                    or order_id_text_or_none(order.get("orderId"))
+                )
                 fill_price = _positive_finite(
                     extract_fill_price(order, fill_price), fill_price)
                 residual_amount = safe_remaining(requested_amount, filled_amount)

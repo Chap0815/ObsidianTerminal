@@ -342,14 +342,15 @@ class TrendBot(SpotBot):
             )
             if not self.simulation:
                 from trading.entry_admission import evaluate_entry_admission
-                from trading.portfolio_risk import PortfolioLimits
+                from trading.portfolio_risk import portfolio_limits_from_config
 
-                portfolio_mode = str(
-                    self.C("PORTFOLIO_RISK_MODE", "shadow") or "shadow"
-                ).strip().lower()
-                expectancy_mode = str(
-                    self.C("NET_EXPECTANCY_MODE", "shadow") or "shadow"
-                ).strip().lower()
+                from shared_limits import normalize_gate_mode
+                portfolio_mode = normalize_gate_mode(
+                    self.C("PORTFOLIO_RISK_MODE", "shadow")
+                )
+                expectancy_mode = normalize_gate_mode(
+                    self.C("NET_EXPECTANCY_MODE", "shadow")
+                )
                 admission = evaluate_entry_admission(
                     exchange=self.ex,
                     intent_id=entry_id,
@@ -361,22 +362,9 @@ class TrendBot(SpotBot):
                     expectancy_mode=expectancy_mode,
                     account_type="spot",
                     features=expectancy_features,
-                    limits=PortfolioLimits(
-                        max_gross_pct=float(
-                            self.C("PORTFOLIO_MAX_GROSS_PCT", 100.0)
-                        ),
-                        max_net_pct=float(
-                            self.C("PORTFOLIO_MAX_NET_PCT", 100.0)
-                        ),
-                        min_free_pct=float(
-                            self.C("PORTFOLIO_MIN_FREE_PCT", 20.0)
-                        ),
-                        max_cluster_pct=float(
-                            self.C("PORTFOLIO_MAX_CLUSTER_PCT", 35.0)
-                        ),
-                        max_beta_pct=float(
-                            self.C("PORTFOLIO_MAX_BETA_PCT", 100.0)
-                        ),
+                    limits=portfolio_limits_from_config(
+                        self.C, max_net_default=100.0,
+                        max_beta_default=100.0,
                     ),
                 )
                 log_struct(

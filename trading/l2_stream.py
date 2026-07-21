@@ -235,15 +235,24 @@ class L2ShadowCollector:
 
         flags = ["sequence_unverified"]
         exchange_ms = normalized["timestamp"]
+        received_time = self._iso8601(received_ms)
         if exchange_ms is None:
             flags.append("missing_exchange_timestamp")
             exchange_ms = received_ms
+            exchange_time = received_time
         else:
-            age_ms = received_ms - exchange_ms
-            if age_ms > self.stale_after_ms:
-                flags.append("stale_exchange_timestamp")
-            elif age_ms < -30_000:
-                flags.append("future_exchange_timestamp")
+            try:
+                exchange_time = self._iso8601(exchange_ms)
+            except (OverflowError, OSError, ValueError):
+                flags.append("invalid_exchange_timestamp")
+                exchange_ms = received_ms
+                exchange_time = received_time
+            else:
+                age_ms = received_ms - exchange_ms
+                if age_ms > self.stale_after_ms:
+                    flags.append("stale_exchange_timestamp")
+                elif age_ms < -30_000:
+                    flags.append("future_exchange_timestamp")
         if nonce_monotonic is False:
             flags.append("non_monotonic_nonce")
 
@@ -272,14 +281,26 @@ class L2ShadowCollector:
             ),
             kind="l2_stream",
             market_id=self._market_id(symbol),
-            exchange_time=self._iso8601(exchange_ms),
-            received_time=self._iso8601(received_ms),
+            exchange_time=exchange_time,
+            received_time=received_time,
             payload=payload,
             quality_flags=tuple(flags),
         )
         try:
             self.writer.write(event)
         except Exception as exc:
+            # A failed write did not satisfy the sampling contract. Roll back
+            # only our own reservation (a slower concurrent write may already
+            # have replaced it) and preserve every observed update so the next
+            # snapshot reports the complete aggregation window.
+            with self._state_lock:
+                if self._last_persist.get(symbol) == now_monotonic:
+                    if previous_persist is None:
+                        self._last_persist.pop(symbol, None)
+                    else:
+                        self._last_persist[symbol] = previous_persist
+                    concurrent_updates = self._updates_since_sample.get(symbol, 0)
+                    self._updates_since_sample[symbol] = updates + concurrent_updates
             self._log(f"storage error for {symbol}: {type(exc).__name__}", "WARN")
             return False
         return True

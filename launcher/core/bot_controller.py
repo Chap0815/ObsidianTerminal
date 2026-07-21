@@ -140,6 +140,8 @@ def _wait_for_bot_ready(name: str, bot, timeout_sec: float = 15.0) -> tuple[bool
     while _time.monotonic() < deadline:
         if not bot.is_running():
             return False, "process exited before readiness"
+        if str(getattr(bot, "run_id", None) or "") != str(run_id):
+            return False, "superseded by newer run"
         last = read_runtime_status(log_dir)
         threads = last.get("threads") if isinstance(last.get("threads"), dict) else {}
         if (last.get("status") == "ready"
@@ -220,6 +222,8 @@ def start_bot(app, name: str) -> None:
 
     def _ready_worker():
         ready, detail = _wait_for_bot_ready(name, bot)
+        if detail == "superseded by newer run":
+            return
         if ready:
             app.after(0, lambda: log_to_card(
                 card, "system", f"Started - ready ({detail})"))
