@@ -177,12 +177,12 @@ class WebSocketFeed:
             self._seq += 1
             return self._seq
 
-    def _update_cache(self, symbol: str, ticker: dict) -> None:
+    def _update_cache(self, symbol: str, ticker: dict) -> bool:
         price = safe_positive_float(ticker.get("last"), 0.0)
         if price <= 0:
             price = safe_positive_float(ticker.get("close"), 0.0)
         if price <= 0:
-            return
+            return False
         entry = {
             "last":       price,
             "bid":        ticker.get("bid"),
@@ -202,26 +202,51 @@ class WebSocketFeed:
             })
         except Exception:
             pass
+        return True
+
+    @staticmethod
+    def _handle_loop_exception(loop, context: dict) -> None:
+        """Suppress only the known ccxt callback cancellation artifact."""
+        source = f"{context.get('message', '')} {context.get('handle', '')}"
+        if (
+            isinstance(context.get("exception"), asyncio.CancelledError)
+            and "exchange.spawn.<locals>.callback" in source.lower()
+        ):
+            return
+        loop.default_exception_handler(context)
 
     def _start_ws(self, symbols: List[str]) -> None:
         def _run() -> None:
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
+            previous_handler = self._loop.get_exception_handler()
+            self._loop.set_exception_handler(self._handle_loop_exception)
             try:
                 self._loop.run_until_complete(self._ws_main(symbols))
             except Exception as e:
                 try:
                     from core.logger import log_event
-                    log_event(f"[WSFeed] WS failed: {e}  falling back to "
-                              f"REST pool", "WARN")
+                    log_event(
+                        f"[WSFeed] Live price stream unavailable "
+                        f"({type(e).__name__}); REST fallback active; "
+                        f"trading continues with polled prices",
+                        "WARN",
+                    )
                 except Exception:
-                    print(f"[WSFeed] WS failed: {e}  falling back to REST pool")
+                    print(
+                        f"[WSFeed] Live price stream unavailable "
+                        f"({type(e).__name__}); REST fallback active"
+                    )
                 # Clear cache on fallback to avoid trading on stale data
                 with self._cache_lock:
                     self._cache.clear()
                 self._ws_mode = False
                 self._ensure_rest_poller()
             finally:
+                try:
+                    self._loop.set_exception_handler(previous_handler)
+                except Exception:
+                    pass
                 try:
                     self._loop.close()
                 except Exception:
@@ -241,8 +266,13 @@ class WebSocketFeed:
         config = build_public_async_config(self._exchange)
 
         backoff = _WS_BASE_BACKOFF
+        interruption_type: str | None = None
+        reconnect_attempts = 0
+        last_warning_at = 0.0
+        initial_health_reported = False
         while self._running:
             async_ex = ex_class(config)
+            healthy_symbols: set[str] = set()
             with self._async_ex_lock:
                 self._async_ex = async_ex
             try:
@@ -259,18 +289,75 @@ class WebSocketFeed:
                         continue
                     tickers = await async_ex.watch_tickers(current_syms)
                     for sym, t in tickers.items():
-                        self._update_cache(sym, t)
+                        if self._update_cache(sym, t):
+                            healthy_symbols.add(sym)
+                    all_current_symbols_healthy = (
+                        bool(current_syms)
+                        and set(current_syms).issubset(healthy_symbols)
+                        and all(self.is_fresh(sym) for sym in current_syms)
+                    )
+                    if all_current_symbols_healthy:
+                        try:
+                            from core.logger import log_event
+                            if interruption_type is not None:
+                                log_event(
+                                    f"[WSFeed] Live price stream restored after "
+                                    f"{interruption_type} ({reconnect_attempts} "
+                                    f"reconnect attempt"
+                                    f"{'s' if reconnect_attempts != 1 else ''})",
+                                    "OK",
+                                )
+                            elif not initial_health_reported:
+                                log_event(
+                                    f"[WSFeed] Live price stream healthy "
+                                    f"({len(current_syms)} symbol"
+                                    f"{'s' if len(current_syms) != 1 else ''})",
+                                    "OK",
+                                )
+                        except Exception:
+                            pass
+                        interruption_type = None
+                        reconnect_attempts = 0
+                        initial_health_reported = True
                     backoff = _WS_BASE_BACKOFF
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                error_type = type(e).__name__
+                reconnect_attempts += 1
                 try:
-                    from core.logger import log_event
-                    log_event(f"[WSFeed] WS error: {e}  reconnecting in "
-                              f"{backoff:.0f}s", "WARN")
+                    from core.logger import log_struct
+                    log_struct(
+                        "ws_feed_interruption",
+                        bot_name=self._bot_name,
+                        error_type=error_type,
+                        detail=str(e),
+                        reconnect_attempt=reconnect_attempts,
+                    )
                 except Exception:
-                    print(f"[WSFeed] WS error: {e}  reconnecting in "
-                          f"{backoff:.0f}s")
+                    pass
+                now = time.monotonic()
+                if (
+                    reconnect_attempts == 1
+                    or error_type != interruption_type
+                    or now - last_warning_at >= 60.0
+                ):
+                    try:
+                        from core.logger import log_event
+                        log_event(
+                            f"[WSFeed] Live price stream interrupted "
+                            f"({error_type}); automatic reconnect in "
+                            f"{backoff:.0f}s",
+                            "WARN",
+                        )
+                    except Exception:
+                        print(
+                            f"[WSFeed] Live price stream interrupted "
+                            f"({error_type}); automatic reconnect in "
+                            f"{backoff:.0f}s"
+                        )
+                    last_warning_at = now
+                interruption_type = error_type
             finally:
                 with self._async_ex_lock:
                     if self._async_ex is async_ex:

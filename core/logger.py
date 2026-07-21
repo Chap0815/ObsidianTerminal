@@ -9,6 +9,7 @@ to once per hour.
 """
 
 import atexit
+import hashlib
 import json
 import math
 import os
@@ -188,6 +189,9 @@ def log_event(msg, level="INFO"):
         "INFO":  ("INFO",  W),  "BUY":   ("BUY",   G),
         "SELL":  ("SELL",  R),  "WIN":   ("WIN",   G),
         "LOSS":  ("LOSS",  R),  "WARN":  ("WARN",  Y),
+        "OK":    ("OK",    G),
+        "ERROR": ("ERROR", R),  "CRITICAL": ("CRITICAL", R),
+        "FATAL": ("FATAL", R),
         "START": ("START", C),  "SCAN":  ("SCAN",  B),
         "WAIT":  ("WAIT",  DIM),
     }
@@ -204,6 +208,9 @@ def log_event(msg, level="INFO"):
         redact(msg),
         max_chars=_LOG_EVENT_MAX_CHARS,
     )
+    # User-facing activity logs are one event per line. Multiline diagnostics
+    # belong in the rotating error/structured logs, not as a UI message wall.
+    msg = re.sub(r"\s*[\r\n]+\s*", " | ", msg).strip()
     _safe_console_print(f"{ts} {_c(icon, color)}  {_c(msg, color)}")
 
 
@@ -1036,13 +1043,26 @@ def _telegram_worker() -> None:
                     data={"chat_id": chat_id, "text": msg},
                     proxies=_TG_PROXIES, timeout=15)
                 if not r.ok:
-                    log_event(f"Telegram api error: status={r.status_code}", "WARN")
-                    _record_tg_failure(f"http_{r.status_code}")
+                    _record_tg_failure(
+                        f"http_{r.status_code}",
+                        _telegram_recipient_key(token, chat_id),
+                    )
                 else:
-                    _reset_tg_failures()
+                    recovered = _reset_tg_failures(
+                        _telegram_recipient_key(token, chat_id)
+                    )
+                    if recovered:
+                        log_event(
+                            f"Telegram delivery restored for one configured "
+                            f"recipient after {recovered} "
+                            f"failed attempt{'s' if recovered != 1 else ''}",
+                            "OK",
+                        )
             except Exception as e:
-                log_event(f"Telegram send failure: {type(e).__name__}", "WARN")
-                _record_tg_failure(type(e).__name__)
+                _record_tg_failure(
+                    type(e).__name__,
+                    _telegram_recipient_key(token, chat_id),
+                )
             finally:
                 try:
                     _TG_QUEUE.task_done()
@@ -1072,38 +1092,54 @@ def _ensure_tg_worker() -> None:
 # Track Telegram failures so the user sees a prominent warning in the log
 # box when alerts stop reaching them (a network block could otherwise
 # silently disable critical SAFE_MODE alerts).
-_TG_FAIL_COUNT     = 0
 _TG_FAIL_LOCK      = threading.Lock()
-_TG_LAST_BIG_WARN  = 0.0
+_TG_FAILURES: dict[str, dict[str, float | int]] = {}
 _TG_BIG_WARN_EVERY = 300.0   # 5 min between escalations
 
 
-def _record_tg_failure(reason: str) -> None:
-    """Bump fail counter. After 5 consecutive failures, log a prominent
-    WARN that survives the classifier and lands in 'error' severity so
-    the user notices their Telegram alerts have stopped."""
-    global _TG_FAIL_COUNT, _TG_LAST_BIG_WARN
+def _telegram_recipient_key(token: str, chat_id: str) -> str:
+    """Return a non-reversible in-memory key without exposing credentials."""
+    material = f"{token}\0{chat_id}".encode("utf-8", errors="replace")
+    return hashlib.sha256(material).hexdigest()[:20]
+
+
+def _record_tg_failure(reason: str, recipient_key: str) -> None:
+    """Report the first failure immediately and rate-limit later reminders."""
+    notice = None
     with _TG_FAIL_LOCK:
-        _TG_FAIL_COUNT += 1
-        n = _TG_FAIL_COUNT
+        state = _TG_FAILURES.setdefault(
+            str(recipient_key), {"count": 0, "last_big_warn": 0.0}
+        )
+        state["count"] = int(state["count"]) + 1
+        n = int(state["count"])
         now = time.time()
-        if n >= 5 and (now - _TG_LAST_BIG_WARN) >= _TG_BIG_WARN_EVERY:
-            _TG_LAST_BIG_WARN = now
-            try:
-                log_event(
-                    f"TELEGRAM FAILED {n}x in a row (last: {reason}) - "
-                    f"alerts may not be reaching you. Check token / network.",
-                    "WARN"
-                )
-            except Exception:
-                pass
+        if n == 1:
+            notice = (
+                f"Telegram delivery temporarily unavailable for one configured "
+                f"recipient ({reason}); "
+                "trading continues normally"
+            )
+        elif n >= 5 and (
+            now - float(state["last_big_warn"])
+        ) >= _TG_BIG_WARN_EVERY:
+            state["last_big_warn"] = now
+            notice = (
+                f"Telegram delivery still unavailable for one configured "
+                f"recipient after {n} attempts (last: {reason}); check token "
+                f"and network"
+            )
+    if notice is not None:
+        try:
+            log_event(notice, "WARN")
+        except Exception:
+            pass
 
 
-def _reset_tg_failures() -> None:
-    """Successful send: reset counter."""
-    global _TG_FAIL_COUNT
+def _reset_tg_failures(recipient_key: str) -> int:
+    """Successful send: reset and return the prior consecutive-failure count."""
     with _TG_FAIL_LOCK:
-        _TG_FAIL_COUNT = 0
+        state = _TG_FAILURES.pop(str(recipient_key), None)
+        return int(state["count"]) if state is not None else 0
 
 
 def _rotate_overflow_if_needed() -> None:

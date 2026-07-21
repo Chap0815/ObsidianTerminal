@@ -26,10 +26,13 @@ from __future__ import annotations
 
 import os
 import queue
+import re
+from collections import deque
 import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 from launcher.config.settings import PROJECT_ROOT, _get_python_exe, subprocess_no_window_kwargs
@@ -38,6 +41,220 @@ from launcher.core.runtime_status_values import (
     positive_int_or_zero,
     strict_bool_or_none,
 )
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+_TIMESTAMP_THEN_LEVEL_RE = re.compile(
+    r"^\s*\[\d{2}:\d{2}:\d{2}\]\s+"
+    r"(?P<level>INFO|OK|WARN|WARNING|ERROR|CRITICAL|FATAL|START|SCAN|WAIT|"
+    r"BUY|SELL|WIN|LOSS)\s+",
+    re.IGNORECASE,
+)
+_LEVEL_THEN_TIMESTAMP_RE = re.compile(
+    r"^\s*(?P<level>INFO|OK|WARN|WARNING|ERROR|CRITICAL|FATAL|START|SCAN|WAIT|"
+    r"BUY|SELL|WIN|LOSS)\s+\[\d{2}:\d{2}:\d{2}\]\s+",
+    re.IGNORECASE,
+)
+
+
+class RepeatedLogCompactor:
+    """Compact only consecutive duplicate UI lines with bounded state.
+
+    Timestamps are ignored for comparison while severity is preserved. Unique lines,
+    including unique traceback frames, are never dropped. A periodic summary
+    keeps an endlessly repeating condition visible without flooding the UI.
+    """
+
+    def __init__(self, *, summary_interval_seconds: float = 30.0) -> None:
+        self.summary_interval_seconds = max(
+            1.0, float(summary_interval_seconds)
+        )
+        self._fingerprint: str | None = None
+        self._level = "INFO"
+        self._repeat_count = 0
+        self._last_summary_at = 0.0
+
+    @staticmethod
+    def _line_fingerprint(line: str) -> str:
+        clean = _ANSI_ESCAPE_RE.sub("", str(line))
+        clean = _TIMESTAMP_THEN_LEVEL_RE.sub(r"\g<level> ", clean, count=1)
+        clean = _LEVEL_THEN_TIMESTAMP_RE.sub(r"\g<level> ", clean, count=1)
+        return clean.strip()
+
+    @staticmethod
+    def _summary(count: int) -> str:
+        noun = "time" if count == 1 else "times"
+        tail = "duplicate condensed" if count == 1 else "duplicates condensed"
+        return f"[Log] Previous message repeated {count} {noun}; {tail}."
+
+    @staticmethod
+    def _line_level(line: str) -> str:
+        clean = _ANSI_ESCAPE_RE.sub("", str(line))
+        match = _TIMESTAMP_THEN_LEVEL_RE.match(clean)
+        if match is None:
+            match = _LEVEL_THEN_TIMESTAMP_RE.match(clean)
+        if match is not None:
+            return match.group("level").upper()
+        if clean.lstrip().startswith(("Traceback", "During handling", "File \"")):
+            return "ERROR"
+        return "INFO"
+
+    def _summary_line(self) -> str:
+        return f"{self._level} {self._summary(self._repeat_count)}"
+
+    def push(self, line: str, *, now: float | None = None) -> tuple[str, ...]:
+        current = time.monotonic() if now is None else float(now)
+        fingerprint = self._line_fingerprint(line)
+        if self._fingerprint is None:
+            self._fingerprint = fingerprint
+            self._level = self._line_level(line)
+            self._last_summary_at = current
+            return (line,)
+        if fingerprint != self._fingerprint:
+            output = []
+            if self._repeat_count:
+                output.append(self._summary_line())
+            output.append(line)
+            self._fingerprint = fingerprint
+            self._level = self._line_level(line)
+            self._repeat_count = 0
+            self._last_summary_at = current
+            return tuple(output)
+
+        self._repeat_count += 1
+        if current - self._last_summary_at >= self.summary_interval_seconds:
+            summary = self._summary_line()
+            self._repeat_count = 0
+            self._last_summary_at = current
+            return (summary,)
+        return ()
+
+    def flush(self) -> tuple[str, ...]:
+        if not self._repeat_count:
+            return ()
+        summary = self._summary_line()
+        self._repeat_count = 0
+        return (summary,)
+
+
+_PRIORITY_LEVEL_RE = re.compile(
+    r"^\s*(?:\[\d{2}:\d{2}:\d{2}\]\s+)?"
+    r"(?:ERROR|CRITICAL|FATAL|TRACEBACK)\b",
+    re.IGNORECASE,
+)
+_WARN_LEVEL_RE = re.compile(
+    r"^\s*(?:\[\d{2}:\d{2}:\d{2}\]\s+)?"
+    r"(?:WARN|WARNING|OK|START)\b",
+    re.IGNORECASE,
+)
+_TRADE_LEVEL_RE = re.compile(
+    r"^\s*(?:\[\d{2}:\d{2}:\d{2}\]\s+)?"
+    r"(?:BUY|SELL|WIN|LOSS)\b",
+    re.IGNORECASE,
+)
+
+
+class BoundedLogQueue:
+    """Bounded UI queue that protects important lines and reports every drop."""
+
+    def __init__(self, maxsize: int = 5000) -> None:
+        self.maxsize = max(1, int(maxsize))
+        self._items = deque()
+        self._lock = threading.Lock()
+        self._dropped_routine = 0
+        self._dropped_important = 0
+
+    @staticmethod
+    def _priority(line: str) -> int:
+        text = _ANSI_ESCAPE_RE.sub("", str(line))
+        if (
+            _PRIORITY_LEVEL_RE.match(text)
+            or text.startswith("  File \"")
+            or text.startswith("During handling of the above exception")
+            or re.match(r"^[\w.]+(?:Error|Exception|Timeout):", text)
+        ):
+            return 3
+        if _TRADE_LEVEL_RE.match(text):
+            return 2
+        if _WARN_LEVEL_RE.match(text):
+            return 1
+        return 0
+
+    def _record_drop(self, priority: int) -> None:
+        if priority:
+            self._dropped_important += 1
+        else:
+            self._dropped_routine += 1
+
+    def put_nowait(self, line: str) -> None:
+        item = str(line)
+        priority = self._priority(item)
+        with self._lock:
+            if len(self._items) < self.maxsize:
+                self._items.append((item, priority))
+                return
+
+            victim = None
+            if priority:
+                for lower_level in range(priority):
+                    victim = next(
+                        (
+                            i
+                            for i, (_text, level) in enumerate(self._items)
+                            if level == lower_level
+                        ),
+                        None,
+                    )
+                    if victim is not None:
+                        break
+                if victim is None and priority == 3:
+                    victim = 0
+            else:
+                victim = next(
+                    (i for i, (_text, level) in enumerate(self._items) if level == 0),
+                    None,
+                )
+
+            if victim is None:
+                self._record_drop(priority)
+                return
+            _dropped_text, dropped_priority = self._items[victim]
+            del self._items[victim]
+            self._record_drop(dropped_priority)
+            self._items.append((item, priority))
+
+    def get_nowait(self) -> str:
+        with self._lock:
+            if self._dropped_routine or self._dropped_important:
+                routine = self._dropped_routine
+                important = self._dropped_important
+                self._dropped_routine = 0
+                self._dropped_important = 0
+                parts = []
+                if routine:
+                    parts.append(
+                        f"{routine} routine line{'s' if routine != 1 else ''}"
+                    )
+                if important:
+                    parts.append(
+                        f"{important} important line{'s' if important != 1 else ''}"
+                    )
+                return (
+                    "WARN [Log] " + " and ".join(parts)
+                    + " omitted because the display queue was full."
+                )
+            if not self._items:
+                raise queue.Empty
+            return self._items.popleft()[0]
+
+    def qsize(self) -> int:
+        with self._lock:
+            return len(self._items) + int(
+                bool(self._dropped_routine or self._dropped_important)
+            )
+
+    def empty(self) -> bool:
+        return self.qsize() == 0
 
 
 class BotProcess:
@@ -339,10 +556,22 @@ class BotProcess:
 
     #  Stdout reader 
 
+    def _enqueue_log_line(self, line: str) -> None:
+        """Queue one line without ever blocking the bot process."""
+        try:
+            self.log_queue.put_nowait(line)
+        except queue.Full:
+            try:
+                self.log_queue.get_nowait()
+                self.log_queue.put_nowait(line)
+            except (queue.Empty, queue.Full):
+                pass
+
     def _reader(self, proc: subprocess.Popen) -> None:
         if not proc or not proc.stdout:
             return
         stdout = proc.stdout
+        compactor = RepeatedLogCompactor()
         try:
             for line in stdout:
                 line = line.rstrip("\n").rstrip("\r")
@@ -351,15 +580,11 @@ class BotProcess:
                     # oldest line and append the new one. Without this the
                     # reader could block forever and new logs would stop
                     # appearing in the UI.
-                    try:
-                        self.log_queue.put_nowait(line)
-                    except queue.Full:
-                        try:
-                            self.log_queue.get_nowait()   # drop oldest
-                            self.log_queue.put_nowait(line)
-                        except (queue.Empty, queue.Full):
-                            pass
+                    for output_line in compactor.push(line):
+                        self._enqueue_log_line(output_line)
         finally:
+            for output_line in compactor.flush():
+                self._enqueue_log_line(output_line)
             try:
                 stdout.close()
             except Exception:

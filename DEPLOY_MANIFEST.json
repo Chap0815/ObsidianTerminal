@@ -1,6 +1,6 @@
 {
-  "build_id": "eb7fe5fd84ce9d66",
-  "created_at": "2026-07-21 09:13:30",
+  "build_id": "38438e1ace528666",
+  "created_at": "2026-07-21 09:57:53",
   "source": "update_deploy_manifest.py",
   "file_count": 174,
   "files": [
@@ -266,8 +266,8 @@
     },
     {
       "path": "core/logger.py",
-      "sha256": "862082e93fbb5d1ee1f58df0e54ed13f9a2fd4566ab73ec2833cf4d7dfcd69c9",
-      "bytes": 39157
+      "sha256": "7f68f5959f5789ca46163795ba9f1aa910ad0b1a632ccaa4231ff095abe731c3",
+      "bytes": 40720
     },
     {
       "path": "core/models.py",
@@ -391,8 +391,8 @@
     },
     {
       "path": "launcher/core/process_manager.py",
-      "sha256": "6681c74ff785081c804ec06b3f0d98793289cba723713b802a72a59039c3f680",
-      "bytes": 14995
+      "sha256": "ccf969f09ab1b1a94aa4136e0ceaf6d271559bd4d65222431d98771b49071429",
+      "bytes": 22731
     },
     {
       "path": "launcher/core/runtime_status_values.py",
@@ -426,8 +426,8 @@
     },
     {
       "path": "launcher/ui/app.py",
-      "sha256": "bff2a42a1146f9448615bf07d502c4b93e87695ddb6a73b82a446d8c5765b2ea",
-      "bytes": 188702
+      "sha256": "492bd11a3c8488428a34453fbe9e7a88bea39ba7732cb4ce962059589beae1ca",
+      "bytes": 188444
     },
     {
       "path": "launcher/ui/components/__init__.py",
@@ -466,8 +466,8 @@
     },
     {
       "path": "launcher/ui/logging_panel.py",
-      "sha256": "9cebe9cc85da59c4be76179bc1316e3244fa0d88f0aeb72964a4e752f2fc9375",
-      "bytes": 11702
+      "sha256": "1512ab93c1e13ecd621d28062564b75e56ad4196ad0014c563f54082b318b9c9",
+      "bytes": 14007
     },
     {
       "path": "launcher/ui/scaling.py",
@@ -766,8 +766,8 @@
     },
     {
       "path": "trading/l2_stream.py",
-      "sha256": "9806243b2f086b317da41a09605df4224e24f2daba22fdef13314276eb9d8f0f",
-      "bytes": 17125
+      "sha256": "b45e4ad6dd02b70c710619b1026aae682bc577541778c34881e73ffdf168c4bc",
+      "bytes": 21772
     },
     {
       "path": "trading/market_filters.py",
@@ -856,8 +856,8 @@
     },
     {
       "path": "trading/ws_feed.py",
-      "sha256": "d853b1bc217f0b46abbf6c32d13fb5299007c6b08a2e5e90644478acbc4c859e",
-      "bytes": 14506
+      "sha256": "46a1328dc413f8bed696db90967fc0ee6100725241074838ba8631377f45b440",
+      "bytes": 18463
     },
     {
       "path": "trading/xsec_signal.py",

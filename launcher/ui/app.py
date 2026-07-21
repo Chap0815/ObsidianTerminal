@@ -98,7 +98,7 @@ try:
     from launcher.config.settings import PARAM_DEFS_FUTREND
 except ImportError:
     PARAM_DEFS_FUTREND = PARAM_DEFS_FUTURES
-from launcher.core.process_manager import BotProcess
+from launcher.core.process_manager import BotProcess, BoundedLogQueue
 from launcher.core.runtime_status_values import (
     finite_float_or_none,
     positive_int_or_zero,
@@ -213,7 +213,7 @@ class ObsidianApp(ctk.CTk):
 
         # Per bot: queue, process wrapper, card refs. Bound log queues so long
         # runs cannot grow memory unbounded if UI reads slower than bots write.
-        self.log_queues = {bot: queue.Queue(maxsize=5000) for bot in BOT_ORDER}
+        self.log_queues = {bot: BoundedLogQueue(maxsize=5000) for bot in BOT_ORDER}
         # All bots support graceful close: SIGINT/SIGTERM/SIGBREAK handlers
         # are registered in each bot's run_bot()  they close all open positions
         # via market orders before exit.
@@ -1535,8 +1535,18 @@ class ObsidianApp(ctk.CTk):
             font=_badge_font, lmargin1=2, lmargin2=2
         )
         log_box.tag_configure(
+            "badge_ok",
+            background="#0b3a25", foreground="#34d399",
+            font=_badge_font, lmargin1=2, lmargin2=2
+        )
+        log_box.tag_configure(
             "badge_trade",
             background="#0b3a25", foreground="#34d399",
+            font=_badge_font, lmargin1=2, lmargin2=2
+        )
+        log_box.tag_configure(
+            "badge_loss",
+            background="#3a1820", foreground="#f87171",
             font=_badge_font, lmargin1=2, lmargin2=2
         )
         log_box.tag_configure(
@@ -3408,31 +3418,15 @@ class ObsidianApp(ctk.CTk):
             card = self.cards[bot]
             q = self.log_queues[bot]
             count = 0
-            # If the queue has built up > 1000 entries (bot in error-loop or
-            # backtest burst producing 100+ lines/sec) we can never catch up
-            # reading 25 lines every 500 ms.  Drain aggressively: discard
-            # everything except the most recent 50 entries and insert a gap
-            # notice so the user knows logs were skipped.
             try:
                 backlog = q.qsize()
             except Exception:
                 backlog = 0
-            if backlog > 1000:
-                discarded = 0
-                while q.qsize() > 50:
-                    try:
-                        q.get_nowait()
-                        discarded += 1
-                    except queue.Empty:
-                        break
-                if discarded:
-                    self._log_to_card(
-                        card, "warn",
-                        f"[System] {discarded} log lines skipped  UI lagging, "
-                        f"catching up to present ({backlog} queued)"
-                    )
-
-            while not q.empty() and count < 25:
+            # Drain faster under pressure, but never blind-drop unique lines.
+            # BoundedLogQueue protects important entries and reports any
+            # mathematically unavoidable overflow explicitly.
+            refresh_budget = 100 if backlog > 1000 else 25
+            while not q.empty() and count < refresh_budget:
                 try:
                     line = q.get_nowait()
                     sev = self._classify_severity(line)

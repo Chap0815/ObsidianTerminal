@@ -27,17 +27,66 @@ from launcher.config.settings import COLORS
 
 #  Severity 
 
+_LEVEL_NAMES = (
+    r"INFO|OK|WARN|WARNING|ERROR|CRITICAL|FATAL|START|SCAN|WAIT|"
+    r"BUY|SELL|WIN|LOSS"
+)
 _EMBEDDED_LEVEL_RE = re.compile(
-    r"^(\[\d{2}:\d{2}:\d{2}\]\s+)"
-    r"(INFO|WARN|WARNING|ERROR|START|SCAN|WAIT|BUY|SELL|WIN|LOSS)\s+",
+    rf"^\[(?P<after_time>\d{{2}}:\d{{2}}:\d{{2}})\]\s+"
+    rf"(?P<after_level>{_LEVEL_NAMES})\s+",
+    re.IGNORECASE,
+)
+_LEADING_LEVEL_RE = re.compile(
+    rf"^(?P<before_level>{_LEVEL_NAMES})\s+"
+    rf"\[(?P<before_time>\d{{2}}:\d{{2}}:\d{{2}})\]\s+",
+    re.IGNORECASE,
+)
+_BARE_LEVEL_RE = re.compile(
+    rf"^(?P<bare_level>{_LEVEL_NAMES})\s+",
+)
+
+_EXPLICIT_LEVEL_RE = re.compile(
+    r"^\s*(?:"
+    r"\[\d{2}:\d{2}:\d{2}\]\s+"
+    rf"(?P<after>{_LEVEL_NAMES})"
+    r"|"
+    rf"(?P<before>{_LEVEL_NAMES})"
+    r"\s+\[\d{2}:\d{2}:\d{2}\]"
+    r"|"
+    rf"(?P<bare>{_LEVEL_NAMES})"
+    r")\b",
     re.IGNORECASE,
 )
 
 
+def _explicit_level(line: str) -> str | None:
+    """Return a producer-supplied level instead of guessing from wording."""
+    match = _EXPLICIT_LEVEL_RE.match(str(line or ""))
+    if match is None:
+        return None
+    return str(
+        match.group("after") or match.group("before") or match.group("bare")
+    ).upper()
+
+
 def normalize_log_message_for_display(msg: str) -> str:
-    """Remove redundant bot-side level labels before rendering in the card."""
+    """Strip redundant producer prefixes and keep one compact UI line."""
     text = str(msg or "")
-    return _EMBEDDED_LEVEL_RE.sub(r"\1", text, count=1)
+    if _EMBEDDED_LEVEL_RE.match(text):
+        text = _EMBEDDED_LEVEL_RE.sub("", text, count=1)
+    elif _LEADING_LEVEL_RE.match(text):
+        text = _LEADING_LEVEL_RE.sub("", text, count=1)
+    else:
+        text = _BARE_LEVEL_RE.sub("", text, count=1)
+    return re.sub(r"\s*[\r\n]+\s*", " | ", text).strip()
+
+
+def _source_timestamp(msg: str) -> str | None:
+    text = str(msg or "")
+    match = _EMBEDDED_LEVEL_RE.match(text) or _LEADING_LEVEL_RE.match(text)
+    if match is None:
+        return None
+    return match.groupdict().get("after_time") or match.groupdict().get("before_time")
 
 
 def is_benign_info_line(line: str) -> bool:
@@ -86,6 +135,21 @@ def classify_severity(line: str) -> str:
     box. Detection order matters  see comments below."""
     upper = line.upper()
     lower = line.lower()
+
+    # A level explicitly supplied by the bot is authoritative. In particular,
+    # wording such as "retry failed" must not turn an intentional WARN into a
+    # red ERROR badge, while an OK recovery containing "Timeout" stays green.
+    explicit = _explicit_level(line)
+    if explicit == "OK":
+        return "ok"
+    if explicit in ("WARN", "WARNING"):
+        return "warn"
+    if explicit in ("ERROR", "CRITICAL", "FATAL"):
+        if explicit in ("CRITICAL", "FATAL"):
+            return "critical"
+        return "error"
+    if explicit in ("BUY", "SELL", "WIN", "LOSS"):
+        return explicit.lower()
 
     if is_benign_info_line(line):
         return "info"
@@ -192,6 +256,10 @@ def _severity_to_badge(severity: str, msg: str = "") -> tuple[str, str, str]:
     # Explicit severities
     if sev == "error":
         return ("ERROR", "badge_error", "error")
+    if sev == "critical":
+        return ("CRITICAL", "badge_error", "error")
+    if sev == "ok":
+        return ("OK", "badge_ok", "win")
     if sev == "warn":
         return ("WARN", "badge_warn", "warn")
     if sev == "monitor":
@@ -200,6 +268,8 @@ def _severity_to_badge(severity: str, msg: str = "") -> tuple[str, str, str]:
         return ("KI", "badge_ki", "system")
     if sev == "win":
         return ("$ TRADE", "badge_trade", "win")
+    if sev == "loss":
+        return ("LOSS", "badge_loss", "error")
     if sev in ("buy", "sell"):
         return ("$ TRADE", "badge_trade", sev)
 
@@ -232,7 +302,7 @@ def write_log_to_box(box: tk.Text, auto_var, severity: str, msg: str) -> None:
     trimmed to keep the Tk text widget from blowing up to hundreds of MB
     during long bot runs.
     """
-    ts = datetime.now().strftime("%H:%M:%S")
+    ts = _source_timestamp(msg) or datetime.now().strftime("%H:%M:%S")
     msg = normalize_log_message_for_display(msg)
     badge_text, badge_tag, msg_tag = _severity_to_badge(severity, msg)
 

@@ -155,6 +155,11 @@ class L2ShadowCollector:
         self._last_nonce: dict[str, object] = {}
         self._updates_since_sample: dict[str, int] = {}
         self._connection_epoch = 0
+        self._health_lock = threading.Lock()
+        self._health_seen_symbols: set[str] = set()
+        self._health_error_type: str | None = None
+        self._health_reconnect_attempts = 0
+        self._health_ok_logged = False
         self._thread: threading.Thread | None = None
         self._shutdown_event: threading.Event | None = None
         self._stop_event = threading.Event()
@@ -303,7 +308,45 @@ class L2ShadowCollector:
                     self._updates_since_sample[symbol] = updates + concurrent_updates
             self._log(f"storage error for {symbol}: {type(exc).__name__}", "WARN")
             return False
+        self._mark_l2_healthy(symbol)
         return True
+
+    def _begin_health_check(
+        self,
+        *,
+        error_type: str | None,
+        reconnect_attempts: int,
+    ) -> None:
+        with self._health_lock:
+            self._health_seen_symbols.clear()
+            self._health_error_type = error_type
+            self._health_reconnect_attempts = reconnect_attempts
+            self._health_ok_logged = False
+
+    def _mark_l2_healthy(self, symbol: str) -> None:
+        desired = set(self._symbol_snapshot())
+        if not desired or symbol not in desired:
+            return
+        with self._health_lock:
+            if self._health_ok_logged:
+                return
+            self._health_seen_symbols.add(symbol)
+            if not desired.issubset(self._health_seen_symbols):
+                return
+            error_type = self._health_error_type
+            attempts = self._health_reconnect_attempts
+            self._health_ok_logged = True
+        if error_type is None:
+            self._log(
+                f"L2 research data healthy ({len(desired)}/{len(desired)} symbols)",
+                "OK",
+            )
+            return
+        self._log(
+            f"L2 research data restored after {error_type} "
+            f"({attempts} reconnect attempt{'s' if attempts != 1 else ''})",
+            "OK",
+        )
 
     def _make_async_exchange(self):
         config = build_public_async_config(self.exchange)
@@ -367,23 +410,95 @@ class L2ShadowCollector:
         while not self._should_stop() and time.monotonic() < deadline:
             await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
 
+    def _handle_loop_exception(self, loop, context: dict) -> None:
+        """Hide the known ccxt callback cancellation, delegate every other fault."""
+        source = f"{context.get('message', '')} {context.get('handle', '')}"
+        if (
+            isinstance(context.get("exception"), asyncio.CancelledError)
+            and "exchange.spawn.<locals>.callback" in source.lower()
+        ):
+            return
+        loop.default_exception_handler(context)
+
+    async def _run_with_exception_handler(self) -> None:
+        """Scope the cancellation filter to this collector's private loop."""
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(self._handle_loop_exception)
+        try:
+            await self._run_async()
+        finally:
+            loop.set_exception_handler(previous_handler)
+
     async def _run_async(self) -> None:
         backoff = 2.0
+        last_error_type: str | None = None
+        reconnect_attempts = 0
+        last_warning_at = 0.0
         while not self._should_stop():
             async_exchange = None
             try:
                 async_exchange = self._make_async_exchange()
                 self._connection_epoch += 1
                 await async_exchange.load_markets()
-                self._log(f"connected (epoch {self._connection_epoch})")
-                backoff = 2.0
+                self._begin_health_check(
+                    error_type=last_error_type,
+                    reconnect_attempts=reconnect_attempts,
+                )
+                if last_error_type is None:
+                    self._log(
+                        f"transport connected; validating L2 research data "
+                        f"(epoch {self._connection_epoch})",
+                    )
+                else:
+                    self._log(
+                        f"transport reconnected after {last_error_type}; "
+                        f"validating L2 research data "
+                        f"(epoch {self._connection_epoch})",
+                    )
                 await self._watch_session(async_exchange)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                self._log(
-                    f"stream error {type(exc).__name__}; reconnecting", "WARN"
-                )
+                error_type = type(exc).__name__
+                with self._health_lock:
+                    was_healthy = self._health_ok_logged
+                    self._health_ok_logged = False
+                if was_healthy:
+                    reconnect_attempts = 0
+                    last_error_type = None
+                    backoff = 2.0
+                reconnect_attempts += 1
+                try:
+                    from core.logger import log_struct
+                    log_struct(
+                        "l2_shadow_interruption",
+                        exchange=self.exchange_id,
+                        error_type=error_type,
+                        detail=str(exc),
+                        reconnect_attempt=reconnect_attempts,
+                    )
+                except Exception:
+                    pass
+                now = time.monotonic()
+                if (
+                    reconnect_attempts == 1
+                    or error_type != last_error_type
+                    or now - last_warning_at >= 30.0
+                ):
+                    suffix = (
+                        ""
+                        if reconnect_attempts == 1
+                        else f" (attempt {reconnect_attempts})"
+                    )
+                    self._log(
+                        f"L2 research data interrupted ({error_type}); trading "
+                        f"and position monitoring are unaffected; reconnecting "
+                        f"automatically{suffix}",
+                        "WARN",
+                    )
+                    last_warning_at = now
+                last_error_type = error_type
             finally:
                 if async_exchange is not None:
                     try:
@@ -398,7 +513,7 @@ class L2ShadowCollector:
 
     def _thread_main(self) -> None:
         try:
-            asyncio.run(self._run_async())
+            asyncio.run(self._run_with_exception_handler())
         except Exception as exc:
             self._log(f"collector stopped: {type(exc).__name__}", "WARN")
         finally:
