@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
+from bot_utils.api_budget import try_consume_api_call
 from bot_utils.order_utils import order_id_text_or_none
 
 try:
@@ -131,6 +132,27 @@ def extract_fee_usdt_known(
     return _fee_to_usdt_known(order.get("fee"), order, base_override)
 
 
+def _has_negative_fee_evidence(order: dict) -> bool:
+    """Whether the authoritative fee payload proves a rebate."""
+    if not isinstance(order, dict):
+        return False
+    fees_list = order.get("fees") or []
+    sources = []
+    if isinstance(fees_list, list):
+        sources = [
+            fee for fee in fees_list
+            if isinstance(fee, dict)
+            and _finite_float_or_none(fee.get("cost")) is not None
+        ]
+    if not sources and isinstance(order.get("fee"), dict):
+        sources = [order["fee"]]
+    return any(
+        (cost := _finite_float_or_none(fee.get("cost"))) is not None
+        and cost < 0
+        for fee in sources
+    )
+
+
 def estimate_fee_usdt(amount_coins: float, fill_price: float,
                       taker_rate: Optional[float] = None) -> float:
     """Estimate the USDT fee when the exchange didn't return one."""
@@ -147,10 +169,12 @@ def estimate_fee_usdt(amount_coins: float, fill_price: float,
 def extract_or_estimate(order: dict, fill_price: float,
                         taker_rate: Optional[float] = None,
                         base_override: str = "") -> float:
-    """Real extracted fee if > 0; otherwise estimate as fallback."""
-    real = extract_fee_usdt(order, base_override)
-    if real > 0:
+    """Return a known exchange fee, otherwise estimate as fallback."""
+    real, known = extract_fee_usdt_known(order, base_override)
+    if known and real != 0:
         return real
+    if _has_negative_fee_evidence(order):
+        return real if known else 0.0
     filled = _first_positive_order_value(order, "filled", "amount")
     if taker_rate is None:
         taker_rate = DEFAULT_TAKER_FEE
@@ -183,9 +207,11 @@ def extract_or_estimate_with_refetch(ex, order: dict, symbol_full: str,
     """
     import time as _time
 
-    real = extract_fee_usdt(order, base_override)
-    if real > 0:
+    real, known = extract_fee_usdt_known(order, base_override)
+    if known and real != 0:
         return real
+    if _has_negative_fee_evidence(order):
+        return real if known else 0.0
 
     # Re-fetch once the exchange has had time to attach fee details.
     order_id = (
@@ -193,14 +219,26 @@ def extract_or_estimate_with_refetch(ex, order: dict, symbol_full: str,
         or order_id_text_or_none(order.get("orderId"))
     )
     if order_id and ex is not None and symbol_full:
-        for attempt in range(max_attempts):
+        for _attempt in range(max_attempts):
+            _time.sleep(retry_delay)
             try:
-                _time.sleep(retry_delay)
+                allowed = try_consume_api_call(
+                    "spot_fee_quote_fetch_order", critical=True
+                )
+            except Exception:
+                break
+            if not allowed:
+                break
+            try:
                 refreshed = ex.fetch_order(order_id, symbol_full)
                 if refreshed:
-                    real = extract_fee_usdt(refreshed, base_override)
-                    if real > 0:
+                    real, known = extract_fee_usdt_known(
+                        refreshed, base_override
+                    )
+                    if known and real != 0:
                         return real
+                    if _has_negative_fee_evidence(refreshed):
+                        return real if known else 0.0
             except Exception:
                 continue
 

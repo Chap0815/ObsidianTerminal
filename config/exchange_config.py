@@ -16,6 +16,7 @@ import ccxt
 from typing import Optional, Tuple
 from dotenv import load_dotenv
 
+from bot_utils.api_budget import try_consume_api_call
 from core.paths import ENV_FILE
 load_dotenv(str(ENV_FILE))
 
@@ -316,6 +317,11 @@ def resync_time_difference(ex) -> bool:
             # place; let the caller retry without a second fetch_time.
             return True
         try:
+            if not try_consume_api_call(
+                "exchange_clock_resync_fetch_time",
+                critical=True,
+            ):
+                return False
             ex._in_time_resync = True
             ex.load_time_difference()   # sets ex.options['timeDifference']
             _LAST_TIME_RESYNC["mono"] = now
@@ -352,7 +358,15 @@ def _install_nonce_selfheal(ex):
             if getattr(ex, "_in_time_resync", False):
                 raise
             if is_clock_skew_error(e) and resync_time_difference(ex):
-                return orig_fetch2(*args, **kwargs)   # retry once, re-signed
+                try:
+                    retry_allowed = bool(try_consume_api_call(
+                        "exchange_clock_signed_retry"
+                    ))
+                except Exception as budget_exc:
+                    _silent("clock_skew_retry_budget", budget_exc)
+                    retry_allowed = False
+                if retry_allowed:
+                    return orig_fetch2(*args, **kwargs)  # once, re-signed
             raise
 
     ex.fetch2 = _fetch2_selfheal
@@ -371,6 +385,8 @@ def _publish_clock_offset(ex) -> None:
     local fallback. WARNs on large drift (the bot self-heals; the user need not
     fix their OS clock)."""
     try:
+        if not try_consume_api_call("exchange_clock_fetch_time"):
+            return
         server_ms = float(ex.fetch_time())
     except Exception as e:
         _silent("publish_clock_offset", e)
@@ -490,8 +506,10 @@ def _ensure_markets_loaded(ex) -> bool:
         markets = getattr(ex, "markets", None)
         if markets:  # already loaded
             return True
+        if not try_consume_api_call("futures_leverage_load_markets"):
+            return False
         ex.load_markets()
-        return True
+        return bool(getattr(ex, "markets", None))
     except Exception as e:
         _log_event(
             f"[exchange] load_markets() failed before leverage call: "
@@ -575,8 +593,12 @@ def try_set_leverage(ex, leverage, symbol=None, direction=None,
         _log_event(f"[exchange] {msg}", "WARN")
         return False, NotImplementedError(msg)
 
-    # ensure markets first
-    _ensure_markets_loaded(ex)
+    # Ensure markets first. A failed cold-load is not recoverable by cycling
+    # through setLeverage parameter shapes and must not trigger more venue I/O.
+    if not _ensure_markets_loaded(ex):
+        return False, RuntimeError(
+            "futures markets unavailable before set_leverage"
+        )
 
     open_type = 2 if str(margin_mode).lower() == "cross" else 1
     pos_type = 2 if str(direction).upper() == "SHORT" else 1
@@ -604,6 +626,16 @@ def try_set_leverage(ex, leverage, symbol=None, direction=None,
         # shape rather than cycling to wrong ones (which amplifies the burst).
         for _retry in range(4):
             try:
+                try:
+                    leverage_allowed = bool(try_consume_api_call(
+                        "futures_set_leverage"
+                    ))
+                except Exception as budget_exc:
+                    return False, budget_exc
+                if not leverage_allowed:
+                    return False, RuntimeError(
+                        "futures set_leverage API budget exhausted"
+                    )
                 _throttle_admin()
                 if params:
                     ex.set_leverage(leverage, symbol, params=params)
@@ -688,6 +720,8 @@ def safe_set_margin_mode(ex, mode: str = "isolated", symbol=None,
         params["direction"] = "short" if str(direction).upper() == "SHORT" \
             else "long"
     try:
+        if not try_consume_api_call("futures_set_margin_mode"):
+            return False
         _throttle_admin()
         ex.set_margin_mode(mode, symbol, params=params)
         return True

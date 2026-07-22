@@ -10,6 +10,8 @@ from __future__ import annotations
 import math
 from typing import Optional, Callable
 
+from bot_utils.api_budget import try_consume_api_call
+
 
 # Common balance paths tried in priority order. Each path is walked
 # safely with isinstance() so a missing intermediate node doesn't
@@ -79,6 +81,9 @@ def safe_fetch_balance_usdt(ex,
                 error_logger(ctx, exc)
             except Exception:
                 pass
+
+    if not try_consume_api_call("entry_fetch_balance"):
+        return None
 
     try:
         bal = ex.fetch_balance()

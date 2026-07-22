@@ -2,7 +2,7 @@
 bot_utils/futures_order.py  Futures-specific order helpers.
 
 Extracted from main_bot_futures.py:
-  create_order_with_retry  exponential-backoff order placement
+  create_order_with_retry  fail-closed entry / bounded reduce-only placement
   classify_order_state  CCXT status  bot state machine
   is_terminal_order_state
   convert_fee_to_usdt_futures  futures fees handle inverse contracts
@@ -20,7 +20,8 @@ import threading
 import time
 from typing import Tuple, Optional
 
-from bot_utils.api_budget import record_api_call, try_consume_api_call
+from bot_utils.api_budget import try_consume_api_call
+from bot_utils.network_retry import RetryForbiddenError
 
 
 def _utc_now_str() -> str:
@@ -267,6 +268,18 @@ def _order_id_text(value) -> str:
     return text
 
 
+class FuturesOrderOutcomeUnknown(RetryForbiddenError):
+    """A Futures order may exist, but its create response was not recovered."""
+
+    def __init__(self, client_order_id):
+        cid = _order_id_text(client_order_id) or "[invalid]"
+        self.client_order_id = cid
+        super().__init__(
+            "futures order outcome unknown "
+            f"(clientOrderId={cid})"
+        )
+
+
 def _first_order_id_text(*values) -> str:
     for value in values:
         text = _order_id_text(value)
@@ -291,6 +304,26 @@ def _order_client_id_matches(o: dict, cid: str) -> bool:
             if _order_id_text(info.get(k)) == cid_text:
                 return True
     return False
+
+
+def _order_client_id_conflicts(o: dict, cid: str) -> bool:
+    """True when explicit client-id evidence contains no requested id."""
+    if not isinstance(o, dict):
+        return False
+    expected = _order_id_text(cid)
+    if not expected:
+        return False
+    observed = set()
+    top_level = _order_id_text(o.get("clientOrderId"))
+    if top_level:
+        observed.add(top_level)
+    info = o.get("info")
+    if isinstance(info, dict):
+        for key in _CLIENT_ID_INFO_KEYS:
+            value = _order_id_text(info.get(key))
+            if value:
+                observed.add(value)
+    return bool(observed) and expected not in observed
 
 
 def _order_response_has_evidence(order: dict) -> bool:
@@ -372,7 +405,13 @@ def _order_landed(o: dict) -> bool:
     return bool(oid)
 
 
-def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
+def _find_order_by_client_id(
+    ex,
+    symbol_full: str,
+    cid: str,
+    log_event=None,
+    lookup_status: Optional[dict] = None,
+):
     """Locate an order by clientOrderId - open orders first, then recent
     history. Used to recover from a lost-response timeout so a retry doesn't
     open a SECOND position. Best-effort; never raises. Returns dict or None.
@@ -381,18 +420,40 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
     aliases (``clOrdId``, ``newClientOrderId``, ...) so the guard works on
     exchanges that don't surface the id at the top level.
 
-    A failed lookup is logged (when ``log_event`` is supplied) rather than
-    silently swallowed: it means the duplicate-order guard could not be
-    verified, so the caller falls back to clientOrderId server-side dedup."""
+    A failed lookup is logged (when ``log_event`` is supplied) and recorded in
+    ``lookup_status``. The order wrapper is stricter still: any unresolved
+    non-reduce-only create outcome is blocked because an instant market fill
+    may legitimately be absent from open-order results."""
+    def _mark_unavailable() -> None:
+        if isinstance(lookup_status, dict):
+            lookup_status["unavailable"] = True
+
     if not cid:
+        _mark_unavailable()
         return None
+
     def _budgeted(endpoint: str, fn):
         try:
-            from bot_utils.api_budget import try_consume_api_call
-            try_consume_api_call(endpoint, critical=True)
+            allowed = try_consume_api_call(endpoint, critical=True)
         except Exception:
-            pass
+            _mark_unavailable()
+            return None
+        if not allowed:
+            _mark_unavailable()
+            return None
         return fn()
+
+    def _recovery_rows(raw):
+        if not isinstance(raw, list):
+            _mark_unavailable()
+            return ()
+        rows = []
+        for row in raw:
+            if not isinstance(row, dict):
+                _mark_unavailable()
+                continue
+            rows.append(row)
+        return rows
     # MEXC exposes an exact, venue-native lookup by externalOid. It is both
     # faster and safer than scanning a short recent-order window, so use it
     # before unified fallbacks.
@@ -418,6 +479,7 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
                         "info": data,
                     }
             except Exception as e:
+                _mark_unavailable()
                 if log_event:
                     try:
                         log_event(
@@ -428,12 +490,13 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
                     except Exception:
                         pass
     try:
-        for o in (_budgeted(
+        for o in _recovery_rows(_budgeted(
                 "order_recovery_fetch_open_orders",
-                lambda: ex.fetch_open_orders(symbol_full)) or []):
+                lambda: ex.fetch_open_orders(symbol_full))):
             if _order_client_id_matches(o, cid):
                 return o
     except Exception as e:
+        _mark_unavailable()
         if log_event:
             try:
                 log_event(f"clientOrderId lookup (open orders) failed for "
@@ -444,12 +507,13 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
     has = getattr(ex, "has", {}) or {}
     try:
         if has.get("fetchOrders"):
-            for o in (_budgeted(
+            for o in _recovery_rows(_budgeted(
                     "order_recovery_fetch_orders",
-                    lambda: ex.fetch_orders(symbol_full, limit=20)) or []):
+                    lambda: ex.fetch_orders(symbol_full, limit=20))):
                 if _order_client_id_matches(o, cid):
                     return o
     except Exception as e:
+        _mark_unavailable()
         if log_event:
             try:
                 log_event(f"clientOrderId lookup (history) failed for "
@@ -463,12 +527,13 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
     # SECOND entry in exactly the fill-but-no-ack window this guard exists for.
     try:
         if has.get("fetchClosedOrders"):
-            for o in (_budgeted(
+            for o in _recovery_rows(_budgeted(
                     "order_recovery_fetch_closed_orders",
-                    lambda: ex.fetch_closed_orders(symbol_full, limit=20)) or []):
+                    lambda: ex.fetch_closed_orders(symbol_full, limit=20))):
                 if _order_client_id_matches(o, cid):
                     return o
     except Exception as e:
+        _mark_unavailable()
         if log_event:
             try:
                 log_event(f"clientOrderId lookup (closed orders) failed for "
@@ -477,12 +542,13 @@ def _find_order_by_client_id(ex, symbol_full: str, cid: str, log_event=None):
                 pass
     try:
         if has.get("fetchMyTrades"):
-            for t in (_budgeted(
+            for t in _recovery_rows(_budgeted(
                     "order_recovery_fetch_my_trades",
-                    lambda: ex.fetch_my_trades(symbol_full, limit=20)) or []):
+                    lambda: ex.fetch_my_trades(symbol_full, limit=20))):
                 if _order_client_id_matches(t, cid):
                     return t
     except Exception as e:
+        _mark_unavailable()
         if log_event:
             try:
                 log_event(f"clientOrderId lookup (my trades) failed for "
@@ -503,7 +569,13 @@ def create_order_with_retry(ex,
                               log_event=None,
                               log_struct=None,
                               abort_on_shutdown: bool = True) -> dict:
-    """Place a market order with exponential backoff retry."""
+    """Place a market order without blindly re-firing ambiguous entries.
+
+    Reduce-only orders may retry with bounded exponential backoff because they
+    cannot increase or reverse the venue position. A non-reduce-only create
+    exception is reconciled once by client id and otherwise surfaced as
+    ``FuturesOrderOutcomeUnknown``.
+    """
     last_err = None
     t_start = time.monotonic()
     order_symbol = _normalize_order_symbol(symbol_full)
@@ -546,10 +618,17 @@ def create_order_with_retry(ex,
             order = ex.create_order(
                 order_symbol, "market", order_side, order_amount,
                 params=order_params)
-            if not _order_response_has_evidence(order):
-                cid = order_params.get("clientOrderId")
+            cid = order_params.get("clientOrderId")
+            client_id_conflict = _order_client_id_conflicts(order, cid)
+            if not _order_response_has_evidence(order) or client_id_conflict:
+                lookup_status = {}
                 existing = _find_order_by_client_id(
-                    ex, order_symbol, cid, log_event=log_event) if cid else None
+                    ex,
+                    order_symbol,
+                    cid,
+                    log_event=log_event,
+                    lookup_status=lookup_status,
+                ) if cid else None
                 if existing is not None and _order_landed(existing):
                     if log_event:
                         try:
@@ -560,10 +639,17 @@ def create_order_with_retry(ex,
                         except Exception:
                             pass
                     return existing
+                if not reduce_only:
+                    raise FuturesOrderOutcomeUnknown(cid)
+                detail = (
+                    "conflicting clientOrderId evidence"
+                    if client_id_conflict
+                    else "missing order id/status/fill evidence"
+                )
                 raise _InvalidOrderResponse(
                     f"{action_label}: invalid exchange order response "
-                    f"{type(order).__name__}; missing order id/status/fill "
-                    "evidence; not retrying to avoid duplicate market order"
+                    f"{type(order).__name__}; {detail}; not retrying to "
+                    "avoid duplicate market order"
                 )
             order_state = classify_order_state(order)
             if (
@@ -613,7 +699,8 @@ def create_order_with_retry(ex,
         except Exception as e:
             last_err = e
             err_str = str(e).lower()
-            if isinstance(e, _InvalidOrderResponse):
+            if isinstance(e, (FuturesOrderOutcomeUnknown,
+                              _InvalidOrderResponse)):
                 if log_struct:
                     try:
                         latency_ms = int((time.monotonic() - t_start) * 1000)
@@ -646,15 +733,21 @@ def create_order_with_retry(ex,
                     except Exception:
                         pass
                 raise
-            # Before retrying, check whether the order actually LANDED under
-            # our clientOrderId. create_order has no idempotency of its own, so
-            # a lost-response timeout that hid a successful fill would otherwise
-            # cause the retry to open a SECOND position. If the prior attempt
-            # filled, return it instead of re-firing.
+            # Reconcile whether the order actually LANDED under our
+            # clientOrderId. A clean empty open-order result is not proof of
+            # absence: an instant MARKET fill is already closed. Therefore an
+            # unresolved entry is never re-fired; only reduce-only work may use
+            # the bounded retry loop below.
             cid = order_params.get("clientOrderId")
             if cid:
-                existing = _find_order_by_client_id(ex, order_symbol, cid,
-                                                    log_event=log_event)
+                lookup_status = {}
+                existing = _find_order_by_client_id(
+                    ex,
+                    order_symbol,
+                    cid,
+                    log_event=log_event,
+                    lookup_status=lookup_status,
+                )
                 if existing is not None and _order_landed(existing):
                     if log_event:
                         try:
@@ -666,6 +759,8 @@ def create_order_with_retry(ex,
                         except Exception:
                             pass
                     return existing
+                if not reduce_only:
+                    raise FuturesOrderOutcomeUnknown(cid) from e
             if attempt < attempts_limit:
                 _record_retry_failure()
                 multiplier = _retry_backoff_multiplier()
@@ -821,17 +916,24 @@ def _discount_token_fee_to_usdt(currency: str, cost: float,
     ex = order_dict.get("_bot_ex")
     if ex is not None:
         try:
-            ticker = ex.fetch_ticker(f"{currency}/USDT")
-            px = _first_positive_float(
-                (ticker or {}).get("last"),
-                (ticker or {}).get("close"),
+            allowed = try_consume_api_call(
+                "futures_fee_conversion_fetch_ticker", critical=True
             )
-            if px > 0:
-                converted = round(cost * px, 6)
-                if math.isfinite(converted):
-                    return converted
         except Exception:
-            pass
+            allowed = False
+        if allowed:
+            try:
+                ticker = ex.fetch_ticker(f"{currency}/USDT")
+                px = _first_positive_float(
+                    (ticker or {}).get("last"),
+                    (ticker or {}).get("close"),
+                )
+                if px > 0:
+                    converted = round(cost * px, 6)
+                    if math.isfinite(converted):
+                        return converted
+            except Exception:
+                pass
     if cost < 0:
         return 0.0
     try:
@@ -1086,6 +1188,14 @@ def extract_or_estimate_futures_fee(ex,
             else:
                 time.sleep(retry_delay)
             try:
+                allowed = try_consume_api_call(
+                    "futures_fee_fetch_order", critical=True
+                )
+            except Exception:
+                break
+            if not allowed:
+                break
+            try:
                 refreshed = ex.fetch_order(str(order_id), symbol_full)
                 if isinstance(refreshed, dict):
                     refreshed_payload = _order_with_fee_context(
@@ -1289,7 +1399,10 @@ def get_exchange_liq_price(ex, symbol_full: str) -> float:
     """Fetch exchange-reported liquidation price."""
     try:
         from config.exchange_config import safe_fetch_positions
-        record_api_call()
+        if not try_consume_api_call(
+            "futures_liquidation_fetch_positions", critical=True
+        ):
+            return 0.0
         positions = safe_fetch_positions(ex)
         if positions is None:
             return 0.0

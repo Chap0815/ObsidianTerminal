@@ -42,8 +42,11 @@ from bot_utils.balance import safe_fetch_balance_usdt
 # Spot
 from bot_utils.spot_exits import (
     spot_market_sell_safe,
+    rollback_spot_entry_after_state_failure,
+    spot_entry_rollback_was_fully_filled,
     emergency_close_all_spot,
     InsufficientSellBalance,
+    SpotSellOutcomeUnknown,
 )
 
 # Futures
@@ -60,6 +63,7 @@ from bot_utils.futures_math import (
     fee_buffered_breakeven,
 )
 from bot_utils.futures_order import (
+    FuturesOrderOutcomeUnknown,
     create_order_with_retry,
     classify_order_state,
     is_terminal_order_state,
@@ -126,8 +130,11 @@ __all__ = [
     "safe_fetch_balance_usdt",
     # Spot
     "spot_market_sell_safe",
+    "rollback_spot_entry_after_state_failure",
+    "spot_entry_rollback_was_fully_filled",
     "emergency_close_all_spot",
     "InsufficientSellBalance",
+    "SpotSellOutcomeUnknown",
     # Futures math
     "calc_liquidation_price",
     "distance_to_liquidation_pct",
@@ -140,6 +147,7 @@ __all__ = [
     "funding_oi_filter",
     "fee_buffered_breakeven",
     # Futures order
+    "FuturesOrderOutcomeUnknown",
     "create_order_with_retry",
     "classify_order_state",
     "is_terminal_order_state",

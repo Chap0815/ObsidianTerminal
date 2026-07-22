@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import Callable, Optional, Tuple
 
+from bot_utils.api_budget import try_consume_api_call
 from bot_utils.futures_order import (
     _order_id_text,
     create_order_with_retry,
@@ -139,6 +140,7 @@ def _resolve_fill_price(ex,
                           fallback_price: float,
                           log_event: Callable) -> Tuple[float, str]:
     """Multi-stage fill-price recovery  returns (price, source_label)."""
+    fallback = _positive_finite_or_zero(fallback_price)
     fp = _extract_fill_from_order(order)
     if fp is not None:
         return fp, "order"
@@ -146,10 +148,18 @@ def _resolve_fill_price(ex,
     raw_order_id = order.get("id") if isinstance(order, dict) else None
     order_id = _order_id_text(raw_order_id) or None
     if raw_order_id is not None and order_id is None:
-        return _positive_finite_or_zero(fallback_price), "fallback"
+        return fallback, "fallback"
 
     if _order_id_is_fetchable(ex, symbol_full, order_id):
         for attempt in range(_FILL_RESOLVE_MAX_RETRIES):
+            try:
+                allowed = try_consume_api_call(
+                    "futures_exit_fill_fetch_order", critical=True
+                )
+            except Exception:
+                return fallback, "fallback"
+            if not allowed:
+                return fallback, "fallback"
             try:
                 time.sleep(_FILL_RESOLVE_DELAY_SEC * (1 + attempt))
                 fetched = ex.fetch_order(order_id, symbol_full)
@@ -174,6 +184,15 @@ def _resolve_fill_price(ex,
                         pass
 
     try:
+        allowed = try_consume_api_call(
+            "futures_exit_fill_fetch_trades", critical=True
+        )
+    except Exception:
+        return fallback, "fallback"
+    if not allowed:
+        return fallback, "fallback"
+
+    try:
         trades = ex.fetch_my_trades(symbol_full, limit=10) or []
         if isinstance(trades, list) and trades:
             trades = [trade for trade in trades if isinstance(trade, dict)]
@@ -189,13 +208,9 @@ def _resolve_fill_price(ex,
             except Exception:
                 pass
             for t in pool:
-                v = t.get("price")
-                try:
-                    fv = float(v)
-                    if math.isfinite(fv) and fv > 0:
-                        return fv, "trades"
-                except (TypeError, ValueError, OverflowError):
-                    continue
+                fv = _positive_finite_or_zero(t.get("price"))
+                if fv > 0:
+                    return fv, "trades"
     except Exception as e:
         try:
             log_event(
@@ -204,7 +219,7 @@ def _resolve_fill_price(ex,
         except Exception:
             pass
 
-    return _positive_finite_or_zero(fallback_price), "fallback"
+    return fallback, "fallback"
 
 
 def _check_min_notional(ex, symbol_full: str,
@@ -359,7 +374,9 @@ def _close_single_position_impl(*,
         curr = 0.0
         if ticker_cache is not None:
             try:
-                ticker = ticker_cache.get(ex, symbol_full, timeout=5.0)
+                ticker = ticker_cache.get(
+                    ex, symbol_full, timeout=5.0, critical=True
+                )
                 curr = _positive_finite_or_zero(ticker.get("last"))
                 if curr <= 0:
                     curr = _positive_finite_or_zero(ticker.get("close"))
@@ -370,12 +387,25 @@ def _close_single_position_impl(*,
                 )
         if curr <= 0:
             try:
-                ticker = ex.fetch_ticker(symbol_full)
-                curr = _positive_finite_or_zero(ticker.get("last"))
-                if curr <= 0:
-                    curr = _positive_finite_or_zero(ticker.get("close"))
-            except Exception as e2:
-                log_event(f"  Price (direct) for {sym} unavailable: {e2}", "WARN")
+                allowed = try_consume_api_call(
+                    "futures_emergency_exit_fetch_ticker", critical=True
+                )
+            except Exception as gate_error:
+                log_event(
+                    f"  Price (direct) for {sym} unavailable: "
+                    f"API budget gate failed ({gate_error})", "WARN"
+                )
+                allowed = False
+            if allowed:
+                try:
+                    ticker = ex.fetch_ticker(symbol_full)
+                    curr = _positive_finite_or_zero(ticker.get("last"))
+                    if curr <= 0:
+                        curr = _positive_finite_or_zero(ticker.get("close"))
+                except Exception as e2:
+                    log_event(
+                        f"  Price (direct) for {sym} unavailable: {e2}", "WARN"
+                    )
         if curr <= 0:
             curr = _positive_finite_or_zero(d.get("last_price", 0))
         used_entry_fallback = False

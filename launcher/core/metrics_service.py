@@ -619,8 +619,10 @@ def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
             from bot_utils.api_budget import try_consume_api_call
             if not try_consume_api_call("launcher_fetch_tickers"):
                 raise RuntimeError("launcher API budget exhausted")
-        except ImportError:
-            pass
+        except ImportError as exc:
+            raise RuntimeError(
+                "launcher API budget gate unavailable"
+            ) from exc
         batch = exchange.fetch_tickers(pairs) or {}
         # Instrument the launcher's own API consumption
         for sym in trades:
@@ -645,8 +647,10 @@ def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
                 from bot_utils.api_budget import try_consume_api_call
                 if not try_consume_api_call("launcher_fetch_ticker"):
                     continue
-            except ImportError:
-                pass
+            except ImportError as exc:
+                raise RuntimeError(
+                    "launcher API budget gate unavailable"
+                ) from exc
             t = exchange.fetch_ticker(f"{sym}/USDT") or {}
             p = _finite_float_or_none(t.get("last"))
             if p is None or p <= 0:

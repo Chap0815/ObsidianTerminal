@@ -332,6 +332,7 @@ class TradeState:
             return
         conflicted = []
         pending = []
+        pending_reasons = {}
         for sym, data in clean.items():
             if self._registry_upsert_current(sym):
                 continue
@@ -342,27 +343,45 @@ class TradeState:
                     is_futures=self._is_futures,
                     fail_closed=True,
                 )
-                if claimed is None:
-                    self._log_registry_warning(
-                        f"startup resync kept {self._bot_name}:{sym}; "
-                        f"registry unavailable; retry pending"
-                    )
-                    pending.append(sym)
-                    self._registry_retry_pending[sym] = copy.deepcopy(data)
-                    self._registry_retry_next_at = max(
-                        self._registry_retry_next_at,
-                        time.monotonic() + self._registry_retry_interval_sec,
-                    )
-                    continue
-                claimed_elsewhere = _base_symbol(sym) in claimed
-            except Exception:
-                claimed_elsewhere = False
-            if claimed_elsewhere:
-                conflicted.append(sym)
-                self._log_registry_warning(
-                    f"startup resync kept {self._bot_name}:{sym} fail-closed; "
-                    f"registry says another bot owns it"
+                claimed_elsewhere = (
+                    _base_symbol(sym) in claimed
+                    if claimed is not None
+                    else False
                 )
+            except Exception:
+                claimed = None
+                claimed_elsewhere = False
+            if claimed is None:
+                self._log_registry_warning(
+                    f"startup resync kept {self._bot_name}:{sym}; "
+                    f"registry unavailable; retry pending"
+                )
+                pending.append(sym)
+                pending_reasons[sym] = "registry_unavailable_on_startup"
+                self._registry_retry_pending[sym] = copy.deepcopy(data)
+                self._registry_retry_next_at = max(
+                    self._registry_retry_next_at,
+                    time.monotonic() + self._registry_retry_interval_sec,
+                )
+                continue
+            if not claimed_elsewhere:
+                self._log_registry_warning(
+                    f"startup resync kept {self._bot_name}:{sym}; "
+                    f"claim write failed and no owner was found; retry pending"
+                )
+                pending.append(sym)
+                pending_reasons[sym] = "registry_unclaimed_on_startup"
+                self._registry_retry_pending[sym] = copy.deepcopy(data)
+                self._registry_retry_next_at = max(
+                    self._registry_retry_next_at,
+                    time.monotonic() + self._registry_retry_interval_sec,
+                )
+                continue
+            conflicted.append(sym)
+            self._log_registry_warning(
+                f"startup resync kept {self._bot_name}:{sym} fail-closed; "
+                f"registry says another bot owns it"
+            )
         if conflicted or pending:
             with self._lock:
                 for sym in conflicted:
@@ -375,7 +394,7 @@ class TradeState:
                     if sym in self._trades:
                         self._trades[sym]["claim_registry_pending"] = True
                         self._trades[sym]["claim_registry_pending_reason"] = (
-                            "registry_unavailable_on_startup"
+                            pending_reasons[sym]
                         )
                         self._registry_retry_pending[sym] = copy.deepcopy(
                             self._trades[sym])

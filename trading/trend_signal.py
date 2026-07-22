@@ -58,6 +58,18 @@ def trend_votes(closes: List[float], p: TrendParams) -> Tuple[int, Dict[str, boo
     don't vote  they never block, never falsely fire."""
     if not closes:
         return 0, {}
+    normalized = []
+    for raw_close in closes:
+        if isinstance(raw_close, bool):
+            return 0, {}
+        try:
+            close = float(raw_close)
+        except (TypeError, ValueError, OverflowError):
+            return 0, {}
+        if not math.isfinite(close) or close <= 0:
+            return 0, {}
+        normalized.append(close)
+    closes = normalized
     last = closes[-1]
     detail: Dict[str, bool] = {}
 

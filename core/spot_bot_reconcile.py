@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import time
 
+from bot_utils.api_budget import try_consume_api_call
 from bot_utils.balance_resolver import effective_balance
 
 _SPOT_ORPHAN_MAX_USDT = 1_000_000_000.0
@@ -172,6 +173,11 @@ def _aggregate_spot_sell_trades(bot, pair: str, target_amount: float) -> tuple[f
     if target <= 0 or not hasattr(bot.ex, "fetch_my_trades"):
         return 0.0, 0.0, "unavailable"
     try:
+        if not try_consume_api_call("spot_reconcile_close_fetch_my_trades"):
+            return 0.0, 0.0, "budget_unavailable"
+    except Exception:
+        return 0.0, 0.0, "budget_unavailable"
+    try:
         trades = bot.ex.fetch_my_trades(pair, limit=50) or []
     except Exception:
         return 0.0, 0.0, "unavailable"
@@ -264,8 +270,6 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
             )
             return False
 
-        pair = f"{sym}/USDT"
-
         close_price = 0.0
         close_fee_actual = 0.0
         close_source = "estimate"
@@ -278,19 +282,9 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
                 close_source = "accounting_pending"
 
         if close_price <= 0:
-            close_price, close_fee_actual, close_source = _aggregate_spot_sell_trades(
-                bot, pair, amount)
-
-        if close_price <= 0:
-            try:
-                ticker = bot.ex.fetch_ticker(pair)
-                close_price = _spot_ticker_price(ticker)
-                if close_price > 0:
-                    close_source = "current_ticker"
-                else:
-                    close_price = 0.0
-            except Exception:
-                pass
+            close_price, close_fee_actual, close_source = (
+                _find_spot_external_close_price(bot, sym, amount)
+            )
 
         if close_price <= 0:
             log_event(
@@ -435,9 +429,13 @@ def _find_spot_external_close_price(bot, sym: str, amount: float = 0.0,
     price, fee, source = _aggregate_spot_sell_trades(bot, pair, amount)
     if price > 0:
         return price, fee, source
+    if source == "budget_unavailable":
+        return 0.0, 0.0, "unavailable"
     if not allow_ticker:
         return 0.0, 0.0, "unavailable"
     try:
+        if not try_consume_api_call("spot_reconcile_close_fetch_ticker"):
+            return 0.0, 0.0, "unavailable"
         ticker = bot.ex.fetch_ticker(pair)
         price = _spot_ticker_price(ticker)
         if price > 0:
@@ -764,6 +762,10 @@ def _still_held_on_spot_exchange(bot, sym: str, dust_usdt: float = 1.0) -> bool:
     returns True  never book a close we couldn't confirm. Sub-dust holdings
     count as not-held (matches the $1 spot dust filter)."""
     try:
+        if not try_consume_api_call(
+            "spot_reconcile_confirm_fetch_balance", critical=True
+        ):
+            return True
         bal = bot.ex.fetch_balance()
         total = _spot_effective_balance_or_none(bal, sym)
     except Exception:
@@ -773,6 +775,10 @@ def _still_held_on_spot_exchange(bot, sym: str, dust_usdt: float = 1.0) -> bool:
     if total <= 0:
         return False
     try:
+        if not try_consume_api_call(
+            "spot_reconcile_confirm_fetch_ticker", critical=True
+        ):
+            return True
         px = _spot_ticker_price(bot.ex.fetch_ticker(f"{sym}/USDT"))
         if px > 0 and total * px < dust_usdt:
             return False
@@ -784,6 +790,10 @@ def _still_held_on_spot_exchange(bot, sym: str, dust_usdt: float = 1.0) -> bool:
 def _fetch_spot_total(bot, sym: str) -> float | None:
     """Return confirmed wallet total for a coin, or None on unclear fetch."""
     try:
+        if not try_consume_api_call(
+            "spot_reconcile_confirm_fetch_balance", critical=True
+        ):
+            return None
         bal = bot.ex.fetch_balance()
         return _spot_effective_balance_or_none(bal, sym)
     except Exception:
@@ -985,6 +995,19 @@ def _adopt_spot_orphans(
             if not (math.isfinite(exch_amt) and exch_amt > 1e-8):
                 continue
             try:
+                ticker_allowed = try_consume_api_call(
+                    "spot_reconcile_adopt_fetch_ticker", critical=True
+                )
+            except Exception as exc:
+                bot._log_error("spot orphan adoption ticker budget", exc)
+                break
+            if not ticker_allowed:
+                log_event(
+                    " Spot orphan adoption deferred: API budget exhausted",
+                    "WARN",
+                )
+                break
+            try:
                 ticker = bot.ex.fetch_ticker(f"{base}/USDT")
                 price = _spot_ticker_price(ticker)
             except Exception:
@@ -1102,6 +1125,10 @@ def startup_reconciliation(bot) -> None:
 
     bal_data = None
     try:
+        if not try_consume_api_call(
+            "spot_reconcile_startup_fetch_balance", critical=True
+        ):
+            return
         bal_data = bot.ex.fetch_balance()
     except Exception as e:
         bot._log_error("startup reconciliation fetch_balance", e)
@@ -1307,6 +1334,10 @@ class ReconcileMixin:
 
             # Exchange drift check
             try:
+                if not try_consume_api_call(
+                    "spot_reconcile_periodic_fetch_balance", critical=True
+                ):
+                    continue
                 bal_data = self.ex.fetch_balance()
                 if not isinstance(bal_data, dict):
                     continue

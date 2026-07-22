@@ -6,6 +6,7 @@ import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
 
+from bot_utils.api_budget import try_consume_api_call
 from shared_limits import normalize_gate_mode
 from trading.portfolio_risk import (
     PortfolioDecision,
@@ -14,6 +15,11 @@ from trading.portfolio_risk import (
     PortfolioSnapshot,
     evaluate_entry,
 )
+
+
+def _require_api_budget(endpoint: str) -> None:
+    if not try_consume_api_call(endpoint):
+        raise RuntimeError(f"API budget exhausted before {endpoint}")
 
 
 def _finite(value) -> float | None:
@@ -134,7 +140,9 @@ def _futures_balance_values(
 def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
     now = datetime.now(timezone.utc)
     try:
+        _require_api_budget("portfolio_guard_fetch_balance")
         balance = exchange.fetch_balance()
+        _require_api_budget("portfolio_guard_fetch_positions")
         positions_raw = exchange.fetch_positions()
         if not isinstance(balance, dict) or not isinstance(positions_raw, list):
             raise ValueError("malformed account snapshot")
@@ -171,6 +179,7 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
                     raise ValueError(f"contract size unavailable for {symbol}")
                 info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
                 if tickers is None:
+                    _require_api_budget("portfolio_guard_fetch_tickers")
                     try:
                         fetched_tickers = exchange.fetch_tickers()
                     except Exception:
@@ -247,6 +256,7 @@ def collect_spot_snapshot(exchange) -> PortfolioSnapshot:
     """Value the complete spot account from exchange truth, fail-closed on gaps."""
     now = datetime.now(timezone.utc)
     try:
+        _require_api_budget("portfolio_guard_fetch_balance")
         balance = exchange.fetch_balance()
         if not isinstance(balance, dict):
             raise ValueError("malformed account snapshot")
@@ -266,6 +276,7 @@ def collect_spot_snapshot(exchange) -> PortfolioSnapshot:
                 equity += amount
                 continue
             symbol = f"{normalized_asset}/USDT"
+            _require_api_budget("portfolio_guard_fetch_ticker")
             ticker = exchange.fetch_ticker(symbol)
             price = _finite(
                 (ticker or {}).get("last") or (ticker or {}).get("close")

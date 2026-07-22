@@ -1,6 +1,6 @@
 {
-  "build_id": "38438e1ace528666",
-  "created_at": "2026-07-21 09:57:53",
+  "build_id": "a510347853052147",
+  "created_at": "2026-07-22 09:08:25",
   "source": "update_deploy_manifest.py",
   "file_count": 174,
   "files": [
@@ -11,18 +11,18 @@
     },
     {
       "path": "bot_utils/__init__.py",
-      "sha256": "9c1ecaee3f6d5f13e93d725c194669f271e87d1c00eff94c5a3cda4df597888d",
-      "bytes": 4955
+      "sha256": "e55e51636118d948b54eb4ec9ba85f34ff7db1a046832b2e965d39bc67e6dc1e",
+      "bytes": 5257
     },
     {
       "path": "bot_utils/api_budget.py",
-      "sha256": "02bce7975036c6c31d26ea3ea3eb418a483607063da5f0321e493a60ed693f80",
-      "bytes": 10471
+      "sha256": "56512d0c911a8d679004f775114d003c223684b5ceef35c363553d22dbbd9a6d",
+      "bytes": 10644
     },
     {
       "path": "bot_utils/balance.py",
-      "sha256": "734d8758a49f75608eae5c7502e6ca9324ae212fc8d03b4bb93c41031718f3ee",
-      "bytes": 4923
+      "sha256": "81037909df5171d99377cbabda0ed7f5c940a15f75805156221ece710196336c",
+      "bytes": 5055
     },
     {
       "path": "bot_utils/balance_resolver.py",
@@ -46,8 +46,8 @@
     },
     {
       "path": "bot_utils/equity_utils.py",
-      "sha256": "ffb557115c59bff85579e11bc85adc08fac6a51062ca6b8cd3593a326e603bab",
-      "bytes": 17549
+      "sha256": "e9995549deead4471d7ef2ae230025cc653d151e282510b7aedd027106443219",
+      "bytes": 18147
     },
     {
       "path": "bot_utils/errors.py",
@@ -61,13 +61,13 @@
     },
     {
       "path": "bot_utils/futures_exits.py",
-      "sha256": "8e3e05c5a877ca48d2c8faa59b96956a0ed66a91933f799194e5016a9301ee41",
-      "bytes": 34187
+      "sha256": "68fc37911b904b55f04f53454fe414c5eeb14fdef331b0deb2edb78d50884bd8",
+      "bytes": 35174
     },
     {
       "path": "bot_utils/futures_funding.py",
-      "sha256": "63dce1b0ea946f40a92f4c178515b12bc914b3b849bbe9b55d09f2c6bce98a5a",
-      "bytes": 12133
+      "sha256": "e955de0baa0ffc1fd9baf7e2e75e6cf84a54144ab496d957d92c5be63463a243",
+      "bytes": 12290
     },
     {
       "path": "bot_utils/futures_math.py",
@@ -76,8 +76,8 @@
     },
     {
       "path": "bot_utils/futures_order.py",
-      "sha256": "8438e83e2da5c71764671bcc765d650653beec8abf26ea4219b85abb9e6346a9",
-      "bytes": 48938
+      "sha256": "53b7b4341b32d88ef85b04a6120f7faabc8eafc8f1d4900dd0255ce8ded6c7f6",
+      "bytes": 52574
     },
     {
       "path": "bot_utils/indicators.py",
@@ -86,8 +86,8 @@
     },
     {
       "path": "bot_utils/network_retry.py",
-      "sha256": "53166401c7b2e55e5d64a5c46a2a875b55a77c0b0a63c47193a70ba8bfee6d59",
-      "bytes": 9446
+      "sha256": "d955c9842b923677464440b408455c53690bda2e96950d30af0d8b8dfef32926",
+      "bytes": 10271
     },
     {
       "path": "bot_utils/order_utils.py",
@@ -101,8 +101,8 @@
     },
     {
       "path": "bot_utils/safe_numeric.py",
-      "sha256": "cadd6dbca7fdc960e3560d4f096bb2500037e0132d22c0391a051dfdcc760d76",
-      "bytes": 2587
+      "sha256": "bb52ea6ef82744821b862b86331fed9b4181b1f2c84566ae04ec90e635a4ce0b",
+      "bytes": 5363
     },
     {
       "path": "bot_utils/silent_log.py",
@@ -116,13 +116,13 @@
     },
     {
       "path": "bot_utils/spot_exits.py",
-      "sha256": "3b8ec047477b90a099d8ba5e9f773fd273a45e17e26b814e53e4cb0a8e795378",
-      "bytes": 34318
+      "sha256": "a35fcd2df3b2a0746e47ee2eadaa91ef9ef0308c6c2186d97e51fb862ed8cdf2",
+      "bytes": 51822
     },
     {
       "path": "bot_utils/spot_fee_settle.py",
-      "sha256": "6c3ef0694d61e065d4f609b4abe0cddbf7db004b0ca24a6ad676fc1e26f740b0",
-      "bytes": 6003
+      "sha256": "8e2568f6f234562f829990e2cd28a49f40d871d954a67e8ceb6d5c11c3dc295d",
+      "bytes": 7790
     },
     {
       "path": "bot_utils/state_persist.py",
@@ -141,13 +141,13 @@
     },
     {
       "path": "bot_utils/ticker_cache.py",
-      "sha256": "fedfdc2e913a103a9fdd958d33164fc1f6ecbd3615879303c8258f133ae5e018",
-      "bytes": 11445
+      "sha256": "fd39cf5a2a01cee759335159df2a585a7aec2c1082b47bd3d419b4323c926156",
+      "bytes": 11402
     },
     {
       "path": "bot_utils/trade_state.py",
-      "sha256": "0539f3d50e80792388916ccbdd7bbc92997d5c4dfa7389b6b9e512acffbb5291",
-      "bytes": 33202
+      "sha256": "45e77a6985a032d8b0c9f3ccd4c8209d24328094599ca67a237d762a0a6e2a3a",
+      "bytes": 33980
     },
     {
       "path": "bots/__init__.py",
@@ -196,8 +196,8 @@
     },
     {
       "path": "config/exchange_config.py",
-      "sha256": "018b45718e2735b5eba4f4f6055f1579fa146b20209144da2e320e40ea02600c",
-      "bytes": 36020
+      "sha256": "50e3c0003b2137bf671540952e61a9377ccd1ef9b1c465cfc4d1214c5b395aba",
+      "bytes": 37565
     },
     {
       "path": "config/github_known_hosts",
@@ -231,13 +231,13 @@
     },
     {
       "path": "core/cross_bot.py",
-      "sha256": "5d4ae98be12a2a2efe979168e30fc93781439ceeacad0def11b4536246b602c7",
-      "bytes": 155145
+      "sha256": "aa447c5281c0e0da8dba7c23de9b219e5967d1f755f4c8dae9efb5b5ec81b131",
+      "bytes": 173253
     },
     {
       "path": "core/database.py",
-      "sha256": "98a36200a0cb3b9903cb01b0e26267fcded3ef6f4b75b401c3df9b331d035f82",
-      "bytes": 161466
+      "sha256": "769b93202ba2289652575df8df3badbbb6217a62ab9395210c1316685d3908dc",
+      "bytes": 181955
     },
     {
       "path": "core/event_bus.py",
@@ -246,23 +246,23 @@
     },
     {
       "path": "core/futures_bot.py",
-      "sha256": "688319578c9824fde3563d0322e3d3cfb72b5f40989623f0e8d01d871cbae63f",
-      "bytes": 38796
+      "sha256": "5a5f58fda2550201ceef674e09cd9ebe88628b97ef703b0f1e54cb65d793d645",
+      "bytes": 40256
     },
     {
       "path": "core/futures_bot_exits.py",
-      "sha256": "b4023fa765b2d21c63e231aaf11254f308e2d897e26582cb3121909585c21e0a",
-      "bytes": 99536
+      "sha256": "6dfba95ffd8d66dfc01722a82c093cacc4512bf6bea0a51b3cbee3cc73e4eab4",
+      "bytes": 101057
     },
     {
       "path": "core/futures_bot_reconcile.py",
-      "sha256": "2ff600548fecc72abb7d0af7a2f559e711fcfc71a1ecdb161f791e52396f0dfc",
-      "bytes": 60759
+      "sha256": "e2d2d8a7632a696047afb19f3b1cc7de0f4971242fdad0b42468aa3846a23d43",
+      "bytes": 61405
     },
     {
       "path": "core/futures_bot_scan.py",
-      "sha256": "5a9885cf02d69a9af9525d6808b1acf05353309338145266889f1a56167fa80f",
-      "bytes": 89375
+      "sha256": "19a5af4fd2166a5104ae8a03fceddc10218f508f9075973a67278c9478edcec1",
+      "bytes": 91384
     },
     {
       "path": "core/logger.py",
@@ -296,23 +296,23 @@
     },
     {
       "path": "core/spot_bot.py",
-      "sha256": "fd3edb8c3652894aa61e8ea1045bb06e2d5835e5ce8d4deb7082730a71ce94b8",
-      "bytes": 29235
+      "sha256": "9dcf05a0eea7a72f1602cf6af4f774fbadd9f2b29b21ad56abdcd0f45415e720",
+      "bytes": 30423
     },
     {
       "path": "core/spot_bot_exits.py",
-      "sha256": "6fac127b62d3239e0c467e5bed6857123909bbbec77eaaaff12e4b8cb29bc623",
-      "bytes": 63058
+      "sha256": "e5c43a9f1bb68cd3832a48e788e3d57a393ca8a362562bcc70d57e80407f6f3e",
+      "bytes": 70195
     },
     {
       "path": "core/spot_bot_reconcile.py",
-      "sha256": "fc24faad8ab7e7cfef2bb676d051ac5337212a87b3d87a358c3f4a057f60c60e",
-      "bytes": 54107
+      "sha256": "cadcc2ee4e648a4f6641fbe007875967703c6be1f3dad1445938b21811a862f8",
+      "bytes": 55408
     },
     {
       "path": "core/spot_bot_scan.py",
-      "sha256": "eaf186c9ab5face5c9ee6a5bb3a536fca0e1d574ebf201218fc45b47100e8aa3",
-      "bytes": 67242
+      "sha256": "6aebebc05bd96ca57e36f092af555e459f53455d64612ad35394b280e9209b02",
+      "bytes": 74253
     },
     {
       "path": "core/state_manager.py",
@@ -326,17 +326,17 @@
     },
     {
       "path": "core/trend_bot.py",
-      "sha256": "5512aaf3eb87ad1f77c94c989c656278da9a5fcd47b5c7ada3bef4bb89d44977",
-      "bytes": 28006
+      "sha256": "c111bd1a34e10e0ce82e0f3eaa3b2817d95e180fcdcc17c0b11de039540b2cf9",
+      "bytes": 28496
     },
     {
       "path": "core/trend_futures_bot.py",
-      "sha256": "dce3d99a5d70a331453614b00c5493afd45e5d903ac3f94fc1d7bd29eb5f0304",
-      "bytes": 109174
+      "sha256": "8ea3bb698de858beffab7a7ceda1c935880b1809f828511b02bb44de650ef91c",
+      "bytes": 110944
     },
     {
       "path": "env_parameter.txt",
-      "sha256": "0d4c5703dcbf6fe969f161ae33165aafbe2466fec82e318f4963ecfe549cf733",
+      "sha256": "9f02f58235f61b127ef0b642d7fbb031810b5ca18dbb74228c02aea310677889",
       "bytes": 12246
     },
     {
@@ -381,13 +381,13 @@
     },
     {
       "path": "launcher/core/metrics_service.py",
-      "sha256": "b4a63a9f4b5a5f494888a0a18b1a3b8159a6229a40474c15159d8590cbe35131",
-      "bytes": 25216
+      "sha256": "0cb7622e227aa6ab2e1936a75c6fafd5361edb58dd9e05ba5a03c9ed8d7878cb",
+      "bytes": 25424
     },
     {
       "path": "launcher/core/positions.py",
-      "sha256": "e53a029b122d7c44d60d4acbe20d8cfb97cecf14598cce893fd857e2eb2bc6cd",
-      "bytes": 94657
+      "sha256": "865c2804acf3540788299977378c88c5bd30622599c6de8e8357036f1df89179",
+      "bytes": 116469
     },
     {
       "path": "launcher/core/process_manager.py",
@@ -416,8 +416,8 @@
     },
     {
       "path": "launcher/state/poller.py",
-      "sha256": "6a7cef42215a1b8100bf7eaa54467da6e36bb9997652fef83943749e108f61c3",
-      "bytes": 32362
+      "sha256": "4cf149429b6ac2adaedce82b30f182634d204112ae0d14cca0e43dced07d3d68",
+      "bytes": 33434
     },
     {
       "path": "launcher/ui/__init__.py",
@@ -456,8 +456,8 @@
     },
     {
       "path": "launcher/ui/dialogs/shutdown.py",
-      "sha256": "d4bf1af3bb0722d031f7b26f33963dc11a93eccb934969152c8e9bce6463d251",
-      "bytes": 46040
+      "sha256": "c33b3894f9dde0e2d875aeceaeaa3bb22bc8533469e0c07f6715d14e7b80a8df",
+      "bytes": 50673
     },
     {
       "path": "launcher/ui/dialogs/tools.py",
@@ -701,8 +701,8 @@
     },
     {
       "path": "trading/entry_executor.py",
-      "sha256": "3c5444fb83da9e069311ae336f883ff219b787775fc575a0deaf546cadb52cce",
-      "bytes": 23224
+      "sha256": "6da64465521603719ac653477f53ec8bf3de903b9d7b40fca71efac9b11e37db",
+      "bytes": 51259
     },
     {
       "path": "trading/entry_lifecycle.py",
@@ -726,8 +726,8 @@
     },
     {
       "path": "trading/execution_quality.py",
-      "sha256": "8e5d389785e4fb2e592905d4a05b20cc0c17a648c623eb3cc6dd0abb573511ed",
-      "bytes": 15479
+      "sha256": "d513ebfc426a4d21d928a4c6e40f666815b5166d48707a204fe4e63581476a46",
+      "bytes": 15630
     },
     {
       "path": "trading/expectancy_runtime.py",
@@ -746,8 +746,8 @@
     },
     {
       "path": "trading/fee_utils.py",
-      "sha256": "bf4fc2f17fb063a6015937822f09dd31aaccc09c71d96e64683637b368144646",
-      "bytes": 9669
+      "sha256": "dff4994bb698b735afb31d53d56ac279470d8ab3471f2c3b7ad65b17cf3520b9",
+      "bytes": 11037
     },
     {
       "path": "trading/futures_exit_shadow.py",
@@ -766,13 +766,13 @@
     },
     {
       "path": "trading/l2_stream.py",
-      "sha256": "b45e4ad6dd02b70c710619b1026aae682bc577541778c34881e73ffdf168c4bc",
-      "bytes": 21772
+      "sha256": "796f5997cec8384cc9c50e5e98ac02e4372e4abbd9ff95c5c713887710f3a6de",
+      "bytes": 22345
     },
     {
       "path": "trading/market_filters.py",
-      "sha256": "e8778a9608425efd79d1e7ba02cc23bd32b7bfa8e6713b523075456deec0c015",
-      "bytes": 28370
+      "sha256": "0d790d91d74863bb75d883ac33f67f4c9572f58817568b3f5074288a14969dda",
+      "bytes": 29337
     },
     {
       "path": "trading/orderflow_experiment.py",
@@ -781,8 +781,8 @@
     },
     {
       "path": "trading/portfolio_guard.py",
-      "sha256": "652566dc307eed0ed0a23b40f879df28e8c64190a5bf0dcd26321aea2239ee37",
-      "bytes": 12702
+      "sha256": "e4f1888533165824919d9508e7f8b4fc558a6c62892b9f88c2c5dc710d979f18",
+      "bytes": 13241
     },
     {
       "path": "trading/portfolio_risk.py",
@@ -826,8 +826,8 @@
     },
     {
       "path": "trading/screener.py",
-      "sha256": "2405d48f252097362d12005410c85a04926524f1ab47fb5a891561e195cf7c01",
-      "bytes": 42685
+      "sha256": "f54ef60db58bc2c278651a8bb7102f3399e61157e3ef0774b9220d5f83cccd47",
+      "bytes": 43348
     },
     {
       "path": "trading/simulation.py",
@@ -841,13 +841,13 @@
     },
     {
       "path": "trading/trend_signal.py",
-      "sha256": "0a6c425884212c9515418cc5bebf1e0ad9b6714730413856fb64893f02111264",
-      "bytes": 4284
+      "sha256": "e89604145a9c68a9833218ad15a54abdff7a20c3079962d64f4c2e5bc9f23214",
+      "bytes": 4661
     },
     {
       "path": "trading/venue_recorder.py",
-      "sha256": "65833b1b089f540ae51fa28eed3b267f58a87ec0dc4e59c063aa595dca0467cd",
-      "bytes": 25037
+      "sha256": "9cb8df7160d0341ca66dd84e0fce7d34d0a3df0652fdde18eb59eec9bbbaff1a",
+      "bytes": 25471
     },
     {
       "path": "trading/vol_target.py",

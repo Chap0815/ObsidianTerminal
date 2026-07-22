@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import time
 
+from bot_utils.api_budget import try_consume_api_call
 from bot_utils.order_utils import extract_base_fee_amount
 
 
@@ -56,6 +57,44 @@ def _order_id_for_refetch(order: dict) -> str:
     return ""
 
 
+def _extract_base_fee_known(order: dict, base_symbol: str) -> tuple[float, bool]:
+    """Return base fee and whether settled currency evidence proves it."""
+    fee = extract_base_fee_amount(order, base_symbol)
+    if fee > 0:
+        return fee, True
+    if not isinstance(order, dict) or not isinstance(base_symbol, str):
+        return 0.0, False
+    base_upper = base_symbol.strip().upper()
+    if not base_upper:
+        return 0.0, False
+
+    sources = []
+    fees = order.get("fees")
+    if isinstance(fees, list):
+        sources.extend(item for item in fees if isinstance(item, dict))
+    singular = order.get("fee")
+    if isinstance(singular, dict):
+        sources.append(singular)
+
+    for fee_dict in sources:
+        raw_currency = fee_dict.get("currency")
+        if not isinstance(raw_currency, str) or not raw_currency.strip():
+            continue
+        raw_cost = fee_dict.get("cost")
+        if isinstance(raw_cost, bool):
+            continue
+        try:
+            cost = float(raw_cost)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(cost) and cost != 0:
+            # A settled non-base fee proves no base deduction. A negative base
+            # rebate is conservatively treated as zero so callers never
+            # fabricate an additional deduction or overstate sellable coins.
+            return 0.0, True
+    return 0.0, False
+
+
 def extract_or_estimate_base_fee(ex,
                                     order: dict,
                                     symbol_pair: str,
@@ -86,8 +125,8 @@ def extract_or_estimate_base_fee(ex,
     the bought coin instead of the gross filled amount).
     """
     # Step 1: direct extract
-    fee = extract_base_fee_amount(order, base_symbol)
-    if fee > 0:
+    fee, fee_known = _extract_base_fee_known(order, base_symbol)
+    if fee_known:
         return fee
 
     # Step 2: refetch loop (cancellable)
@@ -101,10 +140,20 @@ def extract_or_estimate_base_fee(ex,
             else:
                 time.sleep(retry_delay)
             try:
+                allowed = try_consume_api_call(
+                    "spot_fee_fetch_order", critical=True
+                )
+            except Exception:
+                break
+            if not allowed:
+                break
+            try:
                 refreshed = ex.fetch_order(order_id, symbol_pair)
                 if isinstance(refreshed, dict):
-                    fee = extract_base_fee_amount(refreshed, base_symbol)
-                    if fee > 0:
+                    fee, fee_known = _extract_base_fee_known(
+                        refreshed, base_symbol
+                    )
+                    if fee_known:
                         return fee
             except Exception as e:
                 if log_event:

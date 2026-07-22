@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Mapping, Sequence
 
+from bot_utils.api_budget import try_consume_api_call
 from bot_utils.silent_log import silent_log
 
 
@@ -380,6 +381,8 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
             symbol = row.get("symbol")
             if not isinstance(symbol, str) or not symbol.strip():
                 raise ValueError("markout symbol is invalid")
+            if not try_consume_api_call("execution_markout_fetch_ticker"):
+                break
             ticker = exchange.fetch_ticker(symbol.strip())
             if not isinstance(ticker, Mapping):
                 raise ValueError("ticker payload unavailable")

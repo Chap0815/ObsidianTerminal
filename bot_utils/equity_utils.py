@@ -33,6 +33,8 @@ from functools import wraps
 import math
 from typing import Optional
 
+from bot_utils.api_budget import try_consume_api_call
+
 LIVE_FUTURES_BOTS = {"FUTURES", "CROSS", "FUTREND"}
 
 
@@ -78,6 +80,18 @@ def _never_raises_none(func):
         except Exception:
             return None
     return guarded
+
+
+def _futures_free_only(free: float) -> dict:
+    return {
+        "free":         round(free, 4),
+        "in_positions": 0.0,
+        "unrealized":   0.0,
+        "equity":       round(free, 4),
+        "open_count":   0,
+        "positions":    [],
+        "source":       "free-only (fetch_positions unavailable)",
+    }
 
 
 def _read_usdt_free(bal: dict) -> Optional[float]:
@@ -253,6 +267,8 @@ def compute_futures_equity(ex) -> Optional[dict]:
         return None
 
     # Free USDT
+    if not try_consume_api_call("dashboard_futures_fetch_balance"):
+        return None
     try:
         bal = ex.fetch_balance()
     except Exception:
@@ -265,20 +281,14 @@ def compute_futures_equity(ex) -> Optional[dict]:
         return None
 
     # Position margin + unrealized
+    if not try_consume_api_call("dashboard_futures_fetch_positions"):
+        return _futures_free_only(free)
     try:
         positions = ex.fetch_positions()
     except Exception:
         # Without positions we don't know what's bound. Return what we
         # know but flag that the unrealized side is incomplete.
-        return {
-            "free":         round(free, 4),
-            "in_positions": 0.0,
-            "unrealized":   0.0,
-            "equity":       round(free, 4),
-            "open_count":   0,
-            "positions":    [],
-            "source":       "free-only (fetch_positions unavailable)",
-        }
+        return _futures_free_only(free)
 
     margin_sum, upnl_sum, count, details = _sum_position_margin_and_upnl(positions)
 
@@ -364,6 +374,8 @@ def compute_spot_equity(ex) -> Optional[dict]:
     if ex is None:
         return None
 
+    if not try_consume_api_call("dashboard_spot_fetch_balance"):
+        return None
     try:
         bal = ex.fetch_balance()
     except Exception:
@@ -417,7 +429,10 @@ def compute_spot_equity(ex) -> Optional[dict]:
         # Try bulk first  much faster, fewer API calls.
         ticker_cache: dict = {}
         try:
-            if getattr(ex, "has", {}).get("fetchTickers"):
+            if (
+                getattr(ex, "has", {}).get("fetchTickers")
+                and try_consume_api_call("dashboard_spot_fetch_tickers")
+            ):
                 tickers = ex.fetch_tickers(list(symbol_pairs.values()))
                 if isinstance(tickers, dict):
                     ticker_cache = tickers
@@ -436,7 +451,10 @@ def compute_spot_equity(ex) -> Optional[dict]:
                     price = _safe_float(t.get("close"))
 
             # Fall back to per-symbol fetch
-            if price <= 0:
+            if (
+                price <= 0
+                and try_consume_api_call("dashboard_spot_fetch_ticker")
+            ):
                 try:
                     t = ex.fetch_ticker(pair)
                     if isinstance(t, dict):

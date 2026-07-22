@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import time
 
+from bot_utils.api_budget import try_consume_api_call
 from core.clock import now_utc
 
 
@@ -174,6 +175,11 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
     if target <= 0 or not hasattr(bot.ex, "fetch_my_trades"):
         return 0.0, 0.0, "unavailable"
     try:
+        if not try_consume_api_call("futures_reconcile_fetch_my_trades"):
+            return 0.0, 0.0, "budget_unavailable"
+    except Exception:
+        return 0.0, 0.0, "budget_unavailable"
+    try:
         trades = bot.ex.fetch_my_trades(symbol_full, limit=50) or []
     except Exception:
         return 0.0, 0.0, "unavailable"
@@ -242,9 +248,13 @@ def _find_futures_external_close_price(bot, symbol_full: str,
         bot, symbol_full, contracts, pos_type)
     if price > 0:
         return price, fee, source
+    if source == "budget_unavailable":
+        return 0.0, 0.0, "unavailable"
     if not allow_ticker:
         return 0.0, 0.0, "unavailable"
     try:
+        if not try_consume_api_call("futures_reconcile_fetch_ticker"):
+            return 0.0, 0.0, "unavailable"
         ticker = bot.ex.fetch_ticker(symbol_full)
         price = _positive_float_or_none(ticker.get("last"))
         if price is None:
@@ -298,6 +308,10 @@ def _fetch_futures_contracts(bot, sym: str) -> float | None:
     full = f"{sym}/USDT:USDT"
     try:
         from config.exchange_config import safe_fetch_positions
+        if not try_consume_api_call(
+            "futures_reconcile_fetch_positions_scoped", critical=True
+        ):
+            return None
         poss = safe_fetch_positions(bot.ex, [full])
         scoped_has_symbol = False
         if poss is not None:
@@ -306,6 +320,10 @@ def _fetch_futures_contracts(bot, sym: str) -> float | None:
             except Exception:
                 scoped_has_symbol = False
         if poss is None or not scoped_has_symbol:
+            if not try_consume_api_call(
+                "futures_reconcile_fetch_positions_global", critical=True
+            ):
+                return None
             poss = safe_fetch_positions(bot.ex)
             if poss is None:
                 return None
@@ -550,11 +568,18 @@ class FuturesReconcileMixin:
         from config.exchange_config import safe_fetch_positions
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
         from core.database import remove_futures_state
-        from bot_utils import record_api_call
 
         try:
             local_state = self.state.get_all()
-            record_api_call()
+            if not try_consume_api_call(
+                "futures_reconcile_fetch_positions", critical=True
+            ):
+                log_event(
+                    "Reconciliation: API budget denied fetch_positions; "
+                    "local state kept unchanged.",
+                    "WARN",
+                )
+                return
             exchange_positions = safe_fetch_positions(self.ex)
             if exchange_positions is None:
                 log_event(
@@ -1005,6 +1030,10 @@ class FuturesReconcileMixin:
         full = f"{sym}/USDT:USDT"
         try:
             from config.exchange_config import safe_fetch_positions
+            if not try_consume_api_call(
+                "futures_reconcile_fetch_positions_scoped", critical=True
+            ):
+                return True
             poss = safe_fetch_positions(self.ex, [full])
             scoped_has_symbol = False
             if poss is not None:
@@ -1015,6 +1044,10 @@ class FuturesReconcileMixin:
                 except Exception:
                     scoped_has_symbol = False
             if poss is None or not scoped_has_symbol:
+                if not try_consume_api_call(
+                    "futures_reconcile_fetch_positions_global", critical=True
+                ):
+                    return True
                 poss = safe_fetch_positions(self.ex)
                 if poss is None:
                     return True
@@ -1117,22 +1150,6 @@ class FuturesReconcileMixin:
                     _find_futures_external_close_price(
                         self, symbol_full, amount, pos_type=pos_type)
                 )
-
-            # Fallback: current market price
-            if close_price <= 0:
-                try:
-                    ticker = self.ex.fetch_ticker(symbol_full)
-                    close_price = _positive_float_or_none(
-                        ticker.get("last") if isinstance(ticker, dict) else None
-                    ) or 0.0
-                    if close_price <= 0 and isinstance(ticker, dict):
-                        close_price = _positive_float_or_none(
-                            ticker.get("close")
-                        ) or 0.0
-                    if close_price > 0:
-                        close_source = "current_ticker"
-                except Exception:
-                    pass
 
             if close_price <= 0:
                 # Last-ditch: assume liquidation if liq price was set

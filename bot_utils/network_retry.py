@@ -16,6 +16,10 @@ import time
 from typing import Any, Callable, Optional
 
 
+class RetryForbiddenError(RuntimeError):
+    """An operation may have succeeded and must be reconciled before retry."""
+
+
 # Word-bounded, phrase-anchored patterns  each tied to a real permanent
 # condition. Bare words ("invalid", "leverage", "below") would also match
 # transient errors.
@@ -168,6 +172,21 @@ def with_network_retry(operation: Callable[[], Any],
             return operation()
         except Exception as e:
             last_err = e
+            # Some create-order failures are explicitly outcome-ambiguous: the
+            # venue may already have accepted the order. Retrying the callable
+            # would risk a duplicate physical order, so its owner must first
+            # reconcile the stable client id.
+            if isinstance(e, RetryForbiddenError):
+                if log_event:
+                    try:
+                        log_event(
+                            f"{action_label}  retry forbidden until outcome "
+                            f"reconciliation: {e}",
+                            "WARN",
+                        )
+                    except Exception:
+                        pass
+                raise
             if is_permanent_error(e):
                 if log_event:
                     try:

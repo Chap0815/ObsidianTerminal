@@ -8,9 +8,9 @@ exchange rate limit  429 / IP ban. This delegates to
 ``api_rate_global`` table) for true cross-process counting; a process-local
 counter is the fallback only when SQLite is unreachable.
 
-The limit (MAX_API_CALLS_PER_MINUTE = 300) leaves headroom for ~150/min per
-bot. Configurable via the ``API_BUDGET_PER_MINUTE`` env var (read once at
-import).
+The limit (MAX_API_CALLS_PER_MINUTE = 300) is shared by all five bot processes
+and the launcher. It is configurable via the ``API_BUDGET_PER_MINUTE`` env var
+(read once at import).
 
 ``try_consume_api_call(endpoint)`` does an atomic ``BEGIN IMMEDIATE``
 check-and-consume  use it instead of the two-step ``if not budget_exhausted():
@@ -48,7 +48,10 @@ def _read_limit_from_env(default: int = 300) -> int:
         return default
 
 
-def _read_expected_bot_count(default: int = 3) -> int:
+_DEFAULT_API_CONSUMER_COUNT = 6  # five bot subprocesses plus the launcher
+
+
+def _read_expected_bot_count(default: int = _DEFAULT_API_CONSUMER_COUNT) -> int:
     try:
         count = int(os.environ.get("API_EXPECTED_BOT_COUNT", str(default)))
     except (TypeError, ValueError, OverflowError):
@@ -251,8 +254,9 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
 
     now_mono = time.monotonic()
 
-    # Per-process fallback divisor: bot count from API_EXPECTED_BOT_COUNT env
-    # (default 3) so the per-process cap matches how many bots actually run.
+    # Per-process fallback divisor: consumer count from
+    # API_EXPECTED_BOT_COUNT. The default includes all five bot subprocesses
+    # plus the launcher, which also performs budgeted exchange calls.
     expected_bot_count = _read_expected_bot_count()
 
     if not _db_available():

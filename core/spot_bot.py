@@ -46,6 +46,7 @@ from bot_utils import (
     emergency_close_all_spot,
     SafeMode,
 )
+from bot_utils.api_budget import try_consume_api_call
 
 # Mixins: split across files to keep this module focused on lifecycle.
 from core.spot_bot_exits import ExitsMixin
@@ -491,6 +492,19 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
 
             for attempt in range(1, 4):
                 try:
+                    try:
+                        markets_allowed = bool(try_consume_api_call(
+                            "spot_startup_load_markets",
+                            critical=True,
+                        ))
+                    except Exception as budget_exc:
+                        raise RuntimeError(
+                            "spot load_markets API budget gate unavailable"
+                        ) from budget_exc
+                    if not markets_allowed:
+                        raise RuntimeError(
+                            "spot load_markets API budget exhausted"
+                        )
                     raw_ex.load_markets()
                     break
                 except Exception as le:
@@ -508,19 +522,30 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             # expired key or wrong passphrase would otherwise only surface on the
             # first scan-thread fetch, after the other threads are running.
             try:
-                _bal = raw_ex.fetch_balance()
-                _ = (_bal or {}).get("USDT", {})
-            except Exception as se:
-                err_lc = str(se).lower()
-                if any(m in err_lc for m in (
-                        "auth", "signature", "permission", "forbidden",
-                        "401", "403", "ip", "passphrase")):
-                    log_event(
-                        f"Spot auth smoke-test FAILED ({type(se).__name__}: "
-                        f"{str(se)[:120]})  check API credentials.",
-                        "WARN")
-                    return False
-                else:
+                auth_probe_allowed = bool(try_consume_api_call(
+                    "spot_startup_auth_fetch_balance"
+                ))
+            except Exception as budget_exc:
+                auth_probe_allowed = False
+                log_event(
+                    f"Spot auth smoke-test skipped - API budget gate "
+                    f"unavailable ({type(budget_exc).__name__})",
+                    "WARN",
+                )
+            if auth_probe_allowed:
+                try:
+                    _bal = raw_ex.fetch_balance()
+                    _ = (_bal or {}).get("USDT", {})
+                except Exception as se:
+                    err_lc = str(se).lower()
+                    if any(m in err_lc for m in (
+                            "auth", "signature", "permission", "forbidden",
+                            "401", "403", "ip", "passphrase")):
+                        log_event(
+                            f"Spot auth smoke-test FAILED ({type(se).__name__}: "
+                            f"{str(se)[:120]})  check API credentials.",
+                            "WARN")
+                        return False
                     log_event(
                         f"Spot auth smoke-test transient error "
                         f"(non-auth: {type(se).__name__})  continuing",

@@ -15,6 +15,8 @@ import customtkinter as ctk
 
 from launcher.config.settings import BOT_META, BOT_ORDER, COLORS, FONT_BODY
 from launcher.core.positions import (
+    normalize_futures_position_view_row,
+    normalize_spot_position_view_row,
     refresh_positions_with_live_prices,
     refresh_spot_positions_with_live_prices,
 )
@@ -216,31 +218,43 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
                   ).pack(fill="x", padx=10)
 
     total_pnl = 0.0
+    invalid_total = False
     for p in positions:
+        p = normalize_spot_position_view_row(p)
         row = ctk.CTkFrame(pos_frame, fg_color="transparent")
         row.pack(fill="x", padx=10, pady=2)
 
         sym = p["symbol"]
         buy = p["buy_price"]
-        curr = p.get("current_price", buy)
-        pnl_usdt = p.get("unrealized_pnl", 0.0)
-        pnl_pct = p.get("unrealized_pct", 0.0)
-        total_pnl += pnl_usdt
+        curr = p["current_price"]
+        pnl_usdt = p["unrealized_pnl"]
+        pnl_pct = p["unrealized_pct"]
+        invalid = bool(p.get("invalid_state"))
+        if invalid:
+            invalid_total = True
+        else:
+            total_pnl += pnl_usdt
 
-        pnl_color = COLORS["success"] if pnl_usdt >= 0 else COLORS["danger"]
+        pnl_color = COLORS["warning"] if invalid else (
+            COLORS["success"] if pnl_usdt >= 0 else COLORS["danger"]
+        )
+        buy_text = "Invalid" if invalid else f"{buy:.6f}"
+        current_text = "Invalid" if invalid else f"{curr:.6f}"
+        pnl_pct_text = "stale" if invalid else f"{pnl_pct:+.2f}%"
+        pnl_usdt_text = "stale" if invalid else f"{pnl_usdt:+.2f}"
 
         ctk.CTkLabel(row, text=sym, font=ctk.CTkFont(app.mono_font, 11, "bold"),
                       text_color=COLORS["text"], width=80, anchor="w").pack(side="left")
-        ctk.CTkLabel(row, text=f"{buy:.6f}",
+        ctk.CTkLabel(row, text=buy_text,
                       font=ctk.CTkFont(app.mono_font, 10),
                       text_color=COLORS["text_dim"], width=90, anchor="w").pack(side="left")
-        ctk.CTkLabel(row, text=f"{curr:.6f}",
+        ctk.CTkLabel(row, text=current_text,
                       font=ctk.CTkFont(app.mono_font, 10),
                       text_color=COLORS["text"], width=90, anchor="w").pack(side="left")
-        ctk.CTkLabel(row, text=f"{pnl_pct:+.2f}%",
+        ctk.CTkLabel(row, text=pnl_pct_text,
                       font=ctk.CTkFont(app.mono_font, 10, "bold"),
                       text_color=pnl_color, width=80, anchor="w").pack(side="left")
-        ctk.CTkLabel(row, text=f"{pnl_usdt:+.2f}",
+        ctk.CTkLabel(row, text=pnl_usdt_text,
                       font=ctk.CTkFont(app.mono_font, 10, "bold"),
                       text_color=pnl_color, width=90, anchor="w").pack(side="left")
 
@@ -336,7 +350,10 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
                     ctk.CTkFrame(
                         pos_frame, fg_color=COLORS["border_soft"], height=1
                     ).pack(fill="x", padx=10)
+                    new_total = 0.0
+                    new_invalid_total = False
                     for p in refreshed:
+                        p = normalize_spot_position_view_row(p)
                         r = ctk.CTkFrame(pos_frame, fg_color="transparent")
                         r.pack(fill="x", padx=10, pady=2)
                         buy2 = p["buy_price"]
@@ -344,6 +361,10 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
                         pnl_u = p.get("unrealized_pnl", 0.0)
                         pnl_p = p.get("unrealized_pct", 0.0)
                         invalid = bool(p.get("invalid_state"))
+                        if invalid:
+                            new_invalid_total = True
+                        else:
+                            new_total += pnl_u
                         pc = COLORS["warning"] if invalid else (
                             COLORS["success"] if pnl_u >= 0 else COLORS["danger"])
                         buy_text = "Invalid" if invalid else f"{buy2:.6f}"
@@ -370,6 +391,13 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
                                       font=ctk.CTkFont(app.mono_font, 10, "bold"),
                                       text_color=pc,
                                       width=90, anchor="w").pack(side="left")
+                    refreshed_button_pnl = (
+                        "PnL stale" if new_invalid_total
+                        else f"{new_total:+.2f} USDT"
+                    )
+                    close_button.configure(
+                        text=f" Close All & Stop ({refreshed_button_pnl})"
+                    )
                 except (tk.TclError, Exception):
                     pass
 
@@ -382,14 +410,18 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
                           name=f"refresh-spot-{name}").start()
 
     action_color = COLORS["danger"] if not sim_mode else COLORS["warning"]
-    ctk.CTkButton(btns,
-        text=f" Close All & Stop ({total_pnl:+.2f} USDT)",
+    close_button_pnl = (
+        "PnL stale" if invalid_total else f"{total_pnl:+.2f} USDT"
+    )
+    close_button = ctk.CTkButton(btns,
+        text=f" Close All & Stop ({close_button_pnl})",
         height=36, corner_radius=8, width=260,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         fg_color=action_color, hover_color=COLORS["panel_hover"],
         text_color="#ffffff",
         command=_close_all_and_stop,
-    ).pack(side="right")
+    )
+    close_button.pack(side="right")
 
     ctk.CTkButton(btns, text=" Stop only",
         height=36, corner_radius=8, width=110,
@@ -495,35 +527,49 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
     ctk.CTkFrame(pos_frame, fg_color=COLORS["border_soft"], height=1).pack(fill="x", padx=10)
 
     total_pnl = 0.0
-    for p in positions:
+    invalid_total = False
+    for raw_position in positions:
+        p = normalize_futures_position_view_row(raw_position)
         row = ctk.CTkFrame(pos_frame, fg_color="transparent")
         row.pack(fill="x", padx=10, pady=2)
 
-        sym = p.get("symbol", "?")
-        ptype = p.get("position_type", "?")
-        entry = float(p.get("entry_price", 0))
-        curr = float(p.get("current_price", 0))
-        pnl_usdt = float(p.get("unrealized_pnl", 0))
-        pnl_pct = float(p.get("unrealized_pct", 0))
-        total_pnl += pnl_usdt
+        sym = p["symbol"]
+        ptype = p["position_type"]
+        entry = p["entry_price"]
+        curr = p["current_price"]
+        pnl_usdt = p["unrealized_pnl"]
+        pnl_pct = p["unrealized_pct"]
+        invalid = bool(p.get("invalid_state"))
+        if invalid:
+            invalid_total = True
+        else:
+            total_pnl += pnl_usdt
 
-        ptype_color = COLORS["success"] if ptype == "LONG" else COLORS["danger"]
-        pnl_color = COLORS["success"] if pnl_usdt >= 0 else COLORS["danger"]
+        ptype_color = COLORS["warning"] if invalid else (
+            COLORS["success"] if ptype == "LONG" else COLORS["danger"]
+        )
+        pnl_color = COLORS["warning"] if invalid else (
+            COLORS["success"] if pnl_usdt >= 0 else COLORS["danger"]
+        )
+        entry_text = "Invalid" if invalid else f"{entry:.4f}"
+        current_text = "Invalid" if invalid else f"{curr:.4f}"
+        pnl_pct_text = "stale" if invalid else f"{pnl_pct:+.2f}%"
+        pnl_usdt_text = "stale" if invalid else f"{pnl_usdt:+.2f}"
 
         ctk.CTkLabel(row, text=sym, font=ctk.CTkFont(app.mono_font, 11, "bold"),
                       text_color=COLORS["text"], width=70, anchor="w").pack(side="left")
         ctk.CTkLabel(row, text=ptype, font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                       text_color=ptype_color, width=50, anchor="w").pack(side="left")
-        ctk.CTkLabel(row, text=f"{entry:.4f}",
+        ctk.CTkLabel(row, text=entry_text,
                       font=ctk.CTkFont(app.mono_font, 10),
                       text_color=COLORS["text_dim"], width=80, anchor="w").pack(side="left")
-        ctk.CTkLabel(row, text=f"{curr:.4f}",
+        ctk.CTkLabel(row, text=current_text,
                       font=ctk.CTkFont(app.mono_font, 10),
                       text_color=COLORS["text_dim"], width=80, anchor="w").pack(side="left")
-        ctk.CTkLabel(row, text=f"{pnl_pct:+.2f}%",
+        ctk.CTkLabel(row, text=pnl_pct_text,
                       font=ctk.CTkFont(app.mono_font, 10, "bold"),
                       text_color=pnl_color, width=70, anchor="w").pack(side="left")
-        ctk.CTkLabel(row, text=f"{pnl_usdt:+.2f}",
+        ctk.CTkLabel(row, text=pnl_usdt_text,
                       font=ctk.CTkFont(app.mono_font, 10, "bold"),
                       text_color=pnl_color, width=80, anchor="w").pack(side="left")
 
@@ -532,12 +578,15 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
         fill="x", padx=10, pady=(4, 0))
     total_row = ctk.CTkFrame(pos_frame, fg_color="transparent")
     total_row.pack(fill="x", padx=10, pady=(4, 8))
-    total_color = COLORS["success"] if total_pnl >= 0 else COLORS["danger"]
+    total_color = COLORS["warning"] if invalid_total else (
+        COLORS["success"] if total_pnl >= 0 else COLORS["danger"]
+    )
+    total_text = "stale" if invalid_total else f"{total_pnl:+.2f} USDT"
     ctk.CTkLabel(total_row, text="TOTAL unrealized PnL:",
                   font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                   text_color=COLORS["text_muted"], anchor="w"
                   ).pack(side="left")
-    ctk.CTkLabel(total_row, text=f"{total_pnl:+.2f} USDT",
+    ctk.CTkLabel(total_row, text=total_text,
                   font=ctk.CTkFont(app.mono_font, 13, "bold"),
                   text_color=total_color, anchor="e"
                   ).pack(side="right")
@@ -628,17 +677,31 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
                         pos_frame, fg_color=COLORS["border_soft"], height=1
                     ).pack(fill="x", padx=10)
                     new_total = 0.0
+                    new_invalid_total = False
                     for p in refreshed:
+                        p = normalize_futures_position_view_row(p)
                         r = ctk.CTkFrame(pos_frame, fg_color="transparent")
                         r.pack(fill="x", padx=10, pady=2)
                         pt = p.get("position_type", "?")
-                        en = float(p.get("entry_price", 0))
-                        cu = float(p.get("current_price", 0))
-                        pu = float(p.get("unrealized_pnl", 0))
-                        pp = float(p.get("unrealized_pct", 0))
-                        new_total += pu
-                        ptc = COLORS["success"] if pt == "LONG" else COLORS["danger"]
-                        pc = COLORS["success"] if pu >= 0 else COLORS["danger"]
+                        en = p["entry_price"]
+                        cu = p["current_price"]
+                        pu = p["unrealized_pnl"]
+                        pp = p["unrealized_pct"]
+                        invalid = bool(p.get("invalid_state"))
+                        if invalid:
+                            new_invalid_total = True
+                        else:
+                            new_total += pu
+                        ptc = COLORS["warning"] if invalid else (
+                            COLORS["success"] if pt == "LONG" else COLORS["danger"]
+                        )
+                        pc = COLORS["warning"] if invalid else (
+                            COLORS["success"] if pu >= 0 else COLORS["danger"]
+                        )
+                        entry_text = "Invalid" if invalid else f"{en:.4f}"
+                        current_text = "Invalid" if invalid else f"{cu:.4f}"
+                        pnl_pct_text = "stale" if invalid else f"{pp:+.2f}%"
+                        pnl_usdt_text = "stale" if invalid else f"{pu:+.2f}"
                         ctk.CTkLabel(r, text=p.get("symbol", "?"),
                                       font=ctk.CTkFont(app.mono_font, 11, "bold"),
                                       text_color=COLORS["text"], width=70,
@@ -647,22 +710,62 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
                                       font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                                       text_color=ptc, width=50,
                                       anchor="w").pack(side="left")
-                        ctk.CTkLabel(r, text=f"{en:.4f}",
+                        ctk.CTkLabel(r, text=entry_text,
                                       font=ctk.CTkFont(app.mono_font, 10),
                                       text_color=COLORS["text_dim"], width=80,
                                       anchor="w").pack(side="left")
-                        ctk.CTkLabel(r, text=f"{cu:.4f}",
+                        ctk.CTkLabel(r, text=current_text,
                                       font=ctk.CTkFont(app.mono_font, 10),
                                       text_color=COLORS["text_dim"], width=80,
                                       anchor="w").pack(side="left")
-                        ctk.CTkLabel(r, text=f"{pp:+.2f}%",
+                        ctk.CTkLabel(r, text=pnl_pct_text,
                                       font=ctk.CTkFont(app.mono_font, 10, "bold"),
                                       text_color=pc, width=70,
                                       anchor="w").pack(side="left")
-                        ctk.CTkLabel(r, text=f"{pu:+.2f}",
+                        ctk.CTkLabel(r, text=pnl_usdt_text,
                                       font=ctk.CTkFont(app.mono_font, 10, "bold"),
                                       text_color=pc, width=80,
                                       anchor="w").pack(side="left")
+                    ctk.CTkFrame(
+                        pos_frame, fg_color=COLORS["border_soft"], height=1
+                    ).pack(fill="x", padx=10, pady=(4, 0))
+                    refreshed_total_row = ctk.CTkFrame(
+                        pos_frame, fg_color="transparent"
+                    )
+                    refreshed_total_row.pack(
+                        fill="x", padx=10, pady=(4, 8)
+                    )
+                    refreshed_total_color = (
+                        COLORS["warning"] if new_invalid_total else (
+                            COLORS["success"] if new_total >= 0
+                            else COLORS["danger"]
+                        )
+                    )
+                    refreshed_total_text = (
+                        "stale" if new_invalid_total
+                        else f"{new_total:+.2f} USDT"
+                    )
+                    ctk.CTkLabel(
+                        refreshed_total_row,
+                        text="TOTAL unrealized PnL:",
+                        font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+                        text_color=COLORS["text_muted"],
+                        anchor="w",
+                    ).pack(side="left")
+                    ctk.CTkLabel(
+                        refreshed_total_row,
+                        text=refreshed_total_text,
+                        font=ctk.CTkFont(app.mono_font, 13, "bold"),
+                        text_color=refreshed_total_color,
+                        anchor="e",
+                    ).pack(side="right")
+                    refreshed_button_pnl = (
+                        "PnL stale" if new_invalid_total
+                        else f"{new_total:+.2f} USDT"
+                    )
+                    close_button.configure(
+                        text=f" Close All & Stop ({refreshed_button_pnl})"
+                    )
                 except (tk.TclError, Exception):
                     pass
 
@@ -675,14 +778,18 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
                           name="refresh-futures-stop").start()
 
     action_color = COLORS["danger"] if not sim_mode else COLORS["warning"]
-    ctk.CTkButton(btns,
-        text=f" Close All & Stop ({total_pnl:+.2f} USDT)",
+    close_button_pnl = (
+        "PnL stale" if invalid_total else f"{total_pnl:+.2f} USDT"
+    )
+    close_button = ctk.CTkButton(btns,
+        text=f" Close All & Stop ({close_button_pnl})",
         height=36, corner_radius=8, width=260,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         fg_color=action_color, hover_color=COLORS["panel_hover"],
         text_color="#ffffff",
         command=_close_all_and_stop,
-    ).pack(side="right")
+    )
+    close_button.pack(side="right")
 
     ctk.CTkButton(btns, text=" Stop only",
         height=36, corner_radius=8, width=110,

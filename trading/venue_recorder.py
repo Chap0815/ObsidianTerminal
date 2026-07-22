@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from bot_utils.api_budget import try_consume_api_call
 from bot_utils.order_utils import order_id_text_or_none
 
 
@@ -310,6 +311,11 @@ class VenueRecorder:
         except Exception:
             pass
 
+    @staticmethod
+    def _require_api_budget(endpoint: str) -> None:
+        if not try_consume_api_call(endpoint):
+            raise RuntimeError(f"API budget denied: {endpoint}")
+
     def _write_event(
         self,
         kind: str,
@@ -363,6 +369,7 @@ class VenueRecorder:
         )
 
     def capture_overview(self) -> int:
+        self._require_api_budget("venue_recorder_fetch_tickers")
         started = int(time.time() * 1000)
         tickers = self.exchange.fetch_tickers()
         ended = int(time.time() * 1000)
@@ -468,6 +475,7 @@ class VenueRecorder:
         return max(timestamps, default=int(fallback))
 
     def capture_microstructure(self, symbol: str) -> tuple[Path, Path]:
+        self._require_api_budget("venue_recorder_fetch_order_book")
         started_book = int(time.time() * 1000)
         book = self.exchange.fetch_order_book(symbol, limit=self.depth_levels)
         ended_book = int(time.time() * 1000)
@@ -513,6 +521,7 @@ class VenueRecorder:
             ended_ms=ended_book,
             flags=tuple(flags),
         )
+        self._require_api_budget("venue_recorder_fetch_trades")
         started_trades = int(time.time() * 1000)
         trades = self.exchange.fetch_trades(symbol, limit=100)
         ended_trades = int(time.time() * 1000)

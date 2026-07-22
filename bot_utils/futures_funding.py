@@ -16,24 +16,18 @@ import math
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
-from bot_utils.api_budget import record_api_call
+from bot_utils.api_budget import try_consume_api_call
 
 
 def _budget_ok(endpoint: str) -> bool:
     """Atomic process-wide API budget gate.
 
-    True means the call is allowed. If the budget module fails, do not block;
-    record best-effort and allow the call.
+    True means the call is allowed. Gate failures block physical exchange I/O.
     """
     try:
-        from bot_utils.api_budget import try_consume_api_call
         return bool(try_consume_api_call(endpoint))
     except Exception:
-        try:
-            record_api_call(endpoint)
-        except Exception:
-            pass
-        return True
+        return False
 
 
 # Per-symbol OI history: symbol  [(monotonic_ts, oi_usdt), ...]
@@ -104,11 +98,13 @@ def fetch_or_estimate_funding(ex,
         if realized != 0.0:
             return realized
         return estimate_funding_paid(ex, symbol_full, since_time_str,
-                                       notional_usdt, pos_type)
+                                       notional_usdt, pos_type,
+                                       fallback_state_value)
     if fallback_state_value:
         return fallback_state_value
     return estimate_funding_paid(ex, symbol_full, since_time_str,
-                                   notional_usdt, pos_type)
+                                   notional_usdt, pos_type,
+                                   fallback_state_value)
 
 
 #  Real fetch (preferred) 
@@ -224,7 +220,8 @@ def estimate_funding_paid(ex,
                             symbol_full: str,
                             since_time_str: str,
                             notional_usdt: float,
-                            pos_type: str = "LONG") -> float:
+                            pos_type: str = "LONG",
+                            fallback_state_value: float = 0.0) -> float:
     """Estimate funding when history API returns empty.
 
     Funding settles at 00:00 / 08:00 / 16:00 UTC on most exchanges.
@@ -250,6 +247,9 @@ def estimate_funding_paid(ex,
         return 0.0
 
     funding_rate_dec = 0.0
+    if not _budget_ok("estimate_funding_rate"):
+        fallback = _finite_float_or_none(fallback_state_value)
+        return fallback if fallback is not None else 0.0
     try:
         from config.exchange_config import safe_fetch_funding_rate
         fr = safe_fetch_funding_rate(ex, symbol_full)

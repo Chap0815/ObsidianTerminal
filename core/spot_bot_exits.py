@@ -23,6 +23,7 @@ from core.clock import now_utc
 from bot_utils import (
     spot_market_sell_safe,
     InsufficientSellBalance,
+    SpotSellOutcomeUnknown,
     extract_fill_price,
     extract_order_fee,
     safe_remaining,
@@ -73,6 +74,38 @@ def _finite_float(value, default: float = 0.0) -> float:
 def _positive_finite(value, default: float = 0.0) -> float:
     parsed = _finite_float(value, default)
     return parsed if parsed > 0 else default
+
+
+def _ensure_spot_exit_client_order_id(bot, sym: str, row: dict,
+                                      leg: str) -> str:
+    """Persist one stable client id before a retryable live SPOT sell."""
+    from bot_utils.spot_exits import ensure_spot_exit_client_order_id
+
+    return ensure_spot_exit_client_order_id(
+        bot.state, sym, row, leg, getattr(bot, "BOT_NAME", "SPOT")
+    )
+
+
+def _mark_spot_exit_outcome_uncertain(bot, sym: str, row: dict,
+                                      leg: str) -> bool:
+    key = f"{leg}_exit_outcome_uncertain"
+    persisted = bot.state.update(
+        sym, key, True
+    )
+    row[key] = True
+    return persisted is not False
+
+
+def _reset_spot_exit_intent(bot, sym: str, row: dict, leg: str) -> bool:
+    updates = {
+        f"{leg}_exit_client_order_id": None,
+        f"{leg}_exit_outcome_uncertain": False,
+    }
+    persisted = bot.state.update_many(sym, updates)
+    if persisted is not False:
+        row.update(updates)
+        return True
+    return False
 
 
 def _spot_excursion_metrics(d: dict, exit_price: float) -> tuple[float, float, float]:
@@ -397,12 +430,12 @@ class ExitsMixin:
         out: dict = {}
         try:
             from bot_utils.api_budget import record_api_error, try_consume_api_call
-        except ImportError:
-            def record_api_error(**kw):
-                return None
-
-            def try_consume_api_call(*a, **kw):
-                return True
+        except ImportError as exc:
+            try:
+                self._log_error("spot ticker API budget import", exc)
+            except Exception:
+                pass
+            return {}
 
         pairs = [f"{s}/USDT" for s in symbols]
         for i in range(0, len(pairs), TICKER_BATCH_SIZE):
@@ -950,9 +983,34 @@ class ExitsMixin:
                 partial_fee = sold_amount * fill_price * 0.001
         else:
             try:
-                order, sold_amount = spot_market_sell_safe(
-                    self.ex, f"{sym}/USDT", amount * partial_pct
+                client_order_id = _ensure_spot_exit_client_order_id(
+                    self, sym, d, "partial"
                 )
+                requested_sell = amount * partial_pct
+                order = None
+                if d.get("partial_exit_outcome_uncertain"):
+                    from bot_utils.spot_exits import (
+                        _find_spot_exit_order_by_client_id,
+                    )
+                    try:
+                        order = _find_spot_exit_order_by_client_id(
+                            self.ex, f"{sym}/USDT", client_order_id
+                        )
+                    except Exception as recovery_error:
+                        log_event(
+                            f"Partial-Sell {sym} outcome still unknown "
+                            f"(clientOrderId={client_order_id}): "
+                            f"{recovery_error}",
+                            "WARN",
+                        )
+                        return False
+                if order is None:
+                    order, sold_amount = spot_market_sell_safe(
+                        self.ex, f"{sym}/USDT", requested_sell,
+                        client_order_id=client_order_id,
+                    )
+                else:
+                    sold_amount = requested_sell
                 # Phantom-fill guard: a market sell that returns
                 # status=new/filled=0 (MEXC reject) must NOT be booked as a
                 # partial-TP  that would shrink the tracked `amount`, mark
@@ -962,9 +1020,26 @@ class ExitsMixin:
                 from bot_utils.order_utils import order_was_filled
                 if not order_was_filled(order, sold_amount, min_fill_ratio=1e-9):
                     _st = order.get("status") if isinstance(order, dict) else "?"
+                    normalized_status = (
+                        _st.strip().lower() if isinstance(_st, str) else ""
+                    )
+                    if normalized_status in {
+                        "canceled", "cancelled", "rejected", "expired",
+                    }:
+                        if not _reset_spot_exit_intent(
+                            self, sym, d, "partial"
+                        ):
+                            _mark_spot_exit_outcome_uncertain(
+                                self, sym, d, "partial"
+                            )
+                    else:
+                        _mark_spot_exit_outcome_uncertain(
+                            self, sym, d, "partial"
+                        )
                     log_event(
                         f" {sym}: partial-TP order did NOT fill "
-                        f"(status={_st})  NOT booking, retry next tick", "WARN")
+                        f"(status={_st})  NOT booking, client-id reconcile "
+                        f"required", "WARN")
                     return False
                 sold_amount = _filled_base_amount(order, sold_amount, sold_amount)
                 exch_oid = (
@@ -981,6 +1056,17 @@ class ExitsMixin:
                     )
                 except Exception:
                     partial_fee = extract_order_fee(order)
+            except SpotSellOutcomeUnknown as e:
+                persisted = _mark_spot_exit_outcome_uncertain(
+                    self, sym, d, "partial"
+                )
+                level = "WARN" if persisted else "ERROR"
+                log_event(
+                    f"Partial-Sell {sym} outcome unknown; retry blocked "
+                    f"pending clientOrderId reconciliation ({e})",
+                    level,
+                )
+                return False
             except Exception as e:
                 log_event(f"Partial-Sell {sym} failed: {e}", "WARN")
                 return False
@@ -1152,22 +1238,71 @@ class ExitsMixin:
                 close_fee = remaining_amount * fill_price * 0.001
         else:
             try:
+                client_order_id = _ensure_spot_exit_client_order_id(
+                    self, sym, d, "full"
+                )
+                order = None
+                if d.get("full_exit_outcome_uncertain"):
+                    from bot_utils.spot_exits import (
+                        _find_spot_exit_order_by_client_id,
+                    )
+                    try:
+                        order = _find_spot_exit_order_by_client_id(
+                            self.ex, f"{sym}/USDT", client_order_id
+                        )
+                    except Exception as recovery_error:
+                        log_event(
+                            f"Sell order {sym} outcome still unknown "
+                            f"(clientOrderId={client_order_id}): "
+                            f"{recovery_error}",
+                            "WARN",
+                        )
+                        return
                 # Network retry  so a single transient API error (DNS, VPN
                 # flap) doesn't abort the sell and hold the position an extra
-                # tick. 3 attempts with backoff usually complete inside the
-                # monitor-tick budget.
-                from bot_utils.network_retry import with_network_retry
-                order, sold = with_network_retry(
-                    operation=lambda: spot_market_sell_safe(
-                        self.ex, f"{sym}/USDT", remaining_amount
-                    ),
-                    action_label=f"sell {sym}",
-                    max_attempts=3,
-                    base_delay=0.5,
-                    shutdown_event=self._shutdown_event,
-                    log_event=log_event,
+                # tick. Outcome-ambiguous errors explicitly forbid wrapper
+                # retries until their stable client id has been reconciled.
+                if order is None:
+                    from bot_utils.network_retry import with_network_retry
+                    order, sold = with_network_retry(
+                        operation=lambda: spot_market_sell_safe(
+                            self.ex, f"{sym}/USDT", remaining_amount,
+                            client_order_id=client_order_id,
+                        ),
+                        action_label=f"sell {sym}",
+                        max_attempts=3,
+                        base_delay=0.5,
+                        shutdown_event=self._shutdown_event,
+                        log_event=log_event,
+                    )
+                else:
+                    sold = remaining_amount
+                raw_status = order.get("status") if isinstance(order, dict) else None
+                normalized_status = (
+                    raw_status.strip().lower()
+                    if isinstance(raw_status, str) else ""
                 )
-                filled_amount = _filled_base_amount(order, sold, requested_amount)
+                if normalized_status in {"new", "open", "pending"}:
+                    _mark_spot_exit_outcome_uncertain(
+                        self, sym, d, "full"
+                    )
+                    log_event(
+                        f"Sell order {sym} is still {normalized_status}; "
+                        f"booking and any retry deferred until terminal state",
+                        "WARN",
+                    )
+                    try:
+                        from trading.cooldown_utils import set_cooldown as _scd
+                        with self._cooldown_lock:
+                            _scd(self.cool, sym, 15, self.COOLDOWN_FILE)
+                    except Exception as cooldown_error:
+                        self._log_error(
+                            f"sell-pending cooldown set {sym}", cooldown_error
+                        )
+                    return
+                filled_amount = _filled_base_amount(
+                    order, sold, requested_amount
+                )
                 # Verify the sell ACTUALLY filled before booking a closed trade.
                 # spot_market_sell_safe returns (order, amt) the instant
                 # create_market_sell_order returns, but MEXC can return an order
@@ -1177,11 +1312,24 @@ class ExitsMixin:
                 # NOT book and do NOT remove state.
                 from bot_utils.order_utils import order_was_filled
                 if not order_was_filled(order, filled_amount):
-                    _st = order.get("status") if isinstance(order, dict) else "?"
+                    _st = raw_status if raw_status is not None else "?"
+                    if normalized_status in {
+                        "canceled", "cancelled", "rejected", "expired",
+                    }:
+                        if not _reset_spot_exit_intent(
+                            self, sym, d, "full"
+                        ):
+                            _mark_spot_exit_outcome_uncertain(
+                                self, sym, d, "full"
+                            )
+                    else:
+                        _mark_spot_exit_outcome_uncertain(
+                            self, sym, d, "full"
+                        )
                     log_event(
                         f" {sym}: sell order did NOT fill (status={_st}, "
-                        f"coins still in wallet)  NOT booking, will retry "
-                        f"next tick", "WARN")
+                        f"coins still in wallet)  NOT booking, client-id "
+                        f"reconcile required", "WARN")
                     try:
                         from trading.cooldown_utils import set_cooldown as _scd
                         with self._cooldown_lock:
@@ -1212,6 +1360,17 @@ class ExitsMixin:
                 except Exception:
                     close_fee = extract_order_fee(order)
                 remaining_amount = filled_amount
+            except SpotSellOutcomeUnknown as unknown:
+                persisted = _mark_spot_exit_outcome_uncertain(
+                    self, sym, d, "full"
+                )
+                level = "WARN" if persisted else "ERROR"
+                log_event(
+                    f"Sell order {sym} outcome unknown; retry blocked "
+                    f"pending clientOrderId reconciliation ({unknown})",
+                    level,
+                )
+                return
             except InsufficientSellBalance as ib:
                 # The BASE coins are not actually on the exchange (already sold,
                 # or only dust below the min lot). Selling will never succeed,
@@ -1281,6 +1440,13 @@ class ExitsMixin:
             booked_invested = current_invested
             booked_reason = reason
 
+        residual_intent_updates = {}
+        if partial_live_fill:
+            residual_intent_updates = {
+                "full_exit_client_order_id": None,
+                "full_exit_outcome_uncertain": False,
+            }
+
         sell_time = _utc_now_str()
         accounting_mode_is_sim = d.get("accounting_pending_mode_is_sim",
                                        self.simulation)
@@ -1330,6 +1496,7 @@ class ExitsMixin:
                         "accounting_pending_partials": pending,
                         "closing_retry_pending": True,
                         "closing_retry_reason": reason,
+                        **residual_intent_updates,
                     })
                 except Exception as state_err:
                     self._log_error(
@@ -1369,6 +1536,7 @@ class ExitsMixin:
                 "last_partial_fill_order_id": exch_oid,
                 "closing_retry_pending": True,
                 "closing_retry_reason": reason,
+                **residual_intent_updates,
             })
             log_event(
                 f" {sym}: full-exit order partially filled "

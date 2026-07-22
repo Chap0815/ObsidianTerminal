@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from bot_utils.api_budget import try_consume_api_call
 from trading.venue_recorder import SQLitePartitionWriter, VenueEvent
 
 
@@ -438,6 +439,18 @@ class L2ShadowCollector:
         while not self._should_stop():
             async_exchange = None
             try:
+                try:
+                    markets_allowed = bool(try_consume_api_call(
+                        "l2_stream_load_markets"
+                    ))
+                except Exception as budget_exc:
+                    raise RuntimeError(
+                        "L2 load_markets API budget gate unavailable"
+                    ) from budget_exc
+                if not markets_allowed:
+                    raise RuntimeError(
+                        "L2 load_markets API budget exhausted"
+                    )
                 async_exchange = self._make_async_exchange()
                 self._connection_epoch += 1
                 await async_exchange.load_markets()

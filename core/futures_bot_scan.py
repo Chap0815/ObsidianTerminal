@@ -30,6 +30,7 @@ import os
 
 from shared_limits import normalize_gate_mode
 from bot_utils import (
+    FuturesOrderOutcomeUnknown,
     budget_exhausted,
     get_funding_info,
     funding_oi_filter,
@@ -42,6 +43,7 @@ from bot_utils import (
     filled_margin_usdt,
     get_maintenance_margin_rate,
 )
+from bot_utils.api_budget import try_consume_api_call
 from trading.entry_quality import EntryQuality, score_futures_entry
 
 
@@ -333,8 +335,13 @@ class FuturesScanMixin:
             if is_claimed_by_other(sym, self.BOT_NAME, is_futures=True):
                 log_event(f"{sym} held by another bot  skipping (coexistence)", "WAIT")
                 return
-        except Exception:
-            pass
+        except Exception as exc:
+            log_event(
+                f"{sym} entry skipped: claim registry unavailable "
+                f"({type(exc).__name__})",
+                "WARN",
+            )
+            return
         if self.state.has(sym):
             return
         if symbol_full not in self.ex.markets:
@@ -351,11 +358,12 @@ class FuturesScanMixin:
                 log_event(f"{sym}: {_why}", "WAIT")
                 return
         except Exception as _te:
-            # Fail-closed on the STOCK suffix even if check_tradability errors.
-            if sym.upper().endswith("STOCK"):
-                log_event(f"{sym}: tokenized stock  skipping (fail-safe)",
-                          "WAIT")
-                return
+            log_event(
+                f"{sym}: tradability gate error "
+                f"({type(_te).__name__}: {_te})  entry skipped fail-closed",
+                "WARN",
+            )
+            return
 
         entry_price = self._positive_float(r.get("price"))
         if entry_price <= 0:
@@ -555,6 +563,15 @@ class FuturesScanMixin:
             try:
                 entry_ticker = self.ticker_cache.get(self.ex, symbol_full, timeout=4.0)
                 if not entry_ticker.get("bid") or not entry_ticker.get("ask"):
+                    if not try_consume_api_call(
+                        "futures_entry_fetch_spread_book"
+                    ):
+                        log_event(
+                            f"{sym}: {direction} blocked  API budget "
+                            "exhausted before spread order book",
+                            "WAIT",
+                        )
+                        return
                     ob = self.ex.fetch_order_book(symbol_full, limit=5)
                     bids = (ob or {}).get("bids") or []
                     asks = (ob or {}).get("asks") or []
@@ -1091,6 +1108,26 @@ class FuturesScanMixin:
                         for _att in range(2):
                             _t.sleep(0.4 * (1 + _att))
                             try:
+                                allowed = try_consume_api_call(
+                                    "futures_entry_fill_fetch_order",
+                                    critical=True,
+                                )
+                            except Exception as budget_exc:
+                                log_event(
+                                    f"{sym}: entry fill refresh skipped - API "
+                                    f"budget gate unavailable "
+                                    f"({type(budget_exc).__name__})",
+                                    "WARN",
+                                )
+                                break
+                            if not allowed:
+                                log_event(
+                                    f"{sym}: entry fill refresh skipped - API "
+                                    f"budget exhausted",
+                                    "WARN",
+                                )
+                                break
+                            try:
                                 refreshed = self.ex.fetch_order(str(oid), symbol_full)
                                 rf = self._positive_float(
                                     (refreshed or {}).get("filled"))
@@ -1426,6 +1463,8 @@ class FuturesScanMixin:
                 liq_price = calc_liquidation_price(fill_price, leverage,
                                                      direction, mm_rate)
             except Exception as e:
+                _outcome_unknown = isinstance(
+                    e, FuturesOrderOutcomeUnknown)
                 emit_entry_lifecycle(
                     entry_id, bot=self.BOT_NAME, symbol=sym,
                     stage="order_failed", mode=entry_mode,
@@ -1518,7 +1557,13 @@ class FuturesScanMixin:
                                       f"tracked provisionally", "WARN")
                 except Exception:
                     pass
-                if not _landed:
+                if not _landed and _outcome_unknown:
+                    log_event(
+                        f"{sym}: entry outcome unknown; claim kept pending "
+                        f"clientOrderId reconciliation",
+                        "ERROR",
+                    )
+                elif not _landed:
                     self._cleanup_rolled_back_futures_entry_state(
                         sym, "futures entry failed before durable state")
                 return

@@ -173,7 +173,7 @@ API_BUDGET_PER_MINUTE    default: 300
     Max exchange API calls per minute, shared across all bots on the same key/
     IP, before the bot throttles itself. Lower it if the exchange rate-limits
     you; values < 10 are ignored (fall back to default).
-API_EXPECTED_BOT_COUNT   default: 3
+API_EXPECTED_BOT_COUNT   default: 6
     How many bot processes share the same API key/IP. The per-minute budget is
     divided by this so the combined rate stays under the exchange's limit.
 

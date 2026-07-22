@@ -48,6 +48,7 @@ from bot_utils import (
     SafeMode,
     emergency_close_all_futures,
 )
+from bot_utils.api_budget import try_consume_api_call
 
 from core.futures_bot_exits import FuturesExitsMixin
 from core.futures_bot_scan import FuturesScanMixin
@@ -653,12 +654,37 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         fast at startup instead of on the first trade attempt.
         """
         from core.logger import log_event
+
+        def _startup_probe_allowed(endpoint: str) -> bool:
+            try:
+                return bool(try_consume_api_call(endpoint))
+            except Exception as budget_exc:
+                log_event(
+                    f"Futures startup probe skipped - API budget gate "
+                    f"unavailable ({type(budget_exc).__name__})",
+                    "WARN",
+                )
+                return False
+
         try:
             raw_ex = self.EXCHANGE_FACTORY()
             # HTTP timeout  higher at startup for slow load_markets
             raw_ex.timeout = 30_000
             for attempt in range(1, 4):
                 try:
+                    try:
+                        markets_allowed = bool(try_consume_api_call(
+                            "futures_startup_load_markets",
+                            critical=True,
+                        ))
+                    except Exception as budget_exc:
+                        raise RuntimeError(
+                            "futures load_markets API budget gate unavailable"
+                        ) from budget_exc
+                    if not markets_allowed:
+                        raise RuntimeError(
+                            "futures load_markets API budget exhausted"
+                        )
                     raw_ex.load_markets()
                     break
                 except Exception as le:
@@ -676,27 +702,27 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
 
             # Auth smoke-test BEFORE going threaded, so a dead key surfaces
             # here instead of on the first close-order.
-            try:
-                _bal = raw_ex.fetch_balance()
-                # We only care that the call succeeded; ignore content.
-                _ = (_bal or {}).get("USDT", {})
-            except Exception as se:
-                # Don't fail the connect on a transient network blip:
-                # log and continue. If the error is a real 401/403 the
-                # next fetch_balance will surface it too.
-                err_lc = str(se).lower()
-                if any(m in err_lc for m in (
-                        "auth", "signature", "permission", "forbidden",
-                        "401", "403", "ip", "passphrase")):
-                    log_event(
-                        f"Futures auth smoke-test FAILED ({type(se).__name__}: "
-                        f"{str(se)[:120]})  bot will not be able to "
-                        f"place orders. Check API key/secret/passphrase.",
-                        "WARN")
-                    # Treat auth errors as fatal  the bot should not
-                    # silently run with a dead key.
-                    return False
-                else:
+            if _startup_probe_allowed("futures_startup_auth_fetch_balance"):
+                try:
+                    _bal = raw_ex.fetch_balance()
+                    # We only care that the call succeeded; ignore content.
+                    _ = (_bal or {}).get("USDT", {})
+                except Exception as se:
+                    # Don't fail the connect on a transient network blip:
+                    # log and continue. If the error is a real 401/403 the
+                    # next fetch_balance will surface it too.
+                    err_lc = str(se).lower()
+                    if any(m in err_lc for m in (
+                            "auth", "signature", "permission", "forbidden",
+                            "401", "403", "ip", "passphrase")):
+                        log_event(
+                            f"Futures auth smoke-test FAILED ({type(se).__name__}: "
+                            f"{str(se)[:120]})  bot will not be able to "
+                            f"place orders. Check API key/secret/passphrase.",
+                            "WARN")
+                        # Treat auth errors as fatal  the bot should not
+                        # silently run with a dead key.
+                        return False
                     log_event(
                         f"Futures auth smoke-test transient error "
                         f"(non-auth: {type(se).__name__})  continuing",
@@ -717,7 +743,9 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             # avoid false-alarm ERROR badges when Bitget is temporarily
             # unreachable. In LIVE mode we distinguish transient network
             # errors (INFO) from auth failures (WARN) which are actionable.
-            if not self.C("SIMULATION", True):
+            if (not self.C("SIMULATION", True)
+                    and _startup_probe_allowed(
+                        "futures_startup_live_fetch_balance")):
                 try:
                     self.ex.fetch_balance()
                 except Exception as bal_err:
@@ -736,15 +764,16 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                             f"H-6 smoke test: fetch_balance transient error "
                             f"({type(bal_err).__name__})  bot will retry on "
                             f"first reconcile cycle", "INFO")
-            try:
-                # fetch_positions sometimes needs a symbol on Bitget; we
-                # only need to know the call path WORKS, not the data.
-                self.ex.fetch_positions(["BTC/USDT:USDT"])
-            except Exception as pos_err:
-                log_event(
-                    f"H-6 smoke test note: fetch_positions raised "
-                    f"{type(pos_err).__name__} (non-fatal; reconcile "
-                    f"will retry)", "INFO")
+            if _startup_probe_allowed("futures_startup_fetch_positions"):
+                try:
+                    # fetch_positions sometimes needs a symbol on Bitget; we
+                    # only need to know the call path WORKS, not the data.
+                    self.ex.fetch_positions(["BTC/USDT:USDT"])
+                except Exception as pos_err:
+                    log_event(
+                        f"H-6 smoke test note: fetch_positions raised "
+                        f"{type(pos_err).__name__} (non-fatal; reconcile "
+                        f"will retry)", "INFO")
 
             log_event("Futures API connection established", "INFO")
             return True

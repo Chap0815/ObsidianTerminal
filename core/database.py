@@ -899,11 +899,16 @@ def _run_migrations(conn) -> None:
         target_price       REAL,
         client_order_id    TEXT NOT NULL UNIQUE,
         fallback_client_order_id TEXT,
+        fallback_exchange_order_id TEXT,
         exchange_order_id  TEXT,
         status             TEXT NOT NULL,
         filled_amount      REAL NOT NULL DEFAULT 0,
         filled_notional    REAL NOT NULL DEFAULT 0,
         fee_usdt           REAL NOT NULL DEFAULT 0,
+        fallback_filled_amount REAL NOT NULL DEFAULT 0,
+        fallback_filled_notional REAL NOT NULL DEFAULT 0,
+        fallback_notional_complete INTEGER NOT NULL DEFAULT 0,
+        fallback_fee_usdt  REAL NOT NULL DEFAULT 0,
         last_error         TEXT,
         created_at         TEXT NOT NULL,
         updated_at         TEXT NOT NULL
@@ -913,6 +918,33 @@ def _run_migrations(conn) -> None:
     )
     _add_column_if_missing(
         conn, "order_intents", "fallback_client_order_id", "TEXT"
+    )
+    _add_column_if_missing(
+        conn, "order_intents", "fallback_exchange_order_id", "TEXT"
+    )
+    _add_column_if_missing(
+        conn,
+        "order_intents",
+        "fallback_filled_amount",
+        "REAL NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        conn,
+        "order_intents",
+        "fallback_filled_notional",
+        "REAL NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        conn,
+        "order_intents",
+        "fallback_notional_complete",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        conn,
+        "order_intents",
+        "fallback_fee_usdt",
+        "REAL NOT NULL DEFAULT 0",
     )
     c.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_order_intents_fallback_client_id "
@@ -3500,14 +3532,12 @@ _ORDER_INTENT_TRANSITIONS = {
     "PREPARED": {"SUBMITTING", "RECOVERY_REQUIRED"},
     "SUBMITTING": {"OPEN", "PARTIAL", "FILLED", "RECOVERY_REQUIRED"},
     "OPEN": {"PARTIAL", "CANCELING", "FILLED", "RECOVERY_REQUIRED"},
-    "PARTIAL": {"CANCELING", "FILLED", "RECOVERY_REQUIRED"},
+    "PARTIAL": {"PARTIAL", "CANCELING", "FILLED", "RECOVERY_REQUIRED"},
     "CANCELING": {"CANCELED", "RECOVERY_REQUIRED"},
-    "CANCELED": {"FALLBACK_SUBMITTING", "FINALIZED"},
+    "CANCELED": {"FALLBACK_SUBMITTING", "FINALIZED", "RECOVERY_REQUIRED"},
     "FALLBACK_SUBMITTING": {"FILLED", "RECOVERY_REQUIRED"},
     "FILLED": {"FINALIZED", "RECOVERY_REQUIRED"},
-    "RECOVERY_REQUIRED": {
-        "OPEN", "PARTIAL", "CANCELING", "CANCELED", "FILLED", "FINALIZED"
-    },
+    "RECOVERY_REQUIRED": {"PARTIAL", "CANCELED", "FILLED"},
     "FINALIZED": set(),
 }
 
@@ -3529,6 +3559,92 @@ def _optional_nonnegative_finite_db(value, field_name: str) -> float | None:
     if value is None:
         return None
     return _required_finite_float_db(value, field_name, minimum=0.0)
+
+
+def _persisted_optional_order_reference_db(
+    value,
+    field_name: str,
+    *,
+    max_length: int,
+) -> str | None:
+    normalized = _optional_order_reference_db(
+        value,
+        field_name,
+        max_length=max_length,
+    )
+    if value is not None and str(value) != normalized:
+        raise ValueError(f"{field_name} is not normalized")
+    return normalized
+
+
+def _persisted_optional_text_db(
+    value,
+    field_name: str,
+    *,
+    max_length: int,
+) -> str | None:
+    if value is None:
+        return None
+    normalized = _required_text_db(
+        value,
+        field_name,
+        max_length=max_length,
+    )
+    if value != normalized:
+        raise ValueError(f"{field_name} is not normalized")
+    return normalized
+
+
+def _validated_persisted_fallback_evidence_db(
+    row,
+) -> tuple[float, float, bool, float]:
+    amount = _required_finite_float_db(
+        row["fallback_filled_amount"],
+        "persisted fallback_filled_amount",
+        minimum=0.0,
+    )
+    notional = _required_finite_float_db(
+        row["fallback_filled_notional"],
+        "persisted fallback_filled_notional",
+        minimum=0.0,
+    )
+    notional_complete = row["fallback_notional_complete"]
+    if notional_complete not in (0, 1):
+        raise ValueError(
+            "persisted fallback_notional_complete must be boolean"
+        )
+    fee = _required_finite_float_db(
+        row["fallback_fee_usdt"],
+        "persisted fallback_fee_usdt",
+        minimum=0.0,
+    )
+    return amount, notional, bool(notional_complete), fee
+
+
+def _validate_fallback_components_within_aggregate_db(
+    fallback_amount: float,
+    fallback_notional: float,
+    fallback_fee: float,
+    *,
+    total_amount: float,
+    total_notional: float,
+    total_fee: float,
+) -> None:
+    if (
+        fallback_amount > total_amount
+        or fallback_notional > total_notional
+        or fallback_fee > total_fee
+    ):
+        raise ValueError("persisted fallback evidence exceeds aggregate totals")
+
+
+def _required_recovery_error_db(value) -> str:
+    if not isinstance(value, str):
+        raise ValueError("recovery error must be text")
+    text = value.strip()
+    if not text:
+        raise ValueError("recovery error is required")
+    return text[:500]
 
 
 def create_order_intent(
@@ -3596,8 +3712,12 @@ def create_order_intent(
                 """INSERT INTO order_intents
                    (intent_id, bot_name, mode, symbol, direction, target_amount,
                      target_price, client_order_id, fallback_client_order_id,
+                     fallback_exchange_order_id, fallback_filled_amount,
+                     fallback_filled_notional, fallback_notional_complete,
+                     fallback_fee_usdt,
                      status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'PREPARED', ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, 0, 0,
+                           'PREPARED', ?, ?)""",
                 (
                     validated_intent_id, validated_bot, normalized_mode,
                     validated_symbol, validated_direction,
@@ -3622,7 +3742,23 @@ def create_order_intent(
             "no column named fallback_client_order_id" in error_text
             or "no such column: fallback_client_order_id" in error_text
         )
-        if not missing_table and not missing_mode and not missing_fallback:
+        missing_fallback_evidence = any(
+            f"no column named {column_name}" in error_text
+            or f"no such column: {column_name}" in error_text
+            for column_name in (
+                "fallback_exchange_order_id",
+                "fallback_filled_amount",
+                "fallback_filled_notional",
+                "fallback_notional_complete",
+                "fallback_fee_usdt",
+            )
+        )
+        if not (
+            missing_table
+            or missing_mode
+            or missing_fallback
+            or missing_fallback_evidence
+        ):
             raise
         conn.rollback()
         if missing_table:
@@ -3634,10 +3770,16 @@ def create_order_intent(
                     target_amount REAL NOT NULL, target_price REAL,
                     client_order_id TEXT NOT NULL UNIQUE,
                     fallback_client_order_id TEXT,
+                    fallback_exchange_order_id TEXT,
                     exchange_order_id TEXT, status TEXT NOT NULL,
                     filled_amount REAL NOT NULL DEFAULT 0,
                     filled_notional REAL NOT NULL DEFAULT 0,
-                    fee_usdt REAL NOT NULL DEFAULT 0, last_error TEXT,
+                    fee_usdt REAL NOT NULL DEFAULT 0,
+                    fallback_filled_amount REAL NOT NULL DEFAULT 0,
+                    fallback_filled_notional REAL NOT NULL DEFAULT 0,
+                    fallback_notional_complete INTEGER NOT NULL DEFAULT 0,
+                    fallback_fee_usdt REAL NOT NULL DEFAULT 0,
+                    last_error TEXT,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 )""")
         else:
@@ -3655,6 +3797,19 @@ def create_order_intent(
                     "ALTER TABLE order_intents "
                     "ADD COLUMN fallback_client_order_id TEXT"
                 )
+            fallback_evidence_columns = {
+                "fallback_exchange_order_id": "TEXT",
+                "fallback_filled_amount": "REAL NOT NULL DEFAULT 0",
+                "fallback_filled_notional": "REAL NOT NULL DEFAULT 0",
+                "fallback_notional_complete": "INTEGER NOT NULL DEFAULT 0",
+                "fallback_fee_usdt": "REAL NOT NULL DEFAULT 0",
+            }
+            for column_name, declaration in fallback_evidence_columns.items():
+                if column_name not in columns:
+                    conn.execute(
+                        f"ALTER TABLE order_intents ADD COLUMN "
+                        f"{column_name} {declaration}"
+                    )
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS "
             "idx_order_intents_fallback_client_id "
@@ -3718,6 +3873,11 @@ def transition_order_intent(
     normalized_fee_usdt = _optional_nonnegative_finite_db(
         fee_usdt, "fee_usdt"
     )
+    recovery_transition_error = (
+        _required_recovery_error_db(error)
+        if target == "RECOVERY_REQUIRED"
+        else None
+    )
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -3726,9 +3886,188 @@ def transition_order_intent(
         ).fetchone()
         if row is None:
             raise ValueError("order intent does not exist")
+        persisted_target_amount = _required_finite_float_db(
+            row["target_amount"],
+            "persisted target_amount",
+            minimum=0.0,
+        )
+        if persisted_target_amount <= 0.0:
+            raise ValueError("persisted target_amount must be positive")
+        persisted_filled_amount = _required_finite_float_db(
+            row["filled_amount"],
+            "persisted filled_amount",
+            minimum=0.0,
+        )
+        persisted_filled_notional = _required_finite_float_db(
+            row["filled_notional"],
+            "persisted filled_notional",
+            minimum=0.0,
+        )
+        persisted_fee_usdt = _required_finite_float_db(
+            row["fee_usdt"],
+            "persisted fee_usdt",
+            minimum=0.0,
+        )
         current = str(row["status"])
         if target not in _ORDER_INTENT_TRANSITIONS.get(current, set()):
             raise ValueError(f"invalid order intent transition {current} -> {target}")
+        if current == "RECOVERY_REQUIRED" and target == "PARTIAL":
+            if (
+                normalized_filled_amount is None
+                or normalized_filled_notional is None
+            ):
+                raise ValueError(
+                    "recovery partial fill requires explicit fill evidence"
+                )
+            if normalized_filled_amount <= 0.0:
+                raise ValueError(
+                    "recovery partial fill amount must be positive"
+                )
+        recovery_resolution_error = None
+        if target == "CANCELED":
+            if (
+                normalized_filled_amount is None
+                or normalized_filled_notional is None
+            ):
+                raise ValueError(
+                    "cancellation requires explicit fill evidence"
+                )
+        if current == "RECOVERY_REQUIRED" and target == "CANCELED":
+            recovery_resolution_error = _required_text_db(
+                error,
+                "recovery cancellation error",
+                max_length=500,
+            )
+        current_exchange_id = _persisted_optional_order_reference_db(
+            row["exchange_order_id"],
+            "persisted exchange_order_id",
+            max_length=128,
+        )
+        persisted_fallback_client_id = _persisted_optional_text_db(
+            row["fallback_client_order_id"],
+            "persisted fallback_client_order_id",
+            max_length=32,
+        )
+        persisted_fallback_exchange_id = (
+            _persisted_optional_order_reference_db(
+                row["fallback_exchange_order_id"],
+                "persisted fallback_exchange_order_id",
+                max_length=128,
+            )
+        )
+        (
+            persisted_fallback_amount,
+            persisted_fallback_notional,
+            _persisted_fallback_notional_complete,
+            persisted_fallback_fee,
+        ) = _validated_persisted_fallback_evidence_db(row)
+        _validate_fallback_components_within_aggregate_db(
+            persisted_fallback_amount,
+            persisted_fallback_notional,
+            persisted_fallback_fee,
+            total_amount=persisted_filled_amount,
+            total_notional=persisted_filled_notional,
+            total_fee=persisted_fee_usdt,
+        )
+        is_journaled_fallback_fill = (
+            persisted_fallback_client_id is not None
+            and target == "FILLED"
+        )
+        if is_journaled_fallback_fill and exchange_id is None:
+            if persisted_fallback_exchange_id is None:
+                raise ValueError("fallback exchange order id is required")
+            exchange_id = str(persisted_fallback_exchange_id)
+        exchange_id_changes = (
+            exchange_id is not None
+            and current_exchange_id is not None
+            and exchange_id != str(current_exchange_id)
+        )
+        if exchange_id_changes and not is_journaled_fallback_fill:
+            raise ValueError("order intent exchange_order_id cannot change")
+        fallback_exchange_id_to_set = None
+        if is_journaled_fallback_fill and exchange_id is not None:
+            if (
+                persisted_fallback_exchange_id is not None
+                and exchange_id != str(persisted_fallback_exchange_id)
+            ):
+                raise ValueError("fallback exchange order id cannot change")
+            if exchange_id_changes or current_exchange_id is None:
+                fallback_exchange_id_to_set = exchange_id
+        monotonic_fields = (
+            (
+                "filled_amount",
+                normalized_filled_amount,
+                persisted_filled_amount,
+            ),
+            (
+                "filled_notional",
+                normalized_filled_notional,
+                persisted_filled_notional,
+            ),
+            ("fee_usdt", normalized_fee_usdt, persisted_fee_usdt),
+        )
+        for field_name, new_value, persisted_value in monotonic_fields:
+            if new_value is not None and new_value < persisted_value:
+                raise ValueError(
+                    f"order intent evidence {field_name} cannot decrease"
+                )
+        effective_filled_amount = (
+            normalized_filled_amount
+            if normalized_filled_amount is not None
+            else persisted_filled_amount
+        )
+        effective_filled_notional = (
+            normalized_filled_notional
+            if normalized_filled_notional is not None
+            else persisted_filled_notional
+        )
+        if (
+            effective_filled_amount <= 0.0
+            and effective_filled_notional > 0.0
+            and not (target == "FINALIZED" and current == "CANCELED")
+        ):
+            raise ValueError(
+                "fill notional requires positive fill amount"
+            )
+        if target == "PARTIAL" and effective_filled_amount <= 0.0:
+            raise ValueError(
+                "partial order intent requires positive fill amount"
+            )
+        if target == "PARTIAL":
+            target_amount = persisted_target_amount
+            fill_tolerance = max(1e-12, target_amount * 1e-9)
+            if effective_filled_amount >= target_amount - fill_tolerance:
+                raise ValueError(
+                    "partial order intent must remain below target amount"
+                )
+        if target == "FILLED" or (target == "FINALIZED" and current == "FILLED"):
+            target_amount = persisted_target_amount
+            fill_tolerance = max(1e-12, target_amount * 1e-9)
+            if (
+                effective_filled_amount < target_amount - fill_tolerance
+                or effective_filled_amount > target_amount + fill_tolerance
+                or effective_filled_notional <= 0.0
+            ):
+                raise ValueError(
+                    "filled order intent requires target amount and notional"
+                )
+        if (
+            target == "FILLED"
+            and exchange_id is None
+            and current_exchange_id is None
+        ):
+            raise ValueError("filled order intent requires order id")
+        if target == "FINALIZED" and current == "CANCELED":
+            has_fill = effective_filled_amount > 0.0
+            has_notional = effective_filled_notional > 0.0
+            if has_fill != has_notional:
+                raise ValueError(
+                    "canceled fill notional must match fill amount evidence"
+                )
+            target_amount = persisted_target_amount
+            fill_tolerance = max(1e-12, target_amount * 1e-9)
+            if effective_filled_amount > target_amount + fill_tolerance:
+                raise ValueError("canceled order intent exceeds target amount")
         if fallback_id is not None:
             collision = conn.execute(
                 """SELECT 1 FROM order_intents
@@ -3744,6 +4083,9 @@ def transition_order_intent(
                       fallback_client_order_id=COALESCE(
                           ?, fallback_client_order_id
                       ),
+                      fallback_exchange_order_id=COALESCE(
+                          ?, fallback_exchange_order_id
+                      ),
                       filled_amount=COALESCE(?, filled_amount),
                       filled_notional=COALESCE(?, filled_notional),
                       fee_usdt=COALESCE(?, fee_usdt), last_error=?, updated_at=?
@@ -3752,10 +4094,19 @@ def transition_order_intent(
                 target,
                 exchange_id,
                 fallback_id,
+                fallback_exchange_id_to_set,
                 normalized_filled_amount,
                 normalized_filled_notional,
                 normalized_fee_usdt,
-                (str(error)[:500] if error is not None else None),
+                (
+                    recovery_resolution_error
+                    if recovery_resolution_error is not None
+                    else (
+                        recovery_transition_error
+                        if recovery_transition_error is not None
+                        else (str(error)[:500] if error is not None else None)
+                    )
+                ),
                 _utcnow_str(),
                 validated_intent_id,
             ),
@@ -3774,6 +4125,207 @@ def transition_order_intent(
     except sqlite3.IntegrityError as exc:
         conn.rollback()
         raise ValueError("order intent identifiers conflict") from exc
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def record_order_intent_fallback_evidence(
+    intent_id: str,
+    *,
+    fallback_exchange_order_id=None,
+    fallback_filled_amount,
+    fallback_filled_notional,
+    fallback_notional_complete,
+    fallback_fee_usdt,
+    error,
+) -> dict:
+    """Atomically persist cumulative fallback evidence and aggregate totals."""
+    validated_recovery_error = _required_recovery_error_db(error)
+    validated_intent_id = _required_text_db(
+        intent_id, "intent_id", max_length=64
+    )
+    fallback_exchange_id = _optional_order_reference_db(
+        fallback_exchange_order_id,
+        "fallback_exchange_order_id",
+        max_length=128,
+    )
+    observed_amount = _required_finite_float_db(
+        fallback_filled_amount,
+        "fallback_filled_amount",
+        minimum=0.0,
+    )
+    observed_notional = _required_finite_float_db(
+        fallback_filled_notional,
+        "fallback_filled_notional",
+        minimum=0.0,
+    )
+    if not isinstance(fallback_notional_complete, bool):
+        raise ValueError("fallback_notional_complete must be boolean")
+    if observed_amount <= 0.0 and observed_notional > 0.0:
+        raise ValueError(
+            "fallback fill notional requires positive fill amount"
+        )
+    if (
+        fallback_notional_complete
+        and observed_amount > 0.0
+        and observed_notional <= 0.0
+    ):
+        raise ValueError(
+            "complete fallback fill notional must be positive"
+        )
+    observed_fee = _required_finite_float_db(
+        fallback_fee_usdt,
+        "fallback_fee_usdt",
+        minimum=0.0,
+    )
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM order_intents WHERE intent_id=?",
+            (validated_intent_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("order intent does not exist")
+        current = str(row["status"])
+        if current not in {"FALLBACK_SUBMITTING", "RECOVERY_REQUIRED"}:
+            raise ValueError(
+                "fallback evidence requires an active fallback recovery"
+            )
+        persisted_fallback_client_id = _persisted_optional_text_db(
+            row["fallback_client_order_id"],
+            "persisted fallback_client_order_id",
+            max_length=32,
+        )
+        if persisted_fallback_client_id is None:
+            raise ValueError("fallback client order id is missing")
+        persisted_exchange_id = _persisted_optional_order_reference_db(
+            row["fallback_exchange_order_id"],
+            "persisted fallback_exchange_order_id",
+            max_length=128,
+        )
+        if (
+            persisted_exchange_id is not None
+            and fallback_exchange_id is not None
+            and persisted_exchange_id != fallback_exchange_id
+        ):
+            raise ValueError("fallback exchange order id cannot change")
+
+        (
+            prior_fallback_amount,
+            prior_fallback_notional,
+            prior_notional_complete,
+            prior_fallback_fee,
+        ) = _validated_persisted_fallback_evidence_db(
+            row,
+        )
+        total_amount = _required_finite_float_db(
+            row["filled_amount"], "persisted filled_amount", minimum=0.0
+        )
+        total_notional = _required_finite_float_db(
+            row["filled_notional"], "persisted filled_notional", minimum=0.0
+        )
+        total_fee = _required_finite_float_db(
+            row["fee_usdt"], "persisted fee_usdt", minimum=0.0
+        )
+        _validate_fallback_components_within_aggregate_db(
+            prior_fallback_amount,
+            prior_fallback_notional,
+            prior_fallback_fee,
+            total_amount=total_amount,
+            total_notional=total_notional,
+            total_fee=total_fee,
+        )
+
+        fill_tolerance = max(
+            1e-12,
+            max(prior_fallback_amount, observed_amount) * 1e-9,
+        )
+        recovery_error_to_set = validated_recovery_error
+        notional_tolerance = max(
+            1e-12,
+            max(prior_fallback_notional, observed_notional) * 1e-9,
+        )
+        notional_decreased = (
+            observed_notional + notional_tolerance
+            < prior_fallback_notional
+        )
+        if observed_amount > prior_fallback_amount + fill_tolerance:
+            merged_amount = observed_amount
+            merged_notional = max(
+                prior_fallback_notional,
+                observed_notional,
+            )
+            merged_fee = max(prior_fallback_fee, observed_fee)
+            merged_notional_complete = (
+                fallback_notional_complete and not notional_decreased
+            )
+            if notional_decreased:
+                recovery_error_to_set = (
+                    "fallback fill notional decreased as fill amount grew"
+                )
+        elif observed_amount + fill_tolerance < prior_fallback_amount:
+            merged_amount = prior_fallback_amount
+            merged_notional = prior_fallback_notional
+            merged_fee = prior_fallback_fee
+            merged_notional_complete = bool(prior_notional_complete)
+        else:
+            merged_amount = max(prior_fallback_amount, observed_amount)
+            merged_notional = max(
+                prior_fallback_notional,
+                observed_notional,
+            )
+            merged_fee = max(prior_fallback_fee, observed_fee)
+            merged_notional_complete = (
+                bool(prior_notional_complete)
+                or (
+                    fallback_notional_complete
+                    and not notional_decreased
+                )
+            )
+            if notional_decreased and not prior_notional_complete:
+                recovery_error_to_set = (
+                    "fallback fill notional decreased at unchanged fill amount"
+                )
+        aggregate_amount = total_amount - prior_fallback_amount + merged_amount
+        aggregate_notional = (
+            total_notional - prior_fallback_notional + merged_notional
+        )
+        aggregate_fee = total_fee - prior_fallback_fee + merged_fee
+        conn.execute(
+            """UPDATE order_intents
+                  SET status='RECOVERY_REQUIRED',
+                      fallback_exchange_order_id=COALESCE(
+                          ?, fallback_exchange_order_id
+                      ),
+                      fallback_filled_amount=?,
+                      fallback_filled_notional=?,
+                      fallback_notional_complete=?,
+                      fallback_fee_usdt=?,
+                      filled_amount=?, filled_notional=?, fee_usdt=?,
+                      last_error=?, updated_at=?
+                WHERE intent_id=?""",
+            (
+                fallback_exchange_id,
+                merged_amount,
+                merged_notional,
+                int(merged_notional_complete),
+                merged_fee,
+                aggregate_amount,
+                aggregate_notional,
+                aggregate_fee,
+                recovery_error_to_set,
+                _utcnow_str(),
+                validated_intent_id,
+            ),
+        )
+        updated = conn.execute(
+            "SELECT * FROM order_intents WHERE intent_id=?",
+            (validated_intent_id,),
+        ).fetchone()
+        conn.commit()
+        return dict(updated)
     except Exception:
         conn.rollback()
         raise

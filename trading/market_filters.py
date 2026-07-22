@@ -16,6 +16,7 @@ from collections import OrderedDict
 from typing import Optional
 from dotenv import load_dotenv
 from core.constants import NONCRYPTO_BASES, STOCK_TOKEN_BASES
+from bot_utils.api_budget import try_consume_api_call
 from bot_utils.safe_numeric import safe_positive_float
 
 load_dotenv()
@@ -222,6 +223,16 @@ def get_btc_change(
     def fetch() -> float:
         limit = max(3, hours + 2) + (1 if closed_only else 0)
 
+        def _fetch_bars(symbol: str):
+            if not try_consume_api_call(
+                "market_filter_fetch_btc_ohlcv",
+                critical=bool(closed_only),
+            ):
+                raise BTCPriceUnavailable(
+                    "API budget exhausted before BTC OHLCV request"
+                )
+            return exchange.fetch_ohlcv(symbol, "1h", limit=limit)
+
         def _calc(bars):
             if not bars:
                 return None
@@ -239,7 +250,7 @@ def get_btc_change(
         primary_symbol = _btc_symbol_for(exchange)
         e_primary = None
         try:
-            bars = exchange.fetch_ohlcv(primary_symbol, "1h", limit=limit)
+            bars = _fetch_bars(primary_symbol)
             result = _calc(bars)
             if result is None:
                 raise BTCPriceUnavailable(f"insufficient BTC history for {hours}h")
@@ -251,7 +262,7 @@ def get_btc_change(
             "BTC/USDT:USDT" if primary_symbol == "BTC/USDT" else "BTC/USDT"
         )
         try:
-            bars = exchange.fetch_ohlcv(fallback_symbol, "1h", limit=limit)
+            bars = _fetch_bars(fallback_symbol)
             result = _calc(bars)
             if result is None:
                 raise BTCPriceUnavailable(f"insufficient BTC history for {hours}h")
@@ -544,9 +555,13 @@ def get_market_regime(exchange) -> dict:
 
         try:
             symbol = _btc_symbol_for(exchange)
+            if not try_consume_api_call("market_regime_fetch_ticker"):
+                raise RuntimeError("API budget exhausted before market-regime ticker")
             ticker_24h = exchange.fetch_ticker(symbol)
             btc_24h = float(ticker_24h.get("percentage", 0) or 0)
 
+            if not try_consume_api_call("market_regime_fetch_ohlcv"):
+                raise RuntimeError("API budget exhausted before market-regime OHLCV")
             bars = exchange.fetch_ohlcv(symbol, "1d", limit=9)
             closed_bars = _closed_daily_bars(bars)
 
@@ -819,12 +834,19 @@ def can_buy_now(
         price = known_price
         if price is None:
             try:
-                ticker = exchange.fetch_ticker(candidate_symbol)
-                price = safe_positive_float(ticker.get("last"), 0.0)
-                if price <= 0:
-                    price = safe_positive_float(ticker.get("close"), 0.0)
+                ticker_allowed = bool(try_consume_api_call(
+                    "can_buy_now_fetch_ticker"
+                ))
             except Exception:
-                price = None
+                ticker_allowed = False
+            if ticker_allowed:
+                try:
+                    ticker = exchange.fetch_ticker(candidate_symbol)
+                    price = safe_positive_float(ticker.get("last"), 0.0)
+                    if price <= 0:
+                        price = safe_positive_float(ticker.get("close"), 0.0)
+                except Exception:
+                    price = None
         if price is not None and not is_price_valid(price):
             return (False, f"Invalid price ({price!r}) for {candidate_symbol}")
 

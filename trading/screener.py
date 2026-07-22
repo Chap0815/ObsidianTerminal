@@ -589,15 +589,20 @@ def _safe_get_indicators(
     record_seen(symbol)
 
     try:
-        from core.database import check_and_consume_global_api
+        from bot_utils.api_budget import try_consume_api_call
 
-        if not check_and_consume_global_api(
-            bot_name or "SCREENER",
-            endpoint=f"fetch_ohlcv/{timeframe}",
-        ):
-            return {}
-    except Exception:
-        pass
+        budget_allowed = try_consume_api_call(
+            f"screener_fetch_ohlcv/{timeframe}"
+        )
+    except Exception as exc:
+        log_event(
+            f"OHLCV fetch skipped for {symbol} {timeframe}: API budget "
+            f"gate unavailable ({type(exc).__name__})",
+            "WARN",
+        )
+        return {}
+    if not budget_allowed:
+        return {}
 
     try:
         bars = exchange.fetch_ohlcv(
@@ -988,6 +993,21 @@ def get_top_momentum_coins(
         f"| Direction: {direction.upper()} ...",
         "SCAN",
     )
+
+    try:
+        from bot_utils.api_budget import try_consume_api_call
+
+        budget_allowed = try_consume_api_call("screener_fetch_tickers")
+    except Exception as exc:
+        log_event(
+            f"Ticker fetch skipped: API budget gate unavailable "
+            f"({type(exc).__name__})",
+            "WARN",
+        )
+        return pd.DataFrame()
+    if not budget_allowed:
+        log_event("Ticker fetch skipped: API budget exhausted", "WAIT")
+        return pd.DataFrame()
 
     try:
         tickers = exchange.fetch_tickers()

@@ -186,7 +186,7 @@ class TickerCache:
                 from bot_utils.api_budget import try_consume_api_call
                 _allowed = try_consume_api_call("fetch_ticker", critical=critical)
             except Exception:
-                _allowed = True  # Budget module unavailable; do not block.
+                _allowed = False
             if not _allowed:
                 self._note("budget_denied")
                 with self._cache_lock:

@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from shared_limits import normalize_gate_mode
+from bot_utils.api_budget import try_consume_api_call
+from bot_utils.safe_numeric import parse_ohlcv_closes
 from core.futures_bot import FuturesBot
 from core.cross_bot import _is_crypto_base   # shared crypto-only perp filter
 from bot_utils.order_utils import order_id_text_or_none
@@ -221,12 +223,13 @@ class TrendFuturesBot(FuturesBot):
         ask = self._safe_float(self._ticker_field(ticker, "ask", "askPrice"))
         if (bid <= 0 or ask <= 0) and not self.simulation:
             try:
-                ob = self.ex.fetch_order_book(full, limit=1)
-                bids = (ob or {}).get("bids") or []
-                asks = (ob or {}).get("asks") or []
-                if bids and asks:
-                    bid = self._safe_float(bids[0][0])
-                    ask = self._safe_float(asks[0][0])
+                if try_consume_api_call("futrend_shadow_fetch_order_book"):
+                    ob = self.ex.fetch_order_book(full, limit=1)
+                    bids = (ob or {}).get("bids") or []
+                    asks = (ob or {}).get("asks") or []
+                    if bids and asks:
+                        bid = self._safe_float(bids[0][0])
+                        ask = self._safe_float(asks[0][0])
             except Exception:
                 pass
         mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else price
@@ -491,13 +494,17 @@ class TrendFuturesBot(FuturesBot):
             n = 30
         min_vol = self._f("MIN_VOLUME", 10_000_000.0)
         try:
-            from bot_utils.api_budget import try_consume_api_call
             if not try_consume_api_call("futrend_fetch_tickers"):
                 log_event(f"[{self.BOT_NAME}] universe scan skipped "
                           f"(API budget exhausted)", "WARN")
                 return {}
-        except Exception:
-            pass
+        except Exception as exc:
+            log_event(
+                f"[{self.BOT_NAME}] universe scan skipped "
+                f"(API budget gate unavailable: {type(exc).__name__})",
+                "WARN",
+            )
+            return {}
         try:
             tickers = self.ex.fetch_tickers()
         except Exception as e:
@@ -519,16 +526,21 @@ class TrendFuturesBot(FuturesBot):
             try:
                 if is_blacklisted(base, self.BOT_NAME):
                     continue
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event(
+                    f"[{self.BOT_NAME}] universe scan aborted: blacklist "
+                    f"registry unavailable ({type(exc).__name__})",
+                    "WARN",
+                )
+                return {}
             if self._is_in_cooldown(base):
                 continue
-            qv = t.get("quoteVolume") or 0
+            raw_qv = t.get("quoteVolume")
             try:
-                qv = float(qv)
-            except (TypeError, ValueError):
+                qv = 0.0 if isinstance(raw_qv, bool) else float(raw_qv)
+            except (TypeError, ValueError, OverflowError):
                 qv = 0.0
-            if qv < min_vol:
+            if not math.isfinite(qv) or qv <= 0 or qv < min_vol:
                 continue
             if is_claimed_by_other(sym, self.BOT_NAME, is_futures=True):
                 continue
@@ -539,26 +551,37 @@ class TrendFuturesBot(FuturesBot):
     def _fetch_closes(self, full_symbol: str, need: int) -> Optional[List[float]]:
         from bot_utils.network_retry import with_network_retry
         tf = self._timeframe()
-        try:
-            from bot_utils.api_budget import try_consume_api_call
-            if not try_consume_api_call("futrend_fetch_ohlcv"):
+
+        def _fetch_once():
+            try:
+                if not try_consume_api_call("futrend_fetch_ohlcv"):
+                    return None
+            except Exception:
                 return None
-        except Exception:
-            pass
+            return self.ex.fetch_ohlcv(full_symbol, tf, limit=need + 2)
+
         try:
             bars = with_network_retry(
-                operation=lambda: self.ex.fetch_ohlcv(full_symbol, tf, limit=need + 2),
+                operation=_fetch_once,
                 action_label=f"ohlcv {full_symbol}",
                 max_attempts=2, base_delay=0.5,
                 shutdown_event=self._shutdown_event,
             )
         except Exception:
             return None
-        closes = [float(b[4]) for b in (bars or []) if b and b[4]]
-        # Drop the still-FORMING last candle so the signal acts on CLOSED bars
-        # only  matches the validated backtest and avoids intra-candle flip-flop.
-        if len(closes) >= 2:
-            closes = closes[:-1]
+        interval_ms = {"1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}[tf]
+        try:
+            from core.clock import now_ms as _clock_now_ms
+            current_time_ms = int(_clock_now_ms())
+        except Exception:
+            current_time_ms = int(time.time() * 1000)
+        closes = parse_ohlcv_closes(
+            bars,
+            expected_interval_ms=interval_ms,
+            now_ms=current_time_ms,
+        )
+        if closes is None:
+            return None
         return closes if len(closes) >= 2 else None
 
     def _warn_short_history(self, base: str, got: int, need: int,
@@ -728,8 +751,13 @@ class TrendFuturesBot(FuturesBot):
                 from core.database import is_blacklisted
                 if is_blacklisted(base, self.BOT_NAME):
                     continue
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event(
+                    f"[{self.BOT_NAME}] entry scan aborted: blacklist "
+                    f"registry unavailable ({type(exc).__name__})",
+                    "WARN",
+                )
+                return
             if self.state.count() >= max_open:
                 break
             if opened_this_tick >= max_new:
@@ -768,7 +796,8 @@ class TrendFuturesBot(FuturesBot):
         from core.database import (is_claimed_by_other, claim_symbol_for_entry,
                                    remove_open_position)
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-        from bot_utils import (create_order_with_retry,
+        from bot_utils import (FuturesOrderOutcomeUnknown,
+                               create_order_with_retry,
                                extract_or_estimate_futures_fee,
                                filled_margin_usdt,
                                futures_contract_size,
@@ -1074,6 +1103,8 @@ class TrendFuturesBot(FuturesBot):
                     config=MakerFirstConfig(mode="disabled"),
                 )
             except Exception as e:
+                _outcome_unknown = isinstance(
+                    e, FuturesOrderOutcomeUnknown)
                 emit_entry_lifecycle(
                     entry_id, bot=self.BOT_NAME, symbol=base,
                     stage="order_failed", mode=entry_mode,
@@ -1124,7 +1155,14 @@ class TrendFuturesBot(FuturesBot):
                                   f"error  tracked and monitoring enabled", "WARN")
                 except Exception:
                     pass
-                if not _landed:
+                if not _landed and _outcome_unknown:
+                    log_event(
+                        f"[{self.BOT_NAME}] {base}: entry outcome unknown; "
+                        f"provisional state and claim kept pending "
+                        f"clientOrderId reconciliation",
+                        "ERROR",
+                    )
+                elif not _landed:
                     removed_state = False
                     try:
                         removed_state = self.state.remove(base)
@@ -1250,6 +1288,11 @@ class TrendFuturesBot(FuturesBot):
         if oid:
             for attempt in range(2):
                 time.sleep(0.4 * (1 + attempt))
+                if not try_consume_api_call(
+                    "futrend_entry_fetch_order",
+                    critical=True,
+                ):
+                    continue
                 try:
                     refreshed = self.ex.fetch_order(oid, full) or {}
                 except Exception:

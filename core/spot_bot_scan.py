@@ -26,6 +26,67 @@ from bot_utils import (
     extract_fill_price,
     budget_exhausted,
 )
+from bot_utils.api_budget import try_consume_api_call
+from bot_utils.network_retry import RetryForbiddenError
+
+
+class _SpotBuyBudgetUnavailable(RuntimeError):
+    """A SPOT buy was not sent because its atomic budget gate failed."""
+
+
+class SpotBuyOutcomeUnknown(RetryForbiddenError):
+    """A SPOT buy may exist, so its claim must remain reserved."""
+
+    def __init__(self, client_order_id: str):
+        self.client_order_id = client_order_id
+        super().__init__(
+            "spot buy outcome unknown "
+            f"(intentClientOrderId={client_order_id})"
+        )
+
+
+def _create_market_buy_budgeted(ex, symbol_pair: str, amount: float,
+                                *, params=None):
+    try:
+        allowed = try_consume_api_call("spot_entry_create_market_buy")
+    except Exception as exc:
+        raise _SpotBuyBudgetUnavailable(
+            "API budget gate unavailable before SPOT market buy"
+        ) from exc
+    if not allowed:
+        raise _SpotBuyBudgetUnavailable(
+            "API budget exhausted before SPOT market buy"
+        )
+    if params is None:
+        return ex.create_market_buy_order(symbol_pair, amount)
+    return ex.create_market_buy_order(symbol_pair, amount, params=params)
+
+
+def _client_order_id_parameter_rejected(exc: Exception) -> bool:
+    """True only for explicit evidence that the parameter is unsupported."""
+    try:
+        text = " ".join(str(exc).lower().split())
+    except Exception:
+        return False
+    if "clientorderid" not in text:
+        return False
+    if type(exc).__name__.lower() == "notsupported":
+        return True
+    return any(
+        phrase in text
+        for phrase in (
+            "clientorderid unsupported",
+            "clientorderid is unsupported",
+            "clientorderid not supported",
+            "clientorderid is not supported",
+            "parameter clientorderid is unsupported",
+            "parameter clientorderid not supported",
+            "does not support clientorderid",
+            "unsupported parameter clientorderid",
+            "unknown parameter clientorderid",
+            "unrecognized parameter clientorderid",
+        )
+    )
 
 
 class ScanMixin:
@@ -421,8 +482,13 @@ class ScanMixin:
                 if is_claimed_by_other(sym, self.BOT_NAME, is_futures=False):
                     log_event(f"{sym} held by another bot  skipping (coexistence)", "WAIT")
                     continue
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event(
+                    f"{sym} entry scan aborted: claim registry unavailable "
+                    f"({type(exc).__name__})",
+                    "WARN",
+                )
+                return
             if self.state.has(sym):
                 continue
 
@@ -438,15 +504,13 @@ class ScanMixin:
                     log_event(f"{sym} skipped  {reason}", "WAIT")
                     continue
             except Exception as _filt_err:
-                # Never block trading on a transient filter outage  but DO
-                # surface programming errors (TypeError/NameError) loudly so a
-                # silently-dead gate (e.g. a bad kwarg) can't masquerade as a
-                # working filter.
-                if isinstance(_filt_err, (TypeError, NameError, AttributeError)):
-                    log_event(f"{sym} filter check BUG "
-                              f"({type(_filt_err).__name__}: {_filt_err})  "
-                              f"entry skipped fail-closed", "WARN")
-                    continue
+                # Normal feed/API failures are handled inside can_buy_now().
+                # Anything escaping that safety boundary means the gate itself
+                # is unavailable, so a new money-bearing entry must not proceed.
+                log_event(f"{sym} filter check error "
+                          f"({type(_filt_err).__name__}: {_filt_err})  "
+                          f"entry skipped fail-closed", "WARN")
+                continue
 
             # Multi-RSI gate
             rsi_values = self._rsi_triplet(r)
@@ -707,6 +771,12 @@ class ScanMixin:
             entry = self._place_buy_order(
                 sym, r, trade_usdt, entry_id=entry_id
             )
+        except SpotBuyOutcomeUnknown as _buy_exc:
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="order_unknown", mode=entry_mode,
+                reason=type(_buy_exc).__name__)
+            raise
         except Exception as _buy_exc:
             emit_entry_lifecycle(
                 entry_id, bot=self.BOT_NAME, symbol=sym,
@@ -781,11 +851,18 @@ class ScanMixin:
                 f"Buy {sym}: state write failed after LIVE fill  "
                 f"attempting immediate rollback sell", "WARN")
             try:
-                from bot_utils.spot_exits import spot_market_sell_safe
-                from bot_utils.order_utils import order_was_filled
-                order, sold_amount = spot_market_sell_safe(
-                    self.ex, f"{sym}/USDT", amount)
-                if order_was_filled(order, sold_amount, min_fill_ratio=1e-9):
+                from bot_utils.spot_exits import (
+                    rollback_spot_entry_after_state_failure,
+                    spot_entry_rollback_was_fully_filled,
+                )
+                order, sold_amount = rollback_spot_entry_after_state_failure(
+                    self.ex,
+                    f"{sym}/USDT",
+                    amount,
+                    entry_id=entry_id,
+                    bot_name=self.BOT_NAME,
+                )
+                if spot_entry_rollback_was_fully_filled(order, sold_amount):
                     self._cleanup_rolled_back_entry_state(
                         sym, "state write failed after live buy")
                     log_event(
@@ -961,45 +1038,93 @@ class ScanMixin:
     def _find_order_by_cid(self, symbol_pair: str, cid: str):
         """Locate an order by OUR clientOrderId (open orders first, then recent
         history). Used to recover from a lost-response timeout so a retry doesn't
-        place a SECOND live buy. Returns the order dict or None.
+        place a SECOND live buy. Returns ``None`` only when every supported
+        lookup completed successfully and proved absence; uncertainty raises.
         """
         try:
             from bot_utils.futures_order import _order_client_id_matches
         except Exception:
             def _order_client_id_matches(o, c):
                 return o.get("clientOrderId") == c
-        try:
-            for o in (self.ex.fetch_open_orders(symbol_pair) or []):
+
+        has = getattr(self.ex, "has", {}) or {}
+        if not isinstance(has, dict):
+            has = {}
+        attempted = False
+        uncertain = False
+
+        def _query(endpoint, fetch):
+            nonlocal attempted, uncertain
+            try:
+                allowed = try_consume_api_call(endpoint, critical=True)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"order reconciliation unavailable: {endpoint}"
+                ) from exc
+            if not allowed:
+                raise RuntimeError(
+                    f"order reconciliation unavailable: {endpoint}"
+                )
+            attempted = True
+            try:
+                rows = fetch()
+            except Exception as exc:
+                uncertain = True
+                try:
+                    self._log_error(f"spot cid reconcile {endpoint}", exc)
+                except Exception:
+                    pass
+                return []
+            if not isinstance(rows, list):
+                uncertain = True
+                return []
+            return rows
+
+        fetch_open = getattr(self.ex, "fetch_open_orders", None)
+        if callable(fetch_open) and has.get("fetchOpenOrders") is not False:
+            for o in _query(
+                "spot_reconcile_fetch_open_orders",
+                lambda: fetch_open(symbol_pair),
+            ):
                 if _order_client_id_matches(o, cid):
                     return o
-        except Exception:
-            pass
-        has = getattr(self.ex, "has", {}) or {}
-        try:
-            if has.get("fetchOrders"):
-                for o in (self.ex.fetch_orders(symbol_pair, limit=20) or []):
-                    if _order_client_id_matches(o, cid):
-                        return o
-        except Exception:
-            pass
+
+        fetch_orders = getattr(self.ex, "fetch_orders", None)
+        if has.get("fetchOrders") and callable(fetch_orders):
+            for o in _query(
+                "spot_reconcile_fetch_orders",
+                lambda: fetch_orders(symbol_pair, limit=20),
+            ):
+                if _order_client_id_matches(o, cid):
+                    return o
         # A just-filled MARKET buy isn't "open", and several venues (bitget  the
         # default  okx, bybit, kucoin, gate) lack unified fetchOrders; the fill
         # shows in closed orders / my-trades. Consult those before giving up so a
         # lost-response retry can't place a SECOND live buy.
-        try:
-            if has.get("fetchClosedOrders"):
-                for o in (self.ex.fetch_closed_orders(symbol_pair, limit=20) or []):
-                    if _order_client_id_matches(o, cid):
-                        return o
-        except Exception:
-            pass
-        try:
-            if has.get("fetchMyTrades"):
-                for t in (self.ex.fetch_my_trades(symbol_pair, limit=20) or []):
-                    if _order_client_id_matches(t, cid):
-                        return t
-        except Exception:
-            pass
+        fetch_closed = getattr(self.ex, "fetch_closed_orders", None)
+        if has.get("fetchClosedOrders") and callable(fetch_closed):
+            for o in _query(
+                "spot_reconcile_fetch_closed_orders",
+                lambda: fetch_closed(symbol_pair, limit=20),
+            ):
+                if _order_client_id_matches(o, cid):
+                    return o
+
+        fetch_trades = getattr(self.ex, "fetch_my_trades", None)
+        if has.get("fetchMyTrades") and callable(fetch_trades):
+            matching_trades = [
+                trade for trade in _query(
+                    "spot_reconcile_fetch_my_trades",
+                    lambda: fetch_trades(symbol_pair, limit=20),
+                )
+                if _order_client_id_matches(trade, cid)
+            ]
+            if matching_trades:
+                from bot_utils.spot_exits import aggregate_spot_order_trades
+
+                return aggregate_spot_order_trades(matching_trades, cid)
+        if not attempted or uncertain:
+            raise RuntimeError("order reconciliation unavailable")
         return None
 
     def _execution_quality_gate(self, sym: str, pair: str) -> bool:
@@ -1022,6 +1147,12 @@ class ScanMixin:
         except Exception as e:
             self._log_error("exec-quality import", e)
             return True
+        if not try_consume_api_call("spot_entry_fetch_ticker"):
+            log_event(
+                f"{sym}: spread gate blocked - API budget exhausted",
+                "WAIT",
+            )
+            return False
         try:
             ticker = self.ex.fetch_ticker(pair)
         except Exception as e:
@@ -1035,6 +1166,13 @@ class ScanMixin:
         if (not self.simulation
                 and (not isinstance(ticker, dict)
                      or ticker.get("bid") is None or ticker.get("ask") is None)):
+            if not try_consume_api_call("spot_entry_fetch_spread_book"):
+                log_event(
+                    f"{sym}: order-book spread check blocked - "
+                    "API budget exhausted",
+                    "WAIT",
+                )
+                return False
             try:
                 ob = self.ex.fetch_order_book(pair, limit=5)
                 bids = (ob or {}).get("bids") or []
@@ -1152,6 +1290,13 @@ class ScanMixin:
         # amount/slippage math reflect what we actually pay.
         from core.constants import SPOT_MAX_CHASE_PCT
         _chase_max = SPOT_MAX_CHASE_PCT
+        if not try_consume_api_call("spot_entry_fetch_chase_book"):
+            log_event(
+                f"Buy {sym}: ABORT - API budget exhausted before "
+                "order-book ask",
+                "WAIT",
+            )
+            return None
         try:
             _ob = self.ex.fetch_order_book(f"{sym}/USDT", limit=5)
             _asks = (_ob or {}).get("asks") or []
@@ -1208,17 +1353,24 @@ class ScanMixin:
                 log_event(f"Buy {sym}: computed amount is 0  skip", "WARN")
                 return None
 
-            # Stable per-intent clientOrderId derived from bot+symbol+30s-bucket
-            # so a lost-response retry of the SAME intent collides (the exchange
-            # dedupes it) while the BOT_NAME component keeps it unique across the
-            # three bots.
-            import hashlib as _hashlib
-            import time as _time
-            _bucket = int(_time.time() // 30)   # 30s idempotency window
-            cid = (f"{self.BUY_PREFIX}-{sym}-"
-                   + _hashlib.sha256(
-                       f"{self.BOT_NAME}:{sym}:{_bucket}".encode()
-                   ).hexdigest()[:10])
+            # Stable per-intent clientOrderId: the DB claim and lifecycle use
+            # this same entry_id, so retries/recovery remain identical across
+            # time buckets while different entry intents can never collide.
+            from bot_utils.order_utils import order_id_text_or_none
+            from trading.execution_quality import make_client_order_id
+
+            stable_entry_id = order_id_text_or_none(entry_id)
+            if not stable_entry_id:
+                log_event(
+                    f"Buy {sym}: missing stable entry_id - refusing LIVE order",
+                    "ERROR",
+                )
+                return None
+            cid = make_client_order_id(
+                stable_entry_id,
+                f"{self.BOT_NAME}:{sym}:entry",
+                prefix=self.BUY_PREFIX,
+            )
 
             # On MEXC/Binance spot, CCXT interprets the `amount` arg of a market
             # buy as USDT COST (quote), not COIN QUANTITY (base). Detect via
@@ -1240,23 +1392,33 @@ class ScanMixin:
                     # the USDT cost when this option is False. We also
                     # send 'cost' in params as belt-and-suspenders for
                     # ccxt versions that read it from params.
-                    order = self.ex.create_market_buy_order(
+                    order = _create_market_buy_budgeted(
+                        self.ex,
                         f"{sym}/USDT", trade_usdt,
                         params={"clientOrderId": cid, "cost": trade_usdt}
                     )
                 else:
                     # Bitget/Kraken/etc: standard coin-amount semantics
-                    order = self.ex.create_market_buy_order(
+                    order = _create_market_buy_budgeted(
+                        self.ex,
                         f"{sym}/USDT", amount_coins,
                         params={"clientOrderId": cid}
                     )
+            except _SpotBuyBudgetUnavailable as _budget_err:
+                log_event(f"Buy {sym}: {_budget_err}", "WAIT")
+                return None
             except Exception as _place_err:
                 # A placement exception does NOT prove the order never reached
                 # the exchange  it may be a lost-response timeout AFTER a fill.
                 # Reconcile by our stable clientOrderId first; only re-fire when
                 # we can prove no order exists AND the failure was the exchange
                 # rejecting the param itself (avoids a double-buy).
-                recovered = self._find_order_by_cid(f"{sym}/USDT", cid)
+                try:
+                    recovered = self._find_order_by_cid(
+                        f"{sym}/USDT", cid
+                    )
+                except Exception as _recovery_err:
+                    raise SpotBuyOutcomeUnknown(cid) from _recovery_err
                 if recovered is not None:
                     # An order carrying our clientOrderId EXISTS on the exchange
                     # (filled OR still resting)  adopt it; NEVER re-fire, that
@@ -1264,18 +1426,28 @@ class ScanMixin:
                     # actually filled. (Previously this required filled>0, so an
                     # accepted-but-not-yet-filled order fell through to a re-fire.)
                     order = recovered
-                elif "clientorderid" in str(_place_err).lower():
+                elif _client_order_id_parameter_rejected(_place_err):
                     # Param rejected  first call never placed an order; safe
                     # to retry once WITHOUT the clientOrderId param.
-                    if quote_first_buy:
-                        order = self.ex.create_market_buy_order(
-                            f"{sym}/USDT", trade_usdt,
-                            params={"cost": trade_usdt}
-                        )
-                    else:
-                        order = self.ex.create_market_buy_order(
-                            f"{sym}/USDT", amount_coins
-                        )
+                    try:
+                        if quote_first_buy:
+                            order = _create_market_buy_budgeted(
+                                self.ex,
+                                f"{sym}/USDT",
+                                trade_usdt,
+                                params={"cost": trade_usdt},
+                            )
+                        else:
+                            order = _create_market_buy_budgeted(
+                                self.ex,
+                                f"{sym}/USDT",
+                                amount_coins,
+                            )
+                    except _SpotBuyBudgetUnavailable as _budget_err:
+                        log_event(f"Buy {sym}: {_budget_err}", "WAIT")
+                        return None
+                    except Exception as _fallback_err:
+                        raise SpotBuyOutcomeUnknown(cid) from _fallback_err
                 else:
                     # Unknown failure and no confirmable fill. Do NOT re-fire
                     # (double-buy risk). Skip; if an order DID land, the
@@ -1284,7 +1456,17 @@ class ScanMixin:
                         f"Buy {sym}: placement failed ({_place_err}) and no "
                         f"order found for cid={cid}  skipping (no blind "
                         f"retry, to avoid a duplicate position)", "WARN")
-                    return None
+                    raise SpotBuyOutcomeUnknown(cid) from _place_err
+
+            raw_order_status = (
+                order.get("status") if isinstance(order, dict) else None
+            )
+            order_status = (
+                raw_order_status.strip().lower()
+                if isinstance(raw_order_status, str) else ""
+            )
+            if order_status in ("new", "open", "pending"):
+                raise SpotBuyOutcomeUnknown(cid)
 
             # Symmetric to the sell path's order_was_filled guard: never book an
             # unfilled buy as an open position. An accepted order with no
@@ -1517,6 +1699,8 @@ class ScanMixin:
 
             return amount, fill_price, gross_amount, invested_usdt, entry_fee
 
+        except SpotBuyOutcomeUnknown:
+            raise
         except Exception as e:
             log_event(f"Buy order {sym} failed: {e}", "WARN")
             return None

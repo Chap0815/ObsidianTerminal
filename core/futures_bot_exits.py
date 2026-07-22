@@ -35,6 +35,7 @@ from bot_utils import (
     safe_funding_scale,
     safe_remaining_funding,
 )
+from bot_utils.api_budget import try_consume_api_call
 from bot_utils.order_utils import order_id_text_or_none
 
 
@@ -739,13 +740,25 @@ class FuturesExitsMixin:
         if self.simulation:
             return 0.0
         try:
+            if not try_consume_api_call(
+                "futures_exit_mark_fetch_positions", critical=True
+            ):
+                return 0.0
             poss = self.ex.fetch_positions([symbol_full]) or []
             for p in poss:
-                info = p.get("info", {}) or {}
-                mark = (p.get("markPrice") or info.get("markPrice")
-                        or info.get("marketPrice") or p.get("lastPrice"))
-                if mark and float(mark) > 0:
-                    return float(mark)
+                if not isinstance(p, dict):
+                    continue
+                raw_info = p.get("info")
+                info = raw_info if isinstance(raw_info, dict) else {}
+                for raw_mark in (
+                    p.get("markPrice"),
+                    info.get("markPrice"),
+                    info.get("marketPrice"),
+                    p.get("lastPrice"),
+                ):
+                    mark = FuturesExitsMixin._safe_positive_price(raw_mark)
+                    if mark > 0:
+                        return mark
         except Exception:
             pass
         return 0.0
@@ -1434,6 +1447,26 @@ class FuturesExitsMixin:
                         import time as _t
                         for _att in range(2):
                             _t.sleep(0.35 * (1 + _att))
+                            try:
+                                allowed = try_consume_api_call(
+                                    "futures_partial_tp_fill_fetch_order",
+                                    critical=True,
+                                )
+                            except Exception as budget_exc:
+                                log_event(
+                                    f"Partial-TP {sym}: fill refresh skipped - "
+                                    f"API budget gate unavailable "
+                                    f"({type(budget_exc).__name__})",
+                                    "WARN",
+                                )
+                                break
+                            if not allowed:
+                                log_event(
+                                    f"Partial-TP {sym}: fill refresh skipped - "
+                                    f"API budget exhausted",
+                                    "WARN",
+                                )
+                                break
                             refreshed = self.ex.fetch_order(str(exch_oid), symbol_full)
                             actual_filled = FuturesExitsMixin._safe_nonnegative_amount(
                                 (refreshed or {}).get("filled"))

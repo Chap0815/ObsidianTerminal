@@ -8,6 +8,8 @@ import math
 from decimal import Decimal, ROUND_DOWN
 from typing import Tuple, Callable, Optional
 
+from bot_utils.api_budget import try_consume_api_call
+from bot_utils.network_retry import RetryForbiddenError
 from bot_utils.order_utils import (
     extract_fill_price,
     extract_order_fee,
@@ -159,9 +161,279 @@ class InsufficientSellBalance(Exception):
             f"{free:.10g}, requested {requested:.10g} (nothing left to sell)")
 
 
+class _SpotSellBudgetUnavailable(RuntimeError):
+    """A sell request was not sent because its atomic budget gate failed."""
+
+
+class SpotSellOutcomeUnknown(RetryForbiddenError):
+    """A SPOT sell may exist, but its create response was not recovered."""
+
+    def __init__(self, client_order_id: str):
+        self.client_order_id = client_order_id
+        super().__init__(
+            "spot sell outcome unknown "
+            f"(clientOrderId={client_order_id})"
+        )
+
+
+def ensure_spot_exit_client_order_id(state, sym: str, row: dict,
+                                     leg: str, bot_name: str) -> str:
+    """Persist a unique client id before the first physical SPOT sell."""
+    key = f"{leg}_exit_client_order_id"
+    existing = order_id_text_or_none(row.get(key))
+    if existing and existing.isascii() and len(existing) <= 32:
+        return existing
+
+    from uuid import uuid4
+    from trading.execution_quality import make_client_order_id
+
+    entry_id = order_id_text_or_none(row.get("entry_id")) or "legacy"
+    intent_id = f"{entry_id}:{uuid4().hex}"
+    client_order_id = make_client_order_id(
+        intent_id, f"{bot_name}:{sym}:{leg}", prefix="sx"
+    )
+    persisted = state.update(sym, key, client_order_id)
+    if persisted is False:
+        raise RuntimeError(
+            f"cannot persist {key} before live SPOT sell for {sym}"
+        )
+    row[key] = client_order_id
+    return client_order_id
+
+
+def rollback_spot_entry_after_state_failure(
+        ex, symbol_pair: str, raw_amount: float, *, entry_id, bot_name: str
+        ) -> Tuple[dict, float]:
+    """Sell an unpersisted live entry with a restart-stable client id.
+
+    The entry state could not be written, so there is no safe place to persist
+    a fresh exit intent.  The already-stable entry id therefore anchors the
+    rollback id and lets ``spot_market_sell_safe`` reconcile a lost response.
+    """
+    stable_entry_id = order_id_text_or_none(entry_id)
+    stable_bot_name = order_id_text_or_none(bot_name)
+    stable_symbol = order_id_text_or_none(symbol_pair)
+    if not stable_entry_id:
+        raise ValueError("stable entry_id required for live SPOT rollback")
+    if not stable_bot_name or not stable_symbol:
+        raise ValueError("bot_name and symbol required for live SPOT rollback")
+
+    from trading.execution_quality import make_client_order_id
+
+    client_order_id = make_client_order_id(
+        stable_entry_id,
+        f"{stable_bot_name}:{stable_symbol}:state-rollback",
+        prefix="sx",
+    )
+    return spot_market_sell_safe(
+        ex,
+        stable_symbol,
+        raw_amount,
+        client_order_id=client_order_id,
+    )
+
+
+def spot_entry_rollback_was_fully_filled(order: dict,
+                                         requested_amount: float) -> bool:
+    """Require quantitative proof that an untracked entry was fully sold."""
+    requested = _positive_finite(requested_amount)
+    if not isinstance(order, dict) or requested <= 0:
+        return False
+    filled = _positive_finite(order.get("filled"))
+    if filled <= 0:
+        return False
+    tolerance = max(1e-12, requested * 1e-9)
+    return filled + tolerance >= requested
+
+
+def _create_market_sell_budgeted(ex, symbol_pair: str, amount: float,
+                                 client_order_id: Optional[str] = None):
+    try:
+        allowed = try_consume_api_call(
+            "spot_exit_create_market_sell", critical=True
+        )
+    except Exception as exc:
+        raise _SpotSellBudgetUnavailable(
+            "API budget gate unavailable before spot market sell"
+        ) from exc
+    if not allowed:
+        raise _SpotSellBudgetUnavailable(
+            "API budget exhausted before spot market sell"
+        )
+    if client_order_id:
+        return ex.create_market_sell_order(
+            symbol_pair, amount, {"clientOrderId": client_order_id}
+        )
+    return ex.create_market_sell_order(symbol_pair, amount)
+
+
+def aggregate_spot_order_trades(trades: list, client_order_id: str) -> dict:
+    """Normalize every trade fill for one client id into one order-shaped row."""
+    amounts = []
+    costs = []
+    fees = []
+    order_ids = set()
+    for trade in trades:
+        amount = _positive_finite(trade.get("amount"))
+        if amount <= 0:
+            raise RuntimeError("spot order trade reconciliation has invalid amount")
+        amounts.append(amount)
+
+        cost = _positive_finite(trade.get("cost"))
+        if cost <= 0:
+            price = _positive_finite(trade.get("price"))
+            cost = amount * price if price > 0 else 0.0
+        costs.append(cost)
+
+        order_id = (
+            order_id_text_or_none(trade.get("order"))
+            or order_id_text_or_none(trade.get("orderId"))
+        )
+        if order_id:
+            order_ids.add(order_id)
+        trade_fees = trade.get("fees")
+        valid_trade_fees = (
+            [dict(item) for item in trade_fees if isinstance(item, dict)]
+            if isinstance(trade_fees, list) else []
+        )
+        if valid_trade_fees:
+            fees.extend(valid_trade_fees)
+        else:
+            fee = trade.get("fee")
+            if isinstance(fee, dict):
+                fees.append(dict(fee))
+
+    if len(order_ids) > 1:
+        raise RuntimeError("spot order trade reconciliation matched many orders")
+    filled = math.fsum(amounts)
+    if not math.isfinite(filled) or filled <= 0:
+        raise RuntimeError("spot order trade reconciliation has no valid fill")
+
+    recovered = dict(trades[0])
+    recovered["clientOrderId"] = client_order_id
+    recovered["filled"] = filled
+    if order_ids:
+        recovered["id"] = next(iter(order_ids))
+    if all(cost > 0 for cost in costs):
+        total_cost = math.fsum(costs)
+        if math.isfinite(total_cost) and total_cost > 0:
+            recovered["cost"] = total_cost
+            recovered["average"] = total_cost / filled
+    if fees:
+        recovered["fees"] = fees
+    return recovered
+
+
+def _aggregate_spot_exit_trades(trades: list,
+                                client_order_id: str) -> dict:
+    """Backward-compatible private alias for existing exit callers/tests."""
+    return aggregate_spot_order_trades(trades, client_order_id)
+
+
+def _find_spot_exit_order_by_client_id(ex, symbol_pair: str,
+                                       client_order_id: str):
+    """Recover a SPOT sell whose create response may have been lost.
+
+    ``None`` means every supported lookup completed and found no match.
+    Missing, denied or malformed lookup evidence raises so callers never
+    interpret uncertainty as proof that it is safe to place a different sell.
+    """
+    from bot_utils.futures_order import _order_client_id_matches
+
+    has = getattr(ex, "has", {}) or {}
+    if not isinstance(has, dict):
+        has = {}
+    attempted = False
+    uncertain = False
+
+    def _query(endpoint: str, fetch):
+        nonlocal attempted, uncertain
+        try:
+            allowed = try_consume_api_call(endpoint, critical=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"spot sell reconciliation unavailable: {endpoint}"
+            ) from exc
+        if not allowed:
+            raise RuntimeError(
+                f"spot sell reconciliation unavailable: {endpoint}"
+            )
+        attempted = True
+        try:
+            rows = fetch()
+        except Exception:
+            uncertain = True
+            return []
+        if not isinstance(rows, list):
+            uncertain = True
+            return []
+        return rows
+
+    fetch_open = getattr(ex, "fetch_open_orders", None)
+    if callable(fetch_open) and has.get("fetchOpenOrders") is not False:
+        for order in _query(
+            "spot_exit_reconcile_fetch_open_orders",
+            lambda: fetch_open(symbol_pair),
+        ):
+            if _order_client_id_matches(order, client_order_id):
+                return order
+
+    fetch_orders = getattr(ex, "fetch_orders", None)
+    if has.get("fetchOrders") and callable(fetch_orders):
+        for order in _query(
+            "spot_exit_reconcile_fetch_orders",
+            lambda: fetch_orders(symbol_pair, limit=20),
+        ):
+            if _order_client_id_matches(order, client_order_id):
+                return order
+
+    fetch_closed = getattr(ex, "fetch_closed_orders", None)
+    if has.get("fetchClosedOrders") and callable(fetch_closed):
+        for order in _query(
+            "spot_exit_reconcile_fetch_closed_orders",
+            lambda: fetch_closed(symbol_pair, limit=20),
+        ):
+            if _order_client_id_matches(order, client_order_id):
+                return order
+
+    fetch_trades = getattr(ex, "fetch_my_trades", None)
+    if has.get("fetchMyTrades") and callable(fetch_trades):
+        matching_trades = [
+            trade for trade in _query(
+                "spot_exit_reconcile_fetch_my_trades",
+                lambda: fetch_trades(symbol_pair, limit=20),
+            )
+            if _order_client_id_matches(trade, client_order_id)
+        ]
+        if matching_trades:
+            return aggregate_spot_order_trades(
+                matching_trades, client_order_id
+            )
+
+    if not attempted or uncertain:
+        raise RuntimeError("spot sell reconciliation unavailable")
+    return None
+
+
+def recover_spot_sell_by_client_id(ex, symbol_pair: str,
+                                   client_order_id: str):
+    """Public recovery boundary for persisted SPOT sell intents."""
+    return _find_spot_exit_order_by_client_id(
+        ex, symbol_pair, client_order_id
+    )
+
+
 def _free_base_balance(ex, symbol_pair: str):
     """Free balance of the BASE asset of ``symbol_pair`` (e.g. FET for
     FET/USDT), or None if it can't be read."""
+    try:
+        allowed = try_consume_api_call(
+            "spot_exit_fetch_balance", critical=True
+        )
+    except Exception:
+        return None
+    if not allowed:
+        return None
     try:
         base = symbol_pair.split("/")[0]
         bal = ex.fetch_balance()
@@ -198,6 +470,27 @@ def _apply_state_updates(state, sym: str, updates: dict) -> None:
     else:
         for key, value in updates.items():
             state.update(sym, key, value)
+
+
+def _persist_spot_exit_fields(state, sym: str, row: dict,
+                              updates: dict) -> bool:
+    """Durably persist exit-control fields and mirror them into ``row``."""
+    try:
+        if hasattr(state, "update_many"):
+            persisted = state.update_many(sym, updates)
+        else:
+            persisted = True
+            for key, value in updates.items():
+                result = state.update(sym, key, value)
+                if result is False:
+                    persisted = False
+                    break
+    except Exception:
+        return False
+    if persisted is False:
+        return False
+    row.update(updates)
+    return True
 
 
 def _remove_accounted_state(state, sym: str, restore_fields: dict) -> bool:
@@ -276,16 +569,21 @@ def _emergency_residual_updates(amount: float, residual_amount: float,
         "closing_retry_pending": True,
         "closing_retry_reason": reason,
         "last_partial_fill_order_id": exch_oid,
+        "emergency_exit_client_order_id": None,
+        "emergency_exit_outcome_uncertain": False,
     }
 
 
-def spot_market_sell_safe(ex, symbol_pair: str, raw_amount: float
+def spot_market_sell_safe(ex, symbol_pair: str, raw_amount: float,
+                          *, client_order_id: Optional[str] = None
                           ) -> Tuple[dict, float]:
     """Wraps create_market_sell_order with precision rounding.
 
     The step is derived from ``markets[symbol].limits.amount.min`` or
     ``markets[symbol].precision.amount`` (so coins with batch sizes >= 1 like
     many meme-coin listings work), falling back to 0.0001 only as a last resort.
+    When a stable ``client_order_id`` is supplied, an ambiguous create failure
+    is reconciled before the caller may retry the sell.
     """
     rounded: float
     safe_raw_amount = _positive_finite(raw_amount)
@@ -339,7 +637,9 @@ def spot_market_sell_safe(ex, symbol_pair: str, raw_amount: float
         if amt <= 0:
             continue
         try:
-            order = ex.create_market_sell_order(symbol_pair, amt)
+            order = _create_market_sell_budgeted(
+                ex, symbol_pair, amt, client_order_id
+            )
             return order, amt
         except Exception as e:
             es = str(e).lower()
@@ -360,24 +660,53 @@ def spot_market_sell_safe(ex, symbol_pair: str, raw_amount: float
                                                "insufficient", "not enough"))):
                 _balance_capped = True
                 free = _free_base_balance(ex, symbol_pair)
-                if free is not None and free > 0:
-                    capped = free
-                    try:
-                        capped = float(ex.amount_to_precision(symbol_pair, free))
-                    except Exception:
-                        pass
-                    min_amt = _exchange_min_amount(ex, symbol_pair)
-                    sellable = (capped > 0 and (min_amt is None
-                                or Decimal(str(capped)) >= min_amt))
-                    if sellable and capped < amt:
-                        try:
-                            order = ex.create_market_sell_order(symbol_pair, capped)
-                            return order, capped
-                        except Exception as e2:
-                            last_exc = e2
-                raise InsufficientSellBalance(symbol_pair, requested=amt,
-                                              free=(free or 0.0))
-            # 3. Any other error  propagate immediately.
+                if free is None:
+                    raise e
+                if free <= 0:
+                    raise InsufficientSellBalance(
+                        symbol_pair, requested=amt, free=free
+                    )
+
+                capped = free
+                try:
+                    precise = ex.amount_to_precision(symbol_pair, free)
+                    if not isinstance(precise, bool):
+                        parsed = float(precise)
+                        if math.isfinite(parsed) and parsed >= 0:
+                            capped = parsed
+                except Exception:
+                    pass
+                min_amt = _exchange_min_amount(ex, symbol_pair)
+                sellable = (
+                    capped > 0
+                    and (min_amt is None or Decimal(str(capped)) >= min_amt)
+                )
+                if not sellable:
+                    raise InsufficientSellBalance(
+                        symbol_pair, requested=amt, free=free
+                    )
+                if capped >= amt:
+                    raise e
+                order = _create_market_sell_budgeted(
+                    ex, symbol_pair, capped, client_order_id
+                )
+                return order, capped
+            # 3. An ambiguous create failure may have happened after the venue
+            #    accepted the sell. Recover by the stable client id; otherwise
+            #    surface a typed unknown outcome so callers persist a retry
+            #    barrier instead of issuing a fresh sell next monitor tick.
+            if client_order_id and not isinstance(e, _SpotSellBudgetUnavailable):
+                try:
+                    recovered = _find_spot_exit_order_by_client_id(
+                        ex, symbol_pair, client_order_id
+                    )
+                except Exception as recovery_error:
+                    raise SpotSellOutcomeUnknown(
+                        client_order_id
+                    ) from recovery_error
+                if recovered is not None:
+                    return recovered, amt
+                raise SpotSellOutcomeUnknown(client_order_id) from e
             raise
     raise last_exc or ValueError(f"all precision retries failed for {raw_amount}")
 
@@ -468,12 +797,23 @@ def emergency_close_all_spot(*,
 
                 curr = 0.0
                 try:
-                    ticker = ex.fetch_ticker(symbol_pair)
-                    curr = _positive_finite(ticker.get("last"))
-                    if curr <= 0:
-                        curr = _positive_finite(ticker.get("close"))
-                except Exception as e:
-                    log_event(f"  Price for {sym} unavailable: {e}", "WARN")
+                    price_allowed = try_consume_api_call(
+                        "spot_emergency_exit_fetch_ticker", critical=True
+                    )
+                except Exception as gate_error:
+                    log_event(
+                        f"  Price for {sym} unavailable: API budget gate "
+                        f"failed ({gate_error})", "WARN"
+                    )
+                    price_allowed = False
+                if price_allowed:
+                    try:
+                        ticker = ex.fetch_ticker(symbol_pair)
+                        curr = _positive_finite(ticker.get("last"))
+                        if curr <= 0:
+                            curr = _positive_finite(ticker.get("close"))
+                    except Exception as e:
+                        log_event(f"  Price for {sym} unavailable: {e}", "WARN")
                 if curr <= 0:
                     curr = buy_price  # fallback
 
@@ -509,6 +849,26 @@ def emergency_close_all_spot(*,
 
                 if not simulation and amount > 0:
                     try:
+                        client_order_id = ensure_spot_exit_client_order_id(
+                            state, sym, d, "emergency", bot_name
+                        )
+                        order = None
+                        if d.get("emergency_exit_outcome_uncertain"):
+                            try:
+                                order = _find_spot_exit_order_by_client_id(
+                                    ex, symbol_pair, client_order_id
+                                )
+                            except Exception as recovery_error:
+                                failed.append(
+                                    f"{sym}: emergency sell outcome still unknown"
+                                )
+                                log_event(
+                                    f"  [LIVE] {sym}: emergency sell outcome "
+                                    f"still unknown (clientOrderId="
+                                    f"{client_order_id}): {recovery_error}",
+                                    "WARN",
+                                )
+                                continue
                         from bot_utils.network_retry import with_network_retry
                         # Idempotency guard: each attempt (including retries
                         # after a lost response that may have already executed)
@@ -524,15 +884,51 @@ def emergency_close_all_spot(*,
                             elif free is not None and free <= 0:
                                 raise InsufficientSellBalance(
                                     _pair, requested=_want, free=0.0)
-                            return spot_market_sell_safe(ex, _pair, sell_amt)
-                        order, _sold = with_network_retry(
-                            operation=_sell_capped,
-                            action_label=f"emergency sell {sym}",
-                            max_attempts=3,
-                            base_delay=0.5,
-                            shutdown_event=None,
-                            log_event=log_event,
+                            return spot_market_sell_safe(
+                                ex, _pair, sell_amt,
+                                client_order_id=client_order_id,
+                            )
+                        if order is None:
+                            order, _sold = with_network_retry(
+                                operation=lambda: _sell_capped(),
+                                action_label=f"emergency sell {sym}",
+                                max_attempts=3,
+                                base_delay=0.5,
+                                shutdown_event=None,
+                                log_event=log_event,
+                            )
+                        else:
+                            _sold = amount
+                        raw_status = (
+                            order.get("status")
+                            if isinstance(order, dict) else None
                         )
+                        normalized_status = (
+                            raw_status.strip().lower()
+                            if isinstance(raw_status, str) else ""
+                        )
+                        if normalized_status in {"new", "open", "pending"}:
+                            persisted = _persist_spot_exit_fields(
+                                state, sym, d,
+                                {"emergency_exit_outcome_uncertain": True},
+                            )
+                            if not persisted:
+                                log_event(
+                                    f"  [LIVE] {sym}: could not persist "
+                                    f"emergency outcome barrier",
+                                    "ERROR",
+                                )
+                            failed.append(
+                                f"{sym}: emergency sell still "
+                                f"{normalized_status}"
+                            )
+                            log_event(
+                                f"  [LIVE] {sym}: emergency sell still "
+                                f"{normalized_status}; booking and retry "
+                                f"deferred until terminal state",
+                                "WARN",
+                            )
+                            continue
                         from bot_utils.order_utils import order_was_filled
                         # Verify the order ACTUALLY filled  MEXC can return an
                         # order object that never executed (status new/open,
@@ -540,6 +936,26 @@ def emergency_close_all_spot(*,
                         # booking it as sold would write a phantom closed trade.
                         if not order_was_filled(order, _sold,
                                                 min_fill_ratio=1e-9):
+                            if normalized_status in {
+                                "canceled", "cancelled", "rejected", "expired",
+                            }:
+                                persisted = _persist_spot_exit_fields(
+                                    state, sym, d, {
+                                        "emergency_exit_client_order_id": None,
+                                        "emergency_exit_outcome_uncertain": False,
+                                    }
+                                )
+                            else:
+                                persisted = _persist_spot_exit_fields(
+                                    state, sym, d,
+                                    {"emergency_exit_outcome_uncertain": True},
+                                )
+                            if not persisted:
+                                log_event(
+                                    f"  [LIVE] {sym}: could not persist "
+                                    f"emergency order state",
+                                    "ERROR",
+                                )
                             failed.append(f"{sym}: order not filled "
                                           f"(status={order.get('status') if isinstance(order, dict) else '?'})")
                             log_event(
@@ -578,6 +994,24 @@ def emergency_close_all_spot(*,
                             f"  [LIVE] Sold {sym} @ {fill_price:.6f}  "
                             f"{profit_usdt:+.2f} USDT", "INFO"
                         )
+                    except SpotSellOutcomeUnknown as unknown:
+                        persisted = _persist_spot_exit_fields(
+                            state, sym, d,
+                            {"emergency_exit_outcome_uncertain": True},
+                        )
+                        if not persisted:
+                            log_event(
+                                f"  [LIVE] {sym}: could not persist emergency "
+                                f"outcome barrier",
+                                "ERROR",
+                            )
+                        failed.append(f"{sym}: {unknown}")
+                        log_event(
+                            f"  [LIVE] Sell {sym} outcome unknown; retry "
+                            f"blocked pending clientOrderId reconciliation",
+                            "WARN",
+                        )
+                        continue
                     except Exception as e:
                         failed.append(f"{sym}: {e}")
                         log_event(f"  [LIVE] Sell {sym} FAILED: {e}", "WARN")
@@ -601,6 +1035,7 @@ def emergency_close_all_spot(*,
                         btc_trend=d.get("btc_trend"), fear_greed=d.get("fear_greed"),
                         is_futures=False,
                         fees_usdt=fees_for_booked_slice,
+                        exchange_order_id=exch_oid,
                         entry_id=d.get("entry_id"),
                     ))
                     if not accounting_ok:

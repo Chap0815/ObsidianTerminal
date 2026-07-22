@@ -494,6 +494,24 @@ class DataPoller:
                                 """LEGACY fallback when equity_utils missing.
                                 Reads free-USDT only  incomplete picture
                                 (no position margin), but better than crash."""
+                                try:
+                                    from bot_utils.api_budget import (
+                                        try_consume_api_call,
+                                    )
+                                except Exception as budget_import_exc:
+                                    raise RuntimeError(
+                                        "legacy equity API budget gate unavailable"
+                                    ) from budget_import_exc
+                                try:
+                                    balance_allowed = bool(try_consume_api_call(
+                                        "dashboard_legacy_fetch_balance"
+                                    ))
+                                except Exception as budget_exc:
+                                    raise RuntimeError(
+                                        "legacy equity API budget gate unavailable"
+                                    ) from budget_exc
+                                if not balance_allowed:
+                                    return None
                                 bal = ex_obj.fetch_balance()
                                 paths = (
                                     ("USDT", "free"), ("USDT", "available"),

@@ -26,7 +26,9 @@ from typing import Dict, List, Optional, Tuple
 
 from shared_limits import normalize_gate_mode
 from core.futures_bot import FuturesBot
+from bot_utils.api_budget import try_consume_api_call
 from bot_utils.order_utils import order_id_text_or_none
+from bot_utils.safe_numeric import parse_ohlcv_closes
 from trading.xsec_signal import XSecParams, compute_target_book
 
 
@@ -546,6 +548,11 @@ class CrossBot(FuturesBot):
         if oid:
             for attempt in range(2):
                 time.sleep(0.4 * (1 + attempt))
+                if not try_consume_api_call(
+                    "cross_entry_fetch_order",
+                    critical=True,
+                ):
+                    continue
                 try:
                     refreshed = self.ex.fetch_order(oid, full) or {}
                 except Exception:
@@ -857,9 +864,18 @@ class CrossBot(FuturesBot):
         if max_pct <= 0:
             return True
         try:
+            if not try_consume_api_call("cross_fetch_funding_rate"):
+                return False
             from config.exchange_config import safe_fetch_funding_rate
             fr = safe_fetch_funding_rate(self.ex, full_symbol)
-            rate = float((fr or {}).get("fundingRate") or 0.0)
+            if not isinstance(fr, dict) or "fundingRate" not in fr:
+                return False
+            raw_rate = fr.get("fundingRate")
+            if raw_rate is None or isinstance(raw_rate, bool):
+                return False
+            rate = float(raw_rate)
+            if not math.isfinite(rate):
+                return False
             try:
                 base = full_symbol.split("/")[0].upper()
                 cache = getattr(self, "_cross_funding_pct", None)
@@ -891,13 +907,30 @@ class CrossBot(FuturesBot):
         """
         iv = self._rebalance_interval_sec()
         slot = int(time.time()) // iv
+        pending_slot = getattr(
+            self, "_rebalance_slot_persist_pending", None,
+        )
+        if pending_slot is not None:
+            try:
+                from core.database import set_param
+                set_param(
+                    self.BOT_NAME,
+                    "REBALANCE_SLOT",
+                    pending_slot,
+                    reason="cross rebalance slot persistence retry",
+                )
+            except Exception:
+                pass
+            else:
+                self._rebalance_slot_persist_pending = None
+        slot_marker_unavailable = False
         if self._last_rebalance_slot is None:
             try:
                 from core.database import get_param
                 self._last_rebalance_slot = int(
                     get_param(self.BOT_NAME, "REBALANCE_SLOT", -1))
             except Exception:
-                self._last_rebalance_slot = -1
+                slot_marker_unavailable = True
         # Rebalance when the slot advances OR when we currently hold NOTHING.
         # The empty-book case cannot accumulate (nothing to stack onto), so
         # (re)establishing a book after a restart - or after the crash-filter /
@@ -907,6 +940,8 @@ class CrossBot(FuturesBot):
             empty = (len(CrossBot._active_legs(self)) == 0)
         except Exception:
             empty = False
+        if slot_marker_unavailable:
+            return empty
         return slot != self._last_rebalance_slot or empty
 
     def _mark_rebalanced(self) -> None:
@@ -920,8 +955,25 @@ class CrossBot(FuturesBot):
             from core.database import set_param
             set_param(self.BOT_NAME, "REBALANCE_SLOT", slot,
                       reason="cross rebalance applied")
-        except Exception:
-            pass
+        except Exception as exc:
+            self._rebalance_slot_persist_pending = slot
+            try:
+                from core.logger import log_event
+                log_event(
+                    f"[{self.BOT_NAME}] rebalance slot persistence failed "
+                    f"({type(exc).__name__}) - retry pending",
+                    "ERROR",
+                )
+            except Exception:
+                pass
+            try:
+                log_error = getattr(self, "_log_error", None)
+                if callable(log_error):
+                    log_error("cross persist rebalance slot", exc)
+            except Exception:
+                pass
+        else:
+            self._rebalance_slot_persist_pending = None
 
     def _should_topup(self) -> bool:
         """True when we hold a partial book (some legs, but UNDER target K/side)
@@ -989,6 +1041,8 @@ class CrossBot(FuturesBot):
         params = self._xsec_params()
         k = int(params.k_per_side)
         prices, sym_map = self._fetch_universe_prices(params.lookback_hours)
+        if self._shutdown_event.is_set():
+            return
         if not prices:
             log_event(f"[{self.BOT_NAME}] top-up: no universe data - skipped", "WARN")
             return
@@ -1002,8 +1056,48 @@ class CrossBot(FuturesBot):
         if getattr(book, "is_flat", False):
             return
         cur = CrossBot._active_legs(self)
-        held_l = sum(1 for d in cur.values() if d.get("position_type") == "LONG")
-        held_s = sum(1 for d in cur.values() if d.get("position_type") == "SHORT")
+        active_sides = {
+            base: CrossBot._safe_exchange_text(
+                row.get("position_type"),
+            ).upper()
+            for base, row in cur.items()
+        }
+        invalid_sides = sorted(
+            base for base, side in active_sides.items()
+            if side not in {"LONG", "SHORT"}
+        )
+        if invalid_sides:
+            log_event(
+                f"[{self.BOT_NAME}] top-up invalid active-leg sides "
+                f"{invalid_sides} - no new legs opened",
+                "ERROR",
+            )
+            return
+        active_notionals = {}
+        invalid_notionals = []
+        for base, row in cur.items():
+            raw_notional = self._notional_from_state(row)
+            if isinstance(raw_notional, bool):
+                invalid_notionals.append(base)
+                continue
+            try:
+                notional_value = float(raw_notional)
+            except (TypeError, ValueError, OverflowError):
+                invalid_notionals.append(base)
+                continue
+            if not math.isfinite(notional_value) or notional_value <= 0:
+                invalid_notionals.append(base)
+                continue
+            active_notionals[base] = notional_value
+        if invalid_notionals:
+            log_event(
+                f"[{self.BOT_NAME}] top-up invalid active-leg notionals "
+                f"{sorted(invalid_notionals)} - no new legs opened",
+                "ERROR",
+            )
+            return
+        held_l = sum(1 for side in active_sides.values() if side == "LONG")
+        held_s = sum(1 for side in active_sides.values() if side == "SHORT")
 
         def _cand(side_list):
             return [b for b in side_list
@@ -1023,8 +1117,7 @@ class CrossBot(FuturesBot):
         notional = (gross / 2.0) / k if k > 0 else 0.0
         if notional <= 0:
             return
-        retained_gross = sum(self._notional_from_state(d)
-                             for d in CrossBot._active_legs(self).values())
+        retained_gross = sum(active_notionals.values())
         new_count = add_l + add_s
         if new_count > 0:
             remaining_gross = max(0.0, gross - retained_gross)
@@ -1037,28 +1130,72 @@ class CrossBot(FuturesBot):
         log_event(f"[{self.BOT_NAME}] top-up {self._topup_attempts}/{self._topup_max}: "
                   f"book {held_l}L/{held_s}S -> adding {add_l}L/{add_s}S", "SCAN")
         self._rebalance_in_progress = True
+        operation_raised = False
         try:
             for b in cand_l[:add_l]:
+                if self._shutdown_event.is_set():
+                    return
                 CrossBot._open_leg_with_quality(
                     self, b, sym_map[b], "LONG", notional, prices[b][-1],
                     lev, book, prices, k)
             for b in cand_s[:add_s]:
+                if self._shutdown_event.is_set():
+                    return
                 CrossBot._open_leg_with_quality(
                     self, b, sym_map[b], "SHORT", notional, prices[b][-1],
                     lev, book, prices, k)
+        except BaseException:
+            operation_raised = True
+            raise
         finally:
             self._rebalance_in_progress = False
-            cur = CrossBot._active_legs(self)
-            long_n = sum(1 for d in cur.values()
-                         if d.get("position_type") == "LONG")
-            short_n = sum(1 for d in cur.values()
-                          if d.get("position_type") == "SHORT")
-            if long_n == short_n:
-                self._neutrality_settle_until = time.time() + 120.0
-            else:
+            if operation_raised:
+                # A failed apply cannot earn a settle window, even when state
+                # inspection itself fails or happens to report equal counts.
                 self._neutrality_settle_until = 0.0
                 self._last_neutrality_check = 0.0
-                self._neutrality_guard(force=True)
+            try:
+                cur = CrossBot._active_legs(self)
+                settled_sides = {
+                    base: CrossBot._safe_exchange_text(
+                        row.get("position_type"),
+                    ).upper()
+                    for base, row in cur.items()
+                }
+                long_n = sum(
+                    1 for side in settled_sides.values() if side == "LONG"
+                )
+                short_n = sum(
+                    1 for side in settled_sides.values() if side == "SHORT"
+                )
+                invalid_sides = sorted(
+                    base for base, side in settled_sides.items()
+                    if side not in {"LONG", "SHORT"}
+                )
+                if long_n == short_n and not invalid_sides and not operation_raised:
+                    self._neutrality_settle_until = time.time() + 120.0
+                elif long_n != short_n or invalid_sides:
+                    self._neutrality_settle_until = 0.0
+                    self._last_neutrality_check = 0.0
+                    self._neutrality_guard(force=True)
+            except Exception as recovery_error:
+                if not operation_raised:
+                    raise
+                try:
+                    log_event(
+                        f"[{self.BOT_NAME}] top-up neutrality recovery failed "
+                        f"({type(recovery_error).__name__})",
+                        "ERROR",
+                    )
+                except Exception:
+                    pass
+                try:
+                    self._log_error(
+                        "cross top-up neutrality recovery",
+                        recovery_error,
+                    )
+                except Exception:
+                    pass
 
     #  REBALANCE loop (reuses the 'Scan' thread) 
     def _strategy_runtime_health(self) -> dict:
@@ -1212,6 +1349,8 @@ class CrossBot(FuturesBot):
 
         params = self._xsec_params()
         prices, sym_map = self._fetch_universe_prices(params.lookback_hours)
+        if self._shutdown_event.is_set():
+            return
         if not prices:
             log_event(f"[{self.BOT_NAME}] no universe data - rebalance skipped "
                       f"(book held)", "WARN")
@@ -1219,29 +1358,29 @@ class CrossBot(FuturesBot):
 
         # 1. realize the PnL of the CURRENT book for the crash-filter signal,
         #    BEFORE we change it (so the filter learns from what just happened).
+        closed_moves_consumed = list(
+            getattr(self, "_closed_leg_moves_since_rebalance", []),
+        )
         realized = self._book_return_since_last()
+        staged_returns = list(self._recent_rebalance_returns)
         if realized is not None:
-            self._recent_rebalance_returns.append(realized)
-            self._recent_rebalance_returns = self._recent_rebalance_returns[-50:]
-        # The early-close moves were just folded into ``realized`` - clear them
-        # so the next cycle starts fresh and can't double-count them.
-        self._closed_leg_moves_since_rebalance = []
+            staged_returns.append(realized)
+            staged_returns = staged_returns[-50:]
 
         # 2. target book from the pure signal module
-        book = compute_target_book(prices, self._recent_rebalance_returns, params)
+        book = compute_target_book(prices, staged_returns, params)
         self._cross_regime_snapshot = CrossBot._cross_market_structure(
             book,
             prices,
             getattr(self, "_cross_quote_volumes", {}),
             getattr(self, "_cross_funding_pct", {}),
         )
-        self._topup_attempts = 0   # reset in-slot top-up budget on a real rebalance
         log_event(
             f"[{self.BOT_NAME}] Rebalance | exposure x{book.exposure_mult:.0f} | "
             f"long {book.longs} | short {book.shorts}", "SCAN")
         log_struct("cross_rebalance", longs=book.longs, shorts=book.shorts,
                    exposure_mult=book.exposure_mult,
-                   recent_returns=self._recent_rebalance_returns[-params.crash_window:],
+                   recent_returns=staged_returns[-params.crash_window:],
                    strategy_shadow_version="xsec_regime_v2",
                    **self._cross_regime_snapshot)
 
@@ -1252,11 +1391,62 @@ class CrossBot(FuturesBot):
         #    _apply_target_book runs its OWN count-based _enforce_neutrality at
         #    the end; the monitor guard is only for drift BETWEEN rebalances.
         self._rebalance_in_progress = True
+        completed = False
+        apply_raised = False
         try:
-            self._apply_target_book(book, params, sym_map, prices)
+            completed = self._apply_target_book(book, params, sym_map, prices)
+        except BaseException:
+            apply_raised = True
+            raise
         finally:
             self._rebalance_in_progress = False
-            self._neutrality_settle_until = time.time() + 120.0
+            if not completed:
+                # A stop or exception can land after one sequential close/open.
+                # Do not persist a partial slot or suppress the notional guard.
+                self._neutrality_settle_until = 0.0
+                self._last_neutrality_check = 0.0
+                try:
+                    self._neutrality_guard(force=True)
+                except Exception as recovery_error:
+                    if not apply_raised:
+                        raise
+                    # Preserve the primary apply failure while keeping an
+                    # independent recovery failure operator-visible.
+                    try:
+                        log_event(
+                            f"[{self.BOT_NAME}] partial-rebalance neutrality "
+                            f"recovery failed "
+                            f"({type(recovery_error).__name__})",
+                            "ERROR",
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        self._log_error(
+                            "cross partial-rebalance neutrality recovery",
+                            recovery_error,
+                        )
+                    except Exception:
+                        pass
+        if not completed:
+            log_event(
+                f"[{self.BOT_NAME}] rebalance apply incomplete - "
+                f"slot remains due",
+                "WARN",
+            )
+            return
+        # Only a committed real rebalance starts a fresh in-slot top-up budget.
+        self._topup_attempts = 0
+        self._recent_rebalance_returns = staged_returns
+        if realized is not None:
+            current_closed_moves = list(
+                getattr(self, "_closed_leg_moves_since_rebalance", []),
+            )
+            if current_closed_moves[:len(closed_moves_consumed)] == closed_moves_consumed:
+                self._closed_leg_moves_since_rebalance = current_closed_moves[
+                    len(closed_moves_consumed):
+                ]
+        self._neutrality_settle_until = time.time() + 120.0
         # Mark this slot consumed ONLY now that a book was actually applied, so
         # a restart inside the same slot resumes instead of re-rebalancing.
         self._mark_rebalanced()
@@ -1309,13 +1499,17 @@ class CrossBot(FuturesBot):
             n = 40
         min_vol = self._f("MIN_VOLUME", 5_000_000.0)
         try:
-            from bot_utils.api_budget import try_consume_api_call
             if not try_consume_api_call("cross_fetch_tickers"):
                 log_event(f"[{self.BOT_NAME}] universe scan skipped "
                           f"(API budget exhausted)", "WARN")
                 return {}, {}
-        except Exception:
-            pass
+        except Exception as exc:
+            log_event(
+                f"[{self.BOT_NAME}] universe scan skipped "
+                f"(API budget gate unavailable: {type(exc).__name__})",
+                "WARN",
+            )
+            return {}, {}
         try:
             tickers = self.ex.fetch_tickers()
         except Exception as e:
@@ -1348,14 +1542,19 @@ class CrossBot(FuturesBot):
                 from core.database import is_blacklisted
                 if is_blacklisted(base, self.BOT_NAME):
                     continue
-            except Exception:
-                pass
-            qv = t.get("quoteVolume") or 0
+            except Exception as exc:
+                log_event(
+                    f"[{self.BOT_NAME}] universe scan aborted: blacklist "
+                    f"registry unavailable ({type(exc).__name__})",
+                    "WARN",
+                )
+                return {}, {}
+            raw_qv = t.get("quoteVolume")
             try:
-                qv = float(qv)
-            except (TypeError, ValueError):
+                qv = 0.0 if isinstance(raw_qv, bool) else float(raw_qv)
+            except (TypeError, ValueError, OverflowError):
                 qv = 0.0
-            if qv < min_vol:
+            if not math.isfinite(qv) or qv <= 0 or qv < min_vol:
                 continue
             # coexistence: don't trade a coin another bot already holds
             if is_claimed_by_other(sym, self.BOT_NAME, is_futures=True):
@@ -1369,20 +1568,59 @@ class CrossBot(FuturesBot):
         skipped_fund = []
         prices: Dict[str, List[float]] = {}
         sym_map: Dict[str, str] = {}
+        missing_funding_cache = object()
+        funding_cache_before = getattr(
+            self, "_cross_funding_pct", missing_funding_cache
+        )
+        if isinstance(funding_cache_before, dict):
+            funding_cache_before = dict(funding_cache_before)
+
+        def discard_partial_snapshot():
+            if funding_cache_before is missing_funding_cache:
+                try:
+                    delattr(self, "_cross_funding_pct")
+                except AttributeError:
+                    pass
+            else:
+                self._cross_funding_pct = funding_cache_before
+            return {}, {}
+
         for _qv, sym, base in cands:
             if self._shutdown_event.is_set():
-                break
+                log_event(
+                    f"[{self.BOT_NAME}] partial universe discarded (shutdown)",
+                    "INFO",
+                )
+                return discard_partial_snapshot()
             try:
                 try:
-                    from bot_utils.api_budget import try_consume_api_call
                     if not try_consume_api_call("cross_fetch_ohlcv"):
-                        break
-                except Exception:
-                    pass
+                        log_event(
+                            f"[{self.BOT_NAME}] partial universe discarded "
+                            f"(API budget exhausted)",
+                            "WARN",
+                        )
+                        return discard_partial_snapshot()
+                except Exception as exc:
+                    log_event(
+                        f"[{self.BOT_NAME}] partial universe discarded "
+                        f"(API budget gate unavailable: {type(exc).__name__})",
+                        "WARN",
+                    )
+                    return discard_partial_snapshot()
                 bars = self.ex.fetch_ohlcv(sym, timeframe="1h", limit=need)
-                closes = [float(b[4]) for b in bars if b and b[4]]
-                if len(closes) > 1:
-                    closes = closes[:-1]          # drop still-forming candle
+                try:
+                    from core.clock import now_ms as _clock_now_ms
+                    current_time_ms = int(_clock_now_ms())
+                except Exception:
+                    current_time_ms = int(time.time() * 1000)
+                closes = parse_ohlcv_closes(
+                    bars,
+                    expected_interval_ms=3_600_000,
+                    now_ms=current_time_ms,
+                )
+                if closes is None:
+                    continue
                 if len(closes) >= lookback + 1:
                     if not self._funding_ok(sym, max_fund):
                         skipped_fund.append(base)
@@ -1500,7 +1738,9 @@ class CrossBot(FuturesBot):
 
     #  Diff target vs current and execute opens/closes 
     def _apply_target_book(self, book, params: XSecParams,
-                           sym_map: Dict[str, str], prices: Dict[str, List[float]]) -> None:
+                           sym_map: Dict[str, str],
+                           prices: Dict[str, List[float]]) -> bool:
+        """Apply one target-book attempt; return false while it remains incomplete."""
         from core.logger import log_event
 
         current = CrossBot._active_legs(self)             # {base: active state-dict}
@@ -1513,15 +1753,40 @@ class CrossBot(FuturesBot):
         # CLOSE first (frees margin - critical for cross margin): held coins that
         # left the book OR flipped side.
         for base in list(current.keys()):
+            if self._shutdown_event.is_set():
+                return False
             held_side = current[base].get("position_type", "LONG")
             if base not in target or target[base] != held_side:
                 self._close_leg(base, current[base], reason="rebalance-out")
 
+        # _close_leg deliberately has no optimistic success return: lock loss,
+        # exchange uncertainty, or recoverable accounting state can leave the
+        # active row in place. Never size/open or consume the slot until every
+        # target-out or side-flipped leg is verifiably absent from active state.
+        remaining = CrossBot._active_legs(self)
+        unresolved = [
+            base for base, leg in remaining.items()
+            if target.get(base) != leg.get("position_type", "LONG")
+        ]
+        if unresolved:
+            log_event(
+                f"[{self.BOT_NAME}] rebalance close incomplete for "
+                f"{sorted(unresolved)} - slot remains due",
+                "WARN",
+            )
+            return False
+
         # OPEN new legs (size from equity x leverage x crash-mult).
         if book.is_flat:
-            return
+            return True
         lev = self._leverage()
         equity = self._equity()
+        if not self.simulation and equity <= 0:
+            log_event(
+                f"[{self.BOT_NAME}] free balance unavailable - slot remains due",
+                "WARN",
+            )
+            return False
         # Gross-exposure CAP: never deploy more than MAX_GROSS_EXPOSURE_PCT% of
         # equity, regardless of leverage (hard backstop against a mis-set lever).
         gross = equity * lev * max(0.0, min(1.0, book.exposure_mult))
@@ -1530,7 +1795,7 @@ class CrossBot(FuturesBot):
         notional = (gross / 2.0) / params.k_per_side if params.k_per_side > 0 else 0.0
         if notional <= 0:
             log_event(f"[{self.BOT_NAME}] computed leg notional 0 - nothing opened", "WARN")
-            return
+            return True
         # Pre-balance against claimability BEFORE opening: another bot may have
         # claimed target coins since the universe scan. Open only as many longs
         # as shorts that are actually free, so we never open an orphan leg that
@@ -1564,10 +1829,10 @@ class CrossBot(FuturesBot):
             if free is None or free <= 0 or margin_per_leg <= 0:
                 log_event(
                     f"[{self.BOT_NAME}] free balance unavailable - "
-                    f"skip opening new balanced pairs fail-closed",
+                    f"skip opening new balanced pairs fail-closed; slot remains due",
                     "WARN",
                 )
-                return
+                return False
             else:
                 cap_n = final
                 while cap_n > 0:
@@ -1585,8 +1850,30 @@ class CrossBot(FuturesBot):
         to_open = ([(b, "LONG") for b in new_l[:max(0, final - len(held_l))]]
                    + [(b, "SHORT") for b in new_s[:max(0, final - len(held_s))]])
         if to_open:
-            retained_gross = sum(self._notional_from_state(d)
-                                 for d in CrossBot._active_legs(self).values())
+            retained_notionals = []
+            invalid_retained = []
+            for base, row in CrossBot._active_legs(self).items():
+                raw_notional = self._notional_from_state(row)
+                if isinstance(raw_notional, bool):
+                    invalid_retained.append(base)
+                    continue
+                try:
+                    notional_value = float(raw_notional)
+                except (TypeError, ValueError, OverflowError):
+                    invalid_retained.append(base)
+                    continue
+                if not math.isfinite(notional_value) or notional_value <= 0:
+                    invalid_retained.append(base)
+                    continue
+                retained_notionals.append(notional_value)
+            if invalid_retained:
+                log_event(
+                    f"[{self.BOT_NAME}] rebalance invalid retained notionals "
+                    f"{sorted(invalid_retained)} - slot remains due",
+                    "ERROR",
+                )
+                return False
+            retained_gross = sum(retained_notionals)
             remaining_gross = max(0.0, gross - retained_gross)
             notional = min(notional, remaining_gross / len(to_open))
             if notional <= 0:
@@ -1599,10 +1886,31 @@ class CrossBot(FuturesBot):
                       f"(coins claimed by other bots / illiquid) - staying as-is",
                       "WAIT")
             if free_cap_limited:
-                return
+                capped = CrossBot._active_legs(self)
+                capped_l = sum(
+                    1 for leg in capped.values()
+                    if leg.get("position_type") == "LONG"
+                )
+                capped_s = sum(
+                    1 for leg in capped.values()
+                    if leg.get("position_type") == "SHORT"
+                )
+                invalid_sides = sorted(
+                    base for base, leg in capped.items()
+                    if leg.get("position_type") not in {"LONG", "SHORT"}
+                )
+                if invalid_sides or capped_l != capped_s:
+                    log_event(
+                        f"[{self.BOT_NAME}] capacity-limited book remains "
+                        f"imbalanced ({capped_l}L/{capped_s}S, "
+                        f"invalid={invalid_sides}) - slot remains due",
+                        "WARN",
+                    )
+                    return False
+                return True
         for base, side in to_open:
             if self._shutdown_event.is_set():
-                return
+                return False
             CrossBot._open_leg_with_quality(
                 self, base, sym_map[base], side, notional, prices[base][-1],
                 lev, book, prices, final)
@@ -1610,6 +1918,28 @@ class CrossBot(FuturesBot):
         # Backstop: a leg can still fail mid-open (min-size / claim race) and
         # leave the book net-directional - trim the excess to stay neutral.
         self._enforce_neutrality(book)
+        settled = CrossBot._active_legs(self)
+        settled_l = sum(
+            1 for leg in settled.values()
+            if leg.get("position_type") == "LONG"
+        )
+        settled_s = sum(
+            1 for leg in settled.values()
+            if leg.get("position_type") == "SHORT"
+        )
+        invalid_sides = sorted(
+            base for base, leg in settled.items()
+            if leg.get("position_type") not in {"LONG", "SHORT"}
+        )
+        if invalid_sides or settled_l != settled_s:
+            log_event(
+                f"[{self.BOT_NAME}] rebalance neutrality incomplete "
+                f"({settled_l}L/{settled_s}S, invalid={invalid_sides}) - "
+                f"slot remains due",
+                "WARN",
+            )
+            return False
+        return True
 
     def _enforce_neutrality(self, book) -> None:
         """Ensure equal LONG and SHORT count (= equal notional -> dollar-neutral).
@@ -1694,6 +2024,8 @@ class CrossBot(FuturesBot):
         spread_pct = None
         max_spread = self._f("XSEC_MAX_SPREAD_PCT", 0.5)
         try:
+            if not try_consume_api_call("cross_entry_fetch_order_book"):
+                raise RuntimeError("API budget denied")
             ob = self.ex.fetch_order_book(full, limit=5)
             bids = (ob or {}).get("bids") or []
             asks = (ob or {}).get("asks") or []
@@ -1803,7 +2135,8 @@ class CrossBot(FuturesBot):
             fees = amount * fill * taker_fee_rate(self.ex, full)
         else:
             #  LIVE: cross-margin market order 
-            from bot_utils import (create_order_with_retry,
+            from bot_utils import (FuturesOrderOutcomeUnknown,
+                                   create_order_with_retry,
                                    extract_or_estimate_futures_fee,
                                    futures_contract_size)
             from config.exchange_config import (must_set_leverage,
@@ -2017,6 +2350,8 @@ class CrossBot(FuturesBot):
                     config=MakerFirstConfig(mode="disabled"),
                 )
             except Exception as e:
+                _outcome_unknown = isinstance(
+                    e, FuturesOrderOutcomeUnknown)
                 emit_entry_lifecycle(
                     entry_id, bot=self.BOT_NAME, symbol=base,
                     stage="order_failed", mode=entry_mode,
@@ -2088,7 +2423,14 @@ class CrossBot(FuturesBot):
                                   f"despite error - tracked provisionally", "WARN")
                 except Exception:
                     pass
-                if not _landed:
+                if not _landed and _outcome_unknown:
+                    log_event(
+                        f"[{self.BOT_NAME}] {base}: entry outcome unknown; "
+                        f"provisional state and claim kept pending "
+                        f"clientOrderId reconciliation",
+                        "ERROR",
+                    )
+                elif not _landed:
                     removed_state = False
                     try:
                         removed_state = self.state.remove(base)
@@ -2271,7 +2613,9 @@ class CrossBot(FuturesBot):
         from core.logger import log_event, _date as _utc
         from bot_utils.futures_math import calc_unrealized_pnl, price_move_pct
         full = f"{base}/USDT:USDT"
-        pos_type = d.get("position_type", "LONG")
+        pos_type = CrossBot._safe_exchange_text(
+            d.get("position_type"),
+        ).upper()
         entry = CrossBot._safe_positive_price(d.get("buy"))
         if d.get("accounting_already_booked"):
             CrossBot._cleanup_accounted_close_state(
@@ -2282,6 +2626,13 @@ class CrossBot(FuturesBot):
                 f"[{self.BOT_NAME}] {base}: position already verified flat; "
                 f"waiting for reconcile/offline accounting",
                             "WARN",
+            )
+            return
+        if pos_type not in {"LONG", "SHORT"}:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: invalid position side "
+                f"{d.get('position_type')!r} - close blocked, state kept",
+                "ERROR",
             )
             return
         margin = CrossBot._safe_float(self, d.get("invested_usdt"), 0.0)
@@ -2425,13 +2776,20 @@ class CrossBot(FuturesBot):
             # Realistic exit: cross the spread (long -> sell into the bid, short ->
             # buy at the ask) so SIM pays the round-trip spread, not the mid.
             try:
-                ob = self.ex.fetch_order_book(full, limit=5)
-                bids = (ob or {}).get("bids") or []
-                asks = (ob or {}).get("asks") or []
-                if pos_type == "LONG" and bids:
-                    close_price = CrossBot._safe_positive_price(bids[0][0]) or close_price
-                elif pos_type == "SHORT" and asks:
-                    close_price = CrossBot._safe_positive_price(asks[0][0]) or close_price
+                if try_consume_api_call("cross_exit_fetch_order_book"):
+                    ob = self.ex.fetch_order_book(full, limit=5)
+                    bids = (ob or {}).get("bids") or []
+                    asks = (ob or {}).get("asks") or []
+                    if pos_type == "LONG" and bids:
+                        close_price = (
+                            CrossBot._safe_positive_price(bids[0][0])
+                            or close_price
+                        )
+                    elif pos_type == "SHORT" and asks:
+                        close_price = (
+                            CrossBot._safe_positive_price(asks[0][0])
+                            or close_price
+                        )
             except Exception:
                 pass
             from bot_utils.fee_math import taker_fee_rate
@@ -2875,32 +3233,36 @@ class CrossBot(FuturesBot):
                 return None
             return move if math.isfinite(move) else None
 
-        for base, d in CrossBot._active_legs(self).items():
+        for _base, d in CrossBot._active_legs(self).items():
+            side = CrossBot._safe_exchange_text(
+                d.get("position_type"),
+            ).upper()
+            if side not in {"LONG", "SHORT"}:
+                return None
             entry = CrossBot._safe_positive_price(d.get("buy"))
             last = CrossBot._safe_positive_price(d.get("last_price"))
             raw_margin = d.get("invested_usdt")
             raw_lev = d.get("leverage")
             if isinstance(raw_margin, bool) or isinstance(raw_lev, bool):
-                continue
+                return None
             try:
                 margin = float(raw_margin)
                 lev = float(raw_lev)
             except (TypeError, ValueError, OverflowError):
-                continue
+                return None
             if (
-                entry > 0 and last > 0
-                and math.isfinite(margin) and margin > 0
-                and math.isfinite(lev) and lev > 0
+                entry <= 0 or last <= 0
+                or not math.isfinite(margin) or margin <= 0
+                or not math.isfinite(lev) or lev <= 0
             ):
-                w = margin * lev
-                if not math.isfinite(w) or w <= 0:
-                    continue
-                move = _price_move_fraction(
-                    entry, last, d.get("position_type", "LONG"))
-                if move is None:
-                    continue
-                wmoves.append(
-                    (move, w))
+                return None
+            w = margin * lev
+            if not math.isfinite(w) or w <= 0:
+                return None
+            move = _price_move_fraction(entry, last, side)
+            if move is None:
+                return None
+            wmoves.append((move, w))
         for m, w in getattr(self, "_closed_leg_moves_since_rebalance", []):
             if isinstance(m, bool) or isinstance(w, bool):
                 continue
@@ -2954,23 +3316,56 @@ class CrossBot(FuturesBot):
             from core.database import get_today_pnl
             from bot_utils.futures_math import calc_unrealized_pnl
             from core.logger import log_event
+            validated = []
+            invalid_bases = []
+            for base, d in trades.items():
+                if not self._is_active_leg(d):
+                    continue
+                side = CrossBot._safe_exchange_text(
+                    d.get("position_type"),
+                ).upper()
+                entry = CrossBot._safe_positive_price(d.get("buy"))
+                last = CrossBot._safe_positive_price(d.get("last_price"))
+                raw_margin = d.get("invested_usdt")
+                raw_lev = d.get("leverage")
+                if (
+                    side not in {"LONG", "SHORT"}
+                    or isinstance(raw_margin, bool)
+                    or isinstance(raw_lev, bool)
+                ):
+                    invalid_bases.append(base)
+                    continue
+                try:
+                    margin = float(raw_margin)
+                    lev = float(raw_lev)
+                except (TypeError, ValueError, OverflowError):
+                    invalid_bases.append(base)
+                    continue
+                if (
+                    entry <= 0 or last <= 0
+                    or not math.isfinite(margin) or margin <= 0
+                    or not math.isfinite(lev) or lev <= 0
+                ):
+                    invalid_bases.append(base)
+                    continue
+                validated.append((base, d, side, entry, last, margin, lev))
+            if invalid_bases:
+                self._last_ks_check = 0.0
+                log_event(
+                    f"[{self.BOT_NAME}] daily killswitch invalid active-leg "
+                    f"snapshot for {sorted(invalid_bases)} - decision skipped",
+                    "ERROR",
+                )
+                return
             today = get_today_pnl(self.BOT_NAME, mode_is_sim=self.simulation)
             realized = CrossBot._safe_float(
                 self, (today or {}).get("total_profit"), 0.0)
             unreal = 0.0
-            for _b, d in trades.items():
-                if not self._is_active_leg(d):
-                    continue
-                entry = CrossBot._safe_positive_price(d.get("buy"))
-                last = CrossBot._safe_positive_price(d.get("last_price"))
-                margin = CrossBot._safe_float(self, d.get("invested_usdt"), 0.0)
-                lev = CrossBot._safe_float(self, d.get("leverage"), 1.0)
-                if lev <= 0:
-                    lev = 1.0
-                if entry > 0 and last > 0 and margin > 0:
-                    u, _ = calc_unrealized_pnl(entry, last, margin, lev,
-                                                d.get("position_type", "LONG"))
-                    unreal += u - (margin * lev * 0.001)   # conservative exit fee
+            for _base, _d, side, entry, last, margin, lev in validated:
+                u, _ = calc_unrealized_pnl(
+                    entry, last, margin, lev, side,
+                )
+                unreal += u - (margin * lev * 0.001)   # conservative exit fee
             total = realized + unreal
             max_loss = self._f("MAX_DAILY_LOSS", -50.0)
             if max_loss < 0 and total <= max_loss:
@@ -2989,7 +3384,7 @@ class CrossBot(FuturesBot):
                     pass
                 if self.safe_mode is not None and not self.safe_mode.is_active():
                     self.safe_mode.trigger(f"daily-loss killswitch ({total:+.2f} USDT)")
-                for base in list(trades.keys()):
+                for base, _d, _side, _entry, _last, _margin, _lev in validated:
                     if self.state.has(base):
                         self._close_leg(base, trades[base], reason="daily-loss killswitch")
                 if CrossBot._active_legs(self):
@@ -3019,21 +3414,45 @@ class CrossBot(FuturesBot):
         trades = CrossBot._active_legs(self, raw_trades)
         if not trades:
             return
+        monitored_trades = {}
+        invalid_sides = []
+        for base, row in trades.items():
+            side = CrossBot._safe_exchange_text(
+                row.get("position_type"),
+            ).upper()
+            if side not in {"LONG", "SHORT"}:
+                invalid_sides.append(base)
+                continue
+            normalized = dict(row)
+            normalized["position_type"] = side
+            monitored_trades[base] = normalized
+        if invalid_sides:
+            log_event(
+                f"[{self.BOT_NAME}] monitor invalid active-leg sides "
+                f"{sorted(invalid_sides)} - unsafe portfolio math skipped",
+                "ERROR",
+            )
+        if not monitored_trades:
+            return
         # Account-level daily-loss killswitch (flatten + SAFE_MODE). Without
         # this, only the next rebalance (up to REBALANCE_HOURS away) would stop
         # new entries - a bleeding book would run unprotected between rebalances.
-        CrossBot._check_daily_killswitch(self, trades)
-        self._maybe_persist_funding_for_all(trades, time.time())
+        if not invalid_sides:
+            CrossBot._check_daily_killswitch(self, monitored_trades)
+        self._maybe_persist_funding_for_all(monitored_trades, time.time())
         disaster = self._f("PER_LEG_DISASTER_STOP", -25.0)
         liq_safety = max(0.0, min(95.0, self._f("LIQ_SAFETY_PCT", 20.0)))
         # Snapshot every leg once for the equity-aware CROSS liq below - each
         # leg's liq depends on the OTHER legs' uPnL + maintenance margin.
-        try:
-            _collateral = self._equity()
-            _legs = self._snapshot_cross_legs(trades)
-        except Exception:
+        if invalid_sides:
             _collateral, _legs = 0.0, {}
-        for base, d in trades.items():
+        else:
+            try:
+                _collateral = self._equity()
+                _legs = self._snapshot_cross_legs(monitored_trades)
+            except Exception:
+                _collateral, _legs = 0.0, {}
+        for base, d in monitored_trades.items():
             if self._shutdown_event.is_set():
                 return
             if d.get("claim_conflict"):
@@ -3302,29 +3721,39 @@ class CrossBot(FuturesBot):
         tol = max(0.0, self._f("CROSS_NEUTRALITY_TOL_PCT", 15.0)) / 100.0
 
         legs = []   # (base, side, notional, upnl, state_dict)
+        invalid_bases = []
         gross = 0.0
         net = 0.0  # +long  short notional
         for base, d in trades.items():
-            side = d.get("position_type", "LONG")
+            side = CrossBot._safe_exchange_text(
+                d.get("position_type"),
+            ).upper()
+            if side not in {"LONG", "SHORT"}:
+                invalid_bases.append(base)
+                continue
             entry = CrossBot._safe_positive_price(d.get("buy"))
             last = CrossBot._safe_positive_price(d.get("last_price"))
             raw_margin = d.get("invested_usdt")
             raw_lev = d.get("leverage")
             if isinstance(raw_margin, bool) or isinstance(raw_lev, bool):
+                invalid_bases.append(base)
                 continue
             try:
                 margin = float(raw_margin)
                 lev = float(raw_lev)
             except (TypeError, ValueError, OverflowError):
+                invalid_bases.append(base)
                 continue
             if (
                 entry <= 0 or last <= 0
                 or not math.isfinite(margin) or margin <= 0
                 or not math.isfinite(lev) or lev <= 0
             ):
+                invalid_bases.append(base)
                 continue
             notional = margin * lev
             if not math.isfinite(notional) or notional <= 0:
+                invalid_bases.append(base)
                 continue
             upnl = 0.0
             upnl, _ = calc_unrealized_pnl(entry, last, margin, lev, side)
@@ -3332,21 +3761,36 @@ class CrossBot(FuturesBot):
             gross += notional
             net += notional if side == "LONG" else -notional
 
+        if invalid_bases:
+            log_event(
+                f"[{self.BOT_NAME}] neutrality-guard invalid active-leg "
+                f"snapshot for {sorted(invalid_bases)} - no trim attempted",
+                "ERROR",
+            )
+            return
         if not math.isfinite(gross) or not math.isfinite(net):
             return
         if gross <= 0 or abs(net) / gross <= tol:
             return
 
-        heavy = "LONG" if net > 0 else "SHORT"
-        # Cut the worst-performing legs on the heavy side first (ascending uPnL).
-        candidates = sorted((leg for leg in legs if leg[1] == heavy),
-                            key=lambda leg: leg[3])
+        # Cut the worst-performing leg on the CURRENT heavy side first. A
+        # whole-leg close can overshoot through zero, so recompute the heavy
+        # side after every confirmed removal instead of leaving the book fully
+        # directional in the opposite direction.
+        candidates = sorted(legs, key=lambda leg: leg[3])
         log_event(f"[{self.BOT_NAME}] neutrality-guard: net notional "
                   f"{net:+.1f}/{gross:.1f} ({abs(net)/gross*100:.0f}% > "
-                  f"{tol*100:.0f}%) - trimming {heavy} side", "WARN")
-        for base, side, notional, _upnl, d in candidates:
-            if gross <= 0 or abs(net) / gross <= tol:
+                  f"{tol*100:.0f}%) - trimming dynamically", "WARN")
+        while gross > 0 and abs(net) / gross > tol:
+            heavy = "LONG" if net > 0 else "SHORT"
+            candidate_idx = next(
+                (idx for idx, leg in enumerate(candidates)
+                 if leg[1] == heavy),
+                None,
+            )
+            if candidate_idx is None:
                 break
+            base, side, notional, _upnl, d = candidates.pop(candidate_idx)
             if not self.state.has(base):
                 continue
             self._close_leg(base, d, reason="neutrality-guard")
@@ -3355,3 +3799,10 @@ class CrossBot(FuturesBot):
             # removing a LONG lowers net; removing a SHORT raises it
             net += -notional if heavy == "LONG" else notional
             gross -= notional
+        if gross > 0 and abs(net) / gross > tol:
+            log_event(
+                f"[{self.BOT_NAME}] neutrality-guard incomplete: net notional "
+                f"{net:+.1f}/{gross:.1f} ({abs(net)/gross*100:.0f}% > "
+                f"{tol*100:.0f}%)",
+                "ERROR",
+            )

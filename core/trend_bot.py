@@ -27,8 +27,9 @@ from __future__ import annotations
 import time as _time
 from typing import Optional, Tuple, Dict, List
 
+from bot_utils.api_budget import try_consume_api_call
 from core.spot_bot import SpotBot
-from bot_utils.safe_numeric import safe_positive_float
+from bot_utils.safe_numeric import parse_ohlcv_closes, safe_positive_float
 from trading.trend_signal import (is_in_trend, params_from_cfg, TrendParams,
                                    has_full_history, bars_required)
 from trading.vol_target import (realized_vol, vol_target_multiplier,
@@ -64,51 +65,55 @@ class TrendBot(SpotBot):
 
     def _get_daily_closes(self, sym: str, need: int) -> List[float]:
         """Daily closes for `sym`, cached ~1h (signal only moves on new bars)."""
-        now = _time.time()
+        wall_now = _time.time()
+        cache_now = _time.monotonic()
         cache = getattr(self, "_dc_cache", None)
         if cache is None:
             cache = self._dc_cache = {}
         ent = cache.get(sym)
-        if ent and (now - ent[0]) < self.DAILY_CACHE_TTL_SEC and len(ent[1]) >= need:
+        cache_age = cache_now - ent[0] if ent else None
+        if (
+            ent
+            and cache_age is not None
+            and 0 <= cache_age < self.DAILY_CACHE_TTL_SEC
+            and len(ent[1]) >= need
+        ):
             return ent[1]
         try:
-            from bot_utils.api_budget import try_consume_api_call
             if not try_consume_api_call("trend_fetch_ohlcv"):
                 return ent[1] if ent else []
         except Exception:
-            pass
+            return ent[1] if ent else []
         try:
             bars = self.ex.fetch_ohlcv(f"{sym}/USDT", "1d", limit=need + 6)
             # Drop the still-FORMING current-day candle so the signal is based
             # on COMPLETED daily closes  exactly like the validated backtest
             # (which acted on closed candles). Without this the live bot reacts
             # to an intraday partial close and whipsaws more than tested.
-            if bars:
-                day_ms = 86_400_000
-                # Exchange-anchored now for the UTC day boundary, compared
-                # against the exchange candle timestamp bars[-1][0].
-                try:
-                    from core.clock import now_ms as _clock_now_ms
-                    now_ms = int(_clock_now_ms())
-                except Exception:
-                    now_ms = int(now * 1000)
-                cur_day_start = now_ms - (now_ms % day_ms)
-                if bars[-1][0] >= cur_day_start:
-                    bars = bars[:-1]
-            closes = [float(b[4]) for b in bars if b and b[4]]
+            try:
+                from core.clock import now_ms as _clock_now_ms
+                current_time_ms = int(_clock_now_ms())
+            except Exception:
+                current_time_ms = int(wall_now * 1000)
+            closes = parse_ohlcv_closes(
+                bars,
+                expected_interval_ms=86_400_000,
+                now_ms=current_time_ms,
+            )
+            if closes is None:
+                raise ValueError("invalid OHLCV close snapshot")
         except Exception as e:
             self._log_error(f"trend fetch_ohlcv {sym}", e)
             return ent[1] if ent else []
-        cache[sym] = (now, closes)
+        cache[sym] = (cache_now, closes)
         return closes
 
     def _current_price(self, sym: str) -> float:
         try:
-            from bot_utils.api_budget import try_consume_api_call
             if not try_consume_api_call("trend_fetch_ticker"):
                 return 0.0
         except Exception:
-            pass
+            return 0.0
         try:
             t = self.ex.fetch_ticker(f"{sym}/USDT")
             price = safe_positive_float(t.get("last"), 0.0)
@@ -278,8 +283,13 @@ class TrendBot(SpotBot):
                 from core.database import is_claimed_by_other
                 if is_claimed_by_other(sym, self.BOT_NAME, is_futures=False):
                     continue
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event(
+                    f"Trend entry scan aborted: claim registry unavailable "
+                    f"({type(exc).__name__})",
+                    "WARN",
+                )
+                return
             if self.state.count() >= max_trades:
                 continue                                  # at Max Open Trades
             coin_size = size * (vol_target_multiplier(vols.get(sym), med)
@@ -481,11 +491,19 @@ class TrendBot(SpotBot):
                     "ERROR",
                 )
                 try:
-                    from bot_utils.spot_exits import spot_market_sell_safe
-                    from bot_utils.order_utils import order_was_filled
-                    order, sold_amount = spot_market_sell_safe(
-                        self.ex, f"{sym}/USDT", amount)
-                    if order_was_filled(order, sold_amount, min_fill_ratio=1e-9):
+                    from bot_utils.spot_exits import (
+                        rollback_spot_entry_after_state_failure,
+                        spot_entry_rollback_was_fully_filled,
+                    )
+                    order, sold_amount = rollback_spot_entry_after_state_failure(
+                        self.ex,
+                        f"{sym}/USDT",
+                        amount,
+                        entry_id=entry_id,
+                        bot_name=self.BOT_NAME,
+                    )
+                    if spot_entry_rollback_was_fully_filled(
+                            order, sold_amount):
                         self._cleanup_rolled_back_entry_state(
                             sym, "trend state write failed after live buy")
                         log_event(

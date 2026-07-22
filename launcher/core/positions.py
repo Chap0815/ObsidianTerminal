@@ -28,6 +28,7 @@ import math
 import os
 from datetime import datetime, timezone
 
+from bot_utils.api_budget import try_consume_api_call
 from launcher.config.settings import BOT_META, PROJECT_ROOT
 
 
@@ -45,6 +46,29 @@ def _utc_now_str() -> str:
 _LIVE_RESIDUAL_DUST_USDT = 1.0
 
 
+class _LauncherCloseBudgetUnavailable(RuntimeError):
+    """A launcher close was not sent because its budget gate failed."""
+
+
+def _create_futures_close_order_budgeted(ex, symbol_full: str, side: str,
+                                         amount: float, params: dict):
+    try:
+        allowed = try_consume_api_call(
+            "launcher_futures_close_create_order", critical=True
+        )
+    except Exception as exc:
+        raise _LauncherCloseBudgetUnavailable(
+            "API budget gate unavailable before launcher futures close"
+        ) from exc
+    if not allowed:
+        raise _LauncherCloseBudgetUnavailable(
+            "API budget exhausted before launcher futures close"
+        )
+    return ex.create_order(
+        symbol_full, "market", side, amount, params=params
+    )
+
+
 def _finite_float(value) -> float | None:
     if isinstance(value, bool):
         return None
@@ -58,6 +82,152 @@ def _finite_float(value) -> float | None:
 def _positive_finite(value) -> float | None:
     parsed = _finite_float(value)
     return parsed if parsed is not None and parsed > 0 else None
+
+
+def _normalized_futures_position_side(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    return normalized if normalized in {"LONG", "SHORT"} else None
+
+
+def normalize_futures_position_view_row(row) -> dict:
+    """Return a render-safe futures row without mutating runtime state."""
+    source = row if isinstance(row, dict) else {}
+    normalized = dict(source)
+    invalid_fields = []
+    upstream_invalid = bool(source.get("invalid_state"))
+    upstream_error = source.get("state_error")
+    if not isinstance(upstream_error, str) or not upstream_error.strip():
+        upstream_error = "upstream invalid futures state"
+
+    raw_symbol = source.get("symbol")
+    symbol = raw_symbol.strip() if isinstance(raw_symbol, str) else ""
+    if not symbol:
+        invalid_fields.append("symbol")
+
+    side = _normalized_futures_position_side(source.get("position_type"))
+    if side is None:
+        invalid_fields.append("position_type")
+
+    numeric = {
+        "entry_price": _positive_finite(source.get("entry_price")),
+        "current_price": _positive_finite(source.get("current_price")),
+        "margin_usdt": _positive_finite(source.get("margin_usdt")),
+        "leverage": _positive_finite(source.get("leverage")),
+        "unrealized_pnl": _finite_float(source.get("unrealized_pnl", 0.0)),
+        "unrealized_pct": _finite_float(source.get("unrealized_pct", 0.0)),
+    }
+    for key, value in numeric.items():
+        if value is None:
+            invalid_fields.append(key)
+
+    normalized["symbol"] = symbol or "?"
+    normalized["position_type"] = side or "?"
+    for key, value in numeric.items():
+        normalized[key] = value if value is not None else 0.0
+
+    errors = []
+    if upstream_invalid:
+        errors.append(upstream_error)
+    if invalid_fields:
+        errors.append("invalid futures view fields: " + ", ".join(invalid_fields))
+    if errors:
+        normalized["invalid_state"] = True
+        normalized["state_error"] = "; ".join(errors)
+    else:
+        normalized.pop("invalid_state", None)
+        normalized.pop("state_error", None)
+    return normalized
+
+
+def normalize_spot_position_view_row(row) -> dict:
+    """Return a render-safe spot row without mutating runtime state."""
+    source = row if isinstance(row, dict) else {}
+    normalized = dict(source)
+    invalid_fields = []
+    upstream_invalid = bool(source.get("invalid_state"))
+    upstream_error = source.get("state_error")
+    if not isinstance(upstream_error, str) or not upstream_error.strip():
+        upstream_error = "upstream invalid spot state"
+
+    raw_symbol = source.get("symbol")
+    symbol = raw_symbol.strip() if isinstance(raw_symbol, str) else ""
+    if not symbol:
+        invalid_fields.append("symbol")
+
+    numeric = {
+        "buy_price": _positive_finite(source.get("buy_price")),
+        "current_price": _positive_finite(source.get("current_price")),
+        "invested_usdt": _positive_finite(source.get("invested_usdt")),
+        "unrealized_pnl": _finite_float(source.get("unrealized_pnl", 0.0)),
+        "unrealized_pct": _finite_float(source.get("unrealized_pct", 0.0)),
+    }
+    for key, value in numeric.items():
+        if value is None:
+            invalid_fields.append(key)
+
+    normalized["symbol"] = symbol or "?"
+    for key, value in numeric.items():
+        normalized[key] = value if value is not None else 0.0
+
+    errors = []
+    if upstream_invalid:
+        errors.append(upstream_error)
+    if invalid_fields:
+        errors.append("invalid spot view fields: " + ", ".join(invalid_fields))
+    if errors:
+        normalized["invalid_state"] = True
+        normalized["state_error"] = "; ".join(errors)
+    else:
+        normalized.pop("invalid_state", None)
+        normalized.pop("state_error", None)
+    return normalized
+
+
+def _pending_accounting_items_fail_closed(value) -> list:
+    """Accept legacy single-dict state without dropping malformed evidence."""
+    if not value:
+        return []
+    if isinstance(value, dict):
+        return [dict(value)]
+    if isinstance(value, list):
+        return list(value)
+    return [value]
+
+
+def _launcher_spot_exit_client_order_id(row: dict, sym: str,
+                                        bot_name: str) -> str:
+    from bot_utils.order_utils import order_id_text_or_none
+
+    existing = order_id_text_or_none(
+        row.get("launcher_exit_client_order_id")
+    )
+    if existing and existing.isascii() and len(existing) <= 32:
+        return existing
+
+    from uuid import uuid4
+
+    from trading.execution_quality import make_client_order_id
+
+    entry_id = order_id_text_or_none(row.get("entry_id")) or "legacy"
+    intent_id = f"{entry_id}:{uuid4().hex}"
+    return make_client_order_id(
+        intent_id, f"{bot_name}:{sym}:launcher-close", prefix="sx"
+    )
+
+
+def _persist_launcher_spot_exit_fields(trades_file: str, all_rows: dict,
+                                       sym: str, row: dict,
+                                       updates: dict) -> dict | None:
+    from bot_utils.state_persist import atomic_save_json
+
+    updated = dict(row)
+    updated.update(updates)
+    all_rows[sym] = updated
+    if not atomic_save_json(trades_file, all_rows):
+        return None
+    return updated
 
 
 def _ticker_last_close_price(ticker: dict | None) -> float | None:
@@ -80,6 +250,15 @@ def _non_negative_finite(value) -> float | None:
 
 def _state_value_prefer_key(row: dict, preferred: str, legacy: str):
     return row.get(preferred) if preferred in row else row.get(legacy)
+
+
+def _invalid_json_position_rows(state: dict) -> list:
+    return [
+        symbol
+        for symbol, row in state.items()
+        if not isinstance(symbol, str) or not symbol.strip()
+        or not isinstance(row, dict)
+    ]
 
 
 def _invalid_spot_position_row(
@@ -470,10 +649,13 @@ def refresh_spot_positions_with_live_prices(positions: list) -> list:
             curr = stored_curr
             if ex is not None and sym:
                 try:
-                    t = ex.fetch_ticker(f"{sym}/USDT")
-                    live = _ticker_last_close_price(t)
-                    if live is not None:
-                        curr = live
+                    if try_consume_api_call(
+                            "launcher_spot_position_refresh_ticker",
+                            critical=False):
+                        t = ex.fetch_ticker(f"{sym}/USDT")
+                        live = _ticker_last_close_price(t)
+                        if live is not None:
+                            curr = live
                 except Exception as e:
                     import logging
                     logging.debug(
@@ -589,21 +771,37 @@ def refresh_positions_with_live_prices(positions: list) -> list:
     for p in positions:
         p2 = dict(p)
         try:
-            sym       = p.get("symbol") or ""
-            pos_type  = (p.get("position_type") or "LONG").upper()
-            entry     = _positive_finite(p.get("entry_price")) or 0.0
-            margin    = _positive_finite(p.get("margin_usdt")) or 0.0
-            lev       = _positive_finite(p.get("leverage")) or 0.0
-            db_curr   = _positive_finite(p.get("current_price")) or 0.0
+            p2.pop("invalid_state", None)
+            p2.pop("state_error", None)
+            sym = p.get("symbol") or ""
+            raw_pos_type = p.get("position_type")
+            pos_type = _normalized_futures_position_side(raw_pos_type)
+            entry = _positive_finite(p.get("entry_price"))
+            margin = _positive_finite(p.get("margin_usdt"))
+            lev = _positive_finite(p.get("leverage"))
+            db_curr = _positive_finite(p.get("current_price"))
+
+            invalid_fields = []
+            if pos_type is None:
+                invalid_fields.append("position_type")
+            if entry is None:
+                invalid_fields.append("entry_price")
+            if margin is None:
+                invalid_fields.append("margin_usdt")
+            if lev is None:
+                invalid_fields.append("leverage")
 
             # Try to refresh current price live; fall back to DB value.
             curr = db_curr
-            if ex is not None and sym:
+            if not invalid_fields and ex is not None and sym:
                 try:
-                    t = ex.fetch_ticker(f"{sym}/USDT:USDT")
-                    live = _ticker_last_close_price(t)
-                    if live is not None:
-                        curr = live
+                    if try_consume_api_call(
+                            "launcher_futures_position_refresh_ticker",
+                            critical=False):
+                        t = ex.fetch_ticker(f"{sym}/USDT:USDT")
+                        live = _ticker_last_close_price(t)
+                        if live is not None:
+                            curr = live
                 except Exception as e:
                     import logging
                     logging.debug(
@@ -611,8 +809,16 @@ def refresh_positions_with_live_prices(positions: list) -> list:
                         sym, type(e).__name__, e,
                     )
 
+            if curr is None:
+                invalid_fields.append("current_price")
+
+            p2["entry_price"] = entry if entry is not None else 0.0
+            p2["current_price"] = curr if curr is not None else 0.0
+            p2["margin_usdt"] = margin if margin is not None else 0.0
+            p2["leverage"] = lev if lev is not None else 0.0
+
             # Recompute PnL from whatever price we ended up with.
-            if curr > 0 and entry > 0 and margin > 0:
+            if not invalid_fields:
                 if pos_type == "LONG":
                     price_move_pct = (curr - entry) / entry * 100.0
                 else:
@@ -624,12 +830,17 @@ def refresh_positions_with_live_prices(positions: list) -> list:
                 p2["unrealized_pnl"] = pnl_usdt
                 p2["unrealized_pct"] = pnl_pct_margin
             else:
-                # Missing inputs  keep DB values rather than blank them
+                p2["invalid_state"] = True
+                p2["state_error"] = (
+                    "invalid futures refresh fields: "
+                    + ", ".join(invalid_fields)
+                )
                 import logging
                 logging.warning(
-                    "[StopDialog] %s: cannot recompute PnL "
-                    "(entry=%s, curr=%s, margin=%s, lev=%s); falling back to stored values.",
-                    sym, entry, curr, margin, lev,
+                    "[StopDialog] %s: cannot recompute PnL; invalid fields: %s. "
+                    "Keeping stored PnL values.",
+                    sym,
+                    ", ".join(invalid_fields),
                 )
         except Exception as e:
             import logging
@@ -695,6 +906,30 @@ def direct_close_remaining_futures(
         positions = []
         state_read_failed = True
 
+    if not state_read_failed:
+        invalid_db_rows = []
+        if not isinstance(positions, list):
+            invalid_db_rows.append("container")
+        else:
+            invalid_db_rows.extend(
+                str(index)
+                for index, row in enumerate(positions)
+                if not isinstance(row, dict)
+                or not isinstance(row.get("symbol"), str)
+                or not row.get("symbol", "").strip()
+            )
+        if invalid_db_rows:
+            log(
+                "error",
+                "futures_state read failed: invalid DB position row(s): "
+                + ", ".join(invalid_db_rows[:5]),
+            )
+            return {
+                "closed": 0,
+                "failed": ["futures_state"],
+                "total_pnl": 0.0,
+            }
+
     try:
         trades_file = _state_path_for_mode(bot_name, sim_only)
     except Exception as e:
@@ -716,6 +951,18 @@ def direct_close_remaining_futures(
                         "total_pnl": 0.0}
     except Exception as e:
         log("error", f"Futures JSON state read failed: {e}")
+        return {"closed": 0, "failed": ["state_file"], "total_pnl": 0.0}
+
+    invalid_json_rows = _invalid_json_position_rows(json_trades)
+    if invalid_json_rows:
+        invalid_labels = ", ".join(
+            str(symbol)[:64] for symbol in invalid_json_rows[:5]
+        )
+        log(
+            "error",
+            "Futures JSON state read failed: invalid position row(s): "
+            + invalid_labels,
+        )
         return {"closed": 0, "failed": ["state_file"], "total_pnl": 0.0}
 
     # Union: ``futures_state`` has CURRENT values (from the monitor
@@ -748,6 +995,7 @@ def direct_close_remaining_futures(
             "funding_booked_on_partials": jt.get("funding_booked_on_partials"),
             "initial_entry_fee": jt.get("initial_entry_fee"),
             "fees_paid":         jt.get("fees_paid"),
+            "entry_id":          jt.get("entry_id"),
             "claim_release_pending": bool(jt.get("claim_release_pending")),
             "accounting_already_booked": bool(jt.get("accounting_already_booked")),
             "accounting_pending": bool(jt.get("accounting_pending")),
@@ -793,6 +1041,7 @@ def direct_close_remaining_futures(
                 "funding_booked_on_partials": j.get("funding_booked_on_partials"),
                 "initial_entry_fee": j.get("initial_entry_fee"),
                 "fees_paid":         j.get("fees_paid"),
+                "entry_id":          j.get("entry_id"),
                 "claim_release_pending": bool(j.get("claim_release_pending")),
                 "accounting_already_booked": bool(j.get("accounting_already_booked")),
                 "accounting_pending": bool(j.get("accounting_pending")),
@@ -859,7 +1108,7 @@ def direct_close_remaining_futures(
             "closing_retry_pending": True,
             "closing_retry_reason": reason,
         }
-        for key in ("initial_entry_fee", "fees_paid",
+        for key in ("initial_entry_fee", "fees_paid", "entry_id",
                     "funding_booked_on_partials",
                     "accounting_pending_partials"):
             if row.get(key) is not None:
@@ -874,12 +1123,35 @@ def direct_close_remaining_futures(
         out.pop("_raw_json_state", None)
         return out
 
-    def _trade_already_booked(sym: str, row: dict) -> bool:
+    def _trade_already_booked(sym: str, row: dict) -> bool | None:
+        if bool(row.get("accounting_already_booked")):
+            return True
         buy_time = str(row.get("opened_at") or row.get("buy_time") or "")
         if not buy_time:
             return False
         try:
             conn = get_connection()
+            raw_entry_id = row.get("entry_id")
+            from bot_utils.order_utils import order_id_text_or_none
+            entry_id = order_id_text_or_none(raw_entry_id)
+            if raw_entry_id is not None and (
+                    entry_id is None
+                    or len(entry_id) > 64
+                    or any(ord(char) < 32 or ord(char) == 127
+                           for char in entry_id)):
+                return False
+            if entry_id is not None:
+                found = conn.execute("""
+                    SELECT 1 FROM trades
+                     WHERE bot_name=?
+                       AND symbol=?
+                       AND buy_time=?
+                       AND entry_id=?
+                       AND COALESCE(is_partial,0)=0
+                       AND COALESCE(is_futures,0)=1
+                     LIMIT 1
+                """, (state_bot_name, sym, buy_time, entry_id)).fetchone()
+                return bool(found)
             found = conn.execute("""
                 SELECT 1 FROM trades
                  WHERE bot_name=?
@@ -890,8 +1162,9 @@ def direct_close_remaining_futures(
                  LIMIT 1
             """, (state_bot_name, sym, buy_time)).fetchone()
             return bool(found)
-        except Exception:
-            return False
+        except Exception as e:
+            log("error", f"{sym}: accounting lookup failed: {e}")
+            return None
 
     try:
         from core.symbol_locks import close_lock as _close_lock
@@ -935,6 +1208,18 @@ def direct_close_remaining_futures(
                     continue
                 closed += 1
                 log("win", f"{sym}: claim cleanup completed")
+                continue
+
+            raw_pos_type = p.get("position_type")
+            pos_type = _normalized_futures_position_side(raw_pos_type)
+            if pos_type is None:
+                failed_syms.append(sym)
+                failed_position_updates[sym] = _failed_futures_state(p)
+                log(
+                    "error",
+                    f"{sym}: close skipped - invalid futures position side "
+                    f"({raw_pos_type!r})",
+                )
                 continue
 
             pending_amount = _positive_finite(p.get("amount"))
@@ -1021,6 +1306,7 @@ def direct_close_remaining_futures(
                     funding_paid=pending_funding,
                     fees_usdt=pending_fees,
                     exchange_order_id=p.get("accounting_pending_exchange_order_id"),
+                    entry_id=p.get("entry_id"),
                     mfe_pct=pending_mfe,
                     mae_pct=pending_mae,
                     giveback_pct=pending_giveback,
@@ -1065,7 +1351,6 @@ def direct_close_remaining_futures(
                     f"({pending_kwargs['profit_usdt']:+.2f} USDT)")
                 continue
 
-            pos_type = p["position_type"]
             entry = _positive_finite(p.get("entry_price"))
             margin = _positive_finite(p.get("margin_usdt"))
             lev = _positive_finite(p.get("leverage"))
@@ -1091,7 +1376,9 @@ def direct_close_remaining_futures(
             partial_sold = bool(p.get("partial_sold"))
             symbol_full = f"{sym}/USDT:USDT"
 
-            pending_partials = list(p.get("accounting_pending_partials") or [])
+            pending_partials = _pending_accounting_items_fail_closed(
+                p.get("accounting_pending_partials")
+            )
             if pending_partials:
                 remaining_pending = []
                 for item in pending_partials:
@@ -1123,7 +1410,12 @@ def direct_close_remaining_futures(
                 p = dict(p)
                 p["accounting_pending_partials"] = []
 
-            if _trade_already_booked(sym, p):
+            already_booked = _trade_already_booked(sym, p)
+            if already_booked is None:
+                failed_syms.append(sym)
+                failed_position_updates[sym] = _failed_futures_state(p)
+                continue
+            if already_booked:
                 if not sim_only:
                     try:
                         from bot_utils.futures_order import verify_position_closed
@@ -1185,10 +1477,13 @@ def direct_close_remaining_futures(
             curr = _positive_finite(p.get("current_price")) or entry
             if ex is not None:
                 try:
-                    t = ex.fetch_ticker(symbol_full)
-                    fresh = _ticker_last_close_price(t)
-                    if fresh is not None:
-                        curr = fresh
+                    if try_consume_api_call(
+                            "launcher_futures_close_price_ticker",
+                            critical=True):
+                        t = ex.fetch_ticker(symbol_full)
+                        fresh = _ticker_last_close_price(t)
+                        if fresh is not None:
+                            curr = fresh
                 except Exception:
                     pass
             if curr <= 0:
@@ -1266,6 +1561,7 @@ def direct_close_remaining_futures(
                 price_move = float(p.get("unrealized_pct") or 0.0)
                 pnl_usdt   = round(float(p.get("unrealized_pnl") or 0.0), 2)
 
+            exchange_order_id = None
             # LIVE-only: reduceOnly market order on the exchange
             if not sim_only and ex is not None and amount > 0:
                 try:
@@ -1317,9 +1613,12 @@ def direct_close_remaining_futures(
                     _already_flat_verified = False
                     for _rl_attempt in range(3):  # 3 tries total
                         try:
-                            order = ex.create_order(
-                                symbol_full, "market", close_side,
-                                close_amt, params=close_params,
+                            order = _create_futures_close_order_budgeted(
+                                ex,
+                                symbol_full,
+                                close_side,
+                                close_amt,
+                                close_params,
                             )
                             break  # success
                         except Exception as _e:
@@ -1363,6 +1662,11 @@ def direct_close_remaining_futures(
 
                     # Pull real fill price + exit fee from the order
                     if isinstance(order, dict):
+                        from bot_utils.order_utils import order_id_text_or_none
+                        exchange_order_id = (
+                            order_id_text_or_none(order.get("id"))
+                            or order_id_text_or_none(order.get("orderId"))
+                        )
                         for k in ("average", "price"):
                             v = order.get(k)
                             if v is not None:
@@ -1480,6 +1784,8 @@ def direct_close_remaining_futures(
                 liquidation_price=p["liquidation_price"],
                 funding_paid=funding_for_close,
                 fees_usdt=entry_fee + exit_fee,
+                exchange_order_id=exchange_order_id,
+                entry_id=p.get("entry_id"),
                 mode_is_sim=sim_only,
             )
             if saved_ok is False:
@@ -1496,9 +1802,27 @@ def direct_close_remaining_futures(
                     "accounting_pending_profit_usdt": pnl_usdt,
                     "accounting_pending_fees_usdt": entry_fee + exit_fee,
                     "accounting_pending_funding_paid": funding_for_close,
+                    "accounting_pending_exchange_order_id": exchange_order_id,
                 })
                 failed_position_updates[sym] = retry_state
                 continue
+            booked_state = None
+            if not sim_only:
+                booked_state = _json_state_from_futures_row(p)
+                booked_state.update({
+                    "claim_release_pending": True,
+                    "accounting_already_booked": True,
+                    "accounting_booked_exchange_order_id": exchange_order_id,
+                })
+                json_trades[sym] = booked_state
+                from bot_utils.state_persist import atomic_save_json
+                if not atomic_save_json(trades_file, json_trades):
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = booked_state
+                    log("error",
+                        f"{sym}: booked-close marker persistence failed - "
+                        f"claim/state KEPT for review")
+                    continue
             try:
                 # Release the shared multi-bot claim. The launcher closes
                 # OUTSIDE TradeState (separate process), so it must clear
@@ -1506,19 +1830,13 @@ def direct_close_remaining_futures(
                 # "claimed" forever.
                 if not sim_only and remove_open_position(bot_name, sym) is False:
                     failed_syms.append(sym)
-                    retry_state = _json_state_from_futures_row(p)
-                    retry_state["claim_release_pending"] = True
-                    retry_state["accounting_already_booked"] = True
-                    failed_position_updates[sym] = retry_state
+                    failed_position_updates[sym] = booked_state
                     log("error",
                         f"{sym}: claim release failed - state kept for review")
                     continue
             except Exception as e:
                 failed_syms.append(sym)
-                retry_state = _json_state_from_futures_row(p)
-                retry_state["claim_release_pending"] = True
-                retry_state["accounting_already_booked"] = True
-                failed_position_updates[sym] = retry_state
+                failed_position_updates[sym] = booked_state
                 log("error", f"{sym}: claim release raised: {e}")
                 continue
             try:
@@ -1528,7 +1846,7 @@ def direct_close_remaining_futures(
                 remove_futures_state(sym, bot_name, sim_only)
             except Exception as e:
                 failed_syms.append(sym)
-                retry_state = _json_state_from_futures_row(p)
+                retry_state = booked_state or _json_state_from_futures_row(p)
                 retry_state["accounting_already_booked"] = True
                 failed_position_updates[sym] = retry_state
                 log("error", f"{sym}: futures_state cleanup failed: {e}")
@@ -1553,6 +1871,7 @@ def direct_close_remaining_futures(
     # Wiping the whole file when some closes failed would mean those
     # positions stay open on the exchange while the bot loses all memory
     # of them  permanent orphans.
+    state_cleanup_failed = False
     try:
         remaining: dict = {}
         if failed_syms:
@@ -1572,17 +1891,21 @@ def direct_close_remaining_futures(
                         symbols_to_close[sym])
         from bot_utils.state_persist import atomic_save_json
         if not atomic_save_json(trades_file, remaining):
+            state_cleanup_failed = True
             log("error", "State cleanup write failed - stale positions may remain")
         if failed_syms:
             log("warn",
                 f" Kept {len(failed_syms)} position(s) in state due to "
                 f"close failures: {', '.join(failed_syms)}  manual review needed")
     except Exception as e:
+        state_cleanup_failed = True
         log("error", f"State cleanup write raised: {e}")
 
-    sev = "warn" if "Emergency" in reason else "system"
+    sev = "warn" if state_cleanup_failed or "Emergency" in reason else "system"
     log(sev,
         f" {closed} position(s) closed  Total realized: {total_pnl:+.2f} USDT")
+    if state_cleanup_failed and not failed_syms:
+        failed_syms.append("state_file")
     return {"closed": closed, "failed": list(failed_syms), "total_pnl": total_pnl}
 
 
@@ -1628,6 +1951,18 @@ def direct_close_remaining_spot(
         log("error", f"Spot state read failed: {e}")
         return {"closed": 0, "failed": ["state_file"], "total_pnl": 0.0}
 
+    invalid_json_rows = _invalid_json_position_rows(json_trades)
+    if invalid_json_rows:
+        invalid_labels = ", ".join(
+            str(symbol)[:64] for symbol in invalid_json_rows[:5]
+        )
+        log(
+            "error",
+            "Spot state read failed: invalid position row(s): "
+            + invalid_labels,
+        )
+        return {"closed": 0, "failed": ["state_file"], "total_pnl": 0.0}
+
     if not json_trades:
         return {"closed": 0, "failed": [], "total_pnl": 0.0}
 
@@ -1662,6 +1997,25 @@ def direct_close_remaining_spot(
             _cl_ctx_s = None
             _cl_got_s = True
         try:
+            if (not sim_only
+                    and d.get("claim_release_pending")
+                    and d.get("accounting_already_booked")):
+                try:
+                    if remove_open_position(bot_name, sym) is False:
+                        failed_syms.append(sym)
+                        failed_position_updates[sym] = dict(d)
+                        log("error",
+                            f"{sym}: claim release still pending - state kept")
+                        continue
+                except Exception as e:
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = dict(d)
+                    log("error", f"{sym}: claim release retry raised: {e}")
+                    continue
+                closed += 1
+                log("win", f"{sym}: claim cleanup completed")
+                continue
+
             # Accept legacy ("buy") or StateManager ("buy_price").
             buy_raw = _state_value_prefer_key(d, "buy_price", "buy")
             buy_price = _positive_finite(buy_raw)
@@ -1683,7 +2037,9 @@ def direct_close_remaining_spot(
                 failed_position_updates[sym] = dict(d)
                 continue
 
-            pending_partials = list(d.get("accounting_pending_partials") or [])
+            pending_partials = _pending_accounting_items_fail_closed(
+                d.get("accounting_pending_partials")
+            )
             if pending_partials:
                 remaining_pending = []
                 for item in pending_partials:
@@ -1741,6 +2097,10 @@ def direct_close_remaining_spot(
                     reason=d.get("accounting_pending_reason") or reason,
                     is_futures=False,
                     fees_usdt=pending_fees,
+                    exchange_order_id=d.get(
+                        "accounting_pending_exchange_order_id"
+                    ),
+                    entry_id=d.get("entry_id"),
                     mode_is_sim=sim_only,
                 )
                 try:
@@ -1804,10 +2164,13 @@ def direct_close_remaining_spot(
             curr = stored_price if stored_price > 0 else buy_price
             if ex is not None:
                 try:
-                    t = ex.fetch_ticker(f"{sym}/USDT")
-                    fresh = _ticker_last_close_price(t)
-                    if fresh is not None:
-                        curr = fresh
+                    if try_consume_api_call(
+                            "launcher_spot_close_price_ticker",
+                            critical=True):
+                        t = ex.fetch_ticker(f"{sym}/USDT")
+                        fresh = _ticker_last_close_price(t)
+                        if fresh is not None:
+                            curr = fresh
                 except Exception:
                     pass
 
@@ -1844,7 +2207,13 @@ def direct_close_remaining_spot(
             partial_live_fill = False
             requested_amount = amount
             filled_amount = amount
+            exchange_order_id = None
             if not sim_only and ex is not None and amount > 0:
+                from bot_utils import spot_market_sell_safe
+                from bot_utils.spot_exits import (
+                    SpotSellOutcomeUnknown,
+                    recover_spot_sell_by_client_id,
+                )
                 try:
                     # Use the precision/lot-size-aware wrapper the BOT uses
                     # (spot_market_sell_safe) instead of a raw market sell:
@@ -1853,8 +2222,85 @@ def direct_close_remaining_spot(
                     # rounds + retries across lot steps; on a genuine failure
                     # it still raises, so the except below keeps the position
                     # in state.
-                    from bot_utils import spot_market_sell_safe
-                    order, _sold = spot_market_sell_safe(ex, f"{sym}/USDT", amount)
+                    from bot_utils.order_utils import order_id_text_or_none
+                    persisted_client_order_id = order_id_text_or_none(
+                        d.get("launcher_exit_client_order_id")
+                    )
+                    persisted_client_order_id_valid = bool(
+                        persisted_client_order_id
+                        and persisted_client_order_id.isascii()
+                        and len(persisted_client_order_id) <= 32
+                    )
+                    if (d.get("launcher_exit_outcome_uncertain")
+                            and not persisted_client_order_id_valid):
+                        log("error",
+                            f"[LIVE] {sym}: sell outcome barrier has no valid "
+                            f"clientOrderId - position KEPT for manual recovery")
+                        failed_syms.append(sym)
+                        failed_position_updates[sym] = dict(d)
+                        continue
+                    client_order_id = _launcher_spot_exit_client_order_id(
+                        d, sym, bot_name
+                    )
+                    if d.get("launcher_exit_client_order_id") != client_order_id:
+                        persisted = _persist_launcher_spot_exit_fields(
+                            trades_file, json_trades, sym, d, {
+                                "launcher_exit_client_order_id": client_order_id,
+                                "launcher_exit_outcome_uncertain": False,
+                            }
+                        )
+                        if persisted is None:
+                            log("error",
+                                f"[LIVE] {sym}: cannot persist sell intent - "
+                                f"position KEPT")
+                            failed_syms.append(sym)
+                            failed_position_updates[sym] = json_trades[sym]
+                            continue
+                        d = persisted
+
+                    order = None
+                    if d.get("launcher_exit_outcome_uncertain"):
+                        try:
+                            order = recover_spot_sell_by_client_id(
+                                ex, f"{sym}/USDT", client_order_id
+                            )
+                        except Exception as recovery_error:
+                            log("error",
+                                f"[LIVE] {sym}: sell outcome still unknown "
+                                f"(clientOrderId={client_order_id}): "
+                                f"{recovery_error}")
+                            failed_syms.append(sym)
+                            failed_position_updates[sym] = dict(d)
+                            continue
+                    if order is None:
+                        order, _sold = spot_market_sell_safe(
+                            ex, f"{sym}/USDT", amount,
+                            client_order_id=client_order_id,
+                        )
+                    else:
+                        _sold = amount
+                    raw_status = (
+                        order.get("status") if isinstance(order, dict) else None
+                    )
+                    normalized_status = (
+                        raw_status.strip().lower()
+                        if isinstance(raw_status, str) else ""
+                    )
+                    if normalized_status in {"new", "open", "pending"}:
+                        persisted = _persist_launcher_spot_exit_fields(
+                            trades_file, json_trades, sym, d,
+                            {"launcher_exit_outcome_uncertain": True},
+                        )
+                        if persisted is not None:
+                            d = persisted
+                        log("error",
+                            f"[LIVE] {sym}: sell still {normalized_status} - "
+                            f"terminal recovery deferred")
+                        failed_syms.append(sym)
+                        failed_position_updates[sym] = dict(
+                            d if persisted is not None else json_trades[sym]
+                        )
+                        continue
                     filled_amount = _filled_base_amount(order, _sold, amount)
                     # Phantom-fill guard, same as the bot's own exit paths.
                     # spot_market_sell_safe returns the order the instant it's
@@ -1865,16 +2311,43 @@ def direct_close_remaining_spot(
                     from bot_utils.order_utils import order_was_filled
                     if not order_was_filled(order, filled_amount):
                         _st = order.get("status") if isinstance(order, dict) else "?"
+                        normalized_status = (
+                            _st.strip().lower() if isinstance(_st, str) else ""
+                        )
+                        if normalized_status in {
+                            "canceled", "cancelled", "rejected", "expired",
+                        }:
+                            updates = {
+                                "launcher_exit_client_order_id": None,
+                                "launcher_exit_outcome_uncertain": False,
+                            }
+                        else:
+                            updates = {
+                                "launcher_exit_outcome_uncertain": True,
+                            }
+                        persisted = _persist_launcher_spot_exit_fields(
+                            trades_file, json_trades, sym, d, updates
+                        )
+                        if persisted is not None:
+                            d = persisted
                         log("error",
                             f"[LIVE] {sym}: sell did NOT fill (status={_st})  "
                             f"position KEPT, sell manually on the exchange!")
                         failed_syms.append(sym)
+                        failed_position_updates[sym] = dict(
+                            d if persisted is not None else json_trades[sym]
+                        )
                         continue
                     # Capture real fill price + fee from the order response.
                     # Emergency closes often run during volatility where
                     # slippage is largest and the difference matters most
                     # for the DB row to be useful for performance analysis.
                     if isinstance(order, dict):
+                        from bot_utils.order_utils import order_id_text_or_none
+                        exchange_order_id = (
+                            order_id_text_or_none(order.get("id"))
+                            or order_id_text_or_none(order.get("orderId"))
+                        )
                         for k in ("average", "price"):
                             v = order.get(k)
                             if v is not None:
@@ -1917,6 +2390,19 @@ def direct_close_remaining_spot(
                     log("win",
                         f"[LIVE] Sold {sym} @ {fill_price:.6f} "
                         f"(fee {close_fee:.4f})  {profit_usdt:+.2f} USDT")
+                except SpotSellOutcomeUnknown as e:
+                    persisted = _persist_launcher_spot_exit_fields(
+                        trades_file, json_trades, sym, d,
+                        {"launcher_exit_outcome_uncertain": True},
+                    )
+                    if persisted is not None:
+                        d = persisted
+                    log("error", f"[LIVE] {sym}: {e} - recovery deferred")
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = dict(
+                        d if persisted is not None else json_trades[sym]
+                    )
+                    continue
                 except Exception as e:
                     try:
                         from bot_utils.spot_exits import InsufficientSellBalance
@@ -1960,6 +2446,8 @@ def direct_close_remaining_spot(
                 is_futures=False,
                 is_partial=partial_live_fill,
                 fees_usdt=entry_fee + (close_fee if not sim_only and amount > 0 else exit_fee),
+                exchange_order_id=exchange_order_id,
+                entry_id=d.get("entry_id"),
                 mode_is_sim=sim_only,
             )
             try:
@@ -1972,6 +2460,8 @@ def direct_close_remaining_spot(
                     f"{sym}: DB trade save failed - state/claim KEPT for review")
                 if partial_live_fill:
                     residual = dict(d)
+                    residual["launcher_exit_client_order_id"] = None
+                    residual["launcher_exit_outcome_uncertain"] = False
                     residual["amount"] = max(
                         0.0, (_positive_finite(d.get("amount")) or 0.0) - amount)
                     residual["invested_usdt"] = max(
@@ -1994,12 +2484,17 @@ def direct_close_remaining_spot(
                         "accounting_pending_profit_pct": profit_pct,
                         "accounting_pending_profit_usdt": profit_usdt,
                         "accounting_pending_fees_usdt": trade_kwargs["fees_usdt"],
+                        "accounting_pending_exchange_order_id": (
+                            exchange_order_id
+                        ),
                     })
                     failed_position_updates[sym] = residual
                 failed_syms.append(sym)
                 continue
             if partial_live_fill:
                 residual = dict(d)
+                residual["launcher_exit_client_order_id"] = None
+                residual["launcher_exit_outcome_uncertain"] = False
                 residual["amount"] = max(
                     0.0, (_positive_finite(d.get("amount")) or 0.0) - amount)
                 residual["invested_usdt"] = max(
@@ -2015,6 +2510,20 @@ def direct_close_remaining_spot(
                 log("warn",
                     f"{sym}: partial fill booked; residual position kept in state")
                 continue
+            booked_state = None
+            if not sim_only:
+                booked_state = dict(d)
+                booked_state["accounting_already_booked"] = True
+                booked_state["claim_release_pending"] = True
+                json_trades[sym] = booked_state
+                from bot_utils.state_persist import atomic_save_json
+                if not atomic_save_json(trades_file, json_trades):
+                    log("error",
+                        f"{sym}: booked-close marker persistence failed - "
+                        f"claim/state KEPT for review")
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = booked_state
+                    continue
             try:
                 # Release the shared multi-bot claim (launcher closes outside
                 # TradeState  must clear bot_open_positions itself).
@@ -2022,12 +2531,12 @@ def direct_close_remaining_spot(
                     log("error",
                         f"{sym}: claim release failed - state kept for review")
                     failed_syms.append(sym)
-                    failed_position_updates[sym] = dict(d)
+                    failed_position_updates[sym] = booked_state
                     continue
             except Exception as e:
                 log("error", f"{sym}: claim release raised: {e}")
                 failed_syms.append(sym)
-                failed_position_updates[sym] = dict(d)
+                failed_position_updates[sym] = booked_state
                 continue
             closed += 1
             total_pnl += profit_usdt
@@ -2046,6 +2555,7 @@ def direct_close_remaining_spot(
 
     # Clean trades.json  but keep failed positions so the bot doesn't
     # forget about positions still open on the exchange.
+    state_cleanup_failed = False
     try:
         remaining: dict = {}
         if failed_syms:
@@ -2062,15 +2572,19 @@ def direct_close_remaining_spot(
                     remaining[sym] = cur[sym]
         from bot_utils.state_persist import atomic_save_json
         if not atomic_save_json(trades_file, remaining):
+            state_cleanup_failed = True
             log("error", "State cleanup write failed - stale positions may remain")
         if failed_syms:
             log("warn",
                 f" Kept {len(failed_syms)} position(s) in state due to "
                 f"close failures: {', '.join(failed_syms)}  manual review needed")
     except Exception as e:
+        state_cleanup_failed = True
         log("error", f"State cleanup write raised: {e}")
 
-    sev = "warn" if "Emergency" in reason else "system"
+    sev = "warn" if state_cleanup_failed or "Emergency" in reason else "system"
     log(sev,
         f" {closed} position(s) closed  Total realized: {total_pnl:+.2f} USDT")
+    if state_cleanup_failed and not failed_syms:
+        failed_syms.append("state_file")
     return {"closed": closed, "failed": list(failed_syms), "total_pnl": total_pnl}
