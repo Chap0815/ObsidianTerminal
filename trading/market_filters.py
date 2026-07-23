@@ -8,6 +8,7 @@ detection, spread/correlation checks, and the combined can_buy_now() gate.
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -17,6 +18,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from core.constants import NONCRYPTO_BASES, STOCK_TOKEN_BASES
 from bot_utils.api_budget import try_consume_api_call
+from bot_utils.circuit_breaker import extract_valid_top_of_book
 from bot_utils.safe_numeric import safe_positive_float
 
 load_dotenv()
@@ -121,6 +123,18 @@ _STALE_BACKOFF: dict = {}
 _STALE_BACKOFF_LOCK = threading.Lock()
 _STALE_GRACE_BASE = 60  # initial grace seconds
 _STALE_GRACE_MAX = 300  # cap
+_CACHE_KEY_LOCKS: dict[str, threading.RLock] = {}
+_CACHE_KEY_LOCKS_GUARD = threading.Lock()
+
+
+def _cache_key_lock(key: str):
+    """Return the process-local single-flight lock for one cache key."""
+    with _CACHE_KEY_LOCKS_GUARD:
+        lock = _CACHE_KEY_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _CACHE_KEY_LOCKS[key] = lock
+        return lock
 
 
 def _next_stale_grace(key: str) -> int:
@@ -139,29 +153,50 @@ def _reset_stale_grace(key: str) -> None:
 
 def _cached(key: str, fetch_fn):
     """Fetch with TTL cache and progressive stale-on-error grace period."""
+    with _cache_key_lock(key):
+        return _cached_locked(key, fetch_fn)
+
+
+def _cached_locked(key: str, fetch_fn):
     entry = _lru.get(key)
-    if entry and entry.get("expires", 0) > time.time():
+    now = time.monotonic()
+    if entry and entry.get("expires", 0) > now:
         return entry["value"]
     try:
         value = fetch_fn()
+        fetched_at = time.monotonic()
         _lru.set(
             key,
             {
                 "value": value,
                 "stale": value,
-                "expires": time.time() + CACHE_TTL,
+                "expires": fetched_at + CACHE_TTL,
+                "stale_until": (
+                    fetched_at + CACHE_TTL + _STALE_GRACE_MAX
+                ),
             },
         )
         _reset_stale_grace(key)
         return value
     except Exception:
-        if entry and "stale" in entry:
+        now = time.monotonic()
+        try:
+            stale_until = float(entry.get("stale_until", 0)) if entry else 0.0
+        except (TypeError, ValueError, OverflowError):
+            stale_until = 0.0
+        if (
+            entry
+            and "stale" in entry
+            and math.isfinite(stale_until)
+            and stale_until > now
+        ):
             grace = _next_stale_grace(key)
+            actual_grace = min(float(grace), stale_until - now)
             from core.logger import log_event
 
             log_event(
                 f"[cache] {key}: fetch failed, serving stale value for "
-                f"up to {grace}s (progressive)",
+                f"up to {actual_grace:.0f}s (bounded progressive)",
                 "WARN",
             )
             _lru.set(
@@ -169,7 +204,8 @@ def _cached(key: str, fetch_fn):
                 {
                     "value": entry["stale"],
                     "stale": entry["stale"],
-                    "expires": time.time() + grace,
+                    "expires": now + actual_grace,
+                    "stale_until": stale_until,
                 },
             )
             return entry["stale"]
@@ -241,11 +277,18 @@ def get_btc_change(
             end = len(bars) - (2 if closed_only else 1)
             if end - hours < 0:
                 return None
-            new_price = bars[end][4]
-            old_price = bars[end - hours][4]
-            if old_price == 0:
+            try:
+                new_price = safe_positive_float(bars[end][4], 0.0)
+                old_price = safe_positive_float(
+                    bars[end - hours][4],
+                    0.0,
+                )
+            except (IndexError, KeyError, TypeError):
                 return None
-            return ((new_price - old_price) / old_price) * 100
+            if new_price <= 0 or old_price <= 0:
+                return None
+            change = ((new_price - old_price) / old_price) * 100
+            return change if math.isfinite(change) else None
 
         primary_symbol = _btc_symbol_for(exchange)
         e_primary = None
@@ -663,7 +706,15 @@ def is_price_valid(price) -> bool:
 def check_spread_quality(
     exchange, symbol: str, max_spread_pct: float = 0.3, fail_closed: bool = True
 ) -> tuple:
-    cache_key = f"spread_{symbol}_{float(max_spread_pct):.6f}_{int(bool(fail_closed))}"
+    try:
+        if isinstance(max_spread_pct, bool):
+            raise ValueError("boolean spread threshold")
+        threshold = float(max_spread_pct)
+        if not math.isfinite(threshold) or threshold < 0.0:
+            raise ValueError("invalid spread threshold")
+    except (TypeError, ValueError, OverflowError):
+        return False, f"{symbol}: invalid spread threshold"
+    cache_key = f"spread_{symbol}_{threshold:.6f}_{int(bool(fail_closed))}"
     now = time.time()
     entry = _spread_cache.get(cache_key)
     if entry and entry["expires"] > now:
@@ -680,22 +731,33 @@ def check_spread_quality(
                 else (True, "OK")
             )
         else:
-            best_bid = float(bids[0][0])
-            best_ask = float(asks[0][0])
-            if best_bid <= 0 or best_ask <= 0:
+            top = extract_valid_top_of_book(ob)
+            if top is None:
                 result = (
                     (False, f"{symbol}: invalid order book quotes")
                     if fail_closed
                     else (True, "OK")
                 )
             else:
+                best_bid, best_ask = top
                 mid = (best_bid + best_ask) / 2
                 spread_pct = (best_ask - best_bid) / mid * 100
-                if spread_pct > max_spread_pct:
+                if (
+                    not math.isfinite(mid)
+                    or mid <= 0.0
+                    or not math.isfinite(spread_pct)
+                    or spread_pct < 0.0
+                ):
+                    result = (
+                        (False, f"{symbol}: invalid order book quotes")
+                        if fail_closed
+                        else (True, "OK")
+                    )
+                elif spread_pct > threshold:
                     result = (
                         False,
                         f"Spread {spread_pct:.2f}% > "
-                        f"{max_spread_pct}%  slippage too high",
+                        f"{threshold}%  slippage too high",
                     )
                 else:
                     result = (True, "OK")

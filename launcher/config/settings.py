@@ -930,24 +930,19 @@ def _append_config_audit(record: dict) -> None:
             allow_nan=False,
         ) + "\n"
         try:
-            from core.logger import _rotate_if_needed
+            from core.logger import _append_rotating_text
         except Exception:
-            _rotate_if_needed = None
+            _append_rotating_text = None
         with _CONFIG_AUDIT_LOCK:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            if _rotate_if_needed is not None:
-                try:
-                    _rotate_if_needed(
-                        path,
-                        CONFIG_AUDIT_MAX_BYTES,
-                        CONFIG_AUDIT_BACKUPS,
-                    )
-                except Exception:
-                    # Rotation is maintenance; the audit record remains more
-                    # important than enforcing the size bound on this write.
-                    pass
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(line)
+            if _append_rotating_text is not None:
+                _append_rotating_text(
+                    path,
+                    line,
+                    CONFIG_AUDIT_MAX_BYTES,
+                    CONFIG_AUDIT_BACKUPS,
+                    jsonl=True,
+                )
     except Exception:
         pass
 

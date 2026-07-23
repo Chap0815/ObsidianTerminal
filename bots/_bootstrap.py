@@ -4,6 +4,22 @@ from __future__ import annotations
 import os
 import sys
 
+BOT_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BOT_PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, BOT_PROJECT_ROOT)
+
+from update_barrier import (  # noqa: E402 - direct-script root bootstrap above
+    UpdateInProgressError,
+    assert_process_start_allowed,
+)
+
+
+def _guard_update_barrier(root: str) -> None:
+    try:
+        assert_process_start_allowed(root)
+    except UpdateInProgressError as exc:
+        raise SystemExit(str(exc)) from exc
+
 
 def project_root_for(file_path: str) -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(file_path)))
@@ -12,6 +28,7 @@ def project_root_for(file_path: str) -> str:
 def prepare_entrypoint(file_path: str, module_name: str) -> str:
     """Prepare cwd, import path and stdio for a bot entrypoint."""
     root = project_root_for(file_path)
+    _guard_update_barrier(root)
     if root not in sys.path:
         sys.path.insert(0, root)
     if module_name == "__main__":
@@ -49,6 +66,8 @@ def guard_pre_start(bot_name: str) -> None:
     (`python -m bots.main_bot_*`) must not bypass stale-state, claim and
     already-running checks.
     """
+    _guard_update_barrier(BOT_PROJECT_ROOT)
+
     from core.pre_start_check import (
         format_issues,
         has_errors,

@@ -28,6 +28,8 @@ from bot_utils import (
     extract_order_fee,
     safe_remaining,
     safe_proportional_fee,
+    normalize_spot_order_status,
+    spot_sell_requires_terminal_recovery,
 )
 from bot_utils.safe_numeric import safe_positive_float
 from bot_utils.order_utils import order_id_text_or_none
@@ -100,12 +102,19 @@ def _reset_spot_exit_intent(bot, sym: str, row: dict, leg: str) -> bool:
     updates = {
         f"{leg}_exit_client_order_id": None,
         f"{leg}_exit_outcome_uncertain": False,
+        f"{leg}_exit_requested_amount": None,
     }
     persisted = bot.state.update_many(sym, updates)
     if persisted is not False:
         row.update(updates)
         return True
     return False
+
+
+def _has_pending_spot_partial_exit(row: dict) -> bool:
+    from bot_utils.spot_exits import has_pending_spot_partial_exit
+
+    return has_pending_spot_partial_exit(row)
 
 
 def _spot_excursion_metrics(d: dict, exit_price: float) -> tuple[float, float, float]:
@@ -173,31 +182,78 @@ class ExitsMixin:
 
     def _retry_pending_partial_accounting(self, sym: str, d: dict) -> None:
         from bot_utils.trade_state import normalize_pending_accounting_items
-        pending = normalize_pending_accounting_items(
-            d.get("accounting_pending_partials"))
-        if not pending:
+        if not normalize_pending_accounting_items(
+            d.get("accounting_pending_partials")
+        ):
             return
         from core.database import save_trade_db
         from core.logger import log_event
+        from core.symbol_locks import close_lock
 
-        remaining = []
-        for item in pending:
+        with close_lock(
+            sym,
+            timeout=2.0,
+            bot_name=getattr(self, "BOT_NAME", "SPOT"),
+        ) as got:
+            if not got:
+                return
+            live = self.state.get(sym)
+            if not isinstance(live, dict):
+                return
+            pending = normalize_pending_accounting_items(
+                live.get("accounting_pending_partials"))
+            if not pending:
+                return
             try:
-                retry_item = dict(item)
-                retry_item.setdefault("mode_is_sim", self.simulation)
-                saved = bool(save_trade_db(**retry_item))
+                durable = self.state.update_many(
+                    sym, {"accounting_pending_partials": pending}
+                )
             except Exception as exc:
-                saved = False
-                self._log_error(f"spot partial accounting retry {sym}", exc)
-            if not saved:
-                remaining.append(item)
-        self.state.update(sym, "accounting_pending_partials", remaining)
-        if remaining:
-            log_event(
-                f" {sym}: {len(remaining)} partial accounting event(s) "
-                f"still pending", "WARN")
-        else:
-            log_event(f"{sym}: pending partial accounting flushed", "INFO")
+                self._log_error(
+                    f"spot partial accounting write-ahead {sym}", exc
+                )
+                return
+            if durable is False:
+                log_event(
+                    f" {sym}: partial accounting state is not durable - "
+                    f"DB retry deferred",
+                    "ERROR",
+                )
+                return
+            remaining = []
+            for item in pending:
+                try:
+                    retry_item = dict(item)
+                    retry_item.setdefault("mode_is_sim", self.simulation)
+                    saved = bool(save_trade_db(**retry_item))
+                except Exception as exc:
+                    saved = False
+                    self._log_error(f"spot partial accounting retry {sym}", exc)
+                if not saved:
+                    remaining.append(item)
+            try:
+                cleared = self.state.update(
+                    sym, "accounting_pending_partials", remaining
+                )
+            except Exception as exc:
+                cleared = False
+                self._log_error(
+                    f"spot partial accounting clear {sym}", exc
+                )
+            if cleared is False:
+                log_event(
+                    f" {sym}: partial accounting was booked but its durable "
+                    f"pending marker could not be updated; idempotent retry "
+                    f"retained",
+                    "ERROR",
+                )
+                return
+            if remaining:
+                log_event(
+                    f" {sym}: {len(remaining)} partial accounting event(s) "
+                    f"still pending", "WARN")
+            else:
+                log_event(f"{sym}: pending partial accounting flushed", "INFO")
 
     def _cleanup_accounted_close_state(self, sym: str, d: dict) -> bool:
         """Remove local/claim state after realized PnL was already booked."""
@@ -390,13 +446,19 @@ class ExitsMixin:
                 # Remaining proportional ENTRY fee  same basis the real close
                 # uses (safe_proportional_fee), so partial-sold positions don't
                 # re-subtract the already-realized partial-close fee.
+                partial_sold = bool(d.get("partial_sold"))
                 initial_entry_fee = _positive_finite(
-                    d.get("initial_entry_fee", d.get("fees_paid", 0.0)))
-                original_amount = _positive_finite(
-                    d.get("original_amount"), amt)
+                    d.get(
+                        "initial_entry_fee",
+                        0.0 if partial_sold else d.get("fees_paid", 0.0),
+                    )
+                )
+                original_amount = _positive_finite(d.get("original_amount"))
+                if original_amount <= 0 and not partial_sold:
+                    original_amount = amt
                 remaining_entry_fee = safe_proportional_fee(
                     initial_entry_fee, amt, original_amount,
-                    partial_sold=bool(d.get("partial_sold")),
+                    partial_sold=partial_sold,
                 )
                 # If we close NOW, we'd pay this taker fee.
                 close_fee_est = amt * last * _UNREALIZED_CLOSE_FEE_RATE
@@ -623,22 +685,58 @@ class ExitsMixin:
         if d.get("accounting_already_booked"):
             ExitsMixin._cleanup_accounted_close_state(self, sym, d)
             return
+        if d.get("verified_flat_pending_accounting"):
+            log_event(
+                f"{sym}: position already verified flat; waiting for "
+                f"combined offline accounting",
+                "WARN",
+            )
+            return
         if d.get("accounting_pending"):
+            from core.symbol_locks import close_lock
             try:
-                from core.spot_bot_reconcile import _record_spot_offline_close
-                if _record_spot_offline_close(self, sym, d):
-                    booked = dict(d)
-                    booked.update({
-                        "accounting_already_booked": True,
-                        "accounting_booked_sell_time": (
-                            d.get("accounting_pending_sell_time")),
-                        "accounting_booked_exchange_order_id": (
-                            d.get("accounting_pending_exchange_order_id")),
-                        "accounting_booked_reason": (
-                            d.get("accounting_pending_reason")
-                            or "Offline close"),
-                    })
-                    ExitsMixin._cleanup_accounted_close_state(self, sym, booked)
+                with close_lock(
+                    sym,
+                    timeout=2.0,
+                    bot_name=getattr(self, "BOT_NAME", "SPOT"),
+                ) as acquired:
+                    if not acquired:
+                        return
+                    live = self.state.get(sym)
+                    if not isinstance(live, dict) or not live.get(
+                        "accounting_pending"
+                    ):
+                        return
+                    pending_fields = {
+                        key: value
+                        for key, value in live.items()
+                        if key == "accounting_pending"
+                        or key.startswith("accounting_pending_")
+                    }
+                    durable = self.state.update_many(sym, pending_fields)
+                    if durable is False:
+                        log_event(
+                            f" {sym}: pending full accounting retry deferred; "
+                            f"recovery marker is not durable",
+                            "ERROR",
+                        )
+                        return
+                    from core.spot_bot_reconcile import _record_spot_offline_close
+                    if _record_spot_offline_close(self, sym, live):
+                        booked = dict(live)
+                        booked.update({
+                            "accounting_already_booked": True,
+                            "accounting_booked_sell_time": (
+                                live.get("accounting_pending_sell_time")),
+                            "accounting_booked_exchange_order_id": (
+                                live.get("accounting_pending_exchange_order_id")),
+                            "accounting_booked_reason": (
+                                live.get("accounting_pending_reason")
+                                or "Offline close"),
+                        })
+                        ExitsMixin._cleanup_accounted_close_state(
+                            self, sym, booked
+                        )
             except Exception as exc:
                 self._log_error(f"spot pending accounting retry {sym}", exc)
             return
@@ -690,6 +788,10 @@ class ExitsMixin:
             self.state.update_many(sym, extrema_updates)
             d.update(extrema_updates)
 
+        if _has_pending_spot_partial_exit(d):
+            self._execute_partial_tp(sym, d, curr)
+            return
+
         if d.get("closing_retry_pending"):
             self._execute_full_exit(
                 sym, d, curr, d.get("closing_retry_reason") or "Close Retry")
@@ -725,7 +827,8 @@ class ExitsMixin:
                 and not partial_block_active
                 and prof >= activation_profit):
             handled = self._execute_partial_tp(sym, d, curr)
-            if handled:
+            live_after_partial = self.state.get(sym) or d
+            if handled or _has_pending_spot_partial_exit(live_after_partial):
                 return  # state already mutated
 
         # Full Exit decision
@@ -817,17 +920,10 @@ class ExitsMixin:
         except ImportError:
             close_lock = None
 
-        partial_pct = _finite_float(self.C("PARTIAL_SELL_PCT"))
-        if not 0 < partial_pct < 1:
-            log_event(
-                f" {sym}: invalid PARTIAL_SELL_PCT={partial_pct!r}  "
-                f"partial-TP skipped",
-                "WARN",
-            )
-            return False
         amount = _positive_finite(d.get("amount"))
         invested = _positive_finite(d.get("invested_usdt"))
         curr = _positive_finite(curr)
+        recovering = _has_pending_spot_partial_exit(d)
         if amount <= 0 or invested <= 0 or curr <= 0:
             log_event(
                 f" {sym}: invalid partial-TP basis "
@@ -837,6 +933,48 @@ class ExitsMixin:
                 "WARN",
             )
             return False
+        if recovering:
+            durable_request = _positive_finite(
+                d.get("partial_exit_requested_amount")
+            )
+            if durable_request <= 0:
+                legacy_pct = _finite_float(self.C("PARTIAL_SELL_PCT"))
+                if not 0 < legacy_pct < 1:
+                    log_event(
+                        f" {sym}: legacy pending partial-TP has no durable "
+                        "amount and current PARTIAL_SELL_PCT is invalid",
+                        "ERROR",
+                    )
+                    return False
+                durable_request = amount * legacy_pct
+                persisted = self.state.update(
+                    sym, "partial_exit_requested_amount", durable_request
+                )
+                if persisted is False:
+                    log_event(
+                        f" {sym}: legacy partial-TP amount backfill is not "
+                        "durable; recovery deferred",
+                        "ERROR",
+                    )
+                    return False
+                d["partial_exit_requested_amount"] = durable_request
+            if durable_request > amount:
+                log_event(
+                    f" {sym}: pending partial-TP has invalid durable amount "
+                    f"({d.get('partial_exit_requested_amount')!r})",
+                    "ERROR",
+                )
+                return False
+            partial_pct = durable_request / amount
+        else:
+            partial_pct = _finite_float(self.C("PARTIAL_SELL_PCT"))
+            if not 0 < partial_pct < 1:
+                log_event(
+                    f" {sym}: invalid PARTIAL_SELL_PCT={partial_pct!r}  "
+                    f"partial-TP skipped",
+                    "WARN",
+                )
+                return False
 
         # Scale the partial up if the slice would be too small (rather than
         # skipping), and read per-symbol min-notional from exchange markets
@@ -850,10 +988,14 @@ class ExitsMixin:
         except Exception:
             min_notional = MIN_NOTIONAL_BUFFER
 
-        sld_test = amount * partial_pct
+        sld_test = (
+            _positive_finite(d.get("partial_exit_requested_amount"))
+            if recovering else 0.0
+        ) or amount * partial_pct
         rem_test = amount - sld_test
-        if (sld_test * curr < min_notional
-                or rem_test * curr < min_notional):
+        if (not recovering
+                and (sld_test * curr < min_notional
+                     or rem_test * curr < min_notional)):
             adjusted = False
             for try_pct in (0.40, 0.50, 0.60):
                 if try_pct <= partial_pct:
@@ -916,14 +1058,21 @@ class ExitsMixin:
                 and time.time() < live_blocked_until
             )
             if (d_live is None or d_live.get("partial_sold")
-                    or live_block_active):
+                    or (live_block_active and not recovering)):
                 return False
+            live_recovering = _has_pending_spot_partial_exit(d_live)
+            if recovering and not live_recovering:
+                return False
+            recovering = live_recovering
             try:
                 live_amount = _positive_finite(d_live.get("amount"))
             except (TypeError, ValueError):
                 live_amount = 0.0
             live_invested = _positive_finite(d_live.get("invested_usdt"))
-            live_sld_test = live_amount * partial_pct
+            live_sld_test = (
+                _positive_finite(d_live.get("partial_exit_requested_amount"))
+                if recovering else 0.0
+            ) or live_amount * partial_pct
             live_rem_test = live_amount - live_sld_test
             if live_amount <= 0 or live_invested <= 0:
                 log_event(
@@ -933,8 +1082,9 @@ class ExitsMixin:
                     "WARN",
                 )
                 return False
-            if (live_sld_test * curr < min_notional
-                    or live_rem_test * curr < min_notional):
+            if (not recovering
+                    and (live_sld_test * curr < min_notional
+                         or live_rem_test * curr < min_notional)):
                 self.state.update_many(sym, {
                     "partial_tp_blocked_min_notional": True,
                     "partial_tp_blocked_min_notional_until": time.time() + 300.0,
@@ -983,18 +1133,45 @@ class ExitsMixin:
                 partial_fee = sold_amount * fill_price * 0.001
         else:
             try:
+                recovering_intent = _has_pending_spot_partial_exit(d)
+                requested_sell = _positive_finite(sld_test)
+                if requested_sell <= 0 or requested_sell > amount:
+                    log_event(
+                        f" {sym}: invalid partial-TP requested amount "
+                        f"({sld_test!r})  skipped",
+                        "ERROR",
+                    )
+                    return False
+                request_key = "partial_exit_requested_amount"
+                durable_request = _positive_finite(d.get(request_key))
+                if durable_request <= 0:
+                    persisted = self.state.update(
+                        sym, request_key, requested_sell
+                    )
+                    if persisted is False:
+                        log_event(
+                            f" {sym}: cannot persist partial-TP amount before "
+                            "live sell",
+                            "ERROR",
+                        )
+                        return False
+                    d[request_key] = requested_sell
+                else:
+                    requested_sell = durable_request
                 client_order_id = _ensure_spot_exit_client_order_id(
                     self, sym, d, "partial"
                 )
-                requested_sell = amount * partial_pct
                 order = None
-                if d.get("partial_exit_outcome_uncertain"):
+                if recovering_intent:
                     from bot_utils.spot_exits import (
                         _find_spot_exit_order_by_client_id,
                     )
                     try:
                         order = _find_spot_exit_order_by_client_id(
-                            self.ex, f"{sym}/USDT", client_order_id
+                            self.ex,
+                            f"{sym}/USDT",
+                            client_order_id,
+                            expected_amount=requested_sell,
                         )
                     except Exception as recovery_error:
                         log_event(
@@ -1005,10 +1182,23 @@ class ExitsMixin:
                         )
                         return False
                 if order is None:
-                    order, sold_amount = spot_market_sell_safe(
-                        self.ex, f"{sym}/USDT", requested_sell,
-                        client_order_id=client_order_id,
-                    )
+                    from bot_utils.trade_state import registry_order_guard
+                    with registry_order_guard(
+                        self.state, sym, d
+                    ) as ownership_live:
+                        if not isinstance(ownership_live, dict):
+                            return False
+                        if ownership_live.get("claim_conflict"):
+                            log_event(
+                                f"{sym}: partial sell blocked by registry "
+                                f"claim conflict",
+                                "ERROR",
+                            )
+                            return False
+                        order, sold_amount = spot_market_sell_safe(
+                            self.ex, f"{sym}/USDT", requested_sell,
+                            client_order_id=client_order_id,
+                        )
                 else:
                     sold_amount = requested_sell
                 # Phantom-fill guard: a market sell that returns
@@ -1017,15 +1207,44 @@ class ExitsMixin:
                 # partial_sold=True and arm break-even while the coins are still
                 # in the wallet. Don't mutate state; return False so the position
                 # is re-evaluated next tick.
-                from bot_utils.order_utils import order_was_filled
-                if not order_was_filled(order, sold_amount, min_fill_ratio=1e-9):
-                    _st = order.get("status") if isinstance(order, dict) else "?"
-                    normalized_status = (
-                        _st.strip().lower() if isinstance(_st, str) else ""
+                from bot_utils.order_utils import (
+                    order_has_proven_zero_fill,
+                    order_has_unquantified_fill_notional,
+                    order_was_filled,
+                )
+                raw_status = (
+                    order.get("status") if isinstance(order, dict) else None
+                )
+                normalized_status = normalize_spot_order_status(raw_status)
+                if spot_sell_requires_terminal_recovery(
+                    order, requested_sell
+                ):
+                    _mark_spot_exit_outcome_uncertain(
+                        self, sym, d, "partial"
                     )
-                    if normalized_status in {
+                    log_event(
+                        f" {sym}: partial-TP order is still "
+                        f"{normalized_status or 'unresolved'}; "
+                        "booking deferred until "
+                        "terminal state",
+                        "WARN",
+                    )
+                    return False
+                unquantified_fill = order_has_unquantified_fill_notional(order)
+                if (
+                    unquantified_fill
+                    or not order_was_filled(
+                        order,
+                        sold_amount,
+                        min_fill_ratio=1e-9,
+                    )
+                ):
+                    if (
+                        normalized_status in {
                         "canceled", "cancelled", "rejected", "expired",
-                    }:
+                        }
+                        and order_has_proven_zero_fill(order)
+                    ):
                         if not _reset_spot_exit_intent(
                             self, sym, d, "partial"
                         ):
@@ -1038,7 +1257,7 @@ class ExitsMixin:
                         )
                     log_event(
                         f" {sym}: partial-TP order did NOT fill "
-                        f"(status={_st})  NOT booking, client-id reconcile "
+                        f"(status={raw_status})  NOT booking, client-id reconcile "
                         f"required", "WARN")
                     return False
                 sold_amount = _filled_base_amount(order, sold_amount, sold_amount)
@@ -1075,7 +1294,9 @@ class ExitsMixin:
         real_prof_pct = ((fill_price - buy) / buy) * 100 if buy > 0 else 0.0
         initial_entry_fee = _positive_finite(
             d.get("initial_entry_fee", d.get("fees_paid", 0.0)))
-        original_amount = _positive_finite(d.get("original_amount"), amount)
+        original_amount = _positive_finite(d.get("original_amount"))
+        if original_amount <= 0:
+            original_amount = amount
         # Safe proportional fee  won't double-deduct if state corrupted
         prop_entry_fee = safe_proportional_fee(
             initial_entry_fee, sold_amount, original_amount,
@@ -1112,13 +1333,9 @@ class ExitsMixin:
             mae_pct=mae_pct,
             giveback_pct=giveback_pct,
         )
-        try:
-            accounting_ok = bool(save_trade_db(**partial_trade))
-        except Exception as e:
-            accounting_ok = False
-            self._log_error(f"spot partial save_trade_db {sym}", e)
-
-        # Update state
+        # Persist the physical position shrink and its exact accounting event
+        # before DB booking. A crash must never leave the old full position on
+        # disk after its partial PnL was already committed.
         new_invested = max(0.0, current_invested - sold_invested)
         new_amount = safe_remaining(amount, sold_amount)
         new_fees_paid = _positive_finite(d.get("fees_paid", 0.0)) + partial_fee
@@ -1126,21 +1343,60 @@ class ExitsMixin:
             "partial_sold": True,
             "invested_usdt": new_invested,
             "amount": new_amount,
+            "original_amount": original_amount,
+            "initial_entry_fee": initial_entry_fee,
             "fees_paid": new_fees_paid,
             "break_even": True,
+            "partial_exit_client_order_id": None,
+            "partial_exit_outcome_uncertain": False,
+            "partial_exit_requested_amount": None,
             "partial_tp_blocked_min_notional": False,
             "partial_tp_blocked_min_notional_until": 0.0,
         }
-        if not accounting_ok:
-            from bot_utils.trade_state import normalize_pending_accounting_items
-            pending = normalize_pending_accounting_items(
-                d.get("accounting_pending_partials"))
-            pending.append(partial_trade)
-            updates["accounting_pending_partials"] = pending
+        from bot_utils.trade_state import normalize_pending_accounting_items
+        pending = normalize_pending_accounting_items(
+            d.get("accounting_pending_partials"))
+        pending.append(partial_trade)
+        updates["accounting_pending_partials"] = pending
+        try:
+            state_persisted = self.state.update_many(sym, updates)
+        except Exception as e:
+            state_persisted = False
+            self._log_error(f"spot partial state write-ahead {sym}", e)
+        if state_persisted is False:
+            log_event(
+                f" {sym}: partial-TP state write-ahead failed - DB booking "
+                f"deferred fail-closed",
+                "ERROR",
+            )
+            # The physical partial fill already happened. Report this tick as
+            # handled so the caller cannot immediately run a second full-exit
+            # decision from its stale pre-fill snapshot.
+            return True
+
+        try:
+            accounting_ok = bool(save_trade_db(**partial_trade))
+        except Exception as e:
+            accounting_ok = False
+            self._log_error(f"spot partial save_trade_db {sym}", e)
+        if accounting_ok:
+            try:
+                cleared = self.state.update(
+                    sym, "accounting_pending_partials", pending[:-1]
+                )
+            except Exception as e:
+                cleared = False
+                self._log_error(f"spot partial pending clear {sym}", e)
+            if cleared is False:
+                log_event(
+                    f" {sym}: partial-TP booked but durable pending clear "
+                    f"failed; idempotent retry retained",
+                    "ERROR",
+                )
+        else:
             log_event(
                 f" {sym}: partial-TP DB save failed  slice kept "
                 f"for accounting retry", "WARN")
-        self.state.update_many(sym, updates)
 
         log_event(
             f"[{self.BOT_NAME}]  {int(partial_pct*100)}% von {sym} bei "
@@ -1209,6 +1465,14 @@ class ExitsMixin:
         # make us sell a stale `amount`.
         d = d_live
 
+        if _has_pending_spot_partial_exit(d):
+            log_event(
+                f" {sym}: full exit deferred while partial-TP client-id "
+                "reconciliation is pending",
+                "WARN",
+            )
+            return
+
         buy = _positive_finite(d.get("buy"))
         remaining_amount = _positive_finite(d.get("amount"))
         current_invested = _positive_finite(d.get("invested_usdt"))
@@ -1238,17 +1502,26 @@ class ExitsMixin:
                 close_fee = remaining_amount * fill_price * 0.001
         else:
             try:
+                persisted_client_order_id = order_id_text_or_none(
+                    d.get("full_exit_client_order_id")
+                )
                 client_order_id = _ensure_spot_exit_client_order_id(
                     self, sym, d, "full"
                 )
                 order = None
-                if d.get("full_exit_outcome_uncertain"):
+                if (
+                    persisted_client_order_id == client_order_id
+                    or d.get("full_exit_outcome_uncertain")
+                ):
                     from bot_utils.spot_exits import (
                         _find_spot_exit_order_by_client_id,
                     )
                     try:
                         order = _find_spot_exit_order_by_client_id(
-                            self.ex, f"{sym}/USDT", client_order_id
+                            self.ex,
+                            f"{sym}/USDT",
+                            client_order_id,
+                            expected_amount=requested_amount,
                         )
                     except Exception as recovery_error:
                         log_event(
@@ -1264,30 +1537,42 @@ class ExitsMixin:
                 # retries until their stable client id has been reconciled.
                 if order is None:
                     from bot_utils.network_retry import with_network_retry
-                    order, sold = with_network_retry(
-                        operation=lambda: spot_market_sell_safe(
-                            self.ex, f"{sym}/USDT", remaining_amount,
-                            client_order_id=client_order_id,
-                        ),
-                        action_label=f"sell {sym}",
-                        max_attempts=3,
-                        base_delay=0.5,
-                        shutdown_event=self._shutdown_event,
-                        log_event=log_event,
-                    )
+                    from bot_utils.trade_state import registry_order_guard
+                    with registry_order_guard(
+                        self.state, sym, d
+                    ) as ownership_live:
+                        if not isinstance(ownership_live, dict):
+                            return
+                        if ownership_live.get("claim_conflict"):
+                            log_event(
+                                f"{sym}: sell blocked by registry claim conflict",
+                                "ERROR",
+                            )
+                            return
+                        order, sold = with_network_retry(
+                            operation=lambda: spot_market_sell_safe(
+                                self.ex, f"{sym}/USDT", remaining_amount,
+                                client_order_id=client_order_id,
+                            ),
+                            action_label=f"sell {sym}",
+                            max_attempts=3,
+                            base_delay=0.5,
+                            shutdown_event=self._shutdown_event,
+                            log_event=log_event,
+                        )
                 else:
                     sold = remaining_amount
                 raw_status = order.get("status") if isinstance(order, dict) else None
-                normalized_status = (
-                    raw_status.strip().lower()
-                    if isinstance(raw_status, str) else ""
-                )
-                if normalized_status in {"new", "open", "pending"}:
+                normalized_status = normalize_spot_order_status(raw_status)
+                if spot_sell_requires_terminal_recovery(
+                    order, requested_amount
+                ):
                     _mark_spot_exit_outcome_uncertain(
                         self, sym, d, "full"
                     )
                     log_event(
-                        f"Sell order {sym} is still {normalized_status}; "
+                        f"Sell order {sym} is still "
+                        f"{normalized_status or 'unresolved'}; "
                         f"booking and any retry deferred until terminal state",
                         "WARN",
                     )
@@ -1310,12 +1595,23 @@ class ExitsMixin:
                 # (remainder below min-notional, matching-engine reject). Keep
                 # the position + a short cooldown so the next tick retries; do
                 # NOT book and do NOT remove state.
-                from bot_utils.order_utils import order_was_filled
-                if not order_was_filled(order, filled_amount):
+                from bot_utils.order_utils import (
+                    order_has_proven_zero_fill,
+                    order_has_unquantified_fill_notional,
+                    order_was_filled,
+                )
+                unquantified_fill = order_has_unquantified_fill_notional(order)
+                if (
+                    unquantified_fill
+                    or not order_was_filled(order, filled_amount)
+                ):
                     _st = raw_status if raw_status is not None else "?"
-                    if normalized_status in {
+                    if (
+                        normalized_status in {
                         "canceled", "cancelled", "rejected", "expired",
-                    }:
+                        }
+                        and order_has_proven_zero_fill(order)
+                    ):
                         if not _reset_spot_exit_intent(
                             self, sym, d, "full"
                         ):
@@ -1379,6 +1675,29 @@ class ExitsMixin:
                 log_event(
                     f"{sym}: nothing left to sell ({ib})  booking offline "
                     f"close before removing state", "WARN")
+                if d.get("unpriced_external_partials"):
+                    flat_pending = {
+                        "verified_flat_pending_accounting": True,
+                        "verified_flat_reason": reason,
+                        "verified_flat_at": _utc_now_str(),
+                    }
+                    try:
+                        flat_persisted = self.state.update_many(
+                            sym, flat_pending
+                        )
+                    except Exception as state_err:
+                        flat_persisted = False
+                        self._log_error(
+                            f"spot orphan combined accounting {sym}", state_err
+                        )
+                    level = "WARN" if flat_persisted is not False else "ERROR"
+                    log_event(
+                        f"{sym}: base balance is zero with unpriced earlier "
+                        f"partials; direct accounting deferred to combined "
+                        f"offline reconcile",
+                        level,
+                    )
+                    return
                 try:
                     from core.spot_bot_reconcile import _record_spot_offline_close
                     if not _record_spot_offline_close(self, sym, d):
@@ -1420,13 +1739,19 @@ class ExitsMixin:
 
         # Proportional entry fee  safe helper won't double-deduct if
         # original_amount is missing AND a partial-TP already executed.
+        partial_sold = bool(d.get("partial_sold"))
         initial_entry_fee = _positive_finite(
-            d.get("initial_entry_fee", d.get("fees_paid", 0.0)))
-        original_amount = _positive_finite(
-            d.get("original_amount"), remaining_amount)
+            d.get(
+                "initial_entry_fee",
+                0.0 if partial_sold else d.get("fees_paid", 0.0),
+            )
+        )
+        original_amount = _positive_finite(d.get("original_amount"))
+        if original_amount <= 0 and not partial_sold:
+            original_amount = requested_amount
         proportional_entry_fee = safe_proportional_fee(
             initial_entry_fee, remaining_amount, original_amount,
-            partial_sold=bool(d.get("partial_sold"))
+            partial_sold=partial_sold
         )
         accumulated_fees = _positive_finite(d.get("fees_paid", 0.0)) + close_fee
         profit_usdt = round(
@@ -1448,6 +1773,31 @@ class ExitsMixin:
             }
 
         sell_time = _utc_now_str()
+        if (
+            not partial_live_fill
+            and d.get("unpriced_external_partials")
+        ):
+            flat_pending = {
+                "verified_flat_pending_accounting": True,
+                "verified_flat_reason": reason,
+                "verified_flat_at": sell_time,
+                "verified_flat_sell_price": fill_price,
+                "verified_flat_exchange_order_id": exch_oid,
+            }
+            try:
+                flat_persisted = self.state.update_many(sym, flat_pending)
+            except Exception as state_err:
+                flat_persisted = False
+                self._log_error(
+                    f"spot verified-flat combined accounting {sym}", state_err
+                )
+            level = "WARN" if flat_persisted is not False else "ERROR"
+            log_event(
+                f" {sym}: final sell filled with unpriced earlier partials; "
+                f"direct accounting deferred to combined offline reconcile",
+                level,
+            )
+            return
         accounting_mode_is_sim = d.get("accounting_pending_mode_is_sim",
                                        self.simulation)
         mfe_pct, mae_pct, giveback_pct = _spot_excursion_metrics(d, fill_price)
@@ -1473,8 +1823,78 @@ class ExitsMixin:
             mae_pct=mae_pct,
             giveback_pct=giveback_pct,
         )
+        pending_partials = None
         if partial_live_fill:
             trade_row["is_partial"] = True
+            remaining_after_fill = safe_remaining(
+                requested_amount, remaining_amount
+            )
+            from bot_utils.trade_state import normalize_pending_accounting_items
+            pending_partials = normalize_pending_accounting_items(
+                d.get("accounting_pending_partials")
+            )
+            pending_partials.append(trade_row)
+            partial_state = {
+                "amount": remaining_after_fill,
+                "invested_usdt": max(
+                    0.0, current_invested - booked_invested
+                ),
+                "original_amount": original_amount,
+                "initial_entry_fee": initial_entry_fee,
+                "fees_paid": accumulated_fees,
+                "accounting_pending_partials": pending_partials,
+                "last_partial_fill_reason": reason,
+                "last_partial_fill_order_id": exch_oid,
+                "closing_retry_pending": True,
+                "closing_retry_reason": reason,
+                **residual_intent_updates,
+            }
+            try:
+                pending_persisted = self.state.update_many(sym, partial_state)
+            except Exception as state_err:
+                pending_persisted = False
+                self._log_error(
+                    f"spot partial full-exit write-ahead {sym}", state_err
+                )
+            if pending_persisted is False:
+                log_event(
+                    f" {sym}: partial full-exit fill was not booked because "
+                    f"its residual accounting state was not durable",
+                    "ERROR",
+                )
+                return
+        else:
+            pending_close = {
+                "accounting_pending": True,
+                "accounting_pending_reason": reason,
+                "accounting_pending_sell_price": fill_price,
+                "accounting_pending_sell_time": sell_time,
+                "accounting_pending_profit_pct": real_prof_pct,
+                "accounting_pending_profit_usdt": profit_usdt,
+                "accounting_pending_invested_usdt": booked_invested,
+                "accounting_pending_mode_is_sim": accounting_mode_is_sim,
+                "accounting_pending_fees_usdt": (
+                    proportional_entry_fee + close_fee
+                ),
+                "accounting_pending_exchange_order_id": exch_oid,
+                "accounting_pending_mfe_pct": mfe_pct,
+                "accounting_pending_mae_pct": mae_pct,
+                "accounting_pending_giveback_pct": giveback_pct,
+            }
+            try:
+                pending_persisted = self.state.update_many(sym, pending_close)
+            except Exception as state_err:
+                pending_persisted = False
+                self._log_error(
+                    f"spot full accounting write-ahead {sym}", state_err
+                )
+            if pending_persisted is False:
+                log_event(
+                    f" {sym}: filled full exit was not booked because its "
+                    f"accounting recovery marker was not durable",
+                    "ERROR",
+                )
+                return
         try:
             accounting_ok = bool(save_trade_db(**trade_row))
         except Exception as e:
@@ -1482,62 +1902,32 @@ class ExitsMixin:
             self._log_error(f"spot full save_trade_db {sym}", e)
         if not accounting_ok:
             if partial_live_fill:
-                remaining_after_fill = safe_remaining(
-                    requested_amount, remaining_amount)
-                from bot_utils.trade_state import normalize_pending_accounting_items
-                pending = normalize_pending_accounting_items(
-                    d.get("accounting_pending_partials"))
-                pending.append(trade_row)
-                try:
-                    self.state.update_many(sym, {
-                        "amount": remaining_after_fill,
-                        "invested_usdt": max(0.0, current_invested - booked_invested),
-                        "fees_paid": accumulated_fees,
-                        "accounting_pending_partials": pending,
-                        "closing_retry_pending": True,
-                        "closing_retry_reason": reason,
-                        **residual_intent_updates,
-                    })
-                except Exception as state_err:
-                    self._log_error(
-                        f"spot mark partial accounting_pending {sym}", state_err)
                 log_event(
                     f" {sym}: partial full-exit fill DB save failed - "
                     f"residual position kept for accounting retry", "WARN")
                 return
-            try:
-                self.state.update_many(sym, {
-                    "accounting_pending": True,
-                    "accounting_pending_reason": reason,
-                    "accounting_pending_sell_price": fill_price,
-                    "accounting_pending_sell_time": sell_time,
-                    "accounting_pending_profit_pct": real_prof_pct,
-                    "accounting_pending_profit_usdt": profit_usdt,
-                    "accounting_pending_mode_is_sim": self.simulation,
-                    "accounting_pending_fees_usdt": proportional_entry_fee + close_fee,
-                    "accounting_pending_exchange_order_id": exch_oid,
-                    "accounting_pending_mfe_pct": mfe_pct,
-                    "accounting_pending_mae_pct": mae_pct,
-                    "accounting_pending_giveback_pct": giveback_pct,
-                })
-            except Exception as state_err:
-                self._log_error(f"spot mark accounting_pending {sym}", state_err)
             log_event(
                 f" {sym}: full-exit DB save failed after filled sell  "
                 f"state kept for accounting retry", "WARN")
             return
         if partial_live_fill:
-            remaining_after_fill = safe_remaining(requested_amount, remaining_amount)
-            self.state.update_many(sym, {
-                "amount": remaining_after_fill,
-                "invested_usdt": max(0.0, current_invested - booked_invested),
-                "fees_paid": accumulated_fees,
-                "last_partial_fill_reason": reason,
-                "last_partial_fill_order_id": exch_oid,
-                "closing_retry_pending": True,
-                "closing_retry_reason": reason,
-                **residual_intent_updates,
-            })
+            try:
+                cleared = self.state.update(
+                    sym,
+                    "accounting_pending_partials",
+                    pending_partials[:-1],
+                )
+            except Exception as state_err:
+                cleared = False
+                self._log_error(
+                    f"spot partial full-exit pending clear {sym}", state_err
+                )
+            if cleared is False:
+                log_event(
+                    f" {sym}: partial full-exit was booked but its durable "
+                    f"pending marker could not be cleared; idempotent retry kept",
+                    "ERROR",
+                )
             log_event(
                 f" {sym}: full-exit order partially filled "
                 f"({remaining_amount:.8f}/{requested_amount:.8f}); "

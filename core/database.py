@@ -647,12 +647,49 @@ def _purge_junk_claims(conn) -> None:
         cutoff = (
             _utcnow() - timedelta(minutes=_AUTO_TRANSIENT_CLAIM_TTL_MINUTES)
         ).strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute("DELETE FROM bot_open_positions "
-                     "WHERE state IN ('CLAIMING','ADOPTING') "
-                     "AND COALESCE(amount, 0) <= 0 "
-                     "AND COALESCE(invested_usdt, 0) <= 0 "
-                     "AND opened_at < ?",
-                     (cutoff,))
+        stale_rows = conn.execute(
+            "SELECT bot_name, symbol, extra_json "
+            "FROM bot_open_positions "
+            "WHERE state IN ('CLAIMING','ADOPTING') "
+            "AND COALESCE(amount, 0) <= 0 "
+            "AND COALESCE(invested_usdt, 0) <= 0 "
+            "AND opened_at < ?",
+            (cutoff,),
+        ).fetchall()
+        for bot_name, symbol, extra_json in stale_rows:
+            try:
+                extra = json.loads(extra_json or "{}")
+                entry_id = (
+                    _causal_entry_id_db(extra.get("entry_id"), required=True)
+                    if isinstance(extra, dict) and "entry_id" in extra
+                    else None
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                entry_id = None
+            if entry_id is not None:
+                intent_row = conn.execute(
+                    "SELECT bot_name, mode, symbol FROM order_intents "
+                    "WHERE intent_id=?",
+                    (entry_id,),
+                ).fetchone()
+                if (
+                    intent_row is not None
+                    and str(intent_row[0]).strip() == str(bot_name).strip()
+                    and str(intent_row[1]).strip().upper() == "LIVE"
+                    and _base_symbol(intent_row[2]) == _base_symbol(symbol)
+                ):
+                    # A journal-bound placeholder is durable recovery evidence,
+                    # not transient junk. Terminal-zero cleanup owns deletion.
+                    continue
+            conn.execute(
+                "DELETE FROM bot_open_positions "
+                "WHERE bot_name=? AND symbol=? "
+                "AND state IN ('CLAIMING','ADOPTING') "
+                "AND COALESCE(amount, 0) <= 0 "
+                "AND COALESCE(invested_usdt, 0) <= 0 "
+                "AND opened_at < ?",
+                (bot_name, symbol, cutoff),
+            )
         conn.commit()
     except Exception:
         pass
@@ -1354,6 +1391,137 @@ def trade_pnl_sanity_reason(
     return None
 
 
+_TRADE_DEDUP_PAYLOAD_COLUMNS = """
+    buy_price, sell_price, profit_pct, profit_usdt, invested_usdt,
+    COALESCE(is_partial, 0), COALESCE(is_futures, 0), position_type,
+    leverage, liquidation_price, funding_paid, fees_usdt,
+    is_sim, entry_id
+"""
+
+
+def _trade_dedup_payload_matches(row, expected: tuple) -> bool:
+    try:
+        return row is not None and tuple(row) == expected
+    except Exception:
+        return False
+
+
+def _log_trade_dedup_conflict(bot_name: str, symbol: str, is_partial: bool) -> None:
+    try:
+        from core.logger import log_event, log_struct
+        log_event(
+            f"[DB] Refusing conflicting accounting replay for {bot_name}:{symbol}",
+            "ERROR",
+        )
+        log_struct(
+            "db_trade_dedup_payload_conflict",
+            bot_name=bot_name,
+            symbol=symbol,
+            is_partial=is_partial,
+        )
+    except Exception:
+        pass
+
+
+def trade_db_payload_rejection_reason(payload: dict) -> str | None:
+    """Pure preflight for a pending ``save_trade_db`` replay payload."""
+    required = (
+        "bot_name", "symbol", "buy_price", "sell_price", "buy_time",
+        "sell_time", "profit_pct", "profit_usdt", "invested_usdt", "reason",
+    )
+    if not isinstance(payload, dict):
+        return "payload must be a dict"
+    missing = [key for key in required if key not in payload]
+    if missing:
+        return f"missing required fields: {','.join(missing)}"
+
+    bot_name = payload.get("bot_name")
+    if not isinstance(bot_name, str) or not bot_name.strip():
+        return "bot_name must be non-empty text"
+    bot_name = bot_name.strip()
+    if "/" in bot_name or ":" in bot_name:
+        return "bot_name looks like a market symbol"
+    symbol = payload.get("symbol")
+    if not isinstance(symbol, str) or not symbol.strip():
+        return "symbol must be non-empty text"
+    is_futures = payload.get("is_futures", False)
+    is_partial = payload.get("is_partial", False)
+    if not isinstance(is_futures, bool):
+        return "is_futures must be boolean"
+    if not isinstance(is_partial, bool):
+        return "is_partial must be boolean"
+    try:
+        _required_text_db(payload.get("reason"), "reason", max_length=256)
+        _, parsed_buy_time = _trade_timestamp_db(
+            payload.get("buy_time"), "buy_time"
+        )
+        _, parsed_sell_time = _trade_timestamp_db(
+            payload.get("sell_time"), "sell_time"
+        )
+        if parsed_sell_time < parsed_buy_time:
+            return "sell_time must not precede buy_time"
+        if parsed_sell_time > _utcnow() + timedelta(minutes=5):
+            return "sell_time is materially in the future"
+        _trade_exchange_order_id_db(payload.get("exchange_order_id"))
+        _causal_entry_id_db(payload.get("entry_id"), required=False)
+    except ValueError as exc:
+        return str(exc)
+
+    explicit_mode = _coerce_mode_is_sim(payload.get("mode_is_sim"))
+    if payload.get("mode_is_sim") is not None and explicit_mode is None:
+        return "mode_is_sim is invalid"
+    if bot_name.endswith(_SIM_TAG) and explicit_mode is False:
+        return "SIM bot_name conflicts with explicit LIVE mode"
+
+    position_type = payload.get("position_type")
+    if position_type is not None:
+        if not isinstance(position_type, str) or not position_type.strip():
+            return "position_type must be known text"
+        normalized_side = position_type.strip().upper()
+        if normalized_side not in {"SPOT", "FUTURES", "LONG", "SHORT"}:
+            return "position_type is unknown"
+        if is_futures and normalized_side == "SPOT":
+            return "futures trade cannot use SPOT position_type"
+        if not is_futures and normalized_side != "SPOT":
+            return "spot trade cannot use futures position_type"
+
+    accounting_values = {
+        "buy_price": payload.get("buy_price"),
+        "sell_price": payload.get("sell_price"),
+        "profit_pct": payload.get("profit_pct"),
+        "profit_usdt": payload.get("profit_usdt"),
+        "invested_usdt": payload.get("invested_usdt"),
+        "funding_paid": payload.get("funding_paid", 0.0),
+        "fees_usdt": payload.get("fees_usdt", 0.0),
+    }
+    if payload.get("leverage") is not None:
+        accounting_values["leverage"] = payload.get("leverage")
+    normalized = {}
+    for name, value in accounting_values.items():
+        if isinstance(value, bool):
+            return f"{name} is not finite"
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return f"{name} is not finite"
+        if not math.isfinite(number):
+            return f"{name} is not finite"
+        normalized[name] = number
+    if normalized["buy_price"] <= 0 or normalized["sell_price"] <= 0:
+        return "invalid prices"
+    if normalized["invested_usdt"] <= 0:
+        return "invested_usdt <= 0"
+    return trade_pnl_sanity_reason(
+        profit_pct=normalized["profit_pct"],
+        profit_usdt=normalized["profit_usdt"],
+        invested_usdt=normalized["invested_usdt"],
+        is_futures=is_futures,
+        leverage=payload.get("leverage"),
+        fees_usdt=normalized["fees_usdt"],
+        funding_paid=normalized["funding_paid"],
+    )
+
+
 def save_trade_db(
     bot_name, symbol, buy_price, sell_price, buy_time, sell_time,
     profit_pct, profit_usdt, invested_usdt, reason,
@@ -1403,6 +1571,8 @@ def save_trade_db(
             )
             if parsed_sell_time < parsed_buy_time:
                 raise ValueError("sell_time must not precede buy_time")
+            if parsed_sell_time > _utcnow() + timedelta(minutes=5):
+                raise ValueError("sell_time is materially in the future")
         except ValueError as exc:
             metadata_error = str(exc)
 
@@ -1577,6 +1747,31 @@ def save_trade_db(
     except Exception:
         hour_of_day = day_of_week = None
 
+    is_partial_db = 1 if is_partial else 0
+    is_futures_db = 1 if is_futures else 0
+    leverage_db = _sanitize_float(leverage, None) if leverage is not None else None
+    liquidation_price_db = (
+        _sanitize_float(liquidation_price, None)
+        if liquidation_price is not None
+        else None
+    )
+    dedup_payload = (
+        buy_price,
+        sell_price,
+        profit_pct,
+        profit_usdt,
+        invested_usdt,
+        is_partial_db,
+        is_futures_db,
+        position_type,
+        leverage_db,
+        liquidation_price_db,
+        funding_paid,
+        fees_usdt,
+        trade_is_sim,
+        entry_id,
+    )
+
     conn = get_connection()
     try:
         # The read-before-insert idempotency checks must be one cross-process
@@ -1584,8 +1779,8 @@ def save_trade_db(
         # workers can both observe "missing" and book the same exchange fill.
         conn.execute("BEGIN IMMEDIATE")
         if is_partial and exchange_order_id is not None:
-            existing_partial = conn.execute("""
-            SELECT 1 FROM trades
+            existing_partial = conn.execute(f"""
+            SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS} FROM trades
              WHERE bot_name = ?
                AND symbol = ?
                AND buy_time = ?
@@ -1595,16 +1790,21 @@ def save_trade_db(
              LIMIT 1
             """, (
                 bot_name, symbol, buy_time,
-                1 if is_futures else 0,
+                is_futures_db,
                 str(exchange_order_id),
             )).fetchone()
             if existing_partial:
-                conn.commit()
-                return True
+                matches = _trade_dedup_payload_matches(
+                    existing_partial, dedup_payload
+                )
+                conn.commit() if matches else conn.rollback()
+                if not matches:
+                    _log_trade_dedup_conflict(bot_name, symbol, is_partial)
+                return matches
         if not is_partial:
             if exchange_order_id is not None:
-                existing_final = conn.execute("""
-                SELECT 1 FROM trades
+                existing_final = conn.execute(f"""
+                SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS} FROM trades
                  WHERE bot_name = ?
                    AND symbol = ?
                    AND buy_time = ?
@@ -1614,12 +1814,12 @@ def save_trade_db(
                  LIMIT 1
                 """, (
                     bot_name, symbol, buy_time,
-                    1 if is_futures else 0,
+                    is_futures_db,
                     str(exchange_order_id),
                 )).fetchone()
             else:
-                existing_final = conn.execute("""
-                SELECT 1 FROM trades
+                existing_final = conn.execute(f"""
+                SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS} FROM trades
                  WHERE bot_name = ?
                    AND symbol = ?
                    AND buy_time = ?
@@ -1629,11 +1829,16 @@ def save_trade_db(
                  LIMIT 1
                 """, (
                     bot_name, symbol, buy_time,
-                    1 if is_futures else 0,
+                    is_futures_db,
                 )).fetchone()
             if existing_final:
-                conn.commit()
-                return True
+                matches = _trade_dedup_payload_matches(
+                    existing_final, dedup_payload
+                )
+                conn.commit() if matches else conn.rollback()
+                if not matches:
+                    _log_trade_dedup_conflict(bot_name, symbol, is_partial)
+                return matches
 
         cur = conn.execute("""
         INSERT OR IGNORE INTO trades
@@ -1656,12 +1861,12 @@ def save_trade_db(
             _sanitize_float(change_pct, None) if change_pct is not None else None,
             hour_of_day, day_of_week,
             1 if profit_usdt >= 0 else 0,
-            1 if is_partial else 0,
+            is_partial_db,
             _sanitize_float(btc_trend, None) if btc_trend is not None else None,
             _optional_fear_greed_db(fear_greed),
-            1 if is_futures else 0,
-            position_type, _sanitize_float(leverage, None) if leverage is not None else None,
-            _sanitize_float(liquidation_price, None) if liquidation_price is not None else None,
+            is_futures_db,
+            position_type, leverage_db,
+            liquidation_price_db,
             funding_paid, fees_usdt,
             str(exchange_order_id) if exchange_order_id is not None else None,
             mfe_pct, mae_pct, giveback_pct,
@@ -1670,17 +1875,19 @@ def save_trade_db(
         ))
         inserted = cur.rowcount > 0
         if inserted:
-            today = _local_today_str()   # lokal-konsistent mit Bad-Hours
+            # Accounting retries can cross local midnight. Bucket the result
+            # by the validated economic event time, not by commit/retry time.
+            trade_date = utc_to_local_date_str(sell_time) or sell_time[:10]
             conn.execute("""
             INSERT INTO daily_pnl (bot_name, trade_date, total_profit, trade_count)
             VALUES (?, ?, ?, 1)
             ON CONFLICT(bot_name, trade_date) DO UPDATE SET
                 total_profit = total_profit + excluded.total_profit,
                 trade_count  = trade_count  + 1""",
-                (bot_name, today, profit_usdt))
+                (bot_name, trade_date, profit_usdt))
         else:
-            existing = conn.execute("""
-            SELECT 1 FROM trades
+            existing = conn.execute(f"""
+            SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS} FROM trades
              WHERE bot_name = ?
                AND symbol = ?
                AND buy_time = ?
@@ -1691,12 +1898,14 @@ def save_trade_db(
              LIMIT 1
             """, (
                 bot_name, symbol, buy_time, sell_time,
-                1 if is_partial else 0,
-                1 if is_futures else 0,
+                is_partial_db,
+                is_futures_db,
                 str(exchange_order_id) if exchange_order_id is not None else None,
             )).fetchone()
-            if not existing:
-                conn.commit()
+            matches = _trade_dedup_payload_matches(existing, dedup_payload)
+            if not matches:
+                conn.rollback()
+                _log_trade_dedup_conflict(bot_name, symbol, is_partial)
                 return False
         conn.commit()
         return True
@@ -2691,12 +2900,33 @@ def release_advisory_lock(lock_name: str, holder_id: str) -> bool:
         return False
 
 
-def release_advisory_locks_for_dead_pid(pid: int, lock_prefix: str = "close:") -> int:
-    """Release close advisory locks owned by an already stopped process."""
+def release_advisory_locks_for_dead_process(
+    pid: int,
+    run_id: str,
+    lock_prefix: str = "close:",
+) -> int:
+    """Release locks for one proven-dead process incarnation.
+
+    PID-only cleanup is unsafe on Windows because a PID may already belong to
+    a newly started process. Legacy ``PID-thread`` holders deliberately expire
+    through their bounded TTL instead of being deleted by a wildcard.
+    """
     if isinstance(pid, bool) or not isinstance(pid, int):
         raise ValueError("pid must be an integer")
     if not 1 <= pid <= 2_147_483_647:
         raise ValueError("pid is outside the supported range")
+    validated_run_id = _required_text_db(
+        run_id, "run_id", max_length=32
+    ).lower()
+    if (
+        len(validated_run_id) != 32
+        or not validated_run_id.isascii()
+        or any(
+            char not in "0123456789abcdef"
+            for char in validated_run_id
+        )
+    ):
+        raise ValueError("run_id must be a 32-character hexadecimal identity")
     validated_prefix = _required_text_db(
         lock_prefix, "lock_prefix", max_length=64
     )
@@ -2706,8 +2936,8 @@ def release_advisory_locks_for_dead_pid(pid: int, lock_prefix: str = "close:") -
     try:
         conn = get_connection()
         cur = conn.execute(
-            "DELETE FROM advisory_locks WHERE lock_name LIKE ? AND holder_id LIKE ?",
-            (f"{validated_prefix}%", f"{pid}-%"),
+            "DELETE FROM advisory_locks WHERE lock_name LIKE ? AND holder_id=?",
+            (f"{validated_prefix}%", f"v2:{pid}:{validated_run_id}"),
         )
         conn.commit()
         return int(cur.rowcount or 0)
@@ -3065,6 +3295,86 @@ def remove_open_position(bot_name: str, symbol: str) -> bool:
         return False
 
 
+def remove_pending_open_position_claim(bot_name: str, symbol: str) -> bool:
+    """Delete one exact claim only while its durable release marker remains.
+
+    Startup recovery must not use the normal base-wide removal: another claim
+    generation or a same-base alias may have appeared after the scan.  The
+    marker recheck and exact delete share one SQLite write transaction, making
+    this a compare-and-delete barrier across processes.
+    """
+    if not isinstance(bot_name, str) or not isinstance(symbol, str):
+        return False
+    normalized_bot = bot_name.strip()
+    normalized_symbol = symbol.strip()
+    if (
+        not normalized_bot
+        or "/" in normalized_bot
+        or ":" in normalized_bot
+        or not normalized_symbol
+    ):
+        return False
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT extra_json FROM bot_open_positions "
+            "WHERE bot_name=? AND symbol=?",
+            (normalized_bot, normalized_symbol),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return True
+        try:
+            extra = json.loads(row["extra_json"] or "{}")
+        except (TypeError, ValueError):
+            conn.execute("ROLLBACK")
+            return False
+        if (
+            not isinstance(extra, dict)
+            or extra.get("claim_release_pending") is not True
+        ):
+            conn.execute("ROLLBACK")
+            return False
+        conn.execute(
+            "DELETE FROM bot_open_positions WHERE bot_name=? AND symbol=?",
+            (normalized_bot, normalized_symbol),
+        )
+        remaining = conn.execute(
+            "SELECT 1 FROM bot_open_positions WHERE bot_name=? AND symbol=?",
+            (normalized_bot, normalized_symbol),
+        ).fetchone()
+        if remaining is not None:
+            conn.execute("ROLLBACK")
+            return False
+        conn.commit()
+        return True
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        try:
+            from core.logger import log_event, log_struct
+            log_event(
+                f"[DB] pending claim remove FAILED for {normalized_symbol}: "
+                f"{exc}",
+                "WARN",
+            )
+            log_struct(
+                "db_pending_claim_remove_error",
+                bot_name=normalized_bot,
+                symbol=normalized_symbol,
+                error=str(exc),
+            )
+        except Exception:
+            print(
+                f"[DB] pending claim remove {normalized_symbol}: {exc}",
+                flush=True,
+            )
+        return False
+
+
 def get_open_positions_db(bot_name: str) -> list:
     conn = get_connection()
     try:
@@ -3194,7 +3504,9 @@ def try_claim_orphan(bot_name: str, symbol: str, position_type: str = "FUTURES")
 
 def _try_claim(bot_name, symbol, position_type, claim_state,
                allow_existing_owner: bool = False, *, intent_id: str | None = None,
-               notional_usdt: float = 0.0, reservation_mode: str = "LIVE") -> bool:
+               notional_usdt: float = 0.0, reservation_mode: str = "LIVE",
+               contract_size: float | None = None,
+               oversize_notional_ceiling: float | None = None) -> bool:
     if not isinstance(bot_name, str) or not bot_name.strip():
         return False
     if not isinstance(symbol, str) or not symbol.strip():
@@ -3209,6 +3521,8 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
     validated_intent_id = None
     reserved = 0.0
     normalized_reservation_mode = "LIVE"
+    validated_contract_size = None
+    validated_oversize_ceiling = None
     if intent_id is not None:
         if not isinstance(intent_id, str) or not intent_id.strip():
             return False
@@ -3222,6 +3536,19 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
         if normalized_reservation_mode != "LIVE":
             return False
         reserved = reserved_value
+        if contract_size is not None:
+            validated_contract_size = _optional_finite_db(contract_size)
+            if validated_contract_size is None or validated_contract_size <= 0.0:
+                return False
+        if oversize_notional_ceiling is not None:
+            validated_oversize_ceiling = _optional_finite_db(
+                oversize_notional_ceiling
+            )
+            if (
+                validated_oversize_ceiling is None
+                or validated_oversize_ceiling <= 0.0
+            ):
+                return False
     # Swap-guard: a real bot_name is never a market symbol. A market-shaped
     # bot_name means the caller swapped (bot_name, symbol)  refuse so we never
     # write a junk row that blocks coins (the swapped row's symbol would be the
@@ -3237,6 +3564,28 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
     base = _base_symbol(symbol)
     if not base:
         return False
+    claim_opened_at = (
+        _utcnow_str() if validated_intent_id is not None else None
+    )
+    if validated_intent_id is not None:
+        claim_extra = {
+            "entry_id": validated_intent_id,
+            "entry_claim_opened_at": claim_opened_at,
+            "entry_intended_notional": reserved,
+        }
+        if validated_contract_size is not None:
+            claim_extra["entry_contract_size"] = validated_contract_size
+        if validated_oversize_ceiling is not None:
+            claim_extra["entry_oversize_notional_ceiling"] = (
+                validated_oversize_ceiling
+            )
+        claim_extra_json = json.dumps(
+            claim_extra,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    else:
+        claim_extra_json = None
     # Only conflict with same-class claims  spot and futures use separate
     # wallets, so a spot claim must not block a futures claim of the same base.
     class_clause = ("position_type != 'SPOT'" if _is_futures_ptype(normalized_position_type)
@@ -3255,7 +3604,7 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
                 )""")
             conn.commit()
         conn.execute("BEGIN IMMEDIATE")
-        now_str = _utcnow_str()
+        now_str = claim_opened_at or _utcnow_str()
         if allow_existing_owner:
             rows = conn.execute(
                 f"""SELECT bot_name FROM bot_open_positions
@@ -3284,15 +3633,17 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
         cur = conn.execute(
             f"""INSERT INTO bot_open_positions
                    (bot_name, symbol, buy_price, buy_time, amount,
-                    invested_usdt, position_type, leverage, state, opened_at)
-               SELECT ?, ?, 0, '', 0, 0, ?, 1, ?, ?
+                    invested_usdt, position_type, leverage, state, extra_json,
+                    opened_at)
+               SELECT ?, ?, 0, '', 0, 0, ?, 1, ?, ?, ?
                WHERE NOT EXISTS (
                    SELECT 1 FROM bot_open_positions
                    WHERE (symbol = ?
                           OR symbol LIKE ? ESCAPE '!'
                           OR symbol LIKE ? ESCAPE '!')
                      AND {class_clause})""",
-            (bot_name, base, normalized_position_type, claim_state, now_str,
+            (bot_name, base, normalized_position_type, claim_state,
+             claim_extra_json, now_str,
              *_literal_symbol_match_params(base)))
         if cur.rowcount > 0 and validated_intent_id is not None:
             expires = (_utcnow() + timedelta(seconds=120)).strftime(
@@ -3324,7 +3675,9 @@ def claim_symbol_for_entry(bot_name: str, symbol: str,
                            position_type: str = "FUTURES", *,
                            intent_id: str | None = None,
                            notional_usdt: float = 0.0,
-                           mode: str = "LIVE") -> bool:
+                           mode: str = "LIVE",
+                           contract_size: float | None = None,
+                           oversize_notional_ceiling: float | None = None) -> bool:
     """Atomic pre-order entry claim (INSERTWHERE NOT EXISTS, symbol+class scoped).
 
     SIM/LIVE design + a KNOWN, ACCEPTED limitation: callers gate this behind
@@ -3348,6 +3701,8 @@ def claim_symbol_for_entry(bot_name: str, symbol: str,
         intent_id=intent_id,
         notional_usdt=notional_usdt,
         reservation_mode=mode,
+        contract_size=contract_size,
+        oversize_notional_ceiling=oversize_notional_ceiling,
     )
 
 
@@ -3837,6 +4192,7 @@ def transition_order_intent(
     fee_usdt=None,
     error=None,
     fallback_client_order_id=None,
+    release_terminal_zero_claim: bool = False,
 ) -> None:
     """Atomically apply one valid order-intent state transition."""
     validated_intent_id = _required_text_db(
@@ -3863,6 +4219,12 @@ def transition_order_intent(
     if fallback_id is not None and target != "FALLBACK_SUBMITTING":
         raise ValueError(
             "fallback client order id may only be set when fallback starts"
+        )
+    if not isinstance(release_terminal_zero_claim, bool):
+        raise ValueError("release_terminal_zero_claim must be boolean")
+    if release_terminal_zero_claim and target != "FINALIZED":
+        raise ValueError(
+            "terminal zero-fill claim release requires FINALIZED target"
         )
     normalized_filled_amount = _optional_nonnegative_finite_db(
         filled_amount, "filled_amount"
@@ -4068,6 +4430,78 @@ def transition_order_intent(
             fill_tolerance = max(1e-12, target_amount * 1e-9)
             if effective_filled_amount > target_amount + fill_tolerance:
                 raise ValueError("canceled order intent exceeds target amount")
+        delete_terminal_zero_claim = False
+        if release_terminal_zero_claim:
+            if (
+                current != "CANCELED"
+                or effective_filled_amount != 0.0
+                or effective_filled_notional != 0.0
+            ):
+                raise ValueError(
+                    "claim release requires canceled terminal zero-fill intent"
+                )
+            claim_base = _base_symbol(row["symbol"])
+            if not claim_base:
+                raise ValueError("order intent symbol is invalid")
+            claim = conn.execute(
+                """SELECT symbol, state, amount, invested_usdt, extra_json,
+                          opened_at
+                     FROM bot_open_positions
+                    WHERE bot_name=? AND symbol=?""",
+                (row["bot_name"], claim_base),
+            ).fetchone()
+            if claim is not None:
+                reservation = conn.execute(
+                    """SELECT bot_name, symbol, created_at
+                         FROM portfolio_reservations
+                        WHERE intent_id=?""",
+                    (validated_intent_id,),
+                ).fetchone()
+                try:
+                    claim_extra = json.loads(claim["extra_json"] or "{}")
+                except (TypeError, ValueError):
+                    claim_extra = None
+                exact_generation = (
+                    isinstance(claim_extra, dict)
+                    and claim_extra.get("entry_id") == validated_intent_id
+                )
+                legacy_generation = (
+                    isinstance(claim_extra, dict)
+                    and not claim_extra
+                    and reservation is not None
+                    and reservation["bot_name"] == row["bot_name"]
+                    and _base_symbol(reservation["symbol"]) == claim_base
+                    and reservation["created_at"] == claim["opened_at"]
+                )
+                claim_state = str(claim["state"]).strip().upper()
+                try:
+                    claim_amount = float(claim["amount"])
+                    claim_invested = float(claim["invested_usdt"])
+                except (TypeError, ValueError, OverflowError):
+                    claim_amount = claim_invested = math.nan
+                placeholder_claim = (
+                    claim_state == "CLAIMING"
+                    and claim_amount == 0.0
+                    and claim_invested == 0.0
+                )
+                provisional_open_claim = (
+                    claim_state == "OPEN"
+                    and claim_amount > 0.0
+                    and claim_invested > 0.0
+                    and isinstance(claim_extra, dict)
+                    and claim_extra.get("provisional") is True
+                )
+                if not (
+                    (
+                        exact_generation
+                        and (placeholder_claim or provisional_open_claim)
+                    )
+                    or (legacy_generation and placeholder_claim)
+                ):
+                    raise ValueError(
+                        "terminal zero-fill claim generation does not match intent"
+                    )
+                delete_terminal_zero_claim = placeholder_claim
         if fallback_id is not None:
             collision = conn.execute(
                 """SELECT 1 FROM order_intents
@@ -4121,6 +4555,14 @@ def transition_order_intent(
             except sqlite3.OperationalError as exc:
                 if "no such table: portfolio_reservations" not in str(exc).lower():
                     raise
+        if delete_terminal_zero_claim:
+            deleted = conn.execute(
+                """DELETE FROM bot_open_positions
+                    WHERE bot_name=? AND symbol=?""",
+                (row["bot_name"], claim_base),
+            )
+            if deleted.rowcount != 1:
+                raise ValueError("terminal zero-fill claim release lost generation")
         conn.commit()
     except sqlite3.IntegrityError as exc:
         conn.rollback()
@@ -4368,6 +4810,17 @@ def _positive_integer_db(value, field_name: str) -> int:
     if parsed <= 0 or parsed != value:
         raise ValueError(f"{field_name} must be a positive integer")
     return parsed
+
+
+def get_order_intent(intent_id: str) -> dict | None:
+    validated_intent_id = _required_text_db(
+        intent_id, "intent_id", max_length=64
+    )
+    row = get_connection().execute(
+        "SELECT * FROM order_intents WHERE intent_id=?",
+        (validated_intent_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def list_nonterminal_order_intents(bot_name: str | None = None) -> list[dict]:

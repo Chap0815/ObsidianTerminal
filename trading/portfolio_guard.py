@@ -161,9 +161,19 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
         valuation_notes = []
         for raw in positions_raw:
             if not isinstance(raw, dict):
-                continue
-            contracts = abs(_finite(raw.get("contracts")) or 0.0)
-            notional = abs(_finite(raw.get("notional")) or 0.0)
+                raise ValueError("malformed position row")
+            raw_contracts = raw.get("contracts")
+            raw_notional = raw.get("notional")
+            if raw_contracts is None and raw_notional is None:
+                raise ValueError("position quantity unavailable")
+            parsed_contracts = _finite(raw_contracts)
+            parsed_notional = _finite(raw_notional)
+            if raw_contracts is not None and parsed_contracts is None:
+                raise ValueError("position contracts unavailable")
+            if raw_notional is not None and parsed_notional is None:
+                raise ValueError("position notional unavailable")
+            contracts = abs(parsed_contracts or 0.0)
+            notional = abs(parsed_notional or 0.0)
             symbol = str(raw.get("symbol") or "UNKNOWN")
             if contracts <= 0.0 and notional <= 0.0:
                 continue
@@ -216,7 +226,7 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
                 notional = contracts * contract_size * price
                 if price_source == "entry_fallback":
                     valuation_notes.append(f"entry-price fallback for {symbol}")
-            if notional <= 0.0:
+            if not math.isfinite(notional) or notional <= 0.0:
                 raise ValueError(f"valuation unavailable for {symbol}")
             side = _position_side(raw)
             if side is None:
@@ -265,15 +275,23 @@ def collect_spot_snapshot(exchange) -> PortfolioSnapshot:
         if not isinstance(totals, dict) or not isinstance(free_balances, dict):
             raise ValueError("spot totals unavailable")
         stable_assets = {"USDT", "USDC", "USD", "FDUSD"}
-        equity = 0.0
-        positions = []
+        free = _finite(free_balances.get("USDT"))
+        if free is None or free < 0.0:
+            raise ValueError("spot USDT free balance unavailable")
+        normalized_totals = []
         for asset, raw_amount in totals.items():
             amount = _finite(raw_amount)
-            if amount is None or amount <= 0.0:
-                continue
-            normalized_asset = str(asset).upper()
+            if amount is None or amount < 0.0:
+                raise ValueError(f"spot amount unavailable for {asset}")
+            if amount > 0.0:
+                normalized_totals.append((str(asset).upper(), amount))
+        equity = 0.0
+        positions = []
+        for normalized_asset, amount in normalized_totals:
             if normalized_asset in stable_assets:
                 equity += amount
+                if not math.isfinite(equity):
+                    raise ValueError("spot equity overflow")
                 continue
             symbol = f"{normalized_asset}/USDT"
             _require_api_budget("portfolio_guard_fetch_ticker")
@@ -284,7 +302,11 @@ def collect_spot_snapshot(exchange) -> PortfolioSnapshot:
             if price is None or price <= 0.0:
                 raise ValueError(f"spot valuation unavailable for {normalized_asset}")
             notional = amount * price
+            if not math.isfinite(notional) or notional <= 0.0:
+                raise ValueError(f"spot valuation unavailable for {normalized_asset}")
             equity += notional
+            if not math.isfinite(equity):
+                raise ValueError("spot equity overflow")
             positions.append(
                 PortfolioPosition(
                     symbol=symbol,
@@ -293,8 +315,7 @@ def collect_spot_snapshot(exchange) -> PortfolioSnapshot:
                     cluster=_symbol_cluster(symbol),
                 )
             )
-        free = _finite(free_balances.get("USDT"))
-        if free is None or equity <= 0.0:
+        if equity <= 0.0 or free > equity * (1.0 + 1e-9):
             raise ValueError("spot USDT free balance or equity unavailable")
         return PortfolioSnapshot(equity, free, tuple(positions), now)
     except Exception as exc:

@@ -10,6 +10,7 @@ custom-painted grid.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import subprocess
@@ -28,6 +29,11 @@ from launcher.config.settings import (
     load_config,
     save_config_merge,
     subprocess_no_window_kwargs,
+)
+from launcher.tool_processes import (
+    start_registered_tool_process,
+    stop_tool_processes,
+    tool_root_xoption,
 )
 from launcher.ui.components.widgets import safe_geometry
 from launcher.ui.logging_panel import classify_severity
@@ -48,8 +54,155 @@ OPTIMIZER_CONFIG_MAPPING = {
     "partial_pct":       "PARTIAL_SELL_PCT",
     "rsi_max":           "RSI_MAX",
 }
+OPTIMIZER_CONFIG_BOUNDS = {
+    "min_pump": (0.5, 20.0),
+    "activation_profit": (1.0, 20.0),
+    "trailing_distance": (0.25, 10.0),
+    "stop_loss": (-15.0, -0.5),
+    "partial_pct": (0.05, 1.0),
+    "rsi_max": (40.0, 90.0),
+}
 
 OPTIMIZER_MIN_HOLDOUT_TRADES = 30
+TOOL_OUTPUT_MAX_PENDING_LINES = 1_000
+TOOL_OUTPUT_MAX_RAW_LINE_BYTES = 16 * 1024
+TOOL_OUTPUT_DRAIN_BATCH_LINES = 100
+OPTIMIZER_BEST_CONFIG_START = "<<<BEST_CONFIG>>>"
+OPTIMIZER_BEST_CONFIG_END = "<<<END_BEST_CONFIG>>>"
+
+
+class _BoundedToolOutputBuffer:
+    """Thread-safe drop-oldest queue with one aggregated UI warning."""
+
+    def __init__(self, *, max_lines: int = TOOL_OUTPUT_MAX_PENDING_LINES):
+        if not isinstance(max_lines, int) or isinstance(max_lines, bool) or max_lines <= 0:
+            raise ValueError("max_lines must be a positive integer")
+        self._max_lines = max_lines
+        self._lines = _deque()
+        self._dropped_since_drain = 0
+        self._lock = threading.Lock()
+
+    def append(self, line) -> None:
+        with self._lock:
+            if len(self._lines) >= self._max_lines:
+                self._lines.popleft()
+                self._dropped_since_drain += 1
+            self._lines.append(line)
+
+    def drain(self, limit: int) -> list:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            return []
+        batch = []
+        with self._lock:
+            remaining = limit
+            if self._dropped_since_drain:
+                batch.append(
+                    f"[WARN] {self._dropped_since_drain} older "
+                    f"tool-output lines dropped (buffer limit "
+                    f"{self._max_lines})"
+                )
+                self._dropped_since_drain = 0
+                remaining -= 1
+            while self._lines and remaining > 0:
+                batch.append(self._lines.popleft())
+                remaining -= 1
+        return batch
+
+    def __bool__(self) -> bool:
+        with self._lock:
+            return bool(self._lines or self._dropped_since_drain)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._lines)
+
+
+class _DelimitedByteFramer:
+    """Frame bounded binary pipe output on CR/LF without partial decoding."""
+
+    def __init__(self, *, max_bytes: int = TOOL_OUTPUT_MAX_RAW_LINE_BYTES):
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+            raise ValueError("max_bytes must be a positive integer")
+        self._max_bytes = max_bytes
+        self._pending = bytearray()
+        self._discard_until_delimiter = False
+        self._skip_lf_after_cr = False
+
+    @property
+    def pending_bytes(self) -> int:
+        return len(self._pending)
+
+    def feed(self, chunk) -> list[bytes]:
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise TypeError("tool output chunk must be bytes-like")
+        framed = []
+        for byte in bytes(chunk):
+            if self._skip_lf_after_cr:
+                self._skip_lf_after_cr = False
+                if byte == 0x0A:
+                    continue
+            if self._discard_until_delimiter:
+                if byte in (0x0A, 0x0D):
+                    self._discard_until_delimiter = False
+                    self._skip_lf_after_cr = byte == 0x0D
+                continue
+            if byte in (0x0A, 0x0D):
+                if self._pending:
+                    framed.append(bytes(self._pending))
+                    self._pending.clear()
+                self._skip_lf_after_cr = byte == 0x0D
+                continue
+            if len(self._pending) >= self._max_bytes:
+                self._pending.clear()
+                self._discard_until_delimiter = True
+                framed.append(
+                    f"[WARN] overlong tool-output line discarded "
+                    f"(limit {self._max_bytes} bytes)".encode("ascii")
+                )
+                continue
+            self._pending.append(byte)
+        return framed
+
+    def finish(self) -> list[bytes]:
+        if self._discard_until_delimiter:
+            self._pending.clear()
+            self._discard_until_delimiter = False
+            self._skip_lf_after_cr = False
+            return []
+        framed = [bytes(self._pending)] if self._pending else []
+        self._pending.clear()
+        self._skip_lf_after_cr = False
+        return framed
+
+
+def _drain_tool_output_batch(
+    buffer,
+    append_line,
+    *,
+    done: bool,
+    limit: int = TOOL_OUTPUT_DRAIN_BATCH_LINES,
+) -> bool:
+    """Render one bounded batch and report whether another UI tick is needed."""
+    drain = getattr(buffer, "drain", None)
+    if callable(drain):
+        for line in drain(limit):
+            append_line(line)
+        return not done or bool(buffer)
+    count = 0
+    while buffer and count < limit:
+        append_line(buffer.popleft())
+        count += 1
+    return not done or bool(buffer)
+
+
+def _finite_optimizer_number(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def optimizer_promotion_reasons(cfg: dict) -> list[str]:
@@ -66,27 +219,52 @@ def optimizer_promotion_reasons(cfg: dict) -> list[str]:
     ):
         if cfg.get(key) is not True:
             reasons.append(f"{key} is not explicitly true")
-    try:
-        if float(cfg.get("holdout_net")) <= 0.0:
-            reasons.append("holdout_net is not positive")
-    except (TypeError, ValueError):
-        reasons.append("holdout_net is missing")
-    try:
-        if int(cfg.get("holdout_trades")) < OPTIMIZER_MIN_HOLDOUT_TRADES:
-            reasons.append("holdout trade count is below minimum")
-    except (TypeError, ValueError):
-        reasons.append("holdout trade count is missing")
-    try:
-        if float(cfg.get("dsr")) < 0.95:
-            reasons.append("DSR is below 0.95")
-    except (TypeError, ValueError):
-        reasons.append("DSR is missing")
-    try:
-        if float(cfg.get("pbo")) > 0.25:
-            reasons.append("PBO is above 0.25")
-    except (TypeError, ValueError):
-        reasons.append("PBO is missing")
+    holdout_net = _finite_optimizer_number(cfg.get("holdout_net"))
+    if holdout_net is None or holdout_net <= 0.0:
+        reasons.append("holdout_net must be finite and positive")
+
+    holdout_trades = _finite_optimizer_number(cfg.get("holdout_trades"))
+    if holdout_trades is None or not holdout_trades.is_integer():
+        reasons.append("holdout trade count must be a finite integer")
+    elif holdout_trades < OPTIMIZER_MIN_HOLDOUT_TRADES:
+        reasons.append("holdout trade count is below minimum")
+
+    dsr = _finite_optimizer_number(cfg.get("dsr"))
+    if dsr is None or not 0.95 <= dsr <= 1.0:
+        reasons.append("DSR must be finite and between 0.95 and 1.0")
+
+    pbo = _finite_optimizer_number(cfg.get("pbo"))
+    if pbo is None or not 0.0 <= pbo <= 0.25:
+        reasons.append("PBO must be finite and between 0.0 and 0.25")
+
+    for key, (minimum, maximum) in OPTIMIZER_CONFIG_BOUNDS.items():
+        if key not in cfg:
+            continue
+        value = _finite_optimizer_number(cfg.get(key))
+        if value is None or not minimum <= value <= maximum:
+            reasons.append(
+                f"{key} must be finite and between {minimum:g} and {maximum:g}"
+            )
     return reasons
+
+
+def optimizer_config_from_complete_marker(line: str) -> dict | None:
+    """Parse only a complete, promotion-eligible single-line marker."""
+    if not isinstance(line, str) or OPTIMIZER_BEST_CONFIG_START not in line:
+        return None
+    payload_with_tail = line.split(OPTIMIZER_BEST_CONFIG_START, 1)[1]
+    if OPTIMIZER_BEST_CONFIG_END not in payload_with_tail:
+        return None
+    payload = payload_with_tail.split(OPTIMIZER_BEST_CONFIG_END, 1)[0]
+    try:
+        import json as _json
+
+        cfg = _json.loads(payload)
+    except Exception:
+        return None
+    if not isinstance(cfg, dict) or optimizer_promotion_reasons(cfg):
+        return None
+    return cfg
 
 
 def optimizer_best_config_updates(cfg: dict) -> tuple[dict, list[str]]:
@@ -98,7 +276,9 @@ def optimizer_best_config_updates(cfg: dict) -> tuple[dict, list[str]]:
     for opt_key, cfg_key in OPTIMIZER_CONFIG_MAPPING.items():
         if opt_key not in cfg:
             continue
-        val = cfg[opt_key]
+        val = _finite_optimizer_number(cfg[opt_key])
+        if val is None:
+            continue
         updates[cfg_key] = val
         applied.append(f"{cfg_key}={val}")
     return updates, applied
@@ -112,16 +292,84 @@ def apply_optimizer_best_config_to_app(app, strategy: str, cfg: dict) -> list[st
     reasons = optimizer_promotion_reasons(cfg)
     if reasons:
         raise ValueError("optimizer result is not promotable: " + "; ".join(reasons))
+    persisted_config = save_config_merge({strategy: dict(updates)})
+    app.config = persisted_config
     for cfg_key, val in updates.items():
-        app.config[strategy][cfg_key] = val
         try:
             row = app.param_rows.get(strategy, {}).get(cfg_key)
             if row:
                 row.set_value(val)
         except Exception:
             pass
-    app.config = save_config_merge({strategy: dict(updates)})
     return applied
+
+
+def reset_optimizer_apply_run_state(parse_state: dict, apply_btn_ref: dict) -> bool:
+    """Invalidate any prior Apply action before a new tool run starts."""
+    button = apply_btn_ref.get("btn")
+    if button is not None:
+        inactive = False
+        try:
+            inactive = not bool(button.winfo_exists())
+        except Exception:
+            pass
+        if not inactive:
+            try:
+                button.configure(state="disabled", command=lambda: None)
+                inactive = True
+            except Exception:
+                pass
+        try:
+            button.destroy()
+            inactive = True
+        except Exception:
+            pass
+        if not inactive:
+            return False
+    try:
+        generation = int(parse_state.get("run_generation", 0)) + 1
+    except (TypeError, ValueError, OverflowError):
+        generation = 1
+    apply_btn_ref["btn"] = None
+    parse_state.clear()
+    parse_state.update({
+        "in_marker": False,
+        "marker_buf": "",
+        "best_config": None,
+        "trophy_lines_seen": 0,
+        "run_generation": generation,
+        "output_complete": False,
+    })
+    return True
+
+
+def finalize_optimizer_apply_run(
+    parse_state: dict,
+    apply_btn_ref: dict,
+    exit_code,
+    publish,
+) -> bool:
+    """Publish a staged optimizer result only after a proven clean exit."""
+    clean_exit = type(exit_code) is int and exit_code == 0
+    cfg = parse_state.get("best_config")
+    if (
+        not clean_exit
+        or parse_state.get("output_complete") is not True
+        or not isinstance(cfg, dict)
+        or optimizer_promotion_reasons(cfg)
+    ):
+        if clean_exit:
+            parse_state["best_config"] = None
+        else:
+            reset_optimizer_apply_run_state(parse_state, apply_btn_ref)
+        return False
+    generation = parse_state.get("run_generation")
+    try:
+        publish(generation)
+    except Exception:
+        reset_optimizer_apply_run_state(parse_state, apply_btn_ref)
+        return False
+    return True
 
 
 def _futures_funding_8h(bot_cfg: dict) -> float:
@@ -423,7 +671,8 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
 
     # Subprocess state
     proc_state: dict = {
-        "proc": None, "reader_thread": None, "buffer": _deque(),
+        "proc": None, "reader_thread": None,
+        "buffer": _BoundedToolOutputBuffer(),
         "done": False, "exit_code": None, "stop_reading": False,
     }
 
@@ -686,6 +935,8 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         "marker_buf": "",
         "best_config": None,
         "trophy_lines_seen": 0,
+        "run_generation": 0,
+        "output_complete": False,
     }
 
     def _append_line(line: str) -> None:
@@ -703,15 +954,11 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             return
 
         # Best-config marker  parse and stash; don't render
-        if "<<<BEST_CONFIG>>>" in line:
-            try:
-                payload = line.split("<<<BEST_CONFIG>>>", 1)[1]
-                payload = payload.split("<<<END_BEST_CONFIG>>>", 1)[0]
-                import json as _json
-                parse_state["best_config"] = _json.loads(payload)
-                dlg.after(50, _show_apply_button)
-            except Exception:
-                pass
+        if OPTIMIZER_BEST_CONFIG_START in line:
+            parse_state["best_config"] = None
+            cfg = optimizer_config_from_complete_marker(line)
+            if cfg is not None:
+                parse_state["best_config"] = cfg
             return
 
         tag = _classify_line(line)
@@ -731,7 +978,9 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
     #  Apply-best-config button (appears when optimizer finishes) 
     apply_btn_ref: dict = {"btn": None}
 
-    def _show_apply_button():
+    def _show_apply_button(run_generation: int):
+        if run_generation != parse_state.get("run_generation"):
+            return
         if apply_btn_ref["btn"] is not None:
             return
         cfg = parse_state.get("best_config")
@@ -813,7 +1062,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             pass
 
     #  Subprocess output reader thread 
-    def _read_stdout(proc):
+    def _read_stdout(proc, run_generation):
         # Pattern to detect the terminal-style progress bar emitted by the
         # optimizer on stderr (which is merged into stdout via stderr=STDOUT).
         # Example: "  Optimize [] 45/648 (7%) ETA 3s Best: +-1.99"
@@ -822,89 +1071,140 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         _PROGRESS_BAR_RE = re.compile(
             r"^\s*\w+\s*\[[\u2588\u2591#=\->\s]+\]\s+\d+/\d+\s+\(\d+%\)"
         )
+        framer = _DelimitedByteFramer()
+        normal_eof = False
+
+        def _append_raw_output(raw: bytes) -> None:
+            if not raw:
+                return
+            try:
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            except Exception:
+                line = str(raw)
+            line = re.sub(r'\x1b\[[0-9;]*m', '', line)
+            if not line.strip() or _PROGRESS_BAR_RE.match(line):
+                return
+            proc_state["buffer"].append(line)
+
         try:
             # When the optimizer uses '\r' to repaint the same line, readline
             # will block until the next '\n'. Split on \r too so we can
             # discard the in-progress bar frames quickly.
-            buf = bytearray()
             while True:
                 chunk = proc.stdout.read(256)
                 if not chunk:
+                    normal_eof = True
                     break
                 if proc_state["stop_reading"]:
                     break
-                buf.extend(chunk)
-                # Split on both \n AND \r so progress-bar updates don't pile up
-                while True:
-                    nl_idx = -1
-                    for i, b in enumerate(buf):
-                        if b in (0x0a, 0x0d):   # \n or \r
-                            nl_idx = i
-                            break
-                    if nl_idx < 0:
-                        break
-                    raw = bytes(buf[:nl_idx])
-                    del buf[:nl_idx + 1]
-                    if not raw:
-                        continue
-                    try:
-                        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-                    except Exception:
-                        line = str(raw)
-                    # Strip ANSI colour codes
-                    line = re.sub(r'\x1b\[[0-9;]*m', '', line)
-                    if not line.strip():
-                        continue
-                    # FILTER: drop the terminal progress-bar repaints. The
-                    # in-UI progress bar (driven by <<<PROGRESS>>> markers)
-                    # already shows this information cleanly.
-                    if _PROGRESS_BAR_RE.match(line):
-                        continue
-                    proc_state["buffer"].append(line)
+                for raw in framer.feed(chunk):
+                    _append_raw_output(raw)
         except Exception as e:
             proc_state["buffer"].append(f"[Reader-Error] {e}")
         finally:
-            # Flush any remainder
-            if buf:
-                try:
-                    rest = buf.decode("utf-8", errors="replace").rstrip("\r\n")
-                    if rest.strip() and not _PROGRESS_BAR_RE.match(rest):
-                        proc_state["buffer"].append(rest)
-                except Exception:
-                    pass
+            for raw in framer.finish():
+                _append_raw_output(raw)
             # Set exit_code BEFORE done  otherwise the UI tick might see
             # done=True with exit_code=None and treat the run as successful.
             try:
                 proc_state["exit_code"] = proc.wait()
             except Exception:
                 proc_state["exit_code"] = -1
+            if parse_state.get("run_generation") == run_generation:
+                parse_state["output_complete"] = bool(
+                    normal_eof and not proc_state["stop_reading"]
+                )
+            if not _process_is_alive(proc):
+                try:
+                    registry = getattr(app, "tool_processes", None)
+                    if registry is not None:
+                        registry.unregister(proc)
+                except Exception:
+                    pass
             proc_state["done"] = True
 
     #  UI tick: poll the buffer every 120ms 
     spinner_chars = ["  ", "  ", "  ", "  "]
     spinner_idx = [0]
 
+    def _process_is_alive(proc) -> bool:
+        if proc is None:
+            return False
+        try:
+            return proc.poll() is None
+        except Exception:
+            return True
+
+    def _stop_owned_process(proc) -> bool:
+        registry = getattr(app, "tool_processes", None)
+        try:
+            if registry is not None:
+                registry.stop(proc)
+            else:
+                stop_tool_processes([proc])
+        except Exception:
+            try:
+                stop_tool_processes([proc])
+            except Exception:
+                pass
+        return not _process_is_alive(proc)
+
+    def _mark_process_survivor() -> None:
+        status_var.set(" Process could not be stopped; launcher still owns it")
+        status_lbl.configure(text_color=COLORS["danger"])
+        run_btn.configure(
+            text=" Process still running",
+            state="disabled",
+            command=lambda: None,
+        )
+        cancel_btn.configure(
+            text="Close",
+            fg_color="transparent",
+            text_color=COLORS["text_dim"],
+            command=_on_close,
+        )
+
+    def _mark_process_survivor_if_open(proc) -> None:
+        try:
+            if (
+                dlg.winfo_exists()
+                and proc_state.get("proc") is proc
+                and _process_is_alive(proc)
+            ):
+                _mark_process_survivor()
+        except Exception:
+            pass
+
     def _ui_tick():
         # Cap at 100 lines per tick so the Tk main thread isn't blocked
         # for seconds when the optimizer dumps 10,000+ lines at once.
         buf = proc_state["buffer"]
-        count = 0
-        while buf and count < 100:
-            _append_line(buf.popleft())
-            count += 1
+        keep_polling = _drain_tool_output_batch(
+            buf,
+            _append_line,
+            done=bool(proc_state["done"]),
+        )
 
-        if not proc_state["done"]:
-            spinner_idx[0] = (spinner_idx[0] + 1) % len(spinner_chars)
-            spinner_var.set(spinner_chars[spinner_idx[0]])
-            dlg.after(120, _ui_tick)
+        if keep_polling:
+            if not proc_state["done"]:
+                spinner_idx[0] = (spinner_idx[0] + 1) % len(spinner_chars)
+                spinner_var.set(spinner_chars[spinner_idx[0]])
+            dlg.after(0 if proc_state["done"] else 120, _ui_tick)
         else:
+            if _process_is_alive(proc_state.get("proc")):
+                _mark_process_survivor()
+                return
             ec = proc_state["exit_code"]
-            # exit_code can be None if the process finished very fast  but
-            # we still read all output, so treat it as success.
-            if ec == 0 or ec is None:
+            published = finalize_optimizer_apply_run(
+                parse_state,
+                apply_btn_ref,
+                ec,
+                _show_apply_button,
+            )
+            if ec == 0:
                 spinner_var.set("")
                 spinner_lbl.configure(text_color=COLORS["success"])
-                if parse_state.get("best_config"):
+                if published:
                     status_var.set(" Completed  best config available below")
                 else:
                     status_var.set(" Completed successfully")
@@ -918,7 +1218,8 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             try:
                 cancel_btn.configure(text="Close",
                                       fg_color="transparent",
-                                      text_color=COLORS["text_dim"])
+                                      text_color=COLORS["text_dim"],
+                                      command=_on_close)
             except Exception:
                 pass
 
@@ -929,57 +1230,82 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             except Exception:
                 pass
 
+            try:
+                withdrawn = str(dlg.state()).strip().lower() == "withdrawn"
+            except Exception:
+                withdrawn = False
+            if withdrawn:
+                dlg.destroy()
+
+    def _hide_dialog() -> None:
+        try:
+            dlg.grab_release()
+        except Exception as exc:
+            status_var.set(f" Cannot hide dialog: {exc}")
+            status_lbl.configure(text_color=COLORS["danger"])
+            return
+        try:
+            dlg.withdraw()
+        except Exception as exc:
+            try:
+                dlg.grab_set()
+            except Exception:
+                pass
+            status_var.set(f" Cannot hide dialog: {exc}")
+            status_lbl.configure(text_color=COLORS["danger"])
+
     #  Stop button: hard-kill the subprocess 
     def _stop_subprocess():
         """Stop the running subprocess without blocking the UI.
 
-        terminate() then reap in a background thread. After terminate(),
-        proc.stdout is closed immediately: the reader thread blocks on
-        proc.stdout.read(256) and wouldn't see stop_reading=True until the
-        OS flushes the pipe, so closing stdout makes that read() return b''
-        at once and the reader exits cleanly (otherwise destroying the
-        dialog mid-terminate would leave it blocked and freeze Tkinter).
+        Terminate, bounded-wait, kill if needed, and reap in a background
+        thread. Streams are closed only after process exit so a reader holding
+        the buffered-pipe lock cannot make shutdown itself unbounded.
         """
         import threading as _threading
 
         proc = proc_state.get("proc")
         proc_state["stop_reading"] = True
-        if proc and proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-            # Close stdout pipe immediately so the reader thread unblocks.
-            try:
-                if proc.stdout:
-                    proc.stdout.close()
-            except Exception:
-                pass
-
+        if _process_is_alive(proc):
             def _reap():
-                import time as _time
-                deadline = _time.monotonic() + 3.0
-                while _time.monotonic() < deadline:
-                    if proc.poll() is not None:
-                        return
-                    _time.sleep(0.1)
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                if not _stop_owned_process(proc):
+                    try:
+                        dlg.after(
+                            0,
+                            lambda stopped_proc=proc: (
+                                _mark_process_survivor_if_open(stopped_proc)
+                            ),
+                        )
+                    except Exception:
+                        pass
 
-            _threading.Thread(target=_reap, daemon=True,
-                               name="proc-reap").start()
+            try:
+                _threading.Thread(target=_reap, daemon=True,
+                                   name="proc-reap").start()
+            except Exception:
+                if not _stop_owned_process(proc):
+                    _mark_process_survivor()
+                    return False
 
-        status_var.set("Stopped by user")
+            status_var.set("Stopping process...")
+        else:
+            status_var.set("Stopped by user")
+        return True
 
     #  Start function: fired on Run click 
     def _start_run():
+        if _process_is_alive(proc_state.get("proc")):
+            _mark_process_survivor()
+            return
+
         bot = bot_var.get()
         days = days_var.get()
+
+        if not reset_optimizer_apply_run_state(parse_state, apply_btn_ref):
+            status_var.set(" Cannot invalidate the previous optimizer result")
+            status_lbl.configure(text_color=COLORS["danger"])
+            return
+        run_generation = parse_state["run_generation"]
 
         # Phase switch: hide config, show output
         config_frame.pack_forget()
@@ -1008,7 +1334,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
 
         # State reset
         proc_state["proc"] = None
-        proc_state["buffer"] = _deque()
+        proc_state["buffer"] = _BoundedToolOutputBuffer()
         proc_state["done"] = False
         proc_state["exit_code"] = None
         proc_state["stop_reading"] = False
@@ -1019,8 +1345,9 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
                             border_width=1, border_color=COLORS["danger"],
                             command=_stop_subprocess)
         cancel_btn.configure(text="Hide (keeps running)",
-                              command=dlg.withdraw)
+                              command=_hide_dialog)
 
+        proc = None
         try:
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
@@ -1037,14 +1364,21 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
                          "FUTREND": "tools.trend_leverage_check",
                          "CROSS":   "tools.xsec_momentum"}.get(bot)
 
+            base_cmd = [
+                _get_python_exe(),
+                "-u",
+                "-X",
+                tool_root_xoption(PROJECT_ROOT),
+                "-m",
+            ]
             if tool_name == "selftest":
-                cmd = [_get_python_exe(), "-u", "-m", "tools.selftest"]
+                cmd = [*base_cmd, "tools.selftest"]
             elif _alt_tool:
-                cmd = [_get_python_exe(), "-u", "-m", _alt_tool, days]
+                cmd = [*base_cmd, _alt_tool, days]
                 if tool_name == "optimizer" and bot == "TREND":
                     cmd.append("--sweep")
             elif tool_name == "backtest":
-                cmd = [_get_python_exe(), "-u", "-m", "tools.backtester", bot, days]
+                cmd = [*base_cmd, "tools.backtester", bot, days]
                 # Read current parameters from bot_config.json and pass
                 # as CLI args so the backtest reflects what the user saved.
                 # Without this, backtester falls back to STRATEGY_DEFAULTS
@@ -1079,7 +1413,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
                 except Exception as _e:
                     _append_line(f"[WARN] bot_config.json nicht gelesen: {_e}  nutze Defaults")
             else:
-                cmd = [_get_python_exe(), "-u", "-m", "tools.optimizer", bot, days]
+                cmd = [*base_cmd, "tools.optimizer", bot, days]
                 if quick_var.get():
                     cmd.append("--quick")
                 if bot == "FUTURES":
@@ -1094,19 +1428,28 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
 
             kw = subprocess_no_window_kwargs()
 
-            proc = subprocess.Popen(
-                cmd, cwd=PROJECT_ROOT, env=env,
+            registry = getattr(app, "tool_processes", None)
+            proc = start_registered_tool_process(
+                registry,
+                cmd,
+                root=PROJECT_ROOT,
+                cwd=PROJECT_ROOT,
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,  # merged
                 # bufsize=-1: Python 3.13 raises RuntimeWarning for bufsize=1
                 # on binary pipes. The subprocess uses -u (unbuffered) so
                 # output is flushed immediately regardless of bufsize.
                 bufsize=-1,
-                **kw
+                **kw,
             )
             proc_state["proc"] = proc
 
-            reader = threading.Thread(target=_read_stdout, args=(proc,), daemon=True)
+            reader = threading.Thread(
+                target=_read_stdout,
+                args=(proc, run_generation),
+                daemon=True,
+            )
             reader.start()
             proc_state["reader_thread"] = reader
 
@@ -1114,15 +1457,27 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
 
             status_var.set("")
         except Exception as e:
+            proc = proc or proc_state.get("proc")
+            stopped = not _process_is_alive(proc)
+            if not stopped:
+                stopped = _stop_owned_process(proc)
             _append_line(f"[ERROR] Failed to start subprocess: {e}")
             status_var.set(f" Failed: {e}")
             status_lbl.configure(text_color=COLORS["danger"])
-            proc_state["done"] = True
+            proc_state["exit_code"] = -1
+            if stopped:
+                proc_state["done"] = True
+                dlg.after(0, _ui_tick)
+            else:
+                proc_state["done"] = False
+                _mark_process_survivor()
 
     run_btn.configure(command=_start_run)
 
     # Cleanup on dialog close: kill the subprocess
     def _on_close():
-        _stop_subprocess()
-        dlg.destroy()
+        try:
+            _stop_subprocess()
+        finally:
+            dlg.destroy()
     dlg.protocol("WM_DELETE_WINDOW", _on_close)

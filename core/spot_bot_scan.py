@@ -23,11 +23,11 @@ import math
 
 from bot_utils import (
     safe_fetch_balance_usdt,
-    extract_fill_price,
     budget_exhausted,
 )
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.network_retry import RetryForbiddenError
+from bot_utils.order_utils import strict_order_snapshot_equal
 
 
 class _SpotBuyBudgetUnavailable(RuntimeError):
@@ -195,40 +195,107 @@ class ScanMixin:
         return quality
 
     @staticmethod
-    def _quote_cost_or_fallback(order, fallback: float,
-                                max_expected: float = 0.0) -> float:
-        fallback_value = ScanMixin._positive_float(fallback)
-        if not isinstance(order, dict):
-            return fallback_value
-        max_expected_value = ScanMixin._positive_float(max_expected)
-        if max_expected_value > 0 and fallback_value > max_expected_value * 10.0:
-            fallback_value = max_expected_value
-        cost = ScanMixin._positive_float(order.get("cost"))
-        if cost <= 0:
-            return fallback_value
-        if max_expected_value > 0 and cost > max_expected_value * 10.0:
-            return fallback_value
-        if fallback_value > 0:
-            ratio = cost / fallback_value
-            if ratio < 0.1 or ratio > 10.0:
-                return fallback_value
-        return cost
+    def _spot_buy_fill_evidence(
+        order,
+        intended_amount: float,
+        *,
+        quote_first_buy: bool,
+        max_quote_cost: float,
+        expected_price: float,
+    ) -> tuple[float, float, float]:
+        """Resolve amount, price, and quote cost from one coherent snapshot."""
+        intended = ScanMixin._positive_float(intended_amount)
+        expected = ScanMixin._positive_float(expected_price)
+        authorized_cost = ScanMixin._positive_float(max_quote_cost)
+        default_cost = authorized_cost or (intended * expected)
+        payload = order if isinstance(order, dict) else {}
+        filled = ScanMixin._positive_float(payload.get("filled"))
+        cost = ScanMixin._positive_float(payload.get("cost"))
+        average = ScanMixin._positive_float(payload.get("average"))
+
+        def _plausible_price(value: float) -> bool:
+            if value <= 0 or expected <= 0:
+                return False
+            ratio = value / expected
+            return math.isfinite(ratio) and 0.1 <= ratio <= 10.0
+
+        average_ok = _plausible_price(average)
+        if quote_first_buy:
+            cost_ok = cost > 0 and (
+                authorized_cost <= 0 or cost <= authorized_cost * 1.05
+            )
+            if cost_ok and average_ok:
+                derived = cost / average
+                if math.isfinite(derived) and derived > 0:
+                    return derived, average, cost
+            if cost_ok and filled > 0:
+                implied_price = cost / filled
+                if _plausible_price(implied_price):
+                    return filled, implied_price, cost
+            if cost_ok and expected > 0:
+                return cost / expected, expected, cost
+            if average_ok and filled > 0:
+                derived_cost = filled * average
+                if (
+                    math.isfinite(derived_cost)
+                    and derived_cost > 0
+                    and (
+                        authorized_cost <= 0
+                        or derived_cost <= authorized_cost * 1.05
+                    )
+                ):
+                    return filled, average, derived_cost
+            if average_ok and default_cost > 0:
+                derived = default_cost / average
+                if math.isfinite(derived) and derived > 0:
+                    return derived, average, default_cost
+            if filled > 0 and expected > 0:
+                derived_cost = filled * expected
+                if (
+                    math.isfinite(derived_cost)
+                    and derived_cost > 0
+                    and (
+                        authorized_cost <= 0
+                        or derived_cost <= authorized_cost * 1.05
+                    )
+                ):
+                    return filled, expected, derived_cost
+            if default_cost > 0 and expected > 0:
+                return default_cost / expected, expected, default_cost
+            return intended, expected, intended * expected
+
+        amount = filled or intended
+        price = average if average_ok else expected
+        derived_cost = amount * price
+        if cost > 0 and derived_cost > 0:
+            cost_ratio = cost / derived_cost
+            if math.isfinite(cost_ratio) and 0.95 <= cost_ratio <= 1.05:
+                return amount, price, cost
+            if not average_ok and amount > 0:
+                implied_price = cost / amount
+                if _plausible_price(implied_price):
+                    return amount, implied_price, cost
+        return amount, price, derived_cost
 
     def _release_entry_claim_if_untracked(self, sym: str) -> bool:
+        from core.logger import log_event
+
         try:
-            if self.state.has(sym):
-                from core.logger import log_event
-                log_event(
-                    f"{sym}: provisional state exists after buy failure - "
-                    f"keeping claim for monitor/reconcile recovery",
-                    "WARN",
-                )
-                return False
-        except Exception:
-            pass
-        from core.database import remove_open_position
-        remove_open_position(self.BOT_NAME, sym)
-        return True
+            released = bool(self.state.release_claim_if_absent(sym))
+        except Exception as exc:
+            log_event(
+                f"{sym}: entry claim cleanup failed ({exc}) - keeping "
+                "portfolio reservation fail-closed",
+                "WARN",
+            )
+            return False
+        if not released:
+            log_event(
+                f"{sym}: state exists or entry claim cleanup failed - "
+                "keeping claim/reservation for recovery",
+                "WARN",
+            )
+        return released
 
     def _cleanup_rolled_back_entry_state(self, sym: str, reason: str) -> bool:
         """Remove a state row after a verified rollback sell.
@@ -251,14 +318,10 @@ class ScanMixin:
         if removed:
             return True
         try:
-            if self.state.has(sym):
-                self.state.update_many(sym, restore)
-                return False
+            return bool(self.state.release_claim_if_absent(sym))
         except Exception as exc:
-            self._log_error(f"mark rolled-back entry cleanup pending {sym}", exc)
-        from core.database import remove_open_position
-        remove_open_position(self.BOT_NAME, sym)
-        return False
+            self._log_error(f"retry rolled-back entry cleanup {sym}", exc)
+            return False
 
     def _assess_spot_entry_signal(self, r, regime: dict):
         rsi_values = self._rsi_triplet(r)
@@ -1035,12 +1098,25 @@ class ScanMixin:
 
     #  Order placement
 
-    def _find_order_by_cid(self, symbol_pair: str, cid: str):
+    def _find_order_by_cid(
+        self,
+        symbol_pair: str,
+        cid: str,
+        expected_amount=None,
+        max_quote_cost=None,
+    ):
         """Locate an order by OUR clientOrderId (open orders first, then recent
         history). Used to recover from a lost-response timeout so a retry doesn't
         place a SECOND live buy. Returns ``None`` only when every supported
         lookup completed successfully and proved absence; uncertainty raises.
         """
+        from bot_utils.spot_exits import (
+            _validated_expected_spot_amount,
+            spot_recovery_terminal_disposition,
+            validate_spot_recovery_candidate,
+        )
+        expected_amount = _validated_expected_spot_amount(expected_amount)
+
         try:
             from bot_utils.futures_order import _order_client_id_matches
         except Exception:
@@ -1052,6 +1128,9 @@ class ScanMixin:
             has = {}
         attempted = False
         uncertain = False
+        deferred_terminal = None
+        terminal_fill_unresolved = False
+        bound_order_id = None
 
         def _query(endpoint, fetch):
             nonlocal attempted, uncertain
@@ -1080,35 +1159,90 @@ class ScanMixin:
                 return []
             return rows
 
+        def _select_batch(rows, *, source_open: bool = False):
+            nonlocal bound_order_id, deferred_terminal
+            nonlocal terminal_fill_unresolved
+            selected = None
+            open_unresolved = False
+            for order in rows:
+                if not _order_client_id_matches(order, cid):
+                    continue
+                bound_order_id = validate_spot_recovery_candidate(
+                    order,
+                    symbol_pair=symbol_pair,
+                    expected_side="buy",
+                    client_order_id=cid,
+                    bound_order_id=bound_order_id,
+                    expected_amount=expected_amount,
+                    max_quote_cost=max_quote_cost,
+                )
+                raw_status = order.get("status")
+                normalized_status = (
+                    raw_status.strip().lower().replace("-", "_")
+                    if isinstance(raw_status, str) else ""
+                )
+                if source_open and normalized_status not in {
+                    "closed",
+                    "filled",
+                    "canceled",
+                    "cancelled",
+                    "expired",
+                    "rejected",
+                }:
+                    open_unresolved = True
+                    terminal_fill_unresolved = True
+                    deferred_terminal = deferred_terminal or order
+                    if selected is None:
+                        selected = order
+                    elif not strict_order_snapshot_equal(selected, order):
+                        raise RuntimeError(
+                            "spot order recovery duplicate snapshot conflict"
+                        )
+                    continue
+                disposition = spot_recovery_terminal_disposition(order)
+                if disposition in {"zero", "unresolved"}:
+                    deferred_terminal = deferred_terminal or order
+                    terminal_fill_unresolved |= disposition == "unresolved"
+                elif selected is None:
+                    selected = order
+                elif not strict_order_snapshot_equal(selected, order):
+                    raise RuntimeError(
+                        "spot order recovery duplicate snapshot conflict"
+                    )
+            return None if source_open and open_unresolved else selected
+
         fetch_open = getattr(self.ex, "fetch_open_orders", None)
         if callable(fetch_open) and has.get("fetchOpenOrders") is not False:
-            for o in _query(
-                "spot_reconcile_fetch_open_orders",
-                lambda: fetch_open(symbol_pair),
-            ):
-                if _order_client_id_matches(o, cid):
-                    return o
+            selected = _select_batch(
+                _query(
+                    "spot_reconcile_fetch_open_orders",
+                    lambda: fetch_open(symbol_pair),
+                ),
+                source_open=True,
+            )
+            if selected is not None:
+                return selected
 
         fetch_orders = getattr(self.ex, "fetch_orders", None)
         if has.get("fetchOrders") and callable(fetch_orders):
-            for o in _query(
+            selected = _select_batch(_query(
                 "spot_reconcile_fetch_orders",
                 lambda: fetch_orders(symbol_pair, limit=20),
-            ):
-                if _order_client_id_matches(o, cid):
-                    return o
+            ))
+            if selected is not None:
+                return selected
         # A just-filled MARKET buy isn't "open", and several venues (bitget  the
         # default  okx, bybit, kucoin, gate) lack unified fetchOrders; the fill
         # shows in closed orders / my-trades. Consult those before giving up so a
         # lost-response retry can't place a SECOND live buy.
         fetch_closed = getattr(self.ex, "fetch_closed_orders", None)
         if has.get("fetchClosedOrders") and callable(fetch_closed):
-            for o in _query(
+            selected = _select_batch(_query(
                 "spot_reconcile_fetch_closed_orders",
                 lambda: fetch_closed(symbol_pair, limit=20),
-            ):
-                if _order_client_id_matches(o, cid):
-                    return o
+            ))
+            if selected is not None:
+                return selected
 
         fetch_trades = getattr(self.ex, "fetch_my_trades", None)
         if has.get("fetchMyTrades") and callable(fetch_trades):
@@ -1122,10 +1256,28 @@ class ScanMixin:
             if matching_trades:
                 from bot_utils.spot_exits import aggregate_spot_order_trades
 
-                return aggregate_spot_order_trades(matching_trades, cid)
+                recovered = aggregate_spot_order_trades(
+                    matching_trades,
+                    cid,
+                    symbol_pair=symbol_pair,
+                    expected_side="buy",
+                    expected_amount=expected_amount,
+                )
+                validate_spot_recovery_candidate(
+                    recovered,
+                    symbol_pair=symbol_pair,
+                    expected_side="buy",
+                    client_order_id=cid,
+                    bound_order_id=bound_order_id,
+                    expected_amount=expected_amount,
+                    max_quote_cost=max_quote_cost,
+                )
+                return recovered
         if not attempted or uncertain:
             raise RuntimeError("order reconciliation unavailable")
-        return None
+        if terminal_fill_unresolved:
+            raise RuntimeError("spot terminal fill amount unavailable")
+        return deferred_terminal
 
     def _execution_quality_gate(self, sym: str, pair: str) -> bool:
         """Pre-trade spread gate for SPOT entries.
@@ -1143,7 +1295,11 @@ class ScanMixin:
         """
         from core.logger import log_event
         try:
-            from bot_utils import check_spread_ok
+            from bot_utils import (
+                check_spread_ok,
+                extract_valid_top_of_book,
+                has_valid_spread_quotes,
+            )
         except Exception as e:
             self._log_error("exec-quality import", e)
             return True
@@ -1163,9 +1319,7 @@ class ScanMixin:
         # this, check_spread_ok returns True on missing quotes  illiquid coins
         # slip ~5% on entry. Fail-CLOSED: no readable book = skip the trade.
         ob_derived = False
-        if (not self.simulation
-                and (not isinstance(ticker, dict)
-                     or ticker.get("bid") is None or ticker.get("ask") is None)):
+        if not self.simulation and not has_valid_spread_quotes(ticker):
             if not try_consume_api_call("spot_entry_fetch_spread_book"):
                 log_event(
                     f"{sym}: order-book spread check blocked - "
@@ -1175,17 +1329,16 @@ class ScanMixin:
                 return False
             try:
                 ob = self.ex.fetch_order_book(pair, limit=5)
-                bids = (ob or {}).get("bids") or []
-                asks = (ob or {}).get("asks") or []
-                if not bids or not asks:
-                    log_event(f"{sym}: empty order book  blocking entry "
-                              f"(illiquid, fail-closed)", "WARN")
-                    return False
-                best_bid, best_ask = float(bids[0][0]), float(asks[0][0])
-                if best_bid <= 0 or best_ask <= 0:
+                top = extract_valid_top_of_book(ob)
+                if top is None:
+                    log_event(
+                        f"{sym}: invalid or empty order book  blocking entry "
+                        f"(illiquid, fail-closed)",
+                        "WARN",
+                    )
                     return False
                 ticker = dict(ticker if isinstance(ticker, dict) else {})
-                ticker["bid"], ticker["ask"] = best_bid, best_ask
+                ticker["bid"], ticker["ask"] = top
                 ob_derived = True
             except Exception as e:
                 log_event(f"{sym}: order-book spread check failed ({e})  "
@@ -1380,6 +1533,8 @@ class ScanMixin:
             ex_id = (getattr(self.ex, "id", "") or "").lower()
             quote_first_buy = ex_id in ("mexc", "binance", "binanceusdm",
                                           "binancecoinm")
+            direct_submit_ack = False
+            direct_ack_client_order_id = cid
             try:
                 if quote_first_buy:
                     # Disable the price-requirement check so we can pass
@@ -1404,6 +1559,7 @@ class ScanMixin:
                         f"{sym}/USDT", amount_coins,
                         params={"clientOrderId": cid}
                     )
+                direct_submit_ack = True
             except _SpotBuyBudgetUnavailable as _budget_err:
                 log_event(f"Buy {sym}: {_budget_err}", "WAIT")
                 return None
@@ -1415,7 +1571,14 @@ class ScanMixin:
                 # rejecting the param itself (avoids a double-buy).
                 try:
                     recovered = self._find_order_by_cid(
-                        f"{sym}/USDT", cid
+                        f"{sym}/USDT",
+                        cid,
+                        expected_amount=(
+                            None if quote_first_buy else amount_coins
+                        ),
+                        max_quote_cost=(
+                            trade_usdt if quote_first_buy else None
+                        ),
                     )
                 except Exception as _recovery_err:
                     raise SpotBuyOutcomeUnknown(cid) from _recovery_err
@@ -1443,6 +1606,8 @@ class ScanMixin:
                                 f"{sym}/USDT",
                                 amount_coins,
                             )
+                        direct_submit_ack = True
+                        direct_ack_client_order_id = None
                     except _SpotBuyBudgetUnavailable as _budget_err:
                         log_event(f"Buy {sym}: {_budget_err}", "WAIT")
                         return None
@@ -1458,14 +1623,60 @@ class ScanMixin:
                         f"retry, to avoid a duplicate position)", "WARN")
                     raise SpotBuyOutcomeUnknown(cid) from _place_err
 
+            if direct_submit_ack:
+                from bot_utils.spot_exits import validate_spot_submit_ack
+
+                try:
+                    validate_spot_submit_ack(
+                        order,
+                        symbol_pair=f"{sym}/USDT",
+                        client_order_id=direct_ack_client_order_id,
+                        expected_amount=(
+                            None if quote_first_buy else amount_coins
+                        ),
+                        expected_side="buy",
+                        max_quote_cost=(
+                            trade_usdt if quote_first_buy else None
+                        ),
+                    )
+                except Exception as _ack_error:
+                    if direct_ack_client_order_id:
+                        try:
+                            recovered = self._find_order_by_cid(
+                                f"{sym}/USDT",
+                                cid,
+                                expected_amount=(
+                                    None if quote_first_buy else amount_coins
+                                ),
+                                max_quote_cost=(
+                                    trade_usdt if quote_first_buy else None
+                                ),
+                            )
+                        except Exception as _recovery_err:
+                            raise SpotBuyOutcomeUnknown(
+                                cid
+                            ) from _recovery_err
+                        if recovered is not None:
+                            order = recovered
+                        else:
+                            raise SpotBuyOutcomeUnknown(cid) from _ack_error
+                    else:
+                        raise SpotBuyOutcomeUnknown(cid) from _ack_error
+
             raw_order_status = (
                 order.get("status") if isinstance(order, dict) else None
             )
             order_status = (
-                raw_order_status.strip().lower()
+                raw_order_status.strip().lower().replace("-", "_")
                 if isinstance(raw_order_status, str) else ""
             )
-            if order_status in ("new", "open", "pending"):
+            if order_status in (
+                "new",
+                "open",
+                "pending",
+                "partially_filled",
+                "partiallyfilled",
+            ):
                 raise SpotBuyOutcomeUnknown(cid)
 
             # Symmetric to the sell path's order_was_filled guard: never book an
@@ -1487,22 +1698,26 @@ class ScanMixin:
                     f"(order={order!r})  skipping, no position booked", "WARN")
                 return None
 
+            (
+                resolved_gross_amount,
+                resolved_fill_price,
+                resolved_invested_usdt,
+            ) = ScanMixin._spot_buy_fill_evidence(
+                order,
+                amount_coins,
+                quote_first_buy=quote_first_buy,
+                max_quote_cost=trade_usdt,
+                expected_price=price,
+            )
             provisional_written = False
-            provisional_fill_price = extract_fill_price(order, price)
+            provisional_fill_price = resolved_fill_price
             if (not math.isfinite(provisional_fill_price)
                     or provisional_fill_price <= 0):
                 provisional_fill_price = price
-            try:
-                provisional_amount = float(order.get("filled") or amount_coins)
-                if not math.isfinite(provisional_amount) or provisional_amount <= 0:
-                    raise ValueError("non-finite filled amount")
-            except (TypeError, ValueError, OverflowError):
-                provisional_amount = amount_coins
+            provisional_amount = resolved_gross_amount
             try:
                 from core.logger import _date as _utc_now_str_inner
-                provisional_invested_usdt = ScanMixin._quote_cost_or_fallback(
-                    order, provisional_amount * provisional_fill_price,
-                    trade_usdt)
+                provisional_invested_usdt = resolved_invested_usdt
                 provisional_ok = self.state.add(sym, {
                     "buy": provisional_fill_price,
                     "highest": provisional_fill_price,
@@ -1531,15 +1746,15 @@ class ScanMixin:
                     f"Buy {sym}: early provisional state-write failed "
                     f"({_prov_e})  relying on final write", "WARN")
 
-            try:
-                amount = float(order.get("filled") or amount_coins)
-                if not math.isfinite(amount) or amount <= 0:
-                    raise ValueError("non-finite filled amount")
-            except (TypeError, ValueError, OverflowError):
-                amount = amount_coins
+            amount = resolved_gross_amount
+            if (
+                isinstance(order, dict)
+                and order.get("filled") is not None
+                and ScanMixin._finite_float(order.get("filled")) is None
+            ):
                 log_event(
                     f"Buy {sym}: filled amount malformed after accepted order; "
-                    f"using intended amount {amount:.8f} for tracking", "WARN")
+                    f"using resolved amount {amount:.8f} for tracking", "WARN")
             # detect partial fill
             if amount < amount_coins * 0.95:
                 log_event(
@@ -1549,7 +1764,7 @@ class ScanMixin:
                     "WARN"
                 )
 
-            fill_price = extract_fill_price(order, price)
+            fill_price = resolved_fill_price
 
             # Record realized entry slippage so repeated bad fills trip
             # SAFE_MODE (no-op when fill_price<=0; handled by the screener-price
@@ -1576,8 +1791,7 @@ class ScanMixin:
                 )
                 fill_price = price
 
-            invested_usdt = ScanMixin._quote_cost_or_fallback(
-                order, amount * fill_price, trade_usdt)
+            invested_usdt = resolved_invested_usdt
 
             # Zombie protection  write a PROVISIONAL state row immediately
             # after the order returns, BEFORE the slow fee refetches (~1.8s). If

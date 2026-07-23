@@ -25,6 +25,8 @@ DAUER:
   --quick: ~5-15 Minuten
 """
 
+# ruff: noqa: E402  # update barrier must run before project/runtime imports
+
 import sys
 import os
 import time
@@ -36,6 +38,14 @@ import random as _random
 import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+
+_TOOL_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _TOOL_PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _TOOL_PROJECT_ROOT)
+
+from launcher.tool_processes import guard_tool_entrypoint
+
+guard_tool_entrypoint(__file__, __name__)
 
 try:
     from scipy.stats import norm as _scipy_norm

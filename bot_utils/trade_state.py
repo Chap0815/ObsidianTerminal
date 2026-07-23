@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import copy
 import inspect
+import json
 import math
 import threading
 import time
+from contextlib import contextmanager
 from typing import Optional, Dict, Any, List
 
 from bot_utils.state_persist import (atomic_save_json,
@@ -26,11 +28,12 @@ from bot_utils.state_persist import (atomic_save_json,
 # Fields that, when changed via update()/update_many(), must be mirrored to the
 # shared bot_open_positions claim row. Deliberately EXCLUDES the high-frequency
 # last_price/highest fields so the monitor's per-tick updates don't hammer the
-# DB  only position-defining changes (e.g. a partial sell shrinking amount/
-# invested) refresh the claim.
+# DB  only position- or recovery-defining changes (e.g. a partial sell
+# shrinking amount/invested or clearing its accounting WAL) refresh the claim.
 _CLAIM_FIELDS = frozenset((
     "amount", "invested_usdt", "buy_price", "buy",
     "leverage", "position_type", "buy_time",
+    "accounting_pending_partials",
 ))
 
 _CLAIM_NUMERIC_FIELDS = frozenset((
@@ -39,12 +42,35 @@ _CLAIM_NUMERIC_FIELDS = frozenset((
 
 _CLAIM_EXTRA_FIELDS = frozenset((
     "original_amount", "initial_entry_fee", "fees_paid", "funding_paid",
-    "funding_booked_on_partials", "partial_sold", "break_even", "be_active",
+    "funding_booked_on_partials", "funding_booked_on_partials_known",
+    "partial_sold", "break_even", "be_active",
     "be_price", "highest", "last_price", "liquidation_price",
     "initial_liq_distance", "margin_mode", "accounting_pending_partials",
     "unpriced_external_partials", "entry_id", "entry_quality_score",
     "entry_quality_label", "entry_quality_reasons", "provisional", "adopted",
+    "claim_release_pending", "entry_intended_notional",
+    "entry_contract_size", "entry_oversize_notional_ceiling",
+    "entry_sizing_recovery_pending", "entry_sizing_recovery_unverified",
+    "entry_claim_opened_at", "entry_funding_window_unverified",
+    "accounting_pending_funding_unverified",
+    "oversize_rollback_pending", "oversize_rollback_reason",
+    "oversize_intended_notional", "oversize_real_notional",
 ))
+
+
+@contextmanager
+def registry_order_guard(state, sym: str, fallback_row=None):
+    """Use TradeState's ownership barrier, with a narrow test-double fallback."""
+    guard = getattr(state, "registry_order_guard", None)
+    if callable(guard):
+        with guard(sym) as row:
+            yield row
+        return
+    getter = getattr(state, "get", None)
+    if callable(getter):
+        yield getter(sym)
+    else:
+        yield copy.deepcopy(fallback_row)
 
 
 def _finite_float(value, default: float = 0.0) -> float:
@@ -75,9 +101,19 @@ def _validate_numeric_field(key: str, value) -> Optional[str]:
     return None
 
 
-def _normalize_position_row(data: dict) -> tuple[Optional[dict], str]:
+def _normalize_position_row(
+    data: dict,
+    *,
+    is_futures: bool = False,
+) -> tuple[Optional[dict], str]:
     if not isinstance(data, dict):
         return None, "not-dict"
+    position_type = data.get("position_type")
+    if is_futures and (
+        not isinstance(position_type, str)
+        or position_type not in ("LONG", "SHORT")
+    ):
+        return None, f"invalid position_type={position_type!r}"
 
     raw_buy = data.get("buy_price")
     buy_val = _finite_float_or_none(raw_buy)
@@ -179,6 +215,8 @@ class TradeState:
         self._is_futures = is_futures
         self._registry_retry_pending: Dict[str, Dict[str, Any]] = {}
         self._registry_retry_generation: Dict[str, int] = {}
+        self._registry_order_inflight: Dict[str, int] = {}
+        self._registry_conflict_deferred: set[str] = set()
         self._registry_retry_interval_sec = 5.0
         self._registry_retry_next_at = 0.0
         # bot_name drives the SHARED multi-bot ownership registry
@@ -193,6 +231,7 @@ class TradeState:
         clean, rejected = validator(initial)
         self._trades: Dict[str, Dict[str, Any]] = clean
         self.init_rejected: List[str] = rejected
+        self._cleanup_orphaned_claim_release_markers(clean)
         # Startup resync: re-claim positions we just loaded. Do not delete
         # registry rows missing from local JSON here: a corrupted/lagging state
         # file can be empty while the exchange still holds a live position.
@@ -210,7 +249,10 @@ class TradeState:
             return True
         try:
             from core.database import upsert_open_position
-            normalized, reason = _normalize_position_row(data)
+            normalized, reason = _normalize_position_row(
+                data,
+                is_futures=self._is_futures,
+            )
             if normalized is None:
                 self._log_registry_warning(
                     f"upsert rejected invalid numeric state for "
@@ -317,8 +359,20 @@ class TradeState:
                 return
             self._registry_retry_pending.pop(sym, None)
             self._registry_retry_generation.pop(sym, None)
+            self._registry_conflict_deferred.discard(sym)
             if not self._registry_retry_pending:
                 self._registry_retry_next_at = 0.0
+
+    def _clear_registry_conflict_locked(self, sym: str) -> bool:
+        current = self._trades.get(sym)
+        if not current or current.get("claim_conflict_reason") not in {
+            "registry_owner_conflict_on_startup",
+            "registry_owner_conflict_after_retry",
+        }:
+            return False
+        current.pop("claim_conflict", None)
+        current.pop("claim_conflict_reason", None)
+        return True
 
     def _resync_registry(self, clean: Dict[str, Dict[str, Any]]) -> None:
         """Re-claim locally loaded positions at startup.
@@ -333,8 +387,12 @@ class TradeState:
         conflicted = []
         pending = []
         pending_reasons = {}
+        healed = []
         for sym, data in clean.items():
             if self._registry_upsert_current(sym):
+                with self._lock:
+                    if self._clear_registry_conflict_locked(sym):
+                        healed.append(sym)
                 continue
             try:
                 from core.database import get_all_claimed_bases, _base_symbol
@@ -382,7 +440,7 @@ class TradeState:
                 f"startup resync kept {self._bot_name}:{sym} fail-closed; "
                 f"registry says another bot owns it"
             )
-        if conflicted or pending:
+        if conflicted or pending or healed:
             with self._lock:
                 for sym in conflicted:
                     if sym in self._trades:
@@ -406,10 +464,119 @@ class TradeState:
                 rev = self._rev
             self._persist_snapshot(rev, snapshot)
 
+    def _cleanup_orphaned_claim_release_markers(
+        self,
+        clean: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Finish only explicitly staged claim releases after a JSON loss.
+
+        An ordinary claim without local JSON may still represent a live
+        exchange position and must remain for exchange-aware reconciliation.
+        ``claim_release_pending`` is written to the claim before the local row
+        can be deleted, so an absent local row plus this exact marker is the
+        narrow durable proof that claim removal was already authorized.
+        """
+        if not self._bot_name:
+            return
+        try:
+            from core.database import (
+                _base_symbol,
+                get_open_positions_db,
+                remove_pending_open_position_claim,
+            )
+
+            local_bases = {
+                _base_symbol(symbol) for symbol in clean if _base_symbol(symbol)
+            }
+            rows = get_open_positions_db(self._bot_name)
+        except Exception:
+            self._log_registry_warning(
+                f"startup pending-release scan failed for {self._bot_name}"
+            )
+            return
+        for row in rows:
+            try:
+                symbol = row.get("symbol", "")
+                base = _base_symbol(symbol)
+                extra = json.loads(row.get("extra_json") or "{}")
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if (
+                not base
+                or base in local_bases
+                or not isinstance(extra, dict)
+                or extra.get("claim_release_pending") is not True
+            ):
+                continue
+            with self._registry_lock:
+                with self._lock:
+                    current_bases = {
+                        _base_symbol(current)
+                        for current in self._trades
+                        if _base_symbol(current)
+                    }
+                if base in current_bases:
+                    continue
+                if remove_pending_open_position_claim(
+                    self._bot_name,
+                    symbol,
+                ):
+                    self._clear_registry_retry_if_absent(base)
+                else:
+                    self._log_registry_warning(
+                        f"startup pending release kept for "
+                        f"{self._bot_name}:{symbol}"
+                    )
+
     def retry_registry_pending(self, *, force: bool = True) -> int:
         """Best-effort repair for claim rows that failed during startup."""
         if not self._bot_name:
             return 0
+        with self._registry_lock:
+            return self._retry_registry_pending_serialized(force=force)
+
+    @contextmanager
+    def registry_order_guard(self, sym: str):
+        """Linearize a managed physical order with registry-conflict writes.
+
+        Callers must acquire the per-symbol ``close_lock`` first and keep this
+        guard only through the bounded exchange submit/recovery operation.
+        Registry retries defer a conflict commit for this symbol while the
+        reservation is live; unrelated symbols and state readers stay free.
+        """
+        # A physical exit is rare and ownership-sensitive: bypass the normal
+        # read backoff so a recovered registry can publish a newly confirmed
+        # foreign owner before the order linearization point.
+        self.retry_registry_pending(force=True)
+        with self._lock:
+            current = self._trades.get(sym)
+            row = copy.deepcopy(current) if current is not None else None
+            conflict_deferred = sym in self._registry_conflict_deferred
+            if conflict_deferred:
+                if row is not None:
+                    row["claim_conflict"] = True
+                    row["claim_conflict_reason"] = (
+                        "registry_owner_conflict_after_retry"
+                    )
+            else:
+                self._registry_order_inflight[sym] = (
+                    self._registry_order_inflight.get(sym, 0) + 1
+                )
+        try:
+            yield row
+        finally:
+            if not conflict_deferred:
+                with self._lock:
+                    inflight = self._registry_order_inflight.get(sym, 0)
+                    if inflight <= 1:
+                        self._registry_order_inflight.pop(sym, None)
+                        if sym in self._registry_retry_pending:
+                            self._registry_retry_next_at = 0.0
+                    else:
+                        self._registry_order_inflight[sym] = inflight - 1
+
+    def _retry_registry_pending_serialized(self, *, force: bool) -> int:
+        """Evaluate and commit one retry generation as an atomic cycle."""
         with self._lock:
             if (
                 not force
@@ -462,18 +629,32 @@ class TradeState:
                     continue
                 self._registry_retry_pending.pop(sym, None)
                 self._registry_retry_generation.pop(sym, None)
+                self._registry_conflict_deferred.discard(sym)
                 if sym in self._trades:
                     self._trades[sym].pop("claim_registry_pending", None)
                     self._trades[sym].pop("claim_registry_pending_reason", None)
+                    self._clear_registry_conflict_locked(sym)
                 cleared_repaired.append(sym)
             for sym in conflicted:
+                # A foreign owner is symbol-level evidence.  If a newer failed
+                # mirror write advanced the generation after the DB query, the
+                # evidence still applies.  Only a proven repair (no pending
+                # generation) or row removal may clear it.
                 if (
-                    self._registry_retry_generation.get(sym, 0)
-                    != pending_generation.get(sym, 0)
+                    sym not in self._trades
+                    or sym not in self._registry_retry_pending
                 ):
+                    self._registry_conflict_deferred.discard(sym)
+                    continue
+                # The order reservation and this commit both linearize under
+                # _lock.  If submit won the race, retain the pending generation
+                # and publish the confirmed conflict immediately after submit.
+                if self._registry_order_inflight.get(sym, 0) > 0:
+                    self._registry_conflict_deferred.add(sym)
                     continue
                 self._registry_retry_pending.pop(sym, None)
                 self._registry_retry_generation.pop(sym, None)
+                self._registry_conflict_deferred.discard(sym)
                 if sym in self._trades:
                     self._trades[sym]["claim_conflict"] = True
                     self._trades[sym]["claim_conflict_reason"] = (
@@ -545,7 +726,10 @@ class TradeState:
         buggy screener producing amount=0 consistently is visible to the
         dashboard / Telegram instead of just silently yielding no trades.
         """
-        normalized, rejection_reason = _normalize_position_row(data)
+        normalized, rejection_reason = _normalize_position_row(
+            data,
+            is_futures=self._is_futures,
+        )
         if normalized is not None:
             data = normalized
             rejection_reason = None
@@ -617,7 +801,10 @@ class TradeState:
                 if key in _CLAIM_FIELDS:
                     candidate = copy.deepcopy(self._trades[sym])
                     candidate[key] = safe_value
-                    normalized, reason = _normalize_position_row(candidate)
+                    normalized, reason = _normalize_position_row(
+                        candidate,
+                        is_futures=self._is_futures,
+                    )
                     if normalized is None:
                         locked_reject_reason = reason
                     else:
@@ -678,7 +865,10 @@ class TradeState:
                 if _CLAIM_FIELDS.intersection(safe_fields):
                     candidate = copy.deepcopy(self._trades[sym])
                     candidate.update(safe_fields)
-                    normalized, reason = _normalize_position_row(candidate)
+                    normalized, reason = _normalize_position_row(
+                        candidate,
+                        is_futures=self._is_futures,
+                    )
                     if normalized is None:
                         locked_reject_reason = reason
                     else:
@@ -705,6 +895,27 @@ class TradeState:
             return status in ("persisted", "stale") and registry_ok
         return False
 
+    def release_claim_if_absent(self, sym: str) -> bool:
+        """Release only a stale registry claim, never a concurrent state row.
+
+        Entry rollback cleanup can observe an already-absent row after a
+        transient registry failure. Hold both coordination locks across the
+        final absence check and registry delete so a concurrent ``add`` cannot
+        be mistaken for the stale generation being cleaned up.
+        """
+        with self._registry_lock:
+            with self._lock:
+                if sym in self._trades:
+                    return False
+                if not self._registry_remove(sym):
+                    return False
+                self._registry_retry_pending.pop(sym, None)
+                self._registry_retry_generation.pop(sym, None)
+                self._registry_conflict_deferred.discard(sym)
+                if not self._registry_retry_pending:
+                    self._registry_retry_next_at = 0.0
+                return True
+
     def remove(self, sym: str, restore_fields: Optional[Dict[str, Any]] = None) -> bool:
         """Remove a trade and return whether removal was persisted.
 
@@ -729,17 +940,27 @@ class TradeState:
                     f"{self._bot_name or '-'}:{sym}"
                 )
                 return False
-        snapshot = None
-        removed = None
-        with self._lock:
-            if sym in self._trades:
-                removed = self._trades.pop(sym)
-                rev, snapshot = self._snapshot_locked()
-        if snapshot is None:
-            # Idempotent state removal must also heal a stale coordination
-            # mirror. Serialize with add/update registry writes and re-check
-            # the current row so a concurrent re-add cannot lose its claim.
-            with self._registry_lock:
+        with self._registry_lock:
+            marker_snapshot = None
+            removed = None
+            with self._lock:
+                if sym not in self._trades:
+                    state_absent = True
+                else:
+                    state_absent = False
+                    if self._bot_name:
+                        staged = copy.deepcopy(self._trades[sym])
+                        if safe_restore_fields:
+                            staged.update(safe_restore_fields)
+                        staged["claim_release_pending"] = True
+                        self._trades[sym] = staged
+                        marker_expected = copy.deepcopy(staged)
+                        marker_rev, marker_snapshot = self._snapshot_locked()
+
+            if state_absent:
+                # Idempotent state removal must also heal a stale coordination
+                # mirror. Serialize with add/update registry writes and re-check
+                # the current row so a concurrent re-add cannot lose its claim.
                 with self._lock:
                     if sym in self._trades:
                         return True
@@ -747,34 +968,76 @@ class TradeState:
                     return False
                 self._clear_registry_retry_if_absent(sym)
                 return True
-        if snapshot is not None:
+
+            if marker_snapshot is not None:
+                marker_status = self._persist_snapshot(
+                    marker_rev,
+                    marker_snapshot,
+                )
+                if marker_status == "failed":
+                    self._log_registry_warning(
+                        f"remove could not persist pending release for "
+                        f"{self._bot_name}:{sym}"
+                    )
+                    return False
+                with self._lock:
+                    current = self._trades.get(sym)
+                    if current != marker_expected:
+                        if (
+                            isinstance(current, dict)
+                            and current.get("claim_release_pending") is not True
+                        ):
+                            # A concurrent add replaced the staged generation.
+                            # The requested row is gone, but the new row and its
+                            # claim must remain untouched.
+                            return True
+                        self._log_registry_warning(
+                            f"remove deferred after concurrent state change for "
+                            f"{self._bot_name}:{sym}"
+                        )
+                        return False
+                    if not self._registry_upsert(sym, marker_expected):
+                        self._log_registry_warning(
+                            f"remove could not stage durable claim release for "
+                            f"{self._bot_name}:{sym}"
+                        )
+                        return False
+                    removed = self._trades.pop(sym)
+                    rev, snapshot = self._snapshot_locked()
+            else:
+                with self._lock:
+                    if sym in self._trades:
+                        removed = self._trades.pop(sym)
+                        rev, snapshot = self._snapshot_locked()
+                    else:
+                        return True
+
             status = self._persist_snapshot(rev, snapshot)
             if status in ("persisted", "stale"):
                 # A newer durable snapshot may already include this removal,
                 # so stale is successful too. Do not release the claim if a
                 # concurrent add has since recreated the symbol.
-                with self._registry_lock:
-                    with self._lock:
-                        symbol_still_absent = sym not in self._trades
-                    if not symbol_still_absent:
-                        return True
-                    # Release the claim so other bots can trade this coin.
-                    if self._registry_remove(sym):
-                        self._clear_registry_retry_if_absent(sym)
-                        return True
-                    with self._lock:
-                        restore_snapshot = None
-                        if sym not in self._trades and removed is not None:
-                            restored = copy.deepcopy(removed)
-                            if safe_restore_fields:
-                                restored.update(safe_restore_fields)
-                            restored["claim_release_pending"] = True
-                            self._trades[sym] = restored
-                            restore_rev, restore_snapshot = (
-                                self._snapshot_locked()
-                            )
-                    if restore_snapshot is not None:
-                        self._persist_snapshot(restore_rev, restore_snapshot)
+                with self._lock:
+                    symbol_still_absent = sym not in self._trades
+                if not symbol_still_absent:
+                    return True
+                # Release the claim so other bots can trade this coin.
+                if self._registry_remove(sym):
+                    self._clear_registry_retry_if_absent(sym)
+                    return True
+                with self._lock:
+                    restore_snapshot = None
+                    if sym not in self._trades and removed is not None:
+                        restored = copy.deepcopy(removed)
+                        if safe_restore_fields:
+                            restored.update(safe_restore_fields)
+                        restored["claim_release_pending"] = True
+                        self._trades[sym] = restored
+                        restore_rev, restore_snapshot = (
+                            self._snapshot_locked()
+                        )
+                if restore_snapshot is not None:
+                    self._persist_snapshot(restore_rev, restore_snapshot)
                 try:
                     from bot_utils.silent_log import silent_log
                     silent_log(
@@ -787,10 +1050,10 @@ class TradeState:
             elif status == "failed":
                 with self._lock:
                     if sym not in self._trades and removed is not None:
+                        restored = copy.deepcopy(removed)
                         if safe_restore_fields:
-                            removed = copy.deepcopy(removed)
-                            removed.update(safe_restore_fields)
-                        self._trades[sym] = removed
+                            restored.update(safe_restore_fields)
+                        self._trades[sym] = restored
                 try:
                     from bot_utils.silent_log import silent_log
                     silent_log(

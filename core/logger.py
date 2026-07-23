@@ -20,6 +20,7 @@ import shutil
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -241,10 +242,14 @@ def _struct_log_writer() -> None:
                 continue
             try:
                 with _STRUCT_LOG_LOCK:
-                    _rotate_if_needed(path)
-                    _ensure_dir(os.path.dirname(path))
-                    with open(path, "a", encoding="utf-8") as fh:
-                        fh.write(line + "\n")
+                    if not _append_rotating_text(
+                        path,
+                        line + "\n",
+                        STRUCT_LOG_MAX_BYTES,
+                        STRUCT_LOG_BACKUPS,
+                        jsonl=True,
+                    ):
+                        raise OSError("structured log cap/write unavailable")
                 with _STRUCT_WRITE_FAIL_LOCK:
                     _STRUCT_WRITE_FAILS = 0
             except Exception as e:
@@ -438,44 +443,41 @@ def _redact_value(v, field_name: object = None):
     return v
 
 
-def _rotate_if_needed(path: str, max_bytes: int = None,
-                       backups: int = None) -> None:
+def _rotate_if_needed(
+    path: str,
+    max_bytes: int = None,
+    backups: int = None,
+    *,
+    incoming_bytes: int = 0,
+    jsonl: bool = False,
+) -> bool:
     """Size-based log rotation. Never raises.
 
     Accepts optional max_bytes/backups so both callers work  the internal
     1-arg calls in this module and errors.py's 3-arg call
     `_rotate_if_needed(path, ERROR_LOG_MAX_BYTES, ERROR_LOG_BACKUPS)`.
     """
-    try:
-        mb = STRUCT_LOG_MAX_BYTES if max_bytes is None else int(max_bytes)
-    except (TypeError, ValueError, OverflowError):
-        mb = STRUCT_LOG_MAX_BYTES
-    try:
-        bk = STRUCT_LOG_BACKUPS if backups is None else int(backups)
-    except (TypeError, ValueError, OverflowError):
-        bk = STRUCT_LOG_BACKUPS
+    mb, bk = _rotation_limits(max_bytes, backups)
     if mb <= 0 or bk <= 0:
-        return
+        return True
     try:
+        incoming = max(0, int(incoming_bytes))
+        if incoming > mb:
+            return False
         if not os.path.exists(path):
-            return
-        if os.path.getsize(path) < mb:
-            return
-        oldest = f"{path}.{bk}"
-        try:
-            if os.path.exists(oldest):
-                os.remove(oldest)
-        except OSError:
-            return
-        for i in range(bk, 1, -1):
-            src = f"{path}.{i - 1}"
-            dst = f"{path}.{i}"
-            if os.path.exists(src):
-                if not _rename_with_retries(src, dst):
-                    return
-        _rename_with_retries(path, f"{path}.1")
-    except OSError:
-        pass
+            return True
+    except (OSError, TypeError, ValueError, OverflowError):
+        return False
+    with _rotation_path_lock(path) as acquired:
+        if not acquired:
+            return False
+        return _ensure_rotation_capacity_locked(
+            path,
+            mb,
+            bk,
+            incoming,
+            jsonl=jsonl,
+        )
 
 
 # Retry tunables for Windows-friendly rotation. ``os.rename`` raises
@@ -500,41 +502,380 @@ def _rename_with_retries(src: str, dst: str) -> bool:
     return False
 
 
-def _rotate_jsonl_if_needed(path: str) -> None:
-    """Rolling rotate with retry loop for Windows PermissionError.
-
-    ``os.rename`` raises PermissionError on Windows when the target file is
-    currently open for read (e.g. by the legacy-rebuild worker); retrying a
-    few times makes rotation reliable. The rebuild worker copies to a temp
-    under the lock, so the contention window is tiny anyway.
-
-    Called inside _TRADE_LOG_LOCK so no extra locking needed.
-    """
+def _rotation_limits(max_bytes, backups) -> tuple[int, int]:
     try:
-        if not os.path.exists(path):
-            return
-        if os.path.getsize(path) < HISTORY_JSONL_MAX_BYTES:
-            return
-        oldest = f"{path}.{HISTORY_JSONL_BACKUPS}"
-        try:
-            if os.path.exists(oldest):
-                os.remove(oldest)
-        except OSError:
-            return
+        mb = STRUCT_LOG_MAX_BYTES if max_bytes is None else int(max_bytes)
+    except (TypeError, ValueError, OverflowError):
+        mb = STRUCT_LOG_MAX_BYTES
+    try:
+        bk = STRUCT_LOG_BACKUPS if backups is None else int(backups)
+    except (TypeError, ValueError, OverflowError):
+        bk = STRUCT_LOG_BACKUPS
+    return mb, bk
 
-        # Shift existing backups (retry loop for Windows)
-        for i in range(HISTORY_JSONL_BACKUPS, 1, -1):
-            src = f"{path}.{i - 1}"
-            dst = f"{path}.{i}"
-            if not os.path.exists(src):
-                continue
-            if not _rename_with_retries(src, dst):
-                return
 
-        # Rotate current file (retry loop for Windows)
-        _rename_with_retries(path, f"{path}.1")
+@contextmanager
+def _rotation_path_lock(path: str):
+    """Bounded cross-process sidecar lock for rotate+append transactions."""
+    stream = None
+    acquired = False
+    try:
+        lock_path = f"{path}.rotation.lock"
+        _ensure_dir(os.path.dirname(lock_path))
+        stream = open(lock_path, "a+b")
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+
+        if os.name == "nt":
+            import msvcrt
+
+            for attempt in range(_ROTATE_MAX_RETRIES):
+                try:
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    if attempt == _ROTATE_MAX_RETRIES - 1:
+                        break
+                    time.sleep(_ROTATE_SLEEP_SEC)
+        else:
+            import fcntl
+
+            for attempt in range(_ROTATE_MAX_RETRIES):
+                try:
+                    fcntl.flock(
+                        stream.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    acquired = True
+                    break
+                except OSError:
+                    if attempt == _ROTATE_MAX_RETRIES - 1:
+                        break
+                    time.sleep(_ROTATE_SLEEP_SEC)
+    except (OSError, TypeError, ValueError):
+        acquired = False
+    try:
+        yield acquired
+    finally:
+        if acquired and stream is not None:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _remove_rotation_file(path: str) -> bool:
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def _lock_windows_segment_for_mutation(stream, size: int) -> int | None:
+    """Probe the full existing byte range before rewriting or truncating it."""
+    if os.name != "nt":
+        return 0
+    try:
+        import msvcrt
+
+        lock_bytes = max(1, int(size))
+        stream.seek(0)
+        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, lock_bytes)
+        return lock_bytes
+    except (OSError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _unlock_windows_segment(stream, lock_bytes: int | None) -> None:
+    if os.name != "nt" or not lock_bytes:
+        return
+    try:
+        import msvcrt
+
+        stream.seek(0)
+        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, lock_bytes)
     except OSError:
         pass
+
+
+def _rotate_backup_chain(path: str, backups: int) -> bool:
+    """Rotate into the oldest writable slot without growing the file set."""
+    if _remove_rotation_file(f"{path}.{backups}"):
+        highest_slot = backups
+    else:
+        highest_slot = None
+        # A Windows reader may deny deleting the oldest backup indefinitely.
+        # Drop the highest writable younger backup instead, preserving the
+        # current (newest) segment and the configured number of files.
+        for slot in range(backups - 1, 0, -1):
+            if _remove_rotation_file(f"{path}.{slot}"):
+                highest_slot = slot
+                break
+        if highest_slot is None:
+            return False
+
+    for slot in range(highest_slot, 1, -1):
+        src = f"{path}.{slot - 1}"
+        dst = f"{path}.{slot}"
+        if os.path.exists(src) and not _rename_with_retries(src, dst):
+            return False
+    return _rename_with_retries(path, f"{path}.1")
+
+
+def _compact_active_log(
+    path: str,
+    max_bytes: int,
+    *,
+    reserve_bytes: int = 0,
+    jsonl: bool = False,
+) -> bool:
+    """Bound an active log in place when every backup slot is Windows-locked.
+
+    Keeps up to half the cap, aligned after a newline. A delimiterless oversized
+    record is dropped rather than retained forever and exhausting the disk.
+    """
+    try:
+        size = os.path.getsize(path)
+        available = max(0, int(max_bytes) - max(0, int(reserve_bytes)))
+        keep_bytes = min(max(0, int(max_bytes) // 2), available)
+        if size <= keep_bytes:
+            return True
+        start = max(0, size - keep_bytes)
+        with open(path, "r+b") as stream:
+            lock_bytes = _lock_windows_segment_for_mutation(stream, size)
+            if lock_bytes is None:
+                return False
+            try:
+                stream.seek(start)
+                tail = stream.read(keep_bytes)
+                if start > 0:
+                    newline = tail.find(b"\n")
+                    tail = tail[newline + 1:] if newline >= 0 else b""
+                if jsonl and tail and not tail.endswith(b"\n"):
+                    last_newline = tail.rfind(b"\n")
+                    tail = tail[:last_newline + 1] if last_newline >= 0 else b""
+                stream.seek(0)
+                stream.write(tail)
+                stream.truncate()
+                stream.flush()
+            finally:
+                _unlock_windows_segment(stream, lock_bytes)
+        return True
+    except (OSError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def _trim_incomplete_jsonl_tail(path: str) -> bool:
+    """Remove only the final non-newline crash fragment under the sidecar lock."""
+    try:
+        with open(path, "r+b") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            if size <= 0:
+                return True
+            lock_bytes = _lock_windows_segment_for_mutation(stream, size)
+            if lock_bytes is None:
+                return False
+            try:
+                stream.seek(size - 1)
+                if stream.read(1) == b"\n":
+                    return True
+                cursor = size
+                while cursor > 0:
+                    start = max(0, cursor - 8192)
+                    stream.seek(start)
+                    chunk = stream.read(cursor - start)
+                    newline = chunk.rfind(b"\n")
+                    if newline >= 0:
+                        stream.truncate(start + newline + 1)
+                        stream.flush()
+                        return True
+                    cursor = start
+                stream.truncate(0)
+                stream.flush()
+                return True
+            finally:
+                _unlock_windows_segment(stream, lock_bytes)
+    except OSError:
+        return False
+
+
+def _ensure_rotation_capacity_locked(
+    path: str,
+    max_bytes: int,
+    backups: int,
+    incoming_bytes: int = 0,
+    *,
+    jsonl: bool = False,
+) -> bool:
+    for slot in range(1, backups + 1):
+        backup_path = f"{path}.{slot}"
+        if (
+            jsonl
+            and os.path.exists(backup_path)
+            and not _trim_incomplete_jsonl_tail(backup_path)
+        ):
+            return False
+        try:
+            oversized = (
+                os.path.exists(backup_path)
+                and os.path.getsize(backup_path) > max_bytes
+            )
+        except OSError:
+            return False
+        if oversized:
+            if not _compact_active_log(
+                backup_path,
+                max_bytes,
+                jsonl=jsonl,
+            ):
+                return False
+            try:
+                if os.path.getsize(backup_path) > max_bytes:
+                    return False
+            except OSError:
+                return False
+    if (
+        jsonl
+        and os.path.exists(path)
+        and not _trim_incomplete_jsonl_tail(path)
+    ):
+        return False
+    try:
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+    except OSError:
+        return False
+    if incoming_bytes > max_bytes:
+        return False
+    if size > max_bytes:
+        if not _compact_active_log(
+            path,
+            max_bytes,
+            reserve_bytes=incoming_bytes,
+            jsonl=jsonl,
+        ):
+            return False
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return False
+    at_maintenance_limit = incoming_bytes == 0 and size >= max_bytes
+    if not at_maintenance_limit and size + incoming_bytes <= max_bytes:
+        return True
+    if size > 0 and _rotate_backup_chain(path, backups):
+        return True
+    if not _compact_active_log(
+        path,
+        max_bytes,
+        reserve_bytes=incoming_bytes,
+        jsonl=jsonl,
+    ):
+        return False
+    try:
+        return os.path.getsize(path) + incoming_bytes <= max_bytes
+    except OSError:
+        return False
+
+
+def _bounded_log_payload(text: str, max_bytes: int, *, jsonl: bool) -> bytes:
+    raw = str(text).encode("utf-8", errors="replace")
+    if max_bytes <= 0 or len(raw) <= max_bytes:
+        return raw
+    if jsonl:
+        marker = (
+            json.dumps(
+                {
+                    "event": "oversized_log_record",
+                    "original_bytes": len(raw),
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        if len(marker) <= max_bytes:
+            return marker
+        return b"{}\n" if max_bytes >= 3 else b""
+
+    suffix = f"...[truncated {len(raw)} bytes]\n".encode("ascii")
+    if len(suffix) >= max_bytes:
+        return suffix[-max_bytes:]
+    prefix = raw[:max_bytes - len(suffix)]
+    prefix = prefix.decode("utf-8", errors="ignore").encode("utf-8")
+    return prefix + suffix
+
+
+def _append_rotating_text(
+    path: str,
+    text: str,
+    max_bytes: int = None,
+    backups: int = None,
+    *,
+    jsonl: bool = False,
+) -> bool:
+    """Atomically enforce cap and append one bounded record across processes."""
+    mb, bk = _rotation_limits(max_bytes, backups)
+    try:
+        payload = _bounded_log_payload(text, mb, jsonl=jsonl)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if jsonl and not payload:
+        return False
+    if mb <= 0 or bk <= 0:
+        try:
+            _ensure_dir(os.path.dirname(path))
+            with open(path, "ab") as stream:
+                stream.write(payload)
+            return True
+        except OSError:
+            return False
+
+    with _rotation_path_lock(path) as acquired:
+        if not acquired:
+            return False
+        if not _ensure_rotation_capacity_locked(
+            path,
+            mb,
+            bk,
+            len(payload),
+            jsonl=jsonl,
+        ):
+            return False
+        try:
+            with open(path, "ab") as stream:
+                stream.write(payload)
+                stream.flush()
+            return os.path.getsize(path) <= mb
+        except OSError:
+            return False
+
+
+def _rotate_jsonl_if_needed(path: str) -> bool:
+    """Rotate history through the shared Windows-bounded implementation."""
+    return _rotate_if_needed(
+        path,
+        HISTORY_JSONL_MAX_BYTES,
+        HISTORY_JSONL_BACKUPS,
+        jsonl=True,
+    )
 
 
 def log_struct(event: str, **fields) -> None:
@@ -959,10 +1300,14 @@ def save_trade(log_dir, symbol, buy_price, buy_time, sell_price,
 
     with _TRADE_LOG_LOCK:
         try:
-            _rotate_jsonl_if_needed(jsonl_path)
-            with open(jsonl_path, "a", encoding="utf-8") as fh:
-                fh.write(encoded_entry)
-                fh.flush()
+            if not _append_rotating_text(
+                jsonl_path,
+                encoded_entry,
+                HISTORY_JSONL_MAX_BYTES,
+                HISTORY_JSONL_BACKUPS,
+                jsonl=True,
+            ):
+                raise OSError("history log cap/write unavailable")
         except Exception as e:
             log_event(
                 f"history.jsonl append error: {_safe_log_text(e)}",
@@ -1142,45 +1487,31 @@ def _reset_tg_failures(recipient_key: str) -> int:
         return int(state["count"]) if state is not None else 0
 
 
-def _rotate_overflow_if_needed() -> None:
-    try:
-        if not os.path.exists(_TG_OVERFLOW_LOG):
-            return
-        if os.path.getsize(_TG_OVERFLOW_LOG) < TG_OVERFLOW_MAX_BYTES:
-            return
-        oldest = f"{_TG_OVERFLOW_LOG}.{TG_OVERFLOW_BACKUPS}"
-        try:
-            if os.path.exists(oldest):
-                os.remove(oldest)
-        except OSError:
-            return
-        for i in range(TG_OVERFLOW_BACKUPS, 1, -1):
-            src = f"{_TG_OVERFLOW_LOG}.{i-1}"
-            dst = f"{_TG_OVERFLOW_LOG}.{i}"
-            if os.path.exists(src):
-                try:
-                    os.rename(src, dst)
-                except OSError:
-                    return
-        try:
-            os.rename(_TG_OVERFLOW_LOG, f"{_TG_OVERFLOW_LOG}.1")
-        except OSError:
-            pass
-    except OSError:
-        pass
+def _rotate_overflow_if_needed() -> bool:
+    return _rotate_if_needed(
+        _TG_OVERFLOW_LOG,
+        TG_OVERFLOW_MAX_BYTES,
+        TG_OVERFLOW_BACKUPS,
+        jsonl=True,
+    )
 
 
 def _write_telegram_overflow(cid: str, msg: str) -> None:
     safe_cid = _telegram_config_text(cid, max_chars=256) or "[invalid]"
     if len(safe_cid) > 4:
         safe_cid = "***" + safe_cid[-4:]
-    os.makedirs(os.path.dirname(_TG_OVERFLOW_LOG), exist_ok=True)
-    with open(_TG_OVERFLOW_LOG, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps({
+    line = json.dumps({
             "ts": _date(),
             "chat_id": safe_cid,
             "msg": redact(clean_user_text(msg, max_chars=500))[:500],
-        }) + "\n")
+        }) + "\n"
+    _append_rotating_text(
+        _TG_OVERFLOW_LOG,
+        line,
+        TG_OVERFLOW_MAX_BYTES,
+        TG_OVERFLOW_BACKUPS,
+        jsonl=True,
+    )
 
 
 def send_telegram(token, chat_id, msg) -> None:
@@ -1226,7 +1557,6 @@ def send_telegram(token, chat_id, msg) -> None:
                 except Exception:
                     pass
             try:
-                _rotate_overflow_if_needed()
                 _write_telegram_overflow(cid, msg)
             except Exception:
                 pass

@@ -148,7 +148,8 @@ def safe_remaining_funding(funding_total: Any,
                            current_amount: Any,
                            original_amount: Any,
                            partial_sold: bool = False,
-                           booked_on_partials: Any = 0.0) -> float:
+                           booked_on_partials: Any = 0.0,
+                           booked_on_partials_known: bool = False) -> float:
     """Funding attributable to the current final-close slice.
 
     Partial-TP rows already write their own funding slice to the trade DB. When
@@ -156,7 +157,8 @@ def safe_remaining_funding(funding_total: Any,
     amount already booked on partial rows instead of charging it twice.
 
     If no partial funding was recorded, fall back to the legacy proportional
-    scale so old state files remain valid.
+    scale so old state files remain valid.  ``booked_on_partials_known``
+    distinguishes a verified zero booking from a legacy missing value.
     """
     scaled = safe_funding_scale(
         funding_total, current_amount, original_amount,
@@ -165,7 +167,13 @@ def safe_remaining_funding(funding_total: Any,
     booked = _finite_number(booked_on_partials)
     if booked is None:
         booked = 0.0
-    if not partial_sold or abs(booked) <= 1e-12:
+    if (
+        not partial_sold
+        or (
+            booked_on_partials_known is not True
+            and abs(booked) <= 1e-12
+        )
+    ):
         return scaled
     total = _finite_number(funding_total)
     if total is None:

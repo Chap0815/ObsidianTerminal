@@ -26,6 +26,36 @@ def _finite_float_or_none(value):
     return parsed if math.isfinite(parsed) else None
 
 
+def order_has_unquantified_fill_notional(order) -> bool:
+    """Return whether an order proves fill value but not the base amount.
+
+    A positive cumulative ``cost`` is physical fill evidence.  Without a
+    positive finite ``filled`` amount callers must not guess the sold quantity
+    or clear their stable client-order-id barrier; recovery must resolve the
+    amount from order/trade/balance evidence first.
+    """
+    if not isinstance(order, dict):
+        return False
+    cost = _finite_float_or_none(order.get("cost"))
+    if cost is None or cost <= 0:
+        return False
+    filled = _finite_float_or_none(order.get("filled"))
+    return filled is None or filled <= 0
+
+
+def order_has_proven_zero_fill(order) -> bool:
+    """Return whether explicit numeric evidence proves no amount or cost fill."""
+    if not isinstance(order, dict) or "filled" not in order:
+        return False
+    filled = _finite_float_or_none(order.get("filled"))
+    if filled != 0:
+        return False
+    if "cost" not in order or order.get("cost") is None:
+        return True
+    cost = _finite_float_or_none(order.get("cost"))
+    return cost == 0
+
+
 def _upper_text(value) -> str:
     return value.upper() if isinstance(value, str) else ""
 
@@ -38,6 +68,63 @@ def order_id_text_or_none(value) -> str | None:
     except Exception:
         return None
     return text or None
+
+
+def strict_order_snapshot_equal(left, right) -> bool:
+    """Type-strict equality for untrusted nested venue snapshots.
+
+    Normal Python equality treats ``True == 1`` and ``False == 0``. That is
+    unsafe when deciding whether two recovery rows are identical physical
+    order evidence, so containers and scalar types are compared explicitly.
+    """
+    active: set[tuple[int, int]] = set()
+
+    def _equal(first, second) -> bool:
+        if type(first) is not type(second):
+            return False
+        value_type = type(first)
+        if value_type is dict:
+            pair = (id(first), id(second))
+            if pair in active:
+                return False
+            active.add(pair)
+            try:
+                if len(first) != len(second):
+                    return False
+                if any(type(key) is not str for key in first):
+                    return False
+                if any(type(key) is not str for key in second):
+                    return False
+                if first.keys() != second.keys():
+                    return False
+                return all(
+                    _equal(value, second[key])
+                    for key, value in first.items()
+                )
+            finally:
+                active.remove(pair)
+        if value_type in (list, tuple):
+            pair = (id(first), id(second))
+            if pair in active:
+                return False
+            active.add(pair)
+            try:
+                return len(first) == len(second) and all(
+                    _equal(a, b) for a, b in zip(first, second)
+                )
+            finally:
+                active.remove(pair)
+        if value_type in (str, int, float, bool, type(None)):
+            try:
+                return bool(first == second)
+            except Exception:
+                return False
+        return False
+
+    try:
+        return _equal(left, right)
+    except Exception:
+        return False
 
 
 def _order_id_text(value) -> str:

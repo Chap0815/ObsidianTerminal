@@ -15,7 +15,11 @@ from typing import Callable, Optional, Tuple
 
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.futures_order import (
+    _explicit_client_order_ids,
+    _explicit_order_ids,
     _order_id_text,
+    _order_from_recovery_trades,
+    _order_refresh_conflicts,
     create_order_with_retry,
     extract_or_estimate_futures_fee,
     futures_contract_size,
@@ -23,7 +27,10 @@ from bot_utils.futures_order import (
     verify_position_closed,
 )
 from bot_utils.futures_math import calc_unrealized_pnl, price_move_pct
-from bot_utils.futures_funding import fetch_or_estimate_funding
+from bot_utils.futures_funding import (
+    fetch_or_estimate_funding,
+    fetch_realized_funding,
+)
 from bot_utils.fee_math import taker_fee_rate
 from bot_utils.order_utils import order_id_text_or_none
 
@@ -33,6 +40,47 @@ _FILL_RESOLVE_DELAY_SEC = 0.8
 _FILL_RESOLVE_MAX_RETRIES = 2
 _VERIFY_CLOSE_TIMEOUT_SEC = 5.0
 _FALLBACK_MIN_NOTIONAL = 5.0
+_EMERGENCY_CLOSE_FRAGMENT_BLOCKED: set[tuple[str, str]] = set()
+_EMERGENCY_CLOSE_FRAGMENT_BLOCKED_LOCK = Lock()
+
+
+def _emergency_fragment_key(bot_name, sym) -> tuple[str, str]:
+    return (str(bot_name or "").strip().upper(), str(sym or "").strip().upper())
+
+
+def _emergency_fragment_is_blocked(bot_name, sym) -> bool:
+    key = _emergency_fragment_key(bot_name, sym)
+    with _EMERGENCY_CLOSE_FRAGMENT_BLOCKED_LOCK:
+        return key in _EMERGENCY_CLOSE_FRAGMENT_BLOCKED
+
+
+def _block_emergency_fragment(bot_name, sym) -> None:
+    key = _emergency_fragment_key(bot_name, sym)
+    with _EMERGENCY_CLOSE_FRAGMENT_BLOCKED_LOCK:
+        _EMERGENCY_CLOSE_FRAGMENT_BLOCKED.add(key)
+
+
+def _persist_emergency_fragment(
+    *, state, sym, fields, bot_name, log_event, error_logger
+) -> bool:
+    try:
+        persisted = state.update_many(sym, fields)
+    except Exception as exc:
+        persisted = False
+        if error_logger:
+            try:
+                error_logger(f"emergency close fragment {sym}", exc)
+            except Exception:
+                pass
+    if persisted is False:
+        _block_emergency_fragment(bot_name, sym)
+        log_event(
+            f"  {sym}: close fragment recovery marker was not durable; "
+            f"further emergency close orders are blocked until restart",
+            "ERROR",
+        )
+        return False
+    return True
 
 
 def _utc_now_str() -> str:
@@ -134,21 +182,77 @@ def _order_id_is_fetchable(ex, symbol_full: str, order_id) -> bool:
     return True
 
 
+def _trade_order_ids(trade: dict) -> set[str]:
+    if not isinstance(trade, dict):
+        return set()
+    info = trade.get("info")
+    if not isinstance(info, dict):
+        info = {}
+    return {
+        value
+        for value in (
+            _order_id_text(trade.get("order")),
+            _order_id_text(trade.get("orderId")),
+            _order_id_text(trade.get("order_id")),
+            _order_id_text(trade.get("orderID")),
+            _order_id_text(info.get("orderId")),
+            _order_id_text(info.get("order_id")),
+            _order_id_text(info.get("orderID")),
+            _order_id_text(info.get("ordId")),
+        )
+        if value
+    }
+
+
+def _trade_as_order_snapshot(trade: dict, order_id: str) -> dict:
+    snapshot = dict(trade)
+    snapshot["id"] = order_id
+    snapshot.pop("order", None)
+    for key in ("orderId", "order_id", "orderID"):
+        snapshot.pop(key, None)
+    info = snapshot.get("info")
+    if isinstance(info, dict):
+        info = dict(info)
+        info.pop("id", None)
+        snapshot["info"] = info
+    return snapshot
+
+
 def _resolve_fill_price(ex,
-                          symbol_full: str,
-                          order: dict,
-                          fallback_price: float,
-                          log_event: Callable) -> Tuple[float, str]:
+                        symbol_full: str,
+                        order: dict,
+                        fallback_price: float,
+                        log_event: Callable,
+                        *,
+                        expected_side: str,
+                        expected_position_side: str = "",
+                        expected_client_id: Optional[str] = None,
+                        expected_amount: Optional[float] = None,
+                        ) -> Tuple[float, str]:
     """Multi-stage fill-price recovery  returns (price, source_label)."""
     fallback = _positive_finite_or_zero(fallback_price)
     fp = _extract_fill_from_order(order)
     if fp is not None:
         return fp, "order"
 
-    raw_order_id = order.get("id") if isinstance(order, dict) else None
-    order_id = _order_id_text(raw_order_id) or None
-    if raw_order_id is not None and order_id is None:
+    order_ids = _explicit_order_ids(order)
+    if len(order_ids) != 1:
         return fallback, "fallback"
+    order_id = next(iter(order_ids))
+    client_ids = _explicit_client_order_ids(order)
+    requested_client_id = _order_id_text(expected_client_id)
+    if expected_client_id is not None and not requested_client_id:
+        return fallback, "fallback"
+    if len(client_ids) > 1:
+        return fallback, "fallback"
+    if requested_client_id and client_ids != set() and client_ids != {
+        requested_client_id
+    }:
+        return fallback, "fallback"
+    bound_client_id = (
+        requested_client_id
+        or next(iter(client_ids), "")
+    )
 
     if _order_id_is_fetchable(ex, symbol_full, order_id):
         for attempt in range(_FILL_RESOLVE_MAX_RETRIES):
@@ -163,6 +267,27 @@ def _resolve_fill_price(ex,
             try:
                 time.sleep(_FILL_RESOLVE_DELAY_SEC * (1 + attempt))
                 fetched = ex.fetch_order(order_id, symbol_full)
+                if _order_refresh_conflicts(
+                    order,
+                    fetched,
+                    symbol_full,
+                    expected_side,
+                    expected_position_side,
+                    _exchange_id(ex),
+                    expected_reduce_only=True,
+                    allow_one_way_position_side=True,
+                    expected_client_id=bound_client_id or None,
+                    expected_amount=expected_amount,
+                ):
+                    try:
+                        log_event(
+                            "fetch_order fill price conflicts with close "
+                            "order identity; ignoring refresh",
+                            "ERROR",
+                        )
+                    except Exception:
+                        pass
+                    continue
                 fp = _extract_fill_from_order(fetched)
                 if fp is not None:
                     return fp, "fetch_order"
@@ -196,21 +321,66 @@ def _resolve_fill_price(ex,
         trades = ex.fetch_my_trades(symbol_full, limit=10) or []
         if isinstance(trades, list) and trades:
             trades = [trade for trade in trades if isinstance(trade, dict)]
-            same_order = [t for t in trades
-                            if order_id and _order_id_text(t.get("order")) == order_id]
-            if order_id and not same_order:
-                return _positive_finite_or_zero(fallback_price), "fallback"
-            pool = same_order if order_id else trades
-            try:
-                pool = sorted(pool,
-                               key=lambda t: t.get("timestamp") or 0,
-                               reverse=True)
-            except Exception:
-                pass
-            for t in pool:
-                fv = _positive_finite_or_zero(t.get("price"))
-                if fv > 0:
-                    return fv, "trades"
+            same_order = []
+            for trade in trades:
+                trade_order_ids = _trade_order_ids(trade)
+                if order_id in trade_order_ids and trade_order_ids != {
+                    order_id
+                }:
+                    return fallback, "fallback"
+                if trade_order_ids == {order_id}:
+                    same_order.append(trade)
+            if not same_order:
+                return fallback, "fallback"
+            for trade in same_order:
+                if _order_refresh_conflicts(
+                    order,
+                    _trade_as_order_snapshot(trade, order_id),
+                    symbol_full,
+                    expected_side,
+                    expected_position_side,
+                    _exchange_id(ex),
+                    expected_reduce_only=True,
+                    allow_one_way_position_side=True,
+                    expected_client_id=bound_client_id or None,
+                ):
+                    return fallback, "fallback"
+            recovered = _order_from_recovery_trades(
+                same_order,
+                bound_client_id,
+                symbol_full,
+                expected_amount=expected_amount,
+            )
+            expected_trade_filled = _positive_finite_or_zero(
+                order.get("filled") if isinstance(order, dict) else None
+            ) or _positive_finite_or_zero(expected_amount)
+            recovered_filled = _positive_finite_or_zero(
+                recovered.get("filled")
+            )
+            if expected_trade_filled > 0:
+                tolerance = max(1e-12, expected_trade_filled * 1e-9)
+                if (
+                    recovered_filled <= 0
+                    or abs(recovered_filled - expected_trade_filled)
+                    > tolerance
+                ):
+                    return fallback, "fallback"
+            if _order_refresh_conflicts(
+                order,
+                recovered,
+                symbol_full,
+                expected_side,
+                expected_position_side,
+                _exchange_id(ex),
+                expected_reduce_only=True,
+                allow_one_way_position_side=True,
+                expected_client_id=bound_client_id or None,
+                expected_amount=expected_amount,
+            ):
+                return fallback, "fallback"
+            fp = _extract_fill_from_order(recovered)
+            if fp is not None:
+                return fp, "trades"
     except Exception as e:
         try:
             log_event(
@@ -261,14 +431,42 @@ def _close_single_position(**kw):
     sym = kw.get("sym")
     state = kw.get("state")
     bot_name = kw.get("bot_name")
+    if _emergency_fragment_is_blocked(bot_name, sym):
+        return (
+            sym,
+            "failed",
+            0.0,
+            "close fragment recovery blocked; physical close not repeated",
+        )
     with close_lock(sym, timeout=15.0, bot_name=bot_name,
                     fail_open=True) as got:
+        if _emergency_fragment_is_blocked(bot_name, sym):
+            return (
+                sym,
+                "failed",
+                0.0,
+                "close fragment recovery blocked; physical close not repeated",
+            )
         if not got:
             return _flatten_without_accounting(**kw)
         if got and state is not None:
             try:
                 if not state.has(sym):
                     return (sym, "closed", 0.0, None)
+                live = state.get(sym)
+                if isinstance(live, dict):
+                    if live.get("accounting_pending") or live.get(
+                        "accounting_already_booked"
+                    ) or live.get("verified_flat_pending_accounting"):
+                        return (
+                            sym,
+                            "failed",
+                            0.0,
+                            "accounting recovery pending; physical close "
+                            "not repeated",
+                        )
+                    kw = dict(kw)
+                    kw["d"] = live
             except Exception:
                 pass
         return _close_single_position_impl(**kw)
@@ -278,6 +476,7 @@ def _flatten_without_accounting(**kw):
     sym = kw.get("sym")
     d = kw.get("d") or {}
     ex = kw.get("ex")
+    state = kw.get("state")
     simulation = bool(kw.get("simulation"))
     margin_mode = kw.get("margin_mode") or "isolated"
     reduce_only_params = kw.get("reduce_only_params")
@@ -315,14 +514,24 @@ def _flatten_without_accounting(**kw):
             margin_mode=margin_mode,
             leverage=max(1, int(__import__("math").ceil(lev))),
         )
-        create_order_with_retry(
-            ex, symbol_full, side, close_amount, params=params,
-            shutdown_event=shutdown_event, max_attempts=5,
-            action_label=f"emergency flatten {sym}",
-            log_event=log_event, abort_on_shutdown=False,
-        )
+        from bot_utils.trade_state import registry_order_guard
+        with registry_order_guard(state, sym, d) as ownership_live:
+            if not isinstance(ownership_live, dict):
+                return (sym, "failed", 0.0, "managed state unavailable")
+            if ownership_live.get("claim_conflict"):
+                return (sym, "failed", 0.0, "registry claim conflict")
+            create_order_with_retry(
+                ex, symbol_full, side, close_amount, params=params,
+                shutdown_event=shutdown_event, max_attempts=5,
+                action_label=f"emergency flatten {sym}",
+                log_event=log_event, abort_on_shutdown=False,
+            )
         closed_ok, remaining = verify_position_closed(
-            ex, symbol_full, timeout=_VERIFY_CLOSE_TIMEOUT_SEC)
+            ex,
+            symbol_full,
+            timeout=_VERIFY_CLOSE_TIMEOUT_SEC,
+            expected_position_side=pos_type,
+        )
         if closed_ok:
             log_event(
                 f"  [LIVE] {sym}: flattened while accounting lock was held; "
@@ -369,6 +578,33 @@ def _close_single_position_impl(*,
         if entry <= 0 or margin <= 0:
             return (sym, "failed", 0.0, "entry/margin invalid")
         symbol_full = f"{sym}/USDT:USDT"
+        pending_fragment_amount = 0.0
+        pending_fragment_price = 0.0
+        if not simulation:
+            from bot_utils.close_fragments import pending_close_values
+            pending_fragment_amount, pending_fragment_price, _fee, _oid = \
+                pending_close_values(d)
+            has_fragment_marker = any(
+                d.get(key) not in (None, "", 0, 0.0)
+                for key in (
+                    "pending_close_filled_amount",
+                    "pending_close_notional_sum",
+                    "pending_close_price",
+                    "pending_close_fee",
+                    "pending_close_order_id",
+                )
+            )
+            if has_fragment_marker and (
+                pending_fragment_amount <= 0
+                or pending_fragment_price <= 0
+                or pending_fragment_amount > amount + 1e-12
+            ):
+                return (
+                    sym,
+                    "failed",
+                    0.0,
+                    "close fragment recovery state invalid",
+                )
 
         # Price fallback chain
         curr = 0.0
@@ -422,6 +658,7 @@ def _close_single_position_impl(*,
         fill_source = "n/a"
         exch_oid: Optional[str] = None  # real order id  trade-dedup key (G2)
         close_fee = 0.0
+        order = None
         # contractSize-aware fee math  needed for contract_size != 1 coins
         # (1000SATS, MEME, ).
         _cs = futures_contract_size(ex, symbol_full)
@@ -435,7 +672,15 @@ def _close_single_position_impl(*,
         else:
             try:
                 close_side = "sell" if pos_type == "LONG" else "buy"
-                raw_amount = amount
+                raw_amount = max(0.0, amount - pending_fragment_amount)
+                if raw_amount <= 1e-12:
+                    return (
+                        sym,
+                        "failed",
+                        0.0,
+                        "close fragment recovery pending; physical close "
+                        "not repeated",
+                    )
                 try:
                     from config.exchange_config import safe_amount_to_precision
                     close_amount = _finite_precision_amount_or_none(
@@ -465,35 +710,55 @@ def _close_single_position_impl(*,
                         f"usually exempt).", "INFO"
                     )
 
-                order = create_order_with_retry(
-                    ex, symbol_full, close_side, close_amount,
-                    params=reduce_only_params(
-                        position_side=("long" if pos_type == "LONG" else "short"),
-                        # MUST mirror the normal close path
-                        # (futures_bot_exits._execute_full_close): MEXC rejects an
-                        # isolated/cross reduce-only order that omits leverage
-                        # ("unexpected keyword argument 'leverage'" / margin
-                        # errors) and the position then stays OPEN  exactly the
-                        # "close manually" failure this emergency path is meant to
-                        # prevent. margin_mode is threaded from the bot so CROSS
-                        # (cross) and FUTURES (isolated) each send the right shape.
-                        margin_mode=margin_mode,
-                        leverage=max(1, int(__import__("math").ceil(lev))) if lev else None,
-                    ),
-                    shutdown_event=shutdown_event,
-                    max_attempts=5,
-                    action_label=f"emergency close {sym}",
-                    log_event=log_event,
-                    log_struct=log_struct,
-                    abort_on_shutdown=False,
-                )
+                import uuid
+
+                from bot_utils.trade_state import registry_order_guard
+                client_order_id = "obx-" + uuid.uuid4().hex[:20]
+                with registry_order_guard(state, sym, d) as ownership_live:
+                    if not isinstance(ownership_live, dict):
+                        return (sym, "failed", 0.0, "managed state unavailable")
+                    if ownership_live.get("claim_conflict"):
+                        return (sym, "failed", 0.0, "registry claim conflict")
+                    order = create_order_with_retry(
+                        ex, symbol_full, close_side, close_amount,
+                        params=reduce_only_params(
+                            position_side=(
+                                "long" if pos_type == "LONG" else "short"
+                            ),
+                            # MUST mirror the normal close path
+                            # (futures_bot_exits._execute_full_close): MEXC
+                            # rejects an isolated/cross reduce-only order that
+                            # omits leverage. margin_mode is threaded from the
+                            # bot so CROSS/FUTURES send the right shape.
+                            margin_mode=margin_mode,
+                            leverage=(
+                                max(1, int(__import__("math").ceil(lev)))
+                                if lev else None
+                            ),
+                            client_order_id=client_order_id,
+                        ),
+                        shutdown_event=shutdown_event,
+                        max_attempts=5,
+                        action_label=f"emergency close {sym}",
+                        log_event=log_event,
+                        log_struct=log_struct,
+                        abort_on_shutdown=False,
+                    )
 
                 exch_oid = (
                     order_id_text_or_none(order.get("id"))
                     or order_id_text_or_none(order.get("orderId"))
                 )
                 resolved, fill_source = _resolve_fill_price(
-                    ex, symbol_full, order, curr, log_event
+                    ex,
+                    symbol_full,
+                    order,
+                    curr,
+                    log_event,
+                    expected_side=close_side,
+                    expected_position_side=pos_type,
+                    expected_client_id=client_order_id,
+                    expected_amount=close_amount,
                 )
                 if resolved is not None and resolved > 0:
                     fill_price = resolved
@@ -515,14 +780,80 @@ def _close_single_position_impl(*,
                     shutdown_event=shutdown_event,
                 )
 
+                def _fee_for_verified_fragment(fragment_amount: float) -> float:
+                    reported_fill = _positive_finite_or_zero(
+                        order.get("filled") if isinstance(order, dict) else None
+                    )
+                    tolerance = max(1e-12, fragment_amount * 1e-9)
+                    if (
+                        reported_fill > 0
+                        and abs(reported_fill - fragment_amount) <= tolerance
+                    ) or (
+                        reported_fill <= 0
+                        and abs(raw_amount - fragment_amount) <= tolerance
+                    ):
+                        return close_fee
+                    fragment_order = {
+                        "id": exch_oid,
+                        "filled": fragment_amount,
+                        "amount": fragment_amount,
+                    }
+                    return extract_or_estimate_futures_fee(
+                        ex,
+                        fragment_order,
+                        symbol_full,
+                        fill_price,
+                        amount=fragment_amount,
+                        contract_size=_cs,
+                        shutdown_event=shutdown_event,
+                    )
+
+                def _persist_verified_fragment(fragment_amount: float) -> bool:
+                    fragment_fee = _fee_for_verified_fragment(fragment_amount)
+                    from bot_utils.close_fragments import (
+                        add_close_fragment_update,
+                    )
+                    fragment_update = add_close_fragment_update(
+                        d,
+                        amount=fragment_amount,
+                        price=fill_price,
+                        fee=fragment_fee,
+                        order_id=exch_oid,
+                    )
+                    fragment_update["pending_close_reason"] = str(
+                        reason or "Emergency Close Retry"
+                    )
+                    return _persist_emergency_fragment(
+                        state=state,
+                        sym=sym,
+                        fields=fragment_update,
+                        bot_name=bot_name,
+                        log_event=log_event,
+                        error_logger=error_logger,
+                    )
+
                 # verify_position_closed returns (closed, remaining).
                 try:
                     closed_ok, remaining = verify_position_closed(
                         ex, symbol_full,
                         timeout=_VERIFY_CLOSE_TIMEOUT_SEC,
+                        expected_position_side=pos_type,
                     )
                 except Exception as ve:
                     closed_ok, remaining = False, -1.0
+                    reported_fill = _positive_finite_or_zero(
+                        order.get("filled") if isinstance(order, dict) else None
+                    )
+                    fragment_amount = min(raw_amount, reported_fill)
+                    if fragment_amount > 0 and fill_price > 0:
+                        if not _persist_verified_fragment(fragment_amount):
+                            return (
+                                sym,
+                                "failed",
+                                0.0,
+                                "partial close fragment recovery marker "
+                                "undurable",
+                            )
                     log_event(
                         f"  [LIVE] {sym}: verify_position_closed raised "
                         f"{ve} - assuming NOT closed", "WARN"
@@ -530,6 +861,19 @@ def _close_single_position_impl(*,
 
                 if not closed_ok:
                     if remaining > 0:
+                        total_filled = max(0.0, amount - float(remaining))
+                        fragment_amount = max(
+                            0.0, total_filled - pending_fragment_amount
+                        )
+                        if fragment_amount > 0 and fill_price > 0:
+                            if not _persist_verified_fragment(fragment_amount):
+                                return (
+                                    sym,
+                                    "failed",
+                                    0.0,
+                                    "partial close fragment recovery marker "
+                                    "undurable",
+                                )
                         log_event(
                             f"  [LIVE] {sym}: partial close detected, "
                             f"{remaining:.6f} contracts still open. "
@@ -551,6 +895,7 @@ def _close_single_position_impl(*,
                         closed_ok, remaining = verify_position_closed(
                             ex, symbol_full,
                             timeout=_VERIFY_CLOSE_TIMEOUT_SEC,
+                            expected_position_side=pos_type,
                         )
                     except Exception as ve:
                         closed_ok, remaining = False, -1.0
@@ -587,6 +932,92 @@ def _close_single_position_impl(*,
         if fill_price is None or fill_price <= 0:
             fill_price = curr
 
+        if not simulation and order is not None:
+            from bot_utils.close_fragments import (
+                add_close_fragment_update,
+                pending_close_values,
+            )
+            final_fragment_amount = max(
+                0.0, amount - pending_fragment_amount
+            )
+            reported_fill = _positive_finite_or_zero(order.get("filled"))
+            if reported_fill > 0 and abs(
+                reported_fill - final_fragment_amount
+            ) > max(1e-12, final_fragment_amount * 1e-9):
+                if reported_fill <= final_fragment_amount:
+                    gap_update = add_close_fragment_update(
+                        d,
+                        amount=reported_fill,
+                        price=fill_price,
+                        fee=_fee_for_verified_fragment(reported_fill),
+                        order_id=exch_oid,
+                    )
+                else:
+                    gap_update = {}
+                gap_update.update({
+                    "pending_close_reason": str(
+                        reason or "Emergency Close Fill Gap"
+                    ),
+                    "verified_flat_pending_accounting": True,
+                    "verified_flat_reason": (
+                        "Emergency close explicit fill evidence does not "
+                        "explain verified-flat position"
+                    ),
+                    "verified_flat_at": _utc_now_str(),
+                })
+                _persist_emergency_fragment(
+                    state=state,
+                    sym=sym,
+                    fields=gap_update,
+                    bot_name=bot_name,
+                    log_event=log_event,
+                    error_logger=error_logger,
+                )
+                _block_emergency_fragment(bot_name, sym)
+                log_event(
+                    f"  {sym}: verified flat but explicit order fill evidence "
+                    f"does not explain the remaining close amount; accounting "
+                    f"and further emergency orders are blocked",
+                    "ERROR",
+                )
+                return (
+                    sym,
+                    "failed",
+                    0.0,
+                    "final close fill evidence incomplete",
+                )
+            pending_view = dict(d)
+            pending_view.update(add_close_fragment_update(
+                d,
+                amount=final_fragment_amount,
+                price=fill_price,
+                fee=_fee_for_verified_fragment(final_fragment_amount),
+                order_id=exch_oid,
+            ))
+            aggregate_amount, aggregate_price, aggregate_fee, aggregate_oid = \
+                pending_close_values(pending_view)
+            if (
+                aggregate_amount <= 0
+                or aggregate_price <= 0
+                or abs(aggregate_amount - amount) > max(1e-12, amount * 1e-9)
+            ):
+                return (
+                    sym,
+                    "failed",
+                    0.0,
+                    "close fragment accounting aggregate invalid",
+                )
+            fill_price = aggregate_price
+            close_fee = aggregate_fee
+            exch_oid = aggregate_oid or exch_oid
+        elif not simulation and pending_fragment_amount > 0:
+            return (
+                sym,
+                "failed",
+                0.0,
+                "position flat with incomplete close fragment accounting",
+            )
+
         # PnL
         move_pct = (price_move_pct(entry, fill_price, pos_type)
                      if entry > 0 else 0.0)
@@ -611,7 +1042,15 @@ def _close_single_position_impl(*,
             funding_pd = safe_remaining_funding(
                 funding_pd, amount, original_amount,
                 partial_sold=True, booked_on_partials=funding_booked,
+                booked_on_partials_known=(
+                    d.get("funding_booked_on_partials_known") is True
+                ),
             )
+        funding_resolution_pending = False
+        funding_window_unverified = (
+            d.get("entry_funding_window_unverified") is True
+            or d.get("accounting_pending_funding_unverified") is True
+        )
         if not simulation:
             try:
                 notional = margin * lev if margin > 0 else 0.0
@@ -619,27 +1058,109 @@ def _close_single_position_impl(*,
                     remaining_ratio = amount / original_amount
                     if 0 < remaining_ratio < 1:
                         notional = notional / remaining_ratio
-                realized = fetch_or_estimate_funding(
-                    ex, symbol_full, d.get("buy_time"),
-                    notional_usdt=notional, pos_type=pos_type,
-                    fallback_state_value=funding_pd,
-                )
+                if funding_window_unverified:
+                    realized = fetch_realized_funding(
+                        ex, symbol_full, d.get("buy_time")
+                    )
+                    funding_resolution_pending = realized is None
+                else:
+                    realized = fetch_or_estimate_funding(
+                        ex, symbol_full, d.get("buy_time"),
+                        notional_usdt=notional, pos_type=pos_type,
+                        fallback_state_value=funding_pd,
+                    )
+                if realized is not None:
+                    realized = _finite_or_default(realized, math.nan)
+                    if not math.isfinite(realized):
+                        realized = None
+                        if funding_window_unverified:
+                            funding_resolution_pending = True
                 if realized is not None:
                     if partial_sold_flag:
                         realized = safe_remaining_funding(
                             realized, amount, original_amount,
                             partial_sold=True,
                             booked_on_partials=funding_booked,
+                            booked_on_partials_known=(
+                                d.get("funding_booked_on_partials_known")
+                                is True
+                            ),
                         )
                     funding_pd = realized
             except Exception:
-                pass
+                if funding_window_unverified:
+                    funding_resolution_pending = True
 
         slice_fees = proportional_entry_fee + close_fee
         profit_usdt = round(pnl_usdt - slice_fees - funding_pd, 2)
 
         buy_time = d.get("buy_time", _utc_now_str())
         sell_time = _utc_now_str()
+        trade_reason = f"Emergency Close ({reason}) [fill_src={fill_source}]"
+        mfe_pct = _finite_or_default(d.get("max_profit_pct"), move_pct)
+        mae_pct = _finite_or_default(d.get("min_profit_pct"), move_pct)
+        giveback_pct = max(0.0, mfe_pct - move_pct)
+        pending_close = {
+            "accounting_pending": True,
+            "accounting_pending_reason": trade_reason,
+            "accounting_pending_sell_price": fill_price,
+            "accounting_pending_sell_time": sell_time,
+            "accounting_pending_profit_pct": move_pct,
+            "accounting_pending_profit_usdt": profit_usdt,
+            "accounting_pending_mode_is_sim": simulation,
+            "accounting_pending_fees_usdt": slice_fees,
+            "accounting_pending_funding_paid": funding_pd,
+            "accounting_pending_exchange_order_id": exch_oid,
+            "accounting_pending_mfe_pct": mfe_pct,
+            "accounting_pending_mae_pct": mae_pct,
+            "accounting_pending_giveback_pct": giveback_pct,
+            "accounting_pending_entry_quality_score": d.get(
+                "entry_quality_score"),
+            "accounting_pending_entry_quality_label": d.get(
+                "entry_quality_label"),
+            "accounting_pending_entry_quality_reasons": d.get(
+                "entry_quality_reasons"),
+        }
+        if funding_resolution_pending:
+            pending_close["accounting_pending_funding_unverified"] = True
+        elif funding_window_unverified:
+            pending_close["entry_funding_window_unverified"] = False
+            pending_close["accounting_pending_funding_unverified"] = False
+        try:
+            pending_persisted = state.update_many(sym, pending_close)
+        except Exception as state_err:
+            pending_persisted = False
+            if error_logger:
+                try:
+                    error_logger(
+                        f"emergency accounting write-ahead {sym}", state_err
+                    )
+                except Exception:
+                    pass
+        if pending_persisted is False:
+            log_event(
+                f"  {sym}: verified emergency close was not booked because "
+                f"its accounting recovery marker was not durable",
+                "ERROR",
+            )
+            return (
+                sym,
+                "failed",
+                0.0,
+                "closed but accounting recovery marker undurable",
+            )
+        if funding_resolution_pending:
+            log_event(
+                f"  {sym}: verified emergency close kept for accounting "
+                f"recovery because exact funding history is unavailable",
+                "ERROR",
+            )
+            return (
+                sym,
+                "failed",
+                0.0,
+                "closed but exact funding accounting is pending",
+            )
         accounting_ok = False
         accounting_error = None
         try:
@@ -651,7 +1172,7 @@ def _close_single_position_impl(*,
                 buy_time=buy_time, sell_time=sell_time,
                 profit_pct=move_pct, profit_usdt=profit_usdt,
                 invested_usdt=margin,
-                reason=f"Emergency Close ({reason}) [fill_src={fill_source}]",
+                reason=trade_reason,
                 rsi_15m=d.get("rsi_15m"), rsi_1h=d.get("rsi_1h"),
                 rsi_4h=d.get("rsi_4h"), change_pct=d.get("change_pct"),
                 btc_trend=d.get("btc_trend"), fear_greed=d.get("fear_greed"),
@@ -662,6 +1183,12 @@ def _close_single_position_impl(*,
                 funding_paid=funding_pd,
                 fees_usdt=slice_fees,
                 exchange_order_id=exch_oid,
+                mfe_pct=mfe_pct,
+                mae_pct=mae_pct,
+                giveback_pct=giveback_pct,
+                entry_quality_score=d.get("entry_quality_score"),
+                entry_quality_label=d.get("entry_quality_label"),
+                entry_quality_reasons=d.get("entry_quality_reasons"),
                 entry_id=d.get("entry_id"),
             ))
             if not accounting_ok:
@@ -671,25 +1198,6 @@ def _close_single_position_impl(*,
             log_event(
                 f"  DB accounting for {sym} could not be saved after close: {e}. "
                 f"State kept for reconcile/accounting recovery.", "WARN")
-            try:
-                state.update_many(sym, {
-                    "accounting_pending": True,
-                    "accounting_pending_reason": (
-                        f"Emergency Close ({reason}) [fill_src={fill_source}]"
-                    ),
-                    "accounting_pending_sell_price": fill_price,
-                    "accounting_pending_sell_time": sell_time,
-                    "accounting_pending_profit_pct": move_pct,
-                    "accounting_pending_profit_usdt": profit_usdt,
-                    "accounting_pending_mode_is_sim": simulation,
-                    "accounting_pending_fees_usdt": slice_fees,
-                    "accounting_pending_funding_paid": funding_pd,
-                    "accounting_pending_exchange_order_id": exch_oid,
-                })
-            except Exception as state_err:
-                log_event(
-                    f"  Could not mark {sym} accounting_pending: "
-                    f"{state_err}", "WARN")
 
         if not accounting_ok:
             return (sym, "failed", 0.0,
@@ -712,24 +1220,87 @@ def _close_single_position_impl(*,
         except Exception as e:
             log_event(f"  Sell log for {sym} could not be written: {e}", "WARN")
 
+        restore_fields = {
+            "accounting_already_booked": True,
+            "accounting_booked_sell_time": sell_time,
+            "accounting_booked_exchange_order_id": exch_oid,
+            "accounting_booked_reason": f"Emergency Close ({reason})",
+        }
         try:
             # Scope by bot: FUTURES + CROSS share futures_state; unscoped would
             # delete the other bot's dashboard row for the same base coin.
             remove_futures_state(sym, bot_name, mode_is_sim=simulation)
-        except Exception:
-            pass
+        except Exception as cleanup_error:
+            if error_logger:
+                try:
+                    error_logger(
+                        f"emergency remove_futures_state {sym}", cleanup_error
+                    )
+                except Exception:
+                    pass
+            try:
+                keep = dict(restore_fields)
+                keep["futures_state_cleanup_pending"] = True
+                state.update_many(sym, keep)
+            except Exception as state_error:
+                if error_logger:
+                    try:
+                        error_logger(
+                            f"emergency mark futures cleanup pending {sym}",
+                            state_error,
+                        )
+                    except Exception:
+                        pass
+            log_event(
+                f"  {sym}: emergency close was booked, but futures_state "
+                f"cleanup failed; state kept for retry",
+                "WARN",
+            )
+            return (
+                sym,
+                "failed",
+                0.0,
+                f"closed but futures_state cleanup failed: {cleanup_error}",
+            )
+
         try:
             from bot_utils.trade_state import remove_with_restore_fields
-            remove_with_restore_fields(state, sym, {
-                "accounting_already_booked": True,
-                "accounting_booked_sell_time": sell_time,
-                "accounting_booked_exchange_order_id": exch_oid,
-                "accounting_booked_reason": f"Emergency Close ({reason})",
-            })
-        except KeyError:
-            pass
-        except Exception:
-            pass
+            removed_state = remove_with_restore_fields(
+                state, sym, restore_fields
+            )
+        except Exception as cleanup_error:
+            removed_state = False
+            try:
+                state.update_many(sym, restore_fields)
+            except Exception as state_error:
+                if error_logger:
+                    try:
+                        error_logger(
+                            f"emergency restore accounted state {sym}",
+                            state_error,
+                        )
+                    except Exception:
+                        pass
+            if error_logger:
+                try:
+                    error_logger(
+                        f"emergency remove accounted state {sym}",
+                        cleanup_error,
+                    )
+                except Exception:
+                    pass
+        if not removed_state:
+            log_event(
+                f"  {sym}: emergency close was booked, but claim/state "
+                f"cleanup failed; state kept for retry",
+                "WARN",
+            )
+            return (
+                sym,
+                "failed",
+                0.0,
+                "closed but claim/state cleanup failed",
+            )
 
         return (sym, "closed", profit_usdt, None)
 

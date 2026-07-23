@@ -18,7 +18,17 @@ _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from launcher.main import main  # noqa: E402 - project path bootstrap precedes import
+from update_barrier import (  # noqa: E402 - project path bootstrap precedes import
+    UpdateInProgressError,
+    assert_process_start_allowed,
+)
+
+try:
+    assert_process_start_allowed(_PROJECT_ROOT)
+except UpdateInProgressError as exc:
+    raise SystemExit(str(exc)) from exc
+
+from launcher.main import main  # noqa: E402 - update barrier precedes import
 
 if __name__ == "__main__":
     main()

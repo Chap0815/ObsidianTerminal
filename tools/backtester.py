@@ -11,12 +11,23 @@ All numeric defaults come from constants.py; STRATEGY_DEFAULTS (bottom) is the
 sole place per-strategy defaults live and is what the CLI reads.
 """
 
+# ruff: noqa: E402  # update barrier must run before project/runtime imports
+
 import sys
 import os
 import time as _time
 import statistics
-import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+_TOOL_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _TOOL_PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _TOOL_PROJECT_ROOT)
+
+from launcher.tool_processes import guard_tool_entrypoint
+
+guard_tool_entrypoint(__file__, __name__)
+
+import pandas as pd
 
 from config.exchange_config import get_spot_exchange_connection
 from core.clock import backtest_asof_ms

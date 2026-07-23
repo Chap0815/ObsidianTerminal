@@ -479,13 +479,19 @@ class CrossBot(FuturesBot):
             price = cls._safe_positive_price(ticker.get("close"))
         return price
 
-    def _fetch_exchange_position(self, full: str) -> tuple[dict | None, bool]:
+    def _fetch_exchange_position(
+        self,
+        full: str,
+        expected_position_side: str,
+    ) -> tuple[dict | None, bool]:
         from bot_utils import fetch_open_position
-        return fetch_open_position(self.ex, full)
+        return fetch_open_position(
+            self.ex,
+            full,
+            expected_position_side=expected_position_side,
+        )
 
     def _cleanup_untracked_entry_state(self, base: str, reason: str) -> bool:
-        from core.database import remove_open_position
-
         restore = {
             "provisional": True,
             "entry_inflight_until": 0.0,
@@ -493,22 +499,35 @@ class CrossBot(FuturesBot):
             "entry_abort_reason": reason,
             "claim_release_pending": True,
         }
+        remove_raised = False
         try:
             removed = self.state.remove(base, restore)
         except Exception as exc:
             self._log_error(f"cross cleanup untracked state {base}", exc)
             removed = False
+            remove_raised = True
         if removed:
             return True
         try:
-            self.state.update_many(base, restore)
+            state_exists = self.state.has(base)
         except Exception as exc:
-            self._log_error(f"cross mark untracked cleanup pending {base}", exc)
+            self._log_error(f"cross inspect untracked cleanup {base}", exc)
+            return False
+        if state_exists:
+            try:
+                self.state.update_many(base, restore)
+            except Exception as exc:
+                self._log_error(
+                    f"cross mark untracked cleanup pending {base}", exc
+                )
+            return False
+        if remove_raised:
+            return False
         try:
-            remove_open_position(self.BOT_NAME, base)
+            return bool(self.state.release_claim_if_absent(base))
         except Exception as exc:
-            self._log_error(f"cross release untracked claim {base}", exc)
-        return False
+            self._log_error(f"cross retry untracked claim cleanup {base}", exc)
+            return False
 
     def _exchange_position_type(self, pos: dict) -> str:
         info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
@@ -529,8 +548,15 @@ class CrossBot(FuturesBot):
             return "SHORT"
         return ""
 
-    def _verify_entry_fill(self, full: str, order: dict,
-                           fallback_fill: float) -> tuple[float, float, bool, str]:
+    def _verify_entry_fill(
+        self,
+        full: str,
+        order: dict,
+        fallback_fill: float,
+        expected_position_side: str,
+        requested_amount: float | None = None,
+        expected_client_id: str | None = None,
+    ) -> tuple[float, float, bool, str]:
         amount = self._safe_float((order or {}).get("filled"), 0.0)
         fill = fallback_fill
         for key in ("average", "price"):
@@ -545,18 +571,54 @@ class CrossBot(FuturesBot):
             order_id_text_or_none((order or {}).get("id"))
             or order_id_text_or_none((order or {}).get("orderId"))
         )
+        latest_order = order
+        refresh_conflict = False
         if oid:
+            from bot_utils.futures_order import (
+                _exchange_id,
+                _order_confirmed_terminal_zero_fill,
+                _order_refresh_conflicts,
+            )
+
+            expected_order_side = {
+                "LONG": "buy",
+                "SHORT": "sell",
+            }.get(str(expected_position_side).strip().upper(), "")
+            if not expected_order_side:
+                refresh_conflict = True
             for attempt in range(2):
+                if refresh_conflict:
+                    break
                 time.sleep(0.4 * (1 + attempt))
-                if not try_consume_api_call(
-                    "cross_entry_fetch_order",
-                    critical=True,
-                ):
+                try:
+                    allowed = try_consume_api_call(
+                        "cross_entry_fetch_order",
+                        critical=True,
+                    )
+                except Exception:
+                    allowed = False
+                if not allowed:
                     continue
                 try:
                     refreshed = self.ex.fetch_order(oid, full) or {}
                 except Exception:
                     continue
+                if _order_refresh_conflicts(
+                    order,
+                    refreshed,
+                    full,
+                    expected_order_side,
+                    expected_position_side,
+                    _exchange_id(self.ex),
+                    expected_reduce_only=False,
+                    allow_one_way_position_side=True,
+                    expected_client_id=expected_client_id,
+                    expected_amount=requested_amount,
+                ):
+                    refresh_conflict = True
+                    break
+                if refreshed:
+                    latest_order = refreshed
                 rf = self._safe_float(refreshed.get("filled"), 0.0)
                 if rf > 0:
                     for key in ("average", "price"):
@@ -565,16 +627,34 @@ class CrossBot(FuturesBot):
                             fill = fv
                             break
                     return rf, fill, False, "order_refresh"
+        if refresh_conflict:
+            try:
+                from core.logger import log_event
 
-        pos, unavailable = self._fetch_exchange_position(full)
+                log_event(
+                    f"[{self.BOT_NAME}] {full}: entry order refresh conflict; "
+                    "ignoring refresh and using position-only recovery",
+                    "ERROR",
+                )
+            except Exception:
+                pass
+
+        pos, unavailable = self._fetch_exchange_position(
+            full,
+            expected_position_side,
+        )
         if pos:
             contracts = abs(self._safe_float(pos.get("contracts") or pos.get("size"), 0.0))
             for key in ("entryPrice", "entry_price"):
                 fv = self._safe_float(pos.get(key), 0.0)
                 if fv > 0:
-                    fill = fv
-                    break
+                        fill = fv
+                        break
             return contracts, fill, False, "position"
+        if refresh_conflict:
+            return 0.0, fill, True, "order_refresh_conflict"
+        if oid and not _order_confirmed_terminal_zero_fill(latest_order):
+            return 0.0, fill, True, "order_status_unknown"
         return 0.0, fill, unavailable, "none"
 
     def _rollback_untracked_live_entry(
@@ -636,7 +716,11 @@ class CrossBot(FuturesBot):
                 action_label=f"cross rollback untracked {base}",
                 log_event=log_event,
             )
-            closed, remaining = verify_position_closed(self.ex, full)
+            closed, remaining = verify_position_closed(
+                self.ex,
+                full,
+                expected_position_side=side,
+            )
             if closed:
                 self._cleanup_untracked_entry_state(base, reason)
                 log_event(
@@ -662,12 +746,14 @@ class CrossBot(FuturesBot):
 
     def _heal_provisional_leg(self, base: str, d: dict) -> bool:
         from core.logger import log_event
-        from core.database import remove_open_position
 
         full = f"{base}/USDT:USDT"
         inflight_active = CrossBot._safe_float(
             self, d.get("entry_inflight_until"), 0.0) > time.time()
-        pos, unavailable = self._fetch_exchange_position(full)
+        expected_side = CrossBot._safe_exchange_text(
+            d.get("position_type")
+        ).upper()
+        pos, unavailable = self._fetch_exchange_position(full, expected_side)
         if pos is None:
             if inflight_active:
                 return False
@@ -675,18 +761,12 @@ class CrossBot(FuturesBot):
                 return False
             log_event(f"[{self.BOT_NAME}] {base}: provisional leg had no "
                       f"exchange position - removing stale claim", "WARN")
-            removed_state = False
             try:
-                removed_state = self.state.remove(base)
+                self.state.remove(base)
             except Exception:
                 pass
-            if removed_state:
-                remove_open_position(self.BOT_NAME, base)
             return False
 
-        expected_side = CrossBot._safe_exchange_text(
-            d.get("position_type")
-        ).upper()
         actual_side = self._exchange_position_type(pos)
         if expected_side in {"LONG", "SHORT"}:
             if not actual_side:
@@ -1971,8 +2051,7 @@ class CrossBot(FuturesBot):
                   price: float, lev: float,
                   quality_context: dict | None = None) -> None:
         from core.logger import log_event, log_struct, _date as _utc
-        from core.database import (is_claimed_by_other, claim_symbol_for_entry,
-                                   remove_open_position)
+        from core.database import is_claimed_by_other, claim_symbol_for_entry
         # Re-check the claim right before opening (race with another bot).
         if is_claimed_by_other(full, self.BOT_NAME, is_futures=True):
             log_event(f"[{self.BOT_NAME}] {base} claimed by another bot - skip", "WAIT")
@@ -2380,12 +2459,52 @@ class CrossBot(FuturesBot):
                 # leaving an untracked orphan. Reconcile-adoption is the backstop;
                 # this closes the window at the source.
                 try:
-                    from bot_utils.futures_order import _find_order_by_client_id
-                    landed = _find_order_by_client_id(self.ex, full, _cid)
+                    from bot_utils.futures_order import (
+                        _exchange_id,
+                        _find_order_by_client_id,
+                        _order_confirmed_terminal_zero_fill,
+                        _order_landed,
+                        _requested_position_side,
+                    )
+                    lookup_status = {}
+                    landed = _find_order_by_client_id(
+                        self.ex,
+                        full,
+                        _cid,
+                        expected_amount=contracts,
+                        expected_side=order_side,
+                        expected_position_side=_requested_position_side(params),
+                        exchange_id=_exchange_id(self.ex),
+                        expected_reduce_only=False,
+                        lookup_status=lookup_status,
+                    )
+                    recovery_conflict = (
+                        landed is not None
+                        and landed.get("_bot_recovery_conflict") is True
+                    )
                     _amt = self._safe_float((landed or {}).get("filled"), 0.0)
-                    if _amt <= 0:
-                        _amt = self._safe_float((landed or {}).get("amount"), 0.0)
-                    if landed is not None and _amt > 0:
+                    recovery_unavailable = bool(
+                        lookup_status.get("unavailable")
+                    )
+                    if recovery_unavailable:
+                        _outcome_unknown = True
+                    elif (
+                        landed is not None
+                        and not recovery_conflict
+                        and _order_confirmed_terminal_zero_fill(landed)
+                    ):
+                        _outcome_unknown = False
+                    elif recovery_conflict or (
+                        landed is not None
+                        and _order_landed(landed)
+                        and _amt <= 0
+                    ):
+                        _outcome_unknown = True
+                    if (
+                        landed is not None
+                        and not recovery_conflict
+                        and _amt > 0
+                    ):
                         try:
                             from bot_utils import filled_margin_usdt
                             _filled_margin, _ = filled_margin_usdt(
@@ -2431,16 +2550,20 @@ class CrossBot(FuturesBot):
                         "ERROR",
                     )
                 elif not _landed:
-                    removed_state = False
                     try:
-                        removed_state = self.state.remove(base)
+                        self.state.remove(base)
                     except Exception:
                         pass
-                    if removed_state:
-                        remove_open_position(self.BOT_NAME, base)
                 return
             amount, fill, positions_unavailable, verified_source = (
-                self._verify_entry_fill(full, order, exec_price)
+                self._verify_entry_fill(
+                    full,
+                    order,
+                    exec_price,
+                    side,
+                    requested_amount=contracts,
+                    expected_client_id=_cid,
+                )
             )
             provisional = False
             if amount <= 0 and not positions_unavailable:
@@ -2452,13 +2575,10 @@ class CrossBot(FuturesBot):
                     f"[{self.BOT_NAME}] {base}: order returned no fill and "
                     f"no exchange position was found - aborting state write",
                     "WARN")
-                removed_state = False
                 try:
-                    removed_state = self.state.remove(base)
+                    self.state.remove(base)
                 except Exception:
                     pass
-                if removed_state:
-                    remove_open_position(self.BOT_NAME, base)
                 return
             if amount <= 0:
                 amount = contracts
@@ -2611,8 +2731,22 @@ class CrossBot(FuturesBot):
 
     def _close_leg_inner(self, base: str, d: dict, reason: str) -> None:
         from core.logger import log_event, _date as _utc
+        from core.futures_bot_exits import (
+            FuturesExitsMixin,
+            _futures_full_exit_clear_fields,
+        )
         from bot_utils.futures_math import calc_unrealized_pnl, price_move_pct
         full = f"{base}/USDT:USDT"
+        blocked_fragments = getattr(
+            self, "_close_fragment_recovery_blocked", None
+        )
+        if isinstance(blocked_fragments, set) and base in blocked_fragments:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: close blocked pending restart "
+                f"reconciliation of an undurable verified fill fragment",
+                "ERROR",
+            )
+            return
         pos_type = CrossBot._safe_exchange_text(
             d.get("position_type"),
         ).upper()
@@ -2757,7 +2891,11 @@ class CrossBot(FuturesBot):
             try:
                 from bot_utils import verify_position_closed
                 from bot_utils.close_fragments import pending_close_values
-                _closed, _remaining = verify_position_closed(self.ex, full)
+                _closed, _remaining = verify_position_closed(
+                    self.ex,
+                    full,
+                    expected_position_side=pos_type,
+                )
                 if _closed:
                     _amt, _price, _fee, _oid = pending_close_values(d)
                     if not _pending_fragment_is_complete(_amt, _price, _fee, d):
@@ -2772,7 +2910,7 @@ class CrossBot(FuturesBot):
             except Exception:
                 pass
 
-        if self.simulation:
+        if self.simulation and not pending_accounting:
             # Realistic exit: cross the spread (long -> sell into the bid, short ->
             # buy at the ask) so SIM pays the round-trip spread, not the mid.
             try:
@@ -2796,16 +2934,22 @@ class CrossBot(FuturesBot):
             close_fee = amt * close_price * taker_fee_rate(self.ex, full)
         elif amt > 0 and not live_close_already_verified:
             #  LIVE: reduce-only market close 
-            from bot_utils import (create_order_with_retry,
-                                   extract_or_estimate_futures_fee,
+            from bot_utils import (extract_or_estimate_futures_fee,
                                    futures_contract_size,
                                    is_no_position_error,
                                    verify_position_closed)
-            from config.exchange_config import reduce_only_params, safe_amount_to_precision
+            from config.exchange_config import safe_amount_to_precision
             lev_int = max(1, int(__import__("math").ceil(lev)))
             try:
+                from bot_utils.close_fragments import pending_close_values
+
+                prior_filled, _px, _fee, _oid = pending_close_values(d)
+            except Exception:
+                prior_filled = 0.0
+            close_amount = max(0.0, amt - prior_filled)
+            try:
                 rounded_amt = CrossBot._precision_amount_or_none(
-                    safe_amount_to_precision(self.ex, full, amt)
+                    safe_amount_to_precision(self.ex, full, close_amount)
                 )
                 if rounded_amt is None:
                     log_event(
@@ -2814,22 +2958,38 @@ class CrossBot(FuturesBot):
                         "ERROR",
                     )
                     return
-                amt = rounded_amt
+                close_amount = rounded_amt
             except Exception:
                 pass
-            if amt <= 0:
+            if close_amount <= 0:
                 log_event(f"[{self.BOT_NAME}] {base}: close amount rounded to 0 "
                           f"- keeping state for retry", "WARN")
                 return
             close_side = "sell" if pos_type == "LONG" else "buy"
             try:
-                order = create_order_with_retry(
-                    self.ex, full, close_side, amt,
-                    params=reduce_only_params(
-                        position_side="long" if pos_type == "LONG" else "short",
-                        margin_mode="cross", leverage=lev_int),
-                    shutdown_event=self._shutdown_event,
-                    action_label=f"cross close {base}", log_event=log_event)
+                from core.futures_bot_exits import (
+                    _recover_or_submit_futures_full_exit,
+                )
+
+                (
+                    order,
+                    close_amount,
+                    full_exit_order_terminal,
+                ) = _recover_or_submit_futures_full_exit(
+                    self,
+                    base,
+                    d,
+                    symbol_full=full,
+                    requested_amount=close_amount,
+                    position_side=pos_type,
+                    close_side=close_side,
+                    margin_mode="cross",
+                    leverage=lev_int,
+                    action_label=f"cross close {base}",
+                    log_event=log_event,
+                )
+                if order is None:
+                    return
                 try:
                     order_filled = max(0.0, CrossBot._safe_float(
                         self, order.get("filled"), 0.0))
@@ -2838,7 +2998,11 @@ class CrossBot(FuturesBot):
             except Exception as e:
                 if is_no_position_error(e):
                     try:
-                        _closed, _remaining = verify_position_closed(self.ex, full)
+                        _closed, _remaining = verify_position_closed(
+                            self.ex,
+                            full,
+                            expected_position_side=pos_type,
+                        )
                     except Exception as ve:
                         self._log_error(f"cross verify-close-after-error {base}", ve)
                         log_event(
@@ -2910,7 +3074,16 @@ class CrossBot(FuturesBot):
                 try:
                     from bot_utils.futures_exits import _resolve_fill_price
                     close_price, _fill_src = _resolve_fill_price(
-                        self.ex, full, order, close_price, log_event)
+                        self.ex,
+                        full,
+                        order,
+                        close_price,
+                        log_event,
+                        expected_side=close_side,
+                        expected_position_side=pos_type,
+                        expected_client_id=d.get("full_exit_client_order_id"),
+                        expected_amount=close_amount,
+                    )
                 except Exception:
                     for _k in ("average", "price"):
                         _v = order.get(_k)
@@ -2932,19 +3105,45 @@ class CrossBot(FuturesBot):
                 # the true remaining size, so the eventual confirmed close books
                 # once and never leaves an unmanaged orphan or double-counts PnL.
                 try:
-                    _closed, _remaining = verify_position_closed(self.ex, full)
+                    _closed, _remaining = verify_position_closed(
+                        self.ex,
+                        full,
+                        expected_position_side=pos_type,
+                    )
                 except Exception as e:
                     if order_filled > 0 and close_price > 0:
                         try:
-                            from bot_utils.close_fragments import add_close_fragment_update
-                            frag_fee = extract_or_estimate_futures_fee(
-                                self.ex, order, full, close_price,
-                                amount=order_filled, contract_size=cs)
-                            self.state.update_many(base, add_close_fragment_update(
-                                d, amount=order_filled, price=close_price,
-                                fee=frag_fee, order_id=exch_oid))
-                        except Exception:
-                            pass
+                            from bot_utils.close_fragments import (
+                                add_close_fragment_update,
+                                pending_close_values,
+                            )
+
+                            prev_amount, _px, _fee, _oid = (
+                                pending_close_values(d)
+                            )
+                            if prev_amount <= 0:
+                                frag_fee = extract_or_estimate_futures_fee(
+                                    self.ex, order, full, close_price,
+                                    amount=order_filled, contract_size=cs)
+                                fields = add_close_fragment_update(
+                                    d, amount=order_filled, price=close_price,
+                                    fee=frag_fee, order_id=exch_oid)
+                                fields["pending_close_reason"] = reason
+                                if full_exit_order_terminal:
+                                    fields.update(
+                                        _futures_full_exit_clear_fields()
+                                    )
+                                if not FuturesExitsMixin._persist_close_fragment(
+                                    self, base, fields, log_event
+                                ):
+                                    return
+                        except Exception as frag_exc:
+                            FuturesExitsMixin._block_close_fragment_recovery(
+                                self, base, log_event, type(frag_exc).__name__
+                            )
+                            self._log_error(
+                                f"cross build close fragment {base}", frag_exc)
+                            return
                     self._log_error(f"cross verify-close {base}", e)
                     log_event(f"[{self.BOT_NAME}] {base}: close unverified - "
                               f"keeping leg, retry next tick", "WARN")
@@ -2963,11 +3162,35 @@ class CrossBot(FuturesBot):
                             if not _finite_non_bool_number(frag_fee):
                                 _log_invalid_pending_fragment()
                                 return
-                            self.state.update_many(base, add_close_fragment_update(
+                            fields = add_close_fragment_update(
                                 d, amount=fragment, price=close_price,
-                                fee=frag_fee, order_id=exch_oid))
-                    except Exception:
-                        pass
+                                fee=frag_fee, order_id=exch_oid)
+                            fields["pending_close_reason"] = reason
+                            if full_exit_order_terminal:
+                                fields.update(
+                                    _futures_full_exit_clear_fields()
+                                )
+                            if not FuturesExitsMixin._persist_close_fragment(
+                                self, base, fields, log_event
+                            ):
+                                return
+                        elif full_exit_order_terminal:
+                            tolerance = max(1e-12, amt * 1e-9)
+                            if abs(total_filled - prev_amount) <= tolerance:
+                                if not FuturesExitsMixin._persist_close_fragment(
+                                    self,
+                                    base,
+                                    _futures_full_exit_clear_fields(),
+                                    log_event,
+                                ):
+                                    return
+                    except Exception as frag_exc:
+                        FuturesExitsMixin._block_close_fragment_recovery(
+                            self, base, log_event, type(frag_exc).__name__
+                        )
+                        self._log_error(
+                            f"cross build close fragment {base}", frag_exc)
+                        return
                     log_event(
                         f"[{self.BOT_NAME}] {base}: close incomplete "
                         f"(remaining {_remaining:.6f}) - keeping leg, retry next "
@@ -3017,19 +3240,63 @@ class CrossBot(FuturesBot):
         if entry > 0 and close_price > 0 and margin > 0 and amt > 0:
             pnl_usdt, _ = calc_unrealized_pnl(entry, close_price, margin, lev, pos_type)
             funding = CrossBot._safe_float(self, d.get("funding_paid"), 0.0)
+            funding_resolution_pending = False
+            funding_history_resolved = False
+            funding_requires_history = (
+                d.get("entry_funding_window_unverified") is True
+                or d.get("accounting_pending_funding_unverified") is True
+            )
             if not self.simulation:
                 try:
-                    from bot_utils import fetch_or_estimate_funding
-                    realized = fetch_or_estimate_funding(
-                        self.ex, full, d.get("buy_time"),
-                        notional_usdt=margin * lev if margin > 0 else 0.0,
-                        pos_type=pos_type,
-                        fallback_state_value=funding,
+                    if funding_requires_history:
+                        from bot_utils.futures_funding import (
+                            fetch_realized_funding,
+                        )
+
+                        realized = fetch_realized_funding(
+                            self.ex,
+                            full,
+                            d.get("buy_time"),
+                        )
+                    else:
+                        from bot_utils import fetch_or_estimate_funding
+
+                        realized = fetch_or_estimate_funding(
+                            self.ex, full, d.get("buy_time"),
+                            notional_usdt=(
+                                margin * lev if margin > 0 else 0.0
+                            ),
+                            pos_type=pos_type,
+                            fallback_state_value=funding,
+                        )
+                    parsed_funding = CrossBot._safe_float(
+                        self, realized, None
                     )
-                    if realized is not None:
-                        funding = CrossBot._safe_float(self, realized, funding)
+                    if funding_requires_history:
+                        funding_resolution_pending = parsed_funding is None
+                        funding_history_resolved = parsed_funding is not None
+                    if parsed_funding is not None:
+                        funding = parsed_funding
                 except Exception:
-                    pass
+                    if funding_requires_history:
+                        funding_resolution_pending = True
+            if bool(d.get("partial_sold")):
+                from bot_utils import safe_remaining_funding
+
+                funding = safe_remaining_funding(
+                    funding,
+                    amt,
+                    CrossBot._safe_float(
+                        self, d.get("original_amount"), amt
+                    ),
+                    partial_sold=True,
+                    booked_on_partials=CrossBot._safe_float(
+                        self, d.get("funding_booked_on_partials"), 0.0
+                    ),
+                    booked_on_partials_known=(
+                        d.get("funding_booked_on_partials_known") is True
+                    ),
+                )
             total_fees = close_fee if close_fee_is_total else entry_fee + close_fee
             total_fees, funding = self._clamp_cross_sim_costs(
                 full, d, total_fees, funding, log_event=log_event)
@@ -3049,21 +3316,29 @@ class CrossBot(FuturesBot):
             sell_time = _utc()
             reason_for_db = f"Cross {reason}"
             if pending_accounting:
-                try:
-                    profit_usdt = CrossBot._safe_float(
-                        self, d.get("accounting_pending_profit_usdt"), profit_usdt)
-                except Exception:
-                    pass
+                if not funding_requires_history:
+                    try:
+                        profit_usdt = CrossBot._safe_float(
+                            self,
+                            d.get("accounting_pending_profit_usdt"),
+                            profit_usdt,
+                        )
+                    except Exception:
+                        pass
                 try:
                     profit_pct = CrossBot._safe_float(
                         self, d.get("accounting_pending_profit_pct"), profit_pct)
                 except Exception:
                     pass
-                try:
-                    funding = CrossBot._safe_float(
-                        self, d.get("accounting_pending_funding_paid"), funding)
-                except Exception:
-                    pass
+                if not funding_requires_history:
+                    try:
+                        funding = CrossBot._safe_float(
+                            self,
+                            d.get("accounting_pending_funding_paid"),
+                            funding,
+                        )
+                    except Exception:
+                        pass
                 try:
                     mfe_pct = CrossBot._safe_float(
                         self, d.get("accounting_pending_mfe_pct"), mfe_pct)
@@ -3081,10 +3356,61 @@ class CrossBot(FuturesBot):
                     pass
                 sell_time = d.get("accounting_pending_sell_time") or sell_time
                 reason_for_db = d.get("accounting_pending_reason") or reason_for_db
+            accounting_mode_is_sim = d.get(
+                "accounting_pending_mode_is_sim", self.simulation)
+            pending_close = {
+                "accounting_pending": True,
+                "accounting_pending_reason": reason_for_db,
+                "accounting_pending_sell_price": close_price,
+                "accounting_pending_sell_time": sell_time,
+                "accounting_pending_profit_pct": profit_pct,
+                "accounting_pending_profit_usdt": profit_usdt,
+                "accounting_pending_mode_is_sim": accounting_mode_is_sim,
+                "accounting_pending_fees_usdt": total_fees,
+                "accounting_pending_funding_paid": funding,
+                "accounting_pending_exchange_order_id": exch_oid,
+                "accounting_pending_mfe_pct": mfe_pct,
+                "accounting_pending_mae_pct": mae_pct,
+                "accounting_pending_giveback_pct": giveback_pct,
+                "accounting_pending_entry_quality_score": d.get(
+                    "entry_quality_score"),
+                "accounting_pending_entry_quality_label": d.get(
+                    "entry_quality_label"),
+                "accounting_pending_entry_quality_reasons": d.get(
+                    "entry_quality_reasons"),
+            }
+            if funding_resolution_pending:
+                pending_close["accounting_pending_funding_unverified"] = True
+            elif funding_history_resolved:
+                pending_close["entry_funding_window_unverified"] = False
+                pending_close["accounting_pending_funding_unverified"] = False
+            if not self.simulation:
+                pending_close.update(_futures_full_exit_clear_fields())
+            try:
+                pending_persisted = self.state.update_many(
+                    base, pending_close)
+            except Exception as state_err:
+                pending_persisted = False
+                self._log_error(
+                    f"cross full accounting write-ahead {base}", state_err)
+            if pending_persisted is False:
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: verified flat close was not "
+                    f"booked because its accounting recovery marker was not "
+                    f"durable",
+                    "ERROR",
+                )
+                return
+            if funding_resolution_pending:
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: verified flat close kept for "
+                    "accounting recovery because exact funding history is "
+                    "unavailable",
+                    "ERROR",
+                )
+                return
             try:
                 from core.database import save_trade_db
-                accounting_mode_is_sim = d.get(
-                    "accounting_pending_mode_is_sim", self.simulation)
                 saved_ok = bool(save_trade_db(
                     bot_name=self.BOT_NAME, mode_is_sim=accounting_mode_is_sim, symbol=base,
                     buy_price=entry, sell_price=close_price,
@@ -3107,31 +3433,6 @@ class CrossBot(FuturesBot):
                 log_event(
                     f"[{self.BOT_NAME}] {base}: DB accounting failed after "
                     f"verified close ({e}) - state kept for recovery", "WARN")
-                try:
-                    self.state.update_many(base, {
-                        "accounting_pending": True,
-                        "accounting_pending_reason": f"Cross {reason}",
-                        "accounting_pending_sell_price": close_price,
-                        "accounting_pending_sell_time": sell_time,
-                        "accounting_pending_profit_pct": profit_pct,
-                        "accounting_pending_profit_usdt": profit_usdt,
-                        "accounting_pending_mode_is_sim": self.simulation,
-                        "accounting_pending_fees_usdt": total_fees,
-                        "accounting_pending_funding_paid": funding,
-                        "accounting_pending_exchange_order_id": exch_oid,
-                        "accounting_pending_mfe_pct": mfe_pct,
-                        "accounting_pending_mae_pct": mae_pct,
-                        "accounting_pending_giveback_pct": giveback_pct,
-                        "accounting_pending_entry_quality_score": d.get(
-                            "entry_quality_score"),
-                        "accounting_pending_entry_quality_label": d.get(
-                            "entry_quality_label"),
-                        "accounting_pending_entry_quality_reasons": d.get(
-                            "entry_quality_reasons"),
-                    })
-                except Exception as state_err:
-                    self._log_error(f"cross mark accounting_pending {base}",
-                                    state_err)
                 return
         else:
             log_event(

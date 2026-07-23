@@ -28,6 +28,7 @@ import os
 import queue
 import re
 from collections import deque
+from contextlib import contextmanager
 import signal
 import subprocess
 import sys
@@ -41,6 +42,7 @@ from launcher.core.runtime_status_values import (
     positive_int_or_zero,
     strict_bool_or_none,
 )
+from update_barrier import process_start_guard
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -288,15 +290,36 @@ class BotProcess:
         self.log_queue = log_queue
         self.start_config: dict | None = None
         self.run_id: str | None = None
+        self._failed_start_owned_proc: subprocess.Popen | None = None
         self.supports_graceful = supports_graceful
         self._lifecycle_lock = threading.Lock()
+        self._stop_close_operation_active = False
 
     #  Lifecycle 
 
     def start(self, current_config_snapshot: dict | None = None) -> None:
         with self._lifecycle_lock:
+            if self._stop_close_operation_active:
+                raise RuntimeError("bot stop/close operation is still in progress")
             if self.is_running():
                 return
+
+            failed_start_proc = self._failed_start_owned_proc
+            if failed_start_proc is not None:
+                try:
+                    failed_start_exited = failed_start_proc.poll() is not None
+                except Exception as exc:
+                    raise RuntimeError(
+                        "failed-start bot process state cannot be determined"
+                    ) from exc
+                if not failed_start_exited:
+                    raise RuntimeError(
+                        "bot process from failed start is still running"
+                    )
+                self._close_process_stdout(failed_start_proc)
+                if self.proc is failed_start_proc:
+                    self.proc = None
+                self._failed_start_owned_proc = None
 
             kw: dict = subprocess_no_window_kwargs()
             if sys.platform == "win32":
@@ -327,15 +350,32 @@ class BotProcess:
             else:
                 argv = [_get_python_exe(), "-u", self.script]
 
-            spawned_proc = subprocess.Popen(
-                argv,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                # Python 3.13: bufsize=1 (line-buffered) raises RuntimeWarning
-                # on binary pipes. The bot uses -u (unbuffered stdout) anyway,
-                # so bufsize=-1 (OS default) gives identical behaviour.
-                text=True, bufsize=-1, encoding="utf-8", errors="replace",
-                env=env, cwd=PROJECT_ROOT, **kw
-            )
+            spawned_proc = None
+            try:
+                with process_start_guard(PROJECT_ROOT):
+                    spawned_proc = subprocess.Popen(
+                        argv,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        # Python 3.13: bufsize=1 (line-buffered) raises RuntimeWarning
+                        # on binary pipes. The bot uses -u (unbuffered stdout) anyway,
+                        # so bufsize=-1 (OS default) gives identical behaviour.
+                        text=True, bufsize=-1, encoding="utf-8", errors="replace",
+                        env=env, cwd=PROJECT_ROOT, **kw
+                    )
+            except Exception:
+                if spawned_proc is not None:
+                    rollback_complete = self._rollback_failed_start(
+                        spawned_proc
+                    )
+                    if not rollback_complete:
+                        self.proc = spawned_proc
+                        self.start_config = current_config_snapshot
+                        self._failed_start_owned_proc = spawned_proc
+                else:
+                    rollback_complete = True
+                if rollback_complete:
+                    self.run_id = None
+                raise
             self.proc = spawned_proc
             self.start_config = current_config_snapshot
             try:
@@ -345,10 +385,13 @@ class BotProcess:
                     daemon=True,
                 ).start()
             except Exception:
-                self._rollback_failed_start(spawned_proc)
-                if self.proc is spawned_proc:
-                    self.proc = None
-                self.run_id = None
+                rollback_complete = self._rollback_failed_start(spawned_proc)
+                if rollback_complete:
+                    if self.proc is spawned_proc:
+                        self.proc = None
+                    self.run_id = None
+                else:
+                    self._failed_start_owned_proc = spawned_proc
                 raise
 
     # Graceful-close budget breakdown (must exceed bot.SHUTDOWN_DEADLINE_SEC):
@@ -359,24 +402,49 @@ class BotProcess:
     _GRACEFUL_TIMEOUT_SEC: float = 75.0
     _FORCE_KILL_TIMEOUT_SEC: float = 5.0
 
-    def _rollback_failed_start(self, proc: subprocess.Popen) -> None:
-        """Reap a child whose stdout reader could not be started."""
+    @staticmethod
+    def _close_process_stdout(proc: subprocess.Popen) -> None:
+        stdout = getattr(proc, "stdout", None)
+        if stdout is None or getattr(stdout, "closed", False):
+            return
+        try:
+            stdout.close()
+        except Exception:
+            pass
+
+    @contextmanager
+    def exclusive_stop_operation(self):
+        """Block concurrent restart until launcher cleanup/fallback is done."""
+        with self._lifecycle_lock:
+            if self._stop_close_operation_active:
+                raise RuntimeError("bot stop/close operation is already in progress")
+            self._stop_close_operation_active = True
+        try:
+            yield
+        finally:
+            with self._lifecycle_lock:
+                self._stop_close_operation_active = False
+
+    def _rollback_failed_start(self, proc: subprocess.Popen) -> bool:
+        """Return True only after a failed-start child is proven reaped."""
+        reaped = False
         try:
             proc.terminate()
             proc.wait(timeout=5)
+            reaped = True
         except Exception:
             try:
                 proc.kill()
                 proc.wait(timeout=self._FORCE_KILL_TIMEOUT_SEC)
+                reaped = True
             except Exception:
-                pass
-        finally:
-            stdout = getattr(proc, "stdout", None)
-            if stdout is not None:
                 try:
-                    stdout.close()
+                    reaped = proc.poll() is not None
                 except Exception:
-                    pass
+                    reaped = False
+        if reaped:
+            self._close_process_stdout(proc)
+        return reaped
 
     def _mark_runtime_stopped(self, returncode=None, *,
                               expected_run_id: str | None = None,
@@ -456,6 +524,11 @@ class BotProcess:
                 pid_to_mark = proc_to_mark.pid
                 returncode_to_mark = proc_to_mark.poll()
                 self.proc = None
+                close_failed_start_stdout = (
+                    self._failed_start_owned_proc is proc_to_mark
+                )
+                if close_failed_start_stdout:
+                    self._failed_start_owned_proc = None
                 already_exited = (
                     returncode_to_mark,
                     run_id_to_mark,
@@ -467,6 +540,8 @@ class BotProcess:
                 pid_to_stop = proc_to_stop.pid
         if already_exited is not None:
             returncode_to_mark, run_id_to_mark, pid_to_mark = already_exited
+            if close_failed_start_stdout:
+                self._close_process_stdout(proc_to_mark)
             self._mark_runtime_stopped(
                 returncode_to_mark,
                 expected_run_id=run_id_to_mark,
@@ -502,44 +577,72 @@ class BotProcess:
                         pass
 
         if signal_ok:
-            # Signal sent  give the bot time to clean up gracefully
+            # Signal sent  give the bot time to clean up gracefully.
             try:
                 proc_to_stop.wait(timeout=self._GRACEFUL_TIMEOUT_SEC)
-            except subprocess.TimeoutExpired:
+            except Exception as exc:
                 stderr = sys.stderr
                 if stderr is not None:
                     try:
                         stderr.write(
-                            f"[BotProcess] graceful close TIMEOUT after "
-                            f"{self._GRACEFUL_TIMEOUT_SEC}s  force kill\n"
+                            f"[BotProcess] graceful close did not finish after "
+                            f"{self._GRACEFUL_TIMEOUT_SEC}s ({exc})  force kill\n"
                         )
                     except Exception:
                         pass
-                try:
-                    proc_to_stop.kill()
-                    proc_to_stop.wait(timeout=self._FORCE_KILL_TIMEOUT_SEC)
-                except Exception:
-                    pass
         else:
-            # Signal failed or not requested  hard terminate immediately
+            # Signal failed or not requested  hard terminate immediately.
+            terminate_sent = False
             try:
                 proc_to_stop.terminate()
-                proc_to_stop.wait(timeout=5)
-            except subprocess.TimeoutExpired:
+                terminate_sent = True
+            except Exception as exc:
+                stderr = sys.stderr
+                if stderr is not None:
+                    try:
+                        stderr.write(
+                            f"[BotProcess] terminate failed ({exc})  force kill\n"
+                        )
+                    except Exception:
+                        pass
+            if terminate_sent and proc_to_stop.poll() is None:
                 try:
-                    proc_to_stop.kill()
-                    proc_to_stop.wait(timeout=self._FORCE_KILL_TIMEOUT_SEC)
+                    proc_to_stop.wait(timeout=5)
                 except Exception:
                     pass
 
+        if proc_to_stop.poll() is None:
+            try:
+                proc_to_stop.kill()
+            except Exception as exc:
+                stderr = sys.stderr
+                if stderr is not None:
+                    try:
+                        stderr.write(f"[BotProcess] force kill failed: {exc}\n")
+                    except Exception:
+                        pass
+            try:
+                proc_to_stop.wait(timeout=self._FORCE_KILL_TIMEOUT_SEC)
+            except Exception:
+                pass
+
         #  Mark dead under the lock 
         if proc_to_stop.poll() is None:
-            return pid_to_stop
+            raise RuntimeError(
+                f"bot process {pid_to_stop} is still running after stop escalation"
+            )
         with self._lifecycle_lock:
             # Only clear if we're still pointing at the proc we just stopped
             #  a concurrent start() shouldn't be clobbered.
             if self.proc is proc_to_stop:
                 self.proc = None
+            close_failed_start_stdout = (
+                self._failed_start_owned_proc is proc_to_stop
+            )
+            if close_failed_start_stdout:
+                self._failed_start_owned_proc = None
+        if close_failed_start_stdout:
+            self._close_process_stdout(proc_to_stop)
         self._mark_runtime_stopped(
             proc_to_stop.poll(),
             expected_run_id=run_id_to_stop,

@@ -17,6 +17,8 @@ Run:
   python -m tools.trend_leverage_check 730 BTC ETH SOL   # custom universe (no sweep)
 """
 
+# ruff: noqa: E402  # update barrier must run before project/runtime imports
+
 from __future__ import annotations
 
 import os
@@ -30,9 +32,13 @@ else:
     except Exception:
         pass
 
-import numpy as np
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from launcher.tool_processes import guard_tool_entrypoint
+
+guard_tool_entrypoint(__file__, __name__)
+
+import numpy as np
 
 from config.exchange_config import get_exchange_connection, get_active_exchange_name
 from tools.trend_check import _sig_price_ma, _sig_cross, _max_dd, COST

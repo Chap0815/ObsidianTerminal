@@ -22,8 +22,30 @@ import subprocess
 import sys
 import threading
 
-from core.constants import LAUNCHER_STDIO_MAX_BYTES
-from launcher.config.settings import PROJECT_ROOT, _get_python_exe
+_PREIMPORT_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PREIMPORT_PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PREIMPORT_PROJECT_ROOT)
+
+from update_barrier import (  # noqa: E402 - pre-import root bootstrap above
+    UpdateInProgressError,
+    assert_process_start_allowed,
+    process_start_guard,
+    update_lifecycle_lock,
+)
+from env_setup_files import (  # noqa: E402 - pre-import root bootstrap above
+    cleanup_stale_env_temps,
+)
+
+try:
+    assert_process_start_allowed(_PREIMPORT_PROJECT_ROOT)
+except UpdateInProgressError as exc:
+    raise SystemExit(str(exc)) from exc
+
+from core.constants import LAUNCHER_STDIO_MAX_BYTES  # noqa: E402 - barrier above
+from launcher.config.settings import (  # noqa: E402 - barrier above
+    PROJECT_ROOT,
+    _get_python_exe,
+)
 
 
 class _BoundedTextStream:
@@ -212,14 +234,24 @@ def _relaunch_windowless() -> bool:
     entry = os.path.join(PROJECT_ROOT, "launcher.pyw")
     if not (os.path.isfile(pythonw) and os.path.isfile(entry)):
         return False  # can't relaunch  run as-is
+    spawned = None
     try:
-        subprocess.Popen(
-            [pythonw, entry], cwd=PROJECT_ROOT,
-            creationflags=subprocess.CREATE_NO_WINDOW, close_fds=True,
-            env=dict(os.environ, OBSIDIAN_NO_REEXEC="1"))
+        with process_start_guard(PROJECT_ROOT):
+            spawned = subprocess.Popen(
+                [pythonw, entry], cwd=PROJECT_ROOT,
+                creationflags=subprocess.CREATE_NO_WINDOW, close_fds=True,
+                env=dict(os.environ, OBSIDIAN_NO_REEXEC="1"))
         return True
     except Exception:
-        return False
+        # If Popen succeeded but releasing the lifecycle lock failed, the
+        # console parent must still exit. Continuing would leave two launchers.
+        return spawned is not None
+
+
+def _cleanup_setup_env_temps(project_root: str) -> None:
+    """Recover secret setup temps even when a complete .env already exists."""
+    with update_lifecycle_lock(project_root, timeout=15.0):
+        cleanup_stale_env_temps(project_root)
 
 
 def main() -> None:
@@ -236,18 +268,25 @@ def main() -> None:
     # braces for back-compat with the bots themselves.
     os.chdir(PROJECT_ROOT)
 
+    try:
+        _cleanup_setup_env_temps(PROJECT_ROOT)
+    except Exception as exc:
+        print(f"[launcher] private setup temp cleanup failed: {exc}")
+        raise SystemExit(1) from exc
+
     env_path = os.path.join(PROJECT_ROOT, ".env")
     wizard_path = os.path.join(PROJECT_ROOT, "setup_wizard.pyw")
 
-    if not os.path.exists(env_path) and os.path.exists(wizard_path):
+    if not os.path.lexists(env_path) and os.path.exists(wizard_path):
         kw = {}
         if sys.platform == "win32":
             kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-        subprocess.Popen(
-            [_get_python_exe(), wizard_path],
-            cwd=PROJECT_ROOT,
-            **kw,
-        )
+        with process_start_guard(PROJECT_ROOT):
+            subprocess.Popen(
+                [_get_python_exe(), wizard_path],
+                cwd=PROJECT_ROOT,
+                **kw,
+            )
         sys.exit(0)
 
     # Ensure the DB schema exists BEFORE the UI queries it. get_bot_stats()

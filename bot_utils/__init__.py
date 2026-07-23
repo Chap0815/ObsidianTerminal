@@ -47,6 +47,8 @@ from bot_utils.spot_exits import (
     emergency_close_all_spot,
     InsufficientSellBalance,
     SpotSellOutcomeUnknown,
+    normalize_spot_order_status,
+    spot_sell_requires_terminal_recovery,
 )
 
 # Futures
@@ -90,6 +92,8 @@ from bot_utils.ticker_cache import TickerCache, TickerOverloaded
 from bot_utils.circuit_breaker import (
     record_slippage,
     check_spread_ok,
+    has_valid_spread_quotes,
+    extract_valid_top_of_book,
     SafeMode,
     MAX_SLIPPAGE_PCT,
     MAX_SPREAD_PCT,
@@ -135,6 +139,8 @@ __all__ = [
     "emergency_close_all_spot",
     "InsufficientSellBalance",
     "SpotSellOutcomeUnknown",
+    "normalize_spot_order_status",
+    "spot_sell_requires_terminal_recovery",
     # Futures math
     "calc_liquidation_price",
     "distance_to_liquidation_pct",
@@ -178,6 +184,8 @@ __all__ = [
     # Circuit breaker
     "record_slippage",
     "check_spread_ok",
+    "has_valid_spread_quotes",
+    "extract_valid_top_of_book",
     "SafeMode",
     "MAX_SLIPPAGE_PCT",
     "MAX_SPREAD_PCT",

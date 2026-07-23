@@ -9,6 +9,7 @@ back to stderr so a critical error is never silently lost.
 """
 from __future__ import annotations
 
+import os
 import sys
 import re
 import threading
@@ -61,6 +62,178 @@ def _stderr_fallback(line: str) -> None:
         pass
 
 
+def _compact_fallback_segment(
+    path: str,
+    cap: int,
+    *,
+    reserve_bytes: int = 0,
+) -> bool:
+    """Bound one early-boot log segment without importing core.logger."""
+    try:
+        size = os.path.getsize(path)
+        available = max(0, cap - max(0, reserve_bytes))
+        keep_bytes = min(max(0, cap // 2), available)
+        if size <= keep_bytes:
+            return True
+        start = max(0, size - keep_bytes)
+        with open(path, "r+b") as stream:
+            lock_bytes = 0
+            if os.name == "nt":
+                import msvcrt
+
+                lock_bytes = max(1, size)
+                stream.seek(0)
+                msvcrt.locking(
+                    stream.fileno(),
+                    msvcrt.LK_NBLCK,
+                    lock_bytes,
+                )
+            try:
+                stream.seek(start)
+                tail = stream.read(keep_bytes)
+                if start > 0:
+                    newline = tail.find(b"\n")
+                    tail = tail[newline + 1:] if newline >= 0 else b""
+                stream.seek(0)
+                stream.write(tail)
+                stream.truncate()
+                stream.flush()
+            finally:
+                if lock_bytes:
+                    try:
+                        stream.seek(0)
+                        msvcrt.locking(
+                            stream.fileno(),
+                            msvcrt.LK_UNLCK,
+                            lock_bytes,
+                        )
+                    except OSError:
+                        pass
+        return os.path.getsize(path) <= cap
+    except OSError:
+        return False
+
+
+def _fallback_bounded_append(
+    path: str,
+    text: str,
+    max_bytes: int,
+    backups: int,
+    **_kwargs,
+) -> bool:
+    """Early-boot fallback used only while core.logger cannot import."""
+    lock_stream = None
+    lock_acquired = False
+    try:
+        cap = int(max_bytes)
+        count = int(backups)
+        if cap <= 0 or count <= 0:
+            return False
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        lock_stream = open(f"{path}.rotation.lock", "a+b")
+        lock_stream.seek(0, os.SEEK_END)
+        if lock_stream.tell() == 0:
+            lock_stream.write(b"\0")
+            lock_stream.flush()
+        if os.name == "nt":
+            import msvcrt
+
+            for attempt in range(_RETRY_ATTEMPTS):
+                try:
+                    lock_stream.seek(0)
+                    msvcrt.locking(
+                        lock_stream.fileno(),
+                        msvcrt.LK_NBLCK,
+                        1,
+                    )
+                    lock_acquired = True
+                    break
+                except OSError:
+                    if attempt == _RETRY_ATTEMPTS - 1:
+                        break
+                    time.sleep(_RETRY_BASE_SLEEP)
+        else:
+            import fcntl
+
+            for attempt in range(_RETRY_ATTEMPTS):
+                try:
+                    fcntl.flock(
+                        lock_stream.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    lock_acquired = True
+                    break
+                except OSError:
+                    if attempt == _RETRY_ATTEMPTS - 1:
+                        break
+                    time.sleep(_RETRY_BASE_SLEEP)
+        if not lock_acquired:
+            return False
+        payload = str(text).encode("utf-8", errors="replace")
+        if len(payload) > cap:
+            marker = f"...[truncated {len(payload)} bytes]\n".encode("ascii")
+            keep = max(0, cap - len(marker))
+            payload = payload[:keep] + marker[-(cap - keep):]
+        for slot in range(1, count + 1):
+            backup_path = f"{path}.{slot}"
+            if (
+                os.path.exists(backup_path)
+                and os.path.getsize(backup_path) > cap
+                and not _compact_fallback_segment(backup_path, cap)
+            ):
+                return False
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        if (
+            size > cap
+            and not _compact_fallback_segment(
+                path,
+                cap,
+                reserve_bytes=len(payload),
+            )
+        ):
+            return False
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        if size + len(payload) > cap and size > 0:
+            oldest = f"{path}.{count}"
+            if os.path.exists(oldest):
+                os.remove(oldest)
+            for slot in range(count, 1, -1):
+                src = f"{path}.{slot - 1}"
+                if os.path.exists(src):
+                    os.replace(src, f"{path}.{slot}")
+            os.replace(path, f"{path}.1")
+        with open(path, "ab") as stream:
+            stream.write(payload)
+        return os.path.getsize(path) <= cap
+    except (OSError, TypeError, ValueError, OverflowError):
+        return False
+    finally:
+        if lock_acquired and lock_stream is not None:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    lock_stream.seek(0)
+                    msvcrt.locking(
+                        lock_stream.fileno(),
+                        msvcrt.LK_UNLCK,
+                        1,
+                    )
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        if lock_stream is not None:
+            try:
+                lock_stream.close()
+            except OSError:
+                pass
+
+
 def log_error(bot_name: str, context: str, exc: Exception) -> None:
     """Write a redacted traceback to error_log.txt for the Launcher UI.
 
@@ -78,11 +251,11 @@ def log_error(bot_name: str, context: str, exc: Exception) -> None:
     disk reach stderr as a last resort.
     """
     try:
-        from core.logger import redact, _rotate_if_needed
+        from core.logger import redact, _append_rotating_text
         from core.constants import ERROR_LOG_MAX_BYTES, ERROR_LOG_BACKUPS
     except Exception:
         redact = _fallback_redact
-        def _rotate_if_needed(*a, **kw): pass
+        _append_rotating_text = _fallback_bounded_append
         ERROR_LOG_MAX_BYTES = 10 * 1024 * 1024
         ERROR_LOG_BACKUPS = 3
 
@@ -111,18 +284,18 @@ def log_error(bot_name: str, context: str, exc: Exception) -> None:
             last_exc: Exception | None = None
             for attempt in range(_RETRY_ATTEMPTS):
                 try:
-                    # Best-effort rotation. If rotate fails (e.g. another
-                    # process is mid-rename), we still try to write to
-                    # the existing file  rotation can happen next time.
-                    try:
-                        _rotate_if_needed(error_log_path, ERROR_LOG_MAX_BYTES,
-                                          ERROR_LOG_BACKUPS)
-                    except (PermissionError, OSError):
-                        pass
-
-                    with open(error_log_path, "a", encoding="utf-8") as f:
-                        f.write(line)
-                    return  # success
+                    if _append_rotating_text is None:
+                        raise OSError("bounded error logger unavailable")
+                    if not _append_rotating_text(
+                        error_log_path,
+                        line,
+                        ERROR_LOG_MAX_BYTES,
+                        ERROR_LOG_BACKUPS,
+                    ):
+                        raise PermissionError(
+                            "bounded error log append unavailable"
+                        )
+                    return
                 except PermissionError as e:
                     # Classic Windows race: another bot subprocess just
                     # rotated the file. Back off and retry.

@@ -138,23 +138,17 @@ def _persist(msg: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         line = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()) + " " + msg
         try:
-            from core.logger import _rotate_if_needed
+            from core.logger import _append_rotating_text
         except Exception:
-            _rotate_if_needed = None
+            _append_rotating_text = None
         with _PERSIST_LOCK:
-            if _rotate_if_needed is not None:
-                try:
-                    _rotate_if_needed(
-                        path,
-                        SILENT_LOG_MAX_BYTES,
-                        SILENT_LOG_BACKUPS,
-                    )
-                except Exception:
-                    # Rotation is maintenance; never let it suppress the
-                    # diagnostic entry that this sink exists to preserve.
-                    pass
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(line)
+            if _append_rotating_text is not None:
+                _append_rotating_text(
+                    path,
+                    line,
+                    SILENT_LOG_MAX_BYTES,
+                    SILENT_LOG_BACKUPS,
+                )
     except Exception:
         pass
 

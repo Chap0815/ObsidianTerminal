@@ -12,6 +12,7 @@ runtime/user files (.env, bot_config.json, prompt edits, logs/data).
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -23,6 +24,8 @@ import sys
 import tempfile
 import time
 import tokenize
+import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -32,12 +35,28 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from bot_utils.subprocess_capture import run_bounded_capture  # noqa: E402
+
 try:
     from tools.ensure_git import find_git
     from tools.release_requirements import REQUIRED_RELEASE_ITEMS, UPDATE_SMOKE_FILES
 except ModuleNotFoundError:
     from ensure_git import find_git
     from release_requirements import REQUIRED_RELEASE_ITEMS, UPDATE_SMOKE_FILES
+
+from update_barrier import (  # noqa: E402 - root bootstrap above
+    update_lifecycle_lock,
+    update_marker_exists,
+)
+from launcher.tool_processes import (  # noqa: E402 - root bootstrap above
+    argv_has_absolute_tool_script,
+    argv_has_root_tool_script,
+    commandline_has_absolute_tool_script,
+    commandline_has_tool_root_marker,
+    commandline_has_root_tool_script,
+    tool_module_from_argv,
+    tool_module_from_commandline,
+)
 
 CONFIG_PATH = ROOT / "config" / "update_config.json"
 CONFIG_EXAMPLE_PATH = ROOT / "config" / "update_config.example.json"
@@ -77,6 +96,7 @@ UPDATE_STATUS_PATH = ROOT / "logs" / "update_status.json"
 SMOKE_FILES = UPDATE_SMOKE_FILES
 BLOCKED_TRACKED_PREFIXES = ("data/", "logs/", "backups/")
 SNAPSHOT_COMPLETE = ".snapshot_complete"
+RUNTIME_SNAPSHOT_COMPLETE_SUFFIX = ".runtime_snapshot_complete"
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+,-]{0,127}$")
 UPDATE_FORBIDDEN_PREFIXES = (
     ".agents/",
@@ -102,6 +122,15 @@ WINDOWS_RESERVED_NAMES = {
     *(f"com{i}" for i in range(1, 10)),
     *(f"lpt{i}" for i in range(1, 10)),
 }
+
+
+@dataclass(frozen=True)
+class _UpdateMarkerClaim:
+    owner: str
+    created: bool
+    original: bytes | None = None
+
+
 UPDATE_FORBIDDEN_NAMES = {
     ".env",
     ".gitignore",
@@ -574,24 +603,74 @@ def _running_bot_processes() -> list[str]:
             script_markers.append(script)
             script_markers.append(Path(script).name.lower())
     out: list[str] = []
-    for proc in psutil.process_iter(["pid", "cmdline", "cwd"]):
-        try:
-            pid = int(proc.info.get("pid") or 0)
-            if pid == current:
+    scan_incomplete = False
+    saw_current_pid = False
+    try:
+        processes = psutil.process_iter(["pid", "name", "exe", "cmdline", "cwd"])
+        for proc in processes:
+            try:
+                pid = int(proc.info.get("pid") or 0)
+                if pid == current:
+                    saw_current_pid = True
+                    continue
+                if pid < 0:
+                    scan_incomplete = True
+                    continue
+                if pid == 0:
+                    continue
+                raw_name = proc.info.get("name")
+                raw_exe = proc.info.get("exe")
+                raw_cmdline = proc.info.get("cmdline")
+                raw_cwd = proc.info.get("cwd")
+                name = str(raw_name or "").lower()
+                exe_name = Path(str(raw_exe or "")).name.lower()
+                cmd_exe_name = ""
+                if isinstance(raw_cmdline, (list, tuple)) and raw_cmdline:
+                    cmd_exe_name = Path(str(raw_cmdline[0])).name.lower()
+                python_like = bool(
+                    re.fullmatch(r"python(?:w|[0-9.]*)?\.exe", name)
+                    or re.fullmatch(
+                        r"python(?:w|[0-9.]*)?\.exe", exe_name
+                    )
+                    or re.fullmatch(
+                        r"python(?:w|[0-9.]*)?\.exe", cmd_exe_name
+                    )
+                )
+                if not isinstance(raw_cmdline, (list, tuple)):
+                    if python_like or not (name or exe_name):
+                        scan_incomplete = True
+                    continue
+                if not raw_cmdline and python_like:
+                    scan_incomplete = True
+                    continue
+                cmdline = " ".join(raw_cmdline)
+                proc_cwd = str(raw_cwd or "")
+            except Exception:
+                scan_incomplete = True
                 continue
-            cmdline = " ".join(proc.info.get("cmdline") or [])
-            proc_cwd = str(proc.info.get("cwd") or "")
-        except Exception:
-            continue
-        norm = cmdline.lower().replace("\\", "/")
-        cwd_norm = proc_cwd.lower().replace("\\", "/")
-        module_match = any(marker in norm for marker in module_markers)
-        scoped_script_match = (
-            (root_text in norm or cwd_norm == root_text)
-            and any(marker in norm for marker in script_markers)
-        )
-        if module_match or scoped_script_match:
-            out.append(f"bot process (pid {pid})")
+            norm = cmdline.lower().replace("\\", "/")
+            cwd_norm = proc_cwd.lower().replace("\\", "/")
+            module_match = any(marker in norm for marker in module_markers)
+            scoped_script_match = (
+                (root_text in norm or cwd_norm == root_text)
+                and any(marker in norm for marker in script_markers)
+            )
+            if (
+                python_like
+                and raw_cwd is None
+                and root_text not in norm
+                and any(marker in norm for marker in script_markers)
+            ):
+                scan_incomplete = True
+                continue
+            if python_like and (module_match or scoped_script_match):
+                out.append(f"bot process (pid {pid})")
+    except Exception:
+        scan_incomplete = True
+    if not saw_current_pid:
+        scan_incomplete = True
+    if scan_incomplete:
+        return _running_bot_processes_via_cim()
     return out
 
 
@@ -608,23 +687,40 @@ def _running_bot_processes_via_cim() -> list[str]:
         if script:
             script_markers.append(script)
             script_markers.append(Path(script).name.lower())
+    escaped_modules = [marker.replace("'", "''") for marker in module_markers]
+    escaped_scripts = [marker.replace("'", "''") for marker in script_markers]
     module_checks = " -or ".join(
-        f"$_.CommandLine.ToLower().Replace('\\','/').Contains('{marker}')"
-        for marker in module_markers
-    )
+        f"$norm.Contains('{marker}')" for marker in escaped_modules
+    ) or "$false"
     script_checks = " -or ".join(
-        f"$_.CommandLine.ToLower().Replace('\\','/').Contains('{marker}')"
-        for marker in script_markers
-    )
+        f"$norm.Contains('{marker}')" for marker in escaped_scripts
+    ) or "$false"
     script = (
+        "$ErrorActionPreference='Stop'; "
         f"$root='{root}'; "
         f"$current={os.getpid()}; "
-        "Get-CimInstance Win32_Process | "
-        "Where-Object { $_.ProcessId -ne $current -and $_.CommandLine -and "
-        f"(({module_checks}) -or "
-        "$_.CommandLine.ToLower().Replace('\\','/').Contains($root) -and "
-        f"({script_checks}))"
-        " } | ForEach-Object { 'bot process (pid ' + $_.ProcessId + ')' }"
+        "$scanPid=$PID; "
+        "$all=@(Get-CimInstance Win32_Process); "
+        "if (-not ($all.ProcessId -contains $current) -or "
+        "-not ($all.ProcessId -contains $scanPid)) { "
+        "throw 'bot process scan missing process-table anchor' }; "
+        "$all | Where-Object { $_.ProcessId -gt 0 -and "
+        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid } | "
+        "ForEach-Object { "
+        "$name=[string]$_.Name; $line=[string]$_.CommandLine; "
+        "$nameLow=$name.ToLower(); "
+        "$pythonLike=($nameLow -match '^python(?:w|[0-9.]*)?\\.exe$'); "
+        "if (-not $name) { "
+        "'bot process scan unknown (pid ' + $_.ProcessId + ')' "
+        "} elseif ($pythonLike -and [string]::IsNullOrWhiteSpace($line)) { "
+        "'bot process scan unknown (pid ' + $_.ProcessId + ')' "
+        "} elseif ($pythonLike -and "
+        "-not [string]::IsNullOrWhiteSpace($line)) { "
+        "$norm=$line.ToLower().Replace('\\','/'); "
+        f"if (({module_checks}) -or "
+        f"($norm.Contains($root) -and ({script_checks}))) {{ "
+        "'bot process (pid ' + $_.ProcessId + ')' } } }; "
+        "'bot process scan ok (count ' + $all.Count + ')'"
     )
     try:
         r = subprocess.run(
@@ -635,11 +731,48 @@ def _running_bot_processes_via_cim() -> list[str]:
             timeout=8,
             **_hidden_kwargs(),
         )
-    except Exception:
-        return []
+    except Exception as exc:
+        raise RuntimeError("bot process scan unavailable via CIM") from exc
     if r.returncode != 0:
-        return []
-    return [line.strip() for line in (r.stdout or "").splitlines() if line.strip()]
+        raise RuntimeError(
+            "bot process scan unavailable via CIM "
+            f"(returncode {r.returncode})"
+        )
+    if (r.stderr or "").strip():
+        raise RuntimeError("bot process scan unavailable via CIM")
+    out: list[str] = []
+    seen: set[int] = set()
+    current = os.getpid()
+    lines = [line.strip() for line in (r.stdout or "").splitlines() if line.strip()]
+    sentinel = (
+        re.fullmatch(
+            r"bot process scan ok \(count ([1-9][0-9]*)\)",
+            lines[-1],
+        )
+        if lines
+        else None
+    )
+    if sentinel is None or int(sentinel.group(1)) < 2:
+        raise RuntimeError("bot process scan returned malformed CIM output")
+    for text in lines[:-1]:
+        if re.fullmatch(
+            r"bot process scan unknown \(pid [1-9][0-9]*\)", text
+        ):
+            raise RuntimeError("bot process scan returned incomplete CIM output")
+        match = re.fullmatch(r"bot process \(pid ([1-9][0-9]*)\)", text)
+        if match is None:
+            raise RuntimeError(
+                "bot process scan returned malformed CIM output"
+            )
+        pid = int(match.group(1))
+        if pid == current:
+            raise RuntimeError(
+                "bot process scan returned malformed CIM output"
+            )
+        if pid not in seen:
+            seen.add(pid)
+            out.append(text)
+    return out
 
 
 def _running_launchers() -> list[str]:
@@ -649,43 +782,114 @@ def _running_launchers() -> list[str]:
         return _running_launchers_via_cim()
     current = os.getpid()
     out: list[str] = []
-    for proc in psutil.process_iter(["pid", "cmdline"]):
-        try:
-            pid = int(proc.info.get("pid") or 0)
-            if pid == current:
+    scan_incomplete = False
+    saw_current_pid = False
+    try:
+        for proc in psutil.process_iter(
+            ["pid", "name", "exe", "cmdline", "cwd"]
+        ):
+            try:
+                pid = int(proc.info.get("pid") or 0)
+                if pid == current:
+                    saw_current_pid = True
+                    continue
+                if pid < 0:
+                    scan_incomplete = True
+                    continue
+                if pid == 0:
+                    continue
+                raw_name = proc.info.get("name")
+                raw_exe = proc.info.get("exe")
+                raw_cmdline = proc.info.get("cmdline")
+                raw_cwd = proc.info.get("cwd")
+                name = str(raw_name or "").lower()
+                exe_name = Path(str(raw_exe or "")).name.lower()
+                cmd_exe_name = ""
+                if isinstance(raw_cmdline, (list, tuple)) and raw_cmdline:
+                    cmd_exe_name = Path(str(raw_cmdline[0])).name.lower()
+                python_like = any(
+                    re.fullmatch(r"python(?:w|[0-9.]*)?\.exe", value)
+                    for value in (name, exe_name, cmd_exe_name)
+                )
+                if not isinstance(raw_cmdline, (list, tuple)):
+                    if python_like or not (name or exe_name):
+                        scan_incomplete = True
+                    continue
+                if not raw_cmdline and python_like:
+                    scan_incomplete = True
+                    continue
+                cmdline = " ".join(raw_cmdline)
+            except Exception:
+                scan_incomplete = True
                 continue
-            cmdline = " ".join(proc.info.get("cmdline") or [])
-        except Exception:
-            continue
-        low = cmdline.lower()
-        if _cmdline_is_launcher(low):
-            out.append(f"launcher pid {pid}")
+            if python_like and _cmdline_is_launcher(cmdline.lower(), raw_cwd):
+                out.append(f"launcher pid {pid}")
+    except Exception:
+        scan_incomplete = True
+    if not saw_current_pid:
+        scan_incomplete = True
+    if scan_incomplete:
+        return _running_launchers_via_cim()
     return out
 
 
-def _cmdline_is_launcher(cmdline_lower: str) -> bool:
-    root_text = str(ROOT).lower()
-    if root_text not in cmdline_lower:
-        return False
+def _cmdline_is_launcher(cmdline_lower: str, cwd: object = None) -> bool:
     compact = " ".join(cmdline_lower.replace("\\", "/").split())
-    return (
+    root_text = str(ROOT).replace("\\", "/").lower().rstrip("/") + "/"
+    launcher_like = (
         "launcher.pyw" in compact
+        or "setup_wizard.pyw" in compact
         or "-m launcher.main" in compact
         or "-m launcher/main" in compact
+    )
+    if not launcher_like:
+        return False
+    if root_text in compact:
+        return True
+    cwd_text = str(cwd or "").replace("\\", "/").lower().rstrip("/")
+    root_dir = root_text.rstrip("/")
+    if cwd_text != root_dir:
+        return False
+    return bool(
+        "-m launcher.main" in compact
+        or "-m launcher/main" in compact
+        or re.search(r"(?:^|\s)[\"']?(?:launcher|setup_wizard)\.pyw(?:[\"']?(?:\s|$))", compact)
     )
 
 
 def _running_launchers_via_cim() -> list[str]:
-    root = str(ROOT).lower().replace("'", "''")
+    root = (
+        str(ROOT).replace("\\", "/").lower().rstrip("/") + "/"
+    ).replace("'", "''")
     script = (
+        "$ErrorActionPreference='Stop'; "
         f"$root='{root}'; "
         f"$current={os.getpid()}; "
-        "Get-CimInstance Win32_Process | "
-        "Where-Object { $_.ProcessId -ne $current -and $_.CommandLine -and "
-        "$line=$_.CommandLine.ToLower().Replace('\\','/'); "
-        "$line.Contains($root) -and "
-        "($line.Contains('launcher.pyw') -or $line.Contains('-m launcher.main')) } | "
-        "ForEach-Object { 'launcher pid ' + $_.ProcessId }"
+        "$scanPid=$PID; "
+        "$all=@(Get-CimInstance Win32_Process); "
+        "if (-not ($all.ProcessId -contains $current) -or "
+        "-not ($all.ProcessId -contains $scanPid)) { "
+        "throw 'runtime process scan missing process-table anchor' }; "
+        "$all | Where-Object { $_.ProcessId -gt 0 -and "
+        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid } | "
+        "ForEach-Object { "
+        "$name=[string]$_.Name; $line=[string]$_.CommandLine; "
+        "$nameLow=$name.ToLower(); "
+        "$pythonLike=($nameLow -match '^python(?:w|[0-9.]*)?\\.exe$'); "
+        "if (-not $name) { "
+        "'runtime process scan unknown (pid ' + $_.ProcessId + ')' "
+        "} elseif ($pythonLike -and [string]::IsNullOrWhiteSpace($line)) { "
+        "'runtime process scan unknown (pid ' + $_.ProcessId + ')' "
+        "} elseif ($pythonLike -and "
+        "-not [string]::IsNullOrWhiteSpace($line)) { "
+        "$norm=$line.ToLower().Replace('\\','/'); "
+        "$launcherLike=($norm.Contains('launcher.pyw') -or "
+        "$norm.Contains('setup_wizard.pyw') -or "
+        "$norm.Contains('-m launcher.main')); "
+        "if ($launcherLike) { if ($norm.Contains($root)) { "
+        "'launcher pid ' + $_.ProcessId } else { "
+        "'runtime process scan unknown (pid ' + $_.ProcessId + ')' } } } }; "
+        "'runtime process scan ok (count ' + $all.Count + ')'"
     )
     try:
         r = subprocess.run(
@@ -696,11 +900,48 @@ def _running_launchers_via_cim() -> list[str]:
         timeout=8,
         **_hidden_kwargs(),
     )
-    except Exception:
-        return []
+    except Exception as exc:
+        raise RuntimeError("launcher scan unavailable") from exc
     if r.returncode != 0:
-        return []
-    return [line.strip() for line in (r.stdout or "").splitlines() if line.strip()]
+        raise RuntimeError(
+            f"launcher scan failed (returncode {r.returncode})"
+        )
+    if (r.stderr or "").strip():
+        raise RuntimeError("launcher scan unavailable")
+    lines = [
+        line.strip()
+        for line in (r.stdout or "").splitlines()
+        if line.strip()
+    ]
+    sentinel = (
+        re.fullmatch(
+            r"runtime process scan ok \(count ([1-9][0-9]*)\)",
+            lines[-1],
+        )
+        if lines
+        else None
+    )
+    if sentinel is None or int(sentinel.group(1)) < 2:
+        raise RuntimeError("launcher scan returned malformed CIM output")
+    out: list[str] = []
+    seen: set[int] = set()
+    current = os.getpid()
+    for text in lines[:-1]:
+        if re.fullmatch(
+            r"runtime process scan unknown \(pid [1-9][0-9]*\)",
+            text,
+        ):
+            raise RuntimeError("launcher scan returned incomplete CIM output")
+        match = re.fullmatch(r"launcher pid ([1-9][0-9]*)", text)
+        if match is None:
+            raise RuntimeError("launcher scan returned malformed CIM output")
+        pid = int(match.group(1))
+        if pid == current:
+            raise RuntimeError("launcher scan returned malformed CIM output")
+        if pid not in seen:
+            seen.add(pid)
+            out.append(text)
+    return out
 
 
 def _running_dashboard_processes() -> list[tuple[int, str]]:
@@ -709,38 +950,279 @@ def _running_dashboard_processes() -> list[tuple[int, str]]:
     except Exception:
         return _running_dashboard_processes_via_cim()
     current = os.getpid()
-    root_text = str(ROOT).replace("\\", "/").lower()
+    root_cwd = str(ROOT).replace("\\", "/").lower().rstrip("/")
+    root_command = root_cwd + "/"
     out: list[tuple[int, str]] = []
-    for proc in psutil.process_iter(["pid", "cmdline", "cwd"]):
-        try:
-            pid = int(proc.info.get("pid") or 0)
-            if pid == current:
+    scan_incomplete = False
+    saw_current_pid = False
+    try:
+        processes = psutil.process_iter(
+            ["pid", "name", "exe", "cmdline", "cwd"]
+        )
+        for proc in processes:
+            try:
+                pid = int(proc.info.get("pid") or 0)
+                if pid == current:
+                    saw_current_pid = True
+                    continue
+                if pid < 0:
+                    scan_incomplete = True
+                    continue
+                if pid == 0:
+                    continue
+                raw_name = proc.info.get("name")
+                raw_exe = proc.info.get("exe")
+                raw_cmdline = proc.info.get("cmdline")
+                raw_cwd = proc.info.get("cwd")
+                name = str(raw_name or "").lower()
+                exe_name = Path(str(raw_exe or "")).name.lower()
+                cmd_exe_name = ""
+                if isinstance(raw_cmdline, (list, tuple)) and raw_cmdline:
+                    cmd_exe_name = Path(str(raw_cmdline[0])).name.lower()
+                python_like = any(
+                    re.fullmatch(r"python(?:w|[0-9.]*)?\.exe", value)
+                    for value in (name, exe_name, cmd_exe_name)
+                )
+                if not isinstance(raw_cmdline, (list, tuple)):
+                    if python_like or not (name or exe_name):
+                        scan_incomplete = True
+                    continue
+                if not raw_cmdline and python_like:
+                    scan_incomplete = True
+                    continue
+                cmdline = " ".join(raw_cmdline)
+                proc_cwd = str(raw_cwd or "")
+            except Exception:
+                scan_incomplete = True
                 continue
-            cmdline = " ".join(proc.info.get("cmdline") or [])
-            proc_cwd = str(proc.info.get("cwd") or "")
-        except Exception:
+            norm = cmdline.replace("\\", "/").lower()
+            cwd_norm = proc_cwd.replace("\\", "/").lower()
+            if not python_like:
+                continue
+            if "streamlit" not in norm or "tools/dashboard.py" not in norm:
+                continue
+            if raw_cwd is None and root_command not in norm:
+                scan_incomplete = True
+                continue
+            if root_command not in norm and cwd_norm.rstrip("/") != root_cwd:
+                continue
+            out.append((pid, f"dashboard pid {pid}"))
+    except Exception:
+        scan_incomplete = True
+    if not saw_current_pid:
+        scan_incomplete = True
+    if scan_incomplete:
+        return _running_dashboard_processes_via_cim()
+    return out
+
+
+def _running_tool_processes() -> list[str]:
+    """Return root-scoped launcher tool children, failing over if incomplete."""
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return _running_tool_processes_via_cim()
+    current = os.getpid()
+    root_cwd = os.path.normcase(str(ROOT.resolve(strict=False))).replace(
+        "\\", "/"
+    ).rstrip("/")
+    out: list[str] = []
+    scan_incomplete = False
+    saw_current_pid = False
+    try:
+        processes = psutil.process_iter(["pid", "name", "exe", "cmdline", "cwd"])
+        for proc in processes:
+            try:
+                pid = int(proc.info.get("pid") or 0)
+                if pid == current:
+                    saw_current_pid = True
+                    continue
+                if pid < 0:
+                    scan_incomplete = True
+                    continue
+                if pid == 0:
+                    continue
+                raw_name = proc.info.get("name")
+                raw_exe = proc.info.get("exe")
+                raw_cmdline = proc.info.get("cmdline")
+                raw_cwd = proc.info.get("cwd")
+                name = str(raw_name or "").lower()
+                exe_name = Path(str(raw_exe or "")).name.lower()
+                cmd_exe_name = ""
+                if isinstance(raw_cmdline, (list, tuple)) and raw_cmdline:
+                    cmd_exe_name = Path(str(raw_cmdline[0])).name.lower()
+                python_like = any(
+                    re.fullmatch(r"python(?:w|[0-9.]*)?\.exe", value)
+                    for value in (name, exe_name, cmd_exe_name)
+                )
+                if not isinstance(raw_cmdline, (list, tuple)):
+                    if python_like or not (name or exe_name):
+                        scan_incomplete = True
+                    continue
+                if not raw_cmdline and python_like:
+                    scan_incomplete = True
+                    continue
+                if not python_like:
+                    continue
+                module = tool_module_from_argv(raw_cmdline)
+                if module is None:
+                    continue
+                cwd_norm = ""
+                if raw_cwd is not None:
+                    cwd_norm = os.path.normcase(
+                        str(Path(str(raw_cwd)).resolve(strict=False))
+                    ).replace("\\", "/").rstrip("/")
+                commandline = subprocess.list2cmdline(
+                    [str(value) for value in raw_cmdline]
+                )
+            except Exception:
+                scan_incomplete = True
+                continue
+            root_marked = commandline_has_tool_root_marker(commandline, ROOT)
+            root_script = argv_has_root_tool_script(raw_cmdline, ROOT)
+            absolute_script = argv_has_absolute_tool_script(raw_cmdline)
+            if absolute_script and not root_script:
+                continue
+            if cwd_norm != root_cwd and not root_marked and not root_script:
+                if raw_cwd is None:
+                    scan_incomplete = True
+                continue
+            out.append(f"tool {module} pid {pid}")
+    except Exception:
+        scan_incomplete = True
+    if not saw_current_pid:
+        scan_incomplete = True
+    if scan_incomplete:
+        return _running_tool_processes_via_cim()
+    return out
+
+
+def _running_tool_processes_via_cim() -> list[str]:
+    """Scan Python command lines via CIM with strict root attribution."""
+    script = (
+        "$ErrorActionPreference='Stop'; "
+        f"$current={os.getpid()}; "
+        "$scanPid=$PID; "
+        "$all=@(Get-CimInstance Win32_Process); "
+        "if (-not ($all.ProcessId -contains $current) -or "
+        "-not ($all.ProcessId -contains $scanPid)) { "
+        "throw 'runtime process scan missing process-table anchor' }; "
+        "$all | Where-Object { $_.ProcessId -gt 0 -and "
+        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid } | "
+        "ForEach-Object { "
+        "$name=[string]$_.Name; $line=[string]$_.CommandLine; "
+        "$pythonLike=($name.ToLower() -match '^python(?:w|[0-9.]*)?\\.exe$'); "
+        "if (-not $name) { "
+        "'runtime process scan unknown (pid ' + $_.ProcessId + ')' "
+        "} elseif ($pythonLike -and [string]::IsNullOrWhiteSpace($line)) { "
+        "'runtime process scan unknown (pid ' + $_.ProcessId + ')' "
+        "} elseif ($pythonLike) { "
+        "$bytes=[Text.Encoding]::Unicode.GetBytes($line); "
+        "$encoded=[Convert]::ToBase64String($bytes); "
+        "'python pid ' + $_.ProcessId + ' cmd ' + $encoded "
+        "} }; "
+        "'runtime process scan ok (count ' + $all.Count + ')'"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            timeout=8,
+            **_hidden_kwargs(),
+        )
+    except Exception as exc:
+        raise RuntimeError("tool process scan unavailable via CIM") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            "tool process scan unavailable via CIM "
+            f"(returncode {result.returncode})"
+        )
+    if (result.stderr or "").strip():
+        raise RuntimeError("tool process scan unavailable via CIM")
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    sentinel = (
+        re.fullmatch(r"runtime process scan ok \(count ([1-9][0-9]*)\)", lines[-1])
+        if lines
+        else None
+    )
+    if sentinel is None or int(sentinel.group(1)) < 2:
+        raise RuntimeError("tool process scan returned malformed CIM output")
+    out: list[str] = []
+    seen: set[int] = set()
+    current = os.getpid()
+    for text in lines[:-1]:
+        if re.fullmatch(r"runtime process scan unknown \(pid [1-9][0-9]*\)", text):
+            raise RuntimeError("tool process scan returned incomplete CIM output")
+        match = re.fullmatch(
+            r"python pid ([1-9][0-9]*) cmd ([A-Za-z0-9+/]+={0,2})",
+            text,
+        )
+        if match is None:
+            raise RuntimeError("tool process scan returned malformed CIM output")
+        pid = int(match.group(1))
+        if pid == current:
+            raise RuntimeError("tool process scan returned malformed CIM output")
+        try:
+            commandline = base64.b64decode(match.group(2), validate=True).decode(
+                "utf-16-le"
+            )
+        except (ValueError, UnicodeError) as exc:
+            raise RuntimeError("tool process scan returned malformed CIM output") from exc
+        module = tool_module_from_commandline(commandline)
+        if module is None:
             continue
-        norm = cmdline.replace("\\", "/").lower()
-        cwd_norm = proc_cwd.replace("\\", "/").lower()
-        if "streamlit" not in norm or "tools/dashboard.py" not in norm:
+        if (
+            commandline_has_absolute_tool_script(commandline)
+            and not commandline_has_root_tool_script(commandline, ROOT)
+        ):
             continue
-        if root_text not in norm and cwd_norm != root_text:
-            continue
-        out.append((pid, f"dashboard pid {pid}"))
+        if not (
+            commandline_has_tool_root_marker(commandline, ROOT)
+            or commandline_has_root_tool_script(commandline, ROOT)
+        ):
+            raise RuntimeError(
+                f"tool process root scope unavailable for pid {pid}"
+            )
+        if pid not in seen:
+            seen.add(pid)
+            out.append(f"tool {module} pid {pid}")
     return out
 
 
 def _running_dashboard_processes_via_cim() -> list[tuple[int, str]]:
-    root = str(ROOT).replace("\\", "/").lower().replace("'", "''")
+    root = (
+        str(ROOT).replace("\\", "/").lower().rstrip("/") + "/"
+    ).replace("'", "''")
     script = (
+        "$ErrorActionPreference='Stop'; "
         f"$root='{root}'; "
         f"$current={os.getpid()}; "
-        "Get-CimInstance Win32_Process | "
-        "Where-Object { $_.ProcessId -ne $current -and $_.CommandLine -and "
-        "$line=$_.CommandLine.ToLower().Replace('\\','/'); "
-        "$line.Contains('streamlit') -and $line.Contains('tools/dashboard.py') -and "
-        "$line.Contains($root) } | "
-        "ForEach-Object { $_.ProcessId }"
+        "$scanPid=$PID; "
+        "$all=@(Get-CimInstance Win32_Process); "
+        "if (-not ($all.ProcessId -contains $current) -or "
+        "-not ($all.ProcessId -contains $scanPid)) { "
+        "throw 'runtime process scan missing process-table anchor' }; "
+        "$all | Where-Object { $_.ProcessId -gt 0 -and "
+        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid } | "
+        "ForEach-Object { "
+        "$name=[string]$_.Name; $line=[string]$_.CommandLine; "
+        "$nameLow=$name.ToLower(); "
+        "$pythonLike=($nameLow -match '^python(?:w|[0-9.]*)?\\.exe$'); "
+        "if (-not $name) { "
+        "'runtime process scan unknown (pid ' + $_.ProcessId + ')' "
+        "} elseif ($pythonLike -and [string]::IsNullOrWhiteSpace($line)) { "
+        "'runtime process scan unknown (pid ' + $_.ProcessId + ')' "
+        "} elseif ($pythonLike -and "
+        "-not [string]::IsNullOrWhiteSpace($line)) { "
+        "$norm=$line.ToLower().Replace('\\','/'); "
+        "if ($norm.Contains('streamlit') -and "
+        "$norm.Contains('tools/dashboard.py')) { "
+        "if ($norm.Contains($root)) { [string]$_.ProcessId } "
+        "else { 'runtime process scan unknown (pid ' + "
+        "$_.ProcessId + ')' } } } }; "
+        "'runtime process scan ok (count ' + $all.Count + ')'"
     )
     try:
         r = subprocess.run(
@@ -751,23 +1233,61 @@ def _running_dashboard_processes_via_cim() -> list[tuple[int, str]]:
             timeout=8,
             **_hidden_kwargs(),
         )
-    except Exception:
-        return []
+    except Exception as exc:
+        raise RuntimeError("dashboard scan unavailable via CIM") from exc
     if r.returncode != 0:
-        return []
+        raise RuntimeError(
+            "dashboard scan unavailable via CIM "
+            f"(returncode {r.returncode})"
+        )
+    if (r.stderr or "").strip():
+        raise RuntimeError("dashboard scan unavailable via CIM")
     out: list[tuple[int, str]] = []
-    for line in (r.stdout or "").splitlines():
-        try:
-            pid = int(line.strip())
-        except Exception:
-            continue
-        out.append((pid, f"dashboard pid {pid}"))
+    seen: set[int] = set()
+    current = os.getpid()
+    lines = [
+        line.strip()
+        for line in (r.stdout or "").splitlines()
+        if line.strip()
+    ]
+    sentinel = (
+        re.fullmatch(
+            r"runtime process scan ok \(count ([1-9][0-9]*)\)",
+            lines[-1],
+        )
+        if lines
+        else None
+    )
+    if sentinel is None or int(sentinel.group(1)) < 2:
+        raise RuntimeError("dashboard scan returned malformed CIM output")
+    for text in lines[:-1]:
+        if re.fullmatch(
+            r"runtime process scan unknown \(pid [1-9][0-9]*\)",
+            text,
+        ):
+            raise RuntimeError(
+                "dashboard scan returned incomplete CIM output"
+            )
+        if re.fullmatch(r"[1-9][0-9]*", text) is None:
+            raise RuntimeError(
+                "dashboard scan returned malformed CIM output"
+            )
+        pid = int(text)
+        if pid == current:
+            raise RuntimeError(
+                "dashboard scan returned malformed CIM output"
+            )
+        if pid not in seen:
+            seen.add(pid)
+            out.append((pid, f"dashboard pid {pid}"))
     return out
 
 
 def _terminate_dashboard_processes() -> list[str]:
-    stopped: list[str] = []
-    for pid, label in _running_dashboard_processes():
+    targets = _running_dashboard_processes()
+    if not targets:
+        return []
+    for pid, _label in targets:
         try:
             subprocess.run(
                 ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
@@ -777,10 +1297,13 @@ def _terminate_dashboard_processes() -> list[str]:
                 timeout=8,
                 **_hidden_kwargs(),
             )
-            stopped.append(label)
         except Exception:
-            stopped.append(f"{label} (stop failed)")
-    return stopped
+            pass
+    remaining = _running_dashboard_processes()
+    if remaining:
+        labels = ", ".join(label for _pid, label in remaining)
+        raise RuntimeError(f"dashboard processes still running: {labels}")
+    return [label for _pid, label in targets]
 
 
 def _copy_file(src: Path, dst: Path) -> None:
@@ -871,7 +1394,11 @@ def _dependency_python() -> Path:
     return Path(sys.executable)
 
 
-def _install_dependencies_if_present(*, force_active_runtime: bool = False) -> None:
+def _install_dependencies_if_present(
+    *,
+    force_active_runtime: bool = False,
+    force_reinstall: bool = False,
+) -> None:
     req = ROOT / "requirements.lock.txt"
     if not req.exists():
         raise RuntimeError(
@@ -890,17 +1417,23 @@ def _install_dependencies_if_present(*, force_active_runtime: bool = False) -> N
             "Starte das Update ueber den Launcher, nicht direkt aus der "
             "aktiven gebuendelten Runtime."
         )
+    if force_reinstall and _runtime_env_dir() is None:
+        raise RuntimeError(
+            "Recovery-Reinstall benoetigt eine vorhandene gebuendelte Python-Runtime."
+        )
     _print("Pruefe/aktualisiere Python-Abhaengigkeiten ...")
     dep_python = _dependency_python()
-    r = subprocess.run(
-        [
-            str(dep_python), "-m", "pip", "install",
-            "--require-hashes", "-r", str(req),
-        ],
+    install_cmd = [
+        str(dep_python), "-m", "pip", "install", "--require-hashes",
+    ]
+    if force_reinstall:
+        install_cmd.append("--force-reinstall")
+    install_cmd.extend(["-r", str(req)])
+    r = run_bounded_capture(
+        install_cmd,
         cwd=str(ROOT),
-        text=True,
-        capture_output=True,
         timeout=900,
+        wrapper_python=sys.executable,
         **_hidden_kwargs(),
     )
     if r.returncode != 0:
@@ -909,6 +1442,22 @@ def _install_dependencies_if_present(*, force_active_runtime: bool = False) -> N
         detail = (err or out or "pip returned no output").strip()
         raise RuntimeError(
             "Dependency-Update fehlgeschlagen. Update wurde nicht vollstaendig abgeschlossen."
+            f"\n{detail}"
+        )
+    smoke = run_bounded_capture(
+        [
+            str(dep_python), "-I", "-B", "-c",
+            "import aiohttp; import ccxt.pro; import portalocker",
+        ],
+        cwd=str(ROOT),
+        timeout=60,
+        wrapper_python=sys.executable,
+        **_hidden_kwargs(),
+    )
+    if smoke.returncode != 0:
+        detail = (smoke.stderr or smoke.stdout or "runtime import smoke failed").strip()
+        raise RuntimeError(
+            "Dependency-Importpruefung fehlgeschlagen; Runtime-Recovery bleibt erforderlich."
             f"\n{detail}"
         )
 
@@ -960,33 +1509,99 @@ def _process_refs_path(value: Any, target: Path) -> bool:
         pass
     target_text = target.resolve().as_posix().lower()
     text = str(value).strip().strip('"').replace("\\", "/").lower()
-    return (
-        text == target_text
-        or text.startswith(target_text + "/")
-        or (target_text + "/") in text
+    return bool(
+        re.search(
+            rf"(^|[\s\"'=,:;()]){re.escape(target_text)}"
+            rf"(?=$|[/\s\"',;()])",
+            text,
+        )
     )
 
 
 def _runtime_env_in_use(path: Path) -> bool:
-    """Best-effort check for another process using the bundled runtime."""
+    """Return whether another process references the bundled runtime."""
     try:
         import psutil  # type: ignore
     except Exception:
-        return False
+        return _runtime_env_in_use_via_cim(path)
     current = os.getpid()
-    for proc in psutil.process_iter(["pid", "exe", "cmdline", "cwd"]):
-        try:
-            pid = int(proc.info.get("pid") or 0)
-            if pid == current:
+    scan_incomplete = False
+    try:
+        processes = psutil.process_iter(["pid", "exe", "cmdline", "cwd"])
+        for proc in processes:
+            try:
+                pid = int(proc.info.get("pid") or 0)
+                if pid == current:
+                    continue
+                exe = proc.info.get("exe")
+                cwd = proc.info.get("cwd")
+                cmdline = proc.info.get("cmdline") or []
+            except Exception:
+                scan_incomplete = True
                 continue
-            exe = proc.info.get("exe")
-            cwd = proc.info.get("cwd")
-            cmdline = proc.info.get("cmdline") or []
-        except Exception:
+            if _process_refs_path(exe, path) or _process_refs_path(cwd, path):
+                return True
+            if any(_process_refs_path(part, path) for part in cmdline):
+                return True
+    except Exception:
+        scan_incomplete = True
+    if scan_incomplete:
+        return _runtime_env_in_use_via_cim(path)
+    return False
+
+
+def _runtime_env_in_use_via_cim(path: Path) -> bool:
+    script = (
+        f"$current={os.getpid()}; "
+        "$items=@(Get-CimInstance Win32_Process | "
+        "Where-Object { $_.ProcessId -gt 0 -and $_.ProcessId -ne $current } | "
+        "ForEach-Object { "
+        "[pscustomobject]@{pid=[int64]$_.ProcessId; "
+        "exe=$_.ExecutablePath; cmdline=$_.CommandLine} }); "
+        "ConvertTo-Json -InputObject $items -Compress"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            timeout=8,
+            **_hidden_kwargs(),
+        )
+    except Exception as exc:
+        raise RuntimeError("runtime process scan unavailable via CIM") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            "runtime process scan unavailable via CIM "
+            f"(returncode {result.returncode})"
+        )
+    try:
+        rows = json.loads(result.stdout or "")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("runtime process scan returned malformed CIM output") from exc
+    if not isinstance(rows, list):
+        raise RuntimeError("runtime process scan returned malformed CIM output")
+    current = os.getpid()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("runtime process scan returned malformed CIM output")
+        pid = row.get("pid")
+        exe = row.get("exe")
+        cmdline = row.get("cmdline")
+        if pid == 0:
             continue
-        if _process_refs_path(exe, path) or _process_refs_path(cwd, path):
-            return True
-        if any(_process_refs_path(part, path) for part in cmdline):
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid < 0
+            or exe is not None and not isinstance(exe, str)
+            or cmdline is not None and not isinstance(cmdline, str)
+        ):
+            raise RuntimeError("runtime process scan returned malformed CIM output")
+        if pid == current:
+            continue
+        if _process_refs_path(exe, path) or _process_refs_path(cmdline, path):
             return True
     return False
 
@@ -1018,26 +1633,94 @@ def _dependency_update_needed_from_ref(git: str, ref: str) -> bool:
     return False
 
 
+def _runtime_snapshot_ignored(path: Path) -> bool:
+    return path.name == "__pycache__" or path.suffix.lower() in {".pyc", ".pyo"}
+
+
+def _runtime_snapshot_marker(snapshot: Path) -> Path:
+    return snapshot.parent / (
+        f".{snapshot.name}{RUNTIME_SNAPSHOT_COMPLETE_SUFFIX}"
+    )
+
+
 def _snapshot_runtime_env(dst: Path) -> Path | None:
     """Copy the mutable Python runtime so dependency updates can roll back."""
     env_dir = _runtime_env_dir()
     if env_dir is None:
         return None
     dst.mkdir(parents=True, exist_ok=True)
+    if _snapshot_source_is_reparse_link(dst) or not dst.is_dir():
+        raise RuntimeError(
+            f"Runtime snapshot destination is not a regular directory: {dst}"
+        )
     target = dst / env_dir.name
-    if target.exists():
+    marker = _runtime_snapshot_marker(target)
+    if marker.exists() or marker.is_symlink():
+        if _snapshot_source_is_reparse_link(marker) or marker.is_file():
+            marker.unlink()
+        else:
+            raise RuntimeError(
+                f"Runtime snapshot marker is not a regular file: {marker}"
+            )
+    if target.exists() or target.is_symlink():
+        if _snapshot_source_is_reparse_link(target) or not target.is_dir():
+            raise RuntimeError(
+                f"Runtime snapshot target is not a regular directory: {target}"
+            )
         _rmtree(target)
-    shutil.copytree(
+    _validate_snapshot_source(env_dir, ignore=_runtime_snapshot_ignored)
+    _copy_snapshot_source(
         env_dir,
         target,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        ignore=_runtime_snapshot_ignored,
     )
+    manifest = _build_snapshot_manifest(
+        target,
+        exclude_completion_marker=False,
+    )
+    marker_tmp = marker.with_name(marker.name + ".tmp")
+    marker_tmp.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="ascii",
+    )
+    os.replace(marker_tmp, marker)
     return target
 
 
-def _restore_runtime_env(snapshot: Path | None) -> None:
-    if snapshot is None or not snapshot.exists():
-        return
+def _restore_runtime_env(snapshot: Path | None) -> bool:
+    if snapshot is None:
+        return True
+    if not snapshot.exists():
+        _print("Runtime rollback skipped: runtime snapshot is missing.")
+        return False
+    marker = _runtime_snapshot_marker(snapshot)
+    manifest = None
+    try:
+        complete = (
+            not _snapshot_source_is_reparse_link(snapshot)
+            and snapshot.is_dir()
+            and not _snapshot_source_is_reparse_link(marker)
+            and marker.is_file()
+        )
+        if complete:
+            candidate = json.loads(marker.read_text(encoding="ascii"))
+            if isinstance(candidate, dict):
+                manifest = candidate
+            else:
+                complete = False
+    except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError):
+        complete = False
+    if not complete or manifest is None:
+        _print("Runtime rollback skipped: no complete runtime snapshot exists.")
+        return False
+    actual_manifest = _build_snapshot_manifest(
+        snapshot,
+        exclude_completion_marker=False,
+    )
+    if actual_manifest != manifest:
+        raise RuntimeError(
+            "Runtime snapshot integrity manifest does not match snapshot content"
+        )
     target = ROOT / snapshot.name
     try:
         Path(sys.executable).resolve().relative_to(target.resolve())
@@ -1046,9 +1729,15 @@ def _restore_runtime_env(snapshot: Path | None) -> None:
             "environment. Code/user rollback continues; rerun the updater "
             "after fixing dependencies."
         )
-        return
+        return False
     except ValueError:
         pass
+    if (target.exists() or target.is_symlink()) and (
+        _snapshot_source_is_reparse_link(target) or not target.is_dir()
+    ):
+        raise RuntimeError(
+            f"Runtime rollback target is not a regular directory: {target}"
+        )
     if target.exists() and _runtime_env_in_use(target):
         _print(
             "Runtime rollback skipped: bundled Python runtime is still in "
@@ -1056,25 +1745,167 @@ def _restore_runtime_env(snapshot: Path | None) -> None:
             "Obsidian processes and rerun the updater if dependencies need "
             "repair."
         )
-        return
+        return False
+    staging = target.with_name(f".{target.name}.rollback_tmp")
+    backup = target.with_name(f".{target.name}.rollback_previous")
+
+    def _remove_runtime_path(path: Path) -> None:
+        if path.is_junction():
+            path.rmdir()
+        elif path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            _rmtree(path)
+
+    if staging.exists() or staging.is_symlink():
+        _remove_runtime_path(staging)
+    if backup.exists() or backup.is_symlink():
+        raise RuntimeError(
+            f"Runtime rollback previous-runtime backup still exists: {backup}"
+        )
+    staging.mkdir(parents=True)
+    _copy_snapshot_manifest(snapshot, staging, manifest)
+    _verify_snapshot_manifest_at_root(staging, manifest)
+    if _build_snapshot_manifest(
+        staging,
+        exclude_completion_marker=False,
+    ) != manifest:
+        raise RuntimeError(
+            "Runtime rollback staging tree does not match snapshot manifest"
+        )
+    if _build_snapshot_manifest(
+        snapshot,
+        exclude_completion_marker=False,
+    ) != manifest:
+        raise RuntimeError(
+            "Runtime snapshot integrity manifest changed during rollback"
+        )
+    previous_runtime_moved = False
     if target.exists():
-        _rmtree(target)
-    shutil.copytree(snapshot, target)
+        os.replace(target, backup)
+        previous_runtime_moved = True
+    try:
+        os.replace(staging, target)
+    except Exception as install_error:
+        if previous_runtime_moved:
+            try:
+                os.replace(backup, target)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "Runtime rollback install failed and the previous runtime "
+                    f"could not be restored; preserved backup: {backup}"
+                ) from rollback_error
+        raise install_error
+    try:
+        _verify_snapshot_manifest_at_root(target, manifest)
+        if _build_snapshot_manifest(
+            target,
+            exclude_completion_marker=False,
+        ) != manifest:
+            raise RuntimeError(
+                "Restored runtime tree does not match snapshot manifest"
+            )
+    except Exception as verification_error:
+        try:
+            _remove_runtime_path(target)
+            if previous_runtime_moved:
+                os.replace(backup, target)
+        except Exception as rollback_error:
+            raise RuntimeError(
+                "Restored runtime verification failed and the previous runtime "
+                f"could not be restored; preserved backup: {backup}"
+            ) from rollback_error
+        raise verification_error
+    if previous_runtime_moved:
+        _remove_runtime_path(backup)
+    return True
 
 
-def _write_update_marker(kind: str) -> None:
+def _marker_payload(kind: str, owner: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "kind": kind,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "pid": os.getpid(),
+    }
+    if owner:
+        payload["owner"] = owner
+    return payload
+
+
+def _claim_update_marker(*, force: bool) -> _UpdateMarkerClaim:
+    owner = uuid.uuid4().hex
+    if update_marker_exists(UPDATE_MARKER.parent):
+        if not force:
+            raise RuntimeError(
+                "Ein vorheriges Update wurde nicht sauber beendet (.update_in_progress vorhanden). "
+                "Pruefe den Installationsordner oder installiere die aktuelle Version erneut. "
+                "Nur fuer Support/Debugging den Updater manuell mit --force starten."
+            )
+        try:
+            original = UPDATE_MARKER.read_bytes()
+        except OSError as exc:
+            raise RuntimeError("Vorhandener Update-Marker ist nicht sicher lesbar.") from exc
+        return _UpdateMarkerClaim(owner=owner, created=False, original=original)
+
+    UPDATE_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(_marker_payload("preflight", owner)) + "\n"
+    try:
+        with UPDATE_MARKER.open("x", encoding="utf-8", newline="\n") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except FileExistsError as exc:
+        raise RuntimeError("Ein anderer Updater hat die Update-Barriere uebernommen.") from exc
+    except Exception:
+        try:
+            UPDATE_MARKER.unlink()
+        except OSError:
+            pass
+        raise
+    return _UpdateMarkerClaim(owner=owner, created=True)
+
+
+def _read_update_marker() -> dict[str, Any] | None:
+    try:
+        data = json.loads(UPDATE_MARKER.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_update_marker(kind: str, *, owner: str | None = None) -> None:
     _write_update_status("running", f"Update laeuft ({kind})")
     _atomic_write_text(
         UPDATE_MARKER,
-        json.dumps({"kind": kind, "started_at": datetime.now().isoformat(timespec="seconds")}) + "\n",
+        json.dumps(_marker_payload(kind, owner)) + "\n",
     )
 
 
-def _clear_update_marker() -> None:
+def _clear_update_marker(
+    *,
+    expected_owner: str | None = None,
+    expected_kind: str | None = None,
+    expected_bytes: bytes | None = None,
+) -> bool:
+    if expected_bytes is not None:
+        try:
+            if UPDATE_MARKER.read_bytes() != expected_bytes:
+                return False
+        except OSError:
+            return False
+    if expected_owner is not None or expected_kind is not None:
+        data = _read_update_marker()
+        if data is None:
+            return False
+        if expected_owner is not None and data.get("owner") != expected_owner:
+            return False
+        if expected_kind is not None and data.get("kind") != expected_kind:
+            return False
     try:
         UPDATE_MARKER.unlink()
     except FileNotFoundError:
-        pass
+        return True
+    return True
 
 
 def _verify_updated_tree() -> None:
@@ -1350,6 +2181,13 @@ def _remove_path_preserving_protected(
     path: Path,
     errors: list[str] | None = None,
 ) -> None:
+    if path.is_junction():
+        try:
+            path.rmdir()
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"{_rel_posix(path) or path.name}: {exc}")
+        return
     if not path.exists():
         return
     if path.is_file() or path.is_symlink():
@@ -1494,35 +2332,369 @@ def _copy_tracked_tree(src_repo: Path) -> None:
     shutil.copytree(src_git, dst_git)
 
 
+def _snapshot_source_is_reparse_link(path: Path) -> bool:
+    try:
+        if path.is_symlink() or path.is_junction():
+            return True
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Snapshot source could not be inspected: {path}"
+        ) from exc
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse_flag and attributes & reparse_flag)
+
+
+def _validate_snapshot_source(path: Path, *, ignore=None) -> None:
+    if ignore is not None and ignore(path):
+        return
+    if _snapshot_source_is_reparse_link(path):
+        raise RuntimeError(
+            f"Snapshot source contains a junction, symlink, or reparse point: {path}"
+        )
+    try:
+        if path.is_dir():
+            for child in path.iterdir():
+                _validate_snapshot_source(child, ignore=ignore)
+        elif not path.is_file():
+            raise RuntimeError(f"Snapshot source has unsupported type: {path}")
+    except OSError as exc:
+        raise RuntimeError(f"Snapshot source could not be read: {path}") from exc
+
+
+def _copy_snapshot_source(
+    path: Path,
+    target: Path,
+    *,
+    merge_existing_dirs: bool = False,
+    ignore=None,
+) -> None:
+    if ignore is not None and ignore(path):
+        return
+    # Recheck while copying so a link introduced after preflight is not
+    # traversed into an external tree.
+    if _snapshot_source_is_reparse_link(path):
+        raise RuntimeError(
+            f"Snapshot source became a junction, symlink, or reparse point: {path}"
+        )
+    if path.is_dir():
+        target_exists = target.exists() or target.is_symlink()
+        if target_exists:
+            if not merge_existing_dirs:
+                raise RuntimeError(f"Snapshot target already exists: {target}")
+            if _snapshot_source_is_reparse_link(target) or not target.is_dir():
+                raise RuntimeError(
+                    f"Snapshot target is not a regular directory: {target}"
+                )
+        else:
+            target.mkdir(parents=True)
+        for child in path.iterdir():
+            _copy_snapshot_source(
+                child,
+                target / child.name,
+                merge_existing_dirs=merge_existing_dirs,
+                ignore=ignore,
+            )
+        return
+    if path.is_file():
+        target_exists = target.exists() or target.is_symlink()
+        if target_exists and _snapshot_source_is_reparse_link(target):
+            raise RuntimeError(
+                f"Snapshot target is a junction, symlink, or reparse point: "
+                f"{target}"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        return
+    raise RuntimeError(f"Snapshot source has unsupported type: {path}")
+
+
+def _snapshot_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise RuntimeError(f"Snapshot file could not be read: {path}") from exc
+    return digest.hexdigest()
+
+
+def _build_snapshot_manifest(
+    snapshot: Path,
+    *,
+    exclude_completion_marker: bool = True,
+) -> dict[str, Any]:
+    if _snapshot_source_is_reparse_link(snapshot) or not snapshot.is_dir():
+        raise RuntimeError(f"Snapshot root is not a regular directory: {snapshot}")
+    entries: list[dict[str, Any]] = []
+
+    def _visit(directory: Path) -> None:
+        try:
+            children = sorted(directory.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Snapshot directory could not be read: {directory}"
+            ) from exc
+        for child in children:
+            if (
+                exclude_completion_marker
+                and directory == snapshot
+                and child.name == SNAPSHOT_COMPLETE
+            ):
+                continue
+            if _snapshot_source_is_reparse_link(child):
+                raise RuntimeError(
+                    "Snapshot source contains a junction, symlink, or reparse "
+                    f"point: {child}"
+                )
+            relative = child.relative_to(snapshot).as_posix()
+            if child.is_dir():
+                entries.append({"path": relative, "type": "dir"})
+                _visit(child)
+            elif child.is_file():
+                try:
+                    size = child.stat().st_size
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Snapshot file could not be inspected: {child}"
+                    ) from exc
+                entries.append(
+                    {
+                        "path": relative,
+                        "type": "file",
+                        "size": size,
+                        "sha256": _snapshot_file_sha256(child),
+                    }
+                )
+            else:
+                raise RuntimeError(f"Snapshot source has unsupported type: {child}")
+
+    _visit(snapshot)
+    return {"version": 1, "entries": entries}
+
+
+def _verify_snapshot_manifest_at_root(root: Path, manifest: dict[str, Any]) -> None:
+    entries = manifest.get("entries")
+    if manifest.get("version") != 1 or not isinstance(entries, list):
+        raise RuntimeError("Snapshot manifest has an unsupported format")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError("Snapshot manifest contains an invalid entry")
+        relative = entry.get("path")
+        kind = entry.get("type")
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or "\\" in relative
+            or any(part in ("", ".", "..") for part in relative.split("/"))
+        ):
+            raise RuntimeError("Snapshot manifest contains an unsafe path")
+        target = root.joinpath(*relative.split("/"))
+        if not (target.exists() or target.is_symlink()):
+            raise RuntimeError(f"Snapshot integrity check failed: missing {relative}")
+        if _snapshot_source_is_reparse_link(target):
+            raise RuntimeError(
+                f"Snapshot integrity check failed: reparse target {relative}"
+            )
+        if kind == "dir":
+            if not target.is_dir():
+                raise RuntimeError(
+                    f"Snapshot integrity check failed: expected directory {relative}"
+                )
+            continue
+        if kind != "file" or not target.is_file():
+            raise RuntimeError(
+                f"Snapshot integrity check failed: expected file {relative}"
+            )
+        try:
+            size = target.stat().st_size
+        except OSError as exc:
+            raise RuntimeError(
+                f"Snapshot target could not be inspected: {relative}"
+            ) from exc
+        if size != entry.get("size") or _snapshot_file_sha256(target) != entry.get(
+            "sha256"
+        ):
+            raise RuntimeError(
+                f"Snapshot integrity check failed: content mismatch {relative}"
+            )
+
+
+def _copy_snapshot_manifest(
+    snapshot: Path,
+    target_root: Path,
+    manifest: dict[str, Any],
+) -> None:
+    """Copy only manifest-bound entries; never enumerate mutable source dirs."""
+    entries = manifest.get("entries")
+    if not isinstance(entries, list):
+        raise RuntimeError("Snapshot manifest has an unsupported format")
+    for entry in entries:
+        relative = entry["path"]
+        source = snapshot.joinpath(*relative.split("/"))
+        target = target_root.joinpath(*relative.split("/"))
+        if not (source.exists() or source.is_symlink()):
+            raise RuntimeError(f"Snapshot integrity check failed: missing {relative}")
+        if _snapshot_source_is_reparse_link(source):
+            raise RuntimeError(
+                f"Snapshot integrity check failed: reparse source {relative}"
+            )
+        if entry["type"] == "dir":
+            if not source.is_dir():
+                raise RuntimeError(
+                    f"Snapshot integrity check failed: expected directory {relative}"
+                )
+            if target.exists() or target.is_symlink():
+                if _snapshot_source_is_reparse_link(target) or not target.is_dir():
+                    raise RuntimeError(
+                        f"Snapshot target is not a regular directory: {target}"
+                    )
+            else:
+                target.mkdir(parents=True)
+            continue
+        if not source.is_file():
+            raise RuntimeError(
+                f"Snapshot integrity check failed: expected file {relative}"
+            )
+        try:
+            source_size = source.stat().st_size
+        except OSError as exc:
+            raise RuntimeError(
+                f"Snapshot source could not be inspected: {relative}"
+            ) from exc
+        if (
+            source_size != entry["size"]
+            or _snapshot_file_sha256(source) != entry["sha256"]
+        ):
+            raise RuntimeError(
+                f"Snapshot integrity check failed: source changed {relative}"
+            )
+        if (target.exists() or target.is_symlink()) and _snapshot_source_is_reparse_link(
+            target
+        ):
+            raise RuntimeError(
+                f"Snapshot target is a junction, symlink, or reparse point: {target}"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+
+def _verify_exact_git_metadata(root: Path, manifest: dict[str, Any]) -> None:
+    entries = manifest.get("entries")
+    if not isinstance(entries, list):
+        raise RuntimeError("Snapshot manifest has an unsupported format")
+    git_entries = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and (
+            entry.get("path") == ".git"
+            or str(entry.get("path", "")).startswith(".git/")
+        )
+    ]
+    target = root / ".git"
+    if not git_entries:
+        if target.exists() or target.is_symlink():
+            raise RuntimeError(
+                "Snapshot Git metadata integrity check failed: unexpected .git"
+            )
+        return
+    root_entries = [entry for entry in git_entries if entry.get("path") == ".git"]
+    if len(root_entries) != 1:
+        raise RuntimeError("Snapshot Git metadata manifest is inconsistent")
+    if root_entries[0].get("type") == "file":
+        if len(git_entries) != 1:
+            raise RuntimeError("Snapshot Git metadata manifest is inconsistent")
+        return
+    if root_entries[0].get("type") != "dir":
+        raise RuntimeError("Snapshot Git metadata manifest is inconsistent")
+    expected = {
+        "version": 1,
+        "entries": [
+            {**entry, "path": entry["path"][5:]}
+            for entry in git_entries
+            if entry.get("path") != ".git"
+        ],
+    }
+    actual = _build_snapshot_manifest(
+        target, exclude_completion_marker=False
+    )
+    if actual != expected:
+        raise RuntimeError(
+            "Snapshot Git metadata integrity check failed: tree mismatch"
+        )
+
+
 def _snapshot_current_app(dst: Path) -> None:
     dst.mkdir(parents=True, exist_ok=True)
-    for item in ROOT.iterdir():
-        if item.name.lower() in PROTECTED_DIR_SET_LOWER or item.name == UPDATE_MARKER.name:
-            continue
-        target = dst / item.name
-        if item.is_dir():
-            shutil.copytree(item, target)
-        elif item.is_file():
-            shutil.copy2(item, target)
-    (dst / SNAPSHOT_COMPLETE).write_text("ok", encoding="ascii")
+    if _snapshot_source_is_reparse_link(dst) or not dst.is_dir():
+        raise RuntimeError(f"Snapshot destination is not a regular directory: {dst}")
+    if any(dst.iterdir()):
+        raise RuntimeError(f"Snapshot destination is not empty: {dst}")
+    items = [
+        item for item in ROOT.iterdir()
+        if (
+            item.name.lower() not in PROTECTED_DIR_SET_LOWER
+            and item.name != UPDATE_MARKER.name
+        )
+    ]
+    for item in items:
+        _validate_snapshot_source(item)
+    for item in items:
+        _copy_snapshot_source(item, dst / item.name)
+    manifest = _build_snapshot_manifest(dst)
+    marker = dst / SNAPSHOT_COMPLETE
+    marker_tmp = dst / f"{SNAPSHOT_COMPLETE}.tmp"
+    marker_tmp.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="ascii",
+    )
+    os.replace(marker_tmp, marker)
 
 
-def _restore_app_snapshot(snapshot: Path) -> None:
-    if not (snapshot / SNAPSHOT_COMPLETE).exists():
+def _restore_app_snapshot(snapshot: Path) -> bool:
+    marker = snapshot / SNAPSHOT_COMPLETE
+    manifest = None
+    try:
+        complete = (
+            not _snapshot_source_is_reparse_link(snapshot)
+            and snapshot.is_dir()
+            and not _snapshot_source_is_reparse_link(marker)
+            and marker.is_file()
+        )
+        if complete:
+            candidate = json.loads(marker.read_text(encoding="ascii"))
+            if isinstance(candidate, dict):
+                manifest = candidate
+            else:
+                complete = False
+    except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError):
+        complete = False
+    if not complete or manifest is None:
         _print("Rollback skipped: no complete app snapshot exists.")
-        return
+        return False
+    actual_manifest = _build_snapshot_manifest(snapshot)
+    if actual_manifest != manifest:
+        raise RuntimeError("Snapshot integrity manifest does not match snapshot content")
     _clean_nonprotected_code()
-    for item in snapshot.iterdir():
-        if item.name == SNAPSHOT_COMPLETE:
-            continue
-        target = ROOT / item.name
-        if item.is_dir():
-            if target.exists():
-                _rmtree(target)
-            shutil.copytree(item, target)
-        elif item.is_file():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(item, target)
+    git_target = ROOT / ".git"
+    if git_target.exists() or git_target.is_symlink():
+        git_errors: list[str] = []
+        _remove_path_preserving_protected(git_target, git_errors)
+        if git_errors or git_target.exists() or git_target.is_symlink():
+            detail = " | ".join(git_errors[:3]) or "target still exists"
+            raise RuntimeError(
+                f"Snapshot rollback could not replace Git metadata: {detail}"
+            )
+    if _build_snapshot_manifest(snapshot) != manifest:
+        raise RuntimeError("Snapshot integrity manifest changed during rollback")
+    _copy_snapshot_manifest(snapshot, ROOT, manifest)
+    if _build_snapshot_manifest(snapshot) != manifest:
+        raise RuntimeError("Snapshot integrity manifest changed during rollback")
+    _verify_snapshot_manifest_at_root(ROOT, manifest)
+    _verify_exact_git_metadata(ROOT, manifest)
+    return True
 
 
 def _is_shallow_repo(git: str) -> bool:
@@ -1555,7 +2727,13 @@ def _discard_self_bootstrap_edit(git: str) -> None:
         _run([git, "checkout", "--", "tools/update_from_git.py"], check=False)
 
 
-def _update_existing_repo(repo_url: str, branch: str) -> None:
+def _update_existing_repo(
+    repo_url: str,
+    branch: str,
+    *,
+    marker_owner: str | None = None,
+    preserve_marker_on_rollback: bool | None = None,
+) -> None:
     git = _git()
     _configure_git_manifest_checkout(git)
     old_head = ""
@@ -1590,7 +2768,12 @@ def _update_existing_repo(repo_url: str, branch: str) -> None:
             "Protected user files are tracked in this install; using safe bootstrap update: "
             + ", ".join(tracked_protected)
         )
-        _bootstrap_from_private_repo(repo_url, branch)
+        _bootstrap_from_private_repo(
+            repo_url,
+            branch,
+            marker_owner=marker_owner,
+            preserve_marker_on_rollback=preserve_marker_on_rollback,
+        )
         return
     tracked_runtime = _tracked_blocked_runtime_files()
     if tracked_runtime:
@@ -1598,14 +2781,26 @@ def _update_existing_repo(repo_url: str, branch: str) -> None:
             "Runtime data is tracked in this install; using safe bootstrap update: "
             + ", ".join(tracked_runtime[:20])
         )
-        _bootstrap_from_private_repo(repo_url, branch)
+        _bootstrap_from_private_repo(
+            repo_url,
+            branch,
+            marker_owner=marker_owner,
+            preserve_marker_on_rollback=preserve_marker_on_rollback,
+        )
         return
 
     backup = _backup_user_files()
     protected_hashes = _stash_protected_files(backup)
     with tempfile.TemporaryDirectory(prefix="obsidian_runtime_rollback_") as runtime_tmp:
         runtime_snapshot = _snapshot_runtime_env(Path(runtime_tmp))
-        _write_update_marker("existing")
+        marker_preexisting = (
+            update_marker_exists(UPDATE_MARKER.parent)
+            if preserve_marker_on_rollback is None
+            else bool(preserve_marker_on_rollback)
+        )
+        _write_update_marker("existing", owner=marker_owner)
+        clear_update_marker = False
+        dependency_install_started = False
         try:
             _discard_self_bootstrap_edit(git)
             _run([git, "checkout", "-B", branch, "FETCH_HEAD"])
@@ -1617,11 +2812,13 @@ def _update_existing_repo(repo_url: str, branch: str) -> None:
             _verify_no_tracked_runtime_files(ROOT)
             _restore_user_files(backup)
             _verify_protected_files(protected_hashes)
+            dependency_install_started = dependency_update_needed
             _install_dependencies_if_present(
                 force_active_runtime=dependency_update_needed)
             _restore_user_files(backup)
             _verify_protected_files(protected_hashes)
             _verify_updated_tree()
+            clear_update_marker = True
         except Exception:
             rollback_errors: list[str] = []
             if old_head:
@@ -1629,7 +2826,11 @@ def _update_existing_repo(repo_url: str, branch: str) -> None:
                 if reset.returncode != 0:
                     rollback_errors.append((reset.stderr or reset.stdout or "git reset failed").strip())
             try:
-                _restore_runtime_env(runtime_snapshot)
+                runtime_restored = _restore_runtime_env(runtime_snapshot)
+                if dependency_install_started and runtime_snapshot is None:
+                    runtime_restored = False
+                if not runtime_restored:
+                    rollback_errors.append("runtime rollback skipped")
             except Exception as restore_exc:
                 rollback_errors.append(f"runtime rollback failed: {restore_exc}")
             try:
@@ -1639,13 +2840,23 @@ def _update_existing_repo(repo_url: str, branch: str) -> None:
                 rollback_errors.append(f"user-file rollback failed: {restore_exc}")
             if rollback_errors:
                 _print("Rollback-Warnung: " + " | ".join(rollback_errors))
+            else:
+                clear_update_marker = not marker_preexisting
             raise
         finally:
-            _clear_update_marker()
+            if clear_update_marker:
+                _clear_update_marker(expected_owner=marker_owner)
     _print(f"Update abgeschlossen. Lokale User-Dateien gesichert in: {backup}")
 
 
-def _bootstrap_from_private_repo(repo_url: str, branch: str) -> None:
+def _bootstrap_from_private_repo(
+    repo_url: str,
+    branch: str,
+    *,
+    marker_owner: str | None = None,
+    preserve_marker_on_rollback: bool | None = None,
+    force_dependency_reinstall: bool = False,
+) -> None:
     git = _git()
     backup = _backup_user_files()
     protected_hashes = _stash_protected_files(backup)
@@ -1653,6 +2864,14 @@ def _bootstrap_from_private_repo(repo_url: str, branch: str) -> None:
         clone_dir = Path(tmp) / "repo"
         snapshot_dir = Path(tmp) / "rollback"
         runtime_snapshot = _snapshot_runtime_env(Path(tmp) / "runtime")
+        marker_preexisting = (
+            update_marker_exists(UPDATE_MARKER.parent)
+            if preserve_marker_on_rollback is None
+            else bool(preserve_marker_on_rollback)
+        )
+        marker_written = False
+        clear_update_marker = False
+        dependency_install_started = False
         try:
             _run([
                 git, "-c", "core.autocrlf=false", "-c", "core.eol=lf",
@@ -1662,27 +2881,41 @@ def _bootstrap_from_private_repo(repo_url: str, branch: str) -> None:
             _configure_git_manifest_checkout(git, clone_dir)
             _force_git_manifest_checkout(git, clone_dir)
             _verify_no_tracked_runtime_files(clone_dir)
-            dependency_update_needed = _dependency_update_needed_from_path(
-                clone_dir / "requirements.lock.txt")
+            dependency_update_needed = (
+                force_dependency_reinstall
+                or _dependency_update_needed_from_path(
+                    clone_dir / "requirements.lock.txt"
+                )
+            )
             _snapshot_current_app(snapshot_dir)
-            _write_update_marker("bootstrap")
+            _write_update_marker("bootstrap", owner=marker_owner)
+            marker_written = True
             _clean_nonprotected_code()
             _copy_tracked_tree(clone_dir)
             _restore_user_files(backup)
             _verify_protected_files(protected_hashes)
+            dependency_install_started = dependency_update_needed
             _install_dependencies_if_present(
-                force_active_runtime=dependency_update_needed)
+                force_active_runtime=dependency_update_needed,
+                force_reinstall=force_dependency_reinstall,
+            )
             _restore_user_files(backup)
             _verify_protected_files(protected_hashes)
             _verify_updated_tree()
+            clear_update_marker = True
         except Exception:
             rollback_errors: list[str] = []
             try:
-                _restore_app_snapshot(snapshot_dir)
+                if not _restore_app_snapshot(snapshot_dir):
+                    rollback_errors.append("app rollback skipped")
             except Exception as restore_exc:
                 rollback_errors.append(f"app rollback failed: {restore_exc}")
             try:
-                _restore_runtime_env(runtime_snapshot)
+                runtime_restored = _restore_runtime_env(runtime_snapshot)
+                if dependency_install_started and runtime_snapshot is None:
+                    runtime_restored = False
+                if not runtime_restored:
+                    rollback_errors.append("runtime rollback skipped")
             except Exception as restore_exc:
                 rollback_errors.append(f"runtime rollback failed: {restore_exc}")
             try:
@@ -1692,59 +2925,102 @@ def _bootstrap_from_private_repo(repo_url: str, branch: str) -> None:
                 rollback_errors.append(f"user-file rollback failed: {restore_exc}")
             if rollback_errors:
                 _print("Rollback-Warnung: " + " | ".join(rollback_errors))
+            else:
+                clear_update_marker = marker_written and not marker_preexisting
             raise
         finally:
-            _clear_update_marker()
+            if clear_update_marker:
+                _clear_update_marker(expected_owner=marker_owner)
     _print(f"Update-Repo initialisiert. Lokale User-Dateien gesichert in: {backup}")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Update Obsidian from a private Git repo.")
-    parser.add_argument("--force", action="store_true", help="Update trotz laufender Runtime-Status-Dateien versuchen.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Nur einen verwaisten Update-Marker kontrolliert uebernehmen.",
+    )
     parser.add_argument("--quiet", action="store_true", help="Weniger Ausgabe fuer Batch-Aufruf.")
     args = parser.parse_args(argv)
     target_remote = ""
     target_branch = ""
 
     try:
-        if UPDATE_MARKER.exists() and not args.force:
-            raise RuntimeError(
-                "Ein vorheriges Update wurde nicht sauber beendet (.update_in_progress vorhanden). "
-                "Pruefe den Installationsordner oder installiere die aktuelle Version erneut. "
-                "Nur fuer Support/Debugging den Updater manuell mit --force starten."
-            )
-        running = _running_bots()
-        launchers = _running_launchers()
-        if launchers and not args.force:
-            raise RuntimeError(
-                "Update abgebrochen: Launcher ist noch geoeffnet. "
-                "Schliesse alle Launcher-Fenster und starte das Update danach wieder ueber den Launcher:\n  "
-                + "\n  ".join(launchers)
-            )
-        if running and not args.force:
-            raise RuntimeError(
-                "Update abgebrochen: Bots laufen noch. Stoppe zuerst alle Bots:\n  "
-                + "\n  ".join(running)
-            )
-        stopped_dashboards = _terminate_dashboard_processes()
-        if stopped_dashboards:
-            _print("Dashboard fuer Update beendet: " + ", ".join(stopped_dashboards))
+        with update_lifecycle_lock(UPDATE_MARKER.parent):
+            claim = _claim_update_marker(force=args.force)
+            try:
+                running = _running_bots()
+                launchers = _running_launchers()
+                if launchers:
+                    raise RuntimeError(
+                        "Update abgebrochen: Launcher ist noch geoeffnet. "
+                        "Schliesse alle Launcher-Fenster und starte das Update danach wieder ueber den Launcher:\n  "
+                        + "\n  ".join(launchers)
+                    )
+                if running:
+                    raise RuntimeError(
+                        "Update abgebrochen: Bots laufen noch. Stoppe zuerst alle Bots:\n  "
+                        + "\n  ".join(running)
+                    )
+                running_tools = _running_tool_processes()
+                if running_tools:
+                    raise RuntimeError(
+                        "Update abgebrochen: Analyse-Tools laufen noch. "
+                        "Beende zuerst alle Optimizer-, Backtester- oder Selftest-Laeufe:\n  "
+                        + "\n  ".join(running_tools)
+                    )
+                stopped_dashboards = _terminate_dashboard_processes()
+                if stopped_dashboards:
+                    _print("Dashboard fuer Update beendet: " + ", ".join(stopped_dashboards))
 
-        repo_url, branch = _load_update_config()
-        target_branch = branch
-        target_remote = _remote_head(repo_url, branch)
-        _print(f"Repo: {_redact_repo_url(repo_url)}")
-        _print(f"Branch: {branch}")
-        if is_valid_git_worktree(ROOT):
-            _update_existing_repo(repo_url, branch)
-        else:
-            _bootstrap_from_private_repo(repo_url, branch)
-        _write_sync_marker(repo_url, branch)
-        _write_update_status(
-            "success", "Update abgeschlossen", returncode=0,
-            remote=target_remote, branch=target_branch,
-        )
-        return 0
+                repo_url, branch = _load_update_config()
+                target_branch = branch
+                target_remote = _remote_head(repo_url, branch)
+                _print(f"Repo: {_redact_repo_url(repo_url)}")
+                _print(f"Branch: {branch}")
+                update_kwargs = {
+                    "marker_owner": claim.owner,
+                    "preserve_marker_on_rollback": not claim.created,
+                }
+                if not claim.created:
+                    _bootstrap_from_private_repo(
+                        repo_url,
+                        branch,
+                        **update_kwargs,
+                        force_dependency_reinstall=True,
+                    )
+                elif is_valid_git_worktree(ROOT):
+                    _update_existing_repo(repo_url, branch, **update_kwargs)
+                else:
+                    _bootstrap_from_private_repo(repo_url, branch, **update_kwargs)
+                if not claim.created and update_marker_exists(UPDATE_MARKER.parent):
+                    try:
+                        marker_unchanged = UPDATE_MARKER.read_bytes() == claim.original
+                    except OSError as exc:
+                        raise RuntimeError(
+                            "Update-Recovery-Marker ist nach dem Update nicht sicher lesbar."
+                        ) from exc
+                    if marker_unchanged:
+                        raise RuntimeError(
+                            "Kein neuer Build wurde angewendet; der vorhandene Recovery-Marker "
+                            "bleibt erhalten, weil Runtime-/Dependency-Recovery nicht bewiesen ist."
+                        )
+                    raise RuntimeError(
+                        "Update-Recovery-Marker wurde nicht owner-sicher abgeschlossen."
+                    )
+                _write_sync_marker(repo_url, branch)
+                _write_update_status(
+                    "success", "Update abgeschlossen", returncode=0,
+                    remote=target_remote, branch=target_branch,
+                )
+                return 0
+            finally:
+                if claim.created:
+                    _clear_update_marker(
+                        expected_owner=claim.owner,
+                        expected_kind="preflight",
+                    )
     except Exception as exc:
         _write_update_status(
             "failed", str(exc), returncode=1,

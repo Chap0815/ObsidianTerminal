@@ -31,6 +31,8 @@ Run
   python trend_check.py 365 BTC ETH SOL     # custom universe
 """
 
+# ruff: noqa: E402  # update barrier must run before project/runtime imports
+
 from __future__ import annotations
 
 import os
@@ -38,6 +40,10 @@ import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from launcher.tool_processes import guard_tool_entrypoint
+
+guard_tool_entrypoint(__file__, __name__)
 
 import numpy as np
 from config.exchange_config import get_exchange_connection, get_active_exchange_name

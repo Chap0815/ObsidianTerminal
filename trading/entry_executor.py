@@ -7,8 +7,17 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 
 from bot_utils.api_budget import try_consume_api_call
-from bot_utils.futures_order import _order_client_id_conflicts
+from bot_utils.futures_order import (
+    _TradeRecoveryOrder,
+    _exchange_id,
+    _explicit_order_ids,
+    _order_confirmed_terminal_zero_fill,
+    _order_client_id_conflicts,
+    _order_request_conflicts,
+    _requested_position_side,
+)
 from bot_utils.silent_log import silent_log
+from core.constants import DEFAULT_TAKER_FEE
 
 
 def _finite_float(value, field_name: str) -> float:
@@ -105,6 +114,12 @@ class _DatabaseJournal:
 
         schedule_execution_markouts(intent_id, **fields)
 
+    @staticmethod
+    def record_fallback_evidence(intent_id, **fields):
+        from core.database import record_order_intent_fallback_evidence
+
+        return record_order_intent_fallback_evidence(intent_id, **fields)
+
 
 def _number(value, default=0.0) -> float:
     if isinstance(value, bool):
@@ -136,6 +151,18 @@ def _has_fill_notional_without_amount(order: dict) -> bool:
     if not isinstance(order, dict):
         return False
     return _number(order.get("filled")) <= 0.0 and _number(order.get("cost")) > 0.0
+
+
+def _verified_final_canceled_fill(order: dict) -> float:
+    if not isinstance(order, dict) or "filled" not in order:
+        raise RuntimeError("final canceled maker fill amount unavailable")
+    try:
+        filled = _finite_float(order["filled"], "final canceled maker fill amount")
+    except ValueError as exc:
+        raise RuntimeError("final canceled maker fill amount unavailable") from exc
+    if filled < 0.0:
+        raise RuntimeError("final canceled maker fill amount unavailable")
+    return filled
 
 
 def _with_verified_fill_notional(order: dict, context: str) -> dict:
@@ -178,6 +205,10 @@ _TERMINAL_NO_FILL_STATUSES = frozenset({
 _TERMINAL_PARTIAL_STATUSES = _TERMINAL_NO_FILL_STATUSES | {"filled", "closed"}
 
 
+class _OrderSnapshotConflict(ValueError):
+    """Conflicting cumulative fill evidence must not be retried away."""
+
+
 def _is_explicit_finite_zero(value) -> bool:
     if value is None or isinstance(value, bool):
         return False
@@ -206,13 +237,8 @@ def _recovered_terminal_without_fill(order: dict, intent: dict) -> str | None:
 def _order_id(order: dict) -> str | None:
     if not isinstance(order, dict):
         return None
-    from bot_utils.order_utils import order_id_text_or_none
-
-    for field in ("id", "orderId"):
-        text = order_id_text_or_none(order.get(field))
-        if text is not None:
-            return text
-    return None
+    explicit_ids = _explicit_order_ids(order)
+    return next(iter(explicit_ids)) if len(explicit_ids) == 1 else None
 
 
 def _fee_usdt(order: dict) -> float:
@@ -257,7 +283,13 @@ def _require_api_budget(endpoint: str, *, critical: bool = False) -> None:
         raise RuntimeError(f"API budget denied: {endpoint}")
 
 
-def _refresh_order(exchange, order: dict, symbol: str) -> dict:
+def _refresh_order(
+    exchange,
+    order: dict,
+    symbol: str,
+    *,
+    target_amount: float | None = None,
+) -> dict:
     order_id = _order_id(order)
     fetch_order = getattr(exchange, "fetch_order", None)
     if not order_id or not callable(fetch_order):
@@ -266,8 +298,35 @@ def _refresh_order(exchange, order: dict, symbol: str) -> dict:
     refreshed = fetch_order(order_id, symbol)
     if not isinstance(refreshed, dict):
         return order
-    merged = dict(order)
+    monotonic_fields = None
+    if target_amount is not None:
+        monotonic_fields = _monotonic_order_fill_fields(
+            order,
+            refreshed,
+            target_amount,
+        )
+        if monotonic_fields is None:
+            return order
+    merged = (
+        _TradeRecoveryOrder(order)
+        if (
+            isinstance(order, _TradeRecoveryOrder)
+            and refreshed.get("amount") in (None, "")
+        )
+        else dict(order)
+    )
     merged.update(refreshed)
+    if monotonic_fields is not None:
+        merged["filled"] = monotonic_fields["filled_amount"]
+        if "filled_notional" in monotonic_fields:
+            merged["cost"] = monotonic_fields["filled_notional"]
+        if "fee_usdt" in monotonic_fields:
+            fee = {
+                "cost": monotonic_fields["fee_usdt"],
+                "currency": "USDT",
+            }
+            merged["fee"] = fee
+            merged["fees"] = [dict(fee)]
     return merged
 
 
@@ -292,7 +351,14 @@ def _reconcile_market_response(
         if config.market_reconcile_delay_seconds:
             time.sleep(config.market_reconcile_delay_seconds)
         try:
-            latest = _refresh_order(exchange, latest, symbol)
+            latest = _refresh_order(
+                exchange,
+                latest,
+                symbol,
+                target_amount=amount,
+            )
+        except _OrderSnapshotConflict:
+            raise
         except Exception:
             continue
         refreshed_order_id = _order_id(latest)
@@ -335,6 +401,30 @@ def _monotonic_order_fill_fields(
     tolerance = max(1e-12, target_amount * 1e-9)
     if observed_filled + tolerance < current_filled:
         return None
+    current_notional = _recovered_fill_notional(
+        current_order,
+        current_filled,
+    )
+    observed_notional = _recovered_fill_notional(
+        observed_order,
+        observed_filled,
+    )
+    notional_tolerance = max(
+        1e-12,
+        max(current_notional or 0.0, observed_notional or 0.0) * 1e-9,
+    )
+    if (
+        observed_filled > current_filled + tolerance
+        and current_notional is not None
+    ):
+        if observed_notional is None:
+            raise _OrderSnapshotConflict(
+                "partial fill notional unavailable as fill amount grew"
+            )
+        if observed_notional + notional_tolerance < current_notional:
+            raise _OrderSnapshotConflict(
+                "partial fill notional decreased as fill amount grew"
+            )
     fields = {
         "exchange_order_id": _order_id(observed_order),
         "filled_amount": max(current_filled, observed_filled),
@@ -342,8 +432,8 @@ def _monotonic_order_fill_fields(
     notionals = tuple(
         value
         for value in (
-            _recovered_fill_notional(current_order, current_filled),
-            _recovered_fill_notional(observed_order, observed_filled),
+            current_notional,
+            observed_notional,
         )
         if value is not None
     )
@@ -356,6 +446,30 @@ def _monotonic_order_fill_fields(
     if fee_known:
         fields["fee_usdt"] = strongest_fee
     return fields
+
+
+def _strongest_order_fill_evidence(
+    orders: tuple[dict, ...],
+    target_amount: float,
+) -> tuple[float, float | None]:
+    strongest = dict(orders[0])
+    for observed in orders[1:]:
+        fields = _monotonic_order_fill_fields(
+            strongest,
+            observed,
+            target_amount,
+        )
+        if fields is None:
+            continue
+        merged = dict(observed)
+        merged["filled"] = fields["filled_amount"]
+        if "filled_notional" in fields:
+            merged["cost"] = fields["filled_notional"]
+        else:
+            merged.pop("cost", None)
+        strongest = merged
+    filled = _number(strongest.get("filled"))
+    return filled, _recovered_fill_notional(strongest, filled)
 
 
 def execute_entry_order(
@@ -397,6 +511,8 @@ def execute_entry_order(
         "yes",
     }:
         raise ValueError("entry maker order cannot be reduce-only")
+    maker_position_side = _requested_position_side(maker_params)
+    exchange_id = _exchange_id(exchange)
     journal = journal or _DatabaseJournal()
     journal.create(
         intent_id,
@@ -448,11 +564,65 @@ def execute_entry_order(
                 amount=amount,
                 config=config,
             )
-            if _order_status(order, amount) == "FILLED":
+            terminal_zero_fill = _order_confirmed_terminal_zero_fill(order)
+            market_status = _order_status(order, amount)
+            explicit_order_ids = _explicit_order_ids(order)
+            if len(explicit_order_ids) > 1:
+                raise _OrderSnapshotConflict(
+                    "market order response has conflicting order ids"
+                )
+            if (
+                market_status in {"FILLED", "PARTIAL"}
+                and len(explicit_order_ids) != 1
+            ):
+                raise _OrderSnapshotConflict(
+                    "positive market fill has missing or conflicting order ids"
+                )
+            if terminal_zero_fill and len(explicit_order_ids) != 1:
+                raise _OrderSnapshotConflict(
+                    "terminal zero-fill has missing or conflicting order ids"
+                )
+            if (
+                (terminal_zero_fill or market_status in {"FILLED", "PARTIAL"})
+                and _order_request_conflicts(
+                    order,
+                    symbol,
+                    side,
+                    maker_position_side,
+                    exchange_id,
+                    expected_reduce_only=False,
+                    allow_one_way_position_side=True,
+                    expected_client_id=client_order_id,
+                    expected_amount=amount,
+                )
+            ):
+                raise _OrderSnapshotConflict(
+                    "market order response conflicts with submitted request"
+                )
+            if market_status == "FILLED":
                 order = _with_verified_fill_notional(order, "market")
             status = _transition_from_order(journal, intent_id, order, amount)
             if status == "FILLED":
                 journal.transition(intent_id, "FINALIZED")
+            elif terminal_zero_fill:
+                terminal_status = _external_text(order.get("status", ""))
+                reason = f"market order terminal zero-fill: {terminal_status}"
+                journal.transition(intent_id, "CANCELING")
+                journal.transition(
+                    intent_id,
+                    "CANCELED",
+                    exchange_order_id=_order_id(order),
+                    filled_amount=0.0,
+                    filled_notional=0.0,
+                    fee_usdt=0.0,
+                    error=reason,
+                )
+                journal.transition(
+                    intent_id,
+                    "FINALIZED",
+                    release_terminal_zero_claim=True,
+                    error=reason,
+                )
             elif (
                 status == "PARTIAL"
                 and _external_text(order.get("status", ""))
@@ -506,9 +676,27 @@ def execute_entry_order(
         )
         if not isinstance(maker_order, dict):
             raise RuntimeError("maker order returned no order object")
+        maker_order_ids = _explicit_order_ids(maker_order)
+        if len(maker_order_ids) > 1:
+            raise RuntimeError("maker create changed order id")
         if _order_client_id_conflicts(maker_order, client_order_id):
             raise RuntimeError("maker create changed client order id")
+        if _order_request_conflicts(
+            maker_order,
+            symbol,
+            side,
+            maker_position_side,
+            exchange_id,
+            expected_reduce_only=False,
+            expected_amount=amount,
+        ):
+            raise RuntimeError("maker create changed symbol or side")
         initial_status = _order_status(maker_order, amount)
+        if (
+            initial_status in {"FILLED", "PARTIAL"}
+            and len(maker_order_ids) != 1
+        ):
+            raise RuntimeError("maker create changed order id")
         if initial_status == "FILLED":
             try:
                 maker_order = _with_verified_fill_notional(
@@ -525,8 +713,8 @@ def execute_entry_order(
                     raise RuntimeError(
                         "maker fill notional recovery returned no order object"
                     )
-                refreshed_id = _order_id(refreshed_maker)
-                if refreshed_id is not None and refreshed_id != order_id:
+                refreshed_order_ids = _explicit_order_ids(refreshed_maker)
+                if refreshed_order_ids != {order_id}:
                     raise RuntimeError(
                         "maker fill notional recovery changed order id"
                     )
@@ -536,6 +724,18 @@ def execute_entry_order(
                 ):
                     raise RuntimeError(
                         "maker fill notional recovery changed client order id"
+                    )
+                if _order_request_conflicts(
+                    refreshed_maker,
+                    symbol,
+                    side,
+                    maker_position_side,
+                    exchange_id,
+                    expected_reduce_only=False,
+                    expected_amount=amount,
+                ):
+                    raise RuntimeError(
+                        "maker fill notional recovery changed symbol or side"
                     )
                 if _order_status(refreshed_maker, amount) != "FILLED":
                     raise RuntimeError(
@@ -583,12 +783,29 @@ def execute_entry_order(
             raise RuntimeError("maker order returned no usable order id")
         _require_api_budget("entry_executor_fetch_order", critical=True)
         latest = exchange.fetch_order(order_id, symbol)
-        latest_order_id = _order_id(latest)
-        if latest_order_id is not None and latest_order_id != order_id:
+        latest_order_ids = _explicit_order_ids(latest)
+        if len(latest_order_ids) > 1 or (
+            latest_order_ids and latest_order_ids != {order_id}
+        ):
             raise RuntimeError("maker status refresh changed order id")
         if _order_client_id_conflicts(latest, client_order_id):
             raise RuntimeError("maker status refresh changed client order id")
+        if _order_request_conflicts(
+            latest,
+            symbol,
+            side,
+            maker_position_side,
+            exchange_id,
+            expected_reduce_only=False,
+            expected_amount=amount,
+        ):
+            raise RuntimeError("maker status refresh changed symbol or side")
         latest_status = _order_status(latest, amount)
+        if (
+            latest_status in {"FILLED", "PARTIAL"}
+            and latest_order_ids != {order_id}
+        ):
+            raise RuntimeError("maker status refresh changed order id")
         if latest_status == "FILLED":
             latest = _with_verified_fill_notional(latest, "maker")
             fill_fields = {
@@ -641,44 +858,47 @@ def execute_entry_order(
         exchange.cancel_order(order_id, symbol)
         _require_api_budget("entry_executor_fetch_order", critical=True)
         canceled = exchange.fetch_order(order_id, symbol)
-        canceled_order_id = _order_id(canceled)
-        if canceled_order_id is not None and canceled_order_id != order_id:
+        canceled_order_ids = _explicit_order_ids(canceled)
+        if canceled_order_ids and canceled_order_ids != {order_id}:
             raise RuntimeError("maker cancel verification changed order id")
         if _order_client_id_conflicts(canceled, client_order_id):
             raise RuntimeError(
                 "maker cancel verification changed client order id"
             )
+        canceled_request = dict(canceled)
+        canceled_request.pop("filled", None)
+        if _order_request_conflicts(
+            canceled_request,
+            symbol,
+            side,
+            maker_position_side,
+            exchange_id,
+            expected_reduce_only=False,
+            expected_amount=amount,
+        ):
+            raise RuntimeError(
+                "maker cancel verification changed symbol or side"
+            )
         canceled_status = _external_text(canceled.get("status", ""))
         if canceled_status not in {"canceled", "cancelled", "expired"}:
             raise RuntimeError("maker cancel was not verified; market fallback refused")
-        if _has_fill_notional_without_amount(
-            latest
-        ) or _has_fill_notional_without_amount(canceled):
+        _verified_final_canceled_fill(canceled)
+        if any(
+            _has_fill_notional_without_amount(snapshot)
+            for snapshot in (maker_order, latest, canceled)
+        ):
             raise RuntimeError(
                 "maker reported positive fill notional without fill amount"
             )
-        latest_filled = _number(latest.get("filled"))
-        canceled_filled = _number(canceled.get("filled"))
-        latest_notional = _recovered_fill_notional(latest, latest_filled)
-        canceled_notional = _recovered_fill_notional(
-            canceled,
-            canceled_filled,
+        filled, maker_notional = _strongest_order_fill_evidence(
+            (maker_order, latest, canceled),
+            amount,
         )
         fill_tolerance = max(1e-12, amount * 1e-9)
-        if latest_filled > canceled_filled + fill_tolerance:
-            filled = latest_filled
-            maker_notional = latest_notional
-        elif canceled_filled > latest_filled + fill_tolerance:
-            filled = canceled_filled
-            maker_notional = canceled_notional
-        else:
-            filled = max(latest_filled, canceled_filled)
-            maker_notionals = tuple(
-                value
-                for value in (latest_notional, canceled_notional)
-                if value is not None
-            )
-            maker_notional = max(maker_notionals, default=None)
+        if filled > amount + fill_tolerance:
+            raise RuntimeError("canceled maker fill exceeded target")
+        if filled > 0.0 and maker_notional is None:
+            raise RuntimeError("canceled maker fill notional unavailable")
         canceled = dict(canceled)
         canceled["filled"] = filled
         if maker_notional is not None:
@@ -691,16 +911,18 @@ def execute_entry_order(
         canceled_fields = {
             "filled_amount": filled,
             "filled_notional": maker_notional or 0.0,
+            "fee_usdt": (
+                maker_fee
+                if maker_fee_known
+                else (maker_notional or 0.0) * DEFAULT_TAKER_FEE
+            ),
         }
-        if maker_fee_known:
-            canceled_fields["fee_usdt"] = maker_fee
+        maker_fee = canceled_fields["fee_usdt"]
         journal.transition(
             intent_id,
             "CANCELED",
             **canceled_fields,
         )
-        if filled > 0.0 and maker_notional is None:
-            raise RuntimeError("canceled maker fill notional unavailable")
         residual = max(0.0, amount - filled)
         if residual <= amount * 1e-9 or not config.market_fallback:
             journal.transition(intent_id, "FINALIZED")
@@ -726,35 +948,69 @@ def execute_entry_order(
         fallback = market_order(residual, fallback_client_order_id)
         if not isinstance(fallback, dict):
             raise RuntimeError("market fallback returned no order object")
+        fallback_status = _order_status(fallback, residual)
+        fallback_order_ids = _explicit_order_ids(fallback)
+        if len(fallback_order_ids) > 1 or (
+            fallback_status in {"FILLED", "PARTIAL"}
+            and len(fallback_order_ids) != 1
+        ):
+            raise RuntimeError("market fallback changed order id")
         fallback_filled = _number(fallback.get("filled"))
+        if fallback_filled > residual + fill_tolerance:
+            raise RuntimeError("market fallback exceeded verified residual")
+        if _order_request_conflicts(
+            fallback,
+            symbol,
+            side,
+            maker_position_side,
+            exchange_id,
+            expected_reduce_only=False,
+            allow_one_way_position_side=True,
+            expected_client_id=fallback_client_order_id,
+            expected_amount=residual,
+        ):
+            raise RuntimeError("market fallback changed submitted request")
         fallback_notional = _recovered_fill_notional(fallback, fallback_filled)
         fallback_fee, fallback_fee_known = _fee_usdt_known(fallback)
         if fallback_filled > 0.0 and fallback_notional is None:
             raise RuntimeError("market fallback fill notional unavailable")
         fallback_cost = fallback_notional or 0.0
-        if fallback_filled > residual + fill_tolerance:
-            raise RuntimeError("market fallback exceeded verified residual")
+        if not fallback_fee_known:
+            fallback_fee = fallback_cost * DEFAULT_TAKER_FEE
         total_filled = filled + fallback_filled
         total_cost = (maker_notional or 0.0) + fallback_cost
         if total_filled < amount * (1.0 - 1e-9):
             raise RuntimeError("market fallback did not fill verified residual")
+        fallback_recorder = getattr(
+            journal,
+            "record_fallback_evidence",
+            None,
+        )
+        if callable(fallback_recorder):
+            fallback_recorder(
+                intent_id,
+                fallback_exchange_order_id=_order_id(fallback),
+                fallback_filled_amount=fallback_filled,
+                fallback_filled_notional=fallback_cost,
+                fallback_notional_complete=True,
+                fallback_fee_usdt=fallback_fee,
+                error="fallback fill verified before finalization",
+            )
         filled_fields = {
             "exchange_order_id": _order_id(fallback),
             "filled_amount": total_filled,
             "filled_notional": total_cost,
         }
-        if maker_fee_known or fallback_fee_known:
-            filled_fields["fee_usdt"] = maker_fee + fallback_fee
+        filled_fields["fee_usdt"] = maker_fee + fallback_fee
         journal.transition(intent_id, "FILLED", **filled_fields)
         journal.transition(intent_id, "FINALIZED")
         result = dict(fallback)
         result["filled"] = total_filled
         result["cost"] = total_cost
         result["maker_filled"] = filled
-        if maker_fee_known and fallback_fee_known:
-            total_fee = maker_fee + fallback_fee
-            result["fee"] = {"cost": total_fee, "currency": "USDT"}
-            result["fees"] = [dict(result["fee"])]
+        total_fee = maker_fee + fallback_fee
+        result["fee"] = {"cost": total_fee, "currency": "USDT"}
+        result["fees"] = [dict(result["fee"])]
         _record_fill_tca(
             journal, intent_id, arrival, result, symbol=symbol, side=side
         )
@@ -867,6 +1123,24 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
                 intent["status"] = "RECOVERY_REQUIRED"
             unresolved.append(intent)
             continue
+        target_amount = _positive_finite_float(
+            intent["target_amount"],
+            "persisted target amount",
+        )
+        expected_snapshot_amount = target_amount
+        if fallback_client_order_id:
+            persisted_fallback_amount = _number(
+                intent.get("fallback_filled_amount")
+            )
+            persisted_total_amount = _number(intent.get("filled_amount"))
+            persisted_maker_amount = max(
+                0.0,
+                persisted_total_amount - persisted_fallback_amount,
+            )
+            expected_snapshot_amount = max(
+                0.0,
+                target_amount - persisted_maker_amount,
+            )
         try:
             refreshed_order = _refresh_order(
                 exchange,
@@ -875,20 +1149,55 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
             )
         except Exception:
             refreshed_order = order
-        expected_order_id = _order_id(order)
-        refreshed_order_id = _order_id(refreshed_order)
+        expected_order_ids = _explicit_order_ids(order)
+        refreshed_order_ids = _explicit_order_ids(refreshed_order)
         refresh_identity_error = None
-        if (
-            expected_order_id is not None
-            and refreshed_order_id is not None
-            and refreshed_order_id != expected_order_id
-        ):
+        if len(expected_order_ids) != 1 or len(refreshed_order_ids) != 1:
+            refresh_identity_error = (
+                "startup refresh has missing or conflicting order ids"
+            )
+        elif expected_order_ids and refreshed_order_ids != expected_order_ids:
             refresh_identity_error = "startup refresh changed order id"
         elif _order_client_id_conflicts(
             refreshed_order,
             lookup_client_order_id,
         ):
             refresh_identity_error = "startup refresh changed client order id"
+        else:
+            direction = str(intent["direction"]).strip().upper()
+            expected_side = "buy" if direction == "LONG" else "sell"
+            if _order_request_conflicts(
+                refreshed_order,
+                str(intent["symbol"]),
+                expected_side,
+                direction.lower(),
+                _exchange_id(exchange),
+                expected_reduce_only=False,
+                allow_one_way_position_side=True,
+            ):
+                refresh_identity_error = (
+                    "startup refresh changed symbol, side, or position side"
+                )
+            else:
+                refreshed_request = (
+                    _TradeRecoveryOrder(refreshed_order)
+                    if isinstance(refreshed_order, _TradeRecoveryOrder)
+                    else dict(refreshed_order)
+                )
+                refreshed_request.pop("filled", None)
+                if _order_request_conflicts(
+                    refreshed_request,
+                    str(intent["symbol"]),
+                    expected_side,
+                    direction.lower(),
+                    _exchange_id(exchange),
+                    expected_reduce_only=False,
+                    allow_one_way_position_side=True,
+                    expected_amount=expected_snapshot_amount,
+                ):
+                    refresh_identity_error = (
+                        "startup refresh changed order amount"
+                    )
         if refresh_identity_error is not None:
             if current != "RECOVERY_REQUIRED":
                 transition_order_intent(
@@ -899,10 +1208,6 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
             unresolved.append(persisted_snapshot(intent_id, intent))
             continue
         order = refreshed_order
-        target_amount = _positive_finite_float(
-            intent["target_amount"],
-            "persisted target amount",
-        )
         terminal_without_fill = _recovered_terminal_without_fill(order, intent)
         if terminal_without_fill is not None:
             reason = (
@@ -917,7 +1222,12 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
             }
             try:
                 if current == "CANCELED":
-                    transition_order_intent(intent_id, "FINALIZED", **fields)
+                    transition_order_intent(
+                        intent_id,
+                        "FINALIZED",
+                        release_terminal_zero_claim=True,
+                        **fields,
+                    )
                 else:
                     if current != "RECOVERY_REQUIRED":
                         transition_order_intent(
@@ -930,6 +1240,7 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
                     transition_order_intent(
                         intent_id,
                         "FINALIZED",
+                        release_terminal_zero_claim=True,
                         error=reason,
                     )
             except ValueError as exc:
@@ -951,7 +1262,7 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
                 continue
             continue
         effective_order = order
-        effective_fee_usdt = _fee_usdt(order)
+        effective_fee_usdt, effective_fee_known = _fee_usdt_known(order)
         if fallback_client_order_id and current == "FILLED":
             effective_order = dict(order)
             effective_order["filled"] = _number(intent.get("filled_amount"))
@@ -1007,6 +1318,13 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
                     or recovered_fallback_notional is not None
                 )
             recovered_fallback_fee = effective_fee_usdt
+            if (
+                not effective_fee_known
+                and recovered_fallback_notional is not None
+            ):
+                recovered_fallback_fee = (
+                    recovered_fallback_notional * DEFAULT_TAKER_FEE
+                )
             fallback_fee = max(persisted_fallback_fee, recovered_fallback_fee)
             effective_fee_usdt = maker_fee + fallback_fee
             fallback_error = "recovered fallback fill pending reconciliation"
@@ -1197,6 +1515,7 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
                     persisted_amount = _number(intent.get("filled_amount"))
                     recovered_amount = partial_fields["filled_amount"]
                     fill_tolerance = max(1e-12, target_amount * 1e-9)
+                    partial_snapshot_error = None
                     if recovered_amount + fill_tolerance < persisted_amount:
                         partial_fields = {
                             "exchange_order_id": persisted_id or recovered_id,
@@ -1207,6 +1526,23 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
                             "fee_usdt": _number(intent.get("fee_usdt")),
                         }
                     else:
+                        persisted_notional = _number(
+                            intent.get("filled_notional")
+                        )
+                        recovered_notional = partial_fields["filled_notional"]
+                        notional_tolerance = max(
+                            1e-12,
+                            max(persisted_notional, recovered_notional) * 1e-9,
+                        )
+                        if (
+                            recovered_amount > persisted_amount + fill_tolerance
+                            and recovered_notional + notional_tolerance
+                            < persisted_notional
+                        ):
+                            partial_snapshot_error = (
+                                "recovered partial fill notional decreased "
+                                "as fill amount grew"
+                            )
                         partial_fields = {
                             "exchange_order_id": persisted_id or recovered_id,
                             "filled_amount": max(
@@ -1214,15 +1550,23 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
                                 recovered_amount,
                             ),
                             "filled_notional": max(
-                                _number(intent.get("filled_notional")),
-                                partial_fields["filled_notional"],
+                                persisted_notional,
+                                recovered_notional,
                             ),
                             "fee_usdt": max(
                                 _number(intent.get("fee_usdt")),
                                 partial_fields["fee_usdt"],
                             ),
                         }
-                    if current == "PARTIAL":
+                    if partial_snapshot_error is not None:
+                        transition_order_intent(
+                            intent_id,
+                            "RECOVERY_REQUIRED",
+                            error=partial_snapshot_error,
+                            **partial_fields,
+                        )
+                        current = "RECOVERY_REQUIRED"
+                    else:
                         transition_order_intent(
                             intent_id, "PARTIAL", **partial_fields)
                 raw_status = _external_text(order.get("status", ""))

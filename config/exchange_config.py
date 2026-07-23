@@ -783,7 +783,8 @@ def safe_fetch_positions(ex, symbols=None):
 
 def reduce_only_params(ex_name: str = None, position_side: str = None,
                          margin_mode: str = "isolated",
-                         leverage: int = None, hedge_mode: bool = False) -> dict:
+                         leverage: int = None, hedge_mode: bool = False,
+                         client_order_id: str = None) -> dict:
     """Build reduce-only params.
 
     ``margin_mode`` keeps cross-margin users out of isolated (vs a hardcoded
@@ -792,6 +793,8 @@ def reduce_only_params(ex_name: str = None, position_side: str = None,
     futures_bot_exits passes it and exchanges that ignore it are unaffected.
     ``hedge_mode`` mirrors entry_params: Binance one-way mode rejects a close
     carrying positionSide (-4061), so it is omitted there unless hedge_mode.
+    ``client_order_id`` binds restart recovery to the same physical close;
+    MEXC receives both the unified and venue-native aliases.
     """
     name = (ex_name or get_active_exchange_name()).lower()
     base = {"reduceOnly": True}
@@ -816,6 +819,10 @@ def reduce_only_params(ex_name: str = None, position_side: str = None,
             base["leverage"] = int(leverage)
         except (ValueError, TypeError):
             pass
+    if client_order_id:
+        base["clientOrderId"] = client_order_id
+        if name == "mexc":
+            base["externalOid"] = client_order_id
     return base
 
 

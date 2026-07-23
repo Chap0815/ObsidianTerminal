@@ -80,6 +80,7 @@ from launcher.config.settings import (
     save_config_merge,
     subprocess_no_window_kwargs,
 )
+from launcher.tool_processes import ToolProcessRegistry, stop_tool_processes
 # Defensive: PARAM_DEFS_TREND is new (v3.5). If an OLDER settings.py is
 # deployed alongside this app.py, a hard import would blank the entire UI.
 # Fall back to the spot param set so the launcher always loads.
@@ -140,7 +141,12 @@ class ObsidianApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
+        self.tool_processes = ToolProcessRegistry()
         self.config = load_config()
+        self._ollama_switch_lock = threading.Lock()
+        self._ollama_switch_desired: str | None = None
+        self._ollama_switch_generation = 0
+        self._ollama_switch_thread: threading.Thread | None = None
 
         self.title("Obsidian Trading Terminal v5.0")
         # Resolution-adaptive scaling: shrink the 2K/4K-baseline layout so it
@@ -2305,24 +2311,37 @@ class ObsidianApp(ctk.CTk):
             return ""
 
     @staticmethod
-    def _running_dashboard_processes() -> list[dict[str, int]]:
+    def _dashboard_process_is_current_root(parts, cwd) -> bool:
+        try:
+            tokens = [
+                str(part).strip().strip('"').replace("\\", "/").lower()
+                for part in (parts or [])
+            ]
+            cwd_text = str(cwd or "").replace("\\", "/").rstrip("/").lower()
+        except Exception:
+            return False
+        root_text = str(PROJECT_ROOT).replace("\\", "/").rstrip("/").lower()
+        script = f"{root_text}/tools/dashboard.py"
+        has_streamlit = any(token == "streamlit" for token in tokens)
+        has_script = script in tokens or (
+            "tools/dashboard.py" in tokens and cwd_text == root_text
+        )
+        return has_streamlit and has_script
+
+    @staticmethod
+    def _running_dashboard_processes() -> list[dict[str, int | float]]:
         try:
             import psutil  # type: ignore
         except Exception:
             return []
-        root_text = str(PROJECT_ROOT).replace("\\", "/").lower()
-        entries: list[dict[str, int]] = []
-        for proc in psutil.process_iter(["pid", "cmdline", "cwd"]):
+        entries: list[dict[str, int | float]] = []
+        for proc in psutil.process_iter(["pid", "cmdline", "cwd", "create_time"]):
             try:
                 parts = [str(p) for p in (proc.info.get("cmdline") or [])]
-                cmd = " ".join(parts)
-                low = cmd.replace("\\", "/").lower()
-                cwd = str(proc.info.get("cwd") or "").replace("\\", "/").lower()
+                cwd = proc.info.get("cwd")
             except Exception:
                 continue
-            if "streamlit" not in low or "tools/dashboard.py" not in low:
-                continue
-            if root_text not in low and cwd != root_text:
+            if not ObsidianApp._dashboard_process_is_current_root(parts, cwd):
                 continue
             port = 8501
             for idx, part in enumerate(parts[:-1]):
@@ -2332,8 +2351,21 @@ class ObsidianApp(ctk.CTk):
                     except Exception:
                         port = 8501
                     break
+            created = _ui_finite_float(proc.info.get("create_time"), 0.0)
+            if created <= 0:
+                try:
+                    created = _ui_finite_float(proc.create_time(), 0.0)
+                except Exception:
+                    # The command line already proved this is a root-scoped
+                    # dashboard. Preserve it as an unkillable barrier instead
+                    # of silently treating the process set as empty.
+                    created = 0.0
             try:
-                entries.append({"pid": int(proc.info.get("pid") or 0), "port": int(port)})
+                entries.append({
+                    "pid": int(proc.info.get("pid") or 0),
+                    "port": int(port),
+                    "create_time": created,
+                })
             except Exception:
                 continue
         return entries
@@ -2342,7 +2374,9 @@ class ObsidianApp(ctk.CTk):
     def _running_dashboard_ports() -> list[int]:
         return [entry["port"] for entry in ObsidianApp._running_dashboard_processes()]
 
-    def _dashboard_process_matches_current_build(self, entry: dict[str, int]) -> bool:
+    def _dashboard_process_matches_current_build(
+        self, entry: dict[str, int | float]
+    ) -> bool:
         try:
             with open(self._dashboard_status_path(), "r", encoding="utf-8") as fh:
                 status = json.load(fh) or {}
@@ -2363,70 +2397,83 @@ class ObsidianApp(ctk.CTk):
         return bool(current_build) and str(status.get("build_id") or "") == current_build
 
     @staticmethod
-    def _terminate_dashboard_process(pid: int) -> None:
+    def _terminate_dashboard_process(entry: dict[str, int | float]) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        pid = int(entry.get("pid") or 0)
+        expected_created = _ui_finite_float(entry.get("create_time"), 0.0)
         if not pid:
-            return
-        psutil = None
+            return False
         try:
             import psutil  # type: ignore
+        except Exception:
+            return False
+
+        no_such_types = tuple(
+            cls
+            for cls in (
+                getattr(psutil, "NoSuchProcess", None),
+                getattr(psutil, "ZombieProcess", None),
+            )
+            if isinstance(cls, type)
+        )
+
+        def _gone(exc: Exception) -> bool:
+            return bool(no_such_types) and isinstance(exc, no_such_types)
+
+        def _identity_status(proc) -> str:
+            try:
+                created = _ui_finite_float(proc.create_time(), 0.0)
+                parts = proc.cmdline()
+                cwd = proc.cwd()
+            except Exception as exc:
+                if _gone(exc):
+                    return "gone"
+                return "unknown"
+            scoped = ObsidianApp._dashboard_process_is_current_root(parts, cwd)
+            if expected_created <= 0 or created <= 0:
+                return "unknown"
+            if not math.isclose(
+                created, expected_created, rel_tol=0.0, abs_tol=1e-6
+            ):
+                return "other-dashboard" if scoped else "reused-unrelated"
+            return "same" if scoped else "unknown"
+
+        try:
             proc = psutil.Process(int(pid))
+        except Exception as exc:
+            return _gone(exc)
+
+        identity = _identity_status(proc)
+        if identity in {"gone", "reused-unrelated"}:
+            return True
+        if identity != "same":
+            return False
+
+        try:
             proc.terminate()
             try:
                 proc.wait(timeout=3.0)
             except psutil.TimeoutExpired:
+                identity = _identity_status(proc)
+                if identity in {"gone", "reused-unrelated"}:
+                    return True
+                if identity != "same":
+                    return False
                 proc.kill()
                 proc.wait(timeout=2.0)
-            return
+            return True
         except Exception as exc:
-            # A process that disappeared is already successfully stopped.
-            no_such_types = tuple(
-                cls
-                for cls in (
-                    getattr(psutil, "NoSuchProcess", None),
-                    getattr(psutil, "ZombieProcess", None),
-                )
-                if isinstance(cls, type)
-            )
-            if no_such_types and isinstance(exc, no_such_types):
-                return
-        with suppress(Exception):
-            subprocess.run(
-                ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                **subprocess_no_window_kwargs(),
-            )
+            return _gone(exc)
 
     @staticmethod
-    def _stop_owned_dashboard_process(proc) -> None:
-        """Bounded stop and reap for the launcher's own Streamlit child."""
+    def _stop_owned_dashboard_process(proc) -> bool:
+        """Boundedly stop an owned Streamlit child and prove it exited."""
         if proc is None:
-            return
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-            proc.wait(timeout=3.0)
-        except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-                proc.wait(timeout=2.0)
-            except Exception:
-                pass
-        except Exception:
-            try:
-                proc.kill()
-                proc.wait(timeout=2.0)
-            except Exception:
-                pass
-        finally:
-            for stream_name in ("stdin", "stdout", "stderr"):
-                stream = getattr(proc, stream_name, None)
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
+            return True
+        return stop_tool_processes(
+            [proc], terminate_timeout=3.0, kill_timeout=2.0
+        )
 
     def _write_dashboard_process_status(self) -> None:
         if self.streamlit is None or not getattr(self.streamlit, "pid", None):
@@ -2450,22 +2497,35 @@ class ObsidianApp(ctk.CTk):
         except Exception:
             pass
 
-    def _open_existing_dashboard_if_healthy(self) -> bool:
-        """Reuse only a dashboard process from the same deployed build."""
+    def _open_existing_dashboard_if_healthy(self) -> bool | None:
+        """Reuse a current dashboard, or prove stale dashboards are gone.
+
+        ``None`` is a fail-closed stop barrier: at least one root-scoped
+        process survived and a replacement must not be spawned.
+        """
         seen: set[tuple[int, int]] = set()
+        reusable: dict[str, int | float] | None = None
         for entry in self._running_dashboard_processes():
             key = (int(entry.get("pid") or 0), int(entry.get("port") or 0))
             if key in seen:
                 continue
             seen.add(key)
+            pid = int(entry.get("pid") or 0)
             port = int(entry.get("port") or 0)
-            if not port or not self._dashboard_health_ok(port):
+            healthy = bool(port) and self._dashboard_health_ok(port)
+            if (
+                healthy
+                and self._dashboard_process_matches_current_build(entry)
+                and reusable is None
+            ):
+                reusable = entry
                 continue
-            if self._dashboard_process_matches_current_build(entry):
-                self._dashboard_port = port
-                webbrowser.open(self._dashboard_url())
-                return True
-            self._terminate_dashboard_process(int(entry.get("pid") or 0))
+            if pid <= 0 or not self._terminate_dashboard_process(entry):
+                return None
+        if reusable is not None:
+            self._dashboard_port = int(reusable.get("port") or 0)
+            webbrowser.open(self._dashboard_url())
+            return True
         return False
 
     def _open_dashboard_when_ready(self, url: str, attempt: int = 0) -> None:
@@ -2496,13 +2556,21 @@ class ObsidianApp(ctk.CTk):
                 pass
 
     def _open_dashboard(self):
-        """Open the streamlit dashboard.
-
-        ``cwd=PROJECT_ROOT`` because "tools/dashboard.py" is a path relative
-        to the project root, not to this module's directory.
-        """
+        """Open the streamlit dashboard with a process-identifiable path."""
         if self.streamlit is None or self.streamlit.poll() is not None:
-            if self._open_existing_dashboard_if_healthy():
+            existing_dashboard = self._open_existing_dashboard_if_healthy()
+            if existing_dashboard is None:
+                stderr = sys.stderr
+                if stderr is not None:
+                    try:
+                        stderr.write(
+                            "[Dashboard] existing process could not be "
+                            "stopped; replacement blocked\n"
+                        )
+                    except Exception:
+                        pass
+                return
+            if existing_dashboard:
                 self.streamlit = None
                 return
             try:
@@ -2522,20 +2590,45 @@ class ObsidianApp(ctk.CTk):
             env["OBSIDIAN_DASHBOARD_PORT"] = str(self._dashboard_port)
             env["OBSIDIAN_DASHBOARD_BUILD_ID"] = self._current_dashboard_build_id()
             env["OBSIDIAN_DASHBOARD_BIND_ADDRESS"] = self._dashboard_bind_address()
+            dashboard_script = os.path.join(
+                PROJECT_ROOT, "tools", "dashboard.py"
+            )
 
             try:
-                self.streamlit = subprocess.Popen(
-                    [_get_python_exe(), "-m", "streamlit", "run",
-                     "tools/dashboard.py",
-                     "--server.port", str(self._dashboard_port),
-                     "--server.address", self._dashboard_bind_address(),
-                     "--server.enableXsrfProtection", "true",
-                     "--server.enableCORS", "true",
-                     "--server.headless", "true"],
-                    env=env, cwd=PROJECT_ROOT, **kw
-                )
-                self._write_dashboard_process_status()
+                from update_barrier import process_start_guard
+
+                spawned_dashboard = None
+                with process_start_guard(PROJECT_ROOT):
+                    # Another launcher may have spawned after our outer scan
+                    # but before this serialized start point. Any root-scoped
+                    # dashboard here is a singleton barrier; a later click can
+                    # reuse it once healthy.
+                    if self._running_dashboard_processes():
+                        return
+                    spawned_dashboard = subprocess.Popen(
+                        [_get_python_exe(), "-m", "streamlit", "run",
+                         dashboard_script,
+                         "--server.port", str(self._dashboard_port),
+                         "--server.address", self._dashboard_bind_address(),
+                         "--server.enableXsrfProtection", "true",
+                         "--server.enableCORS", "true",
+                         "--server.headless", "true"],
+                        env=env, cwd=PROJECT_ROOT, **kw
+                    )
+                    self.streamlit = spawned_dashboard
+                    self._write_dashboard_process_status()
             except Exception as e:
+                if "spawned_dashboard" in locals() and spawned_dashboard is not None:
+                    stopped = self._stop_owned_dashboard_process(
+                        spawned_dashboard
+                    )
+                    if stopped and self.streamlit is spawned_dashboard:
+                        self.streamlit = None
+                    elif not stopped:
+                        # A child created before a guard-release or later
+                        # startup failure remains ours until a future shutdown
+                        # can prove it exited.
+                        self.streamlit = spawned_dashboard
                 stderr = sys.stderr
                 if stderr is not None:
                     try:
@@ -2687,6 +2780,9 @@ class ObsidianApp(ctk.CTk):
         The updater waits for this process to disappear before touching files,
         so the user does not have to run update.bat manually.
         """
+        registry_prepared = False
+        updater_process = None
+        retained_updater_stopped = True
         try:
             running = [name for name, bot in self.bots.items() if bot.is_running()]
             external = self._externally_active_bots()
@@ -2706,6 +2802,14 @@ class ObsidianApp(ctk.CTk):
                 from tkinter import messagebox
                 messagebox.showerror("Obsidian Update", "Update-Runner fehlt: tools/update_launcher.py")
                 return
+            if not ObsidianApp._stop_registered_tools_for_shutdown(self):
+                return
+            registry_prepared = True
+            retained_updater_stopped = (
+                ObsidianApp._stop_or_retain_failed_update_process(self)
+            )
+            if not retained_updater_stopped:
+                raise RuntimeError("previous update runner is still active")
             pyw = _get_pythonw_exe()
             exe = pyw if pyw and os.path.exists(str(pyw)) else _get_python_exe()
             cmd = [exe, runner, "--parent-pid", str(os.getpid()), "--restart"]
@@ -2718,16 +2822,42 @@ class ObsidianApp(ctk.CTk):
                     cmd.extend(["--remote", remote])
                 if branch:
                     cmd.extend(["--branch", branch])
-            subprocess.Popen(
+            self._set_update_cta_visible(False)
+            self._clear_update_status_override()
+            self.status_text.set("Update startet, Launcher wird geschlossen ...")
+            updater_process = subprocess.Popen(
                 cmd,
                 cwd=PROJECT_ROOT,
                 **subprocess_no_window_kwargs(),
             )
-            self._set_update_cta_visible(False)
-            self._clear_update_status_override()
-            self.status_text.set("Update startet, Launcher wird geschlossen ...")
-            self.after(250, self._shutdown_clean)
+            if not self._shutdown_clean(tools_stopped=True):
+                raise RuntimeError("launcher shutdown did not complete")
         except Exception as exc:
+            updater_stopped = updater_process is None
+            if updater_process is not None:
+                updater_stopped = (
+                    ObsidianApp._stop_or_retain_failed_update_process(
+                        self, updater_process
+                    )
+                )
+            all_updaters_stopped = (
+                retained_updater_stopped and updater_stopped
+            )
+            registry_reopened = False
+            if registry_prepared and all_updaters_stopped:
+                registry = getattr(self, "tool_processes", None)
+                resume = getattr(registry, "resume_after_aborted_shutdown", None)
+                if callable(resume):
+                    try:
+                        registry_reopened = bool(resume())
+                    except Exception:
+                        pass
+            if registry_reopened:
+                try:
+                    self._set_update_cta_visible(True)
+                    self.status_text.set("Update nicht gestartet")
+                except Exception:
+                    pass
             try:
                 from tkinter import messagebox
                 messagebox.showerror("Obsidian Update", f"Update konnte nicht gestartet werden:\n{exc}")
@@ -2743,7 +2873,126 @@ class ObsidianApp(ctk.CTk):
 
     #  LLM MODEL SELECTOR 
 
-    def _switch_ollama_model_async(self, new_model: str) -> None:
+    def _ollama_switch_is_current(
+        self,
+        model: str,
+        generation: int | None,
+    ) -> bool:
+        with self._ollama_switch_lock:
+            try:
+                if self.config.get("LLM_MODEL") != model:
+                    return False
+            except Exception:
+                return False
+            if generation is None:
+                return True
+            return (
+                self._ollama_switch_generation == generation
+                and self._ollama_switch_desired == model
+            )
+
+    def _publish_ollama_cache_if_current(
+        self,
+        model: str,
+        generation: int | None,
+    ) -> bool:
+        with self._ollama_switch_lock:
+            try:
+                current = self.config.get("LLM_MODEL") == model
+            except Exception:
+                current = False
+            if generation is not None:
+                current = current and (
+                    self._ollama_switch_generation == generation
+                    and self._ollama_switch_desired == model
+                )
+            if not current:
+                return False
+            try:
+                with self.poller.lock:
+                    self.poller.cache["llm"] = {
+                        "online": True,
+                        "model": model,
+                        "loaded": True,
+                    }
+            except Exception:
+                return False
+        return True
+
+    def _run_ollama_model_switch_worker(self) -> None:
+        while True:
+            with self._ollama_switch_lock:
+                model = self._ollama_switch_desired
+                generation = self._ollama_switch_generation
+            if not model:
+                with self._ollama_switch_lock:
+                    self._ollama_switch_thread = None
+                return
+            try:
+                self._switch_ollama_model_async(model, generation=generation)
+            except Exception as exc:
+                error_text = (
+                    f"Ollama model switch failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+                def _log_current_worker_error(
+                    target=model,
+                    target_generation=generation,
+                    message=error_text,
+                ):
+                    if self._ollama_switch_is_current(
+                        target,
+                        target_generation,
+                    ):
+                        self._log_to_card(
+                            self.cards[BOT_ORDER[0]],
+                            "warn",
+                            message,
+                        )
+
+                try:
+                    self.after(0, _log_current_worker_error)
+                except Exception:
+                    pass
+            with self._ollama_switch_lock:
+                if (
+                    self._ollama_switch_generation == generation
+                    and self._ollama_switch_desired == model
+                ):
+                    self._ollama_switch_thread = None
+                    return
+
+    def _request_ollama_model_switch(self, new_model: str) -> bool:
+        model = str(new_model or "").strip()
+        if not model:
+            return False
+        with self._ollama_switch_lock:
+            self._ollama_switch_generation += 1
+            self._ollama_switch_desired = model
+            worker = self._ollama_switch_thread
+            if worker is not None and worker.is_alive():
+                return True
+            worker = threading.Thread(
+                target=self._run_ollama_model_switch_worker,
+                name="ollama-switch-worker",
+                daemon=True,
+            )
+            self._ollama_switch_thread = worker
+            try:
+                worker.start()
+            except Exception:
+                if self._ollama_switch_thread is worker:
+                    self._ollama_switch_thread = None
+                return False
+        return True
+
+    def _switch_ollama_model_async(
+        self,
+        new_model: str,
+        *,
+        generation: int | None = None,
+    ) -> None:
         """Actively switch the active model in Ollama's VRAM.
 
         Runs in a background thread (called from _apply via Thread.start).
@@ -2772,9 +3021,13 @@ class ObsidianApp(ctk.CTk):
         log_target = running[0] if running else BOT_ORDER[0]
 
         def _log(severity: str, msg: str) -> None:
+            if not self._ollama_switch_is_current(new_model, generation):
+                return
+            def _emit_if_current() -> None:
+                if self._ollama_switch_is_current(new_model, generation):
+                    self._log_to_card(self.cards[log_target], severity, msg)
             try:
-                self.after(0, lambda: self._log_to_card(
-                    self.cards[log_target], severity, msg))
+                self.after(0, _emit_if_current)
             except Exception:
                 pass
 
@@ -2827,20 +3080,16 @@ class ObsidianApp(ctk.CTk):
                     timeout=120,   # cold-load of 14B can take 30-60s
                 )
                 if r.status_code == 200:
+                    if not self._publish_ollama_cache_if_current(
+                        new_model,
+                        generation,
+                    ):
+                        return
                     # ONE concise summary line, not three.
                     suffix = (f" (replaced {', '.join(unloaded)})"
                                 if unloaded else "")
                     _log("system",
                           f" Ollama: {new_model} active{suffix}")
-                    # Refresh sidebar  the next poller tick will confirm
-                    try:
-                        with self.poller.lock:
-                            self.poller.cache["llm"] = {
-                                "online": True, "model": new_model,
-                                "loaded": True,
-                            }
-                    except Exception:
-                        pass
                 elif r.status_code == 404:
                     _log("warn", f" Model {new_model} not installed. "
                                   f"Run: ollama pull {new_model}")
@@ -2875,12 +3124,13 @@ class ObsidianApp(ctk.CTk):
             if not new_model:
                 return
             save_failed_reason = None
-            cfg_written = None
+            persisted_config = None
             try:
-                self.config = save_config_merge({"LLM_MODEL": new_model})
-                cfg_written = self.config.get("LLM_MODEL")
+                persisted_config = save_config_merge({"LLM_MODEL": new_model})
+                cfg_written = persisted_config.get("LLM_MODEL")
             except Exception as e:
                 save_failed_reason = f"{type(e).__name__}: {e}"
+                cfg_written = None
 
             if save_failed_reason or cfg_written != new_model:
                 reason = (save_failed_reason
@@ -2894,26 +3144,20 @@ class ObsidianApp(ctk.CTk):
                     pass
                 return
 
-            #  In-memory sync 
-            # Keep the in-memory ``self.config`` in step with what we just
-            # wrote to disk. Otherwise the next ``save_config(self.config)``
-            # (parameter save, bot-visibility change  all write the FULL
-            # dict) would overwrite the file with the stale LLM_MODEL.
-            self.config["LLM_MODEL"] = new_model
+            # Commit in-memory config and loading telemetry under the same
+            # switch lock used by the worker's final cache publication.
+            with self._ollama_switch_lock:
+                self.config = persisted_config
+                try:
+                    with self.poller.lock:
+                        self.poller.cache["llm"] = {
+                            "online": True, "model": new_model, "loaded": False,
+                        }
+                except Exception:
+                    pass
 
             # Update sidebar immediately so the user sees feedback
             self.sb_llm_model.configure(text=f"  {new_model}")
-
-            # Invalidate the poller's LLM cache so the next tick re-reads
-            # bot_config.json and reflects the new model in the sidebar
-            # without waiting for the 10s ping cycle.
-            try:
-                with self.poller.lock:
-                    self.poller.cache["llm"] = {
-                        "online": True, "model": new_model, "loaded": False,
-                    }
-            except Exception:
-                pass
 
             dlg.destroy()
 
@@ -2924,12 +3168,12 @@ class ObsidianApp(ctk.CTk):
             #   2) warm up the new model     (1-token generate, long keep_alive)
             # The bot subprocesses then see the new model already in VRAM on
             # their next generate()  no scan-cycle latency.
-            threading.Thread(
-                target=self._switch_ollama_model_async,
-                args=(new_model,),
-                name=f"ollama-switch-{new_model}",
-                daemon=True,
-            ).start()
+            if not self._request_ollama_model_switch(new_model):
+                self._log_to_card(
+                    self.cards[BOT_ORDER[0]],
+                    "warn",
+                    f"Ollama: could not start model switch for {new_model}",
+                )
 
             # Single concise log line per card  the async switch worker
             # below adds 2-3 more lines to ONE card (the primary one) so
@@ -4149,20 +4393,104 @@ class ObsidianApp(ctk.CTk):
         else:
             self._show_quit_no_positions_dialog()
 
-    def _shutdown_clean(self):
-        """Clean shutdown: stop poller, close streamlit, destroy window."""
+    def _stop_registered_tools_for_shutdown(self) -> bool:
+        """Fail closed unless every launcher-owned tool is proven stopped."""
+        try:
+            registry = getattr(self, "tool_processes", None)
+            if registry is not None and not registry.stop_all():
+                raise RuntimeError("at least one launcher tool is still running")
+        except Exception as exc:
+            try:
+                from tkinter import messagebox
+                messagebox.showerror(
+                    "Obsidian Shutdown",
+                    "Der Launcher bleibt geoeffnet, weil ein Tool-Prozess "
+                    f"nicht sicher beendet werden konnte:\n{exc}",
+                )
+            except Exception:
+                pass
+            return False
+        return True
+
+    def _stop_or_retain_failed_update_process(self, proc=None) -> bool:
+        """Stop one failed updater or retain its exact handle for retry."""
+        if proc is None:
+            proc = getattr(self, "_failed_update_process", None)
+        if proc is None:
+            return True
+        self._failed_update_process = proc
+        registry = getattr(self, "tool_processes", None)
+        registry_stop = getattr(registry, "stop", None)
+        attempted_registry_stop = False
+        stopped = False
+        if callable(registry_stop):
+            attempted_registry_stop = True
+            try:
+                stopped = bool(registry_stop(proc))
+            except Exception:
+                attempted_registry_stop = False
+        if not attempted_registry_stop:
+            try:
+                stopped = bool(stop_tool_processes([proc]))
+            except Exception:
+                stopped = False
+        if stopped:
+            if getattr(self, "_failed_update_process", None) is proc:
+                self._failed_update_process = None
+            return True
+        return False
+
+    def _shutdown_clean(self, *, tools_stopped: bool = False):
+        """Clean shutdown after every registered tool is proven stopped."""
+        if (
+            not tools_stopped
+            and not ObsidianApp._stop_registered_tools_for_shutdown(self)
+        ):
+            return False
+        if not ObsidianApp._stop_or_retain_failed_update_process(self):
+            return False
+        dashboard = getattr(self, "streamlit", None)
+        if dashboard is not None:
+            try:
+                dashboard_stopped = ObsidianApp._stop_owned_dashboard_process(
+                    dashboard
+                )
+            except Exception:
+                dashboard_stopped = False
+            if not dashboard_stopped:
+                if not tools_stopped:
+                    # A normal close that aborts here leaves the launcher and
+                    # its poller operational. Reopen the now-empty tool
+                    # registry so the still-running UI is not permanently
+                    # degraded. The updater path owns its later resume and
+                    # must stay sealed until that spawned updater is stopped.
+                    registry = getattr(self, "tool_processes", None)
+                    resume = getattr(
+                        registry, "resume_after_aborted_shutdown", None
+                    )
+                    if callable(resume):
+                        try:
+                            resume()
+                        except Exception:
+                            pass
+                try:
+                    from tkinter import messagebox
+                    messagebox.showerror(
+                        "Obsidian Shutdown",
+                        "Der Launcher bleibt geoeffnet, weil das Dashboard "
+                        "nicht sicher beendet werden konnte.",
+                    )
+                except Exception:
+                    pass
+                return False
+            if self.streamlit is dashboard:
+                self.streamlit = None
         try:
             self.poller.stop()
         except Exception:
             pass
-        try:
-            if self.streamlit:
-                ObsidianApp._stop_owned_dashboard_process(self.streamlit)
-        except Exception:
-            pass
-        finally:
-            self.streamlit = None
         self.destroy()
+        return True
 
     def _show_quit_no_positions_dialog(self):
         from launcher.ui.dialogs.shutdown import show_quit_no_positions_dialog

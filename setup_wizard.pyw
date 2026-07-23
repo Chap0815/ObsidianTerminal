@@ -13,9 +13,33 @@ Auto-launched by the launcher when no .env exists.
 import sys
 import os
 import json
-import customtkinter as ctk
+import tempfile
 import threading
 from tkinter import font as tkfont
+
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from update_barrier import (  # noqa: E402 - project root bootstrap above
+    UpdateInProgressError,
+    assert_process_start_allowed,
+    process_start_guard,
+    update_lifecycle_lock,
+)
+from env_setup_files import (  # noqa: E402 - project root bootstrap above
+    ENV_SETUP_TEMP_PREFIX,
+    ENV_SETUP_TEMP_SUFFIX,
+    cleanup_stale_env_temps,
+    unlink_env_temp,
+)
+
+try:
+    assert_process_start_allowed(_PROJECT_ROOT)
+except UpdateInProgressError as exc:
+    raise SystemExit(str(exc)) from exc
+
+import customtkinter as ctk  # noqa: E402 - update barrier precedes UI import
 
 # -- Design (matches launcher.pyw) ---------------------------------------------
 ctk.set_appearance_mode("dark")
@@ -68,6 +92,65 @@ def _safe_mono_font():
     except Exception:
         pass
     return "Consolas"
+
+
+def _write_new_private_text_file(path: str, content: str) -> None:
+    """Durably publish a complete private file without replacing an existing one."""
+    directory = os.path.dirname(os.path.abspath(path))
+    basename = os.path.basename(path)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=ENV_SETUP_TEMP_PREFIX if basename == ".env" else f"{basename}.",
+        suffix=ENV_SETUP_TEMP_SUFFIX,
+        dir=directory,
+    )
+    try:
+        stream = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        fd = -1
+        with stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        try:
+            import stat as _stat
+            os.chmod(temp_path, _stat.S_IRUSR | _stat.S_IWUSR)
+        except (OSError, AttributeError):
+            # mkstemp is already 0600 on POSIX; Windows uses the user ACL.
+            pass
+
+        try:
+            if os.name == "nt":
+                os.rename(temp_path, path)
+                temp_path = ""
+            else:
+                os.link(temp_path, path)
+                unlink_env_temp(temp_path)
+                temp_path = ""
+        except FileExistsError as exc:
+            raise RuntimeError(
+                ".env already exists; edit Env Settings instead of rerunning setup"
+            ) from exc
+
+        if os.name != "nt":
+            dir_fd = -1
+            try:
+                flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                dir_fd = os.open(directory, flags)
+                os.fsync(dir_fd)
+            finally:
+                if dir_fd >= 0:
+                    os.close(dir_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temp_path:
+            active_error = sys.exc_info()[1]
+            try:
+                unlink_env_temp(temp_path)
+            except OSError as cleanup_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(str(cleanup_error))
 
 
 # -- Exchange Definitions ------------------------------------------------------
@@ -896,25 +979,13 @@ class SetupWizard(ctk.CTk):
         # Schreibe .env IMMER in das Script-Verzeichnis, nicht ins CWD
         script_dir = os.path.dirname(os.path.abspath(__file__))
         env_path   = os.path.join(script_dir, ".env")
-        if os.path.exists(env_path):
-            raise RuntimeError(
-                ".env already exists; edit Env Settings instead of rerunning setup"
-            )
-        with open(env_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-        # N-3 fix: tighten POSIX permissions to 0600 so the .env file
-        # (which contains API keys and Telegram tokens) is readable only
-        # by the owning user. Without this, default umask (typically
-        # 022) leaves the file world-readable, which means any other
-        # local user can ``cat`` your exchange credentials. Windows
-        # silently ignores chmod - fine, the file lives inside the
-        # user's profile directory which has its own ACL.
-        try:
-            import stat as _stat
-            os.chmod(env_path, _stat.S_IRUSR | _stat.S_IWUSR)   # 0600
-        except (OSError, AttributeError):
-            # Windows or filesystem without POSIX bits - fail silently.
-            pass
+        with update_lifecycle_lock(script_dir, timeout=15.0):
+            cleanup_stale_env_temps(script_dir)
+            if os.path.lexists(env_path):
+                raise RuntimeError(
+                    ".env already exists; edit Env Settings instead of rerunning setup"
+                )
+            _write_new_private_text_file(env_path, "\n".join(lines))
 
     def _show_success_dialog(self):
         for w in self.content.winfo_children():
@@ -974,11 +1045,12 @@ class SetupWizard(ctk.CTk):
             kw = {}
             if sys.platform == "win32":
                 kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-            subprocess.Popen(
-                [_get_pythonw_exe(), launcher],
-                cwd=root,
-                **kw
-            )
+            with process_start_guard(root):
+                subprocess.Popen(
+                    [_get_pythonw_exe(), launcher],
+                    cwd=root,
+                    **kw
+                )
         except Exception:
             pass
         self.destroy()

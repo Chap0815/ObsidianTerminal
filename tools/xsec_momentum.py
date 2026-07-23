@@ -9,10 +9,21 @@ pro Namens-Rotation).
 Run: PYTHONIOENCODING=utf-8 python -m tools.xsec_momentum [days]
 """
 
-import sys
-import statistics
+# ruff: noqa: E402  # update barrier must run before project/runtime imports
+
 import math
+import os
+import statistics
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+_TOOL_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _TOOL_PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _TOOL_PROJECT_ROOT)
+
+from launcher.tool_processes import guard_tool_entrypoint
+
+guard_tool_entrypoint(__file__, __name__)
 
 import pandas as pd
 

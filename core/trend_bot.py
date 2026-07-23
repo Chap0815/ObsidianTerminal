@@ -432,6 +432,8 @@ class TrendBot(SpotBot):
                 stage="order_attempt",
                 mode=entry_mode,
             )
+            from core.spot_bot_scan import SpotBuyOutcomeUnknown
+
             try:
                 entry = self._place_buy_order(
                     sym,
@@ -439,6 +441,16 @@ class TrendBot(SpotBot):
                     coin_size,
                     entry_id=entry_id,
                 )
+            except SpotBuyOutcomeUnknown as _buy_exc:
+                emit_entry_lifecycle(
+                    entry_id,
+                    bot=self.BOT_NAME,
+                    symbol=sym,
+                    stage="order_unknown",
+                    mode=entry_mode,
+                    reason=type(_buy_exc).__name__,
+                )
+                raise
             except Exception as _buy_exc:
                 emit_entry_lifecycle(
                     entry_id,
@@ -454,7 +466,7 @@ class TrendBot(SpotBot):
                         from core.database import release_portfolio_reservation
 
                         release_portfolio_reservation(entry_id)
-                raise _buy_exc
+                raise
             if entry is None:
                 emit_entry_lifecycle(
                     entry_id,

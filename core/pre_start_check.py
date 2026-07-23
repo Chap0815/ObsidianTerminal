@@ -509,6 +509,7 @@ def _check_state_and_claims(bot_name: str | None,
         elif not sim and claim_bases - bases:
             missing = []
             recoverable = []
+            pending_release = []
             for r in claims:
                 base = str(r.get("symbol") or "").split("/")[0].split(":")[0].upper()
                 if base in bases:
@@ -519,10 +520,29 @@ def _check_state_and_claims(bot_name: str | None,
                     invested = float(r.get("invested_usdt") or 0)
                 except (TypeError, ValueError):
                     amount = invested = 0.0
-                if state in {"CLAIMING", "ADOPTING"} and amount <= 0 and invested <= 0:
+                try:
+                    extra = json.loads(r.get("extra_json") or "{}")
+                except (TypeError, ValueError):
+                    extra = None
+                if (
+                    isinstance(extra, dict)
+                    and extra.get("claim_release_pending") is True
+                ):
+                    pending_release.append(base)
+                elif (
+                    state in {"CLAIMING", "ADOPTING"}
+                    and amount <= 0
+                    and invested <= 0
+                ):
                     recoverable.append(base)
                 else:
                     missing.append(base)
+            if pending_release:
+                issues.append(_issue(
+                    "warn", "pending_claim_release_without_state",
+                    f"{name}: explicitly pending claim release(s) without "
+                    f"JSON state: {sorted(set(pending_release))}; startup "
+                    f"recovery will compare-and-delete exact marked rows"))
             if recoverable:
                 issues.append(_issue(
                     "warn", "pending_claims_without_state",

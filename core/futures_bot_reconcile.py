@@ -9,10 +9,13 @@ Two reconciliation paths:
 """
 from __future__ import annotations
 
+import json
 import math
 import time
+from datetime import datetime, timezone
 
 from bot_utils.api_budget import try_consume_api_call
+from bot_utils.futures_order import FUTURES_DEFAULT_TAKER_FEE, position_row_side
 from core.clock import now_utc
 
 
@@ -42,15 +45,17 @@ def _positive_abs_float_or_none(value) -> float | None:
 def _position_signed_contracts_or_none(position: dict | None) -> float | None:
     if not isinstance(position, dict):
         return None
+    size_evidence_seen = False
     for key in ("contracts", "size"):
         if key not in position or position.get(key) is None:
             continue
+        size_evidence_seen = True
         parsed = _finite_float_or_none(position.get(key))
         if parsed is None:
             return None
         if parsed != 0:
             return parsed
-    return 0.0
+    return 0.0 if size_evidence_seen else None
 
 
 def _position_contracts_or_none(position: dict | None) -> float | None:
@@ -59,6 +64,51 @@ def _position_contracts_or_none(position: dict | None) -> float | None:
         return None
     contracts = abs(signed)
     return contracts if contracts > 0 else 0.0
+
+
+def _position_side_or_none(position: dict | None) -> str | None:
+    side, contradictory = position_row_side(position)
+    if contradictory or not side:
+        return None
+    return side.upper()
+
+
+def _position_entry_order_id_or_none(position: dict | None) -> str | None:
+    """Return a conflict-free venue-provided entry-order identity."""
+    if not isinstance(position, dict):
+        return None
+    info = position.get("info")
+    sources = (position, info if isinstance(info, dict) else {})
+    aliases = ("entryOrderId", "entry_order_id", "openOrderId", "open_order_id")
+    found: set[str] = set()
+    for source in sources:
+        for key in aliases:
+            if key not in source or source.get(key) is None:
+                continue
+            order_id = _safe_identifier(source.get(key), max_length=128)
+            if order_id is None:
+                return None
+            found.add(order_id)
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def _side_conflict_details(
+    local_side,
+    exchange_side,
+) -> tuple[str, str]:
+    if local_side not in ("LONG", "SHORT"):
+        return "", ""
+    if exchange_side not in ("LONG", "SHORT"):
+        return (
+            f"exchange_side_unavailable:{local_side}",
+            f"side unavailable local={local_side}",
+        )
+    if local_side != exchange_side:
+        return (
+            f"exchange_side_mismatch:{local_side}:{exchange_side}",
+            f"side mismatch local={local_side}, exchange={exchange_side}",
+        )
+    return "", ""
 
 
 def _nonnegative_float_or_none(value) -> float | None:
@@ -70,19 +120,249 @@ def _is_true_bool(value) -> bool:
     return value is True
 
 
-def _is_reduce_only_trade(t: dict) -> bool:
+def _safe_identifier(value, *, max_length: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if (
+        not text
+        or len(text) > max_length
+        or any(ord(char) < 32 for char in text)
+    ):
+        return None
+    return text
+
+
+def _base_symbol(value) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip().upper()
+    return text.split("/")[0].split(":")[0]
+
+
+def _utc_datetime_or_none(value) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _validated_entry_sizing_recovery(
+    metadata: dict,
+    intent: dict | None,
+    *,
+    bot_name: str,
+    base: str,
+    side: str,
+    contracts: float,
+    entry_price: float,
+    current_time: datetime,
+    require_settlement_safe: bool = True,
+) -> dict | None:
+    """Bind pre-state crash sizing evidence to one fresh finalized entry."""
+    if not (
+        metadata.get("entry_sizing_recovery_pending") is True
+        or metadata.get("oversize_rollback_pending") is True
+    ):
+        return None
+    if not isinstance(intent, dict):
+        return None
+    entry_id = _safe_identifier(metadata.get("entry_id"), max_length=64)
+    if entry_id is None or _safe_identifier(
+        intent.get("intent_id"), max_length=64
+    ) != entry_id:
+        return None
+    if str(intent.get("bot_name") or "").strip() != str(bot_name).strip():
+        return None
+    if str(intent.get("mode") or "").strip().upper() != "LIVE":
+        return None
+    if _base_symbol(intent.get("symbol")) != _base_symbol(base):
+        return None
+    if str(intent.get("direction") or "").strip().upper() != side:
+        return None
+    if metadata.get("entry_claim_position_type") != side:
+        return None
+    if str(intent.get("status") or "").strip().upper() != "FINALIZED":
+        return None
+    if _safe_identifier(
+        intent.get("exchange_order_id"), max_length=128
+    ) is None:
+        return None
+
+    filled_amount = _positive_float_or_none(intent.get("filled_amount"))
+    filled_notional = _positive_float_or_none(intent.get("filled_notional"))
+    contract_size = _positive_float_or_none(
+        metadata.get("entry_contract_size")
+    )
+    intended = _positive_float_or_none(
+        metadata.get("entry_intended_notional")
+    )
+    ceiling = _positive_float_or_none(
+        metadata.get("entry_oversize_notional_ceiling")
+    )
+    if None in (
+        filled_amount,
+        filled_notional,
+        contract_size,
+        intended,
+        ceiling,
+    ):
+        return None
+    if not math.isclose(
+        float(filled_amount), contracts, rel_tol=1e-6, abs_tol=1e-9
+    ):
+        return None
+    actual_notional = contracts * float(contract_size) * entry_price
+    if not math.isfinite(actual_notional) or actual_notional <= 0.0:
+        return None
+    if not math.isclose(
+        float(filled_notional), actual_notional, rel_tol=0.01, abs_tol=1e-6
+    ):
+        return None
+
+    claim_opened = _utc_datetime_or_none(metadata.get("entry_claim_opened_at"))
+    intent_created = _utc_datetime_or_none(intent.get("created_at"))
+    intent_updated = _utc_datetime_or_none(intent.get("updated_at"))
+    if None in (claim_opened, intent_created, intent_updated):
+        return None
+    if abs((intent_created - claim_opened).total_seconds()) > 120.0:
+        return None
+    if intent_updated < intent_created:
+        return None
+    # The journal bounds the fill between creation and final update.  If that
+    # uncertainty interval crosses an 8-hour funding settlement, neither edge
+    # is a safe accounting start time; require manual/venue-history recovery.
+    funding_period_seconds = 8 * 60 * 60
+    funding_window_unverified = (
+        int(intent_created.timestamp()) // funding_period_seconds
+        != int(intent_updated.timestamp()) // funding_period_seconds
+    )
+    if require_settlement_safe and funding_window_unverified:
+        return None
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    current_time = current_time.astimezone(timezone.utc)
+    age_seconds = (current_time - intent_updated).total_seconds()
+    if age_seconds < -300.0 or age_seconds > 1800.0:
+        return None
+
+    fee = _nonnegative_float_or_none(intent.get("fee_usdt"))
+    if fee is None:
+        return None
+    if fee == 0.0:
+        fee = round(actual_notional * FUTURES_DEFAULT_TAKER_FEE, 6)
+    return {
+        "actual_notional": actual_notional,
+        "buy_time": intent_created.strftime("%Y-%m-%d %H:%M:%S"),
+        "contract_size": float(contract_size),
+        "intended_notional": float(intended),
+        "notional_ceiling": float(ceiling),
+        "entry_fee": fee,
+        "funding_window_unverified": funding_window_unverified,
+        "oversized": (
+            actual_notional / max(float(intended), 1e-9) > 2.0
+            or float(intended) > float(ceiling)
+        ),
+    }
+
+
+def _trade_evidence_sources(t: dict) -> tuple[dict, ...]:
     if not isinstance(t, dict):
-        return False
+        return ()
     raw_info = t.get("info")
-    info = raw_info if isinstance(raw_info, dict) else {}
-    raw_reduce_only = (
-        info.get("reduceOnly")
-        if "reduceOnly" in info else info.get("reduce_only")
-    )
-    return raw_reduce_only is True or (
-        isinstance(raw_reduce_only, str)
-        and raw_reduce_only.strip().lower() in ("1", "true", "yes")
-    )
+    if isinstance(raw_info, dict):
+        return t, raw_info
+    return (t,)
+
+
+def _trade_reduce_only_evidence(t: dict) -> tuple[bool | None, bool]:
+    """Return ``(value, valid)`` for conflict-aware reduce-only evidence."""
+    values = []
+    for source in _trade_evidence_sources(t):
+        for key in ("reduceOnly", "reduce_only"):
+            if key not in source:
+                continue
+            raw = source.get(key)
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                continue
+            if isinstance(raw, bool):
+                parsed = raw
+            elif isinstance(raw, int) and raw in (0, 1):
+                parsed = bool(raw)
+            elif isinstance(raw, str):
+                normalized = raw.strip().lower()
+                if normalized in {"1", "true", "yes"}:
+                    parsed = True
+                elif normalized in {"0", "false", "no"}:
+                    parsed = False
+                else:
+                    return None, False
+            else:
+                return None, False
+            values.append(parsed)
+    if not values:
+        return None, True
+    if any(value != values[0] for value in values[1:]):
+        return None, False
+    return values[0], True
+
+
+def _trade_position_leg_evidence(t: dict) -> tuple[str | None, bool]:
+    """Return an explicit LONG/SHORT leg without trusting conflicting aliases."""
+    legs = []
+    for source in _trade_evidence_sources(t):
+        for key in ("positionSide", "posSide", "holdSide"):
+            if key not in source:
+                continue
+            raw = source.get(key)
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                continue
+            if not isinstance(raw, str):
+                return None, False
+            normalized = raw.strip().upper().replace("-", "_")
+            if normalized in {"LONG", "SHORT"}:
+                legs.append(normalized)
+            elif normalized not in {"BOTH", "NET", "ONEWAY", "ONE_WAY"}:
+                return None, False
+    if not legs:
+        return None, True
+    if any(leg != legs[0] for leg in legs[1:]):
+        return None, False
+    return legs[0], True
+
+
+def _is_reduce_only_trade(t: dict) -> bool:
+    reduce_only, valid = _trade_reduce_only_evidence(t)
+    return valid and reduce_only is True
+
+
+def _reconcile_hedge_mode_or_none(bot) -> bool | None:
+    getter = getattr(bot, "C", None)
+    if not callable(getter):
+        return False
+    try:
+        raw = getter("HEDGE_MODE", False)
+    except Exception:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int) and raw in (0, 1):
+        return bool(raw)
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
 
 
 def _trade_side(t: dict) -> str:
@@ -93,20 +373,28 @@ def _trade_side(t: dict) -> str:
     return str(t.get("side") or info.get("side") or "").strip().lower()
 
 
-def _is_close_trade_for_position(t: dict, pos_type: str | None) -> bool:
+def _is_close_trade_for_position(
+    t: dict,
+    pos_type: str | None,
+    *,
+    hedge_mode: bool = False,
+) -> bool:
     side = _trade_side(t)
     ptype = str(pos_type or "").upper()
-    if _is_reduce_only_trade(t):
-        if ptype in {"LONG", "SHORT"}:
-            if ptype == "LONG":
-                return side in {"sell", "short"}
-            return side in {"buy", "long"}
-        return True
+    reduce_only, reduce_valid = _trade_reduce_only_evidence(t)
+    position_leg, leg_valid = _trade_position_leg_evidence(t)
+    if not reduce_valid or not leg_valid:
+        return False
+    if ptype not in {"LONG", "SHORT"}:
+        return reduce_only is True
+    if position_leg is not None and position_leg != ptype:
+        return False
+    if hedge_mode:
+        if reduce_only is not True and position_leg != ptype:
+            return False
     if ptype == "LONG":
         return side in {"sell", "short"}
-    if ptype == "SHORT":
-        return side in {"buy", "long"}
-    return False
+    return side in {"buy", "long"}
 
 
 def _trade_amount(t: dict) -> float:
@@ -163,16 +451,86 @@ def _estimate_futures_close_fee_usdt(
     return fee if math.isfinite(fee) else 0.0
 
 
+def _entry_trade_boundary_ms(buy_time: str) -> int | None:
+    """Earliest trade millisecond provably after a second-resolution entry."""
+    if not isinstance(buy_time, str):
+        return None
+    try:
+        opened = datetime.strptime(buy_time, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+    if opened.strftime("%Y-%m-%d %H:%M:%S") != buy_time:
+        return None
+    try:
+        return int(opened.timestamp() * 1000) + 1000
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _iso_timestamp_ms_or_none(value) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    try:
+        timestamp_ms = parsed.astimezone(timezone.utc).timestamp() * 1000.0
+    except (OSError, OverflowError, ValueError):
+        return None
+    return timestamp_ms if math.isfinite(timestamp_ms) and timestamp_ms > 0 else None
+
+
+def _trade_timestamp_ms_or_none(trade: dict) -> float | None:
+    raw_timestamp = trade.get("timestamp")
+    raw_datetime = trade.get("datetime")
+    timestamp_ms = None
+    if raw_timestamp is not None:
+        timestamp_ms = _finite_float_or_none(raw_timestamp)
+        if timestamp_ms is None or timestamp_ms <= 0:
+            return None
+        try:
+            datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    datetime_ms = None
+    if raw_datetime is not None:
+        datetime_ms = _iso_timestamp_ms_or_none(raw_datetime)
+        if datetime_ms is None:
+            return None
+    if timestamp_ms is None:
+        return datetime_ms
+    if datetime_ms is not None and not math.isclose(
+        timestamp_ms, datetime_ms, rel_tol=0.0, abs_tol=1.0
+    ):
+        return None
+    return timestamp_ms
+
+
 def _aggregate_futures_reduce_trades(bot, symbol_full: str,
                                      target_contracts: float,
-                                     pos_type: str | None = None) -> tuple[float, float, str]:
+                                     pos_type: str | None,
+                                     buy_time: str) -> tuple[float, float, str]:
     try:
         target = max(0.0, float(target_contracts or 0.0))
     except (TypeError, ValueError, OverflowError):
         target = 0.0
     if target >= float("inf"):
         target = 0.0
-    if target <= 0 or not hasattr(bot.ex, "fetch_my_trades"):
+    boundary_ms = _entry_trade_boundary_ms(buy_time)
+    if (
+        target <= 0
+        or boundary_ms is None
+        or not hasattr(bot.ex, "fetch_my_trades")
+    ):
+        return 0.0, 0.0, "unavailable"
+    hedge_mode = _reconcile_hedge_mode_or_none(bot)
+    if hedge_mode is None:
         return 0.0, 0.0, "unavailable"
     try:
         if not try_consume_api_call("futures_reconcile_fetch_my_trades"):
@@ -183,16 +541,28 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
         trades = bot.ex.fetch_my_trades(symbol_full, limit=50) or []
     except Exception:
         return 0.0, 0.0, "unavailable"
+    eligible_trades = []
+    for trade in trades:
+        if not isinstance(trade, dict):
+            continue
+        timestamp_ms = _trade_timestamp_ms_or_none(trade)
+        if timestamp_ms is None or timestamp_ms < boundary_ms:
+            continue
+        eligible_trades.append((timestamp_ms, trade))
+    eligible_trades.sort(key=lambda item: item[0], reverse=True)
+
     qty = 0.0
     notional = 0.0
     fee_usdt = 0.0
     fees_known = True
     used_side_fallback = False
-    for t in reversed(trades):
-        if not isinstance(t, dict):
-            continue
+    for _timestamp_ms, t in eligible_trades:
         is_reduce = _is_reduce_only_trade(t)
-        if not _is_close_trade_for_position(t, pos_type):
+        if not _is_close_trade_for_position(
+            t,
+            pos_type,
+            hedge_mode=hedge_mode,
+        ):
             continue
         used_side_fallback = used_side_fallback or not is_reduce
         amt = _trade_amount(t)
@@ -243,9 +613,10 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
 def _find_futures_external_close_price(bot, symbol_full: str,
                                        contracts: float = 0.0,
                                        allow_ticker: bool = True,
-                                       pos_type: str | None = None) -> tuple[float, float, str]:
+                                       pos_type: str | None = None,
+                                       buy_time: str = "") -> tuple[float, float, str]:
     price, fee, source = _aggregate_futures_reduce_trades(
-        bot, symbol_full, contracts, pos_type)
+        bot, symbol_full, contracts, pos_type, buy_time)
     if price > 0:
         return price, fee, source
     if source == "budget_unavailable":
@@ -290,6 +661,31 @@ def _append_unpriced_partial(row: dict, item: dict) -> list:
     return pending
 
 
+def _persist_futures_external_partial_state(
+    bot,
+    sym: str,
+    fields: dict,
+) -> bool:
+    """Persist the physical shrink and any accounting WAL atomically."""
+    from core.logger import log_event
+
+    try:
+        durable = bool(bot.state.update_many(sym, fields))
+    except Exception as exc:
+        durable = False
+        try:
+            bot._log_error(f"futures external partial write-ahead {sym}", exc)
+        except Exception:
+            pass
+    if not durable:
+        log_event(
+            f" Reconciliation: {sym} futures partial state write-ahead "
+            f"failed; DB booking deferred fail-closed",
+            "ERROR",
+        )
+    return durable
+
+
 def _is_fresh_position(state_row: dict, max_age_s: float) -> bool:
     bt = state_row.get("buy_time", "")
     if not bt:
@@ -303,7 +699,12 @@ def _is_fresh_position(state_row: dict, max_age_s: float) -> bool:
     return (datetime.now(timezone.utc) - opened).total_seconds() < max_age_s
 
 
-def _fetch_futures_contracts(bot, sym: str) -> float | None:
+def _fetch_futures_contracts(
+    bot,
+    sym: str,
+    *,
+    expected_side: str | None = None,
+) -> float | None:
     """Return confirmed open contracts, or None when the exchange is unclear."""
     full = f"{sym}/USDT:USDT"
     try:
@@ -329,20 +730,34 @@ def _fetch_futures_contracts(bot, sym: str) -> float | None:
                 return None
     except Exception:
         return None
+    open_matches = []
     for p in poss or []:
+        if not isinstance(p, dict):
+            return None
         if (p.get("symbol") or "") != full:
             continue
-        return _position_contracts_or_none(p)
-    return 0.0
+        contracts = _position_contracts_or_none(p)
+        if contracts is None:
+            return None
+        if contracts > 0:
+            open_matches.append((contracts, _position_side_or_none(p)))
+    if not open_matches:
+        return 0.0
+    if len(open_matches) != 1:
+        return None
+    contracts, observed_side = open_matches[0]
+    if expected_side in ("LONG", "SHORT") and observed_side != expected_side:
+        return None
+    return contracts
 
 
 def _record_futures_external_partial(bot, sym: str, state_row: dict,
                                      remaining_contracts: float) -> tuple[bool, dict]:
     """Book a futures position shrink caused outside the bot.
 
-    The state is still shrunk when DB booking fails, but the partial event is
-    stored under ``accounting_pending_partials`` so the monitor retry path can
-    flush realized PnL later without sending another close order.
+    The reduced position and its pending accounting event are written durably
+    before DB booking. A DB failure leaves the event under
+    ``accounting_pending_partials`` for retry without another close order.
     """
     from core.database import save_trade_db
     from core.logger import log_event
@@ -373,7 +788,7 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
     margin_remaining = max(0.0, margin - margin_sold)
     close_price, close_fee_actual, source = _find_futures_external_close_price(
         bot, symbol_full, sold_contracts, allow_ticker=False,
-        pos_type=pos_type)
+        pos_type=pos_type, buy_time=state_row.get("buy_time", ""))
     if close_price <= 0:
         fields = {
             "amount": remaining_contracts,
@@ -406,6 +821,7 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
             f" Reconciliation: {sym} external futures partial detected "
             f"but close price unavailable; state shrunk without PnL booking",
             "WARN")
+        _persist_futures_external_partial_state(bot, sym, fields)
         return False, fields
 
     if pos_type == "SHORT":
@@ -486,24 +902,59 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
             f"{local_amt:.12g}->{remaining_contracts:.12g}"
         ),
     }
-    saved = bool(save_trade_db(**item))
     fields = {
         "amount": remaining_contracts,
         "invested_usdt": margin_remaining,
         "partial_sold": True,
         "partial_profit_realized": prev_realized + profit_usdt,
         "funding_booked_on_partials": prev_funding + funding_partial,
+        "funding_booked_on_partials_known": True,
     }
     if repair_original_amount:
         fields["original_amount"] = local_amt
-    if not saved:
-        fields["accounting_pending_partials"] = _append_pending_partial(
-            state_row, item)
-    else:
+    pending = _append_pending_partial(state_row, item)
+    fields["accounting_pending_partials"] = pending
+    if not _persist_futures_external_partial_state(bot, sym, fields):
+        return False, fields
+    try:
+        saved = bool(save_trade_db(**item))
+    except Exception as exc:
+        saved = False
+        try:
+            bot._log_error(f"futures external partial accounting {sym}", exc)
+        except Exception:
+            pass
+    if saved:
+        try:
+            cleared = bool(bot.state.update(
+                sym,
+                "accounting_pending_partials",
+                pending[:-1],
+            ))
+        except Exception as exc:
+            cleared = False
+            try:
+                bot._log_error(
+                    f"futures external partial pending clear {sym}", exc
+                )
+            except Exception:
+                pass
+        if not cleared:
+            log_event(
+                f" Reconciliation: {sym} external futures partial booked "
+                f"but durable pending clear failed; idempotent retry retained",
+                "ERROR",
+            )
         log_event(
             f" Reconciliation: {sym} external futures partial recorded "
             f"({sold_contracts:.6f} contracts, PnL={profit_usdt:+.2f} USDT)",
             "WARN")
+    else:
+        log_event(
+            f" Reconciliation: {sym} external futures partial DB save "
+            f"failed; durable accounting retry retained",
+            "WARN",
+        )
     return saved, fields
 
 
@@ -554,7 +1005,174 @@ def _row_with_unpriced_futures_partials(state_row: dict) -> dict:
 
 class FuturesReconcileMixin:
 
-    def _startup_reconciliation(self) -> None:
+    def _refresh_entry_recovery_barrier(
+        self,
+        log_event,
+        *,
+        context: str,
+    ) -> tuple[bool, int]:
+        lock = getattr(self, "_entry_recovery_lock", None)
+        if lock is None:
+            recovery_generation = int(
+                getattr(self, "_entry_recovery_generation", 0)
+            )
+        else:
+            with lock:
+                recovery_generation = int(
+                    getattr(self, "_entry_recovery_generation", 0)
+                )
+        if bool(getattr(self, "simulation", True)):
+            self._entry_recovery_blocked = False
+            return True, recovery_generation
+        try:
+            from trading.entry_executor import recover_nonterminal_order_intents
+
+            unresolved = recover_nonterminal_order_intents(
+                self.ex,
+                self.BOT_NAME,
+                log_event=log_event,
+            )
+        except Exception as exc:
+            if lock is None:
+                self._entry_recovery_blocked = True
+            else:
+                with lock:
+                    self._entry_recovery_blocked = True
+            self._log_error(f"{context} order-intent recovery", exc)
+            return False, recovery_generation
+        if unresolved:
+            if lock is None:
+                self._entry_recovery_blocked = True
+            else:
+                with lock:
+                    self._entry_recovery_blocked = True
+            log_event(
+                f"[{self.BOT_NAME}] {len(unresolved)} unresolved order "
+                "intent(s); new entries blocked until reconciliation",
+                "ERROR",
+            )
+            return False, recovery_generation
+        return True, recovery_generation
+
+    def _complete_entry_recovery_barrier(
+        self,
+        recovery_generation: int,
+        *,
+        recovery_ok: bool,
+        reconciliation_ok: bool,
+    ) -> bool:
+        clear_barrier = bool(recovery_ok and reconciliation_ok)
+        if clear_barrier:
+            try:
+                from core.database import (
+                    _base_symbol,
+                    _causal_entry_id_db,
+                    get_open_positions_db,
+                )
+
+                claim_rows = get_open_positions_db(self.BOT_NAME)
+                claim_generations = {}
+                for row in claim_rows:
+                    claim_symbol = _base_symbol(row.get("symbol"))
+                    if not claim_symbol or claim_symbol in claim_generations:
+                        clear_barrier = False
+                        break
+                    try:
+                        amount = float(row.get("amount", 0.0))
+                        invested = float(row.get("invested_usdt", 0.0))
+                    except (TypeError, ValueError, OverflowError):
+                        clear_barrier = False
+                        break
+                    if (
+                        str(row.get("state", "")).strip().upper()
+                        in {"CLAIMING", "ADOPTING"}
+                        or not math.isfinite(amount)
+                        or not math.isfinite(invested)
+                        or amount <= 0.0
+                        or invested <= 0.0
+                    ):
+                        clear_barrier = False
+                        break
+                    try:
+                        claim_extra = json.loads(row.get("extra_json") or "{}")
+                        if not isinstance(claim_extra, dict):
+                            raise ValueError("claim metadata is not an object")
+                        if (
+                            claim_extra.get("entry_sizing_recovery_pending") is True
+                            or claim_extra.get(
+                                "entry_sizing_recovery_unverified"
+                            ) is True
+                        ):
+                            clear_barrier = False
+                            break
+                        claim_generations[claim_symbol] = (
+                            _causal_entry_id_db(
+                                claim_extra.get("entry_id"),
+                                required=True,
+                            )
+                            if "entry_id" in claim_extra
+                            else None
+                        )
+                    except (TypeError, ValueError):
+                        clear_barrier = False
+                        break
+                if clear_barrier:
+                    state_generations = {}
+                    for symbol, state_row in self.state.get_all().items():
+                        state_symbol = _base_symbol(symbol)
+                        if (
+                            not state_symbol
+                            or state_symbol in state_generations
+                            or not isinstance(state_row, dict)
+                        ):
+                            clear_barrier = False
+                            break
+                        try:
+                            if (
+                                state_row.get(
+                                    "entry_sizing_recovery_pending"
+                                ) is True
+                                or state_row.get(
+                                    "entry_sizing_recovery_unverified"
+                                ) is True
+                            ):
+                                clear_barrier = False
+                                break
+                            state_generations[state_symbol] = (
+                                _causal_entry_id_db(
+                                    state_row.get("entry_id"),
+                                    required=True,
+                                )
+                                if "entry_id" in state_row
+                                else None
+                            )
+                        except (TypeError, ValueError):
+                            clear_barrier = False
+                            break
+                    if clear_barrier and state_generations != claim_generations:
+                        clear_barrier = False
+            except Exception as exc:
+                self._log_error("entry recovery claim verification", exc)
+                clear_barrier = False
+        lock = getattr(self, "_entry_recovery_lock", None)
+        if lock is None:
+            same_generation = int(
+                getattr(self, "_entry_recovery_generation", 0)
+            ) == int(recovery_generation)
+            self._entry_recovery_blocked = not (
+                clear_barrier and same_generation
+            )
+        else:
+            with lock:
+                same_generation = int(
+                    getattr(self, "_entry_recovery_generation", 0)
+                ) == int(recovery_generation)
+                self._entry_recovery_blocked = not (
+                    clear_barrier and same_generation
+                )
+        return not self._entry_recovery_blocked
+
+    def _startup_reconciliation(self) -> bool:
         """Boot-time reconciliation  compares state vs exchange.
 
         Defensive against ``safe_fetch_positions`` returning an EMPTY list
@@ -567,7 +1185,6 @@ class FuturesReconcileMixin:
         from core.logger import log_event, send_telegram
         from config.exchange_config import safe_fetch_positions
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-        from core.database import remove_futures_state
 
         try:
             local_state = self.state.get_all()
@@ -579,36 +1196,60 @@ class FuturesReconcileMixin:
                     "local state kept unchanged.",
                     "WARN",
                 )
-                return
+                return False
             exchange_positions = safe_fetch_positions(self.ex)
             if exchange_positions is None:
                 log_event(
                     "Reconciliation: fetch_positions unavailable on this "
                     "exchange  skipping. Local state used as-is.", "WARN"
                 )
-                return
+                return False
 
             # Build set of symbols with non-zero contracts on exchange
             exchange_open: dict = {}
+            ambiguous_exchange_bases = set()
+            exchange_snapshot_complete = True
             for p in exchange_positions:
                 contracts = _position_contracts_or_none(p)
-                if contracts is None or contracts <= 0:
+                if contracts is None:
+                    exchange_snapshot_complete = False
+                    continue
+                if contracts <= 0:
                     continue
                 full_sym = p.get("symbol")
                 if not isinstance(full_sym, str):
+                    exchange_snapshot_complete = False
                     continue
                 full_sym = full_sym.strip()
                 if not full_sym:
+                    exchange_snapshot_complete = False
                     continue
                 base = full_sym.split("/")[0] if "/" in full_sym else full_sym
                 if base:
+                    if base in ambiguous_exchange_bases:
+                        continue
+                    if base in exchange_open:
+                        exchange_open.pop(base, None)
+                        ambiguous_exchange_bases.add(base)
+                        continue
                     exchange_open[base] = p
+            for base in sorted(ambiguous_exchange_bases):
+                log_event(
+                    f" Reconciliation: {base} has multiple open exchange legs; "
+                    f"state model cannot represent them safely  skipping "
+                    f"reconciliation and adoption",
+                    "ERROR",
+                )
 
             # SAFETY GATE  if local state has positions but exchange shows
             # ZERO, refuse to wipe state. Protects against auth/network glitches
             # returning [] when positions actually exist on the exchange.
             # Manual intervention required.
-            if local_state and not exchange_open:
+            if (
+                local_state
+                and not exchange_open
+                and not ambiguous_exchange_bases
+            ):
                 log_event(
                     f" Reconciliation ABORT: {len(local_state)} local "
                     f"position(s) but exchange returned 0  possible API "
@@ -639,6 +1280,9 @@ class FuturesReconcileMixin:
             if strikes is None:
                 strikes = self._recon_missing_strikes = {}
             for sym in list(local_state.keys()):
+                if sym in ambiguous_exchange_bases:
+                    strikes.pop(sym, None)
+                    continue
                 if sym in exchange_open:
                     strikes.pop(sym, None)
                     try:
@@ -646,6 +1290,48 @@ class FuturesReconcileMixin:
                         local_amt = _positive_abs_float_or_none(
                             local_row.get("amount")) or 0.0
                         p = exchange_open.get(sym) or {}
+                        local_side = local_row.get("position_type")
+                        exchange_side = _position_side_or_none(p)
+                        side_conflict, side_message = _side_conflict_details(
+                            local_side,
+                            exchange_side,
+                        )
+                        if side_conflict:
+                            with close_lock(
+                                sym,
+                                bot_name=self.BOT_NAME,
+                            ) as got:
+                                if not got:
+                                    log_event(
+                                        f" Reconciliation: {sym} side conflict "
+                                        f"could not acquire close lock; monitor "
+                                        f"state left unchanged this cycle",
+                                        "ERROR",
+                                    )
+                                    continue
+                                live_row = self.state.get(sym)
+                                if not isinstance(live_row, dict):
+                                    continue
+                                local_side = live_row.get("position_type")
+                                side_conflict, side_message = (
+                                    _side_conflict_details(
+                                        local_side,
+                                        exchange_side,
+                                    )
+                                )
+                                if not side_conflict:
+                                    continue
+                                persisted = self.state.update_many(sym, {
+                                    "claim_conflict": True,
+                                    "claim_conflict_reason": side_conflict,
+                                })
+                            suffix = "" if persisted else " (persistence failed)"
+                            log_event(
+                                f" Reconciliation: {sym} {side_message}; "
+                                f"monitor blocked fail-closed{suffix}",
+                                "ERROR",
+                            )
+                            continue
                         exch_amt = _position_contracts_or_none(p) or 0.0
                         if (local_amt > 0 and exch_amt > 0
                                 and exch_amt < local_amt * 0.95
@@ -657,7 +1343,11 @@ class FuturesReconcileMixin:
                                 live_row = self.state.get(sym) or local_row
                                 live_amt = _positive_abs_float_or_none(
                                     live_row.get("amount")) or 0.0
-                                refetched_amt = _fetch_futures_contracts(self, sym)
+                                refetched_amt = _fetch_futures_contracts(
+                                    self,
+                                    sym,
+                                    expected_side=live_row.get("position_type"),
+                                )
                                 if refetched_amt is None:
                                     log_event(
                                         f" Reconciliation: {sym} partial shrink "
@@ -669,14 +1359,8 @@ class FuturesReconcileMixin:
                                         or _is_fresh_position(
                                             live_row, self.RECONCILE_INTERVAL_SEC)):
                                     continue
-                                fields = _record_futures_external_partial(
-                                    self, sym, dict(live_row), refetched_amt)[1]
-                            if fields:
-                                if not self.state.update_many(sym, fields):
-                                    log_event(
-                                        f" Reconciliation: {sym} partial state "
-                                        f"update was not durably persisted",
-                                        "WARN")
+                                _record_futures_external_partial(
+                                    self, sym, dict(live_row), refetched_amt)
                     except (TypeError, ValueError):
                         pass
                     continue
@@ -698,17 +1382,20 @@ class FuturesReconcileMixin:
                     if not self.state.has(sym):
                         strikes.pop(sym, None)
                         continue
+                    live_row = self.state.get(sym) or local_state[sym]
                     # Authoritative re-fetch before the irreversible booking: a
                     # position that reappears was a transient snapshot glitch,
                     # not an offline close (M-6).
-                    if self._still_open_on_exchange(sym):
+                    if self._still_open_on_exchange(
+                        sym,
+                        live_row.get("position_type"),
+                    ):
                         strikes.pop(sym, None)
                         log_event(
                             f" Reconciliation: {sym} present on authoritative "
                             f"re-fetch  NOT booking a close (transient "
                             f"snapshot glitch)", "WARN")
                         continue
-                    live_row = self.state.get(sym) or local_state[sym]
                     if bool(live_row.get("accounting_already_booked")):
                         log_event(
                             f" Reconciliation: {sym} already has close "
@@ -716,11 +1403,13 @@ class FuturesReconcileMixin:
                             "WARN",
                         )
                         try:
-                            removed_state = self.state.remove(sym)
-                            if removed_state:
-                                remove_futures_state(
-                                    sym, self.BOT_NAME,
-                                    mode_is_sim=getattr(self, "simulation", None))
+                            from core.futures_bot_exits import FuturesExitsMixin
+                            cleaned = (
+                                FuturesExitsMixin._cleanup_accounted_close_state(
+                                    self, sym, live_row
+                                )
+                            )
+                            if cleaned:
                                 strikes.pop(sym, None)
                         except Exception as e:
                             self._log_error(f"reconcile-remove booked {sym}", e)
@@ -732,11 +1421,27 @@ class FuturesReconcileMixin:
                             f"for retry",
                             "WARN")
                         continue
+                    if live_row.get("verified_flat_pending_accounting"):
+                        log_event(
+                            f" Reconciliation: {sym} has a verified-flat "
+                            f"fill gap pending exact accounting; state kept "
+                            f"for recovery",
+                            "ERROR",
+                        )
+                        continue
                     close_row = (
                         _row_with_unpriced_futures_partials(live_row)
                         if live_row.get("unpriced_external_partials")
                         else live_row
                     )
+                    if close_row.get("unpriced_external_partials"):
+                        log_event(
+                            f" Reconciliation: {sym} has invalid unpriced "
+                            f"partial accounting evidence  state kept for "
+                            f"recovery",
+                            "ERROR",
+                        )
+                        continue
                     recorded = self._record_offline_close(sym, close_row)
                     if not recorded:
                         log_event(
@@ -752,54 +1457,37 @@ class FuturesReconcileMixin:
                         f"or liquidated while bot was offline)",
                         "WARN"
                     )
-                    restore = {
+                    booked_row = dict(close_row)
+                    booked_row.update({
                         "accounting_already_booked": True,
                         "accounting_booked_reason": "Offline reconcile",
-                    }
-                    try:
-                        from bot_utils.trade_state import remove_with_restore_fields
-                        removed_state = remove_with_restore_fields(
-                            self.state, sym, restore,
+                    })
+                    if close_row.get("accounting_pending_sell_time") is not None:
+                        booked_row["accounting_booked_sell_time"] = (
+                            close_row.get("accounting_pending_sell_time")
                         )
-                        if removed_state:
-                            try:
-                                # Scope by bot: FUTURES + CROSS share futures_state;
-                                # unscoped would wipe the other bot's dashboard row.
-                                remove_futures_state(
-                                    sym, self.BOT_NAME,
-                                    mode_is_sim=getattr(self, "simulation", None))
-                            except Exception:
-                                keep = dict(close_row)
-                                keep.update(restore)
-                                keep["futures_state_cleanup_pending"] = True
-                                try:
-                                    self.state.add(sym, keep)
-                                except Exception as state_err:
-                                    self._log_error(
-                                        f"restore reconcile state {sym}",
-                                        state_err)
-                                raise
+                    if (
+                        close_row.get("accounting_pending_exchange_order_id")
+                        is not None
+                    ):
+                        booked_row["accounting_booked_exchange_order_id"] = (
+                            close_row.get("accounting_pending_exchange_order_id")
+                        )
+                    try:
+                        from core.futures_bot_exits import FuturesExitsMixin
+                        cleaned = FuturesExitsMixin._cleanup_accounted_close_state(
+                            self, sym, booked_row,
+                        )
+                        if cleaned:
                             strikes.pop(sym, None)
                     except Exception as e:
                         self._log_error(f"reconcile-remove {sym}", e)
-                        try:
-                            keep = dict(restore)
-                            keep["futures_state_cleanup_pending"] = True
-                            self.state.update_many(sym, keep)
-                        except Exception as state_err:
-                            self._log_error(
-                                f"mark reconcile cleanup pending {sym}",
-                                state_err)
-                        log_event(
-                            f" Reconciliation: {sym} close already booked, "
-                            f"but futures_state cleanup failed  keeping state "
-                            f"for retry.",
-                            "WARN"
-                        )
 
             # Exchange-only positions. COEXISTENCE: a coin held by ANOTHER bot
             # (shared claims registry) is NOT our orphan  subtract those.
             orphan_syms = set(exchange_open.keys()) - set(local_state.keys())
+            foreign_claimed_bases = set()
+            claim_registry_verified = True
             own_claim_metadata = {}
             try:
                 from core.database import get_open_positions_db
@@ -821,11 +1509,24 @@ class FuturesReconcileMixin:
                             "skipping exchange-only adoption this cycle",
                             "WARN",
                         )
+                        claim_registry_verified = False
                         orphan_syms = set()
                     else:
-                        orphan_syms = {s for s in orphan_syms
-                                       if _base_symbol(s) not in _other}
+                        normalized_other = {
+                            _base_symbol(symbol) for symbol in _other
+                        }
+                        if "" in normalized_other:
+                            claim_registry_verified = False
+                            orphan_syms = set()
+                        else:
+                            foreign_claimed_bases = normalized_other
+                            orphan_syms = {
+                                symbol for symbol in orphan_syms
+                                if _base_symbol(symbol)
+                                not in foreign_claimed_bases
+                            }
                 except Exception:
+                    claim_registry_verified = False
                     orphan_syms = set()
 
             # ADOPT: a LIVE trading bot must NEVER leave a leveraged exchange
@@ -834,7 +1535,8 @@ class FuturesReconcileMixin:
             # the exchange and add the position to state: the monitor manages its
             # exits, and the write claims the coin so the scan/rebalance never
             # re-opens it (which would net).
-            adopted, unadoptable = [], []
+            adopted = []
+            unadoptable = list(ambiguous_exchange_bases)
             try:
                 from core.database import try_claim_orphan, remove_open_position
             except Exception:
@@ -863,9 +1565,7 @@ class FuturesReconcileMixin:
                     if raw_contracts is None:
                         raise ValueError("invalid exchange contracts")
                     contracts = abs(raw_contracts)
-                    side = str(p.get("side") or "").lower()
-                    if not side and raw_contracts < 0:
-                        side = "short"
+                    side = _position_side_or_none(p)
                     lev = (
                         _positive_float_or_none(p.get("leverage"))
                         or _positive_float_or_none(self.C("LEVERAGE", 3))
@@ -880,9 +1580,9 @@ class FuturesReconcileMixin:
                                   or info.get("marginType") or "").lower()
                 except (TypeError, ValueError):
                     entry = contracts = lev = liq = 0.0
-                    side = ""
+                    side = None
                     mm_mode = ""
-                if entry <= 0 or contracts <= 0 or side not in ("long", "short"):
+                if entry <= 0 or contracts <= 0 or side not in ("LONG", "SHORT"):
                     # Won the claim but can't adopt safely  RELEASE it so the
                     # coin isn't blocked-but-unmanaged.
                     remove_open_position(self.BOT_NAME, base)
@@ -893,8 +1593,362 @@ class FuturesReconcileMixin:
                     cs = self._get_contract_size(full)
                 except Exception:
                     cs = 1.0
-                margin = (contracts * cs * entry) / lev if lev > 0 else 0.0
-                pos_type = "LONG" if side == "long" else "SHORT"
+                pos_type = side
+                recovered_metadata = dict(own_claim_metadata.get(base, {}))
+                if recovered_metadata.get(
+                    "partial_claim_recovery_invalid"
+                ) is True:
+                    log_event(
+                        f" Reconciliation: {base} claim-only partial "
+                        "accounting evidence is invalid; adoption deferred",
+                        "ERROR",
+                    )
+                    unadoptable.append(base)
+                    continue
+                if recovered_metadata.get(
+                    "funding_booked_on_partials_known"
+                ) is True:
+                    partial_claim_amount = _positive_float_or_none(
+                        recovered_metadata.pop("partial_claim_amount", None)
+                    )
+                    partial_claim_side = recovered_metadata.pop(
+                        "partial_claim_position_type", None
+                    )
+                    partial_claim_buy = _positive_float_or_none(
+                        recovered_metadata.pop("partial_claim_buy_price", None)
+                    )
+                    partial_claim_matches = (
+                        partial_claim_amount is not None
+                        and partial_claim_side == pos_type
+                        and partial_claim_buy is not None
+                        and math.isclose(
+                            partial_claim_amount,
+                            contracts,
+                            rel_tol=1e-6,
+                            abs_tol=1e-9,
+                        )
+                        and math.isclose(
+                            partial_claim_buy,
+                            entry,
+                            rel_tol=1e-6,
+                            abs_tol=1e-9,
+                        )
+                    )
+                    position_info = p.get("info")
+                    identity_sources = (
+                        p,
+                        position_info if isinstance(position_info, dict) else {},
+                    )
+                    position_has_entry_identity = any(
+                        key in source and source.get(key) is not None
+                        for source in identity_sources
+                        for key in (
+                            "entryOrderId",
+                            "entry_order_id",
+                            "openOrderId",
+                            "open_order_id",
+                        )
+                    )
+                    if partial_claim_matches and position_has_entry_identity:
+                        position_entry_order_id = (
+                            _position_entry_order_id_or_none(p)
+                        )
+                        intent_entry_order_id = None
+                        try:
+                            from core.database import get_order_intent
+                            partial_intent = get_order_intent(
+                                recovered_metadata.get("entry_id")
+                            )
+                            if (
+                                isinstance(partial_intent, dict)
+                                and str(
+                                    partial_intent.get("status") or ""
+                                ).strip().upper() == "FINALIZED"
+                            ):
+                                intent_entry_order_id = _safe_identifier(
+                                    partial_intent.get("exchange_order_id"),
+                                    max_length=128,
+                                )
+                        except Exception as intent_exc:
+                            self._log_error(
+                                f"verify partial claim identity {base}",
+                                intent_exc,
+                            )
+                        partial_claim_matches = (
+                            position_entry_order_id is not None
+                            and intent_entry_order_id is not None
+                            and position_entry_order_id
+                            == intent_entry_order_id
+                        )
+                    if not partial_claim_matches:
+                        recovered_metadata.clear()
+                        log_event(
+                            f" Reconciliation: {base} stale partial claim "
+                            "economics ignored because current position shape "
+                            "does not match",
+                            "ERROR",
+                        )
+                claim_amount = recovered_metadata.get(
+                    "entry_claim_amount", None
+                )
+                actual_notional = contracts * cs * entry
+                entry_fee = 0.0
+                recovered_buy_time = now_utc().strftime("%Y-%m-%d %H:%M:%S")
+
+                if recovered_metadata.get(
+                    "entry_sizing_recovery_pending"
+                ) is True:
+                    intent = None
+                    intent_lookup_failed = False
+                    try:
+                        from core.database import get_order_intent
+                        intent = get_order_intent(
+                            recovered_metadata.get("entry_id")
+                        )
+                    except Exception as intent_exc:
+                        intent_lookup_failed = True
+                        self._log_error(
+                            f"recover entry sizing evidence {base}", intent_exc
+                        )
+                    intent_status = (
+                        str(intent.get("status") or "").strip().upper()
+                        if isinstance(intent, dict)
+                        else ""
+                    )
+                    if intent_lookup_failed or intent_status != "FINALIZED":
+                        log_event(
+                            f" Reconciliation: {base} pre-state entry intent "
+                            "is unavailable or nonterminal; adoption deferred",
+                            "ERROR",
+                        )
+                        unadoptable.append(base)
+                        continue
+                    sizing_recovery = _validated_entry_sizing_recovery(
+                        recovered_metadata,
+                        intent,
+                        bot_name=self.BOT_NAME,
+                        base=base,
+                        side=pos_type,
+                        contracts=contracts,
+                        entry_price=entry,
+                        current_time=now_utc(),
+                    )
+                    economics_recovery = (
+                        sizing_recovery
+                        or _validated_entry_sizing_recovery(
+                            recovered_metadata,
+                            intent,
+                            bot_name=self.BOT_NAME,
+                            base=base,
+                            side=pos_type,
+                            contracts=contracts,
+                            entry_price=entry,
+                            current_time=now_utc(),
+                            require_settlement_safe=False,
+                        )
+                    )
+                    position_entry_order_id = (
+                        _position_entry_order_id_or_none(p)
+                    )
+                    intent_entry_order_id = (
+                        _safe_identifier(
+                            intent.get("exchange_order_id"), max_length=128
+                        )
+                        if isinstance(intent, dict)
+                        else None
+                    )
+                    if (
+                        economics_recovery is not None
+                        and (
+                            position_entry_order_id is None
+                            or position_entry_order_id != intent_entry_order_id
+                        )
+                    ):
+                        economics_recovery = None
+                        sizing_recovery = None
+                    if economics_recovery is None:
+                        recovered_metadata[
+                            "entry_sizing_recovery_unverified"
+                        ] = True
+                        log_event(
+                            f" Reconciliation: {base} pre-state entry sizing "
+                            "could not be generation-verified; adopting without "
+                            "a forced rollback marker",
+                            "ERROR",
+                        )
+                    else:
+                        recovered_metadata.pop(
+                            "entry_sizing_recovery_pending", None
+                        )
+                        recovered_metadata.pop("entry_claim_opened_at", None)
+                        cs = economics_recovery["contract_size"]
+                        actual_notional = economics_recovery["actual_notional"]
+                        entry_fee = economics_recovery["entry_fee"]
+                        recovered_buy_time = economics_recovery["buy_time"]
+                        if sizing_recovery is None:
+                            recovered_metadata.update({
+                                "entry_sizing_recovery_unverified": True,
+                                "entry_funding_window_unverified": True,
+                            })
+                        else:
+                            recovered_metadata.pop(
+                                "entry_sizing_recovery_unverified", None
+                            )
+                            recovered_metadata.pop(
+                                "entry_funding_window_unverified", None
+                            )
+                        if (
+                            sizing_recovery is not None
+                            and sizing_recovery["oversized"]
+                        ):
+                            recovered_metadata.update({
+                                "oversize_rollback_pending": True,
+                                "oversize_rollback_reason": (
+                                    "Oversized Entry Rollback"
+                                ),
+                                "oversize_intended_notional": (
+                                    sizing_recovery["intended_notional"]
+                                ),
+                                "oversize_real_notional": actual_notional,
+                            })
+                elif recovered_metadata.get(
+                    "oversize_rollback_pending"
+                ) is True:
+                    intended_notional = _positive_float_or_none(
+                        recovered_metadata.get("oversize_intended_notional")
+                    )
+                    stored_real_notional = _positive_float_or_none(
+                        recovered_metadata.get("oversize_real_notional")
+                    )
+                    intent = None
+                    try:
+                        from core.database import get_order_intent
+                        intent = get_order_intent(
+                            recovered_metadata.get("entry_id")
+                        )
+                    except Exception as intent_exc:
+                        self._log_error(
+                            f"verify oversize recovery marker {base}",
+                            intent_exc,
+                        )
+                    sizing_recovery = _validated_entry_sizing_recovery(
+                        recovered_metadata,
+                        intent,
+                        bot_name=self.BOT_NAME,
+                        base=base,
+                        side=pos_type,
+                        contracts=contracts,
+                        entry_price=entry,
+                        current_time=now_utc(),
+                    )
+                    economics_recovery = (
+                        sizing_recovery
+                        or _validated_entry_sizing_recovery(
+                            recovered_metadata,
+                            intent,
+                            bot_name=self.BOT_NAME,
+                            base=base,
+                            side=pos_type,
+                            contracts=contracts,
+                            entry_price=entry,
+                            current_time=now_utc(),
+                            require_settlement_safe=False,
+                        )
+                    )
+                    position_entry_order_id = (
+                        _position_entry_order_id_or_none(p)
+                    )
+                    intent_entry_order_id = (
+                        _safe_identifier(
+                            intent.get("exchange_order_id"), max_length=128
+                        )
+                        if isinstance(intent, dict)
+                        else None
+                    )
+                    marker_matches = (
+                        sizing_recovery is not None
+                        and sizing_recovery["oversized"] is True
+                        and position_entry_order_id is not None
+                        and position_entry_order_id == intent_entry_order_id
+                        and intended_notional is not None
+                        and stored_real_notional is not None
+                        and _positive_float_or_none(claim_amount) is not None
+                        and math.isclose(
+                            float(claim_amount),
+                            contracts,
+                            rel_tol=1e-6,
+                            abs_tol=1e-9,
+                        )
+                        and math.isclose(
+                            stored_real_notional,
+                            sizing_recovery["actual_notional"],
+                            rel_tol=0.01,
+                            abs_tol=1e-6,
+                        )
+                        and math.isclose(
+                            intended_notional,
+                            sizing_recovery["intended_notional"],
+                            rel_tol=1e-9,
+                            abs_tol=1e-9,
+                        )
+                    )
+                    if marker_matches:
+                        cs = sizing_recovery["contract_size"]
+                        actual_notional = sizing_recovery["actual_notional"]
+                        entry_fee = sizing_recovery["entry_fee"]
+                        recovered_buy_time = sizing_recovery["buy_time"]
+                    else:
+                        if (
+                            economics_recovery is not None
+                            and position_entry_order_id is not None
+                            and position_entry_order_id
+                            == intent_entry_order_id
+                            and economics_recovery[
+                                "funding_window_unverified"
+                            ] is True
+                        ):
+                            cs = economics_recovery["contract_size"]
+                            actual_notional = economics_recovery[
+                                "actual_notional"
+                            ]
+                            entry_fee = economics_recovery["entry_fee"]
+                            recovered_buy_time = economics_recovery["buy_time"]
+                            recovered_metadata[
+                                "entry_funding_window_unverified"
+                            ] = True
+                        for key in (
+                            "oversize_rollback_pending",
+                            "oversize_rollback_reason",
+                            "oversize_intended_notional",
+                            "oversize_real_notional",
+                        ):
+                            recovered_metadata.pop(key, None)
+                        recovered_metadata[
+                            "entry_sizing_recovery_unverified"
+                        ] = True
+                        log_event(
+                            f" Reconciliation: {base} stale or mismatched "
+                            "oversize rollback marker ignored",
+                            "ERROR",
+                        )
+                recovered_metadata.pop("entry_claim_amount", None)
+                recovered_metadata.pop("entry_claim_position_type", None)
+                retain_claim_on_state_failure = (
+                    _safe_identifier(
+                        recovered_metadata.get("entry_id"), max_length=64
+                    )
+                    is not None
+                    or recovered_metadata.get(
+                        "entry_sizing_recovery_pending"
+                    ) is True
+                    or recovered_metadata.get(
+                        "entry_sizing_recovery_unverified"
+                    ) is True
+                    or recovered_metadata.get(
+                        "oversize_rollback_pending"
+                    ) is True
+                )
+                margin = actual_notional / lev if lev > 0 else 0.0
                 try:
                     from bot_utils import get_maintenance_margin_rate
                     from bot_utils.futures_math import (
@@ -911,21 +1965,26 @@ class FuturesReconcileMixin:
                 if initial_liq_distance <= 0:
                     initial_liq_distance = max(1.0, 100.0 / max(1.0, lev))
                 try:
-                    recovered_metadata = own_claim_metadata.get(base, {})
                     adopted_state = {
                         "position_type": pos_type, "buy": entry, "highest": entry,
                         "last_price": entry,
-                        "buy_time": now_utc().strftime("%Y-%m-%d %H:%M:%S"),
+                        "buy_time": recovered_buy_time,
                         "invested_usdt": margin, "leverage": lev,
                         "amount": contracts, "original_amount": contracts,
                         "liquidation_price": liq, "funding_paid": 0.0,
                         "initial_liq_distance": initial_liq_distance,
-                        "initial_entry_fee": 0.0, "fees_paid": 0.0,
+                        "initial_entry_fee": entry_fee,
+                        "fees_paid": entry_fee,
                         "partial_sold": False, "break_even": False,
                         "be_active": False, "adopted": True,
                         "margin_mode": mm_mode or self.C("MARGIN_MODE", "isolated"),
                     }
                     adopted_state.update(recovered_metadata)
+                    if recovered_metadata.get(
+                        "funding_booked_on_partials_known"
+                    ) is not True:
+                        adopted_state["initial_entry_fee"] = entry_fee
+                        adopted_state["fees_paid"] = entry_fee
                     adopted_state["adopted"] = True
                     added = self.state.add(base, adopted_state)
                     if added is False:
@@ -961,7 +2020,11 @@ class FuturesReconcileMixin:
                         adopted.append(base)
                         self._log_error(f"adopt orphan {base}", _ae)
                         continue
-                    remove_open_position(self.BOT_NAME, base)  # release on failure
+                    if not retain_claim_on_state_failure:
+                        remove_open_position(
+                            self.BOT_NAME,
+                            base,
+                        )  # release only an unproven generic orphan claim
                     self._log_error(f"adopt orphan {base}", _ae)
                     unadoptable.append(base)
 
@@ -981,14 +2044,15 @@ class FuturesReconcileMixin:
             if unadoptable:
                 log_event(
                     f" Reconciliation: {len(unadoptable)} exchange position(s) "
-                    f"could NOT be adopted (no entry/size/side)  CLOSE MANUALLY: "
+                    f"could NOT be safely reconciled/adopted  CHECK MANUALLY: "
                     f"{', '.join(sorted(unadoptable))}", "WARN")
                 try:
                     if not bool(getattr(self, "simulation", True)):
                         send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
                             f" [{self.BOT_NAME}] {len(unadoptable)} position(s) could "
-                            f"not be adopted:\n{', '.join(sorted(unadoptable))}\n"
-                            f"Close manually on the exchange.")
+                            f"not be safely reconciled/adopted:\n"
+                            f"{', '.join(sorted(unadoptable))}\n"
+                            f"Check manually on the exchange.")
                 except Exception as e:
                     log_event(f"Telegram failed: {e}", "WARN")
             if not orphan_syms:
@@ -999,10 +2063,7 @@ class FuturesReconcileMixin:
                 from trading.runtime_observability import emit_startup_integrity
                 exchange_layer = {}
                 for base, position in exchange_open.items():
-                    signed = _position_signed_contracts_or_none(position)
-                    side = str(position.get("side") or "").upper()
-                    if not side and signed is not None:
-                        side = "SHORT" if signed < 0 else "LONG"
+                    side = _position_side_or_none(position) or ""
                     exchange_layer[base] = {
                         "amount": _position_contracts_or_none(position),
                         "direction": side,
@@ -1014,60 +2075,55 @@ class FuturesReconcileMixin:
                 )
             except Exception:
                 pass
+            managed_symbols = set(self.state.get_all())
+            return (
+                exchange_snapshot_complete
+                and not ambiguous_exchange_bases
+                and not unadoptable
+                and claim_registry_verified
+                and set(exchange_open).issubset(
+                    managed_symbols | foreign_claimed_bases
+                )
+            )
         except Exception as e:
             self._log_error("reconciliation", e)
+            return False
 
-    def _still_open_on_exchange(self, sym: str) -> bool:
+    def _still_open_on_exchange(
+        self,
+        sym: str,
+        expected_side: str | None = None,
+    ) -> bool:
         """Authoritative single-symbol position re-fetch (M-6).
 
         The batch snapshot can transiently report a real position with 0
         contracts; two such glitches in a row pass the 2-strike gate and would
         book a phantom offline-close, then re-adopt next cycle. Before that
         irreversible booking we re-fetch JUST this symbol. Returns True if the
-        position is still present OR the fetch can't confirm it's gone (errors,
-        empty)  so the caller DEFERS rather than booking on doubt; False only
-        when the exchange authoritatively reports no contracts."""
+        expected target leg is still present OR the fetch can't confirm it's
+        gone, so the caller DEFERS rather than booking on doubt. False is
+        returned only when the exchange authoritatively reports that target
+        leg flat."""
         full = f"{sym}/USDT:USDT"
+
+        def reserve_api_call(stage: str) -> bool:
+            return try_consume_api_call(
+                f"futures_reconcile_fetch_positions_{stage}",
+                critical=True,
+            )
+
         try:
-            from config.exchange_config import safe_fetch_positions
-            if not try_consume_api_call(
-                "futures_reconcile_fetch_positions_scoped", critical=True
-            ):
-                return True
-            poss = safe_fetch_positions(self.ex, [full])
-            scoped_has_symbol = False
-            if poss is not None:
-                try:
-                    scoped_has_symbol = any(
-                        (p.get("symbol") or "") == full for p in poss
-                    )
-                except Exception:
-                    scoped_has_symbol = False
-            if poss is None or not scoped_has_symbol:
-                if not try_consume_api_call(
-                    "futures_reconcile_fetch_positions_global", critical=True
-                ):
-                    return True
-                poss = safe_fetch_positions(self.ex)
-                if poss is None:
-                    return True
+            from bot_utils.futures_order import fetch_open_position
+            position, unavailable = fetch_open_position(
+                self.ex,
+                full,
+                expected_position_side=expected_side,
+                _reserve_api_call=reserve_api_call,
+            )
         except Exception as e:
             self._log_error(f"reconcile re-fetch {sym}", e)
             return True  # can't confirm closed  conservative: defer
-        for p in poss or []:
-            if not isinstance(p, dict):
-                return True
-            position_symbol = p.get("symbol")
-            if not isinstance(position_symbol, str):
-                return True
-            if position_symbol != full:
-                continue
-            contracts = _position_contracts_or_none(p)
-            if contracts is None:
-                return True
-            if contracts > 0:
-                return True
-        return False
+        return unavailable or position is not None
 
     def _record_offline_close(self, sym: str, state_row: dict) -> bool:
         """When reconciliation finds a position gone from the exchange,
@@ -1096,6 +2152,13 @@ class FuturesReconcileMixin:
         from bot_utils.futures_order import FUTURES_DEFAULT_TAKER_FEE
 
         try:
+            if state_row.get("verified_flat_pending_accounting"):
+                log_event(
+                    f" {sym}: offline-close record skipped because exact "
+                    f"verified-flat fill accounting is pending",
+                    "ERROR",
+                )
+                return False
             entry = _positive_float_or_none(state_row.get("buy"))
             amount = _positive_abs_float_or_none(state_row.get("amount"))
             pos_type = state_row.get("position_type", "LONG")
@@ -1108,6 +2171,28 @@ class FuturesReconcileMixin:
                 state_row.get("funding_paid", 0))
             if funding_total is None:
                 funding_total = 0.0
+            funding_requires_history = (
+                state_row.get("entry_funding_window_unverified") is True
+                or state_row.get(
+                    "accounting_pending_funding_unverified"
+                ) is True
+            )
+            if funding_requires_history:
+                from bot_utils.futures_funding import fetch_realized_funding
+
+                exact_funding = fetch_realized_funding(
+                    self.ex,
+                    f"{sym}/USDT:USDT",
+                    buy_time,
+                )
+                if exact_funding is None:
+                    log_event(
+                        f" {sym}: offline-close accounting deferred; exact "
+                        "funding history unavailable",
+                        "ERROR",
+                    )
+                    return False
+                funding_total = exact_funding
             funding_booked = _finite_float_or_none(
                 state_row.get("funding_booked_on_partials", 0))
             if funding_booked is None:
@@ -1148,7 +2233,12 @@ class FuturesReconcileMixin:
             if close_price <= 0:
                 close_price, close_fee_actual, close_source = (
                     _find_futures_external_close_price(
-                        self, symbol_full, amount, pos_type=pos_type)
+                        self,
+                        symbol_full,
+                        amount,
+                        pos_type=pos_type,
+                        buy_time=buy_time,
+                    )
                 )
 
             if close_price <= 0:
@@ -1199,6 +2289,9 @@ class FuturesReconcileMixin:
                 funding_total, amount, original_amount,
                 partial_sold=partial_sold,
                 booked_on_partials=funding_booked,
+                booked_on_partials_known=(
+                    state_row.get("funding_booked_on_partials_known") is True
+                ),
             )
 
             # Net PnL  fees and funding deducted. If emergency-close already
@@ -1206,19 +2299,37 @@ class FuturesReconcileMixin:
             # its captured realized values over a later ticker estimate.
             net_pnl = round(gross_pnl - entry_fee - close_fee - funding_pd, 4)
             if pending_accounting and close_source == "accounting_pending":
-                pending_pnl = _finite_float_or_none(
-                    state_row.get("accounting_pending_profit_usdt"))
-                if pending_pnl is not None:
-                    net_pnl = pending_pnl
-                pending_funding = _finite_float_or_none(
-                    state_row.get("accounting_pending_funding_paid"))
-                if pending_funding is not None:
-                    funding_pd = pending_funding
                 close_fee_total = _nonnegative_float_or_none(
                     state_row.get("accounting_pending_fees_usdt"))
                 if close_fee_total is not None:
                     entry_fee = 0.0
                     close_fee = close_fee_total
+                if funding_requires_history:
+                    funding_pd = safe_remaining_funding(
+                        funding_total,
+                        amount,
+                        original_amount,
+                        partial_sold=partial_sold,
+                        booked_on_partials=funding_booked,
+                        booked_on_partials_known=(
+                            state_row.get(
+                                "funding_booked_on_partials_known"
+                            ) is True
+                        ),
+                    )
+                    net_pnl = round(
+                        gross_pnl - entry_fee - close_fee - funding_pd,
+                        4,
+                    )
+                else:
+                    pending_pnl = _finite_float_or_none(
+                        state_row.get("accounting_pending_profit_usdt"))
+                    if pending_pnl is not None:
+                        net_pnl = pending_pnl
+                    pending_funding = _finite_float_or_none(
+                        state_row.get("accounting_pending_funding_paid"))
+                    if pending_funding is not None:
+                        funding_pd = pending_funding
                 pending_pct = _finite_float_or_none(
                     state_row.get("accounting_pending_profit_pct"))
                 if pending_pct is not None:
@@ -1246,11 +2357,73 @@ class FuturesReconcileMixin:
                     f"non-finite accounting value", "WARN")
                 return False
 
+            accounting_mode_is_sim = state_row.get(
+                "accounting_pending_mode_is_sim",
+                getattr(self, "simulation", None),
+            )
+            accounting_exchange_order_id = state_row.get(
+                "accounting_pending_exchange_order_id"
+            )
+            entry_quality_score = state_row.get(
+                "accounting_pending_entry_quality_score",
+                state_row.get("entry_quality_score"),
+            )
+            entry_quality_label = state_row.get(
+                "accounting_pending_entry_quality_label",
+                state_row.get("entry_quality_label"),
+            )
+            entry_quality_reasons = state_row.get(
+                "accounting_pending_entry_quality_reasons",
+                state_row.get("entry_quality_reasons"),
+            )
+            replay_fields = {
+                "accounting_pending": True,
+                "accounting_pending_sell_price": close_price,
+                "accounting_pending_sell_time": sell_time,
+                "accounting_pending_reason": reason,
+                "accounting_pending_profit_usdt": net_pnl,
+                "accounting_pending_profit_pct": price_move_pct,
+                "accounting_pending_fees_usdt": entry_fee + close_fee,
+                "accounting_pending_funding_paid": funding_pd,
+                "accounting_pending_mode_is_sim": accounting_mode_is_sim,
+                "accounting_pending_exchange_order_id": (
+                    accounting_exchange_order_id
+                ),
+                "accounting_pending_mfe_pct": mfe_pct,
+                "accounting_pending_mae_pct": mae_pct,
+                "accounting_pending_giveback_pct": giveback_pct,
+                "accounting_pending_entry_quality_score": entry_quality_score,
+                "accounting_pending_entry_quality_label": entry_quality_label,
+                "accounting_pending_entry_quality_reasons": (
+                    entry_quality_reasons
+                ),
+                # Exact funding history has now been folded into funding_pd.
+                # Replays must not depend on the venue still serving history.
+                "accounting_pending_funding_unverified": False,
+                "entry_funding_window_unverified": False,
+            }
+            try:
+                replay_durable = self.state.update_many(sym, replay_fields)
+            except Exception as exc:
+                replay_durable = False
+                try:
+                    self._log_error(
+                        f"futures-offline-replay-persist {sym}",
+                        exc,
+                    )
+                except Exception:
+                    pass
+            if replay_durable is not True:
+                log_event(
+                    f" {sym}: offline-close accounting replay is not durable  "
+                    f"DB save deferred.",
+                    "ERROR",
+                )
+                return False
+
             saved = save_trade_db(
                 bot_name=self.BOT_NAME,
-                mode_is_sim=state_row.get(
-                    "accounting_pending_mode_is_sim",
-                    getattr(self, "simulation", None)),
+                mode_is_sim=accounting_mode_is_sim,
                 symbol=sym,
                 buy_price=entry, sell_price=close_price,
                 buy_time=buy_time, sell_time=sell_time,
@@ -1262,20 +2435,13 @@ class FuturesReconcileMixin:
                 liquidation_price=liq_price,
                 funding_paid=funding_pd,
                 fees_usdt=entry_fee + close_fee,
-                exchange_order_id=state_row.get(
-                    "accounting_pending_exchange_order_id"),
+                exchange_order_id=accounting_exchange_order_id,
                 mfe_pct=mfe_pct,
                 mae_pct=mae_pct,
                 giveback_pct=giveback_pct,
-                entry_quality_score=state_row.get(
-                    "accounting_pending_entry_quality_score",
-                    state_row.get("entry_quality_score")),
-                entry_quality_label=state_row.get(
-                    "accounting_pending_entry_quality_label",
-                    state_row.get("entry_quality_label")),
-                entry_quality_reasons=state_row.get(
-                    "accounting_pending_entry_quality_reasons",
-                    state_row.get("entry_quality_reasons")),
+                entry_quality_score=entry_quality_score,
+                entry_quality_label=entry_quality_label,
+                entry_quality_reasons=entry_quality_reasons,
                 entry_id=state_row.get("entry_id"),
             )
             if not saved:
@@ -1344,8 +2510,18 @@ class FuturesReconcileMixin:
 
         last_gc = 0.0
         while not self._shutdown_event.is_set():
-            if self._shutdown_event.wait(timeout=self.RECONCILE_INTERVAL_SEC):
-                return
+            wait_timeout = float(self.RECONCILE_INTERVAL_SEC)
+            if bool(getattr(self, "_entry_recovery_blocked", False)):
+                wait_timeout = min(wait_timeout, 5.0)
+            wakeup = getattr(self, "_reconcile_wakeup_event", None)
+            if wakeup is None:
+                if self._shutdown_event.wait(timeout=wait_timeout):
+                    return
+            else:
+                wakeup.wait(timeout=wait_timeout)
+                wakeup.clear()
+                if self._shutdown_event.is_set():
+                    return
 
             # GC idle locks
             now = time.monotonic()
@@ -1372,8 +2548,22 @@ class FuturesReconcileMixin:
 
             # Drift check (same logic as startup)
             try:
-                self._startup_reconciliation()
+                recovery_ok, recovery_generation = (
+                    FuturesReconcileMixin._refresh_entry_recovery_barrier(
+                        self,
+                        log_event,
+                        context="periodic",
+                    )
+                )
+                reconciliation_ok = self._startup_reconciliation()
+                FuturesReconcileMixin._complete_entry_recovery_barrier(
+                    self,
+                    recovery_generation,
+                    recovery_ok=recovery_ok,
+                    reconciliation_ok=reconciliation_ok,
+                )
             except Exception as e:
+                self._entry_recovery_blocked = True
                 self._log_error("periodic reconciliation", e)
 
             # Execution markouts are persisted at fill time, so this bounded

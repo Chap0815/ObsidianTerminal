@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 import threading
+from contextlib import ExitStack
 
 from launcher.config.settings import (
     BOT_META,
@@ -57,14 +58,84 @@ def _fmt_int(value, default=0) -> int:
         return int(default)
 
 
-def _release_dead_process_close_locks(pid: int | None) -> None:
-    if not pid:
+def _release_dead_process_close_locks(
+    process_identity: tuple[int, str] | None,
+) -> None:
+    if process_identity is None:
         return
     try:
-        from core.database import release_advisory_locks_for_dead_pid
-        release_advisory_locks_for_dead_pid(int(pid), "close:")
+        pid, run_id = process_identity
+        from core.database import release_advisory_locks_for_dead_process
+        release_advisory_locks_for_dead_process(
+            int(pid), str(run_id), "close:"
+        )
     except Exception:
         pass
+
+
+def _stop_bot_process_verified(
+    bot,
+    *,
+    graceful_close: bool,
+) -> tuple[int, str] | None:
+    """Stop one bot and return its proven-dead process incarnation."""
+    prior_pid = None
+    prior_run_id = ""
+    try:
+        prior_proc = getattr(bot, "proc", None)
+        prior_pid = getattr(prior_proc, "pid", None)
+        prior_run_id = str(getattr(bot, "run_id", "") or "")
+    except Exception:
+        prior_pid = None
+        prior_run_id = ""
+    stop_error: Exception | None = None
+    try:
+        stopped_pid = bot.stop(graceful_close=graceful_close)
+    except Exception as exc:
+        stopped_pid = None
+        stop_error = exc
+    try:
+        still_running = bool(bot.is_running())
+    except Exception as exc:
+        raise RuntimeError("bot stop outcome could not be verified") from exc
+    if still_running:
+        raise RuntimeError("bot is still running after stop escalation") from stop_error
+    if stop_error is not None:
+        stderr = sys.stderr
+        if stderr is not None:
+            try:
+                stderr.write(
+                    f"[Stop] process exited despite stop error: {stop_error}\n"
+                )
+            except Exception:
+                pass
+    resolved_pid = stopped_pid if stopped_pid is not None else prior_pid
+    if (
+        isinstance(resolved_pid, bool)
+        or not isinstance(resolved_pid, int)
+        or not 1 <= resolved_pid <= 2_147_483_647
+    ):
+        return None
+    if (
+        prior_pid is not None
+        and (
+            isinstance(prior_pid, bool)
+            or not isinstance(prior_pid, int)
+            or prior_pid != resolved_pid
+        )
+    ):
+        raise RuntimeError("bot stop returned a different process identity")
+    normalized_run_id = prior_run_id.lower()
+    if (
+        len(normalized_run_id) != 32
+        or not normalized_run_id.isascii()
+        or any(
+            char not in "0123456789abcdef"
+            for char in normalized_run_id
+        )
+    ):
+        return None
+    return resolved_pid, normalized_run_id
 
 
 def format_start_params(name: str, snapshot: dict) -> str:
@@ -369,11 +440,15 @@ def stop_bot(app, name: str) -> None:
 
     def _instant_stop_worker():
         try:
-            # graceful_close=False  uses terminate() path inside
-            # BotProcess.stop(): wait up to 5s, then kill(). No
-            # emergency-close handler is even reached because the bot
-            # process is hard-terminated.
-            bot.stop(graceful_close=False)
+            with bot.exclusive_stop_operation():
+                # graceful_close=False uses terminate() without invoking the
+                # bot's emergency-close handler. Keep restart blocked until
+                # the old OS process is proven dead.
+                stopped_pid = _stop_bot_process_verified(
+                    bot,
+                    graceful_close=False,
+                )
+                _release_dead_process_close_locks(stopped_pid)
             app.after(0, lambda: log_to_card(card, "system", "Stopped"))
         except Exception as e:
             app.after(0, lambda err=e: log_to_card(
@@ -435,23 +510,18 @@ def restart_bot(app, name: str) -> None:
             # close). The state file already has open positions, the next
             # start_bot will reconcile them.
             try:
-                bot.stop(graceful_close=False)
+                with bot.exclusive_stop_operation():
+                    stopped_pid = _stop_bot_process_verified(
+                        bot,
+                        graceful_close=False,
+                    )
+                    _release_dead_process_close_locks(stopped_pid)
             except Exception as e:
                 app.after(0, lambda err=e: log_to_card(
-                    card, "warn", f"Stop signal failed: {err}"))
-
-            # Step 2: poll briefly until the process is actually gone.
-            import time as _time
-            deadline = _time.monotonic() + 8.0
-            while bot.is_running() and _time.monotonic() < deadline:
-                _time.sleep(0.1)
-
-            if bot.is_running():
-                app.after(0, lambda: log_to_card(card, "warn",
-                    "Old process still alive after 8s  click Start manually"))
+                    card, "warn", f"Restart aborted: {err}"))
                 return
 
-            # Step 3: start with the new config (on the UI thread, since
+            # Step 2: start with the new config (on the UI thread, since
             # start_bot touches widgets)
             app.after(0, lambda: start_bot(app, name))
         finally:
@@ -554,6 +624,12 @@ def config_restart_required_reason(app, name: str) -> str:
 #  Async workers (run on background threads) 
 
 def async_simple_stop(app, name: str, card: dict, update) -> None:
+    """Keep restart blocked until the verified hard stop is complete."""
+    with app.bots[name].exclusive_stop_operation():
+        _async_simple_stop_owned(app, name, card, update)
+
+
+def _async_simple_stop_owned(app, name: str, card: dict, update) -> None:
     """Simple async stop WITHOUT closing positions.
 
     graceful_close MUST be False here: "Stop without closing" means keep
@@ -566,7 +642,9 @@ def async_simple_stop(app, name: str, card: dict, update) -> None:
     update("Hard-stopping bot  positions stay OPEN on exchange")
     try:
         # HARD STOP. No graceful close, no bot signal handler.
-        stopped_pid = app.bots[name].stop(graceful_close=False)
+        stopped_pid = _stop_bot_process_verified(
+            app.bots[name], graceful_close=False
+        )
         _release_dead_process_close_locks(stopped_pid)
     except Exception as e:
         stderr = sys.stderr
@@ -575,25 +653,44 @@ def async_simple_stop(app, name: str, card: dict, update) -> None:
                 stderr.write(f"[Stop] hard stop {name} failed: {e}\n")
             except Exception:
                 pass
+        update("Stop failed - bot is still running; positions unchanged")
+        app.after(0, lambda: log_to_card(
+            card,
+            "error",
+            "Stop failed: bot is still running; no success was reported",
+        ))
+        return
     update("Done. Positions left open  reconciled on next start.")
     app.after(0, lambda: log_to_card(card, "system",
                                        "Stopped (positions kept open)"))
 
 
 def async_close_and_stop_spot(app, name: str, update) -> None:
+    """Keep restart blocked across stop, fallback close, and accounting."""
+    with app.bots[name].exclusive_stop_operation():
+        _async_close_and_stop_spot_owned(app, name, update)
+
+
+def _async_close_and_stop_spot_owned(app, name: str, update) -> None:
     """Graceful shutdown of a spot bot (its own handler closes positions),
     then verify + cleanup."""
     card = app.cards[name]
     close_modes = close_modes_for_stop(name)
+    def _log(severity, msg):
+        app.after(0, lambda: log_to_card(card, severity, msg))
+
     update("Sending shutdown signal to bot")
     try:
-        stopped_pid = app.bots[name].stop(graceful_close=True)
+        stopped_pid = _stop_bot_process_verified(
+            app.bots[name], graceful_close=True
+        )
         _release_dead_process_close_locks(stopped_pid)
     except Exception as e:
         sys.stderr.write(f"[Stop] graceful stop failed: {e}" + "\n")
+        _log("error", f"Stop failed; launcher fallback aborted: {e}")
+        update("Stop failed - bot is still running; fallback close aborted")
+        return
     update("Verifying positions closed")
-    def _log(severity, msg):
-        app.after(0, lambda: log_to_card(card, severity, msg))
 
     # Fallback: if the bot's handler couldn't close everything, do it here in
     # the same SIM/LIVE buckets the pre-stop position scan found.
@@ -612,17 +709,35 @@ def async_close_and_stop_spot(app, name: str, update) -> None:
 
 def async_close_and_stop_futures(app, name: str, card: dict, update,
                                   reason: str = "Manual Close & Stop") -> None:
+    """Keep restart blocked across stop, fallback close, and accounting."""
+    with app.bots[name].exclusive_stop_operation():
+        _async_close_and_stop_futures_owned(app, name, card, update, reason)
+
+
+def _async_close_and_stop_futures_owned(
+    app,
+    name: str,
+    card: dict,
+    update,
+    reason: str,
+) -> None:
     """Graceful shutdown + fallback close for FUTURES."""
     close_modes = close_modes_for_stop(name)
+    def _log(severity, msg):
+        app.after(0, lambda: log_to_card(card, severity, msg))
+
     update("Sending shutdown signal to bot")
     try:
-        stopped_pid = app.bots[name].stop(graceful_close=True)
+        stopped_pid = _stop_bot_process_verified(
+            app.bots[name], graceful_close=True
+        )
         _release_dead_process_close_locks(stopped_pid)
     except Exception as e:
         sys.stderr.write(f"[Stop] graceful stop failed: {e}" + "\n")
+        _log("error", f"Stop failed; launcher fallback aborted: {e}")
+        update("Stop failed - bot is still running; fallback close aborted")
+        return
     update("Verifying all positions closed")
-    def _log(severity, msg):
-        app.after(0, lambda: log_to_card(card, severity, msg))
 
     # Pass bot_name=name so a CROSS "Close & Stop" closes the CROSS book
     # (it defaults to "FUTURES" otherwise).
@@ -640,6 +755,31 @@ def async_close_and_stop_futures(app, name: str, card: dict, update,
 
 
 def async_emergency_close(app, card: dict, bot_was_running: bool, update) -> None:
+    """Hold every futures restart barrier through the emergency fallback."""
+    futures_bots = [
+        name for name, meta in BOT_META.items() if meta.get("is_futures")
+    ]
+    with ExitStack() as stack:
+        for bot_name in futures_bots:
+            bot = app.bots.get(bot_name)
+            if bot is not None:
+                stack.enter_context(bot.exclusive_stop_operation())
+        _async_emergency_close_owned(
+            app,
+            card,
+            bot_was_running,
+            update,
+            futures_bots,
+        )
+
+
+def _async_emergency_close_owned(
+    app,
+    card: dict,
+    bot_was_running: bool,
+    update,
+    futures_bots: list[str],
+) -> None:
     """Emergency Close  all futures-type bots.
 
       NO confirmation dialog  the dialog already confirmed.
@@ -658,8 +798,6 @@ def async_emergency_close(app, card: dict, bot_was_running: bool, update) -> Non
     direct-close path still records each trade to the DB  just via
     the launcher's own path, not the bot's.
     """
-    futures_bots = [name for name, meta in BOT_META.items()
-                    if meta.get("is_futures")]
     close_modes_by_bot: dict[str, list[bool]] = {}
     mode_errors: dict[str, str] = {}
 
@@ -673,24 +811,33 @@ def async_emergency_close(app, card: dict, bot_was_running: bool, update) -> Non
             close_modes_by_bot[bot_name] = [False, True]
             mode_errors[bot_name] = str(exc)
 
+    def _log(severity, msg):
+        app.after(0, lambda: log_to_card(card, severity, msg))
+
     # Step 1: kill futures subprocesses immediately. We don't want them to
     # race with the launcher by trying to close the same positions.
     update("Terminating futures bots")
+    stop_failures: list[str] = []
     for bot_name in futures_bots:
         try:
             bot = app.bots.get(bot_name)
             if bot is not None and bot.is_running():
-                stopped_pid = bot.stop(graceful_close=False)
+                stopped_pid = _stop_bot_process_verified(
+                    bot, graceful_close=False
+                )
                 _release_dead_process_close_locks(stopped_pid)
         except Exception as e:
             sys.stderr.write(f"[Emergency] terminate {bot_name} failed: {e}\n")
+            stop_failures.append(bot_name)
+            _log("error", f"{bot_name}: stop failed; emergency fallback aborted: {e}")
+
+    if stop_failures:
+        update("Emergency close aborted - bot is still running")
+        return
 
     # Step 2: direct close. The bot is now dead, the launcher owns
     # the exchange state.
     update("Closing all open positions")
-
-    def _log(severity, msg):
-        app.after(0, lambda: log_to_card(card, severity, msg))
 
     for bot_name in futures_bots:
         if bot_name in mode_errors:

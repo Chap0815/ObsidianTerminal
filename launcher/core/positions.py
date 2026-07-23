@@ -993,6 +993,12 @@ def direct_close_remaining_futures(
             "original_amount":   jt_original,
             "partial_sold":      bool(jt.get("partial_sold")),
             "funding_booked_on_partials": jt.get("funding_booked_on_partials"),
+            "funding_booked_on_partials_known": (
+                jt.get("funding_booked_on_partials_known") is True
+            ),
+            "entry_funding_window_unverified": (
+                jt.get("entry_funding_window_unverified") is True
+            ),
             "initial_entry_fee": jt.get("initial_entry_fee"),
             "fees_paid":         jt.get("fees_paid"),
             "entry_id":          jt.get("entry_id"),
@@ -1006,6 +1012,9 @@ def direct_close_remaining_futures(
             "accounting_pending_profit_usdt": jt.get("accounting_pending_profit_usdt"),
             "accounting_pending_fees_usdt": jt.get("accounting_pending_fees_usdt"),
             "accounting_pending_funding_paid": jt.get("accounting_pending_funding_paid"),
+            "accounting_pending_funding_unverified": (
+                jt.get("accounting_pending_funding_unverified") is True
+            ),
             "accounting_pending_exchange_order_id": jt.get("accounting_pending_exchange_order_id"),
             "accounting_pending_mfe_pct": jt.get("accounting_pending_mfe_pct"),
             "accounting_pending_mae_pct": jt.get("accounting_pending_mae_pct"),
@@ -1039,6 +1048,12 @@ def direct_close_remaining_futures(
                     j.get("original_amount", j.get("amount", 0))),
                 "partial_sold":      bool(j.get("partial_sold")),
                 "funding_booked_on_partials": j.get("funding_booked_on_partials"),
+                "funding_booked_on_partials_known": (
+                    j.get("funding_booked_on_partials_known") is True
+                ),
+                "entry_funding_window_unverified": (
+                    j.get("entry_funding_window_unverified") is True
+                ),
                 "initial_entry_fee": j.get("initial_entry_fee"),
                 "fees_paid":         j.get("fees_paid"),
                 "entry_id":          j.get("entry_id"),
@@ -1052,6 +1067,9 @@ def direct_close_remaining_futures(
                 "accounting_pending_profit_usdt": j.get("accounting_pending_profit_usdt"),
                 "accounting_pending_fees_usdt": j.get("accounting_pending_fees_usdt"),
                 "accounting_pending_funding_paid": j.get("accounting_pending_funding_paid"),
+                "accounting_pending_funding_unverified": (
+                    j.get("accounting_pending_funding_unverified") is True
+                ),
                 "accounting_pending_exchange_order_id": j.get("accounting_pending_exchange_order_id"),
                 "accounting_pending_mfe_pct": j.get("accounting_pending_mfe_pct"),
                 "accounting_pending_mae_pct": j.get("accounting_pending_mae_pct"),
@@ -1110,6 +1128,9 @@ def direct_close_remaining_futures(
         }
         for key in ("initial_entry_fee", "fees_paid", "entry_id",
                     "funding_booked_on_partials",
+                    "funding_booked_on_partials_known",
+                    "entry_funding_window_unverified",
+                    "accounting_pending_funding_unverified",
                     "accounting_pending_partials"):
             if row.get(key) is not None:
                 out[key] = row.get(key)
@@ -1166,6 +1187,77 @@ def direct_close_remaining_futures(
             log("error", f"{sym}: accounting lookup failed: {e}")
             return None
 
+    def _cleanup_futures_state_then_claim(
+            sym: str,
+            row: dict,
+            *,
+            retry_state: dict | None = None,
+    ) -> bool:
+        """Delete bot-scoped recovery state before releasing the global claim."""
+
+        def _retry_copy() -> dict:
+            if retry_state is not None:
+                return dict(retry_state)
+            raw = row.get("_raw_json_state")
+            if isinstance(raw, dict) and raw:
+                return dict(raw)
+            return _json_state_from_futures_row(row)
+
+        if not sim_only:
+            durable_retry = _retry_copy()
+            durable_retry["accounting_already_booked"] = True
+            durable_retry["claim_release_pending"] = True
+            if json_trades.get(sym) != durable_retry:
+                json_trades[sym] = durable_retry
+                from bot_utils.state_persist import atomic_save_json
+                if not atomic_save_json(trades_file, json_trades):
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = durable_retry
+                    log(
+                        "error",
+                        f"{sym}: cleanup retry marker persistence failed - "
+                        "state/claim kept for review",
+                    )
+                    return False
+
+        try:
+            remove_futures_state(sym, bot_name, sim_only)
+        except Exception as e:
+            keep = _retry_copy()
+            keep["accounting_already_booked"] = True
+            keep["futures_state_cleanup_pending"] = True
+            if not sim_only:
+                keep["claim_release_pending"] = True
+            failed_syms.append(sym)
+            failed_position_updates[sym] = keep
+            log("error", f"{sym}: futures_state cleanup failed: {e}")
+            return False
+
+        if sim_only:
+            return True
+
+        try:
+            claim_released = remove_open_position(bot_name, sym)
+        except Exception as e:
+            keep = _retry_copy()
+            keep["accounting_already_booked"] = True
+            keep["claim_release_pending"] = True
+            keep.pop("futures_state_cleanup_pending", None)
+            failed_syms.append(sym)
+            failed_position_updates[sym] = keep
+            log("error", f"{sym}: claim release raised: {e}")
+            return False
+        if claim_released is False:
+            keep = _retry_copy()
+            keep["accounting_already_booked"] = True
+            keep["claim_release_pending"] = True
+            keep.pop("futures_state_cleanup_pending", None)
+            failed_syms.append(sym)
+            failed_position_updates[sym] = keep
+            log("error", f"{sym}: claim release failed - state kept for review")
+            return False
+        return True
+
     try:
         from core.symbol_locks import close_lock as _close_lock
     except Exception:
@@ -1185,26 +1277,7 @@ def direct_close_remaining_futures(
             _cl_got = True
         try:
             if p.get("claim_release_pending") and not sim_only:
-                try:
-                    if remove_open_position(bot_name, sym) is False:
-                        failed_syms.append(sym)
-                        failed_position_updates[sym] = _failed_futures_state(p)
-                        log("error",
-                            f"{sym}: claim release still pending - state kept")
-                        continue
-                except Exception as e:
-                    failed_syms.append(sym)
-                    failed_position_updates[sym] = _failed_futures_state(p)
-                    log("error", f"{sym}: claim release retry raised: {e}")
-                    continue
-                try:
-                    remove_futures_state(sym, bot_name, sim_only)
-                except Exception as e:
-                    retry_state = _json_state_from_futures_row(p)
-                    retry_state["accounting_already_booked"] = True
-                    failed_syms.append(sym)
-                    failed_position_updates[sym] = retry_state
-                    log("error", f"{sym}: futures_state cleanup failed: {e}")
+                if not _cleanup_futures_state_then_claim(sym, p):
                     continue
                 closed += 1
                 log("win", f"{sym}: claim cleanup completed")
@@ -1221,6 +1294,7 @@ def direct_close_remaining_futures(
                     f"({raw_pos_type!r})",
                 )
                 continue
+            symbol_full = f"{sym}/USDT:USDT"
 
             pending_amount = _positive_finite(p.get("amount"))
             if (p.get("accounting_pending")
@@ -1234,6 +1308,19 @@ def direct_close_remaining_futures(
                     continue
 
             if p.get("accounting_pending"):
+                pending_sell_time = (
+                    p.get("accounting_pending_sell_time") or _utc_now_str()
+                )
+                pending_buy_time = (
+                    p.get("opened_at") or p.get("buy_time") or pending_sell_time
+                )
+                p = dict(p)
+                p["opened_at"] = pending_buy_time
+                pending_retry_state = _failed_futures_state(p)
+                pending_retry_state["buy_time"] = pending_buy_time
+                pending_retry_state["accounting_pending_sell_time"] = (
+                    pending_sell_time
+                )
                 pending_entry = _positive_finite(
                     p.get("entry_price") or p.get("buy"))
                 pending_sell = _positive_finite(
@@ -1272,6 +1359,69 @@ def direct_close_remaining_futures(
                 if pending_giveback is not None:
                     pending_giveback = _finite_float(pending_giveback)
                 if (
+                    not sim_only
+                    and (
+                        p.get("entry_funding_window_unverified") is True
+                        or p.get("accounting_pending_funding_unverified") is True
+                    )
+                ):
+                    try:
+                        from bot_utils.futures_funding import fetch_realized_funding
+
+                        exact_funding = _finite_float(fetch_realized_funding(
+                            ex, symbol_full, pending_buy_time
+                        ))
+                    except Exception:
+                        exact_funding = None
+                    if exact_funding is None:
+                        failed_syms.append(sym)
+                        pending_retry_state[
+                            "accounting_pending_funding_unverified"
+                        ] = True
+                        failed_position_updates[sym] = pending_retry_state
+                        log(
+                            "error",
+                            f"{sym}: pending futures accounting deferred - "
+                            "exact funding history unavailable",
+                        )
+                        continue
+                    if bool(p.get("partial_sold")):
+                        from bot_utils import safe_remaining_funding
+
+                        exact_funding = safe_remaining_funding(
+                            exact_funding,
+                            pending_amount,
+                            _positive_finite(p.get("original_amount"))
+                            or pending_amount,
+                            partial_sold=True,
+                            booked_on_partials=(
+                                _finite_float(
+                                    p.get("funding_booked_on_partials")
+                                )
+                                or 0.0
+                            ),
+                            booked_on_partials_known=(
+                                p.get("funding_booked_on_partials_known") is True
+                            ),
+                        )
+                    if pending_pnl is not None and pending_funding is not None:
+                        pending_pnl = round(
+                            pending_pnl + pending_funding - exact_funding, 2
+                        )
+                    pending_funding = exact_funding
+                    pending_retry_state[
+                        "accounting_pending_funding_paid"
+                    ] = exact_funding
+                    pending_retry_state[
+                        "accounting_pending_profit_usdt"
+                    ] = pending_pnl
+                    pending_retry_state.pop(
+                        "accounting_pending_funding_unverified", None
+                    )
+                    pending_retry_state.pop(
+                        "entry_funding_window_unverified", None
+                    )
+                if (
                     pending_entry is None
                     or pending_sell is None
                     or pending_pct is None
@@ -1283,7 +1433,7 @@ def direct_close_remaining_futures(
                     or pending_fees is None
                 ):
                     failed_syms.append(sym)
-                    failed_position_updates[sym] = _failed_futures_state(p)
+                    failed_position_updates[sym] = pending_retry_state
                     log("error",
                         f"{sym}: pending futures accounting skipped - "
                         f"invalid pending values")
@@ -1293,8 +1443,8 @@ def direct_close_remaining_futures(
                     symbol=sym,
                     buy_price=pending_entry,
                     sell_price=pending_sell,
-                    buy_time=p.get("opened_at") or p.get("buy_time") or _utc_now_str(),
-                    sell_time=p.get("accounting_pending_sell_time") or _utc_now_str(),
+                    buy_time=pending_buy_time,
+                    sell_time=pending_sell_time,
                     profit_pct=pending_pct,
                     profit_usdt=pending_pnl,
                     invested_usdt=pending_margin,
@@ -1319,30 +1469,13 @@ def direct_close_remaining_futures(
                     log("error", f"{sym}: pending futures DB retry raised: {e}")
                 if not saved_ok:
                     failed_syms.append(sym)
-                    failed_position_updates[sym] = _failed_futures_state(p)
+                    failed_position_updates[sym] = pending_retry_state
                     continue
-                if not sim_only:
-                    try:
-                        if remove_open_position(bot_name, sym) is False:
-                            failed_syms.append(sym)
-                            failed_position_updates[sym] = _failed_futures_state(p)
-                            log("error",
-                                f"{sym}: claim release failed after pending DB retry")
-                            continue
-                    except Exception as e:
-                        failed_syms.append(sym)
-                        failed_position_updates[sym] = _failed_futures_state(p)
-                        log("error",
-                            f"{sym}: claim release raised after pending DB retry: {e}")
-                        continue
-                try:
-                    remove_futures_state(sym, bot_name, sim_only)
-                except Exception as e:
-                    retry_state = _json_state_from_futures_row(p)
-                    retry_state["accounting_already_booked"] = True
-                    failed_syms.append(sym)
-                    failed_position_updates[sym] = retry_state
-                    log("error", f"{sym}: futures_state cleanup failed: {e}")
+                if not _cleanup_futures_state_then_claim(
+                        sym,
+                        p,
+                        retry_state=_json_state_from_futures_row(p),
+                ):
                     continue
                 closed += 1
                 total_pnl += pending_kwargs["profit_usdt"]
@@ -1374,8 +1507,6 @@ def direct_close_remaining_futures(
                 continue
             original_amount = _positive_finite(p.get("original_amount")) or amount
             partial_sold = bool(p.get("partial_sold"))
-            symbol_full = f"{sym}/USDT:USDT"
-
             pending_partials = _pending_accounting_items_fail_closed(
                 p.get("accounting_pending_partials")
             )
@@ -1420,7 +1551,11 @@ def direct_close_remaining_futures(
                     try:
                         from bot_utils.futures_order import verify_position_closed
                         _closed, _remaining = verify_position_closed(
-                            ex, symbol_full, timeout=5.0)
+                            ex,
+                            symbol_full,
+                            timeout=5.0,
+                            expected_position_side=pos_type,
+                        )
                     except Exception as e:
                         failed_syms.append(sym)
                         failed_position_updates[sym] = _failed_futures_state(p)
@@ -1435,32 +1570,7 @@ def direct_close_remaining_futures(
                             f"{sym}: trade already booked but exchange still "
                             f"shows {_remaining} contracts - manual review")
                         continue
-                    try:
-                        if remove_open_position(bot_name, sym) is False:
-                            retry_state = _failed_futures_state(p)
-                            retry_state["claim_release_pending"] = True
-                            retry_state["accounting_already_booked"] = True
-                            failed_syms.append(sym)
-                            failed_position_updates[sym] = retry_state
-                            log("error",
-                                f"{sym}: stale state found but claim release failed")
-                            continue
-                    except Exception as e:
-                        retry_state = _failed_futures_state(p)
-                        retry_state["claim_release_pending"] = True
-                        retry_state["accounting_already_booked"] = True
-                        failed_syms.append(sym)
-                        failed_position_updates[sym] = retry_state
-                        log("error", f"{sym}: stale state claim cleanup raised: {e}")
-                        continue
-                try:
-                    remove_futures_state(sym, bot_name, sim_only)
-                except Exception as e:
-                    retry_state = _json_state_from_futures_row(p)
-                    retry_state["accounting_already_booked"] = True
-                    failed_syms.append(sym)
-                    failed_position_updates[sym] = retry_state
-                    log("error", f"{sym}: futures_state cleanup failed: {e}")
+                if not _cleanup_futures_state_then_claim(sym, p):
                     continue
                 log("win", f"{sym}: stale state cleaned (trade already booked)")
                 closed += 1
@@ -1520,6 +1630,9 @@ def direct_close_remaining_futures(
                 booked_on_partials=(
                     _finite_float(p.get("funding_booked_on_partials"))
                     or 0.0
+                ),
+                booked_on_partials_known=(
+                    p.get("funding_booked_on_partials_known") is True
                 ),
             )
             if amount > 0 and curr > 0:
@@ -1638,7 +1751,11 @@ def direct_close_remaining_futures(
                                     )
                                     if is_no_position_error(_e):
                                         _closed, _remaining = verify_position_closed(
-                                            ex, symbol_full, timeout=5.0)
+                                            ex,
+                                            symbol_full,
+                                            timeout=5.0,
+                                            expected_position_side=pos_type,
+                                        )
                                         if _closed:
                                             _already_flat_verified = True
                                             log("warn",
@@ -1704,7 +1821,11 @@ def direct_close_remaining_futures(
                         try:
                             from bot_utils.futures_order import verify_position_closed
                             _closed, _remaining = verify_position_closed(
-                                ex, symbol_full, timeout=5.0)
+                                ex,
+                                symbol_full,
+                                timeout=5.0,
+                                expected_position_side=pos_type,
+                            )
                         except Exception as _ve:
                             _closed, _remaining = False, -1.0
                             log("warn", f"[LIVE] {sym}: close unverified ({_ve})  "
@@ -1732,32 +1853,22 @@ def direct_close_remaining_futures(
                 try:
                     from bot_utils.futures_order import verify_position_closed
                     _closed, _remaining = verify_position_closed(
-                        ex, symbol_full, timeout=5.0)
+                        ex,
+                        symbol_full,
+                        timeout=5.0,
+                        expected_position_side=pos_type,
+                    )
                 except Exception as e:
                     _closed, _remaining = False, -1.0
                     log("error",
                         f"{sym}: LIVE close skipped - amount unknown and flat "
                         f"check failed ({e}). Position KEPT; review manually.")
                 if _closed:
-                    try:
-                        if remove_open_position(bot_name, sym) is False:
-                            failed_syms.append(sym)
-                            failed_position_updates[sym] = _json_state_from_futures_row(p)
-                            log("error",
-                                f"{sym}: stale amount=0 state but claim release failed")
-                            continue
-                    except Exception as e:
-                        failed_syms.append(sym)
-                        failed_position_updates[sym] = _json_state_from_futures_row(p)
-                        log("error",
-                            f"{sym}: stale amount=0 claim cleanup raised: {e}")
-                        continue
-                    try:
-                        remove_futures_state(sym, bot_name, sim_only)
-                    except Exception as e:
-                        failed_syms.append(sym)
-                        failed_position_updates[sym] = _json_state_from_futures_row(p)
-                        log("error", f"{sym}: futures_state cleanup failed: {e}")
+                    if not _cleanup_futures_state_then_claim(
+                            sym,
+                            p,
+                            retry_state=_json_state_from_futures_row(p),
+                    ):
                         continue
                     closed += 1
                     log("win", f"{sym}: stale amount=0 state cleaned (flat)")
@@ -1770,8 +1881,92 @@ def direct_close_remaining_futures(
                 continue
 
             # Write to DB  shows up in "Realized Profit"
-            buy_time = p.get("opened_at") or _utc_now_str()
+            buy_time = p.get("opened_at") or p.get("buy_time") or _utc_now_str()
             sell_time = _utc_now_str()
+            p = dict(p)
+            p["opened_at"] = buy_time
+            if (
+                not sim_only
+                and p.get("entry_funding_window_unverified") is True
+            ):
+                try:
+                    from bot_utils.futures_funding import fetch_realized_funding
+
+                    exact_funding = _finite_float(fetch_realized_funding(
+                        ex, symbol_full, buy_time
+                    ))
+                except Exception:
+                    exact_funding = None
+                if exact_funding is None:
+                    retry_state = _failed_futures_state(p)
+                    retry_state.update({
+                        "accounting_pending": True,
+                        "accounting_pending_funding_unverified": True,
+                        "accounting_pending_reason": reason,
+                        "accounting_pending_sell_price": curr,
+                        "accounting_pending_sell_time": sell_time,
+                        "accounting_pending_profit_pct": price_move,
+                        "accounting_pending_profit_usdt": pnl_usdt,
+                        "accounting_pending_fees_usdt": entry_fee + exit_fee,
+                        "accounting_pending_funding_paid": funding_for_close,
+                        "accounting_pending_exchange_order_id": exchange_order_id,
+                    })
+                    json_trades[sym] = retry_state
+                    try:
+                        from bot_utils.state_persist import atomic_save_json
+
+                        pending_durable = atomic_save_json(
+                            trades_file, json_trades
+                        )
+                    except Exception:
+                        pending_durable = False
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = retry_state
+                    if pending_durable:
+                        log(
+                            "error",
+                            f"{sym}: verified flat close kept for accounting "
+                            "recovery because exact funding history is unavailable",
+                        )
+                    else:
+                        log(
+                            "error",
+                            f"{sym}: verified flat close funding recovery marker "
+                            "could not be persisted",
+                        )
+                    continue
+                if partial_sold:
+                    exact_funding = safe_remaining_funding(
+                        exact_funding,
+                        amount,
+                        original_amount,
+                        partial_sold=True,
+                        booked_on_partials=(
+                            _finite_float(p.get("funding_booked_on_partials"))
+                            or 0.0
+                        ),
+                        booked_on_partials_known=(
+                            p.get("funding_booked_on_partials_known") is True
+                        ),
+                    )
+                funding_for_close = exact_funding
+                pnl_usdt = round(
+                    notional * (price_move / 100.0)
+                    - entry_fee
+                    - exit_fee
+                    - funding_for_close,
+                    2,
+                )
+                p.pop("entry_funding_window_unverified", None)
+                p.pop("accounting_pending_funding_unverified", None)
+                raw_state = p.get("_raw_json_state")
+                if isinstance(raw_state, dict):
+                    raw_state = dict(raw_state)
+                    raw_state.pop("entry_funding_window_unverified", None)
+                    raw_state.pop(
+                        "accounting_pending_funding_unverified", None
+                    )
+                    p["_raw_json_state"] = raw_state
             saved_ok = save_trade_db(
                 bot_name=bot_name, symbol=sym,
                 buy_price=entry, sell_price=curr,
@@ -1823,33 +2018,11 @@ def direct_close_remaining_futures(
                         f"{sym}: booked-close marker persistence failed - "
                         f"claim/state KEPT for review")
                     continue
-            try:
-                # Release the shared multi-bot claim. The launcher closes
-                # OUTSIDE TradeState (separate process), so it must clear
-                # bot_open_positions itself  otherwise the coin stays
-                # "claimed" forever.
-                if not sim_only and remove_open_position(bot_name, sym) is False:
-                    failed_syms.append(sym)
-                    failed_position_updates[sym] = booked_state
-                    log("error",
-                        f"{sym}: claim release failed - state kept for review")
-                    continue
-            except Exception as e:
-                failed_syms.append(sym)
-                failed_position_updates[sym] = booked_state
-                log("error", f"{sym}: claim release raised: {e}")
-                continue
-            try:
-                # Scope by bot: FUTURES + CROSS share futures_state; an
-                # unscoped delete would wipe the other bot's dashboard row
-                # for the same base coin.
-                remove_futures_state(sym, bot_name, sim_only)
-            except Exception as e:
-                failed_syms.append(sym)
-                retry_state = booked_state or _json_state_from_futures_row(p)
-                retry_state["accounting_already_booked"] = True
-                failed_position_updates[sym] = retry_state
-                log("error", f"{sym}: futures_state cleanup failed: {e}")
+            if not _cleanup_futures_state_then_claim(
+                    sym,
+                    p,
+                    retry_state=booked_state or _json_state_from_futures_row(p),
+            ):
                 continue
 
             closed += 1
@@ -2068,6 +2241,13 @@ def direct_close_remaining_spot(
                 d["accounting_pending_partials"] = []
 
             if d.get("accounting_pending"):
+                pending_sell_time = (
+                    d.get("accounting_pending_sell_time") or _utc_now_str()
+                )
+                pending_buy_time = d.get("buy_time") or pending_sell_time
+                d = dict(d)
+                d["buy_time"] = pending_buy_time
+                d["accounting_pending_sell_time"] = pending_sell_time
                 pending_sell = _positive_finite(
                     d.get("accounting_pending_sell_price"))
                 pending_pct = _finite_float(
@@ -2089,8 +2269,8 @@ def direct_close_remaining_spot(
                     bot_name=bot_name, symbol=sym,
                     buy_price=buy_price,
                     sell_price=pending_sell,
-                    buy_time=d.get("buy_time") or _utc_now_str(),
-                    sell_time=d.get("accounting_pending_sell_time") or _utc_now_str(),
+                    buy_time=pending_buy_time,
+                    sell_time=pending_sell_time,
                     profit_pct=pending_pct,
                     profit_usdt=pending_pnl,
                     invested_usdt=margin,
@@ -2177,19 +2357,26 @@ def direct_close_remaining_spot(
             profit_pct  = ((curr - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
             # Taker fee on entry AND exit (mirrors the bot logic)
             taker_fee   = 0.001   # Spot: 0.1% per side (standard taker)
+            partial_sold = bool(d.get("partial_sold"))
             initial_entry_fee = _non_negative_finite(d.get(
-                "initial_entry_fee", d.get("fees_paid", margin * taker_fee)
+                "initial_entry_fee",
+                0.0 if partial_sold else d.get(
+                    "fees_paid", margin * taker_fee
+                ),
             )) or 0.0
+            original_amount = _positive_finite(d.get("original_amount"))
+            if original_amount is None and not partial_sold:
+                original_amount = amount
             try:
                 from bot_utils import safe_proportional_fee
                 entry_fee = safe_proportional_fee(
                     initial_entry_fee,
                     amount,
-                    _positive_finite(d.get("original_amount")) or amount,
-                    partial_sold=bool(d.get("partial_sold")),
+                    original_amount,
+                    partial_sold=partial_sold,
                 )
             except Exception:
-                entry_fee = initial_entry_fee if not d.get("partial_sold") else 0.0
+                entry_fee = initial_entry_fee if not partial_sold else 0.0
             exit_fee = (
                 amount * curr * taker_fee
                 if amount > 0 and curr > 0 else margin * taker_fee
@@ -2212,7 +2399,9 @@ def direct_close_remaining_spot(
                 from bot_utils import spot_market_sell_safe
                 from bot_utils.spot_exits import (
                     SpotSellOutcomeUnknown,
+                    normalize_spot_order_status,
                     recover_spot_sell_by_client_id,
+                    spot_sell_requires_terminal_recovery,
                 )
                 try:
                     # Use the precision/lot-size-aware wrapper the BOT uses
@@ -2259,10 +2448,17 @@ def direct_close_remaining_spot(
                         d = persisted
 
                     order = None
-                    if d.get("launcher_exit_outcome_uncertain"):
+                    if (
+                        (
+                            persisted_client_order_id_valid
+                            and persisted_client_order_id == client_order_id
+                        )
+                        or d.get("launcher_exit_outcome_uncertain")
+                    ):
                         try:
                             order = recover_spot_sell_by_client_id(
-                                ex, f"{sym}/USDT", client_order_id
+                                ex, f"{sym}/USDT", client_order_id,
+                                expected_amount=requested_amount,
                             )
                         except Exception as recovery_error:
                             log("error",
@@ -2282,11 +2478,10 @@ def direct_close_remaining_spot(
                     raw_status = (
                         order.get("status") if isinstance(order, dict) else None
                     )
-                    normalized_status = (
-                        raw_status.strip().lower()
-                        if isinstance(raw_status, str) else ""
-                    )
-                    if normalized_status in {"new", "open", "pending"}:
+                    normalized_status = normalize_spot_order_status(raw_status)
+                    if spot_sell_requires_terminal_recovery(
+                        order, requested_amount
+                    ):
                         persisted = _persist_launcher_spot_exit_fields(
                             trades_file, json_trades, sym, d,
                             {"launcher_exit_outcome_uncertain": True},
@@ -2294,7 +2489,8 @@ def direct_close_remaining_spot(
                         if persisted is not None:
                             d = persisted
                         log("error",
-                            f"[LIVE] {sym}: sell still {normalized_status} - "
+                            f"[LIVE] {sym}: sell still "
+                            f"{normalized_status or 'unresolved'} - "
                             f"terminal recovery deferred")
                         failed_syms.append(sym)
                         failed_position_updates[sym] = dict(
@@ -2308,15 +2504,26 @@ def direct_close_remaining_spot(
                     # that never executed. On non-fill: keep the position and
                     # tell the user to sell manually, rather than booking a
                     # phantom sell while the coins stay in the wallet.
-                    from bot_utils.order_utils import order_was_filled
-                    if not order_was_filled(order, filled_amount):
+                    from bot_utils.order_utils import (
+                        order_has_proven_zero_fill,
+                        order_has_unquantified_fill_notional,
+                        order_was_filled,
+                    )
+                    unquantified_fill = order_has_unquantified_fill_notional(order)
+                    if (
+                        unquantified_fill
+                        or not order_was_filled(order, filled_amount)
+                    ):
                         _st = order.get("status") if isinstance(order, dict) else "?"
                         normalized_status = (
                             _st.strip().lower() if isinstance(_st, str) else ""
                         )
-                        if normalized_status in {
+                        if (
+                            normalized_status in {
                             "canceled", "cancelled", "rejected", "expired",
-                        }:
+                            }
+                            and order_has_proven_zero_fill(order)
+                        ):
                             updates = {
                                 "launcher_exit_client_order_id": None,
                                 "launcher_exit_outcome_uncertain": False,
@@ -2435,6 +2642,8 @@ def direct_close_remaining_spot(
 
             buy_time = d.get("buy_time") or _utc_now_str()
             sell_time = _utc_now_str()
+            d = dict(d)
+            d["buy_time"] = buy_time
             trade_kwargs = dict(
                 bot_name=bot_name, symbol=sym,
                 buy_price=buy_price, sell_price=fill_price,

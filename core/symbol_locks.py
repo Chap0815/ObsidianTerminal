@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid
 from contextlib import contextmanager
 from typing import Dict
 
@@ -29,6 +30,20 @@ _REFCOUNTS: Dict[str, int]            = {}
 
 _ADVISORY_TTL_SEC   = 120
 _ADVISORY_TIMEOUT   = 2.0
+
+
+def _process_run_id() -> str:
+    configured = os.getenv("BOT_RUN_ID", "").strip()
+    if (
+        len(configured) == 32
+        and configured.isascii()
+        and all(char in "0123456789abcdefABCDEF" for char in configured)
+    ):
+        return configured.lower()
+    return uuid.uuid4().hex
+
+
+_PROCESS_RUN_ID = _process_run_id()
 
 
 def _advisory_lock_name(bot_name: str, base: str) -> str:
@@ -91,7 +106,7 @@ def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
             _base = sym.split("/")[0].split(":")[0].strip().upper()
             if _bn and _base:
                 _adv_lock_name = _advisory_lock_name(_bn, _base)
-                _adv_holder_id = f"{os.getpid()}-{threading.get_ident()}"
+                _adv_holder_id = f"v2:{os.getpid()}:{_PROCESS_RUN_ID}"
                 import time as _time
                 _deadline = _time.monotonic() + _ADVISORY_TIMEOUT
                 while _time.monotonic() < _deadline:

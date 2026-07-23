@@ -105,6 +105,9 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         self.COOLDOWN_FILE = sim_state_path(self.COOLDOWN_FILE, simulation)
         self.cfg = load_runtime_config(self.BOT_NAME, self.DEFAULTS)
         self._shutdown_event = threading.Event()
+        self._reconcile_wakeup_event = threading.Event()
+        self._entry_recovery_lock = threading.Lock()
+        self._entry_recovery_generation = 0
         self._shutdown_lock = threading.Lock()
         self._cooldown_lock = threading.Lock()
         # populated in run()
@@ -408,23 +411,16 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
 
         #  Startup reconciliation (in mixin) 
         if not self.simulation:
-            try:
-                from trading.entry_executor import recover_nonterminal_order_intents
-
-                unresolved = recover_nonterminal_order_intents(
-                    self.ex, self.BOT_NAME, log_event=log_event
-                )
-                self._entry_recovery_blocked = bool(unresolved)
-                if unresolved:
-                    log_event(
-                        f"[{self.BOT_NAME}] {len(unresolved)} unresolved order "
-                        "intent(s); new entries blocked until reconciliation",
-                        "ERROR",
-                    )
-            except Exception as exc:
-                self._entry_recovery_blocked = True
-                self._log_error("startup order-intent recovery", exc)
-            self._startup_reconciliation()
+            recovery_ok, recovery_generation = self._refresh_entry_recovery_barrier(
+                log_event,
+                context="startup",
+            )
+            reconciliation_ok = self._startup_reconciliation()
+            self._complete_entry_recovery_barrier(
+                recovery_generation,
+                recovery_ok=recovery_ok,
+                reconciliation_ok=reconciliation_ok,
+            )
 
         #  Register shutdown handlers 
         try:
@@ -805,6 +801,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             if getattr(self, "_emergency_closed", False):
                 return
             self._shutdown_event.set()
+            self._reconcile_wakeup_event.set()
             if getattr(self, "_emergency_in_progress", False):
                 return
             self._emergency_in_progress = True

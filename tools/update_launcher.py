@@ -8,9 +8,12 @@ launcher again after a successful update.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -19,10 +22,16 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from bot_utils.subprocess_capture import run_bounded_capture  # noqa: E402
+
+from update_barrier import (  # noqa: E402 - root bootstrap above
+    process_start_guard,
+    update_marker_exists,
+)
 
 try:
     from core.constants import UPDATE_LOG_BACKUPS, UPDATE_LOG_MAX_BYTES
@@ -34,6 +43,7 @@ except Exception:
 LOG_DIR = ROOT / "logs"
 LOG_PATH = LOG_DIR / "update_last.log"
 STATUS_PATH = LOG_DIR / "update_status.json"
+UPDATE_MARKER = ROOT / ".update_in_progress"
 _UPDATE_LOG_LOCK = threading.Lock()
 
 
@@ -66,24 +76,18 @@ def _append_log(message: str) -> None:
     try:
         line = f"[{_now()}] {_redact_text(message)}\n"
         try:
-            from core.logger import _rotate_if_needed
+            from core.logger import _append_rotating_text
         except Exception:
-            _rotate_if_needed = None
+            _append_rotating_text = None
         with _UPDATE_LOG_LOCK:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
-            if _rotate_if_needed is not None:
-                try:
-                    _rotate_if_needed(
-                        str(LOG_PATH),
-                        UPDATE_LOG_MAX_BYTES,
-                        UPDATE_LOG_BACKUPS,
-                    )
-                except Exception:
-                    # A maintenance failure must not suppress diagnostics or
-                    # turn an otherwise valid software update into a failure.
-                    pass
-            with LOG_PATH.open("a", encoding="utf-8") as fh:
-                fh.write(line)
+            if _append_rotating_text is not None:
+                _append_rotating_text(
+                    str(LOG_PATH),
+                    line,
+                    UPDATE_LOG_MAX_BYTES,
+                    UPDATE_LOG_BACKUPS,
+                )
     except Exception:
         # Status JSON remains the authoritative UI signal if logging is not
         # writable (read-only install, full disk, antivirus lock, etc.).
@@ -146,6 +150,269 @@ def _python_console() -> str:
     return str(exe)
 
 
+def _is_reparse_path(path: Path, path_stat: os.stat_result | None = None) -> bool:
+    """Return whether *path* is a symlink, junction, or other reparse point."""
+    try:
+        if path.is_symlink() or (
+            hasattr(path, "is_junction") and path.is_junction()
+        ):
+            return True
+        path_stat = path_stat or path.lstat()
+        attributes = getattr(path_stat, "st_file_attributes", 0)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        return bool(attributes & reparse_flag)
+    except OSError as exc:
+        raise RuntimeError(f"Cannot inspect update runtime path: {path}") from exc
+
+
+def _runtime_entry_ignored(name: str, *, is_dir: bool) -> bool:
+    return name == "__pycache__" if is_dir else name.lower().endswith((".pyc", ".pyo"))
+
+
+def _runtime_stat_matches(left: os.stat_result, right: os.stat_result) -> bool:
+    if (left.st_size, left.st_mtime_ns, stat.S_IFMT(left.st_mode)) != (
+        right.st_size,
+        right.st_mtime_ns,
+        stat.S_IFMT(right.st_mode),
+    ):
+        return False
+    return not (left.st_ino and right.st_ino) or (
+        left.st_dev,
+        left.st_ino,
+    ) == (right.st_dev, right.st_ino)
+
+
+def _hash_regular_file(path: Path, expected: os.stat_result) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise RuntimeError(f"Update runtime contains a non-regular file: {path}")
+            if not _runtime_stat_matches(opened, expected):
+                raise RuntimeError(f"Update runtime changed during validation: {path}")
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read update runtime file: {path}") from exc
+    try:
+        current = path.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"Update runtime changed during validation: {path}") from exc
+    if _is_reparse_path(path, current) or not _runtime_stat_matches(current, expected):
+        raise RuntimeError(f"Update runtime changed during validation: {path}")
+    return opened.st_size, digest.hexdigest()
+
+
+def _build_runtime_manifest(root: Path) -> dict[str, tuple[str, int, str]]:
+    """Build an exact content manifest without following filesystem links."""
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"Cannot inspect bundled update runtime: {root}") from exc
+    if _is_reparse_path(root, root_stat) or not stat.S_ISDIR(root_stat.st_mode):
+        raise RuntimeError(f"Bundled update runtime is a link or non-directory: {root}")
+
+    manifest: dict[str, tuple[str, int, str]] = {}
+
+    def visit(directory: Path, relative: Path) -> None:
+        try:
+            with os.scandir(directory) as scanner:
+                entries = sorted(scanner, key=lambda entry: entry.name)
+        except OSError as exc:
+            raise RuntimeError(f"Cannot inspect bundled update runtime: {directory}") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            rel = relative / entry.name
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise RuntimeError(f"Cannot inspect update runtime path: {path}") from exc
+            if _is_reparse_path(path, entry_stat):
+                raise RuntimeError(f"Update runtime contains a link or reparse point: {path}")
+            if stat.S_ISDIR(entry_stat.st_mode):
+                if _runtime_entry_ignored(entry.name, is_dir=True):
+                    continue
+                manifest[rel.as_posix()] = ("dir", 0, "")
+                visit(path, rel)
+            elif stat.S_ISREG(entry_stat.st_mode):
+                if _runtime_entry_ignored(entry.name, is_dir=False):
+                    continue
+                size, file_hash = _hash_regular_file(path, entry_stat)
+                manifest[rel.as_posix()] = ("file", size, file_hash)
+            else:
+                raise RuntimeError(f"Update runtime contains a non-regular path: {path}")
+
+    visit(root, Path())
+    return manifest
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _validate_external_runtime_location(
+    temp_root: Path,
+    expected_root: Path,
+    candidate: Path,
+) -> None:
+    """Revalidate the external target boundary before every write stage."""
+    try:
+        temp_stat = temp_root.lstat()
+    except OSError as exc:
+        raise RuntimeError("Cannot inspect external update runtime target") from exc
+    if _is_reparse_path(temp_root, temp_stat) or not stat.S_ISDIR(temp_stat.st_mode):
+        raise RuntimeError("External update runtime target is a link or non-directory")
+    try:
+        current_root = temp_root.resolve(strict=True)
+        candidate_absolute = candidate.absolute()
+        relative = candidate_absolute.relative_to(temp_root.absolute())
+        candidate_resolved = candidate.resolve(strict=False)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("External update runtime target escaped its root") from exc
+    app_root = ROOT.resolve()
+    if current_root != expected_root or not _path_within(candidate_resolved, expected_root):
+        raise RuntimeError("External update runtime target changed or escaped its root")
+    if _path_within(candidate_resolved, app_root):
+        raise RuntimeError("External update runtime target resolved inside application root")
+
+    current = temp_root
+    for part in relative.parts:
+        current /= part
+        try:
+            current_stat = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise RuntimeError("Cannot inspect external update runtime target") from exc
+        if _is_reparse_path(current, current_stat):
+            raise RuntimeError("External update runtime target contains a reparse point")
+
+
+def _copy_runtime_tree(
+    source: Path,
+    target: Path,
+    *,
+    temp_root: Path,
+    expected_root: Path,
+) -> None:
+    """Copy a validated runtime while rechecking every source entry."""
+    _validate_external_runtime_location(temp_root, expected_root, target)
+    try:
+        target.mkdir()
+    except OSError as exc:
+        raise RuntimeError(f"Cannot create external update runtime: {target}") from exc
+
+    def copy_directory(source_dir: Path, target_dir: Path) -> None:
+        _validate_external_runtime_location(temp_root, expected_root, target_dir)
+        try:
+            source_dir_stat = source_dir.lstat()
+            if _is_reparse_path(source_dir, source_dir_stat) or not stat.S_ISDIR(
+                source_dir_stat.st_mode
+            ):
+                raise RuntimeError(
+                    f"Update runtime contains a link or non-directory: {source_dir}"
+                )
+            with os.scandir(source_dir) as scanner:
+                entries = sorted(scanner, key=lambda entry: entry.name)
+        except RuntimeError:
+            raise
+        except OSError as exc:
+            raise RuntimeError(f"Cannot inspect bundled update runtime: {source_dir}") from exc
+        for entry in entries:
+            source_path = Path(entry.path)
+            target_path = target_dir / entry.name
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise RuntimeError(f"Cannot inspect update runtime path: {source_path}") from exc
+            if _is_reparse_path(source_path, entry_stat):
+                raise RuntimeError(
+                    f"Update runtime contains a link or reparse point: {source_path}"
+                )
+            if stat.S_ISDIR(entry_stat.st_mode):
+                if _runtime_entry_ignored(entry.name, is_dir=True):
+                    continue
+                _validate_external_runtime_location(
+                    temp_root,
+                    expected_root,
+                    target_path,
+                )
+                try:
+                    target_path.mkdir()
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Cannot create external update runtime: {target_path}"
+                    ) from exc
+                copy_directory(source_path, target_path)
+            elif stat.S_ISREG(entry_stat.st_mode):
+                if _runtime_entry_ignored(entry.name, is_dir=False):
+                    continue
+                _hash_regular_file(source_path, entry_stat)
+                _validate_external_runtime_location(
+                    temp_root,
+                    expected_root,
+                    target_path,
+                )
+                try:
+                    shutil.copy2(source_path, target_path, follow_symlinks=False)
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Cannot copy bundled update runtime file: {source_path}"
+                    ) from exc
+                current = source_path.lstat()
+                if _is_reparse_path(source_path, current) or not _runtime_stat_matches(
+                    current, entry_stat
+                ):
+                    raise RuntimeError(
+                        f"Update runtime changed during copy: {source_path}"
+                    )
+            else:
+                raise RuntimeError(
+                    f"Update runtime contains a non-regular path: {source_path}"
+                )
+
+    copy_directory(source, target)
+
+
+def _prepare_external_runtime_root(temp_root: Path) -> Path:
+    root_resolved = ROOT.resolve()
+    temp_resolved = temp_root.resolve()
+    try:
+        temp_resolved.relative_to(root_resolved)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("External update runtime must be outside the application root")
+    if temp_root.exists():
+        temp_stat = temp_root.lstat()
+        if _is_reparse_path(temp_root, temp_stat) or not stat.S_ISDIR(temp_stat.st_mode):
+            raise RuntimeError("External update runtime target is a link or non-directory")
+        try:
+            if next(temp_root.iterdir(), None) is not None:
+                raise RuntimeError("External update runtime target must be empty")
+        except OSError as exc:
+            raise RuntimeError("Cannot inspect external update runtime target") from exc
+    else:
+        try:
+            temp_root.mkdir(parents=True)
+        except OSError as exc:
+            raise RuntimeError("Cannot create external update runtime target") from exc
+        temp_stat = temp_root.lstat()
+        if _is_reparse_path(temp_root, temp_stat) or not stat.S_ISDIR(temp_stat.st_mode):
+            raise RuntimeError("External update runtime target is a link or non-directory")
+    resolved = temp_root.resolve(strict=True)
+    if _path_within(resolved, ROOT.resolve()):
+        raise RuntimeError("External update runtime target resolved inside application root")
+    return resolved
+
+
 def _external_update_python(temp_root: Path) -> tuple[str, Path | None]:
     """Return a Python executable that is outside ROOT when possible.
 
@@ -155,13 +422,30 @@ def _external_update_python(temp_root: Path) -> tuple[str, Path | None]:
     """
     portable = ROOT / "python" / "python.exe"
     if portable.exists():
+        source = ROOT / "python"
+        source_manifest = _build_runtime_manifest(source)
+        expected_root = _prepare_external_runtime_root(temp_root)
         runtime_copy = temp_root / "python"
-        shutil.copytree(
-            ROOT / "python",
+        if runtime_copy.exists():
+            raise RuntimeError("External update runtime target already exists")
+        _copy_runtime_tree(
+            source,
             runtime_copy,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            temp_root=temp_root,
+            expected_root=expected_root,
         )
-        return str(runtime_copy / "python.exe"), runtime_copy
+        if _build_runtime_manifest(source) != source_manifest:
+            raise RuntimeError("Bundled update runtime changed during copy")
+        if _build_runtime_manifest(runtime_copy) != source_manifest:
+            raise RuntimeError("External update runtime failed integrity verification")
+        copied_python = runtime_copy / "python.exe"
+        _validate_external_runtime_location(temp_root, expected_root, copied_python)
+        copied_python_stat = copied_python.lstat()
+        if _is_reparse_path(copied_python, copied_python_stat) or not stat.S_ISREG(
+            copied_python_stat.st_mode
+        ):
+            raise RuntimeError("External update Python is a link or non-regular file")
+        return str(copied_python), runtime_copy
     return _python_console(), None
 
 
@@ -189,43 +473,114 @@ def _launcher_processes() -> list[str]:
         return _launcher_processes_via_cim()
     current = os.getpid()
     out: list[str] = []
-    for proc in psutil.process_iter(["pid", "cmdline"]):
-        try:
-            pid = int(proc.info.get("pid") or 0)
-            if pid == current:
+    scan_incomplete = False
+    saw_current_pid = False
+    try:
+        for proc in psutil.process_iter(
+            ["pid", "name", "exe", "cmdline", "cwd"]
+        ):
+            try:
+                pid = int(proc.info.get("pid") or 0)
+                if pid == current:
+                    saw_current_pid = True
+                    continue
+                if pid < 0:
+                    scan_incomplete = True
+                    continue
+                if pid == 0:
+                    continue
+                raw_name = proc.info.get("name")
+                raw_exe = proc.info.get("exe")
+                raw_cmdline = proc.info.get("cmdline")
+                raw_cwd = proc.info.get("cwd")
+                name = str(raw_name or "").lower()
+                exe_name = Path(str(raw_exe or "")).name.lower()
+                cmd_exe_name = ""
+                if isinstance(raw_cmdline, (list, tuple)) and raw_cmdline:
+                    cmd_exe_name = Path(str(raw_cmdline[0])).name.lower()
+                python_like = any(
+                    re.fullmatch(r"python(?:w|[0-9.]*)?\.exe", value)
+                    for value in (name, exe_name, cmd_exe_name)
+                )
+                if not isinstance(raw_cmdline, (list, tuple)):
+                    if python_like or not (name or exe_name):
+                        scan_incomplete = True
+                    continue
+                if not raw_cmdline and python_like:
+                    scan_incomplete = True
+                    continue
+                cmdline = " ".join(raw_cmdline)
+            except Exception:
+                scan_incomplete = True
                 continue
-            cmdline = " ".join(proc.info.get("cmdline") or [])
-        except Exception:
-            continue
-        low = cmdline.lower()
-        if _cmdline_is_launcher(low):
-            out.append(f"pid {pid}")
+            if python_like and _cmdline_is_launcher(cmdline.lower(), raw_cwd):
+                out.append(f"pid {pid}")
+    except Exception:
+        scan_incomplete = True
+    if not saw_current_pid:
+        scan_incomplete = True
+    if scan_incomplete:
+        return _launcher_processes_via_cim()
     return out
 
 
-def _cmdline_is_launcher(cmdline_lower: str) -> bool:
-    root_text = str(ROOT).lower()
-    if root_text not in cmdline_lower:
-        return False
+def _cmdline_is_launcher(cmdline_lower: str, cwd: object = None) -> bool:
     compact = " ".join(cmdline_lower.replace("\\", "/").split())
-    return (
+    root_text = str(ROOT).replace("\\", "/").lower().rstrip("/") + "/"
+    launcher_like = (
         "launcher.pyw" in compact
+        or "setup_wizard.pyw" in compact
         or "-m launcher.main" in compact
         or "-m launcher/main" in compact
+    )
+    if not launcher_like:
+        return False
+    if root_text in compact:
+        return True
+    cwd_text = str(cwd or "").replace("\\", "/").lower().rstrip("/")
+    root_dir = root_text.rstrip("/")
+    if cwd_text != root_dir:
+        return False
+    return bool(
+        "-m launcher.main" in compact
+        or "-m launcher/main" in compact
+        or re.search(r"(?:^|\s)[\"']?(?:launcher|setup_wizard)\.pyw(?:[\"']?(?:\s|$))", compact)
     )
 
 
 def _launcher_processes_via_cim() -> list[str]:
-    root = str(ROOT).lower().replace("'", "''")
+    root = (
+        str(ROOT).replace("\\", "/").lower().rstrip("/") + "/"
+    ).replace("'", "''")
     script = (
+        "$ErrorActionPreference='Stop'; "
         f"$root='{root}'; "
         f"$current={os.getpid()}; "
-        "Get-CimInstance Win32_Process | "
-        "Where-Object { $_.ProcessId -ne $current -and $_.CommandLine -and "
-        "$line=$_.CommandLine.ToLower().Replace('\\','/'); "
-        "$line.Contains($root) -and "
-        "($line.Contains('launcher.pyw') -or $line.Contains('-m launcher.main')) } | "
-        "ForEach-Object { 'pid ' + $_.ProcessId }"
+        "$scanPid=$PID; "
+        "$all=@(Get-CimInstance Win32_Process); "
+        "if (-not ($all.ProcessId -contains $current) -or "
+        "-not ($all.ProcessId -contains $scanPid)) { "
+        "throw 'runtime process scan missing process-table anchor' }; "
+        "$all | Where-Object { $_.ProcessId -gt 0 -and "
+        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid } | "
+        "ForEach-Object { "
+        "$name=[string]$_.Name; $line=[string]$_.CommandLine; "
+        "$nameLow=$name.ToLower(); "
+        "$pythonLike=($nameLow -match '^python(?:w|[0-9.]*)?\\.exe$'); "
+        "if (-not $name) { "
+        "'runtime process scan unknown (pid ' + $_.ProcessId + ')' "
+        "} elseif ($pythonLike -and [string]::IsNullOrWhiteSpace($line)) { "
+        "'runtime process scan unknown (pid ' + $_.ProcessId + ')' "
+        "} elseif ($pythonLike -and "
+        "-not [string]::IsNullOrWhiteSpace($line)) { "
+        "$norm=$line.ToLower().Replace('\\','/'); "
+        "$launcherLike=($norm.Contains('launcher.pyw') -or "
+        "$norm.Contains('setup_wizard.pyw') -or "
+        "$norm.Contains('-m launcher.main')); "
+        "if ($launcherLike) { if ($norm.Contains($root)) { "
+        "'pid ' + $_.ProcessId } else { "
+        "'runtime process scan unknown (pid ' + $_.ProcessId + ')' } } } }; "
+        "'runtime process scan ok (count ' + $all.Count + ')'"
     )
     try:
         result = subprocess.run(
@@ -236,11 +591,48 @@ def _launcher_processes_via_cim() -> list[str]:
             timeout=8,
             **_hidden_kwargs(),
         )
-    except Exception:
-        return []
+    except Exception as exc:
+        raise RuntimeError("launcher scan unavailable") from exc
     if result.returncode != 0:
-        return []
-    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        raise RuntimeError(
+            f"launcher scan failed (returncode {result.returncode})"
+        )
+    if (result.stderr or "").strip():
+        raise RuntimeError("launcher scan unavailable")
+    lines = [
+        line.strip()
+        for line in (result.stdout or "").splitlines()
+        if line.strip()
+    ]
+    sentinel = (
+        re.fullmatch(
+            r"runtime process scan ok \(count ([1-9][0-9]*)\)",
+            lines[-1],
+        )
+        if lines
+        else None
+    )
+    if sentinel is None or int(sentinel.group(1)) < 2:
+        raise RuntimeError("launcher scan returned malformed CIM output")
+    out: list[str] = []
+    seen: set[int] = set()
+    current = os.getpid()
+    for text in lines[:-1]:
+        if re.fullmatch(
+            r"runtime process scan unknown \(pid [1-9][0-9]*\)",
+            text,
+        ):
+            raise RuntimeError("launcher scan returned incomplete CIM output")
+        match = re.fullmatch(r"pid ([1-9][0-9]*)", text)
+        if match is None:
+            raise RuntimeError("launcher scan returned malformed CIM output")
+        pid = int(match.group(1))
+        if pid == current:
+            raise RuntimeError("launcher scan returned malformed CIM output")
+        if pid not in seen:
+            seen.add(pid)
+            out.append(text)
+    return out
 
 
 def _wait_for_launcher_exit(parent_pid: int, timeout: float = 45.0) -> None:
@@ -257,13 +649,18 @@ def _wait_for_launcher_exit(parent_pid: int, timeout: float = 45.0) -> None:
 def _restart_launcher() -> None:
     vbs = ROOT / "OBSIDIAN.vbs"
     bat = ROOT / "start_launcher.bat"
-    if vbs.exists():
-        subprocess.Popen(["wscript.exe", str(vbs)], cwd=str(ROOT), **_hidden_kwargs())
-        return
-    if bat.exists():
-        subprocess.Popen(["cmd.exe", "/c", str(bat)], cwd=str(ROOT), **_hidden_kwargs())
-        return
-    subprocess.Popen([sys.executable, str(ROOT / "launcher.pyw")], cwd=str(ROOT), **_hidden_kwargs())
+    with process_start_guard(ROOT):
+        if vbs.exists():
+            subprocess.Popen(["wscript.exe", str(vbs)], cwd=str(ROOT), **_hidden_kwargs())
+            return
+        if bat.exists():
+            subprocess.Popen(["cmd.exe", "/c", str(bat)], cwd=str(ROOT), **_hidden_kwargs())
+            return
+        subprocess.Popen(
+            [sys.executable, str(ROOT / "launcher.pyw")],
+            cwd=str(ROOT),
+            **_hidden_kwargs(),
+        )
 
 
 def _run_update() -> int:
@@ -273,12 +670,11 @@ def _run_update() -> int:
             _append_log(f"Nutze externe temporaere Update-Runtime: {runtime_copy}")
         cmd = [update_python, str(ROOT / "tools" / "update_from_git.py")]
         _append_log("Starte Update: " + " ".join(cmd))
-        proc = subprocess.run(
+        proc = run_bounded_capture(
             cmd,
             cwd=str(ROOT),
-            text=True,
-            capture_output=True,
             timeout=7200,
+            wrapper_python=update_python,
             **_hidden_kwargs(),
         )
     if proc.stdout:
@@ -313,6 +709,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main_impl(args: argparse.Namespace) -> int:
     restart_after_update = False
+    launcher_exited = False
     try:
         _write_status(
             "running",
@@ -323,6 +720,7 @@ def _main_impl(args: argparse.Namespace) -> int:
         _append_log("=" * 72)
         _append_log(f"Runner gestartet, parent pid={args.parent_pid}")
         _wait_for_launcher_exit(args.parent_pid)
+        launcher_exited = True
         rc = _run_update()
         if rc == 0:
             _write_status("success", "Update abgeschlossen", rc)
@@ -343,7 +741,12 @@ def _main_impl(args: argparse.Namespace) -> int:
             )
         return 1
     finally:
-        if args.restart:
+        marker_retained = True
+        try:
+            marker_retained = update_marker_exists(UPDATE_MARKER.parent)
+        except Exception as exc:
+            _append_log(f"Update-Marker nicht sicher pruefbar: {exc}")
+        if args.restart and launcher_exited and not marker_retained:
             try:
                 time.sleep(0.8)
                 _restart_launcher()
@@ -356,6 +759,15 @@ def _main_impl(args: argparse.Namespace) -> int:
                     )
             except Exception as exc:
                 _append_log(f"Launcher-Neustart fehlgeschlagen: {exc}")
+        elif args.restart and not launcher_exited:
+            _append_log(
+                "Launcher-Neustart unterdrueckt, weil der urspruengliche "
+                "Launcher nicht beendet wurde."
+            )
+        elif args.restart:
+            _append_log(
+                "Launcher-Neustart wegen behaltenem Update-Recovery-Marker ausgesetzt."
+            )
 
 
 def _status_text() -> str:

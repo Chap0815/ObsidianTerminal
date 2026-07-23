@@ -37,6 +37,8 @@ from bot_utils import (
     calc_liquidation_price,
     distance_to_liquidation_pct,
     check_spread_ok,
+    extract_valid_top_of_book,
+    has_valid_spread_quotes,
     record_slippage,
     create_order_with_retry,
     extract_or_estimate_futures_fee,
@@ -74,6 +76,17 @@ class FuturesScanMixin:
             return float(default)
         return parsed
 
+    def _oversize_notional_ceiling(self, leverage: float) -> float:
+        safe_leverage = self._positive_float(leverage, 1.0)
+        max_margin = self._finite_float(
+            self.C("POSITION_SIZE_MAX", 50.0), 50.0
+        )
+        derived = max(1.0, max_margin) * safe_leverage * 3.0
+        configured = self._positive_float(
+            os.getenv("FUT_MAX_NOTIONAL_USDT"), 0.0
+        )
+        return configured if configured > 0.0 else derived
+
     def _entry_quality_min_score(self) -> float:
         raw = self._finite_float(self.C("ENTRY_QUALITY_MIN_SCORE", 75.0), 75.0)
         return max(0.0, min(100.0, raw))
@@ -84,14 +97,15 @@ class FuturesScanMixin:
 
     @staticmethod
     def _spread_pct_from_ticker(ticker: dict | None) -> float | None:
-        if not isinstance(ticker, dict):
+        if not has_valid_spread_quotes(ticker):
             return None
-        bid = FuturesScanMixin._positive_float(ticker.get("bid"))
-        ask = FuturesScanMixin._positive_float(ticker.get("ask"))
-        mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
-        if mid <= 0:
+        bid = float(ticker["bid"])
+        ask = float(ticker["ask"])
+        mid = (bid + ask) / 2.0
+        if not math.isfinite(mid) or mid <= 0.0:
             return None
-        return (ask - bid) / mid * 100.0
+        spread_pct = (ask - bid) / mid * 100.0
+        return spread_pct if math.isfinite(spread_pct) else None
 
     def _cleanup_rolled_back_futures_entry_state(
         self,
@@ -112,15 +126,48 @@ class FuturesScanMixin:
         if removed:
             return True
         try:
-            if self.state.has(sym):
-                self.state.update_many(sym, restore)
-                return False
+            return bool(self.state.release_claim_if_absent(sym))
         except Exception as exc:
-            self._log_error(
-                f"mark rolled-back futures entry cleanup pending {sym}", exc)
-        from core.database import remove_open_position
-        remove_open_position(self.BOT_NAME, sym)
-        return False
+            self._log_error(f"retry rolled-back futures entry cleanup {sym}", exc)
+            return False
+
+    def _release_untracked_futures_entry_claim(
+        self,
+        sym: str,
+        reason: str,
+    ) -> bool:
+        from core.logger import log_event
+
+        try:
+            released = bool(self.state.release_claim_if_absent(sym))
+        except Exception as exc:
+            self._log_error(f"release untracked futures entry claim {sym}", exc)
+            released = False
+        if not released:
+            log_event(
+                f"{sym}: claim cleanup deferred after {reason}; current "
+                "state/claim kept fail-closed",
+                "WARN",
+            )
+        return released
+
+    def _mark_futures_entry_recovery_pending(self) -> None:
+        lock = getattr(self, "_entry_recovery_lock", None)
+        if lock is None:
+            self._entry_recovery_generation = (
+                int(getattr(self, "_entry_recovery_generation", 0)) + 1
+            )
+            self._entry_recovery_blocked = True
+        else:
+            with lock:
+                self._entry_recovery_generation = (
+                    int(getattr(self, "_entry_recovery_generation", 0)) + 1
+                )
+                self._entry_recovery_blocked = True
+        wakeup = getattr(self, "_reconcile_wakeup_event", None)
+        setter = getattr(wakeup, "set", None)
+        if callable(setter):
+            setter()
 
     def _scan_loop(self):
         from core.logger import log_event, send_telegram
@@ -562,7 +609,7 @@ class FuturesScanMixin:
         if not self.simulation:
             try:
                 entry_ticker = self.ticker_cache.get(self.ex, symbol_full, timeout=4.0)
-                if not entry_ticker.get("bid") or not entry_ticker.get("ask"):
+                if not has_valid_spread_quotes(entry_ticker):
                     if not try_consume_api_call(
                         "futures_entry_fetch_spread_book"
                     ):
@@ -573,13 +620,20 @@ class FuturesScanMixin:
                         )
                         return
                     ob = self.ex.fetch_order_book(symbol_full, limit=5)
-                    bids = (ob or {}).get("bids") or []
-                    asks = (ob or {}).get("asks") or []
-                    entry_ticker = dict(entry_ticker)
-                    if bids:
-                        entry_ticker["bid"] = bids[0][0]
-                    if asks:
-                        entry_ticker["ask"] = asks[0][0]
+                    top = extract_valid_top_of_book(ob)
+                    if top is None:
+                        log_event(
+                            f"{sym}: {direction} blocked  invalid spread "
+                            "order book",
+                            "WAIT",
+                        )
+                        return
+                    entry_ticker = (
+                        dict(entry_ticker)
+                        if isinstance(entry_ticker, dict)
+                        else {}
+                    )
+                    entry_ticker["bid"], entry_ticker["ask"] = top
                 entry_spread_pct = self._spread_pct_from_ticker(entry_ticker)
                 if not check_spread_ok(entry_ticker, log_event=log_event,
                                        symbol=sym, missing_ok=False):
@@ -828,6 +882,7 @@ class FuturesScanMixin:
         fill_price = entry_price
         fees_paid = 0.0
         entry_verified = bool(self.simulation)
+        entry_time = _utc_now_str()
 
         if self.simulation:
             try:
@@ -1044,8 +1099,10 @@ class FuturesScanMixin:
                         log_event=log_event,
                         log_struct=log_struct,
                     )
-                from core.database import (claim_symbol_for_entry,
-                                           remove_open_position)
+                entry_notional_ceiling = self._oversize_notional_ceiling(
+                    leverage
+                )
+                from core.database import claim_symbol_for_entry
                 if not claim_symbol_for_entry(
                     self.BOT_NAME,
                     sym,
@@ -1053,6 +1110,8 @@ class FuturesScanMixin:
                     intent_id=entry_id,
                     notional_usdt=notional,
                     mode=entry_mode,
+                    contract_size=contract_size,
+                    oversize_notional_ceiling=entry_notional_ceiling,
                 ):
                     log_event(f"{sym} claimed by another bot  skip "
                               f"(coexistence)", "WAIT")
@@ -1101,7 +1160,20 @@ class FuturesScanMixin:
                 filled_raw = order.get("filled")
                 amount = self._positive_float(filled_raw)
                 entry_verified = amount > 0
+                latest_order = order
+                latest_order_identity_conflict = False
                 if amount <= 0:
+                    from bot_utils.futures_order import (
+                        _exchange_id,
+                        _explicit_order_ids,
+                        _order_request_conflicts,
+                        _requested_position_side,
+                    )
+
+                    original_order_ids = _explicit_order_ids(order)
+                    expected_position_side = _requested_position_side(
+                        _entry_order_params(_cid)
+                    )
                     oid = order.get("id") or order.get("orderId")
                     if oid:
                         import time as _t
@@ -1129,6 +1201,32 @@ class FuturesScanMixin:
                                 break
                             try:
                                 refreshed = self.ex.fetch_order(str(oid), symbol_full)
+                                if isinstance(refreshed, dict) and refreshed:
+                                    refreshed_ids = _explicit_order_ids(refreshed)
+                                    identity_conflict = (
+                                        bool(original_order_ids)
+                                        and bool(refreshed_ids)
+                                        and refreshed_ids != original_order_ids
+                                    ) or _order_request_conflicts(
+                                        refreshed,
+                                        symbol_full,
+                                        side,
+                                        expected_position_side,
+                                        _exchange_id(self.ex),
+                                        expected_reduce_only=False,
+                                        allow_one_way_position_side=True,
+                                        expected_client_id=_cid,
+                                        expected_amount=amount_contracts,
+                                    )
+                                    if identity_conflict:
+                                        latest_order_identity_conflict = True
+                                        log_event(
+                                            f"{sym}: entry fill refresh identity "
+                                            "conflict; claim kept pending recovery",
+                                            "ERROR",
+                                        )
+                                        continue
+                                    latest_order = refreshed
                                 rf = self._positive_float(
                                     (refreshed or {}).get("filled"))
                                 if rf > 0:
@@ -1154,7 +1252,10 @@ class FuturesScanMixin:
                     try:
                         from bot_utils import fetch_open_position
                         pos, positions_unavailable = fetch_open_position(
-                            self.ex, symbol_full)
+                            self.ex,
+                            symbol_full,
+                            expected_position_side=direction,
+                        )
                         if pos is not None:
                             real_amt = abs(self._finite_float(
                                 pos.get("contracts") or pos.get("size")))
@@ -1174,6 +1275,42 @@ class FuturesScanMixin:
                     except Exception:
                         positions_unavailable = True
                     if amount <= 0 and not positions_unavailable:
+                        from bot_utils.futures_order import (
+                            _order_confirmed_terminal_zero_fill,
+                        )
+
+                        if (
+                            latest_order_identity_conflict
+                            or _order_request_conflicts(
+                                latest_order,
+                                symbol_full,
+                                side,
+                                expected_position_side,
+                                _exchange_id(self.ex),
+                                expected_reduce_only=False,
+                                allow_one_way_position_side=True,
+                                expected_client_id=_cid,
+                                expected_amount=amount_contracts,
+                            )
+                            or not _order_confirmed_terminal_zero_fill(latest_order)
+                        ):
+                            self._mark_futures_entry_recovery_pending()
+                            emit_entry_lifecycle(
+                                entry_id,
+                                bot=self.BOT_NAME,
+                                symbol=sym,
+                                stage="order_unknown",
+                                mode=entry_mode,
+                                reason="entry_order_not_terminal",
+                                direction=direction,
+                            )
+                            log_event(
+                                f"{sym}: order has no verified fill or position "
+                                "but is not proven terminal; claim kept pending "
+                                "reconciliation",
+                                "ERROR",
+                            )
+                            return
                         emit_entry_lifecycle(
                             entry_id, bot=self.BOT_NAME, symbol=sym,
                             stage="order_failed", mode=entry_mode,
@@ -1182,7 +1319,9 @@ class FuturesScanMixin:
                             f"{sym}: order returned no fill and no exchange "
                             f"position was found  aborting state write",
                             "WARN")
-                        remove_open_position(self.BOT_NAME, sym)
+                        self._release_untracked_futures_entry_claim(
+                            sym, "terminal zero-fill futures entry"
+                        )
                         return
                     if amount > 0 and positions_verified:
                         entry_verified = True
@@ -1195,18 +1334,185 @@ class FuturesScanMixin:
                     amount = float(amount_contracts)
                     entry_verified = False
 
-                #  POST-OPEN VERIFICATION 
+                # Normalize the actual fill before any post-open branch. The
+                # oversize rollback is a real round trip and therefore needs
+                # the same entry price, margin and fee evidence as a normal
+                # position before a close can be attempted safely.
+                for key in ("average", "price"):
+                    value = order.get(key)
+                    if value:
+                        try:
+                            parsed = float(value)
+                            if math.isfinite(parsed) and parsed > 0:
+                                fill_price = parsed
+                                break
+                        except (ValueError, TypeError, OverflowError):
+                            continue
+                try:
+                    fees_paid = extract_or_estimate_futures_fee(
+                        self.ex,
+                        order,
+                        symbol_full,
+                        fill_price,
+                        amount=amount,
+                        contract_size=contract_size,
+                    )
+                except Exception as fee_error:
+                    fees_paid = 0.0
+                    log_event(
+                        f"{sym}: entry fee extraction failed "
+                        f"({type(fee_error).__name__})  recorded 0",
+                        "INFO",
+                    )
+
+                liq_price = calc_liquidation_price(
+                    fill_price, leverage, direction, mm_rate
+                )
+                raw_margin, margin_from_fill = filled_margin_usdt(
+                    amount,
+                    contract_size,
+                    fill_price,
+                    leverage,
+                    margin_usdt,
+                )
+                actual_margin = round(float(raw_margin), 6)
+
+                # Check the physical fill against the intended exposure before
+                # persisting state, so the forced rollback intent is part of
+                # the very first restart-visible row.
+                intended_notional = float(margin_usdt) * float(leverage)
+                try:
+                    real_notional = (
+                        float(amount) * float(contract_size) * float(fill_price)
+                    )
+                except (ValueError, TypeError):
+                    real_notional = 0.0
+                ratio = real_notional / max(intended_notional, 1e-9)
+                oversized = (
+                    real_notional > 0
+                    and (
+                        ratio > 2.0
+                        or intended_notional > entry_notional_ceiling
+                    )
+                )
+
+                entry_time = _utc_now_str()
+                provisional_data = {
+                    "position_type": direction,
+                    "buy": fill_price,
+                    "highest": fill_price,
+                    "buy_time": entry_time,
+                    "invested_usdt": actual_margin,
+                    "leverage": leverage,
+                    "margin_mode": margin_mode,
+                    "liquidation_price": liq_price,
+                    "initial_liq_distance": distance_to_liquidation_pct(
+                        fill_price, liq_price, direction
+                    ),
+                    "amount": amount,
+                    "original_amount": amount,
+                    "rsi_15m": r["rsi_15m"],
+                    "rsi_1h": r["rsi_1h"],
+                    "rsi_4h": r["rsi_4h"],
+                    "change_pct": r["change_percent"],
+                    "funding_paid": 0.0,
+                    "entry_id": entry_id,
+                    "entry_intended_notional": intended_notional,
+                    "entry_contract_size": contract_size,
+                    "entry_oversize_notional_ceiling": (
+                        entry_notional_ceiling
+                    ),
+                    "entry_quality_score": quality.score,
+                    "entry_quality_label": quality.label,
+                    "entry_quality_reasons": ",".join(quality.reasons),
+                    "initial_entry_fee": fees_paid,
+                    "fees_paid": fees_paid,
+                    "partial_sold": False,
+                    "break_even": False,
+                    "be_active": False,
+                    "provisional": True,
+                }
+                if oversized:
+                    provisional_data.update({
+                        "oversize_rollback_pending": True,
+                        "oversize_rollback_reason": "Oversized Entry Rollback",
+                        "oversize_intended_notional": intended_notional,
+                        "oversize_real_notional": real_notional,
+                    })
+                try:
+                    provisional_ok = self.state.add(sym, provisional_data)
+                except Exception as state_error:
+                    provisional_ok = False
+                    self._log_error(
+                        f"durable futures entry state {sym}", state_error
+                    )
+                if provisional_ok is False:
+                    log_event(
+                        f"{sym}: provisional state-write returned False; "
+                        f"claim retained until recovery is durable",
+                        "ERROR",
+                    )
+                state_getter = getattr(self.state, "get", None)
+                try:
+                    managed_row = (
+                        state_getter(sym)
+                        if callable(state_getter)
+                        else (
+                            provisional_data
+                            if provisional_ok is not False
+                            else None
+                        )
+                    )
+                except Exception as state_error:
+                    managed_row = None
+                    try:
+                        self._log_error(
+                            f"read durable futures entry state {sym}",
+                            state_error,
+                        )
+                    except Exception:
+                        pass
+                managed_close_available = (
+                    isinstance(managed_row, dict)
+                    and managed_row.get("entry_id") == entry_id
+                )
+                if provisional_ok is False and managed_close_available:
+                    log_event(
+                        f"{sym}: state add reported undurable but the matching "
+                        f"generation remains managed; using durable close "
+                        f"recovery pipeline",
+                        "WARN",
+                    )
+                try:
+                    record_slippage(
+                        entry_price,
+                        fill_price,
+                        symbol=sym,
+                        side="sell" if direction == "SHORT" else "buy",
+                        trigger_safe_mode=self.safe_mode.trigger,
+                        log_event=log_event,
+                    )
+                except Exception as slippage_error:
+                    log_event(
+                        f"{sym}: slippage telemetry failed "
+                        f"({type(slippage_error).__name__}); entry recovery "
+                        f"continues from durable state",
+                        "WARN",
+                    )
+                    try:
+                        self._log_error(
+                            f"futures entry slippage {sym}", slippage_error
+                        )
+                    except Exception:
+                        pass
+
+                #  POST-OPEN VERIFICATION
                 # Check against REALITY: after the fill, compute the true
                 # notional from the actual filled amount and contractSize, and
                 # compare to what we intended (margin * leverage). If the real
                 # position is wildly larger (contract_size bug), the order was
                 # mis-sized: emergency-close it immediately and abort. Measures
                 # the real order rather than trusting the formula.
-                intended_notional = float(margin_usdt) * float(leverage)
-                try:
-                    real_notional = float(amount) * float(contract_size) * float(fill_price)
-                except (ValueError, TypeError):
-                    real_notional = 0.0
                 #  Oversize detection  RATIO-FIRST, never on healthy size 
                 # A position whose REAL notional matches what we INTENDED
                 # (ratio ~1.0x) is correctly sized by definition and is never
@@ -1222,21 +1528,8 @@ class FuturesScanMixin:
                 #      for config drift / Kelly growth. Checks INTENDED (not
                 #      real), so a correctly-sized position can never trip it.
                 #      Env FUT_MAX_NOTIONAL_USDT overrides the derived ceiling.
-                ratio = real_notional / max(intended_notional, 1e-9)
-                try:
-                    _max_margin = float(self.C("POSITION_SIZE_MAX", 50.0))
-                except (ValueError, TypeError):
-                    _max_margin = 50.0
-                _derived_ceiling = max(1.0, _max_margin) * float(leverage) * 3.0
-                _env_cap = os.getenv("FUT_MAX_NOTIONAL_USDT")
-                try:
-                    ceiling = float(_env_cap) if _env_cap else _derived_ceiling
-                except (ValueError, TypeError):
-                    ceiling = _derived_ceiling
-                oversized = (real_notional > 0
-                             and (ratio > 2.0
-                                  or intended_notional > ceiling))
                 if oversized:
+                    rollback_complete = False
                     log_event(
                         f" {sym}: POSITION OVERSIZED  real notional "
                         f"{real_notional:.0f} USDT vs intended "
@@ -1249,92 +1542,130 @@ class FuturesScanMixin:
                                intended_notional=intended_notional,
                                contract_size=contract_size,
                                ratio=real_notional / max(intended_notional, 1))
-                    # Emergency reduce-only close of exactly what we hold. Use
-                    # the retry wrapper (transient errors) and VERIFY flat  a
-                    # partial fill must not leave an untracked oversized orphan.
-                    _closed_ok = False
-                    try:
-                        from bot_utils import verify_position_closed
-                        from config.exchange_config import reduce_only_params
-                        close_side = "sell" if direction == "LONG" else "buy"
-                        # Route through the single source of truth (per-exchange:
-                        # OKX tdMode, Binance one-way omits positionSide  -4061)
-                        # instead of a hand-built dict, matching every other close.
-                        close_params = reduce_only_params(
-                            position_side=("long" if direction == "LONG" else "short"),
-                            margin_mode=margin_mode,
-                            leverage=_lev_int,
-                        )
-                        create_order_with_retry(
-                            self.ex, symbol_full, close_side, amount,
-                            params=close_params,
-                            shutdown_event=self._shutdown_event,
-                            action_label=f"oversize-close {sym}",
-                            log_event=log_event, log_struct=log_struct,
-                        )
-                        closed, _rem = verify_position_closed(self.ex, symbol_full)
-                        _closed_ok = bool(closed)
-                        if _closed_ok:
-                            log_event(f"{sym}: oversized position emergency-closed "
-                                      f"(verified flat)", "WARN")
-                        else:
-                            log_event(f" {sym}: oversize close incomplete "
-                                      f"({_rem:.6f} left)  handing residual to "
-                                      f"monitor", "ERROR")
-                    except Exception as _ce:
-                        _exch = getattr(self.ex, "name", None) or "the exchange"
-                        log_event(
-                            f" {sym}: EMERGENCY CLOSE FAILED ({_ce})  "
-                            f"CLOSE MANUALLY ON {_exch} NOW!", "ERROR")
-                        log_struct("futures_emergency_close_failed",
-                                   symbol=sym, error=str(_ce))
-
-                    residual_state = False
-                    if not _closed_ok:
-                        # Position (or a residual) is still open on the exchange.
-                        # Write provisional state so it stays visible to
-                        # self.state and the normal exit machinery keeps reducing
-                        # it (reduce-only caps to the real size; reconcile heals
-                        # the rest)  otherwise a leveraged position runs
-                        # completely unmanaged.
+                    if managed_close_available:
                         try:
-                            added_residual = self.state.add(sym, {
-                                "position_type": direction,
-                                "buy": entry_price,
-                                "highest": entry_price,
-                                "buy_time": _utc_now_str(),
-                                "invested_usdt": margin_usdt,
-                                "leverage": leverage,
-                                "margin_mode": margin_mode,
-                                "liquidation_price": liq_price,
-                                "amount": amount,
-                                "original_amount": amount,
-                                "funding_paid": 0.0,
-                                "entry_id": entry_id,
-                                "entry_quality_score": quality.score,
-                                "entry_quality_label": quality.label,
-                                "entry_quality_reasons": ",".join(quality.reasons),
-                                "initial_entry_fee": 0.0,
-                                "fees_paid": 0.0,
-                                "partial_sold": False,
-                                "break_even": False,
-                                "be_active": False,
-                                "provisional": True,
-                            })
-                            if added_residual is False:
-                                log_event(
-                                    f" {sym}: residual state registration "
-                                    f"returned False; claim kept, manual "
-                                    f"recovery required", "ERROR")
-                            else:
-                                residual_state = True
-                                log_event(
-                                    f"{sym}: failed/partial close handed to "
-                                    f"monitor for managed exit", "WARN")
-                        except Exception as _se:
+                            from core.symbol_locks import close_lock
+
+                            with close_lock(
+                                sym, bot_name=self.BOT_NAME
+                            ) as acquired:
+                                if not acquired:
+                                    log_event(
+                                        f" {sym}: oversize rollback close lock "
+                                        f"unavailable; state and claim retained",
+                                        "ERROR",
+                                    )
+                                else:
+                                    live = self.state.get(sym)
+                                    live_entry_id = (
+                                        live.get("entry_id")
+                                        if isinstance(live, dict)
+                                        else None
+                                    )
+                                    if live is None or live_entry_id != entry_id:
+                                        rollback_complete = True
+                                        log_event(
+                                            f"{sym}: oversize rollback generation "
+                                            f"already changed; stale close skipped",
+                                            "WARN",
+                                        )
+                                    else:
+                                        self._execute_full_close(
+                                            sym,
+                                            live,
+                                            fill_price,
+                                            0.0,
+                                            0.0,
+                                            fill_price,
+                                            liq_price,
+                                            actual_margin,
+                                            leverage,
+                                            direction,
+                                            reason="Oversized Entry Rollback",
+                                        )
+                                        after = self.state.get(sym)
+                                        rollback_complete = (
+                                            not isinstance(after, dict)
+                                            or after.get("entry_id") != entry_id
+                                        )
+                        except Exception as close_error:
+                            self._log_error(
+                                f"durable oversized-entry rollback {sym}",
+                                close_error,
+                            )
                             log_event(
-                                f" {sym}: could not register orphan for "
-                                f"monitoring ({_se})  CLOSE MANUALLY!", "ERROR")
+                                f" {sym}: durable emergency close failed "
+                                f"({close_error}); state and claim retained",
+                                "ERROR",
+                            )
+                    else:
+                        # Risk reduction still takes precedence when the local
+                        # write-ahead store is unavailable. Never release the
+                        # claim after this fallback: exact accounting and
+                        # restart recovery are not durable.
+                        self._mark_futures_entry_recovery_pending()
+                        try:
+                            from bot_utils import verify_position_closed
+                            from config.exchange_config import reduce_only_params
+                            from core.symbol_locks import close_lock
+
+                            close_side = "sell" if direction == "LONG" else "buy"
+                            close_params = reduce_only_params(
+                                position_side=(
+                                    "long" if direction == "LONG" else "short"
+                                ),
+                                margin_mode=margin_mode,
+                                leverage=_lev_int,
+                            )
+                            with close_lock(
+                                sym,
+                                bot_name=self.BOT_NAME,
+                                fail_open=True,
+                            ) as acquired:
+                                if not acquired:
+                                    raise RuntimeError(
+                                        "oversize fallback close lock unavailable"
+                                    )
+                                create_order_with_retry(
+                                    self.ex,
+                                    symbol_full,
+                                    close_side,
+                                    amount,
+                                    params=close_params,
+                                    shutdown_event=self._shutdown_event,
+                                    action_label=f"oversize-close {sym}",
+                                    log_event=log_event,
+                                    log_struct=log_struct,
+                                )
+                                closed, remaining = verify_position_closed(
+                                    self.ex,
+                                    symbol_full,
+                                    expected_position_side=direction,
+                                )
+                            level = "ERROR"
+                            if closed:
+                                detail = "verified flat but accounting is undurable"
+                            else:
+                                detail = f"{remaining:.6f} contracts remain"
+                            log_event(
+                                f" {sym}: oversize fallback close {detail}; "
+                                f"claim retained for manual recovery",
+                                level,
+                            )
+                        except Exception as close_error:
+                            exchange_name = (
+                                getattr(self.ex, "name", None) or "the exchange"
+                            )
+                            log_event(
+                                f" {sym}: EMERGENCY CLOSE FAILED ({close_error})  "
+                                f"CLOSE MANUALLY ON {exchange_name} NOW!",
+                                "ERROR",
+                            )
+                            log_struct(
+                                "futures_emergency_close_failed",
+                                symbol=sym,
+                                error=str(close_error),
+                            )
                     # Cooldown so we don't immediately re-open the same trap.
                     try:
                         from trading.cooldown_utils import set_cooldown
@@ -1347,18 +1678,17 @@ class FuturesScanMixin:
                             set_cooldown(self.cool, sym, 120, _cdfile)
                     except Exception as _cde:
                         log_event(f"{sym}: cooldown set failed ({_cde})", "WARN")
-                    if _closed_ok:
-                        remove_open_position(self.BOT_NAME, sym)
+                    if managed_close_available and rollback_complete:
                         emit_entry_lifecycle(
                             entry_id, bot=self.BOT_NAME, symbol=sym,
                             stage="aborted", mode=entry_mode,
                             reason="oversized_entry_rolled_back",
                             direction=direction)
-                    elif residual_state:
+                    elif managed_close_available:
                         emit_entry_lifecycle(
                             entry_id, bot=self.BOT_NAME, symbol=sym,
                             stage="opened", mode=entry_mode,
-                            reason="oversized_residual_managed",
+                            reason="oversized_rollback_recovery_managed",
                             direction=direction, provisional=True)
                     else:
                         emit_entry_lifecycle(
@@ -1367,101 +1697,6 @@ class FuturesScanMixin:
                             reason="oversized_residual_untracked",
                             direction=direction)
                     return
-
-                # Orphan detection. If amount is still 0 after the order, the
-                # position IS on the exchange but TradeState will reject the
-                # add()  position becomes invisible to the bot. Loud warning +
-                # struct log so the user can manually verify and close.
-                if amount <= 0:
-                    log_event(
-                        f" {sym}: ORPHAN RISK  order placed but "
-                        f"filled=0 returned. Check Bitget manually!",
-                        "WARN"
-                    )
-                    log_struct("futures_orphan_risk",
-                                symbol=sym, direction=direction,
-                                requested=amount_contracts,
-                                order_id=str(order.get("id", "")))
-                    emit_entry_lifecycle(
-                        entry_id, bot=self.BOT_NAME, symbol=sym,
-                        stage="order_failed", mode=entry_mode,
-                        reason="zero_amount_orphan_risk", direction=direction)
-                    remove_open_position(self.BOT_NAME, sym)
-                    return
-
-                #  Zombie protection: write provisional state IMMEDIATELY 
-                provisional_ok = self.state.add(sym, {
-                    "position_type": direction,
-                    "buy": entry_price,
-                    "highest": entry_price,
-                    "buy_time": _utc_now_str(),
-                    "invested_usdt": margin_usdt,
-                    "leverage": leverage,
-                    "margin_mode": margin_mode,
-                    "liquidation_price": liq_price,
-                    "initial_liq_distance": distance_to_liquidation_pct(
-                        entry_price, liq_price, direction),
-                    "amount": amount,
-                    "original_amount": amount,
-                    "funding_paid": 0.0,
-                    "entry_id": entry_id,
-                    "entry_quality_score": quality.score,
-                    "entry_quality_label": quality.label,
-                    "entry_quality_reasons": ",".join(quality.reasons),
-                    "initial_entry_fee": 0.0,
-                    "fees_paid": 0.0,
-                    "partial_sold": False,
-                    "break_even": False,
-                    "be_active": False,
-                    "provisional": True,
-                })
-                if provisional_ok is False:
-                    log_event(
-                        f"{sym}: provisional state-write returned False; "
-                        f"final state write must recover before claim release",
-                        "WARN")
-
-                # Real fill price for accurate PnL
-                for k in ("average", "price"):
-                    v = order.get(k)
-                    if v:
-                        try:
-                            fv = float(v)
-                            if math.isfinite(fv) and fv > 0:
-                                fill_price = fv
-                                break
-                        except (ValueError, TypeError, OverflowError):
-                            continue
-
-                try:
-                    # Refetch+estimate variant so the entry fee is recorded
-                    # even when Bitget returns fee=0 on the initial market-order
-                    # response (very common).
-                    fees_paid = extract_or_estimate_futures_fee(
-                        self.ex, order, symbol_full, fill_price,
-                        amount=amount, contract_size=contract_size,
-                    )
-                except Exception as _fee_e:
-                    # A transient fetch hiccup here must NOT bubble to the outer
-                    # handler, which would mistake this filled order for a failed
-                    # one and skip the final trade record. Record 0 and continue.
-                    fees_paid = 0.0
-                    log_event(
-                        f"{sym}: entry fee extraction failed "
-                        f"({type(_fee_e).__name__})  recorded 0", "INFO")
-
-                # Slippage tracking + circuit breaker
-                record_slippage(
-                    entry_price, fill_price,
-                    symbol=sym,
-                    side="sell" if direction == "SHORT" else "buy",
-                    trigger_safe_mode=self.safe_mode.trigger,
-                    log_event=log_event,
-                )
-
-                # Recompute liq price with real fill
-                liq_price = calc_liquidation_price(fill_price, leverage,
-                                                     direction, mm_rate)
             except Exception as e:
                 _outcome_unknown = isinstance(
                     e, FuturesOrderOutcomeUnknown)
@@ -1478,10 +1713,54 @@ class FuturesScanMixin:
                 # leaving an untracked orphan. Reconcile-adoption is the backstop;
                 # this closes the window at the source.
                 try:
-                    from bot_utils.futures_order import _find_order_by_client_id
-                    landed = _find_order_by_client_id(self.ex, symbol_full, _cid)
+                    from bot_utils.futures_order import (
+                        _exchange_id,
+                        _find_order_by_client_id,
+                        _order_confirmed_terminal_zero_fill,
+                        _order_landed,
+                        _requested_position_side,
+                    )
+                    lookup_status = {}
+                    landed = _find_order_by_client_id(
+                        self.ex,
+                        symbol_full,
+                        _cid,
+                        expected_amount=amount_contracts,
+                        expected_side=side,
+                        expected_position_side=_requested_position_side(
+                            _entry_order_params(_cid)
+                        ),
+                        exchange_id=_exchange_id(self.ex),
+                        expected_reduce_only=False,
+                        lookup_status=lookup_status,
+                    )
+                    recovery_conflict = (
+                        landed is not None
+                        and landed.get("_bot_recovery_conflict") is True
+                    )
                     _landed_amt = self._positive_float((landed or {}).get("filled"))
-                    if landed is not None and _landed_amt > 0:
+                    recovery_unavailable = bool(
+                        lookup_status.get("unavailable")
+                    )
+                    if recovery_unavailable:
+                        _outcome_unknown = True
+                    elif (
+                        landed is not None
+                        and not recovery_conflict
+                        and _order_confirmed_terminal_zero_fill(landed)
+                    ):
+                        _outcome_unknown = False
+                    elif recovery_conflict or (
+                        landed is not None
+                        and _order_landed(landed)
+                        and _landed_amt <= 0
+                    ):
+                        _outcome_unknown = True
+                    if (
+                        landed is not None
+                        and not recovery_conflict
+                        and _landed_amt > 0
+                    ):
                         _amt = _landed_amt or float(amount_contracts)
                         added = self.state.add(sym, {
                             "position_type": direction, "buy": entry_price,
@@ -1520,7 +1799,10 @@ class FuturesScanMixin:
                                 )
                                 from bot_utils import verify_position_closed
                                 closed, remaining = verify_position_closed(
-                                    self.ex, symbol_full)
+                                    self.ex,
+                                    symbol_full,
+                                    expected_position_side=direction,
+                                )
                                 if closed:
                                     self._cleanup_rolled_back_futures_entry_state(
                                         sym,
@@ -1595,10 +1877,14 @@ class FuturesScanMixin:
         # Actual margin from the filled position. A partial entry fill must not
         # keep the intended margin, otherwise open PnL and risk gates scale too
         # high. ContractSize matters for MEXC-style swap contracts.
-        _csize = self._get_contract_size(symbol_full)
-        raw_margin, margin_from_fill = filled_margin_usdt(
-            amount, _csize, fill_price, leverage, margin_usdt)
-        actual_margin = round(float(raw_margin), 6)
+        if self.simulation:
+            _csize = self._get_contract_size(symbol_full)
+            raw_margin, margin_from_fill = filled_margin_usdt(
+                amount, _csize, fill_price, leverage, margin_usdt
+            )
+            actual_margin = round(float(raw_margin), 6)
+        else:
+            _csize = contract_size
         try:
             if margin_from_fill and margin_usdt and margin_usdt > 0:
                 fill_ratio = actual_margin / max(float(margin_usdt), 1e-9)
@@ -1615,7 +1901,7 @@ class FuturesScanMixin:
             "position_type": direction,
             "buy": fill_price,
             "highest": fill_price,
-            "buy_time": _utc_now_str(),
+            "buy_time": entry_time,
             "invested_usdt": actual_margin,
             "leverage": leverage,
             "liquidation_price": liq_price,
@@ -1674,7 +1960,11 @@ class FuturesScanMixin:
                     log_event=log_event,
                 )
                 from bot_utils import verify_position_closed
-                closed, remaining = verify_position_closed(self.ex, symbol_full)
+                closed, remaining = verify_position_closed(
+                    self.ex,
+                    symbol_full,
+                    expected_position_side=direction,
+                )
                 if closed:
                     self._cleanup_rolled_back_futures_entry_state(
                         sym, "state write failed after live futures entry")

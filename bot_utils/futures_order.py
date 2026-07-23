@@ -22,6 +22,7 @@ from typing import Tuple, Optional
 
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.network_retry import RetryForbiddenError
+from bot_utils.order_utils import strict_order_snapshot_equal
 
 
 def _utc_now_str() -> str:
@@ -76,11 +77,46 @@ def _normalize_order_symbol(symbol_full) -> str:
     return symbol_full.strip()
 
 
-def _normalize_order_side(side) -> str:
+def _normalize_order_side(side, exchange_id: str = "") -> str:
     if not isinstance(side, str):
         return ""
     normalized = side.strip().lower()
+    if exchange_id == "mexc":
+        if normalized in {"1", "2"}:
+            return "buy"
+        if normalized in {"3", "4"}:
+            return "sell"
     return normalized if normalized in {"buy", "sell"} else ""
+
+
+def _normalize_order_position_side(position_side) -> str:
+    if not isinstance(position_side, str):
+        return ""
+    normalized = position_side.strip().lower()
+    return normalized if normalized in {"long", "short"} else ""
+
+
+def _normalize_order_bool(value) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes"}:
+            return True
+        if normalized in {"0", "false", "no"}:
+            return False
+    return None
+
+
+def _mexc_contract_action(side) -> tuple[str, str, bool] | None:
+    return {
+        "1": ("buy", "long", False),
+        "2": ("buy", "short", True),
+        "3": ("sell", "short", False),
+        "4": ("sell", "long", True),
+    }.get(_order_id_text(side))
 
 
 def _normalize_order_status(status) -> str:
@@ -254,7 +290,7 @@ def _is_rate_limit_error(err_str: str) -> bool:
 _CLIENT_ID_INFO_KEYS = (
     "clientOrderId", "clientOid", "client_oid", "newClientOrderId",
     "origClientOrderId", "clientOrderID", "cl_ord_id", "clOrdId",
-    "externalOid", "external_oid",
+    "externalOid", "external_oid", "orderLinkId", "order_link_id",
 )
 
 
@@ -280,12 +316,58 @@ class FuturesOrderOutcomeUnknown(RetryForbiddenError):
         )
 
 
+class _TradeRecoveryOrder(dict):
+    """Order-shaped snapshot created only from internally aggregated trades."""
+
+
 def _first_order_id_text(*values) -> str:
     for value in values:
         text = _order_id_text(value)
         if text:
             return text
     return ""
+
+
+def _explicit_order_ids(order: dict) -> set[str]:
+    """Return every explicit venue order id carried by an order snapshot."""
+    if not isinstance(order, dict):
+        return set()
+    info = order.get("info")
+    if not isinstance(info, dict):
+        info = {}
+    info_id = None if isinstance(order, _TradeRecoveryOrder) else info.get("id")
+    return {
+        value
+        for value in (
+            _order_id_text(order.get("id")),
+            _order_id_text(order.get("orderId")),
+            _order_id_text(order.get("order_id")),
+            _order_id_text(order.get("orderID")),
+            _order_id_text(info_id),
+            _order_id_text(info.get("orderId")),
+            _order_id_text(info.get("order_id")),
+            _order_id_text(info.get("orderID")),
+            _order_id_text(info.get("ordId")),
+        )
+        if value
+    }
+
+
+def _explicit_client_order_ids(order: dict) -> set[str]:
+    """Return every explicit client order id carried by an order snapshot."""
+    if not isinstance(order, dict):
+        return set()
+    info = order.get("info")
+    if not isinstance(info, dict):
+        info = {}
+    return {
+        value
+        for value in (
+            _order_id_text(order.get("clientOrderId")),
+            *(_order_id_text(info.get(key)) for key in _CLIENT_ID_INFO_KEYS),
+        )
+        if value
+    }
 
 
 def _order_client_id_matches(o: dict, cid: str) -> bool:
@@ -307,47 +389,238 @@ def _order_client_id_matches(o: dict, cid: str) -> bool:
 
 
 def _order_client_id_conflicts(o: dict, cid: str) -> bool:
-    """True when explicit client-id evidence contains no requested id."""
+    """True when any explicit client-id evidence differs from the request."""
     if not isinstance(o, dict):
         return False
     expected = _order_id_text(cid)
     if not expected:
         return False
-    observed = set()
-    top_level = _order_id_text(o.get("clientOrderId"))
-    if top_level:
-        observed.add(top_level)
-    info = o.get("info")
-    if isinstance(info, dict):
-        for key in _CLIENT_ID_INFO_KEYS:
-            value = _order_id_text(info.get(key))
-            if value:
-                observed.add(value)
-    return bool(observed) and expected not in observed
+    observed = _explicit_client_order_ids(o)
+    return bool(observed) and observed != {expected}
+
+
+def _order_request_conflicts(
+    order: dict,
+    expected_symbol: str,
+    expected_side: str,
+    expected_position_side: str = "",
+    exchange_id: str = "",
+    expected_reduce_only: Optional[bool] = None,
+    allow_one_way_position_side: bool = False,
+    expected_client_id: Optional[str] = None,
+    expected_amount: Optional[float] = None,
+) -> bool:
+    """Reject explicit response evidence that contradicts the request."""
+    if not isinstance(order, dict):
+        return False
+    if order.get("_bot_recovery_conflict") is True:
+        return True
+    if len(_explicit_order_ids(order)) > 1:
+        return True
+    if expected_client_id and _order_client_id_conflicts(
+        order, expected_client_id
+    ):
+        return True
+    if expected_amount is not None:
+        requested = _finite_order_telemetry_value(
+            expected_amount, positive=True
+        )
+        if requested is None:
+            return True
+        tolerance = max(1e-12, requested * 1e-9)
+        raw_amount = order.get("amount")
+        if raw_amount not in (None, ""):
+            observed_amount = _finite_order_telemetry_value(
+                raw_amount, positive=True
+            )
+            if observed_amount is None:
+                return True
+            if isinstance(order, _TradeRecoveryOrder):
+                if observed_amount > requested + tolerance:
+                    return True
+            elif abs(observed_amount - requested) > tolerance:
+                return True
+        raw_filled = order.get("filled")
+        if raw_filled not in (None, ""):
+            observed_filled = _finite_order_telemetry_value(raw_filled)
+            if (
+                observed_filled is None
+                or observed_filled > requested + tolerance
+            ):
+                return True
+    if (
+        _normalize_order_status(order.get("status")) == "rejected"
+        and _order_response_has_fill_evidence(order)
+    ):
+        return True
+    raw_symbol = order.get("symbol")
+    if raw_symbol not in (None, ""):
+        observed_symbol = _normalize_order_symbol(raw_symbol)
+        if not observed_symbol or observed_symbol != expected_symbol:
+            return True
+    expected_leg = _normalize_order_position_side(expected_position_side)
+    raw_info = order.get("info")
+    if raw_info not in (None, "") and not isinstance(raw_info, dict):
+        return True
+    info = raw_info if isinstance(raw_info, dict) else {}
+    raw_side = order.get("side")
+    mexc_action = None
+    if exchange_id == "mexc":
+        raw_venue_side = info.get("side")
+        if raw_venue_side not in (None, ""):
+            venue_side = _order_id_text(raw_venue_side)
+            if venue_side not in {"1", "2", "3", "4"}:
+                return True
+            raw_side = venue_side
+            mexc_action = _mexc_contract_action(venue_side)
+    if exchange_id == "mexc" and mexc_action is None:
+        mexc_action = _mexc_contract_action(raw_side)
+    if mexc_action is not None:
+        observed_side, observed_leg, observed_reduce_only = mexc_action
+        if observed_side != expected_side:
+            return True
+        if expected_leg and observed_leg != expected_leg:
+            return True
+        if (
+            expected_reduce_only is not None
+            and observed_reduce_only is not expected_reduce_only
+        ):
+            return True
+    if raw_side not in (None, ""):
+        observed_side = _normalize_order_side(raw_side, exchange_id)
+        if not observed_side or observed_side != expected_side:
+            return True
+    sources = (order, info)
+    if expected_reduce_only is not None:
+        okx_raw_reduce_evidence = exchange_id != "okx" or any(
+            key in info
+            and info.get(key) is not None
+            and not (
+                isinstance(info.get(key), str)
+                and not info.get(key).strip()
+            )
+            for key in ("reduceOnly", "reduce_only")
+        )
+        for source in sources:
+            for key in ("reduceOnly", "reduce_only"):
+                if key not in source:
+                    continue
+                raw_reduce_only = source.get(key)
+                if raw_reduce_only is None or (
+                    isinstance(raw_reduce_only, str)
+                    and not raw_reduce_only.strip()
+                ):
+                    continue
+                observed_reduce_only = _normalize_order_bool(raw_reduce_only)
+                if (
+                    source is order
+                    and exchange_id == "okx"
+                    and raw_reduce_only is False
+                    and not okx_raw_reduce_evidence
+                ):
+                    # CCXT synthesizes top-level False for OKX place-order
+                    # acknowledgements even though the venue ACK contains no
+                    # reduce-only evidence.  Only raw info is authoritative.
+                    continue
+                if observed_reduce_only is None:
+                    return True
+                if observed_reduce_only is not expected_reduce_only:
+                    return True
+    for source in sources:
+        for key in ("positionSide", "posSide", "holdSide"):
+            raw_leg = source.get(key)
+            if raw_leg in (None, ""):
+                continue
+            observed_leg = _normalize_order_position_side(raw_leg)
+            raw_leg_text = str(raw_leg).strip().lower()
+            if expected_leg:
+                if (
+                    not observed_leg
+                    and allow_one_way_position_side
+                    and raw_leg_text in {"both", "net"}
+                ):
+                    continue
+                if not observed_leg or observed_leg != expected_leg:
+                    return True
+            elif raw_leg_text != "both":
+                return True
+    return False
+
+
+def _order_refresh_conflicts(
+    original_order: dict,
+    refreshed_order: dict,
+    expected_symbol: str,
+    expected_side: str,
+    expected_position_side: str = "",
+    exchange_id: str = "",
+    expected_reduce_only: Optional[bool] = None,
+    allow_one_way_position_side: bool = False,
+    expected_client_id: Optional[str] = None,
+    expected_amount: Optional[float] = None,
+) -> bool:
+    """Reject a refresh that cannot be bound to its original request."""
+    if not isinstance(original_order, dict) or not isinstance(
+        refreshed_order, dict
+    ):
+        return True
+    original_ids = _explicit_order_ids(original_order)
+    refreshed_ids = _explicit_order_ids(refreshed_order)
+    if len(original_ids) != 1 or len(refreshed_ids) > 1:
+        return True
+    refresh_can_release_state = (
+        _order_response_has_fill_evidence(refreshed_order)
+        or _order_confirmed_terminal_zero_fill(refreshed_order)
+    )
+    if refresh_can_release_state and refreshed_ids != original_ids:
+        return True
+    if refreshed_ids and refreshed_ids != original_ids:
+        return True
+    request = (
+        expected_symbol,
+        expected_side,
+        expected_position_side,
+        exchange_id,
+    )
+    request_options = {
+        "expected_reduce_only": expected_reduce_only,
+        "allow_one_way_position_side": allow_one_way_position_side,
+        "expected_client_id": expected_client_id,
+        "expected_amount": expected_amount,
+    }
+    return _order_request_conflicts(
+        original_order,
+        *request,
+        **request_options,
+    ) or _order_request_conflicts(
+        refreshed_order,
+        *request,
+        **request_options,
+    )
+
+
+def _requested_position_side(params: dict) -> str:
+    """Return a normalized explicit hedge leg from outbound order params."""
+    if not isinstance(params, dict):
+        return ""
+    for key in ("positionSide", "posSide", "holdSide"):
+        raw_leg = params.get(key)
+        if raw_leg not in (None, ""):
+            return _normalize_order_position_side(raw_leg)
+    return ""
 
 
 def _order_response_has_evidence(order: dict) -> bool:
     """True when a create_order response contains minimal exchange evidence."""
     if not isinstance(order, dict):
         return False
-    if _first_order_id_text(
-        order.get("id"),
-        order.get("orderId"),
-        order.get("order_id"),
-        order.get("orderID"),
-        order.get("clientOrderId"),
-    ):
+    if _explicit_order_ids(order):
+        return True
+    if _order_id_text(order.get("clientOrderId")):
         return True
     info = order.get("info")
     if isinstance(info, dict):
         if any(_order_id_text(info.get(k)) for k in _CLIENT_ID_INFO_KEYS):
-            return True
-        if _first_order_id_text(
-            info.get("orderId"),
-            info.get("order_id"),
-            info.get("orderID"),
-            info.get("id"),
-        ):
             return True
     status = _normalize_order_status(order.get("status"))
     if status in (
@@ -373,36 +646,289 @@ def _order_response_has_fill_evidence(order: dict) -> bool:
 def _order_landed(o: dict) -> bool:
     """True if a recovered order should be treated as already placed.
 
-    Accept it as "landed" when it filled, OR is live/accepted (status
-    open/new/closed/partially_filled), OR carries a real exchange id - but
-    NEVER when it is genuinely rejected/canceled/expired. MEXC/Bitget can
-    report filled=0 for hundreds of ms after an order actually landed, so a
-    filled>0-only check would let a retry fire a duplicate."""
+    Accept it when it has physical fill evidence, is live/accepted, or carries
+    a real exchange id. A terminal canceled/expired/rejected status only proves
+    no placement when there is no fill: exchanges can cancel the unfilled
+    remainder after a partial execution."""
     if not isinstance(o, dict):
         return False
-    status = _normalize_order_status(o.get("status"))
-    if status in ("rejected", "canceled", "cancelled", "expired"):
+    order_ids = _explicit_order_ids(o)
+    if len(order_ids) > 1:
         return False
-    if _finite_nonnegative_order_value(o.get("filled")) > 0:
+    status = _normalize_order_status(o.get("status"))
+    if status == "rejected":
+        return False
+    if _order_response_has_fill_evidence(o):
         return True
+    if status in ("canceled", "cancelled", "expired"):
+        return False
     if status in ("open", "new", "closed", "partially_filled", "partiallyfilled"):
         return True
-    oid = _first_order_id_text(
-        o.get("id"),
-        o.get("orderId"),
-        o.get("order_id"),
-        o.get("orderID"),
-    )
-    if not oid:
-        info = o.get("info")
-        if isinstance(info, dict):
-            oid = _first_order_id_text(
-                info.get("id"),
-                info.get("orderId"),
-                info.get("order_id"),
-                info.get("orderID"),
+    return bool(order_ids)
+
+
+def _order_confirmed_terminal_zero_fill(order: dict) -> bool:
+    """True only for explicit terminal status plus explicit zero fill."""
+    if not isinstance(order, dict):
+        return False
+    if _normalize_order_status(order.get("status")) not in (
+        "canceled",
+        "cancelled",
+        "expired",
+        "rejected",
+    ):
+        return False
+    filled = _finite_order_telemetry_value(order.get("filled"))
+    if filled != 0:
+        return False
+    info = order.get("info")
+    if isinstance(info, dict):
+        for key in (
+            "baseVolume",
+            "dealVol",
+            "dealSize",
+            "executedQty",
+            "filledSize",
+            "filledQty",
+            "filled_qty",
+            "filled_amount",
+            "cumExecQty",
+            "cumQty",
+            "accFillSz",
+        ):
+            if key not in info:
+                continue
+            raw_value = info.get(key)
+            if raw_value in (None, ""):
+                continue
+            observed = _finite_order_telemetry_value(raw_value)
+            if observed is None or observed > 0:
+                return False
+        for key in (
+            "dealMoney",
+            "cumQuote",
+            "cumExecValue",
+            "executedValue",
+            "fillNotional",
+            "filledValue",
+            "filled_total",
+            "quoteVolume",
+            "quoteSize",
+        ):
+            if key not in info:
+                continue
+            raw_value = info.get(key)
+            if raw_value in (None, ""):
+                continue
+            observed = _finite_order_telemetry_value(raw_value)
+            if observed is None or observed > 0:
+                return False
+        gate_totals = []
+        for source in (
+            info,
+            info.get("put"),
+            info.get("initial"),
+        ):
+            if source is None:
+                continue
+            if not isinstance(source, dict):
+                return False
+            for key in ("amount", "size"):
+                raw_value = source.get(key)
+                if raw_value in (None, ""):
+                    continue
+                if isinstance(raw_value, bool):
+                    return False
+                try:
+                    parsed = abs(float(raw_value))
+                except (TypeError, ValueError, OverflowError):
+                    return False
+                if not math.isfinite(parsed):
+                    return False
+                gate_totals.append(parsed)
+        raw_left = info.get("left")
+        if gate_totals and raw_left not in (None, ""):
+            if isinstance(raw_left, bool):
+                return False
+            try:
+                left = abs(float(raw_left))
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if not math.isfinite(left):
+                return False
+            for total in gate_totals:
+                tolerance = max(1e-12, total * 1e-9)
+                if left > total + tolerance or total - left > tolerance:
+                    return False
+    raw_cost = order.get("cost")
+    if raw_cost in (None, ""):
+        return True
+    cost = _finite_order_telemetry_value(raw_cost)
+    return cost == 0
+
+
+def _order_from_recovery_trades(
+    trades: list[dict],
+    cid: str,
+    symbol_full: str,
+    expected_amount: Optional[float] = None,
+) -> dict:
+    """Build one order-shaped snapshot from matching CCXT trade fills."""
+    order_ids: set[str] = set()
+    symbols: set[str] = set()
+    sides: set[str] = set()
+    fees: list[dict] = []
+    filled = 0.0
+    cost = 0.0
+    cost_known = True
+    malformed = False
+    first_info = {}
+    unique_trades: list[dict] = []
+    trades_by_id: dict[str, dict] = {}
+
+    for trade in trades:
+        info = trade.get("info")
+        if not isinstance(info, dict):
+            info = {}
+        trade_ids = {
+            value
+            for value in (
+                _order_id_text(trade.get("id")),
+                _order_id_text(trade.get("tradeId")),
+                _order_id_text(info.get("tradeId")),
+                _order_id_text(info.get("trade_id")),
+                _order_id_text(info.get("execId")),
+                _order_id_text(info.get("fillId")),
             )
-    return bool(oid)
+            if value
+        }
+        if len(trade_ids) != 1:
+            malformed = True
+            unique_trades.append(trade)
+            continue
+        trade_id = next(iter(trade_ids))
+        previous = trades_by_id.get(trade_id)
+        if previous is not None:
+            if not strict_order_snapshot_equal(previous, trade):
+                malformed = True
+            continue
+        trades_by_id[trade_id] = trade
+        unique_trades.append(trade)
+
+    for trade in unique_trades:
+        info = trade.get("info")
+        if not isinstance(info, dict):
+            info = {}
+        if not first_info:
+            first_info = dict(info)
+        observed_order_ids = {
+            value
+            for value in (
+                _order_id_text(trade.get("order")),
+                _order_id_text(trade.get("orderId")),
+                _order_id_text(trade.get("order_id")),
+                _order_id_text(trade.get("orderID")),
+                _order_id_text(info.get("orderId")),
+                _order_id_text(info.get("order_id")),
+                _order_id_text(info.get("orderID")),
+                _order_id_text(info.get("ordId")),
+            )
+            if value
+        }
+        if len(observed_order_ids) == 1:
+            order_ids.update(observed_order_ids)
+        else:
+            malformed = True
+        if _order_client_id_conflicts(trade, cid):
+            malformed = True
+
+        raw_symbol = trade.get("symbol")
+        if raw_symbol not in (None, ""):
+            normalized_symbol = _normalize_order_symbol(raw_symbol)
+            if normalized_symbol:
+                symbols.add(normalized_symbol)
+            else:
+                malformed = True
+
+        raw_side = trade.get("side")
+        if raw_side not in (None, ""):
+            normalized_side = _normalize_order_side(raw_side)
+            if normalized_side:
+                sides.add(normalized_side)
+            else:
+                malformed = True
+
+        amount = _finite_order_telemetry_value(
+            trade.get("amount"), positive=True
+        )
+        if amount is None:
+            malformed = True
+            continue
+        filled += amount
+        raw_cost = trade.get("cost")
+        explicit_cost = "cost" in trade and raw_cost not in (None, "")
+        trade_cost = _finite_order_telemetry_value(raw_cost)
+        if explicit_cost and trade_cost is None:
+            malformed = True
+        elif trade_cost is None:
+            price = _finite_order_telemetry_value(
+                trade.get("price"), positive=True
+            )
+            if price is None:
+                cost_known = False
+            else:
+                trade_cost = amount * price
+        if trade_cost is not None:
+            cost += trade_cost
+
+        trade_fees = trade.get("fees")
+        if isinstance(trade_fees, list) and trade_fees:
+            fees.extend(dict(fee) for fee in trade_fees if isinstance(fee, dict))
+        elif isinstance(trade.get("fee"), dict):
+            fees.append(dict(trade["fee"]))
+
+    if len(order_ids) != 1 or len(symbols) > 1 or len(sides) > 1:
+        malformed = True
+    if symbols and symbol_full not in symbols:
+        malformed = True
+    if not math.isfinite(filled) or filled <= 0:
+        malformed = True
+    if expected_amount is not None:
+        expected = _finite_order_telemetry_value(
+            expected_amount, positive=True
+        )
+        if expected is None:
+            malformed = True
+        else:
+            tolerance = max(1e-12, expected * 1e-9)
+            if filled > expected + tolerance:
+                malformed = True
+    if not math.isfinite(cost):
+        malformed = True
+    total_cost = cost if cost_known and not malformed else None
+    average = (
+        total_cost / filled
+        if total_cost is not None and filled > 0
+        else None
+    )
+    return _TradeRecoveryOrder({
+        "id": next(iter(order_ids), None),
+        "clientOrderId": cid,
+        "symbol": next(iter(symbols), symbol_full),
+        "side": next(iter(sides), None),
+        "status": "closed",
+        "filled": filled if filled > 0 and math.isfinite(filled) else None,
+        "amount": filled if filled > 0 and math.isfinite(filled) else None,
+        "cost": total_cost,
+        "average": average,
+        "price": average,
+        "fee": fees[0] if len(fees) == 1 else None,
+        "fees": fees,
+        "trades": [dict(trade) for trade in unique_trades],
+        "info": first_info,
+        "_bot_recovery_from_trades": True,
+        "_bot_recovery_conflict": malformed,
+    })
 
 
 def _find_order_by_client_id(
@@ -411,6 +937,11 @@ def _find_order_by_client_id(
     cid: str,
     log_event=None,
     lookup_status: Optional[dict] = None,
+    expected_amount: Optional[float] = None,
+    expected_side: Optional[str] = None,
+    expected_position_side: str = "",
+    exchange_id: str = "",
+    expected_reduce_only: Optional[bool] = None,
 ):
     """Locate an order by clientOrderId - open orders first, then recent
     history. Used to recover from a lost-response timeout so a retry doesn't
@@ -454,6 +985,70 @@ def _find_order_by_client_id(
                 continue
             rows.append(row)
         return rows
+
+    terminal_zero_fill = None
+    observed_order_ids: set[str] = set()
+
+    def _defer_terminal_zero_fill(order: dict) -> bool:
+        return (
+            isinstance(order, dict)
+            and order.get("_bot_recovery_conflict") is not True
+            and _normalize_order_status(order.get("status"))
+            in ("canceled", "cancelled", "expired")
+            and not _order_response_has_fill_evidence(order)
+        )
+
+    def _select_recovery_candidate(order: dict):
+        nonlocal terminal_zero_fill, observed_order_ids
+        current_ids = _explicit_order_ids(order)
+        if (
+            len(current_ids) > 1
+            or (
+                observed_order_ids
+                and current_ids
+                and observed_order_ids != current_ids
+            )
+        ):
+            conflict = dict(order)
+            conflict["_bot_recovery_conflict"] = True
+            return conflict
+        observed_order_ids.update(current_ids)
+        if expected_side and _order_request_conflicts(
+            order,
+            symbol_full,
+            expected_side,
+            expected_position_side,
+            exchange_id,
+            expected_reduce_only=expected_reduce_only,
+            expected_client_id=cid,
+            expected_amount=expected_amount,
+        ):
+            conflict = dict(order)
+            conflict["_bot_recovery_conflict"] = True
+            return conflict
+        if not _defer_terminal_zero_fill(order):
+            return order
+        terminal_zero_fill = order
+        return None
+
+    def _select_recovery_batch(rows):
+        selected = None
+        for order in rows:
+            if not _order_client_id_matches(order, cid):
+                continue
+            candidate = _select_recovery_candidate(order)
+            if candidate is None:
+                continue
+            if candidate.get("_bot_recovery_conflict") is True:
+                return candidate
+            if selected is None:
+                selected = candidate
+            elif not strict_order_snapshot_equal(selected, candidate):
+                conflict = dict(candidate)
+                conflict["_bot_recovery_conflict"] = True
+                return conflict
+        return selected
+
     # MEXC exposes an exact, venue-native lookup by externalOid. It is both
     # faster and safer than scanning a short recent-order window, so use it
     # before unified fallbacks.
@@ -470,14 +1065,90 @@ def _find_order_by_client_id(
                     lambda: native({"symbol": market_id, "externalOid": cid}),
                 )
                 data = raw.get("data") if isinstance(raw, dict) else None
-                if isinstance(data, dict) and _order_id_text(
-                    data.get("externalOid") or data.get("external_oid")
-                ) == _order_id_text(cid):
-                    return {
-                        "id": data.get("orderId") or data.get("id"),
-                        "clientOrderId": cid,
-                        "info": data,
+                if isinstance(data, dict):
+                    expected_cid = _order_id_text(cid)
+                    external_ids = {
+                        value
+                        for value in (
+                            _order_id_text(data.get("externalOid")),
+                            _order_id_text(data.get("external_oid")),
+                        )
+                        if value
                     }
+                    raw_state = _order_id_text(data.get("state"))
+                    status = {
+                        "2": "open",
+                        "3": "closed",
+                        "4": "canceled",
+                    }.get(raw_state)
+                    filled = _finite_order_telemetry_value(
+                        data.get("dealVol")
+                    )
+                    amount = _finite_order_telemetry_value(data.get("vol"))
+                    average = _finite_order_telemetry_value(
+                        data.get("dealAvgPrice"), positive=True
+                    )
+                    order_ids = {
+                        value
+                        for value in (
+                            _order_id_text(data.get("orderId")),
+                            _order_id_text(data.get("id")),
+                        )
+                        if value
+                    }
+                    order_id = next(iter(order_ids), "")
+                    raw_symbol = _order_id_text(data.get("symbol"))
+                    expected_native_symbols = {
+                        _order_id_text(market_id),
+                        _order_id_text(symbol_full),
+                    }
+                    malformed = (
+                        status is None
+                        or external_ids != {expected_cid}
+                        or len(order_ids) != 1
+                        or (
+                            bool(raw_symbol)
+                            and raw_symbol not in expected_native_symbols
+                        )
+                        or ("dealVol" in data and filled is None)
+                        or (
+                            "vol" in data
+                            and _finite_order_telemetry_value(
+                                data.get("vol"), positive=True
+                            ) is None
+                        )
+                    )
+                    if filled is not None and amount is not None:
+                        tolerance = max(1e-12, amount * 1e-9)
+                        if filled > amount + tolerance:
+                            malformed = True
+                        if status == "closed" and abs(filled - amount) > tolerance:
+                            malformed = True
+                    expected = _finite_order_telemetry_value(
+                        expected_amount, positive=True
+                    )
+                    if expected is not None:
+                        tolerance = max(1e-12, expected * 1e-9)
+                        if (
+                            (amount is not None and amount > expected + tolerance)
+                            or (filled is not None and filled > expected + tolerance)
+                        ):
+                            malformed = True
+                    native_order = {
+                        "id": order_id,
+                        "clientOrderId": cid,
+                        "symbol": symbol_full,
+                        "side": data.get("side"),
+                        "status": status,
+                        "filled": filled,
+                        "amount": amount,
+                        "average": average,
+                        "info": data,
+                        "_bot_recovery_conflict": malformed,
+                    }
+                    selected = _select_recovery_candidate(native_order)
+                    if selected is not None:
+                        return selected
             except Exception as e:
                 _mark_unavailable()
                 if log_event:
@@ -490,11 +1161,12 @@ def _find_order_by_client_id(
                     except Exception:
                         pass
     try:
-        for o in _recovery_rows(_budgeted(
-                "order_recovery_fetch_open_orders",
-                lambda: ex.fetch_open_orders(symbol_full))):
-            if _order_client_id_matches(o, cid):
-                return o
+        selected = _select_recovery_batch(_recovery_rows(_budgeted(
+            "order_recovery_fetch_open_orders",
+            lambda: ex.fetch_open_orders(symbol_full),
+        )))
+        if selected is not None:
+            return selected
     except Exception as e:
         _mark_unavailable()
         if log_event:
@@ -507,11 +1179,12 @@ def _find_order_by_client_id(
     has = getattr(ex, "has", {}) or {}
     try:
         if has.get("fetchOrders"):
-            for o in _recovery_rows(_budgeted(
-                    "order_recovery_fetch_orders",
-                    lambda: ex.fetch_orders(symbol_full, limit=20))):
-                if _order_client_id_matches(o, cid):
-                    return o
+            selected = _select_recovery_batch(_recovery_rows(_budgeted(
+                "order_recovery_fetch_orders",
+                lambda: ex.fetch_orders(symbol_full, limit=20),
+            )))
+            if selected is not None:
+                return selected
     except Exception as e:
         _mark_unavailable()
         if log_event:
@@ -527,11 +1200,12 @@ def _find_order_by_client_id(
     # SECOND entry in exactly the fill-but-no-ack window this guard exists for.
     try:
         if has.get("fetchClosedOrders"):
-            for o in _recovery_rows(_budgeted(
-                    "order_recovery_fetch_closed_orders",
-                    lambda: ex.fetch_closed_orders(symbol_full, limit=20))):
-                if _order_client_id_matches(o, cid):
-                    return o
+            selected = _select_recovery_batch(_recovery_rows(_budgeted(
+                "order_recovery_fetch_closed_orders",
+                lambda: ex.fetch_closed_orders(symbol_full, limit=20),
+            )))
+            if selected is not None:
+                return selected
     except Exception as e:
         _mark_unavailable()
         if log_event:
@@ -542,11 +1216,24 @@ def _find_order_by_client_id(
                 pass
     try:
         if has.get("fetchMyTrades"):
-            for t in _recovery_rows(_budgeted(
+            matching_trades = [
+                trade
+                for trade in _recovery_rows(_budgeted(
                     "order_recovery_fetch_my_trades",
-                    lambda: ex.fetch_my_trades(symbol_full, limit=20))):
-                if _order_client_id_matches(t, cid):
-                    return t
+                    lambda: ex.fetch_my_trades(symbol_full, limit=20),
+                ))
+                if _order_client_id_matches(trade, cid)
+            ]
+            if matching_trades:
+                recovered = _order_from_recovery_trades(
+                    matching_trades,
+                    cid,
+                    symbol_full,
+                    expected_amount=expected_amount,
+                )
+                selected = _select_recovery_candidate(recovered)
+                if selected is not None:
+                    return selected
     except Exception as e:
         _mark_unavailable()
         if log_event:
@@ -555,7 +1242,7 @@ def _find_order_by_client_id(
                           f"{symbol_full}: {type(e).__name__}", "WARN")
             except Exception:
                 pass
-    return None
+    return terminal_zero_fill
 
 
 def create_order_with_retry(ex,
@@ -595,6 +1282,8 @@ def create_order_with_retry(ex,
     order_params = _normalize_order_params(params)
     if order_params is None:
         raise ValueError(f"invalid order params for {action_label}: {params!r}")
+    order_position_side = _requested_position_side(order_params)
+    exchange_id = _exchange_id(ex)
     # Idempotency for EVERY caller: ensure a clientOrderId so the lost-response
     # recovery below also protects the close/emergency paths (which pass
     # reduce_only_params and supply no cid). Without one, a transient timeout
@@ -620,7 +1309,21 @@ def create_order_with_retry(ex,
                 params=order_params)
             cid = order_params.get("clientOrderId")
             client_id_conflict = _order_client_id_conflicts(order, cid)
-            if not _order_response_has_evidence(order) or client_id_conflict:
+            request_conflict = _order_request_conflicts(
+                order,
+                order_symbol,
+                order_side,
+                order_position_side,
+                exchange_id,
+                expected_reduce_only=reduce_only,
+                expected_client_id=cid,
+                expected_amount=order_amount,
+            )
+            if (
+                not _order_response_has_evidence(order)
+                or client_id_conflict
+                or request_conflict
+            ):
                 lookup_status = {}
                 existing = _find_order_by_client_id(
                     ex,
@@ -628,8 +1331,27 @@ def create_order_with_retry(ex,
                     cid,
                     log_event=log_event,
                     lookup_status=lookup_status,
+                    expected_amount=order_amount,
+                    expected_side=order_side,
+                    expected_position_side=order_position_side,
+                    exchange_id=exchange_id,
+                    expected_reduce_only=reduce_only,
                 ) if cid else None
-                if existing is not None and _order_landed(existing):
+                recovered_request_conflict = _order_request_conflicts(
+                    existing,
+                    order_symbol,
+                    order_side,
+                    order_position_side,
+                    exchange_id,
+                    expected_reduce_only=reduce_only,
+                    expected_client_id=cid,
+                    expected_amount=order_amount,
+                )
+                if (
+                    existing is not None
+                    and _order_landed(existing)
+                    and not recovered_request_conflict
+                ):
                     if log_event:
                         try:
                             log_event(
@@ -639,12 +1361,18 @@ def create_order_with_retry(ex,
                         except Exception:
                             pass
                     return existing
+                if request_conflict or recovered_request_conflict:
+                    raise FuturesOrderOutcomeUnknown(cid)
                 if not reduce_only:
                     raise FuturesOrderOutcomeUnknown(cid)
                 detail = (
                     "conflicting clientOrderId evidence"
                     if client_id_conflict
-                    else "missing order id/status/fill evidence"
+                    else (
+                        "conflicting symbol/side evidence"
+                        if request_conflict
+                        else "missing order id/status/fill evidence"
+                    )
                 )
                 raise _InvalidOrderResponse(
                     f"{action_label}: invalid exchange order response "
@@ -747,8 +1475,27 @@ def create_order_with_retry(ex,
                     cid,
                     log_event=log_event,
                     lookup_status=lookup_status,
+                    expected_amount=order_amount,
+                    expected_side=order_side,
+                    expected_position_side=order_position_side,
+                    exchange_id=exchange_id,
+                    expected_reduce_only=reduce_only,
                 )
-                if existing is not None and _order_landed(existing):
+                recovered_request_conflict = _order_request_conflicts(
+                    existing,
+                    order_symbol,
+                    order_side,
+                    order_position_side,
+                    exchange_id,
+                    expected_reduce_only=reduce_only,
+                    expected_client_id=cid,
+                    expected_amount=order_amount,
+                )
+                if (
+                    existing is not None
+                    and _order_landed(existing)
+                    and not recovered_request_conflict
+                ):
                     if log_event:
                         try:
                             log_event(
@@ -759,6 +1506,8 @@ def create_order_with_retry(ex,
                         except Exception:
                             pass
                     return existing
+                if recovered_request_conflict:
+                    raise FuturesOrderOutcomeUnknown(cid) from e
                 if not reduce_only:
                     raise FuturesOrderOutcomeUnknown(cid) from e
             if attempt < attempts_limit:
@@ -835,13 +1584,30 @@ def _position_contracts_abs(pos: dict) -> Optional[float]:
     """Parse exchange position size; malformed payload means untrusted state."""
     if not isinstance(pos, dict):
         return None
-    raw = pos.get("contracts")
-    if raw in (None, "", 0, 0.0):
-        raw = pos.get("size")
+    raw_contracts = pos.get("contracts")
+    raw_size = pos.get("size")
+    raw = raw_contracts
+    if raw_contracts not in (None, ""):
+        if isinstance(raw_contracts, bool):
+            return None
+        try:
+            parsed_contracts = float(raw_contracts)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(parsed_contracts):
+            return None
+        if parsed_contracts == 0.0 and raw_size not in (None, ""):
+            raw = raw_size
+        else:
+            return abs(parsed_contracts)
+    else:
+        raw = raw_size
+    if raw in (None, ""):
+        return None
     if isinstance(raw, bool):
         return None
     try:
-        contracts = abs(float(raw or 0.0))
+        contracts = abs(float(raw))
     except (TypeError, ValueError, OverflowError):
         return None
     return contracts if math.isfinite(contracts) else None
@@ -1279,7 +2045,74 @@ def extract_or_estimate_futures_fee(ex,
 
 #  Position verification 
 
-def fetch_open_position(ex, symbol_full: str) -> Tuple[Optional[dict], bool]:
+def position_row_side(pos: object) -> tuple[str, bool]:
+    """Return (long|short|unknown, contradictory) for a position row."""
+    if not isinstance(pos, dict):
+        return "", True
+    info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+    observed: set[str] = set()
+    unknown_explicit = False
+    for key in ("side", "positionSide", "posSide", "holdSide", "direction"):
+        for raw in (pos.get(key), info.get(key)):
+            if raw in (None, ""):
+                continue
+            if not isinstance(raw, str):
+                unknown_explicit = True
+                continue
+            normalized = raw.strip().lower()
+            if normalized in {"long", "buy"}:
+                observed.add("long")
+            elif normalized in {"short", "sell"}:
+                observed.add("short")
+            elif normalized not in {"", "both", "net", "oneway"}:
+                unknown_explicit = True
+    if unknown_explicit or len(observed) > 1:
+        return "", True
+
+    signed_short = False
+    for key in ("contracts", "size"):
+        raw = pos.get(key)
+        if raw in (None, ""):
+            continue
+        if isinstance(raw, bool):
+            return "", True
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return "", True
+        if not math.isfinite(parsed):
+            return "", True
+        signed_short |= parsed < 0
+    if observed:
+        side = next(iter(observed))
+        if signed_short and side != "short":
+            return "", True
+        return side, False
+    return ("short", False) if signed_short else ("", False)
+
+
+def _validated_position_rows(raw) -> Optional[list[dict]]:
+    """Return a trusted CCXT position list or ``None`` for malformed data."""
+    if not isinstance(raw, (list, tuple)):
+        return None
+    rows: list[dict] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            return None
+        symbol = row.get("symbol")
+        if not isinstance(symbol, str) or not symbol.strip():
+            return None
+        rows.append(row)
+    return rows
+
+
+def fetch_open_position(
+    ex,
+    symbol_full: str,
+    *,
+    expected_position_side: Optional[str] = None,
+    _reserve_api_call=None,
+) -> Tuple[Optional[dict], bool]:
     """Return the open exchange position for ``symbol_full``.
 
     MEXC/CCXT can occasionally return an empty list for symbol-scoped
@@ -1291,50 +2124,105 @@ def fetch_open_position(ex, symbol_full: str) -> Tuple[Optional[dict], bool]:
     Returns ``(position, unavailable)``. ``unavailable=True`` means the
     exchange position endpoint could not be trusted and callers should keep or
     create provisional state instead of deleting claims/state.
+
+    ``_reserve_api_call`` is an internal integration hook for callers that
+    require a dedicated critical API-budget namespace while reusing this exact
+    position-selection contract.
     """
     try:
         from config.exchange_config import safe_fetch_positions
     except Exception:
         return None, True
 
-    try:
-        if not try_consume_api_call("fetch_positions:scoped"):
+    expected_side = ""
+    if expected_position_side not in (None, ""):
+        expected_side = _normalize_order_position_side(expected_position_side)
+        if not expected_side:
             return None, True
-        positions = safe_fetch_positions(ex, [symbol_full])
+
+    if _reserve_api_call is None:
+        def reserve_api_call(stage):
+            return try_consume_api_call(f"fetch_positions:{stage}")
+    else:
+        reserve_api_call = _reserve_api_call
+
+    try:
+        if not reserve_api_call("scoped"):
+            return None, True
+        scoped_raw = safe_fetch_positions(ex, [symbol_full])
+        if scoped_raw is None:
+            positions = None
+        else:
+            positions = _validated_position_rows(scoped_raw)
+            if positions is None:
+                return None, True
         scoped_has_symbol = False
+        scoped_unavailable = False
         if positions is not None:
-            try:
-                scoped_has_symbol = any(
-                    isinstance(p, dict)
-                    and (p.get("symbol") or "") == symbol_full
-                    for p in positions
-                )
-            except Exception:
-                scoped_has_symbol = False
+            for candidate in positions:
+                if candidate["symbol"] != symbol_full:
+                    continue
+                scoped_contracts = _position_contracts_abs(candidate)
+                if scoped_contracts is None:
+                    scoped_unavailable = True
+                    continue
+                if scoped_contracts <= 1e-8:
+                    continue
+                if not expected_side:
+                    scoped_has_symbol = True
+                    continue
+                observed_side, contradictory = position_row_side(candidate)
+                if contradictory or not observed_side:
+                    scoped_unavailable = True
+                    continue
+                if observed_side == expected_side:
+                    scoped_has_symbol = True
         if positions is None or not scoped_has_symbol:
-            if not try_consume_api_call("fetch_positions:global"):
+            if not reserve_api_call("global"):
                 return None, True
-            global_positions = safe_fetch_positions(ex)
-            if global_positions is None:
+            global_raw = safe_fetch_positions(ex)
+            if global_raw is None:
                 return None, True
-            positions = global_positions
+            positions = _validated_position_rows(global_raw)
+            if positions is None:
+                return None, True
+        if scoped_unavailable:
+            return None, True
     except Exception:
         return None, True
 
-    for pos in positions or []:
-        if not isinstance(pos, dict):
-            continue
-        if (pos.get("symbol") or "") != symbol_full:
+    matching: list[dict] = []
+    unknown_matching_leg = False
+    for pos in positions:
+        if pos["symbol"] != symbol_full:
             continue
         contracts = _position_contracts_abs(pos)
         if contracts is None:
             return None, True
         if contracts > 1e-8:
-            return pos, False
+            if not expected_side:
+                matching.append(pos)
+                continue
+            observed_side, contradictory = position_row_side(pos)
+            if contradictory or not observed_side:
+                unknown_matching_leg = True
+                continue
+            if observed_side == expected_side:
+                matching.append(pos)
+    if unknown_matching_leg or len(matching) > 1:
+        return None, True
+    if matching:
+        return matching[0], False
     return None, False
 
-def verify_position_closed(ex, symbol_full: str, timeout: float = 5.0
-                            ) -> Tuple[bool, float]:
+
+def verify_position_closed(
+    ex,
+    symbol_full: str,
+    timeout: float = 5.0,
+    *,
+    expected_position_side: Optional[str] = None,
+) -> Tuple[bool, float]:
     """Confirm via fetch_positions that contracts == 0 after a close.
 
     The ``timeout`` parameter is enforced via a monotonic deadline.
@@ -1351,7 +2239,11 @@ def verify_position_closed(ex, symbol_full: str, timeout: float = 5.0
     last_remaining = -1.0
     while time.monotonic() < deadline:
         try:
-            pos, unavailable = fetch_open_position(ex, symbol_full)
+            pos, unavailable = fetch_open_position(
+                ex,
+                symbol_full,
+                expected_position_side=expected_position_side,
+            )
             if unavailable:
                 pass
             elif pos is None:

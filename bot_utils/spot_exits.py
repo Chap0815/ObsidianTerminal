@@ -13,10 +13,33 @@ from bot_utils.network_retry import RetryForbiddenError
 from bot_utils.order_utils import (
     extract_fill_price,
     extract_order_fee,
+    order_has_proven_zero_fill,
     order_id_text_or_none,
+    strict_order_snapshot_equal,
 )
 
 _EMERGENCY_RESIDUAL_DUST_USDT = 1.0
+_SPOT_KNOWN_ORDER_STATUSES = frozenset({
+    "new",
+    "open",
+    "pending",
+    "partially_filled",
+    "partiallyfilled",
+    "closed",
+    "filled",
+    "canceled",
+    "cancelled",
+    "expired",
+    "rejected",
+})
+_SPOT_TERMINAL_ORDER_STATUSES = frozenset({
+    "closed",
+    "filled",
+    "canceled",
+    "cancelled",
+    "expired",
+    "rejected",
+})
 
 
 #  Helpers 
@@ -36,11 +59,82 @@ def _positive_finite(value, default: float = 0.0) -> float:
     return parsed if parsed > 0 else default
 
 
+def has_pending_spot_partial_exit(row: dict) -> bool:
+    """Return whether a physical SPOT partial exit still needs recovery."""
+    if not isinstance(row, dict) or row.get("partial_sold"):
+        return False
+    return bool(
+        row.get("partial_exit_outcome_uncertain")
+        or order_id_text_or_none(row.get("partial_exit_client_order_id"))
+    )
+
+
+def _validated_expected_spot_amount(value) -> Optional[float]:
+    if value is None:
+        return None
+    parsed = _positive_finite(value)
+    if parsed <= 0:
+        raise RuntimeError("spot order recovery expected amount invalid")
+    return parsed
+
+
 def _external_text(value) -> str:
     try:
         return str(value).strip().lower()
     except Exception:
         return ""
+
+
+def normalize_spot_order_status(value) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower().replace("-", "_")
+
+
+def spot_sell_requires_terminal_recovery(
+    order,
+    expected_amount,
+) -> bool:
+    """Return whether a sell ACK cannot yet be booked safely.
+
+    A positive partial fill is not sufficient evidence that the remainder is
+    no longer live at the venue. Only an explicit terminal status permits
+    accounting/state mutation. Statusless full fills remain compatible with
+    exchanges that omit status but report the complete requested quantity.
+    """
+    if not isinstance(order, dict):
+        return True
+    raw_status = order.get("status")
+    if raw_status not in (None, ""):
+        if not isinstance(raw_status, str):
+            # The submit/recovery validators reject malformed explicit status
+            # values before any production caller reaches this helper.
+            return False
+        normalized_status = normalize_spot_order_status(raw_status)
+        return (
+            normalized_status in _SPOT_KNOWN_ORDER_STATUSES
+            and normalized_status not in _SPOT_TERMINAL_ORDER_STATUSES
+        )
+
+    requested = _positive_finite(expected_amount)
+    raw_filled = order.get("filled")
+    if "filled" in order and raw_filled not in (None, ""):
+        if isinstance(raw_filled, bool):
+            return True
+        try:
+            explicit_filled = float(raw_filled)
+        except (TypeError, ValueError, OverflowError):
+            return True
+        if not math.isfinite(explicit_filled) or explicit_filled <= 0:
+            return True
+    filled = _positive_finite(raw_filled)
+    remaining = _positive_finite(order.get("remaining"))
+    if remaining > 0:
+        return True
+    if requested <= 0 or filled <= 0:
+        return False
+    tolerance = max(1e-12, requested * 1e-9)
+    return filled + tolerance < requested
 
 
 def _positive_finite_decimal(value) -> Optional[Decimal]:
@@ -267,13 +361,128 @@ def _create_market_sell_budgeted(ex, symbol_pair: str, amount: float,
     return ex.create_market_sell_order(symbol_pair, amount)
 
 
-def aggregate_spot_order_trades(trades: list, client_order_id: str) -> dict:
+def _spot_order_ids(row: dict, *, trade: bool) -> set[str]:
+    keys = (
+        ("order", "orderId", "order_id", "orderID")
+        if trade
+        else ("id", "orderId", "order_id", "orderID")
+    )
+    values = {
+        value
+        for key in keys
+        if (value := order_id_text_or_none(row.get(key)))
+    }
+    info = row.get("info")
+    if isinstance(info, dict):
+        info_keys = ("orderId", "order_id", "orderID", "ordId")
+        if not trade:
+            info_keys += ("id",)
+        for key in info_keys:
+            value = order_id_text_or_none(info.get(key))
+            if value:
+                values.add(value)
+    return values
+
+
+def _spot_trade_ids(trade: dict) -> set[str]:
+    values = {
+        value
+        for key in (
+            "id", "tradeId", "trade_id", "tradeID", "execId",
+            "exec_id", "executionId", "fillId", "fill_id",
+        )
+        if (value := order_id_text_or_none(trade.get(key)))
+    }
+    info = trade.get("info")
+    if isinstance(info, dict):
+        for key in (
+            "id",
+            "tradeId",
+            "trade_id",
+            "tradeID",
+            "execId",
+            "exec_id",
+            "executionId",
+            "fillId",
+            "fill_id",
+        ):
+            value = order_id_text_or_none(info.get(key))
+            if value:
+                values.add(value)
+    return values
+
+
+def aggregate_spot_order_trades(
+    trades: list,
+    client_order_id: str,
+    *,
+    symbol_pair: Optional[str] = None,
+    expected_side: Optional[str] = None,
+    expected_amount: Optional[float] = None,
+) -> dict:
     """Normalize every trade fill for one client id into one order-shaped row."""
+    from bot_utils.futures_order import (
+        _order_client_id_conflicts,
+        _order_client_id_matches,
+    )
+    requested_amount = _validated_expected_spot_amount(expected_amount)
+
     amounts = []
     costs = []
     fees = []
     order_ids = set()
+    unique_trades = []
+    seen_trade_ids = {}
     for trade in trades:
+        if not isinstance(trade, dict):
+            raise RuntimeError("spot order trade reconciliation row malformed")
+        _validate_explicit_spot_identity_fields(
+            trade,
+            context="order trade reconciliation",
+            trade=True,
+        )
+        if (
+            _order_client_id_conflicts(trade, client_order_id)
+            or not _order_client_id_matches(trade, client_order_id)
+        ):
+            raise RuntimeError(
+                "spot order trade reconciliation client id conflict"
+            )
+        if symbol_pair is not None:
+            observed_symbol = trade.get("symbol")
+            if observed_symbol not in (None, "") and (
+                not isinstance(observed_symbol, str)
+                or observed_symbol.strip() != symbol_pair
+            ):
+                raise RuntimeError(
+                    "spot order trade reconciliation symbol conflict"
+                )
+        if expected_side is not None:
+            observed_side = trade.get("side")
+            if observed_side not in (None, "") and (
+                not isinstance(observed_side, str)
+                or observed_side.strip().lower() != expected_side
+            ):
+                raise RuntimeError(
+                    "spot order trade reconciliation side conflict"
+                )
+        trade_ids = _spot_trade_ids(trade)
+        if len(trade_ids) != 1:
+            raise RuntimeError(
+                "spot order trade reconciliation requires one stable execution id"
+            )
+        trade_id = next(iter(trade_ids))
+        previous = seen_trade_ids.get(trade_id)
+        if previous is not None:
+            if not strict_order_snapshot_equal(previous, trade):
+                raise RuntimeError(
+                    "spot order trade reconciliation duplicate trade conflict"
+                )
+            continue
+        seen_trade_ids[trade_id] = dict(trade)
+        unique_trades.append(trade)
+
+    for trade in unique_trades:
         amount = _positive_finite(trade.get("amount"))
         if amount <= 0:
             raise RuntimeError("spot order trade reconciliation has invalid amount")
@@ -285,12 +494,7 @@ def aggregate_spot_order_trades(trades: list, client_order_id: str) -> dict:
             cost = amount * price if price > 0 else 0.0
         costs.append(cost)
 
-        order_id = (
-            order_id_text_or_none(trade.get("order"))
-            or order_id_text_or_none(trade.get("orderId"))
-        )
-        if order_id:
-            order_ids.add(order_id)
+        order_ids.update(_spot_order_ids(trade, trade=True))
         trade_fees = trade.get("fees")
         valid_trade_fees = (
             [dict(item) for item in trade_fees if isinstance(item, dict)]
@@ -308,8 +512,18 @@ def aggregate_spot_order_trades(trades: list, client_order_id: str) -> dict:
     filled = math.fsum(amounts)
     if not math.isfinite(filled) or filled <= 0:
         raise RuntimeError("spot order trade reconciliation has no valid fill")
+    if requested_amount is not None and filled > requested_amount + max(
+        1e-12, requested_amount * 1e-9
+    ):
+        raise RuntimeError("spot order recovery exceeded expected amount")
 
-    recovered = dict(trades[0])
+    recovered = dict(unique_trades[0])
+    recovered.pop("id", None)
+    recovered.pop("tradeId", None)
+    raw_info = recovered.get("info")
+    if isinstance(raw_info, dict):
+        recovered["info"] = dict(raw_info)
+        recovered["info"].pop("id", None)
     recovered["clientOrderId"] = client_order_id
     recovered["filled"] = filled
     if order_ids:
@@ -330,8 +544,367 @@ def _aggregate_spot_exit_trades(trades: list,
     return aggregate_spot_order_trades(trades, client_order_id)
 
 
-def _find_spot_exit_order_by_client_id(ex, symbol_pair: str,
-                                       client_order_id: str):
+def spot_recovery_terminal_disposition(order: dict) -> str:
+    if not isinstance(order, dict):
+        return "other"
+    status = order.get("status")
+    normalized_status = normalize_spot_order_status(status)
+    if normalized_status not in {
+        "canceled", "cancelled", "expired", "rejected", "closed", "filled",
+    }:
+        return "other"
+    parsed_values = {}
+    for key in ("filled", "cost"):
+        value = order.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            raise RuntimeError("spot terminal fill evidence invalid")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise RuntimeError("spot terminal fill evidence invalid")
+        if not math.isfinite(parsed) or parsed < 0:
+            raise RuntimeError("spot terminal fill evidence invalid")
+        parsed_values[key] = parsed
+    filled = parsed_values.get("filled", 0.0)
+    cost = parsed_values.get("cost", 0.0)
+    if normalized_status == "rejected" and (filled > 0 or cost > 0):
+        raise RuntimeError("spot rejected order has fill evidence")
+    if filled > 0:
+        return "filled"
+    if normalized_status in {"closed", "filled"}:
+        return "unresolved"
+    if cost > 0:
+        return "unresolved"
+    if order_has_proven_zero_fill(order):
+        return "zero"
+    return "unresolved"
+
+
+def spot_recovery_is_terminal_zero_fill(order: dict) -> bool:
+    return spot_recovery_terminal_disposition(order) == "zero"
+
+
+def _validate_explicit_spot_identity_fields(
+    order: dict,
+    *,
+    context: str,
+    trade: bool = False,
+) -> None:
+    """Reject identities that cannot be stable scalar venue references."""
+    from bot_utils.futures_order import _CLIENT_ID_INFO_KEYS
+
+    raw_info = order.get("info")
+    if raw_info not in (None, "") and not isinstance(raw_info, dict):
+        raise RuntimeError(f"spot {context} info malformed")
+    info = raw_info if isinstance(raw_info, dict) else {}
+
+    def _reject_malformed(source: dict, keys, label: str) -> None:
+        for key in keys:
+            if key not in source:
+                continue
+            raw_value = source.get(key)
+            if raw_value is None or (
+                isinstance(raw_value, str) and not raw_value.strip()
+            ):
+                continue
+            if isinstance(raw_value, bool) or not isinstance(
+                raw_value, (str, int)
+            ):
+                raise RuntimeError(f"spot {context} {label} invalid")
+            if order_id_text_or_none(raw_value) is None:
+                raise RuntimeError(f"spot {context} {label} invalid")
+
+    order_keys = (
+        ("order", "orderId", "order_id", "orderID")
+        if trade else ("id", "orderId", "order_id", "orderID")
+    )
+    _reject_malformed(order, order_keys, "order id")
+    _reject_malformed(
+        info,
+        (
+            ("orderId", "order_id", "orderID", "ordId")
+            if trade
+            else ("id", "orderId", "order_id", "orderID", "ordId")
+        ),
+        "order id",
+    )
+    if trade:
+        execution_keys = (
+            "id",
+            "tradeId",
+            "trade_id",
+            "tradeID",
+            "execId",
+            "exec_id",
+            "executionId",
+            "fillId",
+            "fill_id",
+        )
+        _reject_malformed(order, execution_keys, "execution id")
+        _reject_malformed(info, execution_keys, "execution id")
+    _reject_malformed(order, ("clientOrderId",), "client id")
+    _reject_malformed(info, _CLIENT_ID_INFO_KEYS, "client id")
+
+
+def _validate_spot_quote_cost(
+    order: dict,
+    max_quote_cost: Optional[float],
+    *,
+    error_prefix: str,
+) -> None:
+    authorized_quote_cost = _validated_expected_spot_amount(max_quote_cost)
+    if authorized_quote_cost is None:
+        return
+    raw_cost = order.get("cost")
+    observed_cost = 0.0
+    if raw_cost not in (None, ""):
+        if isinstance(raw_cost, bool):
+            raise RuntimeError(f"{error_prefix} cost invalid")
+        try:
+            observed_cost = float(raw_cost)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(f"{error_prefix} cost invalid") from exc
+        if not math.isfinite(observed_cost) or observed_cost < 0:
+            raise RuntimeError(f"{error_prefix} cost invalid")
+    if observed_cost == 0:
+        filled = _positive_finite(order.get("filled"))
+        fill_price = (
+            _positive_finite(order.get("average"))
+            or _positive_finite(order.get("price"))
+        )
+        if filled > 0 and fill_price > 0:
+            observed_cost = filled * fill_price
+        else:
+            return
+    cost_tolerance = max(1e-12, authorized_quote_cost * 1e-9)
+    if (
+        not math.isfinite(observed_cost)
+        or observed_cost > authorized_quote_cost * 1.05 + cost_tolerance
+    ):
+        raise RuntimeError(f"{error_prefix} cost conflict")
+
+
+def validate_spot_submit_ack(
+    order,
+    *,
+    symbol_pair: str,
+    client_order_id: Optional[str],
+    expected_amount: Optional[float],
+    expected_side: str = "sell",
+    max_quote_cost: Optional[float] = None,
+) -> str:
+    """Bind a direct create-order ACK to one submitted SPOT request."""
+    from bot_utils.futures_order import (
+        _order_client_id_conflicts,
+        _order_client_id_matches,
+    )
+
+    normalized_side = (
+        expected_side.strip().lower()
+        if isinstance(expected_side, str) else ""
+    )
+    if normalized_side not in {"buy", "sell"}:
+        raise RuntimeError("spot acknowledgement expected side invalid")
+    context = f"{normalized_side} acknowledgement"
+    error_prefix = f"spot {context}"
+    if not isinstance(order, dict):
+        raise RuntimeError(f"{error_prefix} malformed")
+    _validate_explicit_spot_identity_fields(
+        order,
+        context=context,
+    )
+
+    expected_client_id = order_id_text_or_none(client_order_id)
+    if client_order_id is not None and not expected_client_id:
+        raise RuntimeError(f"{error_prefix} client id invalid")
+    if (
+        expected_client_id
+        and _order_client_id_conflicts(order, expected_client_id)
+    ):
+        raise RuntimeError(f"{error_prefix} client id conflict")
+    client_id_matches = bool(
+        expected_client_id
+        and _order_client_id_matches(order, expected_client_id)
+    )
+
+    requested_amount = _validated_expected_spot_amount(expected_amount)
+    tolerance = (
+        max(1e-12, requested_amount * 1e-9)
+        if requested_amount is not None else None
+    )
+    raw_amount = order.get("amount")
+    if raw_amount not in (None, ""):
+        observed_amount = None
+        try:
+            if not isinstance(raw_amount, bool):
+                observed_amount = float(raw_amount)
+        except (TypeError, ValueError, OverflowError):
+            observed_amount = None
+        if observed_amount is None or not math.isfinite(observed_amount):
+            if normalized_side == "sell":
+                raise RuntimeError(f"{error_prefix} amount invalid")
+        elif observed_amount <= 0:
+            if normalized_side == "sell":
+                raise RuntimeError(f"{error_prefix} amount invalid")
+        elif (
+                requested_amount is not None
+                and tolerance is not None
+                and abs(observed_amount - requested_amount) > tolerance
+        ):
+            raise RuntimeError(f"{error_prefix} amount conflict")
+
+    raw_filled = order.get("filled")
+    if raw_filled not in (None, ""):
+        observed_filled = None
+        try:
+            if not isinstance(raw_filled, bool):
+                observed_filled = float(raw_filled)
+        except (TypeError, ValueError, OverflowError):
+            observed_filled = None
+        if observed_filled is None or not math.isfinite(observed_filled):
+            if normalized_side == "sell":
+                raise RuntimeError(f"{error_prefix} fill invalid")
+        elif observed_filled < 0:
+            if normalized_side == "sell":
+                raise RuntimeError(f"{error_prefix} fill invalid")
+        elif (
+                requested_amount is not None
+                and tolerance is not None
+                and observed_filled > requested_amount + tolerance
+        ):
+            raise RuntimeError(f"{error_prefix} fill conflict")
+
+    _validate_spot_quote_cost(
+        order,
+        max_quote_cost,
+        error_prefix=error_prefix,
+    )
+
+    raw_status = order.get("status")
+    if raw_status not in (None, ""):
+        if not isinstance(raw_status, str):
+            raise RuntimeError(f"{error_prefix} status invalid")
+        normalized_status = normalize_spot_order_status(raw_status)
+        if normalized_status not in _SPOT_KNOWN_ORDER_STATUSES:
+            raise RuntimeError(f"{error_prefix} status invalid")
+        if normalized_side == "sell" or normalized_status == "rejected":
+            spot_recovery_terminal_disposition(order)
+
+    observed_symbol = order.get("symbol")
+    if observed_symbol not in (None, "") and (
+        not isinstance(observed_symbol, str)
+        or observed_symbol.strip() != symbol_pair
+    ):
+        raise RuntimeError(f"{error_prefix} symbol conflict")
+    observed_side = order.get("side")
+    if observed_side not in (None, "") and (
+        not isinstance(observed_side, str)
+        or observed_side.strip().lower() != normalized_side
+    ):
+        raise RuntimeError(f"{error_prefix} side conflict")
+
+    order_ids = _spot_order_ids(order, trade=False)
+    if len(order_ids) > 1:
+        raise RuntimeError(f"{error_prefix} order id conflict")
+    venue_order_id = next(iter(order_ids)) if order_ids else None
+    stable_identity = venue_order_id or (
+        expected_client_id if client_id_matches else None
+    )
+    if not stable_identity:
+        raise RuntimeError(f"{error_prefix} identity missing")
+    return stable_identity
+
+
+def validate_spot_recovery_candidate(
+    order: dict,
+    *,
+    symbol_pair: str,
+    expected_side: str,
+    client_order_id: str,
+    bound_order_id: Optional[str],
+    expected_amount: Optional[float] = None,
+    max_quote_cost: Optional[float] = None,
+) -> Optional[str]:
+    from bot_utils.futures_order import (
+        _order_client_id_conflicts,
+        _order_client_id_matches,
+    )
+
+    if not isinstance(order, dict):
+        raise RuntimeError("spot order recovery candidate malformed")
+    _validate_explicit_spot_identity_fields(
+        order,
+        context="order recovery",
+    )
+    if (
+        _order_client_id_conflicts(order, client_order_id)
+        or not _order_client_id_matches(order, client_order_id)
+    ):
+        raise RuntimeError("spot order recovery client id conflict")
+    requested_amount = _validated_expected_spot_amount(expected_amount)
+    if requested_amount is not None:
+        tolerance = max(1e-12, requested_amount * 1e-9)
+        for key in ("amount", "filled"):
+            raw_value = order.get(key)
+            if raw_value in (None, ""):
+                continue
+            if isinstance(raw_value, bool):
+                raise RuntimeError("spot order recovery amount invalid")
+            try:
+                observed_amount = float(raw_value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError("spot order recovery amount invalid") from exc
+            if not math.isfinite(observed_amount) or observed_amount < 0:
+                raise RuntimeError("spot order recovery amount invalid")
+            if observed_amount > requested_amount + tolerance:
+                raise RuntimeError(
+                    "spot order recovery exceeded expected amount"
+                )
+    _validate_spot_quote_cost(
+        order,
+        max_quote_cost,
+        error_prefix="spot order recovery",
+    )
+    raw_status = order.get("status")
+    if raw_status not in (None, ""):
+        if not isinstance(raw_status, str):
+            raise RuntimeError("spot order recovery status invalid")
+        normalized_status = normalize_spot_order_status(raw_status)
+        if normalized_status not in _SPOT_KNOWN_ORDER_STATUSES:
+            raise RuntimeError("spot order recovery status invalid")
+    observed_symbol = order.get("symbol")
+    if observed_symbol not in (None, ""):
+        if not isinstance(observed_symbol, str) or (
+            observed_symbol.strip() != symbol_pair
+        ):
+            raise RuntimeError("spot order recovery symbol conflict")
+    observed_side = order.get("side")
+    if observed_side not in (None, ""):
+        if not isinstance(observed_side, str) or (
+            observed_side.strip().lower() != expected_side
+        ):
+            raise RuntimeError("spot order recovery side conflict")
+    order_ids = _spot_order_ids(order, trade=False)
+    if len(order_ids) > 1:
+        raise RuntimeError("spot order recovery order id conflict")
+    observed_order_id = next(iter(order_ids)) if order_ids else None
+    if (
+        bound_order_id
+        and observed_order_id
+        and observed_order_id != bound_order_id
+    ):
+        raise RuntimeError("spot order recovery order id conflict")
+    return observed_order_id or bound_order_id
+
+
+def _find_spot_exit_order_by_client_id(
+    ex,
+    symbol_pair: str,
+    client_order_id: str,
+    expected_amount: Optional[float] = None,
+):
     """Recover a SPOT sell whose create response may have been lost.
 
     ``None`` means every supported lookup completed and found no match.
@@ -340,11 +913,17 @@ def _find_spot_exit_order_by_client_id(ex, symbol_pair: str,
     """
     from bot_utils.futures_order import _order_client_id_matches
 
+    expected_amount = _validated_expected_spot_amount(expected_amount)
     has = getattr(ex, "has", {}) or {}
     if not isinstance(has, dict):
         has = {}
     attempted = False
     uncertain = False
+    deferred_terminal = None
+    terminal_fill_unresolved = False
+    terminal_rejected = False
+    bound_order_id = None
+    selected_order = None
 
     def _query(endpoint: str, fetch):
         nonlocal attempted, uncertain
@@ -369,57 +948,128 @@ def _find_spot_exit_order_by_client_id(ex, symbol_pair: str,
             return []
         return rows
 
+    def _select_batch(rows):
+        nonlocal bound_order_id, deferred_terminal
+        nonlocal terminal_fill_unresolved, terminal_rejected
+        selected = None
+        for order in rows:
+            if not _order_client_id_matches(order, client_order_id):
+                continue
+            bound_order_id = validate_spot_recovery_candidate(
+                order,
+                symbol_pair=symbol_pair,
+                expected_side="sell",
+                client_order_id=client_order_id,
+                bound_order_id=bound_order_id,
+                expected_amount=expected_amount,
+            )
+            disposition = spot_recovery_terminal_disposition(order)
+            status = order.get("status")
+            if isinstance(status, str) and status.strip().lower() == "rejected":
+                terminal_rejected = True
+            if disposition in {"zero", "unresolved"}:
+                deferred_terminal = deferred_terminal or order
+                terminal_fill_unresolved |= disposition == "unresolved"
+            elif selected is None:
+                selected = order
+            elif not strict_order_snapshot_equal(selected, order):
+                raise RuntimeError(
+                    "spot order recovery duplicate snapshot conflict"
+                )
+        return selected
+
     fetch_open = getattr(ex, "fetch_open_orders", None)
     if callable(fetch_open) and has.get("fetchOpenOrders") is not False:
-        for order in _query(
+        selected = _select_batch(_query(
             "spot_exit_reconcile_fetch_open_orders",
             lambda: fetch_open(symbol_pair),
-        ):
-            if _order_client_id_matches(order, client_order_id):
-                return order
+        ))
+        if selected is not None:
+            selected_order = selected
 
     fetch_orders = getattr(ex, "fetch_orders", None)
     if has.get("fetchOrders") and callable(fetch_orders):
-        for order in _query(
+        selected = _select_batch(_query(
             "spot_exit_reconcile_fetch_orders",
             lambda: fetch_orders(symbol_pair, limit=20),
-        ):
-            if _order_client_id_matches(order, client_order_id):
-                return order
+        ))
+        if selected is not None:
+            selected_order = selected
 
     fetch_closed = getattr(ex, "fetch_closed_orders", None)
     if has.get("fetchClosedOrders") and callable(fetch_closed):
-        for order in _query(
+        selected = _select_batch(_query(
             "spot_exit_reconcile_fetch_closed_orders",
             lambda: fetch_closed(symbol_pair, limit=20),
-        ):
-            if _order_client_id_matches(order, client_order_id):
-                return order
+        ))
+        if selected is not None:
+            selected_order = selected
+
+    if selected_order is not None:
+        if terminal_rejected:
+            raise RuntimeError("spot rejected order has fill evidence")
+        return selected_order
 
     fetch_trades = getattr(ex, "fetch_my_trades", None)
     if has.get("fetchMyTrades") and callable(fetch_trades):
+        trade_limit = 20
+        trade_rows = _query(
+            "spot_exit_reconcile_fetch_my_trades",
+            lambda: fetch_trades(symbol_pair, limit=trade_limit),
+        )
         matching_trades = [
-            trade for trade in _query(
-                "spot_exit_reconcile_fetch_my_trades",
-                lambda: fetch_trades(symbol_pair, limit=20),
-            )
+            trade for trade in trade_rows
             if _order_client_id_matches(trade, client_order_id)
         ]
         if matching_trades:
-            return aggregate_spot_order_trades(
-                matching_trades, client_order_id
+            recovered = aggregate_spot_order_trades(
+                matching_trades,
+                client_order_id,
+                symbol_pair=symbol_pair,
+                expected_side="sell",
+                expected_amount=expected_amount,
             )
+            validate_spot_recovery_candidate(
+                recovered,
+                symbol_pair=symbol_pair,
+                expected_side="sell",
+                client_order_id=client_order_id,
+                bound_order_id=bound_order_id,
+                expected_amount=expected_amount,
+            )
+            recovered_fill = _positive_finite(recovered.get("filled"))
+            if terminal_rejected and recovered_fill > 0:
+                raise RuntimeError("spot rejected order has fill evidence")
+            incomplete_fill = (
+                expected_amount is None
+                or recovered_fill + max(1e-12, expected_amount * 1e-9)
+                < expected_amount
+            )
+            if (
+                incomplete_fill
+                and (
+                    deferred_terminal is None
+                    or len(trade_rows) >= trade_limit
+                )
+            ):
+                raise RuntimeError(
+                    "spot trade-only recovery lacks terminal/full-fill proof"
+                )
+            return recovered
 
     if not attempted or uncertain:
         raise RuntimeError("spot sell reconciliation unavailable")
-    return None
+    if terminal_fill_unresolved:
+        raise RuntimeError("spot terminal fill amount unavailable")
+    return deferred_terminal
 
 
 def recover_spot_sell_by_client_id(ex, symbol_pair: str,
-                                   client_order_id: str):
+                                   client_order_id: str,
+                                   expected_amount: Optional[float] = None):
     """Public recovery boundary for persisted SPOT sell intents."""
     return _find_spot_exit_order_by_client_id(
-        ex, symbol_pair, client_order_id
+        ex, symbol_pair, client_order_id, expected_amount=expected_amount
     )
 
 
@@ -516,7 +1166,7 @@ def _remove_accounted_state(state, sym: str, restore_fields: dict) -> bool:
 def _order_has_open_remainder(order) -> bool:
     if not isinstance(order, dict):
         return False
-    status = _external_text(order.get("status"))
+    status = normalize_spot_order_status(order.get("status"))
     if status in ("closed", "canceled", "cancelled", "expired", "rejected"):
         return False
     if status in ("open", "new", "partially_filled", "partiallyfilled"):
@@ -552,13 +1202,19 @@ def _emergency_residual_amount(ex, symbol_pair: str, requested_amount: float,
 
 def _emergency_residual_updates(amount: float, residual_amount: float,
                                 margin: float, initial_entry_fee: float,
-                                proportional_entry_fee: float, exch_oid,
+                                original_amount: float, exch_oid,
                                 reason: str) -> dict:
     remaining_invested = (
         margin * (residual_amount / amount)
         if amount > 0 else 0.0
     )
-    remaining_entry_fee = max(0.0, initial_entry_fee - proportional_entry_fee)
+    from bot_utils import safe_proportional_fee
+    remaining_entry_fee = safe_proportional_fee(
+        initial_entry_fee,
+        residual_amount,
+        original_amount,
+        partial_sold=True,
+    )
     return {
         "amount": residual_amount,
         "original_amount": residual_amount,
@@ -629,6 +1285,24 @@ def spot_market_sell_safe(ex, symbol_pair: str, raw_amount: float,
     last_exc: Optional[Exception] = None
     raw_dec = Decimal(str(safe_raw_amount))
     _balance_capped = False   # re-read free balance at most once on Oversold
+
+    def _recover_submit_error(submit_error: Exception,
+                              submitted_amount: float):
+        try:
+            recovered = _find_spot_exit_order_by_client_id(
+                ex,
+                symbol_pair,
+                client_order_id,
+                expected_amount=submitted_amount,
+            )
+        except Exception as recovery_error:
+            raise SpotSellOutcomeUnknown(
+                client_order_id
+            ) from recovery_error
+        if recovered is not None:
+            return recovered
+        raise SpotSellOutcomeUnknown(client_order_id) from submit_error
+
     for step in steps_to_try:
         if step is None:
             amt = rounded
@@ -639,6 +1313,12 @@ def spot_market_sell_safe(ex, symbol_pair: str, raw_amount: float,
         try:
             order = _create_market_sell_budgeted(
                 ex, symbol_pair, amt, client_order_id
+            )
+            validate_spot_submit_ack(
+                order,
+                symbol_pair=symbol_pair,
+                client_order_id=client_order_id,
+                expected_amount=amt,
             )
             return order, amt
         except Exception as e:
@@ -687,26 +1367,35 @@ def spot_market_sell_safe(ex, symbol_pair: str, raw_amount: float,
                     )
                 if capped >= amt:
                     raise e
-                order = _create_market_sell_budgeted(
-                    ex, symbol_pair, capped, client_order_id
-                )
+                try:
+                    order = _create_market_sell_budgeted(
+                        ex, symbol_pair, capped, client_order_id
+                    )
+                    validate_spot_submit_ack(
+                        order,
+                        symbol_pair=symbol_pair,
+                        client_order_id=client_order_id,
+                        expected_amount=capped,
+                    )
+                except Exception as capped_error:
+                    if (
+                        client_order_id
+                        and not isinstance(
+                            capped_error, _SpotSellBudgetUnavailable
+                        )
+                    ):
+                        order = _recover_submit_error(
+                            capped_error, capped
+                        )
+                    else:
+                        raise
                 return order, capped
             # 3. An ambiguous create failure may have happened after the venue
             #    accepted the sell. Recover by the stable client id; otherwise
             #    surface a typed unknown outcome so callers persist a retry
             #    barrier instead of issuing a fresh sell next monitor tick.
             if client_order_id and not isinstance(e, _SpotSellBudgetUnavailable):
-                try:
-                    recovered = _find_spot_exit_order_by_client_id(
-                        ex, symbol_pair, client_order_id
-                    )
-                except Exception as recovery_error:
-                    raise SpotSellOutcomeUnknown(
-                        client_order_id
-                    ) from recovery_error
-                if recovered is not None:
-                    return recovered, amt
-                raise SpotSellOutcomeUnknown(client_order_id) from e
+                return _recover_submit_error(e, amt), amt
             raise
     raise last_exc or ValueError(f"all precision retries failed for {raw_amount}")
 
@@ -769,10 +1458,75 @@ def emergency_close_all_spot(*,
                     )
                     continue
 
-            if not state.has(sym):
-                continue
-
             try:
+                # The snapshot predates the close lock. Re-read under the lock
+                # so a concurrent partial exit cannot be overwritten by an
+                # emergency sell based on stale state.
+                d_live = state.get(sym)
+                if not isinstance(d_live, dict):
+                    continue
+                d = d_live
+
+                if d.get("accounting_already_booked") is True:
+                    restore_fields = {
+                        "accounting_already_booked": True,
+                        "accounting_booked_sell_time": d.get(
+                            "accounting_booked_sell_time"
+                        ),
+                        "accounting_booked_exchange_order_id": d.get(
+                            "accounting_booked_exchange_order_id"
+                        ),
+                        "accounting_booked_reason": d.get(
+                            "accounting_booked_reason"
+                        ),
+                    }
+                    if _remove_accounted_state(
+                        state, sym, restore_fields
+                    ):
+                        closed_count += 1
+                    else:
+                        failed.append(
+                            f"{sym}: cleanup failed after booked close"
+                        )
+                        log_event(
+                            f"Emergency: {sym} was already booked, but "
+                            "state/claim cleanup still failed",
+                            "WARN",
+                        )
+                    continue
+
+                if d.get("accounting_pending") is True:
+                    failed.append(f"{sym}: full exit accounting pending")
+                    log_event(
+                        f"Emergency: {sym} has full-exit accounting pending; "
+                        "physical sell remains blocked until reconciliation",
+                        "WARN",
+                    )
+                    continue
+
+                if has_pending_spot_partial_exit(d):
+                    failed.append(f"{sym}: partial exit reconciliation pending")
+                    log_event(
+                        f"Emergency: {sym} has a pending partial-exit intent; "
+                        "keeping state for reconciliation",
+                        "WARN",
+                    )
+                    continue
+
+                from bot_utils.trade_state import (
+                    normalize_pending_accounting_items,
+                )
+                if normalize_pending_accounting_items(
+                    d.get("accounting_pending_partials")
+                ):
+                    failed.append(f"{sym}: partial exit accounting pending")
+                    log_event(
+                        f"Emergency: {sym} has pending partial accounting; "
+                        "keeping state for retry",
+                        "WARN",
+                    )
+                    continue
+
                 buy_price = _positive_finite(d.get("buy"))
                 amount = _positive_finite(d.get("amount"))
                 margin = _positive_finite(d.get("invested_usdt"))
@@ -819,14 +1573,20 @@ def emergency_close_all_spot(*,
 
                 profit_pct = ((curr - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
 
+                partial_sold = bool(d.get("partial_sold"))
                 initial_entry_fee = _positive_finite(
-                    d.get("initial_entry_fee", d.get("fees_paid", 0.0)))
-                original_amount = _positive_finite(
-                    d.get("original_amount"), amount)
+                    d.get(
+                        "initial_entry_fee",
+                        0.0 if partial_sold else d.get("fees_paid", 0.0),
+                    )
+                )
+                original_amount = _positive_finite(d.get("original_amount"))
+                if original_amount <= 0 and not partial_sold:
+                    original_amount = amount
                 from bot_utils import safe_proportional_fee
                 proportional_entry_fee = safe_proportional_fee(
                     initial_entry_fee, amount, original_amount,
-                    partial_sold=bool(d.get("partial_sold"))
+                    partial_sold=partial_sold
                 )
                 sold_amount = amount
                 booked_invested = sold_amount * buy_price if buy_price > 0 else margin
@@ -839,6 +1599,7 @@ def emergency_close_all_spot(*,
                 fill_price = curr
                 exch_oid = None
                 order = None
+                client_order_id = None
                 if simulation and amount > 0 and fill_price > 0:
                     close_fee = sold_amount * fill_price * 0.001
                     profit_usdt = round(
@@ -849,14 +1610,23 @@ def emergency_close_all_spot(*,
 
                 if not simulation and amount > 0:
                     try:
+                        persisted_client_order_id = order_id_text_or_none(
+                            d.get("emergency_exit_client_order_id")
+                        )
                         client_order_id = ensure_spot_exit_client_order_id(
                             state, sym, d, "emergency", bot_name
                         )
                         order = None
-                        if d.get("emergency_exit_outcome_uncertain"):
+                        if (
+                            persisted_client_order_id == client_order_id
+                            or d.get("emergency_exit_outcome_uncertain")
+                        ):
                             try:
                                 order = _find_spot_exit_order_by_client_id(
-                                    ex, symbol_pair, client_order_id
+                                    ex,
+                                    symbol_pair,
+                                    client_order_id,
+                                    expected_amount=amount,
                                 )
                             except Exception as recovery_error:
                                 failed.append(
@@ -889,25 +1659,42 @@ def emergency_close_all_spot(*,
                                 client_order_id=client_order_id,
                             )
                         if order is None:
-                            order, _sold = with_network_retry(
-                                operation=lambda: _sell_capped(),
-                                action_label=f"emergency sell {sym}",
-                                max_attempts=3,
-                                base_delay=0.5,
-                                shutdown_event=None,
-                                log_event=log_event,
-                            )
+                            from bot_utils.trade_state import registry_order_guard
+                            with registry_order_guard(
+                                state, sym, d
+                            ) as ownership_live:
+                                if not isinstance(ownership_live, dict):
+                                    continue
+                                if ownership_live.get("claim_conflict"):
+                                    failed.append(
+                                        f"{sym}: registry claim conflict"
+                                    )
+                                    log_event(
+                                        f"  [LIVE] {sym}: emergency sell blocked "
+                                        f"by registry claim conflict",
+                                        "ERROR",
+                                    )
+                                    continue
+                                order, _sold = with_network_retry(
+                                    operation=lambda: _sell_capped(),
+                                    action_label=f"emergency sell {sym}",
+                                    max_attempts=3,
+                                    base_delay=0.5,
+                                    shutdown_event=None,
+                                    log_event=log_event,
+                                )
                         else:
                             _sold = amount
                         raw_status = (
                             order.get("status")
                             if isinstance(order, dict) else None
                         )
-                        normalized_status = (
-                            raw_status.strip().lower()
-                            if isinstance(raw_status, str) else ""
+                        normalized_status = normalize_spot_order_status(
+                            raw_status
                         )
-                        if normalized_status in {"new", "open", "pending"}:
+                        if spot_sell_requires_terminal_recovery(
+                            order, amount
+                        ):
                             persisted = _persist_spot_exit_fields(
                                 state, sym, d,
                                 {"emergency_exit_outcome_uncertain": True},
@@ -924,21 +1711,38 @@ def emergency_close_all_spot(*,
                             )
                             log_event(
                                 f"  [LIVE] {sym}: emergency sell still "
-                                f"{normalized_status}; booking and retry "
+                                f"{normalized_status or 'unresolved'}; "
+                                "booking and retry "
                                 f"deferred until terminal state",
                                 "WARN",
                             )
                             continue
-                        from bot_utils.order_utils import order_was_filled
+                        from bot_utils.order_utils import (
+                            order_has_proven_zero_fill,
+                            order_has_unquantified_fill_notional,
+                            order_was_filled,
+                        )
                         # Verify the order ACTUALLY filled  MEXC can return an
                         # order object that never executed (status new/open,
                         # filled=0, e.g. remaining size below min-notional);
                         # booking it as sold would write a phantom closed trade.
-                        if not order_was_filled(order, _sold,
-                                                min_fill_ratio=1e-9):
-                            if normalized_status in {
+                        unquantified_fill = (
+                            order_has_unquantified_fill_notional(order)
+                        )
+                        if (
+                            unquantified_fill
+                            or not order_was_filled(
+                                order,
+                                _sold,
+                                min_fill_ratio=1e-9,
+                            )
+                        ):
+                            if (
+                                normalized_status in {
                                 "canceled", "cancelled", "rejected", "expired",
-                            }:
+                                }
+                                and order_has_proven_zero_fill(order)
+                            ):
                                 persisted = _persist_spot_exit_fields(
                                     state, sym, d, {
                                         "emergency_exit_client_order_id": None,
@@ -965,13 +1769,14 @@ def emergency_close_all_spot(*,
                         exch_oid = (
                             order_id_text_or_none(order.get("id"))
                             or order_id_text_or_none(order.get("orderId"))
+                            or order_id_text_or_none(client_order_id)
                         )
                         sold_amount = _filled_base_amount(order, _sold, amount)
                         fill_price = _positive_finite(
                             extract_fill_price(order, curr), curr)
                         proportional_entry_fee = safe_proportional_fee(
                             initial_entry_fee, sold_amount, original_amount,
-                            partial_sold=bool(d.get("partial_sold"))
+                            partial_sold=partial_sold
                         )
                         booked_invested = (sold_amount * buy_price
                                            if buy_price > 0 else margin)
@@ -1020,89 +1825,138 @@ def emergency_close_all_spot(*,
                 buy_time = d.get("buy_time", _utc_now_str())
                 sell_time = _utc_now_str()
                 fees_for_booked_slice = proportional_entry_fee + close_fee
+                residual_amount = (
+                    _emergency_residual_amount(
+                        ex, symbol_pair, amount, sold_amount,
+                        fill_price, order=order
+                    )
+                    if not simulation and amount > 0 else 0.0
+                )
+                is_partial_close = residual_amount > 0
+                from core.spot_bot_exits import _spot_excursion_metrics
+                mfe_pct, mae_pct, giveback_pct = _spot_excursion_metrics(
+                    d, fill_price
+                )
+                booked_reason = f"Emergency Close ({reason})"
+                trade_row = dict(
+                    bot_name=bot_name,
+                    mode_is_sim=simulation,
+                    symbol=sym,
+                    buy_price=buy_price,
+                    sell_price=fill_price,
+                    buy_time=buy_time,
+                    sell_time=sell_time,
+                    profit_pct=profit_pct,
+                    profit_usdt=profit_usdt,
+                    invested_usdt=booked_invested,
+                    reason=booked_reason,
+                    rsi_15m=d.get("rsi_15m"),
+                    rsi_1h=d.get("rsi_1h"),
+                    rsi_4h=d.get("rsi_4h"),
+                    change_pct=d.get("change_pct"),
+                    btc_trend=d.get("btc_trend"),
+                    fear_greed=d.get("fear_greed"),
+                    is_futures=False,
+                    fees_usdt=fees_for_booked_slice,
+                    exchange_order_id=exch_oid,
+                    entry_quality_score=d.get("entry_quality_score"),
+                    entry_quality_label=d.get("entry_quality_label"),
+                    entry_quality_reasons=d.get("entry_quality_reasons"),
+                    entry_id=d.get("entry_id"),
+                    mfe_pct=mfe_pct,
+                    mae_pct=mae_pct,
+                    giveback_pct=giveback_pct,
+                )
+                pending_partials = []
+                if is_partial_close:
+                    trade_row["is_partial"] = True
+                    from bot_utils.trade_state import (
+                        normalize_pending_accounting_items,
+                    )
+                    pending_partials = normalize_pending_accounting_items(
+                        d.get("accounting_pending_partials")
+                    )
+                    pending_partials.append(dict(trade_row))
+                    write_ahead = _emergency_residual_updates(
+                        amount, residual_amount, margin,
+                        initial_entry_fee, original_amount,
+                        exch_oid, reason
+                    )
+                    write_ahead["accounting_pending_partials"] = (
+                        pending_partials
+                    )
+                else:
+                    write_ahead = {
+                        "accounting_pending": True,
+                        "accounting_pending_reason": booked_reason,
+                        "accounting_pending_sell_price": fill_price,
+                        "accounting_pending_sell_time": sell_time,
+                        "accounting_pending_profit_pct": profit_pct,
+                        "accounting_pending_profit_usdt": profit_usdt,
+                        "accounting_pending_invested_usdt": (
+                            booked_invested
+                        ),
+                        "accounting_pending_mode_is_sim": simulation,
+                        "accounting_pending_fees_usdt": (
+                            fees_for_booked_slice
+                        ),
+                        "accounting_pending_exchange_order_id": exch_oid,
+                        "accounting_pending_mfe_pct": mfe_pct,
+                        "accounting_pending_mae_pct": mae_pct,
+                        "accounting_pending_giveback_pct": giveback_pct,
+                    }
+
+                state_persisted = _persist_spot_exit_fields(
+                    state, sym, d, write_ahead
+                )
+                if not state_persisted:
+                    if not simulation:
+                        _persist_spot_exit_fields(
+                            state,
+                            sym,
+                            d,
+                            {"emergency_exit_outcome_uncertain": True},
+                        )
+                    failed.append(
+                        f"{sym}: accounting state not durable after close"
+                    )
+                    log_event(
+                        f"  {sym}: physical emergency fill was not booked "
+                        "because its accounting recovery state was not durable",
+                        "ERROR",
+                    )
+                    continue
+
                 try:
-                    accounting_ok = bool(save_trade_db(
-                        bot_name=bot_name,
-                        mode_is_sim=simulation,
-                        symbol=sym,
-                        buy_price=buy_price, sell_price=fill_price,
-                        buy_time=buy_time, sell_time=sell_time,
-                        profit_pct=profit_pct, profit_usdt=profit_usdt,
-                        invested_usdt=booked_invested,
-                        reason=f"Emergency Close ({reason})",
-                        rsi_15m=d.get("rsi_15m"), rsi_1h=d.get("rsi_1h"),
-                        rsi_4h=d.get("rsi_4h"), change_pct=d.get("change_pct"),
-                        btc_trend=d.get("btc_trend"), fear_greed=d.get("fear_greed"),
-                        is_futures=False,
-                        fees_usdt=fees_for_booked_slice,
-                        exchange_order_id=exch_oid,
-                        entry_id=d.get("entry_id"),
-                    ))
+                    accounting_ok = bool(save_trade_db(**trade_row))
                     if not accounting_ok:
                         raise RuntimeError("save_trade_db returned False")
                 except Exception as e:
                     log_event(
                         f"  DB accounting for {sym} failed after close: {e}. "
-                        f"State kept for recovery.", "WARN")
-                    try:
-                        residual_amount = (
-                            _emergency_residual_amount(
-                                ex, symbol_pair, amount, sold_amount,
-                                fill_price, order=order)
-                            if not simulation and amount > 0 else 0.0
-                        )
-                        if residual_amount > 0:
-                            pending_trade = dict(
-                                bot_name=bot_name, symbol=sym,
-                                buy_price=buy_price, sell_price=fill_price,
-                                buy_time=buy_time, sell_time=sell_time,
-                                profit_pct=profit_pct,
-                                profit_usdt=profit_usdt,
-                                invested_usdt=booked_invested,
-                                reason=f"Emergency Close ({reason})",
-                                rsi_15m=d.get("rsi_15m"),
-                                rsi_1h=d.get("rsi_1h"),
-                                rsi_4h=d.get("rsi_4h"),
-                                change_pct=d.get("change_pct"),
-                                btc_trend=d.get("btc_trend"),
-                                fear_greed=d.get("fear_greed"),
-                                is_futures=False,
-                                is_partial=True,
-                                fees_usdt=fees_for_booked_slice,
-                                exchange_order_id=exch_oid,
-                                entry_id=d.get("entry_id"),
-                            )
-                            pending = list(
-                                d.get("accounting_pending_partials") or [])
-                            pending.append(pending_trade)
-                            updates = _emergency_residual_updates(
-                                amount, residual_amount, margin,
-                                initial_entry_fee, proportional_entry_fee,
-                                exch_oid, reason)
-                            updates["accounting_pending_partials"] = pending
-                            _apply_state_updates(state, sym, updates)
-                            log_event(
-                                f"  [LIVE] {sym}: sold slice accounting pending; "
-                                f"{residual_amount:.6f} kept in state for retry",
-                                "WARN")
-                        else:
-                            updates = {
-                                "accounting_pending": True,
-                                "accounting_pending_reason": f"Emergency Close ({reason})",
-                                "accounting_pending_sell_price": fill_price,
-                                "accounting_pending_sell_time": sell_time,
-                                "accounting_pending_profit_pct": profit_pct,
-                                "accounting_pending_profit_usdt": profit_usdt,
-                                "accounting_pending_fees_usdt": fees_for_booked_slice,
-                                "accounting_pending_exchange_order_id": exch_oid,
-                            }
-                            _apply_state_updates(state, sym, updates)
-                    except Exception as se:
-                        log_event(
-                            f"  Could not mark {sym} accounting_pending: {se}",
-                            "WARN")
+                        f"Durable retry state retained.", "WARN")
                     failed.append(f"{sym}: accounting failed after close")
                     continue
+
+                if is_partial_close:
+                    remaining_pending = pending_partials[:-1]
+                    cleared = _persist_spot_exit_fields(
+                        state,
+                        sym,
+                        d,
+                        {
+                            "accounting_pending_partials": (
+                                remaining_pending
+                            )
+                        },
+                    )
+                    if not cleared:
+                        log_event(
+                            f"  [LIVE] {sym}: partial emergency fill was "
+                            "booked, but its durable pending marker could not "
+                            "be cleared; idempotent retry retained",
+                            "ERROR",
+                        )
 
                 # The canonical DB booking is authoritative. Optional file and
                 # console logs must never turn an already-booked close into a
@@ -1146,35 +2000,19 @@ def emergency_close_all_spot(*,
                         except Exception:
                             pass
 
-                # A balance-capped emergency sell can partial-fill. Keep a
-                # meaningful remainder in state with its original cost basis.
-                if not simulation and amount > 0:
-                    residual_amount = _emergency_residual_amount(
-                        ex, symbol_pair, amount, sold_amount, fill_price,
-                        order=order)
-                    if residual_amount > 0:
-                        updates = _emergency_residual_updates(
-                            amount, residual_amount, margin,
-                            initial_entry_fee, proportional_entry_fee,
-                            exch_oid, reason)
-                        try:
-                            _apply_state_updates(state, sym, updates)
-                        except Exception as se:
-                            failed.append(
-                                f"{sym}: residual state update failed: {se}")
-                            log_event(
-                                f"  [LIVE] {sym}: residual state update failed "
-                                f"({se}) - NOT removing state", "WARN")
-                            continue
-                        log_event(
-                            f"  [LIVE] {sym}: {residual_amount:.6f} still open after "
-                            f"emergency sell (>5% of {amount:.6f}) - kept in "
-                            f"state for retry/reconcile.",
-                            "WARN")
-                        failed.append(
-                            f"{sym}: residual kept in state ({residual_amount:.6f})")
-                        total_pnl += profit_usdt
-                        continue
+                if is_partial_close:
+                    log_event(
+                        f"  [LIVE] {sym}: {residual_amount:.6f} remains "
+                        "after emergency sell and stays durable for "
+                        "retry/reconcile",
+                        "WARN",
+                    )
+                    failed.append(
+                        f"{sym}: residual kept in state "
+                        f"({residual_amount:.6f})"
+                    )
+                    total_pnl += profit_usdt
+                    continue
 
                 removed = _remove_accounted_state(state, sym, {
                     "accounting_already_booked": True,

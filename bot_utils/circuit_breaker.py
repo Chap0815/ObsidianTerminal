@@ -15,6 +15,7 @@ and closing existing positions. State is reset by restarting the bot.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import threading
 import time
@@ -122,6 +123,71 @@ def _record_slippage_into(
 #  Spread check
 
 
+def has_valid_spread_quotes(ticker: dict | None) -> bool:
+    """Return whether ticker bid/ask form a finite executable top of book."""
+    if not isinstance(ticker, dict):
+        return False
+    bid = ticker.get("bid")
+    ask = ticker.get("ask")
+    if bid is None or ask is None or isinstance(bid, bool) or isinstance(ask, bool):
+        return False
+    try:
+        bid_f = float(bid)
+        ask_f = float(ask)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        math.isfinite(bid_f)
+        and math.isfinite(ask_f)
+        and bid_f > 0.0
+        and ask_f > 0.0
+        and ask_f >= bid_f
+    )
+
+
+def extract_valid_top_of_book(order_book: dict | None) -> tuple[float, float] | None:
+    """Return finite positive ``(bid, ask)`` from strict CCXT book rows."""
+    if not isinstance(order_book, dict):
+        return None
+    bids = order_book.get("bids")
+    asks = order_book.get("asks")
+    if (
+        not isinstance(bids, (list, tuple))
+        or not isinstance(asks, (list, tuple))
+        or not bids
+        or not asks
+    ):
+        return None
+    bid_row = bids[0]
+    ask_row = asks[0]
+    if (
+        not isinstance(bid_row, (list, tuple))
+        or not isinstance(ask_row, (list, tuple))
+        or len(bid_row) < 2
+        or len(ask_row) < 2
+    ):
+        return None
+    bid_amount = bid_row[1]
+    ask_amount = ask_row[1]
+    if isinstance(bid_amount, bool) or isinstance(ask_amount, bool):
+        return None
+    try:
+        bid_amount_f = float(bid_amount)
+        ask_amount_f = float(ask_amount)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    quotes = {"bid": bid_row[0], "ask": ask_row[0]}
+    if (
+        not math.isfinite(bid_amount_f)
+        or not math.isfinite(ask_amount_f)
+        or bid_amount_f <= 0.0
+        or ask_amount_f <= 0.0
+        or not has_valid_spread_quotes(quotes)
+    ):
+        return None
+    return float(quotes["bid"]), float(quotes["ask"])
+
+
 def check_spread_ok(
     ticker: dict,
     log_event: Optional[Callable] = None,
@@ -147,14 +213,25 @@ def check_spread_ok(
         if log_event and not missing_ok:
             log_event("Spread check unavailable  blocking entry", "WARN")
         return bool(missing_ok)
+    if not has_valid_spread_quotes(ticker):
+        if log_event:
+            log_event("Spread check invalid bid/ask  blocking entry", "WARN")
+        return False
     try:
-        bid_f, ask_f = float(bid), float(ask)
-        if bid_f <= 0 or ask_f <= 0:
-            if log_event and not missing_ok:
-                log_event("Spread check invalid bid/ask  blocking entry", "WARN")
-            return bool(missing_ok)
+        bid_f = float(bid)
+        ask_f = float(ask)
         threshold = max_spread_pct if max_spread_pct is not None else MAX_SPREAD_PCT
-        spread_pct = (ask_f - bid_f) / ((ask_f + bid_f) / 2) * 100
+        if isinstance(threshold, bool):
+            raise ValueError("boolean spread threshold")
+        threshold = float(threshold)
+        if not math.isfinite(threshold) or threshold < 0.0:
+            raise ValueError("invalid spread threshold")
+        mid = (ask_f + bid_f) / 2.0
+        if not math.isfinite(mid) or mid <= 0.0:
+            raise ValueError("invalid spread midpoint")
+        spread_pct = (ask_f - bid_f) / mid * 100
+        if not math.isfinite(spread_pct) or spread_pct < 0.0:
+            raise ValueError("invalid spread result")
         if spread_pct > threshold:
             if log_event:
                 log_event(
@@ -168,10 +245,10 @@ def check_spread_ok(
                     spread_pct, symbol=symbol, log_event=log_event
                 )
             return False
-    except (TypeError, ValueError):
-        if log_event and not missing_ok:
+    except (TypeError, ValueError, OverflowError):
+        if log_event:
             log_event("Spread check invalid ticker values  blocking entry", "WARN")
-        return bool(missing_ok)
+        return False
     return True
 
 

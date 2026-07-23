@@ -31,6 +31,10 @@ TESTS_DIR = os.path.join(PROJECT_ROOT, "tests")
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+from launcher.tool_processes import guard_tool_entrypoint  # noqa: E402
+
+guard_tool_entrypoint(__file__, __name__)
+
 from tools.release_requirements import REQUIRED_RELEASE_ITEMS  # noqa: E402
 
 

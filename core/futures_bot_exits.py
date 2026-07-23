@@ -39,6 +39,491 @@ from bot_utils.api_budget import try_consume_api_call
 from bot_utils.order_utils import order_id_text_or_none
 
 
+_PARTIAL_EXIT_CLIENT_ID = "partial_exit_client_order_id"
+_PARTIAL_EXIT_AMOUNT = "partial_exit_requested_amount"
+_PARTIAL_EXIT_SIDE = "partial_exit_position_side"
+_PARTIAL_EXIT_MODE = "partial_exit_mode"
+_PARTIAL_EXIT_OBSERVED_FILLED = "partial_exit_observed_filled"
+_FULL_EXIT_CLIENT_ID = "full_exit_client_order_id"
+_FULL_EXIT_AMOUNT = "full_exit_requested_amount"
+_FULL_EXIT_SIDE = "full_exit_position_side"
+_FULL_EXIT_MODE = "full_exit_mode"
+_FULL_EXIT_BASE_FILLED = "full_exit_base_filled_amount"
+
+
+def _has_futures_partial_exit_intent(row: dict) -> bool:
+    return isinstance(row, dict) and any(
+        row.get(key) not in (None, "")
+        for key in (
+            _PARTIAL_EXIT_CLIENT_ID,
+            _PARTIAL_EXIT_AMOUNT,
+            _PARTIAL_EXIT_SIDE,
+            _PARTIAL_EXIT_MODE,
+            _PARTIAL_EXIT_OBSERVED_FILLED,
+        )
+    )
+
+
+def _futures_partial_exit_order_is_terminal(
+    order: dict,
+    *,
+    requested_amount: float,
+    filled_amount: float,
+) -> bool:
+    if not isinstance(order, dict):
+        return False
+    raw_status = order.get("status")
+    status = raw_status.strip().lower() if isinstance(raw_status, str) else ""
+    if status in {"closed", "filled", "canceled", "cancelled", "expired"}:
+        return True
+    tolerance = max(1e-12, requested_amount * 1e-9)
+    return filled_amount >= requested_amount - tolerance
+
+
+def _ensure_futures_partial_exit_intent(
+    state,
+    sym: str,
+    row: dict,
+    *,
+    requested_amount: float,
+    position_side: str,
+    bot_name: str,
+) -> tuple[str, float, bool]:
+    """Return a durable partial-close intent and whether this call created it."""
+    existing = order_id_text_or_none(row.get(_PARTIAL_EXIT_CLIENT_ID))
+    raw_amount = row.get(_PARTIAL_EXIT_AMOUNT)
+    raw_side = row.get(_PARTIAL_EXIT_SIDE)
+    raw_mode = row.get(_PARTIAL_EXIT_MODE)
+    raw_observed_filled = row.get(_PARTIAL_EXIT_OBSERVED_FILLED)
+    if existing:
+        if not existing.isascii() or len(existing) > 32:
+            raise RuntimeError(f"invalid pending partial-exit client id for {sym}")
+        if isinstance(raw_amount, bool):
+            raise RuntimeError(f"invalid pending partial-exit amount for {sym}")
+        try:
+            stored_amount = float(raw_amount)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                f"invalid pending partial-exit amount for {sym}"
+            ) from exc
+        if not math.isfinite(stored_amount) or stored_amount <= 0:
+            raise RuntimeError(f"invalid pending partial-exit amount for {sym}")
+        stored_side = raw_side.strip().upper() if isinstance(raw_side, str) else ""
+        if stored_side not in {"LONG", "SHORT"} or stored_side != position_side:
+            raise RuntimeError(f"invalid pending partial-exit side for {sym}")
+        if raw_mode != "LIVE":
+            raise RuntimeError(f"invalid pending partial-exit mode for {sym}")
+        if isinstance(raw_observed_filled, bool):
+            raise RuntimeError(
+                f"invalid pending partial-exit observed fill for {sym}"
+            )
+        try:
+            observed_filled = float(raw_observed_filled)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                f"invalid pending partial-exit observed fill for {sym}"
+            ) from exc
+        tolerance = max(1e-12, stored_amount * 1e-9)
+        if (
+            not math.isfinite(observed_filled)
+            or observed_filled < 0
+            or observed_filled > stored_amount + tolerance
+        ):
+            raise RuntimeError(
+                f"invalid pending partial-exit observed fill for {sym}"
+            )
+        return existing, stored_amount, False
+
+    if any(
+        value not in (None, "")
+        for value in (
+            row.get(_PARTIAL_EXIT_CLIENT_ID),
+            raw_amount,
+            raw_side,
+            raw_mode,
+            raw_observed_filled,
+        )
+    ):
+        raise RuntimeError(f"incomplete pending partial-exit intent for {sym}")
+    if (
+        isinstance(requested_amount, bool)
+        or not math.isfinite(requested_amount)
+        or requested_amount <= 0
+        or position_side not in {"LONG", "SHORT"}
+    ):
+        raise RuntimeError(f"invalid new partial-exit intent for {sym}")
+
+    from uuid import uuid4
+    from trading.execution_quality import make_client_order_id
+
+    entry_id = order_id_text_or_none(row.get("entry_id")) or "legacy"
+    client_order_id = make_client_order_id(
+        f"{entry_id}:{uuid4().hex}",
+        f"{bot_name}:{sym}:partial",
+        prefix="fx",
+    )
+    updates = {
+        _PARTIAL_EXIT_CLIENT_ID: client_order_id,
+        _PARTIAL_EXIT_AMOUNT: requested_amount,
+        _PARTIAL_EXIT_SIDE: position_side,
+        _PARTIAL_EXIT_MODE: "LIVE",
+        _PARTIAL_EXIT_OBSERVED_FILLED: 0.0,
+    }
+    persisted = state.update_many(sym, updates)
+    if persisted is False:
+        raise RuntimeError(
+            f"cannot persist partial-exit intent before live order for {sym}"
+        )
+    row.update(updates)
+    return client_order_id, requested_amount, True
+
+
+def _clear_futures_partial_exit_intent(state, sym: str, row: dict) -> bool:
+    updates = {
+        _PARTIAL_EXIT_CLIENT_ID: None,
+        _PARTIAL_EXIT_AMOUNT: None,
+        _PARTIAL_EXIT_SIDE: None,
+        _PARTIAL_EXIT_MODE: None,
+        _PARTIAL_EXIT_OBSERVED_FILLED: None,
+    }
+    persisted = state.update_many(sym, updates)
+    if persisted is False:
+        return False
+    row.update(updates)
+    return True
+
+
+def _ensure_futures_full_exit_intent(
+    state,
+    sym: str,
+    row: dict,
+    *,
+    requested_amount: float,
+    position_side: str,
+    bot_name: str,
+) -> tuple[str, float, bool]:
+    """Return one durable full-close intent and whether this call created it."""
+    existing = order_id_text_or_none(row.get(_FULL_EXIT_CLIENT_ID))
+    raw_amount = row.get(_FULL_EXIT_AMOUNT)
+    raw_side = row.get(_FULL_EXIT_SIDE)
+    raw_mode = row.get(_FULL_EXIT_MODE)
+    raw_base_filled = row.get(_FULL_EXIT_BASE_FILLED)
+    if existing:
+        if not existing.isascii() or len(existing) > 32:
+            raise RuntimeError(f"invalid pending full-exit client id for {sym}")
+        if isinstance(raw_amount, bool):
+            raise RuntimeError(f"invalid pending full-exit amount for {sym}")
+        try:
+            stored_amount = float(raw_amount)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                f"invalid pending full-exit amount for {sym}"
+            ) from exc
+        if not math.isfinite(stored_amount) or stored_amount <= 0:
+            raise RuntimeError(f"invalid pending full-exit amount for {sym}")
+        stored_side = raw_side.strip().upper() if isinstance(raw_side, str) else ""
+        if stored_side not in {"LONG", "SHORT"} or stored_side != position_side:
+            raise RuntimeError(f"invalid pending full-exit side for {sym}")
+        if raw_mode != "LIVE":
+            raise RuntimeError(f"invalid pending full-exit mode for {sym}")
+        if isinstance(raw_base_filled, bool):
+            raise RuntimeError(
+                f"invalid pending full-exit fill baseline for {sym}"
+            )
+        try:
+            base_filled = float(raw_base_filled)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                f"invalid pending full-exit fill baseline for {sym}"
+            ) from exc
+        if not math.isfinite(base_filled) or base_filled < 0:
+            raise RuntimeError(
+                f"invalid pending full-exit fill baseline for {sym}"
+            )
+        try:
+            from bot_utils.close_fragments import pending_close_values
+
+            current_filled, _price, _fee, _order_id = pending_close_values(row)
+        except Exception as exc:
+            raise RuntimeError(
+                f"invalid pending full-exit fill evidence for {sym}"
+            ) from exc
+        tolerance = max(1e-12, max(stored_amount, base_filled) * 1e-9)
+        if current_filled + tolerance < base_filled:
+            raise RuntimeError(
+                f"pending full-exit fill baseline exceeds evidence for {sym}"
+            )
+        durable_fields = {
+            _FULL_EXIT_CLIENT_ID: existing,
+            _FULL_EXIT_AMOUNT: stored_amount,
+            _FULL_EXIT_SIDE: stored_side,
+            _FULL_EXIT_MODE: "LIVE",
+            _FULL_EXIT_BASE_FILLED: base_filled,
+        }
+        try:
+            persisted = state.update_many(sym, durable_fields)
+        except Exception as exc:
+            raise RuntimeError(
+                f"cannot confirm durable full-exit intent for {sym}"
+            ) from exc
+        if persisted is False:
+            raise RuntimeError(
+                f"cannot confirm durable full-exit intent for {sym}"
+            )
+        row.update(durable_fields)
+        return existing, stored_amount, False
+
+    if any(
+        value not in (None, "")
+        for value in (
+            row.get(_FULL_EXIT_CLIENT_ID),
+            raw_amount,
+            raw_side,
+            raw_mode,
+            raw_base_filled,
+        )
+    ):
+        raise RuntimeError(f"incomplete pending full-exit intent for {sym}")
+    if (
+        isinstance(requested_amount, bool)
+        or not math.isfinite(requested_amount)
+        or requested_amount <= 0
+        or position_side not in {"LONG", "SHORT"}
+    ):
+        raise RuntimeError(f"invalid new full-exit intent for {sym}")
+
+    from uuid import uuid4
+    from trading.execution_quality import make_client_order_id
+
+    entry_id = order_id_text_or_none(row.get("entry_id")) or "legacy"
+    try:
+        from bot_utils.close_fragments import pending_close_values
+
+        base_filled, _price, _fee, _order_id = pending_close_values(row)
+    except Exception as exc:
+        raise RuntimeError(
+            f"invalid new full-exit fill baseline for {sym}"
+        ) from exc
+    client_order_id = make_client_order_id(
+        f"{entry_id}:{uuid4().hex}",
+        f"{bot_name}:{sym}:full",
+        prefix="fx",
+    )
+    updates = {
+        _FULL_EXIT_CLIENT_ID: client_order_id,
+        _FULL_EXIT_AMOUNT: requested_amount,
+        _FULL_EXIT_SIDE: position_side,
+        _FULL_EXIT_MODE: "LIVE",
+        _FULL_EXIT_BASE_FILLED: base_filled,
+    }
+    persisted = state.update_many(sym, updates)
+    if persisted is False:
+        raise RuntimeError(
+            f"cannot persist full-exit intent before live order for {sym}"
+        )
+    row.update(updates)
+    return client_order_id, requested_amount, True
+
+
+def _futures_full_exit_clear_fields() -> dict:
+    return {
+        _FULL_EXIT_CLIENT_ID: None,
+        _FULL_EXIT_AMOUNT: None,
+        _FULL_EXIT_SIDE: None,
+        _FULL_EXIT_MODE: None,
+        _FULL_EXIT_BASE_FILLED: None,
+    }
+
+
+def _clear_futures_full_exit_intent(state, sym: str, row: dict) -> bool:
+    updates = _futures_full_exit_clear_fields()
+    previous = {
+        _FULL_EXIT_CLIENT_ID: row.get(_FULL_EXIT_CLIENT_ID),
+        _FULL_EXIT_AMOUNT: row.get(_FULL_EXIT_AMOUNT),
+        _FULL_EXIT_SIDE: row.get(_FULL_EXIT_SIDE),
+        _FULL_EXIT_MODE: row.get(_FULL_EXIT_MODE),
+        _FULL_EXIT_BASE_FILLED: row.get(_FULL_EXIT_BASE_FILLED),
+    }
+    try:
+        persisted = state.update_many(sym, updates)
+    except Exception:
+        persisted = False
+    if persisted is False:
+        try:
+            state.update_many(sym, previous)
+        except Exception:
+            pass
+        row.update(previous)
+        return False
+    row.update(updates)
+    return True
+
+
+def _recover_or_submit_futures_full_exit(
+    bot,
+    sym: str,
+    row: dict,
+    *,
+    symbol_full: str,
+    requested_amount: float,
+    position_side: str,
+    close_side: str,
+    margin_mode: str,
+    leverage: int,
+    action_label: str,
+    log_event,
+    log_struct=None,
+):
+    """Recover a durable full-close intent or submit it exactly once."""
+    client_order_id, close_amount, created_intent = (
+        _ensure_futures_full_exit_intent(
+            bot.state,
+            sym,
+            row,
+            requested_amount=requested_amount,
+            position_side=position_side,
+            bot_name=bot.BOT_NAME,
+        )
+    )
+    intent_base_filled = FuturesExitsMixin._safe_nonnegative_amount(
+        row.get(_FULL_EXIT_BASE_FILLED)
+    )
+    from config.exchange_config import reduce_only_params
+    from bot_utils.futures_order import (
+        _exchange_id,
+        _find_order_by_client_id,
+        _order_confirmed_terminal_zero_fill,
+        _order_landed,
+        _requested_position_side,
+        classify_order_state,
+        is_terminal_order_state,
+    )
+
+    order_params = reduce_only_params(
+        position_side=("long" if position_side == "LONG" else "short"),
+        margin_mode=margin_mode,
+        leverage=leverage,
+        client_order_id=client_order_id,
+    )
+    requested_position_side = _requested_position_side(order_params)
+    order = None
+    if not created_intent:
+        lookup_status = {}
+        order = _find_order_by_client_id(
+            bot.ex,
+            symbol_full,
+            client_order_id,
+            log_event=log_event,
+            lookup_status=lookup_status,
+            expected_amount=close_amount,
+            expected_side=close_side,
+            expected_position_side=requested_position_side,
+            exchange_id=_exchange_id(bot.ex),
+            expected_reduce_only=True,
+        )
+        recovery_conflict = (
+            isinstance(order, dict)
+            and order.get("_bot_recovery_conflict") is True
+        )
+        if lookup_status.get("unavailable") or recovery_conflict:
+            log_event(
+                f"{action_label}: pending full-close recovery unavailable "
+                "or conflicting - additional submit remains blocked",
+                "ERROR" if recovery_conflict else "WARN",
+            )
+            return None, close_amount, False
+        if _order_confirmed_terminal_zero_fill(order):
+            try:
+                from bot_utils.close_fragments import pending_close_values
+
+                prior_filled, _price, _fee, _oid = pending_close_values(row)
+            except Exception:
+                log_event(
+                    f"{action_label}: terminal zero-fill conflicts with "
+                    "invalid pending close evidence",
+                    "ERROR",
+                )
+                return None, close_amount, False
+            tolerance = max(1e-12, close_amount * 1e-9)
+            if abs(prior_filled - intent_base_filled) > tolerance:
+                log_event(
+                    f"{action_label}: terminal zero-fill conflicts with "
+                    "fill evidence recorded after this intent was created",
+                    "ERROR",
+                )
+                return None, close_amount, False
+            if not _clear_futures_full_exit_intent(
+                bot.state, sym, row
+            ):
+                log_event(
+                    f"{action_label}: terminal zero-fill intent could not "
+                    "be cleared durably",
+                    "ERROR",
+                )
+            return None, close_amount, False
+        if order is not None and not _order_landed(order):
+            log_event(
+                f"{action_label}: pending full-close order is not proven "
+                "landed - additional submit remains blocked",
+                "WARN",
+            )
+            return None, close_amount, False
+
+    if order is None:
+        from bot_utils import create_order_with_retry
+        from bot_utils.trade_state import registry_order_guard
+
+        with registry_order_guard(
+            bot.state, sym, row
+        ) as ownership_live:
+            if not isinstance(ownership_live, dict):
+                return None, close_amount, False
+            if ownership_live.get("claim_conflict"):
+                log_event(
+                    f"{action_label}: close blocked by registry claim conflict",
+                    "ERROR",
+                )
+                return None, close_amount, False
+            live_client_order_id = order_id_text_or_none(
+                ownership_live.get(_FULL_EXIT_CLIENT_ID)
+            )
+            live_amount = FuturesExitsMixin._safe_positive_float(
+                ownership_live.get(_FULL_EXIT_AMOUNT), 0.0
+            )
+            live_base_filled = FuturesExitsMixin._safe_nonnegative_amount(
+                ownership_live.get(_FULL_EXIT_BASE_FILLED)
+            )
+            tolerance = max(1e-12, close_amount * 1e-9)
+            if (
+                live_client_order_id != client_order_id
+                or abs(live_amount - close_amount) > tolerance
+                or ownership_live.get(_FULL_EXIT_SIDE) != position_side
+                or ownership_live.get(_FULL_EXIT_MODE) != "LIVE"
+                or abs(live_base_filled - intent_base_filled) > tolerance
+            ):
+                log_event(
+                    f"{action_label}: durable full-close intent changed "
+                    "before submit",
+                    "ERROR",
+                )
+                return None, close_amount, False
+            order = create_order_with_retry(
+                bot.ex,
+                symbol_full,
+                close_side,
+                close_amount,
+                params=order_params,
+                shutdown_event=bot._shutdown_event,
+                max_attempts=1,
+                action_label=action_label,
+                log_event=log_event,
+                log_struct=log_struct,
+            )
+
+    terminal = is_terminal_order_state(classify_order_state(order))
+    return order, close_amount, terminal
+
+
 class FuturesExitsMixin:
     def _record_futures_exit_shadow(
         self, sym: str, d: dict, *, move_pct: float,
@@ -268,31 +753,81 @@ class FuturesExitsMixin:
 
     def _retry_pending_partial_accounting(self, sym: str, d: dict) -> None:
         from bot_utils.trade_state import normalize_pending_accounting_items
-        pending = normalize_pending_accounting_items(
-            d.get("accounting_pending_partials"))
-        if not pending:
+        if not normalize_pending_accounting_items(
+            d.get("accounting_pending_partials")
+        ):
             return
         from core.database import save_trade_db
         from core.logger import log_event
+        from core.symbol_locks import close_lock
 
-        remaining = []
-        for item in pending:
+        with close_lock(
+            sym,
+            timeout=2.0,
+            bot_name=getattr(self, "BOT_NAME", "FUTURES"),
+        ) as got:
+            if not got:
+                return
+            live = self.state.get(sym)
+            if not isinstance(live, dict):
+                return
+            pending = normalize_pending_accounting_items(
+                live.get("accounting_pending_partials"))
+            if not pending:
+                return
             try:
-                retry_item = dict(item)
-                retry_item.setdefault("mode_is_sim", self.simulation)
-                saved = bool(save_trade_db(**retry_item))
+                durable = self.state.update_many(
+                    sym, {"accounting_pending_partials": pending}
+                )
             except Exception as exc:
-                saved = False
-                self._log_error(f"futures partial accounting retry {sym}", exc)
-            if not saved:
-                remaining.append(item)
-        self.state.update(sym, "accounting_pending_partials", remaining)
-        if remaining:
-            log_event(
-                f"{sym}: {len(remaining)} futures partial accounting "
-                f"event(s) still pending", "WARN")
-        else:
-            log_event(f"{sym}: pending futures partial accounting flushed", "INFO")
+                self._log_error(
+                    f"futures partial accounting write-ahead {sym}", exc
+                )
+                return
+            if durable is False:
+                log_event(
+                    f"{sym}: futures partial accounting state is not durable "
+                    f"- DB retry deferred",
+                    "ERROR",
+                )
+                return
+            remaining = []
+            for item in pending:
+                try:
+                    retry_item = dict(item)
+                    retry_item.setdefault("mode_is_sim", self.simulation)
+                    saved = bool(save_trade_db(**retry_item))
+                except Exception as exc:
+                    saved = False
+                    self._log_error(f"futures partial accounting retry {sym}", exc)
+                if not saved:
+                    remaining.append(item)
+            try:
+                cleared = self.state.update(
+                    sym, "accounting_pending_partials", remaining
+                )
+            except Exception as exc:
+                cleared = False
+                self._log_error(
+                    f"futures partial accounting clear {sym}", exc
+                )
+            if cleared is False:
+                log_event(
+                    f"{sym}: futures partial accounting was booked but its "
+                    f"durable pending marker could not be updated; idempotent "
+                    f"retry retained",
+                    "ERROR",
+                )
+                return
+            if remaining:
+                log_event(
+                    f"{sym}: {len(remaining)} futures partial accounting "
+                    f"event(s) still pending", "WARN")
+            else:
+                log_event(
+                    f"{sym}: pending futures partial accounting flushed",
+                    "INFO",
+                )
 
     def _cleanup_accounted_close_state(self, sym: str, d: dict) -> bool:
         """Remove dashboard/local state after PnL was already booked.
@@ -704,6 +1239,14 @@ class FuturesExitsMixin:
   # the live rate  settlements crossed so paper PnL carries it.
                     realized = estimate_funding_paid(
                         self.ex, symbol_full, buy_time, notional, pos_type)
+                elif d.get("entry_funding_window_unverified") is True:
+                    from bot_utils.futures_funding import fetch_realized_funding
+
+                    realized = fetch_realized_funding(
+                        self.ex,
+                        symbol_full,
+                        buy_time,
+                    )
                 else:
                     realized = fetch_or_estimate_funding(
                         self.ex, symbol_full, buy_time,
@@ -796,6 +1339,21 @@ class FuturesExitsMixin:
 
   #  Per-position exit check 
 
+    def _claim_conflict_blocks_monitor(self, sym: str, row: dict) -> bool:
+        if not isinstance(row, dict) or not row.get("claim_conflict"):
+            return False
+        from core.logger import log_event
+        warned = getattr(self, "_claim_conflict_warned", set())
+        if sym not in warned:
+            log_event(
+                f"[{self.BOT_NAME}] {sym}: claim conflict - monitor skipped "
+                f"fail-closed; run claim/state repair",
+                "ERROR",
+            )
+            warned.add(sym)
+            self._claim_conflict_warned = warned
+        return True
+
     def _check_position_exits(self, sym: str, d: dict) -> None:
         """Run all exit checks for ONE futures position.
 
@@ -813,37 +1371,126 @@ class FuturesExitsMixin:
             FuturesExitsMixin._cleanup_accounted_close_state(self, sym, d)
             return
         if d.get("accounting_pending"):
+            from core.symbol_locks import close_lock
             try:
-                if self._record_offline_close(sym, d):
-                    booked = dict(d)
-                    booked.update({
-                        "accounting_already_booked": True,
-                        "accounting_booked_sell_time": (
-                            d.get("accounting_pending_sell_time")),
-                        "accounting_booked_exchange_order_id": (
-                            d.get("accounting_pending_exchange_order_id")),
-                        "accounting_booked_reason": (
-                            d.get("accounting_pending_reason")
-                            or "Offline close"),
-                    })
-                    FuturesExitsMixin._cleanup_accounted_close_state(
-                        self, sym, booked)
+                with close_lock(
+                    sym,
+                    timeout=2.0,
+                    bot_name=getattr(self, "BOT_NAME", "FUTURES"),
+                ) as acquired:
+                    if not acquired:
+                        return
+                    live = self.state.get(sym)
+                    if not isinstance(live, dict) or not live.get(
+                        "accounting_pending"
+                    ):
+                        return
+                    pending_fields = {
+                        key: value
+                        for key, value in live.items()
+                        if key == "accounting_pending"
+                        or key.startswith("accounting_pending_")
+                    }
+                    durable = self.state.update_many(sym, pending_fields)
+                    if durable is False:
+                        log_event(
+                            f"{sym}: pending full accounting retry deferred; "
+                            f"recovery marker is not durable",
+                            "ERROR",
+                        )
+                        return
+                    if self._record_offline_close(sym, live):
+                        booked = dict(live)
+                        booked.update({
+                            "accounting_already_booked": True,
+                            "accounting_booked_sell_time": (
+                                live.get("accounting_pending_sell_time")),
+                            "accounting_booked_exchange_order_id": (
+                                live.get("accounting_pending_exchange_order_id")),
+                            "accounting_booked_reason": (
+                                live.get("accounting_pending_reason")
+                                or "Offline close"),
+                        })
+                        FuturesExitsMixin._cleanup_accounted_close_state(
+                            self, sym, booked
+                        )
             except Exception as exc:
                 self._log_error(f"futures pending accounting retry {sym}", exc)
             return
-        if d.get("claim_conflict"):
-            warned = getattr(self, "_claim_conflict_warned", set())
-            if sym not in warned:
-                log_event(
-                    f"[{self.BOT_NAME}] {sym}: registry claim conflict - "
-                    f"monitor skipped fail-closed; run claim/state repair",
-                    "ERROR",
-                )
-                warned.add(sym)
-                self._claim_conflict_warned = warned
+        if FuturesExitsMixin._claim_conflict_blocks_monitor(self, sym, d):
+            return
+        if d.get("oversize_rollback_pending"):
+            from core.symbol_locks import close_lock
+
+            try:
+                with close_lock(sym, bot_name=self.BOT_NAME) as acquired:
+                    if not acquired:
+                        return
+                    live = self.state.get(sym)
+                    if not isinstance(live, dict) or not live.get(
+                        "oversize_rollback_pending"
+                    ):
+                        return
+                    if FuturesExitsMixin._claim_conflict_blocks_monitor(
+                        self, sym, live
+                    ):
+                        return
+                    pos_type = str(live.get("position_type") or "").upper()
+                    entry = FuturesExitsMixin._safe_positive_price(
+                        live.get("buy")
+                    )
+                    margin = FuturesExitsMixin._safe_positive_float(
+                        live.get("invested_usdt"), 0.0
+                    )
+                    leverage = FuturesExitsMixin._safe_positive_float(
+                        live.get("leverage"), 0.0
+                    )
+                    amount = FuturesExitsMixin._safe_nonnegative_amount(
+                        live.get("amount")
+                    )
+                    if (
+                        pos_type not in ("LONG", "SHORT")
+                        or entry <= 0
+                        or margin <= 0
+                        or leverage <= 0
+                        or amount <= 0
+                    ):
+                        log_event(
+                            f"{sym}: persisted oversize rollback has invalid "
+                            f"state; close deferred fail-closed",
+                            "ERROR",
+                        )
+                        return
+                    liq_price = FuturesExitsMixin._safe_positive_price(
+                        live.get("liquidation_price")
+                    )
+                    current = FuturesExitsMixin._safe_positive_price(
+                        live.get("last_price")
+                    ) or entry
+                    reason = str(
+                        live.get("oversize_rollback_reason")
+                        or "Oversized Entry Rollback"
+                    )
+                    self._execute_full_close(
+                        sym,
+                        live,
+                        current,
+                        0.0,
+                        0.0,
+                        entry,
+                        liq_price,
+                        margin,
+                        leverage,
+                        pos_type,
+                        reason=reason,
+                    )
+            except Exception as exc:
+                self._log_error(f"retry oversized-entry rollback {sym}", exc)
             return
         self._retry_pending_partial_accounting(sym, d)
         d = self.state.get(sym) or d
+        if FuturesExitsMixin._claim_conflict_blocks_monitor(self, sym, d):
+            return
         if d.get("accounting_pending_partials"):
             return
 
@@ -1062,20 +1709,57 @@ class FuturesExitsMixin:
             bool(d.get("partial_tp_blocked_min_notional"))
             and time.time() < partial_blocked_until
         )
-        if (not sell_trigger
+        pending_partial_intent = _has_futures_partial_exit_intent(d)
+        if (
+            pending_partial_intent
+            or (
+                not sell_trigger
                 and not d.get("partial_sold")
                 and not partial_block_active
-                and move_pct >= activation):
+                and move_pct >= activation
+            )
+        ):
             from core.symbol_locks import close_lock
+            partial_path_taken = False
             with close_lock(sym, bot_name=self.BOT_NAME) as got:
                 if not got or not self.state.has(sym):
                     return
                 live = self.state.get(sym) or d
-                if live.get("partial_sold"):
+                if FuturesExitsMixin._claim_conflict_blocks_monitor(
+                    self, sym, live
+                ):
                     return
-                self._execute_partial_tp(sym, live, curr, move_pct, pnl_pct_margin,
-                                          entry, liq_price, margin, lev, pos_type)
-            return
+                live_pending_partial = _has_futures_partial_exit_intent(live)
+                live_partial_blocked_until = (
+                    FuturesExitsMixin._safe_finite_float(
+                        live.get("partial_tp_blocked_min_notional_until"), 0.0
+                    )
+                )
+                live_partial_block_active = (
+                    bool(live.get("partial_tp_blocked_min_notional"))
+                    and time.time() < live_partial_blocked_until
+                )
+                if live_pending_partial or (
+                    not sell_trigger
+                    and not live.get("partial_sold")
+                    and not live_partial_block_active
+                    and move_pct >= activation
+                ):
+                    self._execute_partial_tp(
+                        sym,
+                        live,
+                        curr,
+                        move_pct,
+                        pnl_pct_margin,
+                        entry,
+                        liq_price,
+                        margin,
+                        lev,
+                        pos_type,
+                    )
+                    partial_path_taken = True
+            if partial_path_taken:
+                return
 
         if sell_trigger:
             # Serialize the flatten against the reconcile-thread offline-close
@@ -1086,14 +1770,102 @@ class FuturesExitsMixin:
                 if not got or not self.state.has(sym):
                     return
                 live = self.state.get(sym) or d
-                live = FuturesExitsMixin._prepare_peak_trail_decision(
-                    self, sym, live, reason=reason,
-                    decision_price=curr, decision_move_pct=move_pct,
-                    mfe_pct=FuturesExitsMixin._safe_finite_float(
-                        live.get("max_profit_pct"), move_pct),
+                if FuturesExitsMixin._claim_conflict_blocks_monitor(
+                    self, sym, live
+                ):
+                    return
+                if _has_futures_partial_exit_intent(live):
+                    self._execute_partial_tp(
+                        sym,
+                        live,
+                        curr,
+                        move_pct,
+                        pnl_pct_margin,
+                        entry,
+                        liq_price,
+                        margin,
+                        lev,
+                        pos_type,
+                    )
+                    return
+                live_pos_type = live.get("position_type")
+                if live_pos_type not in {"LONG", "SHORT"}:
+                    log_event(
+                        f"{sym}: full close blocked by invalid live position side",
+                        "ERROR",
+                    )
+                    return
+                live_entry = FuturesExitsMixin._safe_positive_price(
+                    live.get("buy")
                 )
-                self._execute_full_close(sym, live, curr, move_pct, pnl_usdt,
-                                           entry, liq_price, margin, lev, pos_type, reason)
+                live_lev = FuturesExitsMixin._safe_positive_float(
+                    live.get("leverage"), 0.0
+                )
+                live_margin = FuturesExitsMixin._safe_positive_float(
+                    live.get("invested_usdt"), 0.0
+                )
+                if live_entry <= 0 or live_lev <= 0 or live_margin <= 0:
+                    log_event(
+                        f"{sym}: full close blocked by invalid live accounting "
+                        "basis",
+                        "ERROR",
+                    )
+                    return
+                live_move_pct = price_move_pct(
+                    live_entry, curr, live_pos_type
+                )
+                live_pnl_usdt, _ = calc_unrealized_pnl(
+                    live_entry,
+                    curr,
+                    live_margin,
+                    live_lev,
+                    live_pos_type,
+                )
+                live_liq_price = FuturesExitsMixin._safe_positive_float(
+                    live.get("liquidation_price"),
+                    calc_liquidation_price(
+                        live_entry, live_lev, live_pos_type, mm_rate
+                    ),
+                )
+                live_liq_dist = distance_to_liquidation_pct(
+                    curr, live_liq_price, live_pos_type
+                )
+                live_highest = FuturesExitsMixin._safe_positive_float(
+                    live.get("highest"), live_entry
+                )
+                live_sell_trigger, live_reason = self._evaluate_futures_exit(
+                    sym,
+                    live,
+                    curr,
+                    live_move_pct,
+                    live_highest,
+                    live_entry,
+                    live_liq_price,
+                    live_liq_dist,
+                    live_lev,
+                    live_pos_type,
+                )
+                if not live_sell_trigger:
+                    return
+                live = FuturesExitsMixin._prepare_peak_trail_decision(
+                    self, sym, live, reason=live_reason,
+                    decision_price=curr, decision_move_pct=live_move_pct,
+                    mfe_pct=FuturesExitsMixin._safe_finite_float(
+                        live.get("max_profit_pct"), live_move_pct),
+                )
+                self._execute_full_close(
+                    sym,
+                    live,
+                    curr,
+                    live_move_pct,
+                    live_pnl_usdt,
+                    live_entry,
+                    live_liq_price,
+                    live_margin,
+                    live_lev,
+                    live_pos_type,
+                    live_reason,
+                )
 
   #  Exit evaluation (pure decision) 
 
@@ -1338,18 +2110,69 @@ class FuturesExitsMixin:
                                  extract_or_estimate_futures_fee,
                                  safe_remaining)
 
-        partial_pct = FuturesExitsMixin._safe_finite_float(
-            self.C("PARTIAL_SELL_PCT"), 0.0)
-        if partial_pct <= 0:
+        pending_partial_intent = _has_futures_partial_exit_intent(d)
+        if self.simulation and pending_partial_intent:
+            log_event(
+                f"{sym}: LIVE partial-TP intent present in SIM mode - "
+                "manual recovery required",
+                "ERROR",
+            )
             return False
-        if partial_pct > 1:
-            partial_pct = 1.0
+        partial_pct = FuturesExitsMixin._safe_finite_float(
+            self.C("PARTIAL_SELL_PCT"), 0.0
+        )
+        if not pending_partial_intent:
+            if partial_pct <= 0:
+                return False
+            if partial_pct > 1:
+                partial_pct = 1.0
         symbol_full = f"{sym}/USDT:USDT"
+        if (
+            not self.simulation
+            and d.get("entry_funding_window_unverified") is True
+        ):
+            from bot_utils.futures_funding import fetch_realized_funding
+
+            exact_funding = fetch_realized_funding(
+                self.ex,
+                symbol_full,
+                d.get("buy_time"),
+            )
+            if exact_funding is None:
+                log_event(
+                    f"Partial-TP {sym}: exact recovered funding history "
+                    "unavailable; submit deferred",
+                    "ERROR",
+                )
+                return False
+            try:
+                funding_persisted = self.state.update(
+                    sym,
+                    "funding_paid",
+                    exact_funding,
+                )
+            except Exception:
+                funding_persisted = False
+            if funding_persisted is False:
+                log_event(
+                    f"Partial-TP {sym}: exact recovered funding was not "
+                    "durable; submit deferred",
+                    "ERROR",
+                )
+                return False
+            d = dict(d)
+            d["funding_paid"] = exact_funding
         amount_total = FuturesExitsMixin._safe_nonnegative_amount(
             d.get("amount", 0))
         if amount_total <= 0:
             return False
-        raw_partial = amount_total * partial_pct
+        raw_partial = (
+            FuturesExitsMixin._safe_nonnegative_amount(
+                d.get(_PARTIAL_EXIT_AMOUNT)
+            )
+            if pending_partial_intent
+            else amount_total * partial_pct
+        )
         margin_mode = str(d.get("margin_mode") or self.C("MARGIN_MODE", "isolated") or "isolated").lower()
 
         # Include contract size in the notional computation. For typical Bitget
@@ -1361,16 +2184,19 @@ class FuturesExitsMixin:
         remaining_after = amount_total - raw_partial
         slice_notional = raw_partial * curr * contract_size
         rem_notional   = remaining_after * curr * contract_size
-
         # Min-notional pre-check against the REAL per-market floor
   # (limits.cost.min via the shared helper), not a hardcoded 5.0  some
         # perps floor at 1 USDT, others at 10. contract_size is folded into the
         # effective amount so the helper's amount*price equals our notional.
         from bot_utils.futures_exits import _check_min_notional
-        ok_slice, _ = _check_min_notional(self.ex, symbol_full,
-                                          raw_partial * contract_size, curr)
-        ok_rem, _ = _check_min_notional(self.ex, symbol_full,
-                                        remaining_after * contract_size, curr)
+        ok_slice, ok_rem = True, True
+        if not pending_partial_intent:
+            ok_slice, _ = _check_min_notional(
+                self.ex, symbol_full, raw_partial * contract_size, curr
+            )
+            ok_rem, _ = _check_min_notional(
+                self.ex, symbol_full, remaining_after * contract_size, curr
+            )
         if not ok_slice or not ok_rem:
             log_event(
                 f"{sym}: partial-TP would violate min-notional "
@@ -1399,34 +2225,154 @@ class FuturesExitsMixin:
                            * taker_fee_rate(self.ex, symbol_full))
         else:
             try:
-                try:
-                    from config.exchange_config import safe_amount_to_precision
-                    partial_amount = FuturesExitsMixin._precision_amount_or_none(
-                        safe_amount_to_precision(self.ex, symbol_full, raw_partial)
-                    )
-                    if partial_amount is None:
-                        log_event(
-                            f"{sym}: partial amount precision invalid - skip",
-                            "WARN",
+                if not pending_partial_intent:
+                    try:
+                        from config.exchange_config import safe_amount_to_precision
+                        partial_amount = FuturesExitsMixin._precision_amount_or_none(
+                            safe_amount_to_precision(
+                                self.ex, symbol_full, raw_partial
+                            )
                         )
-                        return False
-                except Exception:
-                    partial_amount = round(raw_partial, 4)
+                        if partial_amount is None:
+                            log_event(
+                                f"{sym}: partial amount precision invalid - skip",
+                                "WARN",
+                            )
+                            return False
+                    except Exception:
+                        partial_amount = round(raw_partial, 4)
                 if partial_amount <= 0:
                     log_event(f"{sym}: partial amount below exchange minimum - skip", "WARN")
                     return False
                 close_side = "sell" if pos_type == "LONG" else "buy"
-                order = create_order_with_retry(
-                    self.ex, symbol_full, close_side, partial_amount,
-                    params=reduce_only_params(
-                        position_side=("long" if pos_type == "LONG" else "short"),
-                        margin_mode=margin_mode,
-                        leverage=max(1, int(__import__("math").ceil(lev))),
-                    ),
-                    shutdown_event=self._shutdown_event,
-                    action_label=f"partial-TP {sym}",
-                    log_event=log_event,
+                client_order_id, partial_amount, created_intent = (
+                    _ensure_futures_partial_exit_intent(
+                        self.state,
+                        sym,
+                        d,
+                        requested_amount=partial_amount,
+                        position_side=pos_type,
+                        bot_name=self.BOT_NAME,
+                    )
                 )
+                observed_filled = FuturesExitsMixin._safe_nonnegative_amount(
+                    d.get(_PARTIAL_EXIT_OBSERVED_FILLED)
+                )
+                order_params = reduce_only_params(
+                    position_side=(
+                        "long" if pos_type == "LONG" else "short"
+                    ),
+                    margin_mode=margin_mode,
+                    leverage=max(1, int(math.ceil(lev))),
+                    client_order_id=client_order_id,
+                )
+                from bot_utils.futures_order import (
+                    _exchange_id,
+                    _find_order_by_client_id,
+                    _order_confirmed_terminal_zero_fill,
+                    _order_landed,
+                    _order_refresh_conflicts,
+                    _requested_position_side,
+                )
+                requested_position_side = _requested_position_side(order_params)
+                order = None
+                if not created_intent:
+                    lookup_status = {}
+                    order = _find_order_by_client_id(
+                        self.ex,
+                        symbol_full,
+                        client_order_id,
+                        log_event=log_event,
+                        lookup_status=lookup_status,
+                        expected_amount=partial_amount,
+                        expected_side=close_side,
+                        expected_position_side=requested_position_side,
+                        exchange_id=_exchange_id(self.ex),
+                        expected_reduce_only=True,
+                    )
+                    recovery_conflict = (
+                        isinstance(order, dict)
+                        and order.get("_bot_recovery_conflict") is True
+                    )
+                    if lookup_status.get("unavailable") or recovery_conflict:
+                        log_event(
+                            f"Partial-TP {sym}: pending order recovery "
+                            "unavailable or conflicting - retry remains blocked",
+                            "ERROR" if recovery_conflict else "WARN",
+                        )
+                        return False
+                    if _order_confirmed_terminal_zero_fill(order):
+                        if observed_filled > 0:
+                            log_event(
+                                f"Partial-TP {sym}: terminal zero-fill "
+                                "snapshot contradicts a durable earlier "
+                                "partial fill - retry remains blocked",
+                                "ERROR",
+                            )
+                            return False
+                        if not _clear_futures_partial_exit_intent(
+                            self.state, sym, d
+                        ):
+                            log_event(
+                                f"Partial-TP {sym}: terminal zero-fill intent "
+                                "could not be cleared durably",
+                                "ERROR",
+                            )
+                        return False
+                    if order is None or not _order_landed(order):
+                        log_event(
+                            f"Partial-TP {sym}: pending order not proven "
+                            "terminal - retry remains blocked",
+                            "WARN",
+                        )
+                        return False
+                if order is None:
+                    from bot_utils.trade_state import registry_order_guard
+                    with registry_order_guard(
+                        self.state, sym, d
+                    ) as ownership_live:
+                        if not isinstance(ownership_live, dict):
+                            return False
+                        if ownership_live.get("claim_conflict"):
+                            log_event(
+                                f"{sym}: partial-TP blocked by registry claim "
+                                f"conflict",
+                                "ERROR",
+                            )
+                            return False
+                        live_client_order_id = order_id_text_or_none(
+                            ownership_live.get(_PARTIAL_EXIT_CLIENT_ID)
+                        )
+                        live_requested_amount = (
+                            FuturesExitsMixin._safe_positive_float(
+                                ownership_live.get(_PARTIAL_EXIT_AMOUNT), 0.0
+                            )
+                        )
+                        amount_tolerance = max(1e-12, partial_amount * 1e-9)
+                        if (
+                            live_client_order_id != client_order_id
+                            or abs(live_requested_amount - partial_amount)
+                            > amount_tolerance
+                            or ownership_live.get(_PARTIAL_EXIT_SIDE) != pos_type
+                            or ownership_live.get(_PARTIAL_EXIT_MODE) != "LIVE"
+                        ):
+                            log_event(
+                                f"{sym}: partial-TP durable intent changed "
+                                "before submit",
+                                "ERROR",
+                            )
+                            return False
+                        order = create_order_with_retry(
+                            self.ex,
+                            symbol_full,
+                            close_side,
+                            partial_amount,
+                            params=order_params,
+                            shutdown_event=self._shutdown_event,
+                            max_attempts=1,
+                            action_label=f"partial-TP {sym}",
+                            log_event=log_event,
+                        )
                 exch_oid = (
                     order_id_text_or_none(order.get("id"))
                     or order_id_text_or_none(order.get("orderId"))
@@ -1437,7 +2383,16 @@ class FuturesExitsMixin:
                 try:
                     from bot_utils.futures_exits import _resolve_fill_price
                     fill_price, fill_src = _resolve_fill_price(
-                        self.ex, symbol_full, order, fill_price, log_event)
+                        self.ex,
+                        symbol_full,
+                        order,
+                        fill_price,
+                        log_event,
+                        expected_side=close_side,
+                        expected_position_side=pos_type,
+                        expected_client_id=client_order_id,
+                        expected_amount=partial_amount,
+                    )
                 except Exception:
                     fallback_fill = FuturesExitsMixin._order_fill_price(order)
                     if fallback_fill > 0:
@@ -1468,6 +2423,27 @@ class FuturesExitsMixin:
                                 )
                                 break
                             refreshed = self.ex.fetch_order(str(exch_oid), symbol_full)
+                            if refreshed and (
+                                not isinstance(refreshed, dict)
+                                or _order_refresh_conflicts(
+                                    order,
+                                    refreshed,
+                                    symbol_full,
+                                    close_side,
+                                    pos_type,
+                                    _exchange_id(self.ex),
+                                    expected_reduce_only=True,
+                                    allow_one_way_position_side=True,
+                                    expected_client_id=client_order_id,
+                                    expected_amount=partial_amount,
+                                )
+                            ):
+                                log_event(
+                                    f"Partial-TP {sym}: fill refresh conflicts "
+                                    "with the durable close intent",
+                                    "ERROR",
+                                )
+                                break
                             actual_filled = FuturesExitsMixin._safe_nonnegative_amount(
                                 (refreshed or {}).get("filled"))
                             if actual_filled > 0:
@@ -1478,11 +2454,20 @@ class FuturesExitsMixin:
                                 break
                     except Exception:
                         actual_filled = 0.0
-                if actual_filled <= 0:
+                order_is_terminal = _futures_partial_exit_order_is_terminal(
+                    order,
+                    requested_amount=partial_amount,
+                    filled_amount=actual_filled,
+                )
+                if actual_filled <= 0 and order_is_terminal:
                     try:
                         from bot_utils import fetch_open_position
                         old_amount = float(d.get("amount", 0) or 0)
-                        pos, unavailable = fetch_open_position(self.ex, symbol_full)
+                        pos, unavailable = fetch_open_position(
+                            self.ex,
+                            symbol_full,
+                            expected_position_side=pos_type,
+                        )
                         if pos is not None:
                             remaining_live = abs(float(pos.get("contracts")
                                                        or pos.get("size") or 0.0))
@@ -1495,7 +2480,62 @@ class FuturesExitsMixin:
                     log_event(f"Partial-TP {sym}: fill unverified - no PnL booked; "
                               f"state unchanged, retry next tick", "WARN")
                     return False
-                partial_amount = min(partial_amount, actual_filled)
+                fill_tolerance = max(1e-12, partial_amount * 1e-9)
+                if not order_is_terminal:
+                    if actual_filled > observed_filled + fill_tolerance:
+                        try:
+                            observed_persisted = self.state.update(
+                                sym,
+                                _PARTIAL_EXIT_OBSERVED_FILLED,
+                                actual_filled,
+                            )
+                        except Exception as e:
+                            observed_persisted = False
+                            log_event(
+                                f"Partial-TP {sym}: open partial-fill "
+                                f"checkpoint failed: {e}",
+                                "ERROR",
+                            )
+                        if observed_persisted is not False:
+                            d[_PARTIAL_EXIT_OBSERVED_FILLED] = actual_filled
+                    log_event(
+                        f"Partial-TP {sym}: order still nonterminal with "
+                        f"cumulative fill {actual_filled:.12g}/"
+                        f"{partial_amount:.12g} - accounting and further "
+                        "additional partial submits remain blocked",
+                        "WARN",
+                    )
+                    return False
+                if actual_filled + fill_tolerance < observed_filled:
+                    log_event(
+                        f"Partial-TP {sym}: terminal fill regressed below "
+                        "durable cumulative evidence - retry remains blocked",
+                        "ERROR",
+                    )
+                    return False
+                if d.get("entry_funding_window_unverified") is True:
+                    exact_funding = fetch_realized_funding(
+                        self.ex,
+                        symbol_full,
+                        d.get("buy_time"),
+                    )
+                    exact_funding = FuturesExitsMixin._safe_finite_float(
+                        exact_funding,
+                        None,
+                    )
+                    if exact_funding is None:
+                        log_event(
+                            f"Partial-TP {sym}: physical fill retained for "
+                            "recovery because exact post-fill funding history "
+                            "is unavailable",
+                            "ERROR",
+                        )
+                        return False
+                    d = dict(d)
+                    d["funding_paid"] = exact_funding
+                partial_amount = min(
+                    partial_amount, max(actual_filled, observed_filled)
+                )
                 # Pass the real slice size + contractSize so the estimate is
                 # correct even when the exchange returns the market-order
                 # response with no fee AND filled=0 (else the exit fee books as
@@ -1561,13 +2601,8 @@ class FuturesExitsMixin:
             entry_quality_reasons=d.get("entry_quality_reasons"),
             entry_id=d.get("entry_id"),
         )
-        try:
-            accounting_ok = bool(save_trade_db(**partial_trade))
-        except Exception as e:
-            accounting_ok = False
-            log_event(f"save_trade_db partial {sym} failed: {e}", "WARN")
-
-        # Update state
+        # Write the physical shrink and the exact accounting event durably
+        # before committing PnL. This makes a crash/restart replay idempotent.
         new_amount = safe_remaining(
             FuturesExitsMixin._safe_nonnegative_amount(d.get("amount", 0)),
             partial_amount,
@@ -1591,17 +2626,58 @@ class FuturesExitsMixin:
             "fees_paid": new_fees,
             "partial_profit_realized": prev_realized + profit_partial,
             "funding_booked_on_partials": prev_funding_booked + funding_partial,
+            "funding_booked_on_partials_known": True,
+            _PARTIAL_EXIT_CLIENT_ID: None,
+            _PARTIAL_EXIT_AMOUNT: None,
+            _PARTIAL_EXIT_SIDE: None,
+            _PARTIAL_EXIT_MODE: None,
+            _PARTIAL_EXIT_OBSERVED_FILLED: None,
         }
-        if not accounting_ok:
-            from bot_utils.trade_state import normalize_pending_accounting_items
-            pending = normalize_pending_accounting_items(
-                d.get("accounting_pending_partials"))
-            pending.append(partial_trade)
-            updates["accounting_pending_partials"] = pending
+        if d.get("entry_funding_window_unverified") is True:
+            updates["funding_paid"] = d["funding_paid"]
+        from bot_utils.trade_state import normalize_pending_accounting_items
+        pending = normalize_pending_accounting_items(
+            d.get("accounting_pending_partials"))
+        pending.append(partial_trade)
+        updates["accounting_pending_partials"] = pending
+        try:
+            state_persisted = self.state.update_many(sym, updates)
+        except Exception as e:
+            state_persisted = False
+            log_event(f"Partial-TP {sym}: state write-ahead failed: {e}", "ERROR")
+        if state_persisted is False:
+            log_event(
+                f"{sym}: futures partial-TP state write-ahead failed - DB "
+                f"booking deferred fail-closed",
+                "ERROR",
+            )
+            return False
+
+        try:
+            accounting_ok = bool(save_trade_db(**partial_trade))
+        except Exception as e:
+            accounting_ok = False
+            log_event(f"save_trade_db partial {sym} failed: {e}", "WARN")
+        if accounting_ok:
+            try:
+                cleared = self.state.update(
+                    sym, "accounting_pending_partials", pending[:-1]
+                )
+            except Exception as e:
+                cleared = False
+                log_event(
+                    f"Partial-TP {sym}: pending clear failed: {e}", "ERROR"
+                )
+            if cleared is False:
+                log_event(
+                    f"{sym}: futures partial-TP booked but durable pending "
+                    f"clear failed; idempotent retry retained",
+                    "ERROR",
+                )
+        else:
             log_event(
                 f"{sym}: futures partial-TP DB save failed - slice kept "
                 f"for accounting retry", "WARN")
-        self.state.update_many(sym, updates)
 
         log_event(
             f"[{self.BOT_NAME}] PARTIAL {int(partial_pct*100)}% of {sym} ({pos_type}) "
@@ -1621,6 +2697,47 @@ class FuturesExitsMixin:
             log_event(f"Telegram failed: {e}", "WARN")
         return True
 
+    def _block_close_fragment_recovery(
+        self,
+        sym: str,
+        log_event,
+        detail: str,
+    ) -> None:
+        blocked = getattr(self, "_close_fragment_recovery_blocked", None)
+        if not isinstance(blocked, set):
+            blocked = set()
+            self._close_fragment_recovery_blocked = blocked
+        blocked.add(sym)
+        log_event(
+            f"{sym}: verified close fragment was not durable ({detail}); "
+            f"further close attempts are blocked until restart reconciliation",
+            "ERROR",
+        )
+
+    def _persist_close_fragment(
+        self,
+        sym: str,
+        fields: dict,
+        log_event,
+    ) -> bool:
+        try:
+            persisted = self.state.update_many(sym, fields)
+        except Exception as exc:
+            FuturesExitsMixin._block_close_fragment_recovery(
+                self, sym, log_event, type(exc).__name__
+            )
+            self._log_error(f"persist close fragment {sym}", exc)
+            return False
+        if persisted is False:
+            FuturesExitsMixin._block_close_fragment_recovery(
+                self, sym, log_event, "state persistence returned False"
+            )
+            return False
+        blocked = getattr(self, "_close_fragment_recovery_blocked", None)
+        if isinstance(blocked, set):
+            blocked.discard(sym)
+        return True
+
   #  Full close 
 
     def _execute_full_close(self, sym, d, curr, move_pct, pnl_usdt,
@@ -1634,11 +2751,9 @@ class FuturesExitsMixin:
         """
         from core.logger import log_event, log_sell, send_telegram, save_trade, log_struct
         from core.database import save_trade_db
-        from config.exchange_config import reduce_only_params
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
         from trading.risk_manager import analyze_and_adapt
-        from bot_utils import (create_order_with_retry,
-                                 extract_or_estimate_futures_fee,
+        from bot_utils import (extract_or_estimate_futures_fee,
                                  fetch_or_estimate_funding,
                                  is_no_position_error,
                                  verify_position_closed)
@@ -1646,6 +2761,16 @@ class FuturesExitsMixin:
 
         close_started_mono = time.monotonic()
         symbol_full = f"{sym}/USDT:USDT"
+        blocked_fragments = getattr(
+            self, "_close_fragment_recovery_blocked", None
+        )
+        if isinstance(blocked_fragments, set) and sym in blocked_fragments:
+            log_event(
+                f"{sym}: close blocked pending restart reconciliation of an "
+                f"undurable verified fill fragment",
+                "ERROR",
+            )
+            return
         if d.get("verified_flat_pending_accounting"):
             log_event(
                 f"{sym}: position already verified flat; waiting for "
@@ -1680,37 +2805,64 @@ class FuturesExitsMixin:
             order = None
             close_amount = raw_amount
             order_filled = 0.0
+            full_exit_order_terminal = False
             pending_fee_from_fallback = False
             try:
                 close_side = "sell" if pos_type == "LONG" else "buy"
                 try:
+                    from bot_utils.close_fragments import pending_close_values
+
+                    prior_filled, _px, _fee, _oid = pending_close_values(d)
+                except Exception:
+                    prior_filled = 0.0
+                requested_residual = max(0.0, raw_amount - prior_filled)
+                try:
                     from config.exchange_config import safe_amount_to_precision
-                    close_amount = FuturesExitsMixin._precision_amount_or_none(
-                        safe_amount_to_precision(self.ex, symbol_full, raw_amount)
+                    rounded_amount = FuturesExitsMixin._precision_amount_or_none(
+                        safe_amount_to_precision(
+                            self.ex, symbol_full, requested_residual
+                        )
                     )
-                    if close_amount is None:
+                    if rounded_amount is None:
                         log_event(
                             f"{sym}: close skipped, invalid precision amount",
                             "ERROR",
                         )
                         return
+                    close_amount = (
+                        rounded_amount
+                        if rounded_amount > 0
+                        else requested_residual
+                    )
                 except Exception:
-                    close_amount = float(raw_amount)
-                if close_amount <= 0 and raw_amount > 0:
-                    close_amount = float(raw_amount)
-
-                order = create_order_with_retry(
-                    self.ex, symbol_full, close_side, close_amount,
-                    params=reduce_only_params(
-                        position_side=("long" if pos_type == "LONG" else "short"),
-                        margin_mode=margin_mode,
-                        leverage=max(1, int(__import__("math").ceil(lev))),
-                    ),
-                    shutdown_event=self._shutdown_event,
+                    close_amount = requested_residual
+                if close_amount <= 0:
+                    log_event(
+                        f"{sym}: no unaccounted residual remains for a new "
+                        "full-close order",
+                        "WARN",
+                    )
+                    return
+                (
+                    order,
+                    close_amount,
+                    full_exit_order_terminal,
+                ) = _recover_or_submit_futures_full_exit(
+                    self,
+                    sym,
+                    d,
+                    symbol_full=symbol_full,
+                    requested_amount=close_amount,
+                    position_side=pos_type,
+                    close_side=close_side,
+                    margin_mode=margin_mode,
+                    leverage=max(1, int(math.ceil(lev))),
                     action_label=f"close {sym}",
                     log_event=log_event,
                     log_struct=log_struct,
                 )
+                if order is None:
+                    return
                 exch_oid = (
                     order_id_text_or_none(order.get("id"))
                     or order_id_text_or_none(order.get("orderId"))
@@ -1720,7 +2872,16 @@ class FuturesExitsMixin:
                 try:
                     from bot_utils.futures_exits import _resolve_fill_price
                     fill_price, _fill_src = _resolve_fill_price(
-                        self.ex, symbol_full, order, fill_price, log_event)
+                        self.ex,
+                        symbol_full,
+                        order,
+                        fill_price,
+                        log_event,
+                        expected_side=close_side,
+                        expected_position_side=pos_type,
+                        expected_client_id=d.get(_FULL_EXIT_CLIENT_ID),
+                        expected_amount=close_amount,
+                    )
                 except Exception:
                     fallback_fill = FuturesExitsMixin._order_fill_price(order)
                     if fallback_fill > 0:
@@ -1731,7 +2892,11 @@ class FuturesExitsMixin:
                     pending_oid = d.get("pending_close_order_id")
                     if not pending_oid:
                         try:
-                            closed, remaining = verify_position_closed(self.ex, symbol_full)
+                            closed, remaining = verify_position_closed(
+                                self.ex,
+                                symbol_full,
+                                expected_position_side=pos_type,
+                            )
                         except Exception as ve:
                             self._log_error(f"verify-flat-after-no-position {sym}", ve)
                             log_event(
@@ -1806,26 +2971,57 @@ class FuturesExitsMixin:
         # open and retry next tick. Verified partial fill fragments are stored
         # as weighted pending close data so the eventual confirmed full-close
         # books the correct total exactly once.
+        funding_requires_history = (
+            d.get("entry_funding_window_unverified") is True
+            or d.get("accounting_pending_funding_unverified") is True
+        )
+        funding_history_resolved = False
         if not self.simulation:
             try:
-                closed, remaining = verify_position_closed(self.ex, symbol_full)
+                closed, remaining = verify_position_closed(
+                    self.ex,
+                    symbol_full,
+                    expected_position_side=pos_type,
+                )
             except Exception as e:
                 if order_filled > 0 and fill_price > 0:
                     try:
-                        from bot_utils.close_fragments import add_close_fragment_update
-                        frag_fee = extract_or_estimate_futures_fee(
-                            self.ex, order or {}, symbol_full, fill_price,
-                            amount=order_filled, contract_size=contract_size,
+                        from bot_utils.close_fragments import (
+                            add_close_fragment_update,
+                            pending_close_values,
                         )
-                        fragment_update = add_close_fragment_update(
-                            d, amount=order_filled, price=fill_price,
-                            fee=frag_fee, order_id=exch_oid,
+
+                        prev_amount, _px, _fee, _oid = pending_close_values(d)
+                        if prev_amount <= 0:
+                            frag_fee = extract_or_estimate_futures_fee(
+                                self.ex, order or {}, symbol_full, fill_price,
+                                amount=order_filled,
+                                contract_size=contract_size,
+                            )
+                            fragment_update = add_close_fragment_update(
+                                d, amount=order_filled, price=fill_price,
+                                fee=frag_fee, order_id=exch_oid,
+                            )
+                            fragment_update["pending_close_reason"] = str(
+                                reason or "Pending Full Close Retry")
+                            if full_exit_order_terminal:
+                                fragment_update.update(
+                                    _futures_full_exit_clear_fields()
+                                )
+                            if not FuturesExitsMixin._persist_close_fragment(
+                                self, sym, fragment_update, log_event
+                            ):
+                                return
+                    except Exception as fragment_error:
+                        FuturesExitsMixin._block_close_fragment_recovery(
+                            self,
+                            sym,
+                            log_event,
+                            type(fragment_error).__name__,
                         )
-                        fragment_update["pending_close_reason"] = str(
-                            reason or "Pending Full Close Retry")
-                        self.state.update_many(sym, fragment_update)
-                    except Exception:
-                        pass
+                        self._log_error(
+                            f"build close fragment {sym}", fragment_error
+                        )
                 self._log_error(f"verify-close {sym}", e)
                 log_event(
                     f"{sym}: close verification raised - keeping state, "
@@ -1850,9 +3046,34 @@ class FuturesExitsMixin:
                             )
                             fragment_update["pending_close_reason"] = str(
                                 reason or "Pending Full Close Retry")
-                            self.state.update_many(sym, fragment_update)
-                    except Exception:
-                        pass
+                            if full_exit_order_terminal:
+                                fragment_update.update(
+                                    _futures_full_exit_clear_fields()
+                                )
+                            if not FuturesExitsMixin._persist_close_fragment(
+                                self, sym, fragment_update, log_event
+                            ):
+                                return
+                        elif full_exit_order_terminal:
+                            tolerance = max(1e-12, raw_amount * 1e-9)
+                            if abs(total_filled - prev_amount) <= tolerance:
+                                if not FuturesExitsMixin._persist_close_fragment(
+                                    self,
+                                    sym,
+                                    _futures_full_exit_clear_fields(),
+                                    log_event,
+                                ):
+                                    return
+                    except Exception as fragment_error:
+                        FuturesExitsMixin._block_close_fragment_recovery(
+                            self,
+                            sym,
+                            log_event,
+                            type(fragment_error).__name__,
+                        )
+                        self._log_error(
+                            f"build close fragment {sym}", fragment_error
+                        )
                     log_event(
                         f"{sym}: close incomplete - {remaining:.6f} contracts "
                         f"still open. Keeping full state, retry next tick "
@@ -1907,6 +3128,32 @@ class FuturesExitsMixin:
                     except Exception:
                         close_fee = 0.0
 
+            if d.get("unpriced_external_partials"):
+                flat_pending = {
+                    "verified_flat_pending_accounting": True,
+                    "verified_flat_reason": reason,
+                    "verified_flat_at": _utc_now_str(),
+                    "verified_flat_sell_price": fill_price,
+                    "verified_flat_exchange_order_id": exch_oid,
+                }
+                flat_pending.update(_futures_full_exit_clear_fields())
+                try:
+                    flat_persisted = self.state.update_many(sym, flat_pending)
+                except Exception as state_err:
+                    flat_persisted = False
+                    self._log_error(
+                        f"futures verified-flat combined accounting {sym}",
+                        state_err,
+                    )
+                level = "WARN" if flat_persisted is not False else "ERROR"
+                log_event(
+                    f"{sym}: final close verified flat with unpriced earlier "
+                    f"partials; direct accounting deferred to combined offline "
+                    f"reconcile",
+                    level,
+                )
+                return
+
         # PnL with real fill + funding + proportional entry fee
         move_pct_real = price_move_pct(entry, fill_price, pos_type) if entry > 0 else move_pct
         peak_decision_at = FuturesExitsMixin._safe_positive_float(
@@ -1947,6 +3194,7 @@ class FuturesExitsMixin:
 
         funding_pd = FuturesExitsMixin._safe_finite_float(
             d.get("funding_paid"), 0.0)
+        funding_resolution_pending = False
         funding_booked = FuturesExitsMixin._safe_finite_float(
             d.get("funding_booked_on_partials"), 0.0)
         # Scale by ACTUAL remaining ratio via the safe helper so a corrupted
@@ -1955,6 +3203,9 @@ class FuturesExitsMixin:
             funding_pd = safe_remaining_funding(
                 funding_pd, current_amount, original_amount,
                 partial_sold=True, booked_on_partials=funding_booked,
+                booked_on_partials_known=(
+                    d.get("funding_booked_on_partials_known") is True
+                ),
             )
         if not self.simulation:
             try:
@@ -1963,13 +3214,28 @@ class FuturesExitsMixin:
                     remaining_ratio = current_amount / original_amount
                     if 0 < remaining_ratio < 1:
                         notional = notional / remaining_ratio
-                realized = fetch_or_estimate_funding(
-                    self.ex, symbol_full, d.get("buy_time"),
-                    notional_usdt=notional, pos_type=pos_type,
-                    fallback_state_value=FuturesExitsMixin._safe_finite_float(
-                        d.get("funding_paid"), 0.0)
-                )
+                if funding_requires_history:
+                    from bot_utils.futures_funding import fetch_realized_funding
+
+                    realized = fetch_realized_funding(
+                        self.ex,
+                        symbol_full,
+                        d.get("buy_time"),
+                    )
+                else:
+                    realized = fetch_or_estimate_funding(
+                        self.ex, symbol_full, d.get("buy_time"),
+                        notional_usdt=notional, pos_type=pos_type,
+                        fallback_state_value=(
+                            FuturesExitsMixin._safe_finite_float(
+                                d.get("funding_paid"), 0.0
+                            )
+                        ),
+                    )
                 realized = FuturesExitsMixin._safe_finite_float(realized, None)
+                if funding_requires_history:
+                    funding_resolution_pending = realized is None
+                    funding_history_resolved = realized is not None
                 if realized is not None:
                     # Safe helper for the realized-funding scaling too
                     if partial_sold and original_amount > 0:
@@ -1977,10 +3243,15 @@ class FuturesExitsMixin:
                             realized, current_amount, original_amount,
                             partial_sold=True,
                             booked_on_partials=funding_booked,
+                            booked_on_partials_known=(
+                                d.get("funding_booked_on_partials_known")
+                                is True
+                            ),
                         )
                     funding_pd = realized
             except Exception:
-                pass
+                if funding_requires_history:
+                    funding_resolution_pending = True
 
         slice_fees = proportional_entry_fee + close_fee
         profit_usdt = round(pnl_real - slice_fees - funding_pd, 2)
@@ -1988,67 +3259,115 @@ class FuturesExitsMixin:
         lifetime_fees = FuturesExitsMixin._safe_finite_float(
             d.get("fees_paid"), 0.0) + close_fee
 
-        # Persist accounting first. Once a live close is verified flat, the
-        # local state is the last recoverable source for PnL/accounting. Do not
-        # remove it unless the DB trade row was actually written.
+        # Persist the exact replay key before accounting. Once a live close is
+        # verified flat, local state is the last recoverable source for PnL.
         buy_time = d.get("buy_time", "")
         sell_time = _utc_now_str()
+        trade_row = {
+            "bot_name": self.BOT_NAME,
+            "mode_is_sim": self.simulation,
+            "symbol": sym,
+            "buy_price": entry,
+            "sell_price": fill_price,
+            "buy_time": buy_time,
+            "sell_time": sell_time,
+            "profit_pct": move_pct_real,
+            "profit_usdt": profit_usdt,
+            "invested_usdt": margin,
+            "reason": reason,
+            "rsi_15m": d.get("rsi_15m"),
+            "rsi_1h": d.get("rsi_1h"),
+            "rsi_4h": d.get("rsi_4h"),
+            "change_pct": d.get("change_pct"),
+            "btc_trend": d.get("btc_trend"),
+            "fear_greed": d.get("fear_greed"),
+            "is_futures": True,
+            "position_type": pos_type,
+            "leverage": lev,
+            "liquidation_price": liq_price,
+            "funding_paid": funding_pd,
+            "fees_usdt": slice_fees,
+            "exchange_order_id": exch_oid,
+            "mfe_pct": mfe_pct,
+            "mae_pct": mae_pct,
+            "giveback_pct": giveback_pct,
+            "entry_quality_score": d.get("entry_quality_score"),
+            "entry_quality_label": d.get("entry_quality_label"),
+            "entry_quality_reasons": d.get("entry_quality_reasons"),
+            "entry_id": d.get("entry_id"),
+        }
+        pending_close = {
+            "accounting_pending": True,
+            "accounting_pending_reason": reason,
+            "accounting_pending_sell_price": fill_price,
+            "accounting_pending_sell_time": sell_time,
+            "accounting_pending_profit_pct": move_pct_real,
+            "accounting_pending_profit_usdt": profit_usdt,
+            "accounting_pending_mode_is_sim": self.simulation,
+            "accounting_pending_fees_usdt": slice_fees,
+            "accounting_pending_funding_paid": funding_pd,
+            "accounting_pending_exchange_order_id": exch_oid,
+            "accounting_pending_mfe_pct": mfe_pct,
+            "accounting_pending_mae_pct": mae_pct,
+            "accounting_pending_giveback_pct": giveback_pct,
+            "accounting_pending_entry_quality_score": d.get(
+                "entry_quality_score"
+            ),
+            "accounting_pending_entry_quality_label": d.get(
+                "entry_quality_label"
+            ),
+            "accounting_pending_entry_quality_reasons": d.get(
+                "entry_quality_reasons"
+            ),
+        }
+        if funding_resolution_pending:
+            pending_close["accounting_pending_funding_unverified"] = True
+        elif funding_history_resolved:
+            pending_close["entry_funding_window_unverified"] = False
+            pending_close["accounting_pending_funding_unverified"] = False
+        if not self.simulation:
+            pending_close.update(_futures_full_exit_clear_fields())
+        try:
+            pending_persisted = self.state.update_many(sym, pending_close)
+        except Exception as state_err:
+            pending_persisted = False
+            self._log_error(
+                f"futures full accounting write-ahead {sym}", state_err
+            )
+        if pending_persisted is False:
+            log_event(
+                f"{sym}: verified flat close was not booked because its "
+                f"accounting recovery marker was not durable",
+                "ERROR",
+            )
+            FuturesExitsMixin._record_peak_trail_execution(
+                self, sym, d, reason=reason,
+                decision_price=peak_decision_price, fill_price=fill_price,
+                decision_move_pct=peak_decision_move_pct,
+                fill_move_pct=move_pct_real,
+                mfe_pct=peak_decision_mfe_pct,
+                latency_ms=execution_latency_ms,
+                profit_usdt=profit_usdt, fees_usdt=slice_fees,
+                funding_paid=funding_pd, accounting_saved=False,
+                exchange_order_id=exch_oid,
+            )
+            return
+        if funding_resolution_pending:
+            log_event(
+                f"{sym}: verified flat close kept for accounting recovery "
+                "because exact funding history is unavailable",
+                "ERROR",
+            )
+            return
         accounting_ok = False
         try:
-            accounting_ok = bool(save_trade_db(
-                bot_name=self.BOT_NAME, mode_is_sim=self.simulation, symbol=sym,
-                buy_price=entry, sell_price=fill_price,
-                buy_time=buy_time, sell_time=sell_time,
-                profit_pct=move_pct_real, profit_usdt=profit_usdt,
-                invested_usdt=margin, reason=reason,
-                rsi_15m=d.get("rsi_15m"), rsi_1h=d.get("rsi_1h"),
-                rsi_4h=d.get("rsi_4h"), change_pct=d.get("change_pct"),
-                btc_trend=d.get("btc_trend"), fear_greed=d.get("fear_greed"),
-                is_futures=True, position_type=pos_type, leverage=lev,
-                liquidation_price=liq_price, funding_paid=funding_pd,
-                # This row's OWN slice fees (proportional entry + close), so
-                # SUM(fees_usdt) over a trade's rows = the true round-trip total
-                # and never double-counts the entry fee against the partial row.
-                fees_usdt=slice_fees,
-                exchange_order_id=exch_oid,
-                mfe_pct=mfe_pct,
-                mae_pct=mae_pct,
-                giveback_pct=giveback_pct,
-                entry_quality_score=d.get("entry_quality_score"),
-                entry_quality_label=d.get("entry_quality_label"),
-                entry_quality_reasons=d.get("entry_quality_reasons"),
-                entry_id=d.get("entry_id"),
-            ))
+            accounting_ok = bool(save_trade_db(**trade_row))
             if not accounting_ok:
                 raise RuntimeError("save_trade_db returned False")
         except Exception as e:
             log_event(
                 f"save_trade_db {sym} failed after verified flat close: {e}. "
                 f"State kept for accounting recovery.", "WARN")
-            try:
-                self.state.update_many(sym, {
-                    "accounting_pending": True,
-                    "accounting_pending_reason": reason,
-                    "accounting_pending_sell_price": fill_price,
-                    "accounting_pending_sell_time": sell_time,
-                    "accounting_pending_profit_pct": move_pct_real,
-                    "accounting_pending_profit_usdt": profit_usdt,
-                    "accounting_pending_mode_is_sim": self.simulation,
-                    "accounting_pending_fees_usdt": slice_fees,
-                    "accounting_pending_funding_paid": funding_pd,
-                    "accounting_pending_exchange_order_id": exch_oid,
-                    "accounting_pending_mfe_pct": mfe_pct,
-                    "accounting_pending_mae_pct": mae_pct,
-                    "accounting_pending_giveback_pct": giveback_pct,
-                    "accounting_pending_entry_quality_score": d.get(
-                        "entry_quality_score"),
-                    "accounting_pending_entry_quality_label": d.get(
-                        "entry_quality_label"),
-                })
-            except Exception as state_err:
-                log_event(
-                    f"mark accounting_pending {sym} failed: {state_err}",
-                    "WARN")
             FuturesExitsMixin._record_peak_trail_execution(
                 self, sym, d, reason=reason,
                 decision_price=peak_decision_price, fill_price=fill_price,

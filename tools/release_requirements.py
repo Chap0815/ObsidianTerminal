@@ -6,6 +6,9 @@ from pathlib import Path
 
 REQUIRED_RELEASE_ITEMS = [
     "launcher.pyw",
+    "update_barrier.py",
+    "env_setup_files.py",
+    "setup_wizard.pyw",
     "OBSIDIAN.vbs",
     "start_launcher.bat",
     "requirements.lock.txt",
@@ -44,6 +47,7 @@ REQUIRED_RELEASE_ITEMS = [
     "core/runtime_status.py",
     "launcher/config/settings.py",
     "launcher/ui/app.py",
+    "launcher/tool_processes.py",
     "tools/dashboard.py",
     "tools/release_requirements.py",
     "tools/ensure_git.py",
@@ -63,6 +67,9 @@ REQUIRED_RELEASE_ITEMS = [
 
 UPDATE_SMOKE_FILES = [
     "launcher.pyw",
+    "update_barrier.py",
+    "env_setup_files.py",
+    "setup_wizard.pyw",
     "OBSIDIAN.vbs",
     "start_launcher.bat",
     "requirements.lock.txt",
@@ -76,6 +83,7 @@ UPDATE_SMOKE_FILES = [
     "bots/main_bot_trendfut.py",
     "launcher/config/settings.py",
     "launcher/ui/app.py",
+    "launcher/tool_processes.py",
     "tools/dashboard.py",
     "tools/ensure_git.py",
     "tools/update_check.py",

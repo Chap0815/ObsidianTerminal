@@ -10,6 +10,7 @@ Every function takes the running :class:`ObsidianApp` as its first arg
 from __future__ import annotations
 
 import threading
+from contextlib import ExitStack
 
 import customtkinter as ctk
 
@@ -1123,6 +1124,49 @@ def show_quit_with_positions_dialog(app, open_summary: dict) -> None:
 
 
 def async_stop_all_and_quit(app, update, close_positions: bool) -> None:
+    """Keep every running bot restart-blocked through quit cleanup."""
+    barriers = ExitStack()
+    transferred_to_shutdown = False
+    try:
+        for bot_name in BOT_ORDER:
+            barriers.enter_context(
+                app.bots[bot_name].exclusive_stop_operation()
+            )
+        running_bots = [b for b in BOT_ORDER if app.bots[b].is_running()]
+
+        if not running_bots and not close_positions:
+            update("No bots running. Closing")
+            shutdown_delay_ms = 300
+        else:
+            shutdown_ready = _async_stop_all_and_quit_owned(
+                app,
+                update,
+                close_positions,
+                running_bots,
+            )
+            if not shutdown_ready:
+                return
+            shutdown_delay_ms = 500
+
+        def _shutdown_with_barrier_release() -> None:
+            try:
+                app._shutdown_clean()
+            finally:
+                barriers.close()
+
+        app.after(shutdown_delay_ms, _shutdown_with_barrier_release)
+        transferred_to_shutdown = True
+    finally:
+        if not transferred_to_shutdown:
+            barriers.close()
+
+
+def _async_stop_all_and_quit_owned(
+    app,
+    update,
+    close_positions: bool,
+    running_bots: list[str],
+) -> bool:
     """Worker: stop all running bots, optionally close their positions,
     then exit the application.
 
@@ -1138,13 +1182,10 @@ def async_stop_all_and_quit(app, update, close_positions: bool) -> None:
         direct_close_remaining_futures,
         direct_close_remaining_spot,
     )
-
-    running_bots = [b for b in BOT_ORDER if app.bots[b].is_running()]
-
-    if not running_bots:
-        update("No bots running. Closing")
-        app.after(300, app._shutdown_clean)
-        return
+    from launcher.core.bot_controller import (
+        _release_dead_process_close_locks,
+        _stop_bot_process_verified,
+    )
 
     # Pick signal type based on user intent.
     if close_positions:
@@ -1153,11 +1194,18 @@ def async_stop_all_and_quit(app, update, close_positions: bool) -> None:
         update("Hard-stopping bots  positions will stay OPEN on exchange")
 
     stop_threads: list[threading.Thread] = []
+    stop_errors: list[str] = []
+    stop_errors_lock = threading.Lock()
 
     def _stop_worker(bot_name: str, graceful: bool):
         try:
-            app.bots[bot_name].stop(graceful_close=graceful)
+            stopped_pid = _stop_bot_process_verified(
+                app.bots[bot_name], graceful_close=graceful
+            )
+            _release_dead_process_close_locks(stopped_pid)
         except Exception as e:
+            with stop_errors_lock:
+                stop_errors.append(f"{bot_name}: {e}")
             import sys as _sys
             stderr = _sys.stderr
             if stderr is not None:
@@ -1177,6 +1225,10 @@ def async_stop_all_and_quit(app, update, close_positions: bool) -> None:
 
     for t in stop_threads:
         t.join()
+
+    if stop_errors:
+        update("Stop failed - bot is still running; application left open")
+        return False
 
     # Fallback close path: ONLY when user WANTS positions closed.
     # The bot's handler may have failed (network glitch during close)
@@ -1225,7 +1277,7 @@ def async_stop_all_and_quit(app, update, close_positions: bool) -> None:
                     except Exception:
                         pass
 
-        for bot in running_bots:
+        for bot in BOT_ORDER:
             t = threading.Thread(target=_close_worker, args=(bot,), daemon=True)
             t.start()
             close_threads.append(t)
@@ -1244,9 +1296,20 @@ def async_stop_all_and_quit(app, update, close_positions: bool) -> None:
                 ))
             except Exception:
                 pass
-            return
+            return False
+
+    process_errors: list[str] = []
+    for bot_name in BOT_ORDER:
+        try:
+            if app.bots[bot_name].is_running():
+                process_errors.append(bot_name)
+        except Exception:
+            process_errors.append(f"{bot_name} (unverifiable)")
+    if process_errors:
+        update("Shutdown aborted - a bot process is still running")
+        return False
 
     msg = ("All bots stopped  positions preserved." if not close_positions
             else "All bots stopped and positions closed.")
     update(f"{msg} Closing application")
-    app.after(500, app._shutdown_clean)
+    return True

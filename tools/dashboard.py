@@ -27,6 +27,13 @@ except ValueError:
     pass
 _sys.path.insert(0, _PROJECT_ROOT)
 
+from update_barrier import UpdateInProgressError, assert_process_start_allowed
+
+try:
+    assert_process_start_allowed(_PROJECT_ROOT)
+except UpdateInProgressError as exc:
+    raise SystemExit(str(exc)) from exc
+
 import streamlit as st
 
 from bot_utils.pnl_view import (
