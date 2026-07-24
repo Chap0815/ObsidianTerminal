@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 import time
 
 
@@ -9,6 +11,43 @@ ENV_SETUP_TEMP_PREFIX = ".env.setup-"
 ENV_SETUP_TEMP_SUFFIX = ".tmp"
 ENV_SETUP_TEMP_DELETE_DELAYS = (0.0, 0.05, 0.1, 0.2, 0.4)
 _TEMPFILE_TOKEN_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
+_WINDOWS_SID_RE = re.compile(r"\bS-\d+(?:-\d+)+\b")
+
+
+def harden_windows_private_file(path: str, *, runner=subprocess.run) -> None:
+    """Remove inherited ACLs and grant only the current Windows user R/W."""
+    try:
+        identity = runner(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except Exception as exc:
+        raise RuntimeError("Could not resolve current Windows user SID") from exc
+    match = _WINDOWS_SID_RE.search(str(getattr(identity, "stdout", "")))
+    if getattr(identity, "returncode", 1) != 0 or match is None:
+        raise RuntimeError("Could not resolve current Windows user SID")
+    sid = match.group(0)
+    try:
+        secured = runner(
+            [
+                "icacls",
+                os.path.abspath(path),
+                "/inheritance:r",
+                "/grant:r",
+                f"*{sid}:(R,W)",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except Exception as exc:
+        raise RuntimeError("Could not apply private Windows ACL") from exc
+    if getattr(secured, "returncode", 1) != 0:
+        raise RuntimeError("Could not apply private Windows ACL")
 
 
 def owned_env_temp_name(name: str) -> bool:

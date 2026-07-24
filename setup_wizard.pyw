@@ -31,6 +31,7 @@ from env_setup_files import (  # noqa: E402 - project root bootstrap above
     ENV_SETUP_TEMP_PREFIX,
     ENV_SETUP_TEMP_SUFFIX,
     cleanup_stale_env_temps,
+    harden_windows_private_file,
     unlink_env_temp,
 )
 
@@ -130,6 +131,22 @@ def _write_new_private_text_file(path: str, content: str) -> None:
             raise RuntimeError(
                 ".env already exists; edit Env Settings instead of rerunning setup"
             ) from exc
+
+        if os.name == "nt":
+            try:
+                harden_windows_private_file(path)
+            except Exception as acl_error:
+                # The file was created by this call and has not been exposed to
+                # any caller yet. Fail closed instead of leaving credentials
+                # protected only by an inherited directory ACL.
+                try:
+                    os.unlink(path)
+                except OSError as cleanup_error:
+                    acl_error.add_note(
+                        "Private file cleanup after ACL failure also failed: "
+                        f"{type(cleanup_error).__name__}"
+                    )
+                raise
 
         if os.name != "nt":
             dir_fd = -1

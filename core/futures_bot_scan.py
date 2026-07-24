@@ -107,6 +107,27 @@ class FuturesScanMixin:
         spread_pct = (ask - bid) / mid * 100.0
         return spread_pct if math.isfinite(spread_pct) else None
 
+    @staticmethod
+    def _adverse_chase_pct(
+        signal_price: float,
+        ticker: dict | None,
+        direction: str,
+    ) -> float | None:
+        """Return adverse drift from signal to the executable book side."""
+        signal = FuturesScanMixin._positive_float(signal_price)
+        if signal <= 0 or not isinstance(ticker, dict):
+            return None
+        bid = FuturesScanMixin._positive_float(ticker.get("bid"))
+        ask = FuturesScanMixin._positive_float(ticker.get("ask"))
+        side = str(direction or "").upper()
+        if side == "LONG" and ask > 0:
+            drift = (ask - signal) / signal * 100.0
+        elif side == "SHORT" and bid > 0:
+            drift = (signal - bid) / signal * 100.0
+        else:
+            return None
+        return drift if math.isfinite(drift) else None
+
     def _cleanup_rolled_back_futures_entry_state(
         self,
         sym: str,
@@ -399,8 +420,20 @@ class FuturesScanMixin:
         # can_buy_now never fires for futures  check the concrete symbol here,
         # before any analysis.
         try:
-            from trading.market_filters import check_tradability
+            from trading.market_filters import (
+                check_correlation_exposure,
+                check_tradability,
+            )
             _ok, _why = check_tradability(self.ex, symbol_full)
+            if not _ok:
+                log_event(f"{sym}: {_why}", "WAIT")
+                return
+            state_keys = getattr(self.state, "keys", None)
+            open_symbols = list(state_keys()) if callable(state_keys) else []
+            _ok, _why = check_correlation_exposure(
+                open_symbols,
+                symbol_full,
+            )
             if not _ok:
                 log_event(f"{sym}: {_why}", "WAIT")
                 return
@@ -638,6 +671,27 @@ class FuturesScanMixin:
                 if not check_spread_ok(entry_ticker, log_event=log_event,
                                        symbol=sym, missing_ok=False):
                     log_event(f"{sym}: {direction} blocked  spread too wide", "WAIT")
+                    return
+                from core.constants import FUT_MAX_CHASE_PCT
+                chase_pct = self._adverse_chase_pct(
+                    entry_price,
+                    entry_ticker,
+                    direction,
+                )
+                if chase_pct is None:
+                    log_event(
+                        f"{sym}: {direction} blocked  executable price "
+                        "unavailable for chase guard",
+                        "WAIT",
+                    )
+                    return
+                if chase_pct > FUT_MAX_CHASE_PCT:
+                    log_event(
+                        f"{sym}: {direction} blocked  price chased "
+                        f"{chase_pct:.2f}% from signal "
+                        f"(max {FUT_MAX_CHASE_PCT:.2f}%)",
+                        "WAIT",
+                    )
                     return
             except Exception as e:
                 log_event(f"{sym}: {direction} blocked  spread check unavailable "

@@ -636,6 +636,8 @@ def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
         extra = {}
     if not isinstance(extra, dict):
         extra = {}
+    if extra.get("claim_release_pending") is True:
+        return None
 
     db_amount = _positive_float_or_none(pos.get("amount"))
     exch_amount = _positive_float_or_none(exch_amt)
@@ -694,9 +696,19 @@ def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
     for key in (
         "entry_id", "entry_quality_score", "entry_quality_label",
         "entry_quality_reasons", "provisional", "adopted",
+        "accounting_pending_partials", "unpriced_external_partials",
     ):
         if key in extra:
-            restored[key] = extra[key]
+            if key in (
+                "accounting_pending_partials",
+                "unpriced_external_partials",
+            ):
+                from bot_utils.trade_state import (
+                    normalize_pending_accounting_items,
+                )
+                restored[key] = normalize_pending_accounting_items(extra[key])
+            else:
+                restored[key] = extra[key]
     return restored
 
 

@@ -274,7 +274,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                 self._log_error("live-start telegram alert", e)
 
         #  Load and validate state 
-        trades_raw = load_j(self.DB_FILE)
+        trades_raw = load_j(self.DB_FILE, preserve_corrupt=True)
         self.cool = load_j(self.COOLDOWN_FILE) or {}
         if not isinstance(self.cool, dict):
             self.cool = {}

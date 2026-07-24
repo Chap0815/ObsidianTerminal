@@ -25,6 +25,20 @@ REST_POLL_INTERVAL = 5.0
 _MAX_REST_WORKERS  = 8
 _WS_BASE_BACKOFF   = 2.0
 _WS_MAX_BACKOFF    = 120.0
+_WS_STABLE_RESET_SEC = 30.0
+
+
+def _ws_session_is_stable(
+    healthy_since: float | None,
+    now: float,
+) -> bool:
+    if healthy_since is None:
+        return False
+    try:
+        elapsed = float(now) - float(healthy_since)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return elapsed >= _WS_STABLE_RESET_SEC
 
 
 def _clone_exchange(exchange):
@@ -273,6 +287,8 @@ class WebSocketFeed:
         while self._running:
             async_ex = ex_class(config)
             healthy_symbols: set[str] = set()
+            healthy_since: float | None = None
+            restoration_reported = False
             with self._async_ex_lock:
                 self._async_ex = async_ex
             try:
@@ -297,9 +313,15 @@ class WebSocketFeed:
                         and all(self.is_fresh(sym) for sym in current_syms)
                     )
                     if all_current_symbols_healthy:
+                        healthy_now = time.monotonic()
+                        if healthy_since is None:
+                            healthy_since = healthy_now
                         try:
                             from core.logger import log_event
-                            if interruption_type is not None:
+                            if (
+                                interruption_type is not None
+                                and not restoration_reported
+                            ):
                                 log_event(
                                     f"[WSFeed] Live price stream restored after "
                                     f"{interruption_type} ({reconnect_attempts} "
@@ -307,6 +329,7 @@ class WebSocketFeed:
                                     f"{'s' if reconnect_attempts != 1 else ''})",
                                     "OK",
                                 )
+                                restoration_reported = True
                             elif not initial_health_reported:
                                 log_event(
                                     f"[WSFeed] Live price stream healthy "
@@ -316,10 +339,16 @@ class WebSocketFeed:
                                 )
                         except Exception:
                             pass
-                        interruption_type = None
-                        reconnect_attempts = 0
                         initial_health_reported = True
-                    backoff = _WS_BASE_BACKOFF
+                        if _ws_session_is_stable(
+                            healthy_since,
+                            healthy_now,
+                        ):
+                            interruption_type = None
+                            reconnect_attempts = 0
+                            backoff = _WS_BASE_BACKOFF
+                    else:
+                        healthy_since = None
             except asyncio.CancelledError:
                 break
             except Exception as e:

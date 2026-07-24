@@ -59,6 +59,19 @@ _LEVEL_THEN_TIMESTAMP_RE = re.compile(
 )
 
 
+def _redact_ui_log_line(line: str) -> str:
+    """Redact subprocess output before it can enter any launcher UI queue."""
+    try:
+        from core.logger import redact
+        safe = redact(str(line))
+        if not isinstance(safe, str):
+            raise TypeError("redactor returned non-text")
+        return safe
+    except Exception:
+        # Never expose the original line when the redaction layer is broken.
+        return "WARN [launcher] subprocess line suppressed: redaction unavailable"
+
+
 class RepeatedLogCompactor:
     """Compact only consecutive duplicate UI lines with bounded state.
 
@@ -661,6 +674,7 @@ class BotProcess:
 
     def _enqueue_log_line(self, line: str) -> None:
         """Queue one line without ever blocking the bot process."""
+        line = _redact_ui_log_line(line)
         try:
             self.log_queue.put_nowait(line)
         except queue.Full:
@@ -679,6 +693,7 @@ class BotProcess:
             for line in stdout:
                 line = line.rstrip("\n").rstrip("\r")
                 if line and "\r" not in line:
+                    line = _redact_ui_log_line(line)
                     # Drop-oldest policy: if the queue is full, ditch the
                     # oldest line and append the new one. Without this the
                     # reader could block forever and new logs would stop

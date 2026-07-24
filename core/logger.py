@@ -1119,13 +1119,50 @@ def log_status(bot, open_trades, balance, next_scan_sec):
 # JSON ops
 # 
 
-def load_j(f, default=None):
+def _preserve_corrupt_json(path: str, max_backups: int = 3) -> None:
+    """Copy one corrupt state file aside with a bounded forensic history."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    basename = os.path.basename(path)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup = os.path.join(
+        directory,
+        f"{basename}.corrupt.{stamp}.{os.getpid()}",
+    )
+    try:
+        shutil.copy2(path, backup)
+        prefix = f"{basename}.corrupt."
+        candidates = sorted(
+            (
+                entry.path
+                for entry in os.scandir(directory)
+                if entry.is_file() and entry.name.startswith(prefix)
+            ),
+            key=lambda item: os.path.getmtime(item),
+            reverse=True,
+        )
+        for old in candidates[max(1, int(max_backups)):]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def load_j(f, default=None, *, preserve_corrupt: bool = False):
     if default is None:
         default = {}
     if os.path.exists(f):
         try:
             with open(f, "r", encoding="utf-8-sig") as fh:
                 return json.load(fh)
+        except (json.JSONDecodeError, UnicodeError) as e:
+            if preserve_corrupt:
+                _preserve_corrupt_json(f)
+            log_event(
+                f"Read error ({_safe_log_text(f)}): {_safe_log_text(e)}",
+                "WARN",
+            )
         except Exception as e:
             log_event(
                 f"Read error ({_safe_log_text(f)}): {_safe_log_text(e)}",

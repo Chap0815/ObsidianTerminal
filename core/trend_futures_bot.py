@@ -729,9 +729,17 @@ class TrendFuturesBot(FuturesBot):
         #  EXITS: close held coins whose trend turned off 
         for base, d in held.items():
             if base in signals and not signals[base]:
-                if self._handle_exit_recovery_gate(base, d):
-                    continue
-                self._close_position(base, d, reason="Trend-Exit")
+                try:
+                    if self._handle_exit_recovery_gate(base, d):
+                        continue
+                    self._close_position(base, d, reason="Trend-Exit")
+                except Exception as exc:
+                    log_event(
+                        f"[{self.BOT_NAME}] {base}: trend exit failed "
+                        f"({type(exc).__name__})",
+                        "WARN",
+                    )
+                    self._log_error(f"trend exit {base}", exc)
 
         #  ENTRIES: open new trends (respect pause / safe-mode / slots) 
         if self.safe_mode is not None and self.safe_mode.is_active():

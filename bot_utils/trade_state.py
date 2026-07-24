@@ -101,6 +101,48 @@ def _validate_numeric_field(key: str, value) -> Optional[str]:
     return None
 
 
+def _nonfinite_value_path(value, path: str = "value", seen=None) -> str | None:
+    if isinstance(value, float):
+        return None if math.isfinite(value) else path
+    if isinstance(value, (str, bytes, bytearray, int, bool, type(None))):
+        return None
+    if seen is None:
+        seen = set()
+    if isinstance(value, dict):
+        marker = id(value)
+        if marker in seen:
+            return f"{path}(cycle)"
+        seen.add(marker)
+        try:
+            for key, item in value.items():
+                found = _nonfinite_value_path(
+                    item,
+                    f"{path}.{key}",
+                    seen,
+                )
+                if found is not None:
+                    return found
+        finally:
+            seen.discard(marker)
+    elif isinstance(value, (list, tuple)):
+        marker = id(value)
+        if marker in seen:
+            return f"{path}(cycle)"
+        seen.add(marker)
+        try:
+            for index, item in enumerate(value):
+                found = _nonfinite_value_path(
+                    item,
+                    f"{path}[{index}]",
+                    seen,
+                )
+                if found is not None:
+                    return found
+        finally:
+            seen.discard(marker)
+    return None
+
+
 def _normalize_position_row(
     data: dict,
     *,
@@ -131,6 +173,9 @@ def _normalize_position_row(
         normalized = copy.deepcopy(data)
     except Exception:
         return None, "uncopyable-state"
+    nonfinite_path = _nonfinite_value_path(normalized)
+    if nonfinite_path is not None:
+        return None, f"non-finite {nonfinite_path}"
     if "buy_price" in normalized:
         normalized["buy_price"] = buy_val
     if "buy" in normalized:
@@ -149,6 +194,9 @@ def _normalize_position_row(
 
 
 def _reject_update_reason(fields: dict) -> Optional[str]:
+    nonfinite_path = _nonfinite_value_path(fields)
+    if nonfinite_path is not None:
+        return f"non-finite {nonfinite_path}"
     for key, value in fields.items():
         reason = _validate_numeric_field(key, value)
         if reason is not None:

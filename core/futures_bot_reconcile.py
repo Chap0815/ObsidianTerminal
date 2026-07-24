@@ -794,6 +794,16 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
             "amount": remaining_contracts,
             "invested_usdt": margin_remaining,
             "partial_sold": True,
+            # No funding was booked for this unpriced slice. Marking the
+            # existing accumulator as known lets a claim restore the complete
+            # WAL bundle after local JSON loss without inventing funding.
+            "funding_booked_on_partials": (
+                _finite_float_or_none(
+                    state_row.get("funding_booked_on_partials", 0.0)
+                )
+                or 0.0
+            ),
+            "funding_booked_on_partials_known": True,
         }
         original_amount = _positive_abs_float_or_none(
             state_row.get("original_amount"))

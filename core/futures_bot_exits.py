@@ -922,15 +922,20 @@ class FuturesExitsMixin:
                         return
                     continue
 
-                # API budget guard: throttle monitor if exhausted
+                # Non-critical scanners may exhaust their budget, but exit
+                # price calls are critical and explicitly bypass that budget.
+                # Never add a blind window before bot-side stops.
                 if budget_exhausted():
-                    extra = min(monitor_interval, 30)
-                    log_event(
-                        f"[Monitor] API budget exhausted - adding {extra}s "
-                        f"throttle (positions still monitored)", "WARN"
+                    last_budget_warn = float(
+                        getattr(self, "_last_budget_monitor_warn", 0.0)
                     )
-                    if self._shutdown_event.wait(timeout=extra):
-                        return
+                    if now - last_budget_warn >= 60.0:
+                        self._last_budget_monitor_warn = now
+                        log_event(
+                            "[Monitor] non-critical API budget exhausted - "
+                            "prioritizing critical position monitoring",
+                            "WARN",
+                        )
 
   # Killswitch  ADAPTIVE cadence: normally 60s, but tighten to
                 # ~8s once today's loss is past 70% of the limit, so a fast 20%

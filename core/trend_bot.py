@@ -460,12 +460,25 @@ class TrendBot(SpotBot):
                     mode=entry_mode,
                     reason=type(_buy_exc).__name__,
                 )
+                clean_failure = not self.state.has(sym)
+                released = not _trend_claimed
                 if _trend_claimed:
                     released = self._release_entry_claim_if_untracked(sym)
                     if released:
                         from core.database import release_portfolio_reservation
 
                         release_portfolio_reservation(entry_id)
+                if clean_failure and released:
+                    log_event(
+                        f"Trend entry {sym} failed "
+                        f"({type(_buy_exc).__name__}); continuing candidate scan",
+                        "WARN",
+                    )
+                    self._log_error(f"trend entry {sym}", _buy_exc)
+                    continue
+                # A provisional row or unreleased ownership means the failure
+                # is no longer clean. Abort the pass so no later entry can race
+                # unresolved post-submit recovery.
                 raise
             if entry is None:
                 emit_entry_lifecycle(
@@ -605,8 +618,8 @@ class TrendBot(SpotBot):
                   "INFO")
         while not self._shutdown_event.is_set():
             try:
-                self._trend_exit_pass()
                 self._trend_killswitch()
+                self._trend_exit_pass()
             except Exception as e:
                 log_event(f"Trend monitor error: {e}", "WARN")
                 self._log_error("trend monitor", e)
@@ -623,32 +636,39 @@ class TrendBot(SpotBot):
         for sym in list(self.state.keys()):
             if self._shutdown_event.is_set():
                 return
-            d = self.state.get(sym)
-            if not d:
-                continue
-            if self._handle_exit_recovery_gate(sym, d):
-                continue
-            curr = self._current_price(sym)
-            buy = float(d.get("buy", 0) or 0)
+            try:
+                self._trend_exit_one(sym, p, disaster)
+            except Exception as e:
+                log_event(
+                    f"Trend exit {sym} failed: {type(e).__name__}",
+                    "WARN",
+                )
+                self._log_error(f"trend exit {sym}", e)
 
-            # Disaster brake: hard stop far below entry (flash-crash / gap
-            # protection). The trend exit normally fires well before this; pure
-            # last-resort safety so an overnight gap can't run unbounded.
-            if curr > 0 and buy > 0 and (curr / buy - 1.0) * 100.0 <= disaster:
-                log_event(f" Trend disaster-stop {sym}: "
-                          f"{(curr/buy-1)*100:.1f}% <= {disaster:.0f}%", "WARN")
-                self._execute_full_exit(sym, d, curr, "Disaster stop")
-                continue
+    def _trend_exit_one(self, sym: str, p, disaster: float) -> None:
+        from core.logger import log_event
 
-            in_trend, votes, _ = self._evaluate(sym, held=True, p=p)
-            if in_trend:
-                continue
-            if curr <= 0:
-                continue
-            log_event(f" Trend EXIT {sym}  out of trend ({votes}/3 votes)",
-                      "INFO")
-            self._execute_full_exit(sym, d, curr,
-                                     f"Trend exit ({votes}/3 votes)")
+        d = self.state.get(sym)
+        if not d or self._handle_exit_recovery_gate(sym, d):
+            return
+        curr = self._current_price(sym)
+        buy = float(d.get("buy", 0) or 0)
+
+        # Disaster brake: hard stop far below entry (flash-crash / gap
+        # protection). The trend exit normally fires well before this; pure
+        # last-resort safety so an overnight gap can't run unbounded.
+        if curr > 0 and buy > 0 and (curr / buy - 1.0) * 100.0 <= disaster:
+            log_event(f" Trend disaster-stop {sym}: "
+                      f"{(curr/buy-1)*100:.1f}% <= {disaster:.0f}%", "WARN")
+            self._execute_full_exit(sym, d, curr, "Disaster stop")
+            return
+
+        in_trend, votes, _ = self._evaluate(sym, held=True, p=p)
+        if in_trend or curr <= 0:
+            return
+        log_event(f" Trend EXIT {sym}  out of trend ({votes}/3 votes)",
+                  "INFO")
+        self._execute_full_exit(sym, d, curr, f"Trend exit ({votes}/3 votes)")
 
     def _trend_killswitch(self):
         """Simple daily-loss killswitch (spot, no leverage  no liquidation, so

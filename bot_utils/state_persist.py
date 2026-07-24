@@ -155,6 +155,29 @@ def _finite_float_or_none(value):
     return parsed if math.isfinite(parsed) else None
 
 
+def _replace_nonfinite_values(value):
+    """Heal JSON-parsed NaN/Inf telemetry without dropping the position."""
+    if isinstance(value, float):
+        return (value, False) if math.isfinite(value) else (None, True)
+    if isinstance(value, dict):
+        changed = False
+        healed = {}
+        for key, item in value.items():
+            clean_item, item_changed = _replace_nonfinite_values(item)
+            healed[key] = clean_item
+            changed = changed or item_changed
+        return healed, changed
+    if isinstance(value, list):
+        changed = False
+        healed = []
+        for item in value:
+            clean_item, item_changed = _replace_nonfinite_values(item)
+            healed.append(clean_item)
+            changed = changed or item_changed
+        return healed, changed
+    return value, False
+
+
 def _validate_state(trades: dict,
                      require_position_type: bool,
                      log_fn: Optional[Callable] = None,
@@ -249,6 +272,7 @@ def _validate_state(trades: dict,
                 if _finite_float_or_none(v) is None:
                     d[field] = 0.0 if field != "highest" else buy
 
+        d, _ = _replace_nonfinite_values(d)
         clean[sym] = d
 
     return clean, rejected

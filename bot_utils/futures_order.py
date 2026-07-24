@@ -1631,7 +1631,12 @@ def _order_with_fee_context(order, ex=None, symbol_full: str = "",
     return payload
 
 
-def _convert_fee_to_usdt_futures_known(fee_dict, order_dict) -> tuple[float, bool]:
+def _convert_fee_to_usdt_futures_known(
+    fee_dict,
+    order_dict,
+    *,
+    allow_discount_estimate: bool = True,
+) -> tuple[float, bool]:
     if not isinstance(fee_dict, dict) or fee_dict.get("cost") is None:
         return 0.0, False
     cost = _finite_fee_cost(fee_dict.get("cost"))
@@ -1649,7 +1654,12 @@ def _convert_fee_to_usdt_futures_known(fee_dict, order_dict) -> tuple[float, boo
     if currency in ("USDT", "USD", "BUSD", "USDC", "FDUSD"):
         return cost, True
     if currency in _FUTURES_DISCOUNT_TOKENS:
-        converted = _discount_token_fee_to_usdt(currency, cost, order_dict)
+        converted = _discount_token_fee_to_usdt(
+            currency,
+            cost,
+            order_dict,
+            allow_estimate=allow_discount_estimate,
+        )
         if converted != 0 and math.isfinite(converted):
             return converted, True
         if cost < 0:
@@ -1671,7 +1681,8 @@ def convert_fee_to_usdt_futures(fee_dict, order_dict) -> float:
 
 
 def _discount_token_fee_to_usdt(currency: str, cost: float,
-                                order_dict) -> float:
+                                order_dict, *,
+                                allow_estimate: bool = True) -> float:
     """Convert a fee paid in a discount token to USDT (best-effort).
 
     Prefers the token's current price (``ex.fetch_ticker('<TOKEN>/USDT')`` via
@@ -1700,8 +1711,16 @@ def _discount_token_fee_to_usdt(currency: str, cost: float,
                         return converted
             except Exception:
                 pass
-    if cost < 0:
+    if cost < 0 or not allow_estimate:
         return 0.0
+    return _estimate_futures_order_fee_from_payload(order_dict)
+
+
+def _estimate_futures_order_fee_from_payload(order_dict: dict) -> float:
+    """Estimate the whole order fee once from fill notional."""
+    if not isinstance(order_dict, dict):
+        return 0.0
+    ex = order_dict.get("_bot_ex")
     try:
         filled = _first_positive_float(
             order_dict.get("filled"),
@@ -1753,6 +1772,7 @@ def _extract_order_fee_futures_known(order) -> tuple[float, bool]:
     if isinstance(fees_list, list):
         saw_fee = False
         saw_known = False
+        saw_unknown = False
         total = 0.0
         for fee_dict in fees_list:
             if not isinstance(fee_dict, dict):
@@ -1762,11 +1782,30 @@ def _extract_order_fee_futures_known(order) -> tuple[float, bool]:
                 saw_fee = True
                 continue
             saw_fee = True
-            fee, known = _convert_fee_to_usdt_futures_known(fee_dict, order)
+            fee, known = _convert_fee_to_usdt_futures_known(
+                fee_dict,
+                order,
+                allow_discount_estimate=False,
+            )
             if known:
                 saw_known = True
                 total += fee
+            elif (
+                _finite_fee_cost(fee_dict.get("cost")) is not None
+                and _upper_currency_text(fee_dict.get("currency"))
+                in _FUTURES_DISCOUNT_TOKENS
+            ):
+                saw_unknown = True
         if saw_fee:
+            if saw_unknown:
+                # A notional fallback describes the whole order, not one fee
+                # row. Apply it once and never add it per discount-token item.
+                estimate = _estimate_futures_order_fee_from_payload(order)
+                best = max(total, estimate)
+                return (
+                    best if math.isfinite(best) else 0.0,
+                    False,
+                )
             if saw_known:
                 return total if math.isfinite(total) else 0.0, math.isfinite(total)
             singular_fee, singular_known = _convert_fee_to_usdt_futures_known(

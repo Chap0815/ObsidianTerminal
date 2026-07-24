@@ -118,6 +118,11 @@ FUT_REGIME_BEAR_7D       default: -5.0
 FUT_REGIME_BULL_7D       default: 5.0
     BTC 7-day % thresholds that define a "clear" bear/bull for the gate above.
 
+FUT_MAX_CHASE_PCT        default: 2.0
+    Maximum adverse move from the screener snapshot to the executable live
+    ask (LONG) or bid (SHORT). Larger drift blocks the entry before sizing and
+    order submission. Accepted range: >0 through 10.0 percent.
+
 --- Entry-quality filters (#2 - #5) -------------------------------------------
 
 FUT_EXT_FILTER           default: 1   (#2  -  extension / pullback)

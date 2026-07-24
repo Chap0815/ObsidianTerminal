@@ -158,6 +158,17 @@ def _pid_alive(pid: int, payload_boot_fp: str = "") -> bool:
         return False
     if payload_boot_fp and payload_boot_fp != _BOOT_FP:
         return False
+    if os.name == "nt":
+        # CPython's Windows os.kill() is not a POSIX liveness probe: signal 0
+        # is passed to TerminateProcess and can kill the slot holder. psutil
+        # uses a read-only process query and is already a runtime dependency.
+        try:
+            import psutil
+            return bool(psutil.pid_exists(pid))
+        except Exception:
+            # Fail closed: an indeterminate holder remains alive until the
+            # bounded stale-lock age expires. Never steal a possibly live slot.
+            return True
     try:
         os.kill(pid, 0)
         return True

@@ -54,6 +54,9 @@ MAX_SPREAD_PCT_SPOT = _bounded_env_float(
 SPOT_MAX_CHASE_PCT = _bounded_env_float(
     "SPOT_MAX_CHASE_PCT", 2.0, minimum=0.000_001, maximum=10.0
 )
+FUT_MAX_CHASE_PCT = _bounded_env_float(
+    "FUT_MAX_CHASE_PCT", 2.0, minimum=0.000_001, maximum=10.0
+)
 FUT_SHORT_VOL_SURGE = _bounded_env_float(
     "FUT_SHORT_VOL_SURGE", 1.0, minimum=0.0, maximum=10.0
 )
