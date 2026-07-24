@@ -13,6 +13,7 @@ from pathlib import Path
 
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.order_utils import order_id_text_or_none
+from core.constants import NONCRYPTO_BASES
 
 
 @dataclass(frozen=True)
@@ -301,6 +302,11 @@ class VenueRecorder:
             return None
         return parsed if math.isfinite(parsed) else None
 
+    def _is_noncrypto_swap(self, symbol: str) -> bool:
+        market = (getattr(self.exchange, "markets", None) or {}).get(symbol) or {}
+        base = str(market.get("base") or str(symbol).split("/", 1)[0])
+        return base.strip().upper() in NONCRYPTO_BASES
+
     def _log_gap(self, context: str, exc: Exception) -> None:
         if not self.log_event:
             return
@@ -404,7 +410,11 @@ class VenueRecorder:
                 volume = 0.0
             candidates.append((volume, symbol, ticker))
         candidates.sort(reverse=True)
-        self._universe = [symbol for _volume, symbol, _ticker in candidates[: self.max_symbols]]
+        self._universe = [
+            symbol
+            for _volume, symbol, _ticker in candidates
+            if not self._is_noncrypto_swap(symbol)
+        ][: self.max_symbols]
         markets_payload = {}
         for _volume, symbol, ticker in candidates:
             info = ticker.get("info") if isinstance(ticker, dict) else {}

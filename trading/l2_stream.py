@@ -122,6 +122,8 @@ def normalize_order_book(book: dict, *, depth_levels: int) -> dict:
 class L2ShadowCollector:
     """Consume every update, persist bounded snapshots, and remain fail-closed."""
 
+    INVALID_WARNING_INTERVAL_SECONDS = 60.0
+
     def __init__(
         self,
         exchange,
@@ -155,6 +157,7 @@ class L2ShadowCollector:
         self._last_persist: dict[str, float] = {}
         self._last_nonce: dict[str, object] = {}
         self._updates_since_sample: dict[str, int] = {}
+        self._invalid_warning_state: dict[str, tuple[float, int]] = {}
         self._connection_epoch = 0
         self._health_lock = threading.Lock()
         self._health_seen_symbols: set[str] = set()
@@ -183,6 +186,10 @@ class L2ShadowCollector:
         ]
         with self._symbols_lock:
             self._symbols = unique
+        active = set(unique)
+        with self._state_lock:
+            for symbol in set(self._invalid_warning_state) - active:
+                self._invalid_warning_state.pop(symbol, None)
 
     def _symbol_snapshot(self) -> tuple[str, ...]:
         with self._symbols_lock:
@@ -217,7 +224,7 @@ class L2ShadowCollector:
         try:
             normalized = normalize_order_book(book, depth_levels=self.depth_levels)
         except OrderBookValidationError as exc:
-            self._log(f"invalid {symbol} snapshot: {exc}", "WARN")
+            self._log_invalid_snapshot(symbol, exc)
             return False
 
         now_monotonic = time.monotonic()
@@ -311,6 +318,36 @@ class L2ShadowCollector:
             return False
         self._mark_l2_healthy(symbol)
         return True
+
+    def _log_invalid_snapshot(
+        self,
+        symbol: str,
+        exc: OrderBookValidationError,
+    ) -> None:
+        now = time.monotonic()
+        suppressed = 0
+        should_log = False
+        with self._state_lock:
+            previous = self._invalid_warning_state.get(symbol)
+            if (
+                previous is None
+                or now - previous[0] >= self.INVALID_WARNING_INTERVAL_SECONDS
+            ):
+                suppressed = previous[1] if previous is not None else 0
+                self._invalid_warning_state[symbol] = (now, 0)
+                should_log = True
+            else:
+                self._invalid_warning_state[symbol] = (
+                    previous[0],
+                    previous[1] + 1,
+                )
+        if not should_log:
+            return
+        suffix = ""
+        if suppressed:
+            noun = "warning" if suppressed == 1 else "warnings"
+            suffix = f" ({suppressed} repeated {noun} suppressed)"
+        self._log(f"invalid {symbol} snapshot: {exc}{suffix}", "WARN")
 
     def _begin_health_check(
         self,

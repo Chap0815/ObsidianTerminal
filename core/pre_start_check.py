@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from bot_utils.config import parse_explicit_bool
 from core.paths import BOT_CONFIG, DB_PATH, PROJECT_ROOT
 from core.runtime_status import (
     get_build_info,
@@ -65,17 +66,7 @@ def _read_config() -> tuple[dict, list[CheckIssue]]:
 
 
 def _to_bool(value) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and value in (0, 1):
-        return bool(value)
-    if isinstance(value, str):
-        s = value.strip().lower()
-        if s in {"true", "1", "yes", "on", "y", "t"}:
-            return True
-        if s in {"false", "0", "no", "off", "n", "f"}:
-            return False
-    return None
+    return parse_explicit_bool(value)
 
 
 def _finite_float(value) -> float:

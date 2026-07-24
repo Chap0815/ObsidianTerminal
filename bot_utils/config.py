@@ -83,7 +83,6 @@ _CLAMPS = {
     "XSEC_UNIVERSE_SIZE":    (10, 100, int),
     "CRASH_WINDOW":      (1, 50, int),
     "XSEC_MAX_SPREAD_PCT":   (0.01, 10.0, float),
-    "ENTRY_QUALITY_FILTER_ENABLED": (0, 1, int),
     "ENTRY_QUALITY_MIN_SCORE": (0.0, 100.0, float),
 }
 
@@ -131,7 +130,6 @@ _CLAMP_DEFAULTS = {
     "XSEC_UNIVERSE_SIZE": 30,
     "CRASH_WINDOW": 4,
     "XSEC_MAX_SPREAD_PCT": 0.5,
-    "ENTRY_QUALITY_FILTER_ENABLED": 1,
     "ENTRY_QUALITY_MIN_SCORE": 75.0,
 }
 
@@ -164,26 +162,40 @@ def _clamp(key, value):
         return _CLAMP_DEFAULTS.get(key, lo)
 
 
-def _coerce_bool(value: Any, default: bool = False) -> bool:
+def parse_explicit_bool(value: Any) -> bool | None:
+    """Parse only explicit boolean or exactly binary numeric values."""
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
         try:
             numeric = float(value)
         except (TypeError, ValueError, OverflowError):
-            return bool(default)
+            return None
         if math.isfinite(numeric) and numeric == 1.0:
             return True
         if math.isfinite(numeric) and numeric == 0.0:
             return False
-        return bool(default)
+        return None
     if isinstance(value, str):
         text = value.strip().lower()
-        if text in ("1", "true", "yes", "on"):
+        if text in ("1", "true", "yes", "on", "y", "t"):
             return True
-        if text in ("0", "false", "no", "off"):
+        if text in ("0", "false", "no", "off", "n", "f"):
             return False
-    return bool(default)
+        try:
+            numeric = float(text)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if math.isfinite(numeric) and numeric == 1.0:
+            return True
+        if math.isfinite(numeric) and numeric == 0.0:
+            return False
+    return None
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    parsed = parse_explicit_bool(value)
+    return bool(default) if parsed is None else parsed
 
 
 def _live_position_cap(bot_name: str,

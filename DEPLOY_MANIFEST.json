@@ -1,6 +1,6 @@
 {
-  "build_id": "f0d7a91474c78055",
-  "created_at": "2026-07-24 07:42:43",
+  "build_id": "60525a2f0bf3e2b3",
+  "created_at": "2026-07-24 08:16:05",
   "source": "update_deploy_manifest.py",
   "file_count": 178,
   "files": [
@@ -41,8 +41,8 @@
     },
     {
       "path": "bot_utils/config.py",
-      "sha256": "1ff099e5d43fbb1ac0ea6add9470bb14c95342feaacefb0f5745a2f8bed2fd0b",
-      "bytes": 16745
+      "sha256": "cd9d097db01b7fb1782ce4164164338ad2244fa1b9f754c691768fed5bcd670e",
+      "bytes": 17154
     },
     {
       "path": "bot_utils/equity_utils.py",
@@ -286,8 +286,8 @@
     },
     {
       "path": "core/pre_start_check.py",
-      "sha256": "28a4716354f702acbf94066a863c5b1f69228a77caaf3310a4dea90cbacf1646",
-      "bytes": 25626
+      "sha256": "7675051b23b2df45a8e838b0006d73cb830574c69e8ed3a31736beec36237b66",
+      "bytes": 25334
     },
     {
       "path": "core/process_identity.py",
@@ -781,8 +781,8 @@
     },
     {
       "path": "trading/l2_stream.py",
-      "sha256": "796f5997cec8384cc9c50e5e98ac02e4372e4abbd9ff95c5c713887710f3a6de",
-      "bytes": 22345
+      "sha256": "8bb34fb9e40411ca337ac0a14a8d1514f715a489d6b123a8b9e03a285d64adde",
+      "bytes": 23698
     },
     {
       "path": "trading/market_filters.py",
@@ -861,8 +861,8 @@
     },
     {
       "path": "trading/venue_recorder.py",
-      "sha256": "9cb8df7160d0341ca66dd84e0fce7d34d0a3df0652fdde18eb59eec9bbbaff1a",
-      "bytes": 25471
+      "sha256": "075cb92b39bfce345f501fd4899ad824e29b92c82ac772fb2a30b274559f195e",
+      "bytes": 25864
     },
     {
       "path": "trading/vol_target.py",
