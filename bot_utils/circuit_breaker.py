@@ -57,7 +57,7 @@ def record_slippage(
     log_event: Optional[Callable] = None,
     safe_mode_instance: Optional["SafeMode"] = None,
 ) -> float:
-    """Record one slippage measurement. Returns abs slippage %.
+    """Record one slippage measurement. Returns adverse slippage %.
 
     Auto-triggers SAFE_MODE via `trigger_safe_mode` callback when
     SLIPPAGE_TRIP_COUNT abnormal readings occur in SLIPPAGE_WINDOW_SEC.
@@ -93,7 +93,16 @@ def _record_slippage_into(
 ) -> float:
     if expected_price <= 0 or actual_fill <= 0:
         return 0.0
-    slippage_pct = abs(actual_fill - expected_price) / expected_price * 100
+    normalized_side = str(side).strip().lower()
+    if normalized_side == "buy":
+        adverse_delta = actual_fill - expected_price
+    elif normalized_side == "sell":
+        adverse_delta = expected_price - actual_fill
+    else:
+        # Unknown direction cannot be classified safely; retain the
+        # conservative legacy behavior for malformed callers.
+        adverse_delta = abs(actual_fill - expected_price)
+    slippage_pct = max(0.0, adverse_delta) / expected_price * 100
     now = time.monotonic()
     abnormal = slippage_pct > MAX_SLIPPAGE_PCT
 
