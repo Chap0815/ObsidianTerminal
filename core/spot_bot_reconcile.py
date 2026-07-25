@@ -1521,6 +1521,20 @@ class ReconcileMixin:
             while not self._shutdown_event.is_set():
                 self._shutdown_event.wait(timeout=self.GC_LOCKS_INTERVAL_SEC)
                 try:
+                    reaped = self.ex.reap_dead_thread_clones()
+                    if reaped:
+                        log_event(
+                            f"[maintenance] reaped {reaped} exchange clones",
+                            "INFO",
+                        )
+                except (AttributeError, TypeError):
+                    pass
+                except Exception as e:
+                    log_event(
+                        f"[maintenance] exchange clone reaper failed: {e}",
+                        "WARN",
+                    )
+                try:
                     n = gc_idle_locks()
                     if n:
                         log_event(f"[maintenance] dropped {n} idle locks", "INFO")
@@ -1544,6 +1558,20 @@ class ReconcileMixin:
             now = time.monotonic()
             if now - last_gc >= self.GC_LOCKS_INTERVAL_SEC:
                 last_gc = now
+                try:
+                    reaped = self.ex.reap_dead_thread_clones()
+                    if reaped:
+                        log_event(
+                            f"[maintenance] reaped {reaped} exchange clones",
+                            "INFO",
+                        )
+                except (AttributeError, TypeError):
+                    pass
+                except Exception as e:
+                    log_event(
+                        f"[maintenance] exchange clone reaper failed: {e}",
+                        "WARN",
+                    )
                 try:
                     n = gc_idle_locks()
                     if n:

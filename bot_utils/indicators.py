@@ -11,10 +11,13 @@ WARUM nativ statt pandas_ta:
 Diese vier Funktionen decken ALLES ab, was Screener + Backtester brauchen,
 in reinem pandas (vektorisiert, schnell, numpy-1.x UND 2.x, pandas-2 UND 3).
 
-FIDELITAET (gegen pandas_ta verifiziert, identische Eingaben):
-  rsi  Wilder-RMA  EXAKT identisch zu df.ta.rsi(length=14)
-  atr  Wilder-RMA  EXAKT identisch zu df.ta.atr(length=14)
-  ema  Standard-EWM  praktisch identisch (0.1% durch Seeding)
+FIDELITAET:
+  rsi  rekursive Wilder-RMA mit expliziter Zero-loss-Behandlung
+  atr  rekursive Wilder-RMA
+  ema  Standard-EWM (adjust=False)
+  Live-Screener und Research verwenden dieselbe Implementierung. Eine
+  Bitidentitaet zu einer bestimmten pandas_ta-Version wird nicht behauptet,
+  weil deren Initial-Seeding versionsabhaengig sein kann.
   macd_signal  gibt die SIGNALLINIE (MACDs) zurueck. Das ist BEWUSST:
     der Altcode nahm ``df.ta.macd(...).iloc[:, -1]``  und die letzte Spalte
     von pandas_ta ist ``MACDs`` (Signallinie), NICHT das Histogramm. Die
@@ -35,7 +38,7 @@ def ema(close: pd.Series, length: int) -> pd.Series:
 
 
 def rsi(close: pd.Series, length: int = 14) -> pd.Series:
-    """Wilder's RSI  bitidentisch zu pandas_ta.rsi(length).
+    """Wilder-RSI mit rekursiver RMA und expliziter Zero-loss-Behandlung.
 
     Zero-loss handling (pandas_ta-Konvention)  ein naives
     ``rs = gain / loss`` ergbe bei verlustfreiem Wilder-Fenster RSI=NaN, und

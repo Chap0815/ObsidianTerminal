@@ -417,9 +417,9 @@ def open_selftest_dialog(app) -> None:
         title="Run Self-Test",
         tool_name="selftest",
         description=(
-            "Run the built-in test suite (pytest).\n"
-            "Pins the critical money-path invariants  verify-before-book,\n"
-            "phantom-fill guard, multi-bot claim separation, indicator math.\n"
+            "Runs the full invariant suite when tests are installed.\n"
+            "Packaged releases without DEV tests run an integrity and\n"
+            "source-compile smoke check instead.\n"
             "Run it after editing code, before going live."
         ),
     )
@@ -1316,7 +1316,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
 
         mode_str = " (Quick)" if tool_name == "optimizer" and quick_var.get() else ""
         if tool_name == "selftest":
-            run_label_var.set("Self-Test  pytest suite")
+            run_label_var.set("Self-Test  invariant suite or package smoke")
         else:
             run_label_var.set(f"{tool_name.title()}  {bot}  {days}d{mode_str}")
 
@@ -1325,8 +1325,11 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         log_text._textbox.delete("1.0", "end")
         log_text.configure(state="disabled")
         if tool_name == "selftest":
-            _append_line("Running the test suite (pytest)...")
-            _append_line("Pins the money-path invariants. Live output below:")
+            _append_line("Running self-test...")
+            _append_line(
+                "Full invariant suite when tests are installed; "
+                "otherwise package integrity smoke. Live output below:"
+            )
         else:
             _append_line(f"Starting {tool_name} for {bot} on {days} days of data...")
             _append_line("This may take a few minutes. Live output below:")

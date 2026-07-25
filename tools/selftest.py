@@ -6,9 +6,9 @@ Two entry points, identical behaviour:
   CLI: ``python -m tools.selftest``
 
 Exit code 0 = all passed, 1 = failures (so it can gate other scripts).
-The suite pins the money-path invariants (verify-before-book, phantom-fill
-guard, multi-bot claim separation, indicator/fee/funding math). It runs fully
-offline against a throwaway temp DB  it never touches data/trading_bot.db.
+It runs the full invariant suite when tests are installed. Packaged releases,
+which intentionally omit DEV tests, run an explicitly labelled package
+integrity and source-compile smoke instead. Neither mode touches live trading.
 """
 
 from __future__ import annotations

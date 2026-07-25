@@ -1208,18 +1208,31 @@ def check_kill_switches(bot_name: str, exchange=None,
         # hide a partial-TP between two SLs, so we query the raw events here.)
         from core.database import get_connection, _metric_bot
         conn = get_connection()
+        try:
+            from core.clock import now_utc as _now_utc
+            streak_now = _now_utc().replace(tzinfo=None)
+        except Exception:
+            streak_now = datetime.now(timezone.utc).replace(tzinfo=None)
+        streak_cutoff = streak_now - timedelta(hours=4)
         # Pull ALL recent trade events (including partials) ordered newest first.
-        # Use a window of 50 events, well above the streak threshold so we
-        # never miss a wins-breaker. SIM/LIVE-namespaced like every other read.
+        # The four-hour wall-clock window makes the pause self-expiring: once
+        # the triggering run ages out it cannot immediately pause the bot again.
+        # Use a 50-event cap, well above the streak threshold. SIM/LIVE is
+        # namespaced like every other read.
         sql_rows = conn.execute("""
-            SELECT reason, is_win, profit_usdt
+            SELECT reason, is_win, profit_usdt, sell_time
             FROM trades
-            WHERE bot_name = ?
+            WHERE bot_name = ? AND sell_time >= ? AND sell_time <= ?
             ORDER BY sell_time DESC
             LIMIT 50
-        """, (_metric_bot(bot_name),)).fetchall()
+        """, (
+            _metric_bot(bot_name),
+            streak_cutoff.strftime("%Y-%m-%d %H:%M:%S"),
+            streak_now.strftime("%Y-%m-%d %H:%M:%S"),
+        )).fetchall()
         recent_all = [dict(r) for r in sql_rows] if sql_rows else []
         streak = 0
+        newest_loss_time = None
         for t in recent_all:
             # Classify by the NUMERIC outcome, not a reason-string prefix: a
             # trade is a loss only when it actually lost money (so losing
@@ -1228,7 +1241,7 @@ def check_kill_switches(bot_name: str, exchange=None,
             # breaks the streak.
             reason = str(t.get("reason") or "").lower()
             if "manual" in reason:
-                break
+                continue
             profit = _finite_float_or_none(t.get("profit_usdt"))
             if profit is None:
                 if (
@@ -1246,12 +1259,33 @@ def check_kill_switches(bot_name: str, exchange=None,
             )
             if not is_loss:
                 break
+            if newest_loss_time is None:
+                try:
+                    newest_loss_time = datetime.strptime(
+                        str(t.get("sell_time")), "%Y-%m-%d %H:%M:%S"
+                    )
+                except (TypeError, ValueError):
+                    newest_loss_time = streak_now
             streak += 1
         if streak >= 5:
             reason = f"STOP: Kill-Switch: {streak} consecutive stop-losses"
+            remaining = max(
+                0.0,
+                ((newest_loss_time or streak_now) + timedelta(hours=4)
+                 - streak_now).total_seconds(),
+            )
+            if remaining <= 0.0:
+                return False, "OK"
             with _KILL_SWITCH_LOCK:
-                _KILL_SWITCH_CACHE[bot_name] = {"until": now + 14400, "reason": reason}
-            log_event(f"[{bot_name}] {reason}  pausing 4 hours", "WARN")
+                _KILL_SWITCH_CACHE[bot_name] = {
+                    "until": now + remaining,
+                    "reason": reason,
+                }
+            log_event(
+                f"[{bot_name}] {reason}  pausing "
+                f"{remaining / 3600:.1f} hours",
+                "WARN",
+            )
             _alert_kill_switch(
                 bot_name, reason, telegram_enabled=not simulation)
             return True, reason

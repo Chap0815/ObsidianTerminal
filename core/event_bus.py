@@ -121,6 +121,9 @@ class EventBus:
         self._history      = deque(maxlen=history_size)
         self._history_lock = threading.Lock()
         self._publish_lock = threading.Lock()
+        self._publish_condition = threading.Condition(self._publish_lock)
+        self._publish_inflight = 0
+        self._accepting = True
         self._shutdown_lock = threading.Lock()
         self._shutdown_event = threading.Event()
         self._stopped      = False
@@ -189,13 +192,14 @@ class EventBus:
 
         event = Event(event_type, safe_payload, emitted_by)
 
-        # Serialize the final admission check with shutdown. An emitter that
-        # passed an earlier boolean check must never enqueue after every worker
-        # has already exited.
-        with self._publish_lock:
-            if self._stopped:
+        # Admission is serialized with shutdown, but queue backpressure is not:
+        # one full critical-handler queue must not freeze unrelated emitters.
+        with self._publish_condition:
+            if not self._accepting or self._stopped:
                 return
+            self._publish_inflight += 1
 
+        try:
             # don't pollute history with high-frequency events
             if event_type not in _SUPPRESS_FROM_HISTORY:
                 stored_payload = _truncate_for_history(safe_payload)
@@ -237,6 +241,11 @@ class EventBus:
                         self._work_queue.put_nowait((handler, event))
                     except queue.Full:
                         pass
+        finally:
+            with self._publish_condition:
+                self._publish_inflight -= 1
+                if self._publish_inflight == 0:
+                    self._publish_condition.notify_all()
 
     def emit_sync(self, event_type: str, payload: dict = None,
                   emitted_by: str = "") -> None:
@@ -333,12 +342,20 @@ class EventBus:
         with self._shutdown_lock:
             workers = list(self._worker_threads)
             if not self._stopped:
-                # Stop the watchdog first, then place one FIFO sentinel behind
-                # all accepted work while publication is excluded. Workers do
-                # not observe ``_stopped`` until every wakeup is queued, so an
-                # idle worker cannot exit in the admission/sentinel gap.
-                with self._publish_lock:
+                # Close admission first, then wait for already-admitted
+                # publishers without holding the admission lock. This preserves
+                # FIFO sentinel ordering while avoiding a global emitter stall.
+                with self._publish_condition:
+                    self._accepting = False
                     self._shutdown_event.set()
+                    while self._publish_inflight:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0.0:
+                            break
+                        self._publish_condition.wait(timeout=remaining)
+                    publications_drained = self._publish_inflight == 0
+
+                if publications_drained:
                     workers = [thread for thread in self._worker_threads
                                if thread.is_alive()]
                     for _ in workers:

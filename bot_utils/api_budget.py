@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 from shared_limits import API_RATE_HARD_MAX_PER_MINUTE
@@ -89,6 +90,17 @@ _bot_name_cache: Optional[str] = None
 # DB-failure throttling: if SQLite repeatedly errors, don't hammer it.
 _db_failed_until: float = 0.0
 _DB_FAILED_BACKOFF_SEC = 30.0
+
+
+@dataclass(frozen=True)
+class ApiCallReservation:
+    """One admission decision plus the optional durable ledger row id."""
+
+    allowed: bool
+    row_id: Optional[int] = None
+
+    def __bool__(self) -> bool:
+        return self.allowed
 
 
 def _resolve_bot_name() -> str:
@@ -159,11 +171,44 @@ def record_api_call(endpoint: str = "") -> None:
         _mark_db_failed()
 
 
-def record_api_error(endpoint: str = "") -> None:
+def record_api_error(
+    endpoint: str = "",
+    reservation: Optional[ApiCallReservation] = None,
+) -> None:
     """Like ``record_api_call`` but ``ok=0`` for error-rate tracking."""
     endpoint = _validated_endpoint(endpoint)
+    if reservation is not None and not isinstance(
+        reservation, ApiCallReservation
+    ):
+        raise ValueError("reservation must be an ApiCallReservation or None")
     now_mono = time.monotonic()
-    _fallback_record(now_mono)
+    already_counted = bool(reservation and reservation.allowed)
+
+    # A successful admission already consumed both the durable and fallback
+    # slot. Reclassify that row instead of recording the same network request
+    # a second time.
+    if reservation is not None and reservation.row_id is not None:
+        if not _db_available():
+            return
+        try:
+            from core.database import mark_global_api_call_error
+            marked = mark_global_api_call_error(
+                reservation.row_id,
+                _resolve_bot_name(),
+                endpoint=endpoint,
+            )
+            if marked:
+                return
+            # Preserve one-call/one-row accounting even if the reserved row
+            # disappeared or SQLite was briefly locked. Under-reporting this
+            # outcome is safer than consuming the budget twice.
+            return
+        except Exception:
+            _mark_db_failed()
+            return
+
+    if not already_counted:
+        _fallback_record(now_mono)
 
     if not _db_available():
         return
@@ -206,16 +251,13 @@ def budget_remaining() -> int:
                    ).strftime("%Y-%m-%d %H:%M:%S")
         now_str = _win_now.strftime("%Y-%m-%d %H:%M:%S")
         conn = _tight_connection()
-        try:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM api_rate_global "
-                "WHERE called_at >= ? AND called_at <= ?",
-                (cutoff, now_str),
-            ).fetchone()
-            count = row[0] if row else 0
-            return max(0, MAX_API_CALLS_PER_MINUTE - count)
-        finally:
-            conn.close()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM api_rate_global "
+            "WHERE called_at >= ? AND called_at <= ?",
+            (cutoff, now_str),
+        ).fetchone()
+        count = row[0] if row else 0
+        return max(0, MAX_API_CALLS_PER_MINUTE - count)
     except Exception:
         _mark_db_failed()
         used = _fallback_count(now_mono)
@@ -230,7 +272,8 @@ def budget_exhausted() -> bool:
 #  atomic check-and-consume 
 
 def try_consume_api_call(endpoint: str = "", ok: int = 1,
-                         critical: bool = False) -> bool:
+                         critical: bool = False,
+                         return_reservation: bool = False):
     """Atomically check the global budget AND record the call in one
     SQLite transaction (BEGIN IMMEDIATE).
 
@@ -251,6 +294,13 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
     ok = _validated_ok(ok)
     if not isinstance(critical, bool):
         raise ValueError("critical must be boolean")
+    if not isinstance(return_reservation, bool):
+        raise ValueError("return_reservation must be boolean")
+
+    def _result(allowed: bool, row_id: Optional[int] = None):
+        if return_reservation:
+            return ApiCallReservation(bool(allowed), row_id)
+        return bool(allowed)
 
     now_mono = time.monotonic()
 
@@ -271,10 +321,10 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
             # honest) but allow it through.
             if critical:
                 _fallback_record(now_mono)
-                return True
-            return False
+                return _result(True)
+            return _result(False)
         _fallback_record(now_mono)
-        return True
+        return _result(True)
 
     try:
         from core.database import check_and_consume_global_api
@@ -283,18 +333,24 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
             endpoint=endpoint or "",
             max_per_minute=MAX_API_CALLS_PER_MINUTE,
             ok=ok,
+            return_reservation=True,
         )
         if ok_call:
             # Mirror to fallback so a sudden DB outage still has recent
             # data to estimate from.
             _fallback_record(now_mono)
-            return True
+            row_id = (
+                int(ok_call)
+                if not isinstance(ok_call, bool) and int(ok_call) > 0
+                else None
+            )
+            return _result(True, row_id)
         # budget exhausted (or lock-timeout fail-closed in the DB gate).
         # Let exit-critical calls proceed regardless.
         if critical:
             _fallback_record(now_mono)
-            return True
-        return False
+            return _result(True)
+        return _result(False)
     except Exception:
         _mark_db_failed()
         # On unexpected exception, prefer fail-open with a per-proc
@@ -304,7 +360,7 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
         if used >= per_proc_cap:
             if critical:   # never starve exit-critical calls
                 _fallback_record(now_mono)
-                return True
-            return False
+                return _result(True)
+            return _result(False)
         _fallback_record(now_mono)
-        return True
+        return _result(True)

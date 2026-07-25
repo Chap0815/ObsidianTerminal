@@ -182,9 +182,9 @@ def liq_buffer_consumed_pct(initial_dist: float, current_dist: float) -> float:
     if initial_dist is None or current_dist is None:
         return 100.0
     if initial_dist <= 0:
-        return 0.0
+        return 100.0
     consumed = ((initial_dist - current_dist) / initial_dist) * 100
-    return consumed if math.isfinite(consumed) else 0.0
+    return consumed if math.isfinite(consumed) else 100.0
 
 
 #  PnL math 

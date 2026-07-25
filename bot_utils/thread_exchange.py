@@ -100,26 +100,38 @@ def _build_clone(src) -> Any:
     clone = cls(cfg)
     # Carry over timeout
     clone.timeout = getattr(src, "timeout", 10_000)
-    # Deep-copy markets so per-market dicts aren't shared
+    # Use CCXT's canonical setter so symbols, currencies and reverse indexes
+    # are initialized together with the deep-copied market dictionaries.
     src_markets = getattr(src, "markets", None)
     if src_markets:
         try:
-            clone.markets = copy.deepcopy(src_markets)
+            markets = copy.deepcopy(src_markets)
         except (TypeError, copy.Error):
             try:
-                clone.markets = dict(src_markets)
+                markets = dict(src_markets)
             except TypeError:
-                clone.markets = src_markets
-    # Carry over markets_by_id too (CCXT uses this for symbolid reverse lookup)
-    src_by_id = getattr(src, "markets_by_id", None)
-    if src_by_id:
+                markets = src_markets
+        src_currencies = getattr(src, "currencies", None) or {}
         try:
-            clone.markets_by_id = copy.deepcopy(src_by_id)
+            currencies = copy.deepcopy(src_currencies)
         except (TypeError, copy.Error):
             try:
-                clone.markets_by_id = dict(src_by_id)
+                currencies = dict(src_currencies)
             except TypeError:
-                pass
+                currencies = src_currencies
+        setter = getattr(clone, "set_markets", None)
+        if callable(setter):
+            setter(markets, currencies)
+        else:
+            clone.markets = markets
+            clone.symbols = list(getattr(src, "symbols", None) or markets)
+            clone.currencies = currencies
+            src_by_id = getattr(src, "markets_by_id", None)
+            if src_by_id:
+                try:
+                    clone.markets_by_id = copy.deepcopy(src_by_id)
+                except (TypeError, copy.Error):
+                    clone.markets_by_id = dict(src_by_id)
     # Re-apply SSL workaround if the project has one (Bitget cert chain)
     try:
         from config.exchange_config import _apply_ssl_workaround  # type: ignore
@@ -165,6 +177,7 @@ class ThreadLocalExchange:
         # deep-copied markets clone until close_all(), leaking RSS over uptime.
         self._clones: list = []
         self._clones_lock = threading.Lock()
+        self._markets_refresh_lock = threading.Lock()
 
     #  Public helpers 
 
@@ -215,6 +228,42 @@ class ThreadLocalExchange:
         for _t, c in dead:
             self._close_one(c)
         return len(dead)
+
+    def load_markets(self, *args, **kwargs):
+        """Refresh the canonical base and propagate one coherent snapshot."""
+        with self._markets_refresh_lock:
+            markets = self._base.load_markets(*args, **kwargs)
+            source_markets = getattr(self._base, "markets", None) or markets or {}
+            source_currencies = getattr(self._base, "currencies", None) or {}
+            with self._clones_lock:
+                clones = [clone for _thread, clone in self._clones]
+            for clone in clones:
+                try:
+                    clone_markets = copy.deepcopy(source_markets)
+                except (TypeError, copy.Error):
+                    clone_markets = dict(source_markets)
+                try:
+                    clone_currencies = copy.deepcopy(source_currencies)
+                except (TypeError, copy.Error):
+                    clone_currencies = dict(source_currencies)
+                setter = getattr(clone, "set_markets", None)
+                if callable(setter):
+                    setter(clone_markets, clone_currencies)
+                else:
+                    clone.markets = clone_markets
+                    clone.symbols = list(
+                        getattr(self._base, "symbols", None) or clone_markets
+                    )
+                    clone.currencies = clone_currencies
+                    try:
+                        clone.markets_by_id = copy.deepcopy(
+                            getattr(self._base, "markets_by_id", {})
+                        )
+                    except (TypeError, copy.Error):
+                        clone.markets_by_id = dict(
+                            getattr(self._base, "markets_by_id", {})
+                        )
+            return markets
 
     @staticmethod
     def _close_one(clone) -> None:

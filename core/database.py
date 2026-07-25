@@ -430,6 +430,7 @@ def _optional_bounded_text_db(
 # 
 
 _conn_local = threading.local()
+_tight_conn_local = threading.local()
 
 
 def get_connection() -> sqlite3.Connection:
@@ -458,26 +459,31 @@ def close_thread_local_conn() -> None:
     Idempotent  safe to call multiple times. Errors are swallowed (we are
     typically already shutting down).
     """
-    conn = getattr(_conn_local, "conn", None)
-    if conn is None:
-        return
-    try:
-        conn.close()
-    except Exception:
-        pass
-    try:
-        del _conn_local.conn
-    except AttributeError:
-        pass
+    for local in (_conn_local, _tight_conn_local):
+        conn = getattr(local, "conn", None)
+        if conn is None:
+            continue
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            del local.conn
+        except AttributeError:
+            pass
 
 
 def _tight_connection() -> sqlite3.Connection:
     from core.constants import API_RATE_DB_TIMEOUT_SEC
+    conn = getattr(_tight_conn_local, "conn", None)
+    if conn is not None:
+        return conn
     conn = sqlite3.connect(DB_PATH, timeout=API_RATE_DB_TIMEOUT_SEC)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute(f"PRAGMA busy_timeout={int(API_RATE_DB_TIMEOUT_SEC*1000)}")
+    _tight_conn_local.conn = conn
     return conn
 
 
@@ -3007,7 +3013,8 @@ def _log_api_gate_error(exc) -> None:
 
 def check_and_consume_global_api(bot_name: str, endpoint: str = "",
                                  max_per_minute: int = 900,
-                                 ok: int = 1) -> bool:
+                                 ok: int = 1,
+                                 return_reservation: bool = False):
     from core.constants import API_RATE_HARD_MAX_PER_MINUTE
 
     validated_bot = _required_text_db(
@@ -3027,6 +3034,8 @@ def check_and_consume_global_api(bot_name: str, endpoint: str = "",
         )
     if isinstance(ok, bool) or not isinstance(ok, int) or ok not in (0, 1):
         raise ValueError("ok must be 0 or 1")
+    if not isinstance(return_reservation, bool):
+        raise ValueError("return_reservation must be boolean")
 
     global _API_PRUNE_COUNTER
     try:
@@ -3045,7 +3054,7 @@ def check_and_consume_global_api(bot_name: str, endpoint: str = "",
             if count >= max_per_minute:
                 conn.execute("ROLLBACK")
                 return False
-            conn.execute(
+            inserted = conn.execute(
                 "INSERT INTO api_rate_global "
                 "(called_at, bot_name, endpoint, ok) VALUES (?,?,?,?)",
                 (now_str, validated_bot, validated_endpoint, ok))
@@ -3069,6 +3078,8 @@ def check_and_consume_global_api(bot_name: str, endpoint: str = "",
                     (prune_cut, latest_plausible),
                 )
             conn.commit()
+            if return_reservation:
+                return int(inserted.lastrowid)
             return True
         except sqlite3.OperationalError:
             # Lock-timeout / contention  fail CLOSED. _tight_connection uses
@@ -3091,10 +3102,59 @@ def check_and_consume_global_api(bot_name: str, endpoint: str = "",
                 pass
             _log_api_gate_error(_e)
             return False
-        finally:
-            conn.close()
     except Exception as _e:
         _log_api_gate_error(_e)
+        return False
+
+
+def mark_global_api_call_error(
+    reservation_id: int,
+    bot_name: str,
+    endpoint: str = "",
+) -> bool:
+    """Reclassify one already-budgeted request as failed without inserting
+    a second ledger row."""
+    if isinstance(reservation_id, bool) or not isinstance(reservation_id, int):
+        raise ValueError("reservation_id must be an integer")
+    if reservation_id <= 0:
+        raise ValueError("reservation_id must be positive")
+    validated_bot = _required_text_db(
+        bot_name, "bot_name", max_length=64
+    ).upper()
+    if len(validated_bot) > 64:
+        raise ValueError("bot_name exceeds 64 characters after normalization")
+    validated_endpoint = _bounded_text_db(
+        endpoint, "endpoint", max_length=256, allow_empty=True
+    )
+    try:
+        conn = _tight_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE api_rate_global SET ok=0 "
+                "WHERE id=? AND bot_name=? AND endpoint=? AND ok=1",
+                (reservation_id, validated_bot, validated_endpoint),
+            )
+            if cur.rowcount != 1:
+                conn.execute("ROLLBACK")
+                return False
+            conn.commit()
+            return True
+        except sqlite3.OperationalError:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            return False
+        except Exception as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            _log_api_gate_error(exc)
+            return False
+    except Exception as exc:
+        _log_api_gate_error(exc)
         return False
 
 

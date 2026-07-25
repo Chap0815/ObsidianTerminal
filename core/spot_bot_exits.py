@@ -502,14 +502,30 @@ class ExitsMixin:
         pairs = [f"{s}/USDT" for s in symbols]
         for i in range(0, len(pairs), TICKER_BATCH_SIZE):
             chunk = pairs[i:i + TICKER_BATCH_SIZE]
+            reservation = None
             try:
-                if not try_consume_api_call("fetch_tickers", critical=True):
-                    continue
+                reservation = try_consume_api_call(
+                    "fetch_tickers",
+                    critical=True,
+                    return_reservation=True,
+                )
+            except Exception as e:
+                try:
+                    self._log_error("spot batch ticker API budget", e)
+                except Exception:
+                    pass
+                continue
+            if not reservation:
+                continue
+            try:
                 result = self.ex.fetch_tickers(chunk) or {}
                 out.update(result)
             except Exception as e:
                 try:
-                    record_api_error(endpoint="fetch_tickers")
+                    record_api_error(
+                        endpoint="fetch_tickers",
+                        reservation=reservation,
+                    )
                 except Exception:
                     pass
                 if self._is_rate_limited(e):
@@ -587,10 +603,23 @@ class ExitsMixin:
                 return v
         if self._ticker_backoff_active():
             return 0.0
+        reservation = None
         try:
             from bot_utils.api_budget import try_consume_api_call
-            if not try_consume_api_call("fetch_ticker", critical=True):
-                return 0.0
+            reservation = try_consume_api_call(
+                "fetch_ticker",
+                critical=True,
+                return_reservation=True,
+            )
+        except Exception as e:
+            try:
+                self._log_error("spot ticker API budget", e)
+            except Exception:
+                pass
+            return 0.0
+        if not reservation:
+            return 0.0
+        try:
             ticker = self.ex.fetch_ticker(pair) or {}
             result = safe_positive_float(ticker.get("last"), 0.0)
             if result <= 0:
@@ -599,7 +628,10 @@ class ExitsMixin:
         except Exception as e:
             try:
                 from bot_utils.api_budget import record_api_error
-                record_api_error(endpoint="fetch_ticker")
+                record_api_error(
+                    endpoint="fetch_ticker",
+                    reservation=reservation,
+                )
             except Exception:
                 pass
             if self._is_rate_limited(e):

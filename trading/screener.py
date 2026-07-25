@@ -710,7 +710,7 @@ def _close_clone(clone) -> None:
 # (each clone holds its own HTTP connection pool).
 _CLONE_POOL: list = []
 _CLONE_POOL_LOCK = threading.Lock()
-_CLONE_POOL_KEY = {"id": None}  # id of the source exchange we cloned from
+_CLONE_POOL_KEY = {"source": None}  # strong object identity, never id()
 
 
 @atexit.register
@@ -720,8 +720,46 @@ def _shutdown_clone_pool() -> None:
     with _CLONE_POOL_LOCK:
         clones = list(_CLONE_POOL)
         _CLONE_POOL.clear()
+        _CLONE_POOL_KEY["source"] = None
     for c in clones:
         _close_clone(c)
+
+
+def _detach_clone_pool() -> list:
+    """Atomically detach the current pool without closing active sessions."""
+    with _CLONE_POOL_LOCK:
+        clones = list(_CLONE_POOL)
+        _CLONE_POOL.clear()
+        _CLONE_POOL_KEY["source"] = None
+        return clones
+
+
+def _retire_clone_pool_after(clones: list, futures) -> None:
+    """Close detached clones only after every submitted worker has stopped."""
+    clones = list(clones)
+    pending = list(dict.fromkeys(futures))
+    if not clones:
+        return
+    if not pending:
+        for clone in clones:
+            _close_clone(clone)
+        return
+
+    remaining = [len(pending)]
+    close_lock = threading.Lock()
+
+    def _worker_done(_future) -> None:
+        to_close = None
+        with close_lock:
+            remaining[0] -= 1
+            if remaining[0] == 0:
+                to_close = clones
+        if to_close is not None:
+            for clone in to_close:
+                _close_clone(clone)
+
+    for future in pending:
+        future.add_done_callback(_worker_done)
 
 
 def _get_clone_pool(exchange, n_workers: int) -> list:
@@ -740,22 +778,22 @@ def _get_clone_pool(exchange, n_workers: int) -> list:
     atexit handler above. If the source exchange object changes
     (e.g. user reconnected), we drop the old pool and rebuild.
     """
-    key = id(exchange)
+    old = []
     with _CLONE_POOL_LOCK:
-        if _CLONE_POOL_KEY["id"] != key:
+        if _CLONE_POOL_KEY["source"] is not exchange:
             # Source exchange changed (or first call). Close the old
             # pool so the sockets don't linger, then rebuild.
             old = list(_CLONE_POOL)
             _CLONE_POOL.clear()
-            _CLONE_POOL_KEY["id"] = key
-            # close old after releasing the lock to keep the critical
-            # section short
-            for c in old:
-                _close_clone(c)
+            _CLONE_POOL_KEY["source"] = exchange
         need = max(0, n_workers - len(_CLONE_POOL))
         for _ in range(need):
             _CLONE_POOL.append(_clone_exchange(exchange))
-        return list(_CLONE_POOL[:n_workers])
+        selected = list(_CLONE_POOL[:n_workers])
+    # Close old sessions after releasing the pool lock.
+    for clone in old:
+        _close_clone(clone)
+    return selected
 
 
 def _apply_quality_filters(
@@ -1185,10 +1223,11 @@ def get_top_momentum_coins(
                             fut.cancel()
                         except Exception:
                             pass
-            try:
-                _shutdown_clone_pool()
-            except Exception:
-                pass
+            # Running futures cannot be cancelled safely. Detach this pool so
+            # the next scan gets fresh sessions, but close it only after every
+            # worker has actually returned.
+            retired = _detach_clone_pool()
+            _retire_clone_pool_after(retired, future_map)
     finally:
         try:
             pool.shutdown(wait=False, cancel_futures=True)

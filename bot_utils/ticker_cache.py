@@ -177,6 +177,7 @@ class TickerCache:
                 f"dropping fetch for {symbol_full}"
             )
 
+        permit_owned_by_caller = True
         try:
             # Atomic cross-process budget gate BEFORE the fetch (not just
             # record_api_call() after) so bot subprocesses can't collectively
@@ -203,6 +204,11 @@ class TickerCache:
             self._note("fetch_attempts")
             fetch_started_at = time.monotonic()
             future = self._pool.submit(ex.fetch_ticker, symbol_full)
+            # A timed-out Future may already be running, in which case
+            # cancel() cannot stop it. Keep the backpressure permit attached
+            # to the actual work item until it really finishes.
+            future.add_done_callback(lambda _future: self._inflight_sem.release())
+            permit_owned_by_caller = False
             try:
                 ticker = future.result(timeout=timeout) or {}
             except _FutTimeout:
@@ -259,7 +265,8 @@ class TickerCache:
                     self._cache.popitem(last=False)
             return ticker
         finally:
-            self._inflight_sem.release()
+            if permit_owned_by_caller:
+                self._inflight_sem.release()
 
     def shutdown(self) -> None:
         """Tear down the pool. Cancels queued work, doesn't wait for running.

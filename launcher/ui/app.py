@@ -689,9 +689,9 @@ class ObsidianApp(ctk.CTk):
         selftest_btn.pack(fill="x", pady=(0, 3))
         attach_tooltip(
             selftest_btn,
-            "Run the built-in test suite (pytest).\n"
-            "Verifies the money-path invariants. Run after code edits,\n"
-            "before going live.",
+            "Runs the full invariant suite when tests are installed.\n"
+            "Packaged releases run an integrity/source-compile smoke.\n"
+            "Run after code edits, before going live.",
             delay_ms=400
         )
 
