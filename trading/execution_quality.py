@@ -46,6 +46,28 @@ def _normalized_side_or_none(value) -> str | None:
     return normalized if normalized in {"buy", "sell"} else None
 
 
+class _RetryableMarkoutError(RuntimeError):
+    """A ticker response is temporarily unusable but the queue row is valid."""
+
+
+def _is_retryable_markout_exception(exc: BaseException) -> bool:
+    if isinstance(exc, _RetryableMarkoutError):
+        return True
+    return _is_network_markout_exception(exc)
+
+
+def _is_network_markout_exception(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return True
+    try:
+        import ccxt
+
+        network_error = getattr(ccxt, "NetworkError", None)
+        return isinstance(network_error, type) and isinstance(exc, network_error)
+    except Exception:
+        return False
+
+
 def _nonnegative_integer_or_none(value) -> int | None:
     parsed = _finite_or_none(value)
     if parsed is None or parsed < 0.0 or not parsed.is_integer():
@@ -357,74 +379,115 @@ def compute_fill_tca(
 def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
     """Measure persisted post-fill markouts; failed reads remain retryable."""
     from core.database import (
+        acquire_advisory_lock,
         complete_execution_markout,
         fail_execution_markout,
         list_due_execution_markouts,
+        release_advisory_lock,
     )
 
     completed = 0
-    for row in list_due_execution_markouts(limit=limit):
+    row_limit = max(1, min(250, int(limit)))
+    holder_id = (
+        f"markout:{threading.get_native_id()}:{time.monotonic_ns()}"
+    )
+    try:
+        if not acquire_advisory_lock(
+            "execution_markout_worker",
+            holder_id,
+            ttl_sec=600,
+        ):
+            return 0
+    except Exception as exc:
+        silent_log("acquire TCA markout worker lock", exc)
+        return 0
+
+    try:
         try:
-            if not isinstance(row, Mapping):
-                raise ValueError("markout row must be a mapping")
-            raw_intent_id = row.get("intent_id")
-            if raw_intent_id is None or isinstance(raw_intent_id, bool):
-                raise ValueError("markout intent id is invalid")
-            intent_id = str(raw_intent_id).strip()
-            horizon = _nonnegative_integer_or_none(row.get("horizon_seconds"))
-            if not intent_id or horizon is None or horizon <= 0:
-                raise ValueError("markout identity or horizon is invalid")
+            due_rows = list(list_due_execution_markouts(limit=row_limit))
         except Exception as exc:
-            silent_log("invalid due TCA markout row", exc)
-            continue
-        try:
-            symbol = row.get("symbol")
-            if not isinstance(symbol, str) or not symbol.strip():
-                raise ValueError("markout symbol is invalid")
-            if not try_consume_api_call("execution_markout_fetch_ticker"):
-                break
-            ticker = exchange.fetch_ticker(symbol.strip())
-            if not isinstance(ticker, Mapping):
-                raise ValueError("ticker payload unavailable")
-            mark = _first_positive_finite(
-                ticker.get("mark"),
-                ticker.get("last"),
-                ticker.get("close"),
-            )
-            reference = _positive_finite_or_none(row["reference_price"])
-            if mark is None:
-                raise ValueError("mark price unavailable")
-            if reference is None:
-                raise ValueError("markout reference price unavailable")
-            normalized_side = _normalized_side_or_none(row.get("side"))
-            if normalized_side is None:
-                raise ValueError("markout side is invalid")
-            sign = 1.0 if normalized_side == "buy" else -1.0
-            markout_bps = sign * (mark - reference) / reference * 10_000.0
-            if not math.isfinite(markout_bps):
-                raise ValueError("markout result is not finite")
-            payload = {
-                "horizon_seconds": horizon,
-                "reference_price": reference,
-                "mark_price": mark,
-                "markout_bps": markout_bps,
-            }
-            if complete_execution_markout(
-                intent_id,
-                horizon,
-                mark_price=mark,
-                markout_bps=markout_bps,
-                tca_stage=f"markout_{horizon}s",
-                tca_payload=payload,
-            ):
-                completed += 1
-        except Exception as exc:
+            silent_log("read due TCA markouts", exc)
+            return 0
+
+        for row in due_rows[:row_limit]:
             try:
-                fail_execution_markout(
+                if not isinstance(row, Mapping):
+                    raise ValueError("markout row must be a mapping")
+                raw_intent_id = row.get("intent_id")
+                if raw_intent_id is None or isinstance(raw_intent_id, bool):
+                    raise ValueError("markout intent id is invalid")
+                intent_id = str(raw_intent_id).strip()
+                horizon = _nonnegative_integer_or_none(
+                    row.get("horizon_seconds")
+                )
+                if not intent_id or horizon is None or horizon <= 0:
+                    raise ValueError("markout identity or horizon is invalid")
+            except Exception as exc:
+                silent_log("invalid due TCA markout row", exc)
+                continue
+
+            try:
+                symbol = row.get("symbol")
+                if not isinstance(symbol, str) or not symbol.strip():
+                    raise ValueError("markout symbol is invalid")
+                reference = _positive_finite_or_none(row["reference_price"])
+                if reference is None:
+                    raise ValueError("markout reference price unavailable")
+                normalized_side = _normalized_side_or_none(row.get("side"))
+                if normalized_side is None:
+                    raise ValueError("markout side is invalid")
+                if not try_consume_api_call("execution_markout_fetch_ticker"):
+                    break
+                ticker = exchange.fetch_ticker(symbol.strip())
+                if not isinstance(ticker, Mapping):
+                    raise _RetryableMarkoutError("ticker payload unavailable")
+                mark = _first_positive_finite(
+                    ticker.get("mark"),
+                    ticker.get("last"),
+                    ticker.get("close"),
+                )
+                if mark is None:
+                    raise _RetryableMarkoutError("mark price unavailable")
+                sign = 1.0 if normalized_side == "buy" else -1.0
+                markout_bps = (
+                    sign * (mark - reference) / reference * 10_000.0
+                )
+                if not math.isfinite(markout_bps):
+                    raise ValueError("markout result is not finite")
+                payload = {
+                    "horizon_seconds": horizon,
+                    "reference_price": reference,
+                    "mark_price": mark,
+                    "markout_bps": markout_bps,
+                }
+            except Exception as exc:
+                failure_persisted = False
+                try:
+                    fail_execution_markout(
+                        intent_id,
+                        horizon,
+                        f"{type(exc).__name__}: {exc}",
+                        retryable=_is_retryable_markout_exception(exc),
+                    )
+                    failure_persisted = True
+                except Exception as persist_exc:
+                    silent_log("persist failed TCA markout", persist_exc)
+                if failure_persisted and _is_network_markout_exception(exc):
+                    break
+                continue
+
+            try:
+                if complete_execution_markout(
                     intent_id,
                     horizon,
-                    f"{type(exc).__name__}: {exc}",
-                )
+                    mark_price=mark,
+                    markout_bps=markout_bps,
+                    tca_stage=f"markout_{horizon}s",
+                    tca_payload=payload,
+                ):
+                    completed += 1
             except Exception as persist_exc:
-                silent_log("persist failed TCA markout", persist_exc)
-    return completed
+                silent_log("persist completed TCA markout", persist_exc)
+        return completed
+    finally:
+        release_advisory_lock("execution_markout_worker", holder_id)

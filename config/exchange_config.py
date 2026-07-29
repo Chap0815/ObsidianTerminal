@@ -38,7 +38,12 @@ class LeverageNotSetError(Exception):
 def _silent(ctx: str, exc: BaseException) -> None:
     try:
         from bot_utils.silent_log import silent_log
-        silent_log(ctx, exc)
+        interval = (
+            300.0
+            if ctx in {"publish_clock_offset", "resync_time_difference"}
+            else 60.0
+        )
+        silent_log(ctx, exc, interval=interval)
     except Exception:
         pass
 

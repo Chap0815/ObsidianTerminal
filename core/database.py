@@ -1018,14 +1018,22 @@ def _run_migrations(conn) -> None:
         status             TEXT NOT NULL DEFAULT 'PENDING',
         attempts           INTEGER NOT NULL DEFAULT 0,
         last_error         TEXT,
+        next_attempt_at    TEXT,
         measured_at        TEXT,
         mark_price         REAL,
         markout_bps        REAL,
         PRIMARY KEY(intent_id, horizon_seconds),
         FOREIGN KEY(intent_id) REFERENCES order_intents(intent_id)
     )""")
+    _add_column_if_missing(
+        conn, "execution_markouts", "next_attempt_at", "TEXT"
+    )
     c.execute("CREATE INDEX IF NOT EXISTS idx_execution_markouts_due "
               "ON execution_markouts(status, due_at)")
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_markouts_retry "
+        "ON execution_markouts(status, next_attempt_at, due_at)"
+    )
     c.execute("""
     CREATE TABLE IF NOT EXISTS portfolio_snapshot_header (
         snapshot_id        TEXT PRIMARY KEY,
@@ -1105,7 +1113,7 @@ def _run_migrations(conn) -> None:
     # Record current schema version  every successful migration run leaves a
     # fingerprint, useful for diagnostics ("did the migration run?") and for
     # future versioned migrations.
-    _CURRENT_SCHEMA_VERSION = 4
+    _CURRENT_SCHEMA_VERSION = 5
     try:
         existing = conn.execute(
             "SELECT version FROM schema_versions WHERE version=?",
@@ -5011,14 +5019,17 @@ def schedule_execution_markouts(
 
 def list_due_execution_markouts(limit: int = 25) -> list[dict]:
     conn = get_connection()
+    now = _utcnow_str()
     return [
         dict(row)
         for row in conn.execute(
             """SELECT * FROM execution_markouts
                WHERE status='PENDING' AND due_at <= ?
-               ORDER BY due_at, intent_id, horizon_seconds
+                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+               ORDER BY COALESCE(next_attempt_at, due_at),
+                        due_at, intent_id, horizon_seconds
                LIMIT ?""",
-            (_utcnow_str(), max(1, min(250, int(limit)))),
+            (now, now, max(1, min(250, int(limit)))),
         ).fetchall()
     ]
 
@@ -5064,7 +5075,8 @@ def complete_execution_markout(
         cur = conn.execute(
             """UPDATE execution_markouts
                   SET status='COMPLETE', measured_at=?, mark_price=?,
-                      markout_bps=?, attempts=attempts+1, last_error=NULL
+                      markout_bps=?, attempts=attempts+1, last_error=NULL,
+                      next_attempt_at=NULL
                 WHERE intent_id=? AND horizon_seconds=? AND status='PENDING'""",
             (measured_at, price, bps, str(intent_id), horizon),
         )
@@ -5082,35 +5094,113 @@ def complete_execution_markout(
         raise
 
 
+_MARKOUT_RETRY_BASE_SECONDS = 30
+_MARKOUT_RETRY_MAX_SECONDS = 300
+_MARKOUT_RETRY_EXPIRY_SECONDS = 24 * 60 * 60
+
+
+def _record_markout_failure(
+    *,
+    table: str,
+    identity_column: str,
+    identity_value: str,
+    horizon: int,
+    failure_reason: str,
+    attempt_limit: int,
+    retryable: bool,
+) -> None:
+    table = _safe_ident(table)
+    identity_column = _safe_ident(identity_column)
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            f"""SELECT attempts,due_at
+                  FROM {table}
+                 WHERE {identity_column}=? AND horizon_seconds=?
+                   AND status='PENDING'""",
+            (identity_value, horizon),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return
+
+        attempts = int(row["attempts"] or 0) + 1
+        if retryable:
+            now = _utcnow()
+            try:
+                due_at = datetime.strptime(
+                    str(row["due_at"]), "%Y-%m-%d %H:%M:%S"
+                )
+                expired = (
+                    now - due_at
+                ).total_seconds() >= _MARKOUT_RETRY_EXPIRY_SECONDS
+            except (TypeError, ValueError, OverflowError):
+                expired = True
+            if expired:
+                status = "FAILED"
+                next_attempt_at = None
+            else:
+                exponent = min(max(0, attempts - 1), 16)
+                retry_delay = min(
+                    _MARKOUT_RETRY_MAX_SECONDS,
+                    _MARKOUT_RETRY_BASE_SECONDS * (2**exponent),
+                )
+                status = "PENDING"
+                next_attempt_at = (
+                    now + timedelta(seconds=retry_delay)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            status = "FAILED" if attempts >= attempt_limit else "PENDING"
+            next_attempt_at = None
+
+        conn.execute(
+            f"""UPDATE {table}
+                   SET attempts=?, status=?, last_error=?, next_attempt_at=?
+                 WHERE {identity_column}=? AND horizon_seconds=?
+                   AND status='PENDING'""",
+            (
+                attempts,
+                status,
+                failure_reason,
+                next_attempt_at,
+                identity_value,
+                horizon,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def fail_execution_markout(
     intent_id: str,
     horizon_seconds: int,
     error: str,
     *,
     max_attempts: int = 5,
+    retryable: bool = False,
 ) -> None:
     validated_intent_id = _order_id_text_db(intent_id)
     if validated_intent_id is None:
         raise ValueError("markout intent id is required")
     horizon = _positive_integer_db(horizon_seconds, "markout horizon")
     attempt_limit = _positive_integer_db(max_attempts, "markout max attempts")
+    if not isinstance(retryable, bool):
+        raise ValueError("markout retryable flag must be boolean")
     if not isinstance(error, str) or not error.strip():
         raise ValueError("markout failure reason is required")
     failure_reason = error.strip()[:500]
-    conn = get_connection()
-    try:
-        conn.execute(
-            """UPDATE execution_markouts
-                  SET attempts=attempts+1,
-                      status=CASE WHEN attempts+1 >= ? THEN 'FAILED' ELSE status END,
-                      last_error=?
-                WHERE intent_id=? AND horizon_seconds=? AND status='PENDING'""",
-            (attempt_limit, failure_reason, validated_intent_id, horizon),
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+    _record_markout_failure(
+        table="execution_markouts",
+        identity_column="intent_id",
+        identity_value=validated_intent_id,
+        horizon=horizon,
+        failure_reason=failure_reason,
+        attempt_limit=attempt_limit,
+        retryable=retryable,
+    )
 
 
 def register_experiment_trial(

@@ -255,6 +255,7 @@ class DataPoller:
         # per 60s. Without this, a persistent network issue would spam
         # one line every 15s = 4 per minute = hundreds per hour.
         self._diag_seen: dict[str, float] = {}
+        self._availability_states: dict[str, bool] = {}
 
         self._spot_exchange   = None   # cached connection for unrealized fetch
         self._error_counter   = _ErrorLogCounter("error_log.txt")
@@ -284,6 +285,22 @@ class DataPoller:
             print(f"[poller-diag] {msg}", file=_sys.stderr, flush=True)
         except Exception:
             pass
+
+    def _set_availability(
+        self,
+        key: str,
+        available: bool,
+        unavailable_message: str,
+    ) -> None:
+        """Log only unavailable/recovered transitions for a polled source."""
+        previous = self._availability_states.get(key)
+        self._availability_states[key] = bool(available)
+        if available:
+            if previous is False:
+                self._log_diag(f"{key.replace('_', ' ')}: recovered")
+            return
+        if previous is not False:
+            self._log_diag(unavailable_message)
 
     #  Main loop 
 
@@ -558,15 +575,23 @@ class DataPoller:
                                         # compute_spot_equity returns None on
                                         # API failure  log so the user can
                                         # see WHY the dashboard shows ''
-                                        self._log_diag(
+                                        self._set_availability(
+                                            "spot_equity",
+                                            False,
                                             "spot equity: returned None "
-                                            "(API unreachable or balance schema unknown)"
+                                            "(API unreachable or balance schema unknown)",
+                                        )
+                                    else:
+                                        self._set_availability(
+                                            "spot_equity", True, ""
                                         )
                                 except Exception as _e_spot:
                                     spot_equity = None
-                                    self._log_diag(
+                                    self._set_availability(
+                                        "spot_equity",
+                                        False,
                                         f"spot equity: {type(_e_spot).__name__}: "
-                                        f"{_safe_error_text(_e_spot)}"
+                                        f"{_safe_error_text(_e_spot)}",
                                     )
 
                             if live_futures:
@@ -584,15 +609,23 @@ class DataPoller:
                                             "source": "free-only (legacy)",
                                         }
                                     if futures_equity is None:
-                                        self._log_diag(
+                                        self._set_availability(
+                                            "futures_equity",
+                                            False,
                                             "futures equity: returned None "
-                                            "(API unreachable or balance schema unknown)"
+                                            "(API unreachable or balance schema unknown)",
+                                        )
+                                    else:
+                                        self._set_availability(
+                                            "futures_equity", True, ""
                                         )
                                 except Exception as _e_fut:
                                     futures_equity = None
-                                    self._log_diag(
+                                    self._set_availability(
+                                        "futures_equity",
+                                        False,
                                         f"futures equity: {type(_e_fut).__name__}: "
-                                        f"{_safe_error_text(_e_fut)}"
+                                        f"{_safe_error_text(_e_fut)}",
                                     )
 
                             # Format strings for the sidebar.
