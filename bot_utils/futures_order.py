@@ -316,6 +316,10 @@ class FuturesOrderOutcomeUnknown(RetryForbiddenError):
         )
 
 
+class FuturesOrderNotSubmitted(RuntimeError):
+    """The API budget blocked an order before ``create_order`` was called."""
+
+
 class _TradeRecoveryOrder(dict):
     """Order-shaped snapshot created only from internally aggregated trades."""
 
@@ -1300,10 +1304,15 @@ def create_order_with_retry(ex,
         or str(raw_reduce).strip().lower() in ("1", "true", "yes")
     )
     endpoint = f"create_order:{action_label or 'order'}"
+    submission_attempted = False
     for attempt in range(1, attempts_limit + 1):
         if not try_consume_api_call(endpoint, critical=reduce_only):
-            raise RuntimeError(f"API budget exhausted before {action_label}")
+            error = f"API budget exhausted before {action_label}"
+            if not submission_attempted:
+                raise FuturesOrderNotSubmitted(error)
+            raise RuntimeError(error)
         try:
+            submission_attempted = True
             order = ex.create_order(
                 order_symbol, "market", order_side, order_amount,
                 params=order_params)

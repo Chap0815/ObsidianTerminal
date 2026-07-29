@@ -65,6 +65,7 @@ from bot_utils.futures_math import (
     fee_buffered_breakeven,
 )
 from bot_utils.futures_order import (
+    FuturesOrderNotSubmitted,
     FuturesOrderOutcomeUnknown,
     create_order_with_retry,
     classify_order_state,
@@ -153,6 +154,7 @@ __all__ = [
     "funding_oi_filter",
     "fee_buffered_breakeven",
     # Futures order
+    "FuturesOrderNotSubmitted",
     "FuturesOrderOutcomeUnknown",
     "create_order_with_retry",
     "classify_order_state",

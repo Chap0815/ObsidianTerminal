@@ -30,6 +30,7 @@ import os
 
 from shared_limits import normalize_gate_mode
 from bot_utils import (
+    FuturesOrderNotSubmitted,
     FuturesOrderOutcomeUnknown,
     budget_exhausted,
     get_funding_info,
@@ -1752,6 +1753,8 @@ class FuturesScanMixin:
                             direction=direction)
                     return
             except Exception as e:
+                _not_submitted = isinstance(
+                    e, FuturesOrderNotSubmitted)
                 _outcome_unknown = isinstance(
                     e, FuturesOrderOutcomeUnknown)
                 emit_entry_lifecycle(
@@ -1760,6 +1763,10 @@ class FuturesScanMixin:
                     reason=type(e).__name__, direction=direction)
                 log_event(f"Order {sym} failed: {e}", "WARN")
                 self._log_error(f"Open {sym}", e)
+                if _not_submitted:
+                    self._cleanup_rolled_back_futures_entry_state(
+                        sym, "futures entry was not submitted")
+                    return
                 _landed = False
                 # ORPHAN PREVENTION: create_order can RAISE after the order
                 # actually LANDED (lost response on the final retry). Check by

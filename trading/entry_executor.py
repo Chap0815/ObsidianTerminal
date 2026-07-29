@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.futures_order import (
+    FuturesOrderNotSubmitted,
     _TradeRecoveryOrder,
     _exchange_id,
     _explicit_order_ids,
@@ -281,6 +282,71 @@ def _require_api_budget(endpoint: str, *, critical: bool = False) -> None:
     )
     if not allowed:
         raise RuntimeError(f"API budget denied: {endpoint}")
+
+
+def _finalize_not_submitted_intent(
+    journal,
+    intent_id: str,
+    error: Exception | str,
+    *,
+    current_status: str = "SUBMITTING",
+) -> None:
+    reason = f"entry order not submitted: {error}"
+    transition = (
+        journal.transition
+        if callable(getattr(journal, "transition", None))
+        else journal
+    )
+    if current_status != "RECOVERY_REQUIRED":
+        transition(intent_id, "RECOVERY_REQUIRED", error=reason)
+    transition(
+        intent_id,
+        "CANCELED",
+        filled_amount=0.0,
+        filled_notional=0.0,
+        fee_usdt=0.0,
+        error=reason,
+    )
+    transition(
+        intent_id,
+        "FINALIZED",
+        release_terminal_zero_claim=True,
+        error=reason,
+    )
+
+
+def _legacy_budget_denial_proves_not_submitted(intent: Mapping) -> bool:
+    def explicit_zero(value) -> bool:
+        if value is None or isinstance(value, bool):
+            return False
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return math.isfinite(number) and number == 0.0
+
+    return (
+        intent.get("status") == "RECOVERY_REQUIRED"
+        and str(intent.get("last_error") or "").startswith(
+            "RuntimeError: API budget exhausted before open "
+        )
+        and bool(str(intent.get("client_order_id") or "").strip())
+        and not str(intent.get("exchange_order_id") or "").strip()
+        and not str(intent.get("fallback_client_order_id") or "").strip()
+        and not str(intent.get("fallback_exchange_order_id") or "").strip()
+        and all(
+            explicit_zero(intent.get(field))
+            for field in (
+                "filled_amount",
+                "filled_notional",
+                "fee_usdt",
+                "fallback_filled_amount",
+                "fallback_filled_notional",
+                "fallback_fee_usdt",
+            )
+        )
+        and intent.get("fallback_notional_complete") in (0, False)
+    )
 
 
 def _refresh_order(
@@ -637,6 +703,9 @@ def execute_entry_order(
                 journal, intent_id, arrival, order, symbol=symbol, side=side
             )
             return order
+        except FuturesOrderNotSubmitted as exc:
+            _finalize_not_submitted_intent(journal, intent_id, exc)
+            raise
         except Exception as exc:
             journal.transition(
                 intent_id, "RECOVERY_REQUIRED", error=f"{type(exc).__name__}: {exc}"
@@ -648,7 +717,7 @@ def execute_entry_order(
             if book_budget_denied or not try_consume_api_call(
                 "entry_executor_fetch_order_book"
             ):
-                raise RuntimeError(
+                raise FuturesOrderNotSubmitted(
                     "API budget denied: entry_executor_fetch_order_book"
                 )
             book = exchange.fetch_order_book(
@@ -665,7 +734,10 @@ def execute_entry_order(
                 "externalOid": client_order_id,
             }
         )
-        _require_api_budget("entry_executor_create_maker")
+        if not try_consume_api_call("entry_executor_create_maker"):
+            raise FuturesOrderNotSubmitted(
+                "API budget denied: entry_executor_create_maker"
+            )
         maker_order = exchange.create_order(
             symbol,
             "limit",
@@ -1015,6 +1087,9 @@ def execute_entry_order(
             journal, intent_id, arrival, result, symbol=symbol, side=side
         )
         return result
+    except FuturesOrderNotSubmitted as exc:
+        _finalize_not_submitted_intent(journal, intent_id, exc)
+        raise
     except Exception as exc:
         try:
             journal.transition(
@@ -1113,6 +1188,17 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
             log_event=log_event,
         )
         if order is None:
+            if _legacy_budget_denial_proves_not_submitted(intent):
+                try:
+                    _finalize_not_submitted_intent(
+                        transition_order_intent,
+                        intent_id,
+                        intent["last_error"],
+                        current_status=current,
+                    )
+                except (TypeError, ValueError):
+                    unresolved.append(persisted_snapshot(intent_id, intent))
+                continue
             if current in {"PREPARED", "SUBMITTING"}:
                 transition_order_intent(
                     intent_id,

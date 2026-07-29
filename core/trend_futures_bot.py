@@ -833,7 +833,8 @@ class TrendFuturesBot(FuturesBot):
         from core.logger import log_event, log_struct, send_telegram
         from core.database import is_claimed_by_other, claim_symbol_for_entry
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-        from bot_utils import (FuturesOrderOutcomeUnknown,
+        from bot_utils import (FuturesOrderNotSubmitted,
+                               FuturesOrderOutcomeUnknown,
                                create_order_with_retry,
                                extract_or_estimate_futures_fee,
                                filled_margin_usdt,
@@ -1140,6 +1141,8 @@ class TrendFuturesBot(FuturesBot):
                     config=MakerFirstConfig(mode="disabled"),
                 )
             except Exception as e:
+                _not_submitted = isinstance(
+                    e, FuturesOrderNotSubmitted)
                 _outcome_unknown = isinstance(
                     e, FuturesOrderOutcomeUnknown)
                 emit_entry_lifecycle(
@@ -1148,6 +1151,10 @@ class TrendFuturesBot(FuturesBot):
                     reason=type(e).__name__, direction="LONG")
                 log_event(f"[{self.BOT_NAME}] {base}: open failed ({e})", "WARN")
                 self._log_error(f"trend open {base}", e)
+                if _not_submitted:
+                    self._cleanup_untracked_entry_state(
+                        base, "trend entry was not submitted")
+                    return
                 # Orphan-prevention: create_order can RAISE after the order
                 # actually landed (lost response). Recover via clientOrderId.
                 _landed = False

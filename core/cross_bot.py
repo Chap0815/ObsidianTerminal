@@ -2214,7 +2214,8 @@ class CrossBot(FuturesBot):
             fees = amount * fill * taker_fee_rate(self.ex, full)
         else:
             #  LIVE: cross-margin market order 
-            from bot_utils import (FuturesOrderOutcomeUnknown,
+            from bot_utils import (FuturesOrderNotSubmitted,
+                                   FuturesOrderOutcomeUnknown,
                                    create_order_with_retry,
                                    extract_or_estimate_futures_fee,
                                    futures_contract_size)
@@ -2429,6 +2430,8 @@ class CrossBot(FuturesBot):
                     config=MakerFirstConfig(mode="disabled"),
                 )
             except Exception as e:
+                _not_submitted = isinstance(
+                    e, FuturesOrderNotSubmitted)
                 _outcome_unknown = isinstance(
                     e, FuturesOrderOutcomeUnknown)
                 emit_entry_lifecycle(
@@ -2437,6 +2440,10 @@ class CrossBot(FuturesBot):
                     reason=type(e).__name__, direction=side)
                 log_event(f"[{self.BOT_NAME}] {base}: open failed ({e})", "WARN")
                 self._log_error(f"cross open {base}", e)
+                if _not_submitted:
+                    self._cleanup_untracked_entry_state(
+                        base, "cross entry was not submitted")
+                    return
                 _landed = False
                 # Delisting / permanently-untradeable pair (MEXC 8823): exclude it
                 # from the universe so the NEXT rebalance picks a tradeable
