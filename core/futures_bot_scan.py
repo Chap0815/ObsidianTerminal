@@ -47,6 +47,7 @@ from bot_utils import (
     get_maintenance_margin_rate,
 )
 from bot_utils.api_budget import try_consume_api_call
+from bot_utils.trade_state import state_exposure_count
 from trading.entry_quality import EntryQuality, score_futures_entry
 
 
@@ -270,7 +271,7 @@ class FuturesScanMixin:
         if paused:
             log_event(f"[{self.BOT_NAME}] Pausiert: {pause_reason}", "WAIT")
             return
-        if self.state.count() >= max_trades:
+        if state_exposure_count(self.state) >= max_trades:
             log_event(f"Max. Trades erreicht ({max_trades})", "WAIT")
             return
         if is_bad_hour(self.BOT_NAME):
@@ -337,7 +338,7 @@ class FuturesScanMixin:
         for _, r in cand.iterrows():
             if self._shutdown_event.is_set():
                 return
-            if self.state.count() >= max_trades:
+            if state_exposure_count(self.state) >= max_trades:
                 break
             if self.safe_mode.is_active():
                 return

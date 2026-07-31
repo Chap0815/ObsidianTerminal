@@ -51,6 +51,60 @@ def _finite_float_or_none(value) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+def _utc_ms_or_none(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+    return int(parsed.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def _funding_symbol_key(value) -> str:
+    if not isinstance(value, str):
+        return ""
+    # Unified swap symbols include the settlement currency after ``:`` while
+    # venue ids generally do not (H/USDT:USDT versus H_USDT).
+    primary = value.split(":", 1)[0]
+    return "".join(char for char in primary.upper() if char.isalnum())
+
+
+def _funding_row_matches_symbol(ex, symbol_full: str, row: dict) -> bool:
+    expected = {_funding_symbol_key(symbol_full)}
+    try:
+        market = ex.market(symbol_full)
+    except Exception:
+        market = None
+    if isinstance(market, dict):
+        expected.add(_funding_symbol_key(market.get("id")))
+        expected.add(_funding_symbol_key(market.get("symbol")))
+    expected.discard("")
+
+    info = row.get("info") if isinstance(row.get("info"), dict) else {}
+    # The raw venue symbol is authoritative. In particular, CCXT's MEXC
+    # adapter copies the requested unified symbol into row["symbol"] even if
+    # the venue returned a different record.
+    raw_symbol = info.get("symbol")
+    observed = _funding_symbol_key(raw_symbol)
+    if observed:
+        return observed in expected
+    observed = _funding_symbol_key(row.get("symbol"))
+    return not observed or observed in expected
+
+
+def funding_amount_is_plausible(
+    funding_paid: float,
+    notional_usdt: float,
+) -> bool:
+    """Mirror the DB's hard funding bound before accounting WAL is frozen."""
+    funding = _finite_float_or_none(funding_paid)
+    notional = _finite_float_or_none(notional_usdt)
+    if funding is None or notional is None or notional <= 0:
+        return False
+    return abs(funding) <= max(0.25, notional * 0.20)
+
+
 def _maybe_sweep_oi_history(now_mono: float) -> None:
     """Remove symbol entries whose newest data point is older than the
     retention window. Called under _OI_LOCK by callers."""
@@ -79,7 +133,8 @@ def fetch_or_estimate_funding(ex,
                                 since_time_str: str,
                                 notional_usdt: float,
                                 pos_type: str,
-                                fallback_state_value: float = 0.0) -> float:
+                                fallback_state_value: float = 0.0,
+                                until_time_str: str | None = None) -> Optional[float]:
     """Best-effort funding amount paid since trade open, in USDT.
 
     Strategy:
@@ -93,25 +148,60 @@ def fetch_or_estimate_funding(ex,
       SHORT +rate  shorts receive  negative return ( -raw)
       SHORT -rate  shorts pay  positive return ( -raw)
     """
-    realized = fetch_realized_funding(ex, symbol_full, since_time_str)
+    realized = fetch_realized_funding(
+        ex,
+        symbol_full,
+        since_time_str,
+        until_time_str=until_time_str,
+        notional_usdt=notional_usdt,
+    )
     if realized is not None:
         if realized != 0.0:
             return realized
-        return estimate_funding_paid(ex, symbol_full, since_time_str,
-                                       notional_usdt, pos_type,
-                                       fallback_state_value)
-    if fallback_state_value:
-        return fallback_state_value
-    return estimate_funding_paid(ex, symbol_full, since_time_str,
-                                   notional_usdt, pos_type,
-                                   fallback_state_value)
+        estimated = estimate_funding_paid(
+            ex,
+            symbol_full,
+            since_time_str,
+            notional_usdt,
+            pos_type,
+            fallback_state_value,
+            until_time_str=until_time_str,
+        )
+        return (
+            estimated
+            if funding_amount_is_plausible(estimated, notional_usdt)
+            else None
+        )
+    fallback = _finite_float_or_none(fallback_state_value)
+    if (
+        fallback is not None
+        and fallback != 0.0
+        and funding_amount_is_plausible(fallback, notional_usdt)
+    ):
+        return fallback
+    estimated = estimate_funding_paid(
+        ex,
+        symbol_full,
+        since_time_str,
+        notional_usdt,
+        pos_type,
+        fallback_state_value=0.0,
+        until_time_str=until_time_str,
+    )
+    return (
+        estimated
+        if funding_amount_is_plausible(estimated, notional_usdt)
+        else None
+    )
 
 
 #  Real fetch (preferred) 
 
 def fetch_realized_funding(ex,
                              symbol_full: str,
-                             since_time_str: str) -> Optional[float]:
+                             since_time_str: str,
+                             until_time_str: str | None = None,
+                             notional_usdt: float | None = None) -> Optional[float]:
     """Fetch sum of funding payments from exchange API.
 
     Returns:
@@ -120,14 +210,14 @@ def fetch_realized_funding(ex,
     """
     if not symbol_full or not since_time_str:
         return None
-    try:
-        ts_dt = datetime.strptime(since_time_str, "%Y-%m-%d %H:%M:%S")
-        # ALWAYS attach UTC tzinfo before .timestamp()  a naive datetime
-        # would be read as LOCAL system time and shift since_ms off the open.
-        ts_dt = ts_dt.replace(tzinfo=timezone.utc)
-        since_ms = int(ts_dt.timestamp() * 1000)
-    except (ValueError, TypeError):
+    since_ms = _utc_ms_or_none(since_time_str)
+    if since_ms is None:
         return None
+    until_ms = None
+    if until_time_str is not None:
+        until_ms = _utc_ms_or_none(until_time_str)
+        if until_ms is None or until_ms < since_ms:
+            return None
 
     fn = getattr(ex, "fetch_funding_history", None)
     if not callable(fn):
@@ -144,6 +234,7 @@ def fetch_realized_funding(ex,
     history: list = []
     next_since = since_ms
     seen_keys = set()
+    unverifiable_row = False
     for _page in range(max_pages):
         # Atomic budget gate. If exhausted, return None and let the caller fall
         # back to state/estimates instead of returning a partial sum.
@@ -163,11 +254,22 @@ def fetch_realized_funding(ex,
         for h in page:
             if not isinstance(h, dict):
                 continue
+            amt = _finite_float_or_none(h.get("amount"))
             ts = h.get("timestamp")
             try:
                 ts_i = int(ts) if ts is not None and not isinstance(ts, bool) else None
             except (TypeError, ValueError):
                 ts_i = None
+            if amt is not None and ts_i is None:
+                unverifiable_row = True
+                continue
+            if ts_i is None:
+                continue
+            max_ts = max(max_ts, ts_i)
+            if ts_i < since_ms or (until_ms is not None and ts_i > until_ms):
+                continue
+            if not _funding_row_matches_symbol(ex, symbol_full, h):
+                continue
             info = h.get("info") if isinstance(h.get("info"), dict) else {}
             key = h.get("id") or info.get("id")
             dedupe = key or (
@@ -180,19 +282,24 @@ def fetch_realized_funding(ex,
             seen_keys.add(dedupe)
             history.append(h)
             added += 1
-            if ts_i is not None:
-                max_ts = max(max_ts, ts_i)
 
         if added == 0 or len(page) < 50 or max_ts <= next_since:
             break
         next_since = max_ts + 1
 
+    if unverifiable_row:
+        return None
     total = 0.0
     for h in history:
         amt = _finite_float_or_none(h.get("amount"))
         if amt is None:
             continue
         total -= amt  # flip: exchange uses +received/-paid; we want +cost
+    if (
+        notional_usdt is not None
+        and not funding_amount_is_plausible(total, notional_usdt)
+    ):
+        return None
     return total
 
 
@@ -221,7 +328,8 @@ def estimate_funding_paid(ex,
                             since_time_str: str,
                             notional_usdt: float,
                             pos_type: str = "LONG",
-                            fallback_state_value: float = 0.0) -> float:
+                            fallback_state_value: float = 0.0,
+                            until_time_str: str | None = None) -> float:
     """Estimate funding when history API returns empty.
 
     Funding settles at 00:00 / 08:00 / 16:00 UTC on most exchanges.
@@ -233,8 +341,14 @@ def estimate_funding_paid(ex,
     try:
         ts_dt = datetime.strptime(since_time_str, "%Y-%m-%d %H:%M:%S")
         ts_open = ts_dt.replace(tzinfo=timezone.utc).timestamp()
-        from core.clock import now_ms
-        ts_close = now_ms() / 1000.0   # exchange-anchored
+        if until_time_str is not None:
+            until_ms = _utc_ms_or_none(until_time_str)
+            if until_ms is None:
+                return 0.0
+            ts_close = until_ms / 1000.0
+        else:
+            from core.clock import now_ms
+            ts_close = now_ms() / 1000.0   # exchange-anchored
     except ImportError:
         ts_close = datetime.now(timezone.utc).timestamp()
     except (ValueError, TypeError):

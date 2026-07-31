@@ -3264,6 +3264,9 @@ class CrossBot(FuturesBot):
                             self.ex,
                             full,
                             d.get("buy_time"),
+                            notional_usdt=(
+                                margin * lev if margin > 0 else None
+                            ),
                         )
                     else:
                         from bot_utils import fetch_or_estimate_funding
@@ -3279,14 +3282,13 @@ class CrossBot(FuturesBot):
                     parsed_funding = CrossBot._safe_float(
                         self, realized, None
                     )
+                    funding_resolution_pending = parsed_funding is None
                     if funding_requires_history:
-                        funding_resolution_pending = parsed_funding is None
                         funding_history_resolved = parsed_funding is not None
                     if parsed_funding is not None:
                         funding = parsed_funding
                 except Exception:
-                    if funding_requires_history:
-                        funding_resolution_pending = True
+                    funding_resolution_pending = True
             if bool(d.get("partial_sold")):
                 from bot_utils import safe_remaining_funding
 

@@ -1251,6 +1251,7 @@ class FuturesExitsMixin:
                         self.ex,
                         symbol_full,
                         buy_time,
+                        notional_usdt=notional,
                     )
                 else:
                     realized = fetch_or_estimate_funding(
@@ -2142,6 +2143,7 @@ class FuturesExitsMixin:
                 self.ex,
                 symbol_full,
                 d.get("buy_time"),
+                notional_usdt=(margin * lev if margin > 0 and lev > 0 else None),
             )
             if exact_funding is None:
                 log_event(
@@ -2523,6 +2525,9 @@ class FuturesExitsMixin:
                         self.ex,
                         symbol_full,
                         d.get("buy_time"),
+                        notional_usdt=(
+                            margin * lev if margin > 0 and lev > 0 else None
+                        ),
                     )
                     exact_funding = FuturesExitsMixin._safe_finite_float(
                         exact_funding,
@@ -3226,6 +3231,7 @@ class FuturesExitsMixin:
                         self.ex,
                         symbol_full,
                         d.get("buy_time"),
+                        notional_usdt=notional,
                     )
                 else:
                     realized = fetch_or_estimate_funding(
@@ -3238,8 +3244,8 @@ class FuturesExitsMixin:
                         ),
                     )
                 realized = FuturesExitsMixin._safe_finite_float(realized, None)
+                funding_resolution_pending = realized is None
                 if funding_requires_history:
-                    funding_resolution_pending = realized is None
                     funding_history_resolved = realized is not None
                 if realized is not None:
                     # Safe helper for the realized-funding scaling too
@@ -3255,8 +3261,7 @@ class FuturesExitsMixin:
                         )
                     funding_pd = realized
             except Exception:
-                if funding_requires_history:
-                    funding_resolution_pending = True
+                funding_resolution_pending = True
 
         slice_fees = proportional_entry_fee + close_fee
         profit_usdt = round(pnl_real - slice_fees - funding_pd, 2)

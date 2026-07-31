@@ -31,6 +31,7 @@ from typing import Dict, List, Optional, Tuple
 from shared_limits import normalize_gate_mode
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.safe_numeric import parse_ohlcv_closes
+from bot_utils.trade_state import state_exposure_count
 from core.futures_bot import FuturesBot
 from core.cross_bot import _is_crypto_base   # shared crypto-only perp filter
 from bot_utils.order_utils import order_id_text_or_none
@@ -796,7 +797,7 @@ class TrendFuturesBot(FuturesBot):
                     "WARN",
                 )
                 return
-            if self.state.count() >= max_open:
+            if state_exposure_count(self.state) >= max_open:
                 break
             if opened_this_tick >= max_new:
                 log_event(
@@ -2154,6 +2155,7 @@ class TrendFuturesBot(FuturesBot):
                             self.ex,
                             full,
                             d.get("buy_time"),
+                            notional_usdt=notional,
                         )
                     else:
                         from bot_utils.futures_funding import (
@@ -2166,14 +2168,13 @@ class TrendFuturesBot(FuturesBot):
                             fallback_state_value=funding,
                         )
                     fresh_funding = _finite_float(fresh_funding, None)
+                    funding_resolution_pending = fresh_funding is None
                     if funding_requires_history:
-                        funding_resolution_pending = fresh_funding is None
                         funding_history_resolved = fresh_funding is not None
                     if fresh_funding is not None:
                         funding = fresh_funding
                 except Exception:
-                    if funding_requires_history:
-                        funding_resolution_pending = True
+                    funding_resolution_pending = True
             if partial_sold and original_amount > 0:
                 funding = safe_remaining_funding(
                     funding, amt, original_amount, partial_sold=True,

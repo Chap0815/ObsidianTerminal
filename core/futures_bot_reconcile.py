@@ -18,6 +18,9 @@ from bot_utils.api_budget import try_consume_api_call
 from bot_utils.futures_order import FUTURES_DEFAULT_TAKER_FEE, position_row_side
 from core.clock import now_utc
 
+_OFFLINE_ACCOUNTING_RETRY_BASE_SEC = 30.0
+_OFFLINE_ACCOUNTING_RETRY_MAX_SEC = 300.0
+
 
 def _finite_float_or_none(value) -> float | None:
     if isinstance(value, bool):
@@ -118,6 +121,46 @@ def _nonnegative_float_or_none(value) -> float | None:
 
 def _is_true_bool(value) -> bool:
     return value is True
+
+
+def _offline_accounting_retry_due(
+    row: dict,
+    *,
+    now_epoch: float | None = None,
+) -> bool:
+    if not isinstance(row, dict):
+        return True
+    retry_at = _finite_float_or_none(
+        row.get("accounting_retry_next_at")
+    )
+    if retry_at is None:
+        return True
+    current = time.time() if now_epoch is None else float(now_epoch)
+    return current >= retry_at
+
+
+def _defer_offline_accounting_retry(bot, sym: str, row: dict) -> float:
+    attempts_raw = row.get("accounting_retry_attempts", 0)
+    try:
+        attempts = max(0, int(attempts_raw)) + 1
+    except (TypeError, ValueError, OverflowError):
+        attempts = 1
+    delay = min(
+        _OFFLINE_ACCOUNTING_RETRY_MAX_SEC,
+        _OFFLINE_ACCOUNTING_RETRY_BASE_SEC * (2 ** min(attempts - 1, 8)),
+    )
+    retry_at = time.time() + delay
+    try:
+        bot.state.update_many(
+            sym,
+            {
+                "accounting_retry_attempts": attempts,
+                "accounting_retry_next_at": retry_at,
+            },
+        )
+    except Exception:
+        pass
+    return delay
 
 
 def _safe_identifier(value, *, max_length: int) -> str | None:
@@ -1452,6 +1495,8 @@ class FuturesReconcileMixin:
                             "ERROR",
                         )
                         continue
+                    if not _offline_accounting_retry_due(close_row):
+                        continue
                     recorded = self._record_offline_close(sym, close_row)
                     if not recorded:
                         log_event(
@@ -2187,6 +2232,31 @@ class FuturesReconcileMixin:
                     "accounting_pending_funding_unverified"
                 ) is True
             )
+            funding_notional = (
+                margin * lev
+                if margin is not None and lev is not None
+                else None
+            )
+            if funding_notional is not None:
+                from bot_utils.futures_funding import (
+                    funding_amount_is_plausible,
+                )
+
+                pending_funding = _finite_float_or_none(
+                    state_row.get("accounting_pending_funding_paid")
+                )
+                if (
+                    not funding_amount_is_plausible(
+                        funding_total, funding_notional
+                    )
+                    or (
+                        pending_funding is not None
+                        and not funding_amount_is_plausible(
+                            pending_funding, funding_notional
+                        )
+                    )
+                ):
+                    funding_requires_history = True
             if funding_requires_history:
                 from bot_utils.futures_funding import fetch_realized_funding
 
@@ -2194,11 +2264,19 @@ class FuturesReconcileMixin:
                     self.ex,
                     f"{sym}/USDT:USDT",
                     buy_time,
+                    until_time_str=state_row.get(
+                        "accounting_pending_sell_time"
+                    ),
+                    notional_usdt=funding_notional,
                 )
                 if exact_funding is None:
+                    retry_delay = _defer_offline_accounting_retry(
+                        self, sym, state_row
+                    )
                     log_event(
                         f" {sym}: offline-close accounting deferred; exact "
-                        "funding history unavailable",
+                        f"funding history unavailable; retry in "
+                        f"{retry_delay:.0f}s",
                         "ERROR",
                     )
                     return False
@@ -2455,9 +2533,12 @@ class FuturesReconcileMixin:
                 entry_id=state_row.get("entry_id"),
             )
             if not saved:
+                retry_delay = _defer_offline_accounting_retry(
+                    self, sym, state_row
+                )
                 log_event(
                     f" {sym}: offline-close DB save failed  state kept "
-                    f"for accounting retry.", "WARN")
+                    f"for accounting retry in {retry_delay:.0f}s.", "WARN")
                 return False
 
             log_event(

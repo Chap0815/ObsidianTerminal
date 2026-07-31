@@ -58,6 +58,31 @@ _CLAIM_EXTRA_FIELDS = frozenset((
 ))
 
 
+def _rows_exposure_count(rows) -> int:
+    if not isinstance(rows, dict):
+        return 0
+    return sum(
+        1
+        for row in rows.values()
+        if not (
+            isinstance(row, dict)
+            and row.get("accounting_pending") is True
+        )
+    )
+
+
+def state_exposure_count(state) -> int:
+    """Return physical exposure count for TradeState and narrow test doubles."""
+    counter = getattr(state, "exposure_count", None)
+    if callable(counter):
+        return max(0, int(counter()))
+    getter = getattr(state, "get_all", None)
+    if callable(getter):
+        return _rows_exposure_count(getter())
+    fallback = getattr(state, "count", None)
+    return max(0, int(fallback())) if callable(fallback) else 0
+
+
 @contextmanager
 def registry_order_guard(state, sym: str, fallback_row=None):
     """Use TradeState's ownership barrier, with a narrow test-double fallback."""
@@ -750,6 +775,18 @@ class TradeState:
         self.retry_registry_pending(force=False)
         with self._lock:
             return len(self._trades)
+
+    def exposure_count(self) -> int:
+        """Count positions that can still represent exchange exposure.
+
+        A full-close accounting WAL remains in ``trades.json`` until its DB
+        row is durable, but ``accounting_pending=True`` is written only after
+        the exchange close was verified flat. Keeping that recovery evidence
+        must not consume a live strategy slot.
+        """
+        self.retry_registry_pending(force=False)
+        with self._lock:
+            return _rows_exposure_count(self._trades)
 
     def has(self, sym: str) -> bool:
         self.retry_registry_pending(force=False)

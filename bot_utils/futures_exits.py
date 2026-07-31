@@ -1060,21 +1060,23 @@ def _close_single_position_impl(*,
                         notional = notional / remaining_ratio
                 if funding_window_unverified:
                     realized = fetch_realized_funding(
-                        ex, symbol_full, d.get("buy_time")
+                        ex,
+                        symbol_full,
+                        d.get("buy_time"),
+                        notional_usdt=notional,
                     )
-                    funding_resolution_pending = realized is None
                 else:
                     realized = fetch_or_estimate_funding(
                         ex, symbol_full, d.get("buy_time"),
                         notional_usdt=notional, pos_type=pos_type,
                         fallback_state_value=funding_pd,
                     )
+                funding_resolution_pending = realized is None
                 if realized is not None:
                     realized = _finite_or_default(realized, math.nan)
                     if not math.isfinite(realized):
                         realized = None
-                        if funding_window_unverified:
-                            funding_resolution_pending = True
+                        funding_resolution_pending = True
                 if realized is not None:
                     if partial_sold_flag:
                         realized = safe_remaining_funding(
@@ -1088,8 +1090,7 @@ def _close_single_position_impl(*,
                         )
                     funding_pd = realized
             except Exception:
-                if funding_window_unverified:
-                    funding_resolution_pending = True
+                funding_resolution_pending = True
 
         slice_fees = proportional_entry_fee + close_fee
         profit_usdt = round(pnl_usdt - slice_fees - funding_pd, 2)

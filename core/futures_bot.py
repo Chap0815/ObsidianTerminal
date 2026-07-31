@@ -49,6 +49,7 @@ from bot_utils import (
     emergency_close_all_futures,
 )
 from bot_utils.api_budget import try_consume_api_call
+from bot_utils.trade_state import state_exposure_count
 
 from core.futures_bot_exits import FuturesExitsMixin
 from core.futures_bot_scan import FuturesScanMixin
@@ -503,7 +504,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             self.simulation,
             threads=threads,
             extra={
-                "open_positions": self.state.count(),
+                "open_positions": state_exposure_count(self.state),
                 **strategy_health,
             })
 
@@ -515,7 +516,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             while not self._shutdown_event.is_set():
                 now = time.time()
                 if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_SEC:
-                    tc = self.state.count()
+                    tc = state_exposure_count(self.state)
                     sm_marker = "  SAFE_MODE" if self.safe_mode.is_active() else ""
                     log_event(
                         f" {self.BOT_NAME} heartbeat  "
@@ -583,7 +584,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                             self.LOG_DIR, self.BOT_NAME, status,
                             self.simulation, threads=threads,
                             extra={
-                                "open_positions": self.state.count(),
+                                "open_positions": state_exposure_count(self.state),
                                 "safe_mode": bool(self.safe_mode.is_active()),
                                 **observability,
                                 **strategy_health,
