@@ -8,6 +8,7 @@ result cache attached to :func:`_query_nvidia_smi`.
 
 from __future__ import annotations
 
+import math
 import subprocess
 import time
 
@@ -30,7 +31,8 @@ def _query_nvidia_smi():
     don't want to fork a subprocess that often. Returns ``None`` when
     nvidia-smi is missing or fails.
     """
-    if _query_nvidia_smi._cached_until > time.time():
+    now = time.monotonic()
+    if _query_nvidia_smi._cached_until > now:
         return _query_nvidia_smi._last_result
     try:
         kw = subprocess_no_window_kwargs()
@@ -43,17 +45,38 @@ def _query_nvidia_smi():
         if result.returncode != 0:
             data = None
         else:
-            parts = [p.strip() for p in result.stdout.strip().split(",")]
-            if len(parts) >= 4:
-                data = {"name": parts[0], "load": float(parts[1]),
-                        "vram_used_mb": float(parts[2]),
-                        "vram_total_mb": float(parts[3])}
-            else:
+            first_row = next(
+                (row.strip() for row in result.stdout.splitlines()
+                 if row.strip()),
+                "",
+            )
+            parts = [part.strip() for part in first_row.split(",")]
+            if len(parts) != 4 or not parts[0]:
                 data = None
+            else:
+                load = float(parts[1])
+                vram_used = float(parts[2])
+                vram_total = float(parts[3])
+                if (
+                    not all(math.isfinite(value) for value in (
+                        load, vram_used, vram_total
+                    ))
+                    or not 0.0 <= load <= 100.0
+                    or not 0.0 <= vram_used <= vram_total
+                    or vram_total <= 0.0
+                ):
+                    data = None
+                else:
+                    data = {
+                        "name": parts[0],
+                        "load": load,
+                        "vram_used_mb": vram_used,
+                        "vram_total_mb": vram_total,
+                    }
     except Exception:
         data = None
     _query_nvidia_smi._last_result = data
-    _query_nvidia_smi._cached_until = time.time() + 3.0
+    _query_nvidia_smi._cached_until = now + 3.0
     return data
 
 

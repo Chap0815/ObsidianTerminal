@@ -39,6 +39,8 @@ LEVERAGE_LIMIT_BY_BOT = {
 }
 MAX_DAILY_LOSS_LIMIT = 100_000.0
 MAX_DAILY_LOSS_MIN_ABS = 0.01
+_PRE_START_CONFIG_JSON_MAX_BYTES = 2 * 1024 * 1024
+_PRE_START_STATE_JSON_MAX_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -52,10 +54,29 @@ def _issue(severity: str, code: str, message: str) -> CheckIssue:
     return CheckIssue(severity=severity, code=code, message=message)
 
 
+def _read_json_bounded(
+    path,
+    max_bytes: int,
+    label: str,
+    *,
+    reject_constants: bool = False,
+):
+    with open(path, "rb") as stream:
+        raw = stream.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"{label} JSON exceeds size limit")
+    kwargs = {"parse_constant": _reject_json_constant} if reject_constants else {}
+    return json.loads(raw.decode("utf-8-sig"), **kwargs)
+
+
 def _read_config() -> tuple[dict, list[CheckIssue]]:
     try:
-        with open(BOT_CONFIG, "r", encoding="utf-8-sig") as fh:
-            cfg = json.load(fh, parse_constant=_reject_json_constant)
+        cfg = _read_json_bounded(
+            BOT_CONFIG,
+            _PRE_START_CONFIG_JSON_MAX_BYTES,
+            "bot_config",
+            reject_constants=True,
+        )
         if not isinstance(cfg, dict):
             return {}, [_issue("error", "config_type",
                                "bot_config.json root is not an object")]
@@ -117,8 +138,11 @@ def _load_state(path: Path) -> tuple[dict, str | None]:
     if not path.exists():
         return {}, None
     try:
-        with path.open("r", encoding="utf-8-sig") as fh:
-            data = json.load(fh)
+        data = _read_json_bounded(
+            path,
+            _PRE_START_STATE_JSON_MAX_BYTES,
+            "state file",
+        )
         if data is None:
             return {}, None
         if not isinstance(data, dict):
@@ -148,6 +172,7 @@ def _validate_state(bot_name: str, raw: dict, is_futures: bool) -> list[CheckIss
 
 
 def _db_rows(table: str, where: str = "", params: Iterable = ()) -> tuple[list[dict], str | None]:
+    con = None
     try:
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
@@ -155,10 +180,15 @@ def _db_rows(table: str, where: str = "", params: Iterable = ()) -> tuple[list[d
         if where:
             sql += f" WHERE {where}"
         rows = [dict(r) for r in con.execute(sql, tuple(params)).fetchall()]
-        con.close()
         return rows, None
     except Exception as e:
         return [], str(e)
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
 
 
 def _check_manifest() -> list[CheckIssue]:

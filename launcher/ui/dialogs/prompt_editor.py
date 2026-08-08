@@ -21,9 +21,12 @@ from bot_utils.silent_log import silent_log
 from launcher.config.settings import BOT_META, COLORS, FONT_BODY, PROJECT_ROOT
 from launcher.ui.components.widgets import safe_geometry
 from launcher.ui.theme import force_dark_titlebar
+from shared_limits import PROMPT_TEXT_MAX_BYTES, read_bounded_text_file
 
 
 def _atomic_write_prompt(path: str, content: str) -> None:
+    if len(content.encode("utf-8")) > PROMPT_TEXT_MAX_BYTES:
+        raise ValueError("prompt text exceeds size limit")
     prompt_dir = os.path.dirname(path) or "."
     os.makedirs(prompt_dir, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
@@ -358,8 +361,7 @@ class PromptEditor(ctk.CTkToplevel):
         # Try the active prompt first
         if os.path.exists(path):
             try:
-                with open(path, encoding="utf-8") as f:
-                    content = f.read()
+                content = read_bounded_text_file(path)
                 loaded_from = "active"
                 loaded_path = path
             except Exception:
@@ -368,8 +370,7 @@ class PromptEditor(ctk.CTkToplevel):
         # Fall back to the default
         if not content and os.path.exists(self.default_path):
             try:
-                with open(self.default_path, encoding="utf-8") as f:
-                    content = f.read()
+                content = read_bounded_text_file(self.default_path)
                 loaded_from = "default"
                 loaded_path = self.default_path
             except Exception:
@@ -566,6 +567,9 @@ class PromptEditor(ctk.CTkToplevel):
                               Pure JSON prompts don't need a RESULT line 
                               the bot reads direction directly from the JSON.
         """
+        if len(content.encode("utf-8")) > PROMPT_TEXT_MAX_BYTES:
+            return False, "Prompt exceeds the 256 KiB size limit"
+
         is_futures = BOT_META[self.bot_name]["is_futures"]
         upper = content.upper()
 
@@ -643,8 +647,7 @@ class PromptEditor(ctk.CTkToplevel):
 
         def _confirm():
             try:
-                with open(self.default_path, encoding="utf-8") as f:
-                    content = f.read()
+                content = read_bounded_text_file(self.default_path)
                 self.editor.delete("1.0", "end")
                 self.editor.insert("1.0", content)
                 self._dirty = True

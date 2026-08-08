@@ -19,6 +19,7 @@ from collections import deque as _deque
 
 import customtkinter as ctk
 
+from bot_utils.config import _read_config_json
 from launcher.config.settings import (
     BOT_META,
     BOT_ORDER,
@@ -44,6 +45,16 @@ from launcher.ui.theme import force_dark_titlebar
 # isn't overstated by modelling zero carry. ~0.01%/8h  0.03%/day. Overridable
 # via the FUTURES config key FUNDING_RATE_8H.
 DEFAULT_FUTURES_FUNDING_8H = 0.0001
+
+_BACKTEST_CONFIG_FLAGS = {
+    "MIN_PUMP": ("--pump", None),
+    "ACTIVATION_PROFIT": ("--activation", None),
+    "TRAILING_DISTANCE": ("--trailing", None),
+    "INITIAL_STOP_LOSS": ("--stop", abs),
+    "PARTIAL_SELL_PCT": ("--partial", None),
+    "RSI_MAX": ("--rsimax", None),
+    "LEVERAGE": ("--leverage", None),
+}
 
 
 OPTIMIZER_CONFIG_MAPPING = {
@@ -203,6 +214,34 @@ def _finite_optimizer_number(value) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _read_tool_bot_config(bot: str, *, path=None) -> dict:
+    """Read one bot section through the shared bounded config reader."""
+    if path is None:
+        from core.paths import BOT_CONFIG
+
+        path = BOT_CONFIG
+    config = _read_config_json(str(path))
+    if not isinstance(config, dict):
+        return {}
+    section = config.get(bot)
+    return section if isinstance(section, dict) else {}
+
+
+def _backtest_config_cli_args(bot_cfg: dict) -> list[str]:
+    """Build backtester overrides from finite numeric config values only."""
+    if not isinstance(bot_cfg, dict):
+        return []
+    args: list[str] = []
+    for cfg_key, (flag, transform) in _BACKTEST_CONFIG_FLAGS.items():
+        value = _finite_optimizer_number(bot_cfg.get(cfg_key))
+        if value is None:
+            continue
+        if transform:
+            value = transform(value)
+        args.extend((flag, str(round(value, 4))))
+    return args
 
 
 def optimizer_promotion_reasons(cfg: dict) -> list[str]:
@@ -375,10 +414,10 @@ def finalize_optimizer_apply_run(
 def _futures_funding_8h(bot_cfg: dict) -> float:
     """8h funding rate to model for a FUTURES run: live config override else default."""
     try:
-        v = bot_cfg.get("FUNDING_RATE_8H")
-        if v is not None:
-            return float(v)
-    except (TypeError, ValueError):
+        value = _finite_optimizer_number(bot_cfg.get("FUNDING_RATE_8H"))
+        if value is not None:
+            return value
+    except (AttributeError, TypeError):
         pass
     return DEFAULT_FUTURES_FUNDING_8H
 
@@ -1387,30 +1426,8 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
                 # Without this, backtester falls back to STRATEGY_DEFAULTS
                 # (hardcoded values) regardless of what's set in the UI.
                 try:
-                    import json as _json
-                    from core.paths import BOT_CONFIG as _CFG
-                    with open(str(_CFG), encoding="utf-8") as _f:
-                        _b = _json.load(_f).get(bot, {})
-                    # bot_config.json key  (backtester CLI flag, transform)
-                    _flag_map = {
-                        "MIN_PUMP":          ("--pump",       None),
-                        "ACTIVATION_PROFIT": ("--activation", None),
-                        "TRAILING_DISTANCE": ("--trailing",   None),
-                        "INITIAL_STOP_LOSS": ("--stop",       abs),
-                        "PARTIAL_SELL_PCT":  ("--partial",    None),
-                        "RSI_MAX":           ("--rsimax",     None),
-                        "LEVERAGE":          ("--leverage",   None),
-                    }
-                    for cfg_key, (flag, transform) in _flag_map.items():
-                        val = _b.get(cfg_key)
-                        if val is not None:
-                            try:
-                                v = float(val)
-                                if transform:
-                                    v = transform(v)
-                                cmd += [flag, str(round(v, 4))]
-                            except (TypeError, ValueError):
-                                pass
+                    _b = _read_tool_bot_config(bot)
+                    cmd += _backtest_config_cli_args(_b)
                     if bot == "FUTURES":
                         cmd += ["--funding", str(_futures_funding_8h(_b))]
                 except Exception as _e:
@@ -1421,10 +1438,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
                     cmd.append("--quick")
                 if bot == "FUTURES":
                     try:
-                        import json as _json
-                        from core.paths import BOT_CONFIG as _CFG
-                        with open(str(_CFG), encoding="utf-8") as _f:
-                            _b = _json.load(_f).get(bot, {})
+                        _b = _read_tool_bot_config(bot)
                     except Exception:
                         _b = {}
                     cmd += ["--funding", str(_futures_funding_8h(_b))]

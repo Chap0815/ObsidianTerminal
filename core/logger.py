@@ -226,6 +226,7 @@ _STRUCT_LOG_QUEUE: queue.Queue = queue.Queue(maxsize=5000)
 _STRUCT_WRITE_FAILS       = 0
 _STRUCT_WRITE_FAIL_LOCK   = threading.Lock()
 _STRUCT_WRITE_FAIL_MAX    = 5
+_STRUCT_WRITE_RETRY_MAX   = 5
 
 _STRUCT_WRITER_THREAD: threading.Thread = None
 _STRUCT_WRITER_LOCK = threading.Lock()
@@ -241,30 +242,47 @@ def _struct_log_writer() -> None:
             except queue.Empty:
                 continue
             try:
-                with _STRUCT_LOG_LOCK:
-                    if not _append_rotating_text(
-                        path,
-                        line + "\n",
-                        STRUCT_LOG_MAX_BYTES,
-                        STRUCT_LOG_BACKUPS,
-                        jsonl=True,
-                    ):
-                        raise OSError("structured log cap/write unavailable")
-                with _STRUCT_WRITE_FAIL_LOCK:
-                    _STRUCT_WRITE_FAILS = 0
-            except Exception as e:
-                with _STRUCT_WRITE_FAIL_LOCK:
-                    _STRUCT_WRITE_FAILS += 1
-                    count = _STRUCT_WRITE_FAILS
-                if count <= _STRUCT_WRITE_FAIL_MAX or count % 100 == 0:
+                attempts = 0
+                while True:
                     try:
-                        sys.stderr.write(
-                            f"[logger] structured-log write FAILED "
-                            f"({count} consecutive): {type(e).__name__}: "
-                            f"{_safe_log_text(e)}\n")
-                        sys.stderr.flush()
-                    except Exception:
-                        pass
+                        with _STRUCT_LOG_LOCK:
+                            if not _append_rotating_text(
+                                path,
+                                line + "\n",
+                                STRUCT_LOG_MAX_BYTES,
+                                STRUCT_LOG_BACKUPS,
+                                jsonl=True,
+                            ):
+                                raise OSError(
+                                    "structured log cap/write unavailable"
+                                )
+                        with _STRUCT_WRITE_FAIL_LOCK:
+                            _STRUCT_WRITE_FAILS = 0
+                        break
+                    except Exception as e:
+                        attempts += 1
+                        with _STRUCT_WRITE_FAIL_LOCK:
+                            _STRUCT_WRITE_FAILS += 1
+                            count = _STRUCT_WRITE_FAILS
+                        if count <= _STRUCT_WRITE_FAIL_MAX or count % 100 == 0:
+                            try:
+                                sys.stderr.write(
+                                    f"[logger] structured-log write FAILED "
+                                    f"({count} consecutive): "
+                                    f"{type(e).__name__}: "
+                                    f"{_safe_log_text(e)}\n"
+                                )
+                                sys.stderr.flush()
+                            except Exception:
+                                pass
+                        if attempts >= _STRUCT_WRITE_RETRY_MAX:
+                            break
+                        # Keep the accepted record unfinished until durable.
+                        # Retry transient Windows/rotation failures, but do
+                        # not let one permanently unwritable or oversized
+                        # record wedge every later structured event.
+                        exponent = min(max(count - 1, 0), 5)
+                        time.sleep(min(1.0, 0.05 * (2 ** exponent)))
             finally:
                 try:
                     _STRUCT_LOG_QUEUE.task_done()
@@ -312,7 +330,8 @@ def flush_structured_logs(timeout: float = 2.0) -> bool:
     while True:
         try:
             if _STRUCT_LOG_QUEUE.unfinished_tasks == 0:
-                return True
+                with _STRUCT_WRITE_FAIL_LOCK:
+                    return _STRUCT_WRITE_FAILS == 0
             _ensure_struct_writer()
         except Exception:
             return False
@@ -1119,6 +1138,20 @@ def log_status(bot, open_trades, balance, next_scan_sec):
 # JSON ops
 # 
 
+_LOGGER_STATE_JSON_MAX_BYTES = 4 * 1024 * 1024
+
+
+class _LoggerStateTooLarge(ValueError):
+    pass
+
+
+def _read_logger_state_json(path: str):
+    with open(path, "rb") as stream:
+        raw = stream.read(_LOGGER_STATE_JSON_MAX_BYTES + 1)
+    if len(raw) > _LOGGER_STATE_JSON_MAX_BYTES:
+        raise _LoggerStateTooLarge("logger state JSON exceeds size limit")
+    return json.loads(raw.decode("utf-8-sig"))
+
 def _preserve_corrupt_json(path: str, max_backups: int = 3) -> None:
     """Copy one corrupt state file aside with a bounded forensic history."""
     directory = os.path.dirname(os.path.abspath(path)) or "."
@@ -1154,8 +1187,12 @@ def load_j(f, default=None, *, preserve_corrupt: bool = False):
         default = {}
     if os.path.exists(f):
         try:
-            with open(f, "r", encoding="utf-8-sig") as fh:
-                return json.load(fh)
+            return _read_logger_state_json(f)
+        except _LoggerStateTooLarge as e:
+            log_event(
+                f"Read error ({_safe_log_text(f)}): {_safe_log_text(e)}",
+                "WARN",
+            )
         except (json.JSONDecodeError, UnicodeError) as e:
             if preserve_corrupt:
                 _preserve_corrupt_json(f)
@@ -1377,6 +1414,36 @@ _TG_QUEUE: queue.Queue = queue.Queue(maxsize=100)
 _TELEGRAM_MESSAGE_MAX_CHARS = 4096
 _TELEGRAM_TOKEN_MAX_CHARS = 256
 _TELEGRAM_CHAT_IDS_MAX_CHARS = 4096
+_TELEGRAM_DELIVERY_ATTEMPTS = 4
+_TELEGRAM_RETRY_BASE_SEC = 1.0
+_TELEGRAM_RETRY_AFTER_MAX_SEC = 30.0
+
+
+def _telegram_retry_after_seconds(response) -> float | None:
+    """Return a safe, bounded Telegram Retry-After delay when present."""
+    try:
+        headers = getattr(response, "headers", None)
+        getter = getattr(headers, "get", None)
+        raw_value = getter("Retry-After") if callable(getter) else None
+        if isinstance(raw_value, bool):
+            return None
+        value = float(raw_value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(value) or value < 0.0:
+        return None
+    return min(_TELEGRAM_RETRY_AFTER_MAX_SEC, value)
+
+
+def _close_http_response_quietly(response) -> None:
+    if response is None:
+        return
+    try:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
 
 
 def _telegram_config_text(value, *, max_chars: int) -> str:
@@ -1420,18 +1487,48 @@ def _telegram_worker() -> None:
             except queue.Empty:
                 continue
             try:
-                r = requests.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    data={"chat_id": chat_id, "text": msg},
-                    proxies=_TG_PROXIES, timeout=15)
-                if not r.ok:
-                    _record_tg_failure(
-                        f"http_{r.status_code}",
-                        _telegram_recipient_key(token, chat_id),
+                delivered = False
+                failure_reason = "unknown"
+                for attempt in range(_TELEGRAM_DELIVERY_ATTEMPTS):
+                    retryable = True
+                    retry_after = None
+                    r = None
+                    try:
+                        r = requests.post(
+                            f"https://api.telegram.org/bot{token}/sendMessage",
+                            data={"chat_id": chat_id, "text": msg},
+                            proxies=_TG_PROXIES,
+                            timeout=15,
+                        )
+                        if r.ok:
+                            delivered = True
+                            break
+                        try:
+                            status = int(r.status_code)
+                        except (TypeError, ValueError, OverflowError):
+                            status = 0
+                        failure_reason = f"http_{status or 'unknown'}"
+                        retryable = status in {408, 425, 429} or 500 <= status < 600
+                        if status == 429:
+                            retry_after = _telegram_retry_after_seconds(r)
+                    except Exception as e:
+                        failure_reason = type(e).__name__
+                    finally:
+                        _close_http_response_quietly(r)
+                    if not retryable or attempt + 1 >= _TELEGRAM_DELIVERY_ATTEMPTS:
+                        break
+                    time.sleep(
+                        retry_after
+                        if retry_after is not None
+                        else min(
+                            8.0, _TELEGRAM_RETRY_BASE_SEC * (2 ** attempt)
+                        )
                     )
-                else:
+
+                recipient_key = _telegram_recipient_key(token, chat_id)
+                if delivered:
                     recovered = _reset_tg_failures(
-                        _telegram_recipient_key(token, chat_id)
+                        recipient_key
                     )
                     if recovered:
                         log_event(
@@ -1440,11 +1537,8 @@ def _telegram_worker() -> None:
                             f"failed attempt{'s' if recovered != 1 else ''}",
                             "OK",
                         )
-            except Exception as e:
-                _record_tg_failure(
-                    type(e).__name__,
-                    _telegram_recipient_key(token, chat_id),
-                )
+                else:
+                    _record_tg_failure(failure_reason, recipient_key)
             finally:
                 try:
                     _TG_QUEUE.task_done()

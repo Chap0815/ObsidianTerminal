@@ -185,11 +185,25 @@ class L2ShadowCollector:
             : self.max_symbols
         ]
         with self._symbols_lock:
+            previous = set(self._symbols)
             self._symbols = unique
         active = set(unique)
         with self._state_lock:
-            for symbol in set(self._invalid_warning_state) - active:
-                self._invalid_warning_state.pop(symbol, None)
+            for state in (
+                self._last_persist,
+                self._last_nonce,
+                self._updates_since_sample,
+                self._invalid_warning_state,
+            ):
+                for symbol in set(state) - active:
+                    state.pop(symbol, None)
+        with self._health_lock:
+            self._health_seen_symbols.intersection_update(active)
+            if active - previous:
+                # A newly selected stream belongs to a new validation
+                # generation; do not inherit the prior universe's healthy
+                # latch before every desired symbol has produced a sample.
+                self._health_ok_logged = False
 
     def _symbol_snapshot(self) -> tuple[str, ...]:
         with self._symbols_lock:

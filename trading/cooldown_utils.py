@@ -9,6 +9,7 @@ Public API:
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import socket
@@ -64,6 +65,15 @@ def should_cooldown_after_exit(reason: str, profit_usdt: float) -> bool:
 
 _COOLDOWN_LOCK = threading.Lock()
 _MAX_COOLDOWN_MINUTES = 366 * 24 * 60
+_COOLDOWN_JSON_MAX_BYTES = 1024 * 1024
+
+
+def _read_cooldown_json(path: str):
+    with open(path, "rb") as stream:
+        raw = stream.read(_COOLDOWN_JSON_MAX_BYTES + 1)
+    if len(raw) > _COOLDOWN_JSON_MAX_BYTES:
+        raise ValueError("cooldown JSON exceeds size limit")
+    return json.loads(raw.decode("utf-8-sig"))
 
 
 def _normalize_cooldown_minutes(value) -> Optional[int]:
@@ -298,10 +308,8 @@ def _persist(path: str, data: dict) -> bool:
             now = _utcnow()
             merged = _active_cooldowns(data, now)
             try:
-                import json
                 if os.path.exists(path):
-                    with open(path, "r", encoding="utf-8-sig") as fh:
-                        disk = _active_cooldowns(json.load(fh), now)
+                    disk = _active_cooldowns(_read_cooldown_json(path), now)
                     for symbol, expiry in disk.items():
                         current = merged.get(symbol)
                         if current is None or expiry > current:
@@ -328,7 +336,6 @@ def _persist(path: str, data: dict) -> bool:
 
 def _atomic_write_json(path: str, data: dict) -> None:
     """Retry budget for Windows AV scan interference."""
-    import json
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:

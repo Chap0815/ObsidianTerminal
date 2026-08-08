@@ -23,6 +23,8 @@ from trading.expectancy_training import (
     expanding_walk_forward_fit,
 )
 
+RESEARCH_VENUE_PAYLOAD_MAX_BYTES = 4 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class ExperimentDefinition:
@@ -742,11 +744,14 @@ def load_cached_ohlcv_panel(
     folder = Path(root) / "data" / "ohlcv_cache"
     panel = {}
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    file_limit = max(1, int(maximum_file_bytes))
     for path in sorted(folder.glob("*__1h.json"))[: max(1, int(max_symbols))]:
         try:
-            if path.stat().st_size > max(1, int(maximum_file_bytes)):
+            with path.open("rb") as handle:
+                raw = handle.read(file_limit + 1)
+            if len(raw) > file_limit:
                 continue
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(raw.decode("utf-8-sig"))
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             continue
         if not isinstance(payload, list):
@@ -870,7 +875,9 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
             conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
             rows = conn.execute(
                 "SELECT exchange_time, payload_json FROM venue_events "
-                "ORDER BY exchange_time"
+                "WHERE length(CAST(payload_json AS BLOB)) <= ? "
+                "ORDER BY exchange_time",
+                (RESEARCH_VENUE_PAYLOAD_MAX_BYTES,),
             )
             for exchange_time, encoded in rows:
                 total_events += 1

@@ -15,6 +15,7 @@ sole place per-strategy defaults live and is what the CLI reads.
 
 import sys
 import os
+import math
 import time as _time
 import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -430,6 +431,50 @@ def _closed_trade_record(
 #
 
 
+def _bounded_backtest_float(
+    value, default: float, low: float, high: float
+) -> float:
+    if isinstance(value, bool):
+        return float(default)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+    if not math.isfinite(parsed):
+        return float(default)
+    return max(float(low), min(float(high), parsed))
+
+
+def _finite_backtest_value(value, default: float) -> float:
+    if isinstance(value, bool):
+        return float(default)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+    return parsed if math.isfinite(parsed) else float(default)
+
+
+def _backtest_env_float(name: str, default: float) -> float:
+    return _finite_backtest_value(os.getenv(name, str(default)), default)
+
+
+def _bounded_backtest_int(value, default: int, low: int, high: int) -> int:
+    if isinstance(value, bool):
+        return int(default)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+    if not math.isfinite(parsed):
+        return int(default)
+    return max(int(low), min(int(high), int(parsed)))
+
+
+def _backtest_position_limit(strategy: str) -> float:
+    return 2500.0 if str(strategy).upper() in {"TREND", "FUTREND"} else 500.0
+
+
 def simulate_fast(
     indexed: dict,
     all_times: list,
@@ -441,44 +486,65 @@ def simulate_fast(
     RT = calc_round_trip(use_maker, strategy)
     defaults = STRATEGY_DEFAULTS.get(strategy, STRATEGY_DEFAULTS["TREND"])
 
-    leverage = float(p.get("leverage", defaults["leverage"]))
-    min_pump = p.get("min_pump", defaults["pump"])
-    act = p.get("activation_profit", defaults["act"])
-    trail = p.get("trailing_distance", defaults["trail"])
-    stop_loss = p.get("stop_loss", -abs(defaults["stop"]))
-    part_pct = p.get("partial_pct", defaults["part"])
-    rsi_max = p.get("rsi_max", defaults["rsi"])
+    leverage = _bounded_backtest_float(
+        p.get("leverage", defaults["leverage"]),
+        defaults["leverage"],
+        1.0,
+        25.0,
+    )
+    min_pump = _finite_backtest_value(
+        p.get("min_pump", defaults["pump"]), defaults["pump"]
+    )
+    act = _finite_backtest_value(
+        p.get("activation_profit", defaults["act"]), defaults["act"]
+    )
+    trail = _finite_backtest_value(
+        p.get("trailing_distance", defaults["trail"]), defaults["trail"]
+    )
+    default_stop = -abs(defaults["stop"])
+    stop_loss = _finite_backtest_value(p.get("stop_loss", default_stop), default_stop)
+    part_pct = _finite_backtest_value(
+        p.get("partial_pct", defaults["part"]), defaults["part"]
+    )
+    rsi_max = _finite_backtest_value(
+        p.get("rsi_max", defaults["rsi"]), defaults["rsi"]
+    )
     # Breakeven-Trigger spiegelt die Live-Bot-Logik (BREAKEVEN_TRIGGER):
     # Sobald prof >= be_trig wird der Stop auf den Einstieg gezogen  VOR
     # dem Partial-TP. 0 = aus (Default  Backtester verhlt sich wie bisher,
     # break_even kommt dann nur nach dem Partial-TP wie gehabt). So lsst
     # sich Ist (z.B. 2.0) gegen BE=0 sauber vergleichen.
-    be_trig = float(p.get("breakeven_trigger", 0.0))
-    try:
-        funding_8h = float(p.get("funding_rate_8h", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        funding_8h = 0.0
-    try:
-        position_size = float(p.get("position_size", POSITION_SIZE) or POSITION_SIZE)
-    except (TypeError, ValueError):
-        position_size = POSITION_SIZE
-    try:
-        position_size_max = float(p.get("position_size_max", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        position_size_max = 0.0
+    be_trig = _finite_backtest_value(p.get("breakeven_trigger", 0.0), 0.0)
+    funding_8h = _finite_backtest_value(
+        p.get("funding_rate_8h", 0.0) or 0.0, 0.0
+    )
+    position_limit = _backtest_position_limit(strategy)
+    position_size = _bounded_backtest_float(
+        p.get("position_size", POSITION_SIZE) or POSITION_SIZE,
+        POSITION_SIZE,
+        0.01,
+        position_limit,
+    )
+    position_size_max = _bounded_backtest_float(
+        p.get("position_size_max", 0.0) or 0.0,
+        0.0,
+        0.0,
+        position_limit,
+    )
     if position_size_max > 0:
         position_size = min(position_size, position_size_max)
-    position_size = max(0.01, position_size)
-    try:
-        max_open_trades = int(float(p.get("max_open_trades", MAX_OPEN_TRADES)))
-    except (TypeError, ValueError):
-        max_open_trades = MAX_OPEN_TRADES
-    max_open_trades = max(1, max_open_trades)
-    try:
-        top_n_per_scan = int(float(p.get("top_n_per_scan", TOP_N_PER_SCAN)))
-    except (TypeError, ValueError):
-        top_n_per_scan = TOP_N_PER_SCAN
-    top_n_per_scan = max(1, top_n_per_scan)
+    max_open_trades = _bounded_backtest_int(
+        p.get("max_open_trades", MAX_OPEN_TRADES),
+        MAX_OPEN_TRADES,
+        1,
+        50,
+    )
+    top_n_per_scan = _bounded_backtest_int(
+        p.get("top_n_per_scan", TOP_N_PER_SCAN),
+        TOP_N_PER_SCAN,
+        1,
+        50,
+    )
 
     #  Own-momentum overlay (opt-in)  mirrors risk_manager.own_momentum_blocked:
     # block NEW entries while the last `om_window` FULL closes are net-negative,
@@ -491,21 +557,19 @@ def simulate_fast(
         )
 
     om_on = _truthy(p.get("own_momentum_filter", False))
-    try:
-        om_window = int(float(p.get("own_momentum_window", 8) or 8))
-    except (TypeError, ValueError):
-        om_window = 8
-    om_window = max(3, min(50, om_window))
+    om_window = _bounded_backtest_int(
+        p.get("own_momentum_window", 8) or 8,
+        8,
+        3,
+        50,
+    )
 
     #  Macro-regime gate (opt-in)  only go LONG when BTC is above its EMA50
     # (uptrend) and only SHORT when BTC is below it. Momentum-long bleeds in
     # bear regimes; this tests whether "don't fight the macro" creates an edge.
     # Uses BTC's own ema_ratio (price vs EMA50, %) as the trend proxy.
     regime_on = _truthy(p.get("regime_filter", False))
-    try:
-        regime_min = float(p.get("regime_min", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        regime_min = 0.0
+    regime_min = _finite_backtest_value(p.get("regime_min", 0.0) or 0.0, 0.0)
 
     #  Entry-signal reworks ported from the live bot (#2/#3/#5)
     # FUTURES only  these mirror _assess_entry_signal's HARD gates so the
@@ -516,10 +580,7 @@ def simulate_fast(
         return os.getenv(_name, "1").strip().lower() not in ("0", "false", "no", "off")
 
     def _flag_val(_name, _d):
-        try:
-            return float(os.getenv(_name, str(_d)))
-        except (ValueError, TypeError):
-            return _d
+        return _backtest_env_float(_name, _d)
 
     _is_fut = strategy == "FUTURES"
     _ext_on = _is_fut and _flag_on("FUT_EXT_FILTER")

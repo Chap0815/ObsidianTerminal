@@ -8,6 +8,7 @@ import os
 import tempfile
 import time
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -17,6 +18,10 @@ from core.paths import PROJECT_ROOT
 _STATUS_REPLACE_RETRIES = 20
 _STATUS_REPLACE_SLEEP_SEC = 0.10
 _STATUS_MAX_FUTURE_SKEW_SEC = 300.0
+_STATUS_JSON_MAX_BYTES = 2 * 1024 * 1024
+_STATUS_MAX_STRING_CHARS = 4096
+_STATUS_MAX_CONTAINER_ITEMS = 256
+_STATUS_MAX_KEY_CHARS = 256
 
 
 def _log_status_write_failure(context: str, exc: Exception) -> None:
@@ -33,8 +38,11 @@ def _utc_now() -> str:
 
 def _read_json(path: Path) -> dict:
     try:
-        with path.open("r", encoding="utf-8-sig") as fh:
-            data = json.load(fh)
+        with path.open("rb") as fh:
+            raw = fh.read(_STATUS_JSON_MAX_BYTES + 1)
+        if len(raw) > _STATUS_JSON_MAX_BYTES:
+            return {}
+        data = json.loads(raw.decode("utf-8-sig"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -164,8 +172,10 @@ def _strict_json_value(value: Any, *, depth: int = 0) -> Any:
     """Normalize runtime telemetry to interoperable JSON primitives."""
     if depth > 20:
         return None
-    if value is None or isinstance(value, (str, bool)):
+    if value is None or isinstance(value, bool):
         return value
+    if isinstance(value, str):
+        return value[:_STATUS_MAX_STRING_CHARS]
     if isinstance(value, int):
         # Avoid Python's integer-string conversion limit turning one corrupt
         # telemetry counter into a missing heartbeat.
@@ -174,16 +184,22 @@ def _strict_json_value(value: Any, *, depth: int = 0) -> Any:
         return value if math.isfinite(value) else None
     if isinstance(value, Mapping):
         try:
-            return {
-                key: _strict_json_value(item, depth=depth + 1)
-                for key, item in value.items()
-                if isinstance(key, str)
-            }
+            bounded = {}
+            for key, item in islice(
+                value.items(), _STATUS_MAX_CONTAINER_ITEMS
+            ):
+                if not isinstance(key, str) or len(key) > _STATUS_MAX_KEY_CHARS:
+                    continue
+                bounded[key] = _strict_json_value(item, depth=depth + 1)
+            return bounded
         except Exception:
             return None
     if isinstance(value, (list, tuple)):
         try:
-            return [_strict_json_value(item, depth=depth + 1) for item in value]
+            return [
+                _strict_json_value(item, depth=depth + 1)
+                for item in value[:_STATUS_MAX_CONTAINER_ITEMS]
+            ]
         except Exception:
             return None
     return None
@@ -253,12 +269,17 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
             "build_id": build.get("build_id", "unknown"),
             "build_source": build.get("source", "fallback"),
             "build_created_at": build.get("created_at", ""),
-            "threads": _strict_json_value(dict(threads or {})),
+            "threads": _strict_json_value(threads or {}),
         }
         if extra:
-            for key, value in dict(extra).items():
+            normalized_extra = _strict_json_value(extra)
+            for key, value in (
+                normalized_extra.items()
+                if isinstance(normalized_extra, Mapping)
+                else ()
+            ):
                 if isinstance(key, str) and key not in payload:
-                    payload[key] = _strict_json_value(value)
+                    payload[key] = value
 
         fd, tmp_name = tempfile.mkstemp(
             prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))

@@ -44,6 +44,7 @@ LOG_DIR = ROOT / "logs"
 LOG_PATH = LOG_DIR / "update_last.log"
 STATUS_PATH = LOG_DIR / "update_status.json"
 UPDATE_MARKER = ROOT / ".update_in_progress"
+UPDATE_STATUS_JSON_MAX_BYTES = 1024 * 1024
 _UPDATE_LOG_LOCK = threading.Lock()
 
 
@@ -687,7 +688,11 @@ def _run_update() -> int:
 
 def _read_status() -> dict:
     try:
-        data = json.loads(STATUS_PATH.read_text(encoding="utf-8-sig"))
+        with open(STATUS_PATH, "rb") as stream:
+            raw = stream.read(UPDATE_STATUS_JSON_MAX_BYTES + 1)
+        if len(raw) > UPDATE_STATUS_JSON_MAX_BYTES:
+            raise ValueError("update status JSON exceeds size limit")
+        data = json.loads(raw.decode("utf-8-sig"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}

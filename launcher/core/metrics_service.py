@@ -26,12 +26,14 @@ from datetime import datetime, timedelta, timezone
 
 import requests as _req
 
+from bot_utils.config import _read_config_json
 from bot_utils.pnl_view import (
     futures_unrealized_from_row,
     is_futures_state_fresh,
     spot_unrealized_pnl,
 )
 from launcher.config.settings import DB_PATH, OLLAMA_URL
+from news.http_limits import read_bounded_json_response
 
 
 #  Low-level helpers 
@@ -39,13 +41,19 @@ from launcher.config.settings import DB_PATH, OLLAMA_URL
 class MetricsDbReadError(RuntimeError):
     """Raised when an existing launcher metrics DB cannot be read."""
 
+_METRICS_STATE_JSON_MAX_BYTES = 4 * 1024 * 1024
+
+
 def load_json(path: str) -> dict:
     """Best-effort JSON load. Returns ``{}`` on any failure (missing file,
     parse error, empty file)."""
     try:
-        with open(path, encoding="utf-8") as f:
-            d = json.load(f)
-            return d if d else {}
+        with open(path, "rb") as stream:
+            raw = stream.read(_METRICS_STATE_JSON_MAX_BYTES + 1)
+        if len(raw) > _METRICS_STATE_JSON_MAX_BYTES:
+            return {}
+        data = json.loads(raw.decode("utf-8-sig"))
+        return data if data else {}
     except Exception:
         return {}
 
@@ -406,6 +414,41 @@ def get_futures_state_count(bot_name: str = None,
 
 #  LLM (Ollama) availability 
 
+_OLLAMA_PROBE_MAX_BYTES = 2 * 1024 * 1024
+
+
+def read_ollama_model_names(response) -> list[str] | None:
+    reader_closes = False
+    try:
+        if getattr(response, "status_code", None) != 200:
+            return None
+        reader_closes = callable(getattr(response, "iter_content", None))
+        payload = read_bounded_json_response(
+            response,
+            max_bytes=_OLLAMA_PROBE_MAX_BYTES,
+        )
+        if not isinstance(payload, dict):
+            return []
+        models = payload.get("models")
+        if not isinstance(models, list):
+            return []
+        names = []
+        for model in models[:256]:
+            if not isinstance(model, dict):
+                continue
+            name = model.get("name")
+            if isinstance(name, str) and name.strip():
+                names.append(name.strip()[:256])
+        return names
+    finally:
+        closer = getattr(response, "close", None)
+        if callable(closer) and not reader_closes:
+            try:
+                closer()
+            except Exception:
+                pass
+
+
 def get_llm_info() -> dict:
     """Probe Ollama. Reports whether a model is loaded (``/api/ps``) and
     falls back to the installed-model list (``/api/tags``) otherwise.
@@ -419,11 +462,10 @@ def get_llm_info() -> dict:
     """
     configured = _read_configured_model()
     try:
-        r = _req.get(f"{OLLAMA_URL}/api/ps", timeout=1.5)
-        if r.status_code == 200:
-            ps_models = r.json().get("models", [])
-            if ps_models:
-                loaded_names = [m["name"] for m in ps_models]
+        r = _req.get(f"{OLLAMA_URL}/api/ps", timeout=1.5, stream=True)
+        loaded_names = read_ollama_model_names(r)
+        if loaded_names is not None:
+            if loaded_names:
                 # PRIORITY 1: configured model is among the currently
                 # loaded ones  that's authoritative.
                 if configured and configured in loaded_names:
@@ -440,10 +482,9 @@ def get_llm_info() -> dict:
                 return {"online": True, "model": loaded_names[0],
                           "loaded": True}
 
-        r = _req.get(f"{OLLAMA_URL}/api/tags", timeout=1.5)
-        if r.status_code == 200:
-            installed = r.json().get("models", [])
-            installed_names = [m["name"] for m in installed]
+        r = _req.get(f"{OLLAMA_URL}/api/tags", timeout=1.5, stream=True)
+        installed_names = read_ollama_model_names(r)
+        if installed_names is not None:
             if installed_names:
                 # Prefer the configured model when it's installed
                 if configured and configured in installed_names:
@@ -474,12 +515,10 @@ def get_llm_info() -> dict:
 def _read_configured_model() -> str:
     """Read LLM_MODEL from bot_config.json. Empty string when unset."""
     try:
-        import json as _json
         from launcher.config.settings import CONFIG_FILE  # type: ignore
         if not os.path.exists(CONFIG_FILE):
             return ""
-        with open(CONFIG_FILE, encoding="utf-8-sig") as f:
-            cfg = _json.load(f)
+        cfg = _read_config_json(CONFIG_FILE)
         return str(cfg.get("LLM_MODEL", "")).strip()
     except Exception:
         return ""

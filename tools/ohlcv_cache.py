@@ -14,7 +14,9 @@ exchange; never used by live trading.
 """
 import os
 import json
+import math
 import time as _time
+import uuid
 
 import ccxt
 
@@ -22,6 +24,7 @@ _CACHE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "ohlcv_cache")
 
 _TF_MS = {"1h": 3_600_000, "1d": 86_400_000}
+_CACHE_JSON_MAX_BYTES = 50_000_000
 
 # Transient errors worth retrying with backoff (rate limit / DDoS guard / net).
 _RETRY = (ccxt.RateLimitExceeded, ccxt.DDoSProtection, ccxt.NetworkError,
@@ -38,23 +41,50 @@ def _load(symbol: str, timeframe: str):
     if not os.path.exists(p):
         return None
     try:
-        with open(p, "r") as f:
-            bars = json.load(f)
-        return bars if bars else None
+        with open(p, "rb") as f:
+            raw = f.read(_CACHE_JSON_MAX_BYTES + 1)
+        if len(raw) > _CACHE_JSON_MAX_BYTES:
+            return None
+        bars = json.loads(raw.decode("utf-8-sig"))
+        if not isinstance(bars, list) or not bars:
+            return None
+        for bar in bars:
+            if not isinstance(bar, list) or len(bar) < 6:
+                return None
+            timestamp = bar[0]
+            if (
+                isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+                or not math.isfinite(float(timestamp))
+                or float(timestamp) <= 0.0
+            ):
+                return None
+        return bars
     except Exception:
         return None
 
 
 def _save(symbol: str, timeframe: str, bars: list) -> None:
+    tmp = None
     try:
         os.makedirs(_CACHE_DIR, exist_ok=True)
         p = _path(symbol, timeframe)
-        tmp = p + ".tmp"
-        with open(tmp, "w") as f:
+        tmp = f"{p}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        with open(tmp, "x", encoding="utf-8", newline="\n") as f:
             json.dump(bars, f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, p)
     except Exception:
         pass
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
 
 
 def _fetch_ohlcv_backoff(exchange, symbol, timeframe, since, limit, retries=6):
@@ -72,15 +102,66 @@ def _fetch_ohlcv_backoff(exchange, symbol, timeframe, since, limit, retries=6):
     return []
 
 
+def _validated_ohlcv_batch(
+    batch, *, since_ms: int, until_ms: int, limit: int
+) -> list:
+    if not isinstance(batch, (list, tuple)) or len(batch) > max(1, int(limit)):
+        return []
+    valid = []
+    for row in batch:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            continue
+        timestamp = row[0]
+        if isinstance(timestamp, bool):
+            continue
+        try:
+            timestamp_float = float(timestamp)
+            values = [float(row[index]) for index in range(1, 6)]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if (
+            not math.isfinite(timestamp_float)
+            or not timestamp_float.is_integer()
+            or not since_ms <= timestamp_float < until_ms
+            or any(not math.isfinite(value) for value in values)
+            or any(value <= 0.0 for value in values[:4])
+            or values[4] < 0.0
+        ):
+            continue
+        valid.append(row)
+    return sorted(valid, key=lambda row: int(row[0]))
+
+
 def _paginate(exchange, symbol, timeframe, since_ms, until_ms) -> list:
     """Page fetch_ohlcv forward from since_ms to until_ms (rate-limit-safe)."""
+    if timeframe not in _TF_MS:
+        raise ValueError(f"unsupported timeframe {timeframe}")
+    if (
+        isinstance(since_ms, bool)
+        or isinstance(until_ms, bool)
+        or not isinstance(since_ms, (int, float))
+        or not isinstance(until_ms, (int, float))
+        or not math.isfinite(float(since_ms))
+        or not math.isfinite(float(until_ms))
+        or since_ms < 0
+        or until_ms <= since_ms
+    ):
+        return []
     tf_ms = _TF_MS[timeframe]
     rl_sleep = max(0.05, getattr(exchange, "rateLimit", 100) / 1000.0)
     out, since, prev_last = {}, since_ms, None
     span = max(1, int((until_ms - since_ms) // tf_ms))
     max_pages = span // 100 + 8
     for _ in range(max_pages):
-        batch = _fetch_ohlcv_backoff(exchange, symbol, timeframe, since, 1000)
+        raw_batch = _fetch_ohlcv_backoff(
+            exchange, symbol, timeframe, since, 1000
+        )
+        batch = _validated_ohlcv_batch(
+            raw_batch,
+            since_ms=since,
+            until_ms=until_ms,
+            limit=1000,
+        )
         if not batch:
             break
         for c in batch:

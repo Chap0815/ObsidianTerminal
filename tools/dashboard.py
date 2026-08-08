@@ -36,6 +36,7 @@ except UpdateInProgressError as exc:
 
 import streamlit as st
 
+from bot_utils.config import parse_explicit_bool
 from bot_utils.pnl_view import (
     futures_state_age_sec,
     futures_unrealized_from_row,
@@ -99,15 +100,48 @@ except Exception:
     }
 
 
+_DASHBOARD_METADATA_JSON_MAX_BYTES = 2 * 1024 * 1024
+_DASHBOARD_STATE_JSON_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _read_dashboard_json(path: str, max_bytes: int, label: str) -> dict:
+    with open(path, "rb") as stream:
+        raw = stream.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"{label} exceeds size limit")
+    data = json.loads(raw.decode("utf-8-sig"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{label} root must be an object")
+    return data
+
+
+def _read_dashboard_state_json(path: str) -> dict:
+    return _read_dashboard_json(
+        path,
+        _DASHBOARD_STATE_JSON_MAX_BYTES,
+        "dashboard state JSON",
+    )
+
+
+def _validated_dashboard_build_id(value) -> str:
+    if not isinstance(value, str) or len(value) != 16:
+        return ""
+    if any(char not in "0123456789abcdefABCDEF" for char in value):
+        return ""
+    return value
+
+
 def _dashboard_build_id() -> str:
     env_build = os.environ.get("OBSIDIAN_DASHBOARD_BUILD_ID")
     if env_build:
-        return str(env_build)
+        return _validated_dashboard_build_id(env_build)
     try:
-        with open(
-            os.path.join(_PROJECT_ROOT, "DEPLOY_MANIFEST.json"), "r", encoding="utf-8"
-        ) as fh:
-            return str((json.load(fh) or {}).get("build_id") or "")
+        manifest = _read_dashboard_json(
+            os.path.join(_PROJECT_ROOT, "DEPLOY_MANIFEST.json"),
+            _DASHBOARD_METADATA_JSON_MAX_BYTES,
+            "dashboard deploy manifest",
+        )
+        return _validated_dashboard_build_id(manifest.get("build_id"))
     except Exception:
         return ""
 
@@ -187,8 +221,11 @@ def _load_bot_modes() -> dict:
             modes[b] = "LIVE" if b in live else "SIM"
         return modes
     try:
-        with open(_BOT_CONFIG_PATH, "r", encoding="utf-8-sig") as f:
-            cfg = json.load(f)
+        cfg = _read_dashboard_json(
+            _BOT_CONFIG_PATH,
+            _DASHBOARD_METADATA_JSON_MAX_BYTES,
+            "dashboard bot config",
+        )
         for bot in modes:
             # config may be nested per-bot or flat; handle both
             bot_cfg = cfg.get(bot, cfg) if isinstance(cfg, dict) else {}
@@ -196,10 +233,9 @@ def _load_bot_modes() -> dict:
                 "SIMULATION_MODE",
                 bot_cfg.get("SIMULATION", bot_cfg.get("simulation_mode")),
             )
-            if sim is None:
+            is_sim = parse_explicit_bool(sim)
+            if is_sim is None:
                 continue
-            # truthy SIM flag  SIM, else LIVE
-            is_sim = str(sim).strip().lower() in ("1", "true", "yes", "on")
             modes[bot] = "SIM" if is_sim else "LIVE"
     except Exception:
         pass
@@ -760,10 +796,7 @@ def load_futures_live() -> pd.DataFrame:
                 try:
                     if not os.path.exists(path):
                         continue
-                    with open(path, "r", encoding="utf-8-sig") as fh:
-                        state = json.load(fh) or {}
-                    if not isinstance(state, dict):
-                        continue
+                    state = _read_dashboard_state_json(path)
                 except Exception:
                     continue
                 for sym, d in state.items():
@@ -887,8 +920,7 @@ def load_open_spot_trades() -> list:
             state_age_sec = state_file_age_sec(path)
             state_age_warning = not is_state_file_fresh(path)
             try:
-                with open(path, encoding="utf-8") as f:
-                    trades = json.load(f) or {}
+                trades = _read_dashboard_state_json(path)
                 for sym, d in trades.items():
                     if not isinstance(d, dict):
                         continue

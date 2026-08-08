@@ -231,12 +231,14 @@ class WebSocketFeed:
 
     def _start_ws(self, symbols: List[str]) -> None:
         def _run() -> None:
+            completed_normally = False
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
             previous_handler = self._loop.get_exception_handler()
             self._loop.set_exception_handler(self._handle_loop_exception)
             try:
                 self._loop.run_until_complete(self._ws_main(symbols))
+                completed_normally = True
             except Exception as e:
                 try:
                     from core.logger import log_event
@@ -265,6 +267,18 @@ class WebSocketFeed:
                     self._loop.close()
                 except Exception:
                     pass
+                restart_symbols = None
+                with self._start_lock:
+                    self._ws_thread_started = False
+                    # A stop/start can race with the old thread's final exit.
+                    # In that case start() observed the old latch; hand the
+                    # newly active generation a replacement thread here.
+                    if completed_normally and self._running and self._ws_mode:
+                        with self._symbols_lock:
+                            restart_symbols = list(self._symbols)
+                        self._ws_thread_started = True
+                if restart_symbols is not None:
+                    self._start_ws(restart_symbols)
 
         t = threading.Thread(target=_run, name="ws-feed-main", daemon=True)
         self._threads.append(weakref.ref(t))
@@ -415,6 +429,23 @@ class WebSocketFeed:
             t.start()
 
     def _rest_pool_loop(self) -> None:
+        completed_normally = False
+        try:
+            self._rest_pool_session()
+            completed_normally = True
+        finally:
+            self._close_rest_clones()
+            with self._rest_poller_lock:
+                self._rest_thread_started = False
+                restart = (
+                    completed_normally and self._running and not self._ws_mode
+                )
+            # A concurrent start may have seen the old latch while that thread
+            # was still winding down.  Re-check under the poller lock.
+            if restart:
+                self._ensure_rest_poller()
+
+    def _rest_pool_session(self) -> None:
         clones = [_clone_exchange(self._exchange)
                   for _ in range(_MAX_REST_WORKERS)]
         with self._rest_clones_lock:

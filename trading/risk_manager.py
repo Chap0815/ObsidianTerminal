@@ -5,7 +5,6 @@ Config validation, Kelly/volatility position sizing, RSI-threshold and
 bad-hour learning, per-coin blacklisting, self-diagnosis, and the kill-switch
 pipeline (loss streak, API error rate, BTC crash).
 """
-import json
 import math
 import os
 import statistics
@@ -15,6 +14,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import core.constants as C
+from bot_utils.config import _read_config_json
 from core.constants import MarketRegime
 from core.database import (
     get_recent_trades, get_param, get_param_text, set_param,
@@ -150,8 +150,11 @@ def _load_bot_config(bot_name: str) -> dict:
         config_path = "bot_config.json"   # fallback
     try:
         if os.path.exists(config_path):
-            with open(config_path, encoding="utf-8-sig") as f:
-                result = json.load(f).get(bot_name, {})
+            config = _read_config_json(config_path)
+            if isinstance(config, dict):
+                section = config.get(bot_name)
+                if isinstance(section, dict):
+                    result = section
         else:
             # Surface the path in the warn message so the user knows
             # exactly where the bot looked for the file

@@ -22,6 +22,7 @@ from core.models import Position
 
 # Robust coin-key regex: only A-Z0-9, 2-15 chars
 _COIN_RE = re.compile(r"^[A-Z0-9]{2,15}$")
+_STATE_JSON_MAX_BYTES = 4 * 1024 * 1024
 
 # Assets that are NEVER bot positions  the quote currency (USDT cash),
 # stablecoins, and exchange tokens (MEXC's MX) held in the account. Without
@@ -148,22 +149,52 @@ class _SingleWriterJSON:
             if item is None:
                 continue
             rev, payload = item
-            with self._cv:
-                if rev < self._floor_rev:
-                    continue
-            try:
-                with self._write_lock:
-                    with self._cv:
-                        if rev < self._floor_rev:
-                            continue
-                    self._write_atomic(payload)
-            except Exception as e:
+            retry_delay = 0.1
+            last_warning_at = 0.0
+            while not self._stop:
+                with self._cv:
+                    if rev < self._floor_rev:
+                        break
+                    pending = self._latest
+                    # A same/newer complete snapshot supersedes this failed
+                    # attempt. The outer loop will persist that generation.
+                    if pending is not None and pending[0] >= rev:
+                        break
                 try:
-                    from core.logger import log_event
-                    log_event(f"[StateManager] JSON write failed for "
-                              f"{self.path}: {e}", "WARN")
-                except Exception:
-                    pass
+                    with self._write_lock:
+                        with self._cv:
+                            if rev < self._floor_rev:
+                                break
+                        self._write_atomic(payload)
+                    # Once a revision is durable, a late older submit must not
+                    # be able to overwrite it.
+                    with self._cv:
+                        self._floor_rev = max(self._floor_rev, rev)
+                    break
+                except Exception as e:
+                    now = time.monotonic()
+                    if last_warning_at == 0.0 or now - last_warning_at >= 60.0:
+                        last_warning_at = now
+                        try:
+                            from core.logger import log_event
+                            log_event(
+                                f"[StateManager] JSON write failed for "
+                                f"{self.path}: {e}; retrying",
+                                "WARN",
+                            )
+                        except Exception:
+                            pass
+                    # Keep the latest full snapshot alive across transient
+                    # Windows reader locks/disk contention. Condition.wait()
+                    # wakes immediately for a newer submit or shutdown.
+                    with self._cv:
+                        if self._stop or rev < self._floor_rev:
+                            break
+                        pending = self._latest
+                        if pending is not None and pending[0] >= rev:
+                            break
+                        self._cv.wait(timeout=retry_delay)
+                    retry_delay = min(2.0, retry_delay * 2.0)
 
     def _write_atomic(self, payload: dict) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
@@ -191,9 +222,10 @@ class _SingleWriterJSON:
                     return
                 except PermissionError:
                     time.sleep(0.05)
-            # All retries exhausted  surface it so _run logs a WARN instead of
-            # silently dropping this snapshot (the next submit re-writes the full
-            # state, so the mirror self-heals once contention clears).
+            # All retries exhausted: surface the error to the single writer,
+            # which keeps the latest complete snapshot queued for bounded,
+            # rate-limited retry until contention clears or a newer revision
+            # supersedes it.
             raise OSError(
                 f"os.replace failed after 8 retries for {self.path}")
         finally:
@@ -721,8 +753,11 @@ class StateManager:
         if not os.path.exists(self.json_path):
             return {}
         try:
-            with open(self.json_path, "r", encoding="utf-8-sig") as fh:
-                data = json.load(fh)
+            with open(self.json_path, "rb") as fh:
+                raw = fh.read(_STATE_JSON_MAX_BYTES + 1)
+            if len(raw) > _STATE_JSON_MAX_BYTES:
+                raise ValueError("state JSON exceeds size limit")
+            data = json.loads(raw.decode("utf-8-sig"))
             return data if isinstance(data, dict) else {}
         except json.JSONDecodeError as e:
             backup = self.json_path + ".corrupted"

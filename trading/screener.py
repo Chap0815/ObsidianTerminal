@@ -111,6 +111,7 @@ _fail_cache: dict = {}
 
 # Debounced disk writes
 _FAIL_CACHE_PERSIST_INTERVAL = 30.0
+_FAIL_CACHE_JSON_MAX_BYTES = 2 * 1024 * 1024
 _fail_cache_dirty = False
 _fail_cache_last_persist = 0.0
 
@@ -140,13 +141,21 @@ def _validated_fail_cache(raw, now: float) -> dict:
     return clean
 
 
+def _read_fail_cache(now: float) -> dict:
+    with open(_FAIL_CACHE_FILE, "rb") as fh:
+        raw = fh.read(_FAIL_CACHE_JSON_MAX_BYTES + 1)
+    if len(raw) > _FAIL_CACHE_JSON_MAX_BYTES:
+        raise ValueError("indicator failure JSON exceeds size limit")
+    return _validated_fail_cache(
+        _json.loads(raw.decode("utf-8-sig")), now
+    )
+
+
 def _load_fail_cache():
     global _fail_cache
     try:
         if os.path.exists(_FAIL_CACHE_FILE):
-            with open(_FAIL_CACHE_FILE, "r", encoding="utf-8") as f:
-                raw = _json.load(f)
-            _fail_cache = _validated_fail_cache(raw, time.time())
+            _fail_cache = _read_fail_cache(time.time())
     except Exception:
         _fail_cache = {}
 
@@ -171,14 +180,7 @@ def _save_fail_cache_locked(force: bool = False):
             disk_cache = {}
             try:
                 if os.path.exists(_FAIL_CACHE_FILE):
-                    with open(
-                        _FAIL_CACHE_FILE,
-                        "r",
-                        encoding="utf-8-sig",
-                    ) as f:
-                        disk_cache = _validated_fail_cache(
-                            _json.load(f), now
-                        )
+                    disk_cache = _read_fail_cache(now)
             except Exception:
                 disk_cache = {}
 

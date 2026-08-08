@@ -93,6 +93,17 @@ LIVE_STATUSES = {"starting", "started", "ready", "running", "degraded"}
 UPDATE_MARKER = ROOT / ".update_in_progress"
 UPDATE_SYNC_PATH = ROOT / ".update_synced.json"
 UPDATE_STATUS_PATH = ROOT / "logs" / "update_status.json"
+UPDATE_CONFIG_JSON_MAX_BYTES = 1024 * 1024
+UPDATE_MARKER_MAX_BYTES = 64 * 1024
+DEPLOY_MANIFEST_JSON_MAX_BYTES = 4 * 1024 * 1024
+APP_SNAPSHOT_MANIFEST_MAX_BYTES = 4 * 1024 * 1024
+RUNTIME_SNAPSHOT_MANIFEST_MAX_BYTES = 32 * 1024 * 1024
+RUNTIME_STATUS_FALLBACK_JSON_MAX_BYTES = 2 * 1024 * 1024
+PINNED_KNOWN_HOSTS_MAX_BYTES = 16 * 1024
+PINNED_KNOWN_HOSTS_SHA256 = (
+    "ba69972348dbe13a16aaeed854523c8c78bdeb0e04cbcc13c5fadf8e820cecdf"
+)
+REQUIREMENTS_LOCK_MAX_BYTES = 1024 * 1024
 SMOKE_FILES = UPDATE_SMOKE_FILES
 BLOCKED_TRACKED_PREFIXES = ("data/", "logs/", "backups/")
 SNAPSHOT_COMPLETE = ".snapshot_complete"
@@ -300,7 +311,14 @@ def _runtime_known_hosts() -> Path:
         "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
     )
     try:
-        text = PINNED_KNOWN_HOSTS_PATH.read_text(encoding="utf-8-sig")
+        raw = _read_bounded_file_bytes(
+            PINNED_KNOWN_HOSTS_PATH,
+            PINNED_KNOWN_HOSTS_MAX_BYTES,
+            "pinned known-hosts file",
+        )
+        if hashlib.sha256(raw).hexdigest() != PINNED_KNOWN_HOSTS_SHA256:
+            raise ValueError("pinned known-hosts file hash mismatch")
+        text = raw.decode("utf-8-sig")
     except Exception:
         text = fallback
     if "[ssh.github.com]:443" not in text:
@@ -408,7 +426,13 @@ def _load_update_config() -> tuple[str, str]:
     branch = env_branch or "main"
     if CONFIG_PATH.exists():
         try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+            data = json.loads(
+                _read_bounded_file_bytes(
+                    CONFIG_PATH,
+                    UPDATE_CONFIG_JSON_MAX_BYTES,
+                    "update config",
+                ).decode("utf-8-sig")
+            )
             repo = repo or str(data.get("repo_url") or "").strip()
             branch = env_branch or str(data.get("branch") or branch or "main").strip()
         except Exception as exc:
@@ -443,6 +467,26 @@ def _load_update_config() -> tuple[str, str]:
             "aus Buchstaben, Zahlen, Punkt, Unterstrich, Bindestrich und Slash."
         )
     return repo, branch or "main"
+
+
+def _read_bounded_file_bytes(path: Path, max_bytes: int, label: str) -> bytes:
+    with open(path, "rb") as stream:
+        raw = stream.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"{label} exceeds size limit")
+    return raw
+
+
+def _read_bounded_json_file(
+    path: Path,
+    max_bytes: int,
+    label: str,
+    *,
+    encoding: str,
+):
+    return json.loads(
+        _read_bounded_file_bytes(path, max_bytes, label).decode(encoding)
+    )
 
 
 def _is_valid_branch_name(branch: str) -> bool:
@@ -510,6 +554,18 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _read_runtime_status_fallback(path: Path) -> dict[str, Any]:
+    data = _read_bounded_json_file(
+        path,
+        RUNTIME_STATUS_FALLBACK_JSON_MAX_BYTES,
+        "runtime status fallback",
+        encoding="utf-8-sig",
+    )
+    if not isinstance(data, dict):
+        raise ValueError("runtime status fallback root must be an object")
+    return data
+
+
 def _running_bots() -> list[str]:
     out: list[str] = []
     logs = ROOT / "logs"
@@ -525,7 +581,7 @@ def _running_bots() -> list[str]:
                 if read_runtime_status_with_path is not None:
                     data, status_path = read_runtime_status_with_path(path.parent)
                 else:
-                    data = json.loads(path.read_text(encoding="utf-8-sig"))
+                    data = _read_runtime_status_fallback(path)
             except Exception:
                 continue
             try:
@@ -552,7 +608,7 @@ def _running_bots() -> list[str]:
                 if read_runtime_status_with_path is not None:
                     data, status_path = read_runtime_status_with_path(path.parent)
                 else:
-                    data = json.loads(path.read_text(encoding="utf-8-sig"))
+                    data = _read_runtime_status_fallback(path)
             except Exception:
                 continue
             try:
@@ -1609,12 +1665,23 @@ def _runtime_env_in_use_via_cim(path: Path) -> bool:
 def _requirements_hash(path: Path) -> str:
     if not path.exists():
         return ""
-    return _requirements_text_hash(path.read_text(encoding="utf-8-sig"))
+    raw = _read_bounded_file_bytes(
+        path,
+        REQUIREMENTS_LOCK_MAX_BYTES,
+        "requirements.lock.txt",
+    )
+    return _requirements_text_hash(raw.decode("utf-8-sig"))
 
 
 def _requirements_text_hash(text: str) -> str:
     normalized = "\n".join((text or "").splitlines())
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    encoded = normalized.encode("utf-8")
+    if len(encoded) > REQUIREMENTS_LOCK_MAX_BYTES:
+        raise RuntimeError(
+            "requirements.lock.txt exceeds size limit "
+            f"({REQUIREMENTS_LOCK_MAX_BYTES} bytes)"
+        )
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _dependency_update_needed(new_hash: str) -> bool:
@@ -1627,7 +1694,20 @@ def _dependency_update_needed_from_path(path: Path) -> bool:
 
 
 def _dependency_update_needed_from_ref(git: str, ref: str) -> bool:
-    r = _run([git, "show", f"{ref}:requirements.lock.txt"], check=False)
+    object_ref = f"{ref}:requirements.lock.txt"
+    size_result = _run([git, "cat-file", "-s", object_ref], check=False)
+    if size_result.returncode != 0:
+        return False
+    try:
+        object_size = int((size_result.stdout or "").strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("requirements.lock.txt object size is malformed") from exc
+    if object_size < 0 or object_size > REQUIREMENTS_LOCK_MAX_BYTES:
+        raise RuntimeError(
+            "requirements.lock.txt exceeds size limit "
+            f"({REQUIREMENTS_LOCK_MAX_BYTES} bytes)"
+        )
+    r = _run([git, "show", object_ref], check=False)
     if r.returncode == 0:
         return _dependency_update_needed(_requirements_text_hash(r.stdout or ""))
     return False
@@ -1703,12 +1783,17 @@ def _restore_runtime_env(snapshot: Path | None) -> bool:
             and marker.is_file()
         )
         if complete:
-            candidate = json.loads(marker.read_text(encoding="ascii"))
+            candidate = _read_bounded_json_file(
+                marker,
+                RUNTIME_SNAPSHOT_MANIFEST_MAX_BYTES,
+                "runtime snapshot manifest",
+                encoding="ascii",
+            )
             if isinstance(candidate, dict):
                 manifest = candidate
             else:
                 complete = False
-    except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError):
+    except (OSError, UnicodeError, ValueError, RuntimeError):
         complete = False
     if not complete or manifest is None:
         _print("Runtime rollback skipped: no complete runtime snapshot exists.")
@@ -1832,6 +1917,14 @@ def _marker_payload(kind: str, owner: str | None = None) -> dict[str, Any]:
     return payload
 
 
+def _read_update_marker_bytes() -> bytes:
+    return _read_bounded_file_bytes(
+        UPDATE_MARKER,
+        UPDATE_MARKER_MAX_BYTES,
+        "update marker",
+    )
+
+
 def _claim_update_marker(*, force: bool) -> _UpdateMarkerClaim:
     owner = uuid.uuid4().hex
     if update_marker_exists(UPDATE_MARKER.parent):
@@ -1842,8 +1935,8 @@ def _claim_update_marker(*, force: bool) -> _UpdateMarkerClaim:
                 "Nur fuer Support/Debugging den Updater manuell mit --force starten."
             )
         try:
-            original = UPDATE_MARKER.read_bytes()
-        except OSError as exc:
+            original = _read_update_marker_bytes()
+        except (OSError, ValueError) as exc:
             raise RuntimeError("Vorhandener Update-Marker ist nicht sicher lesbar.") from exc
         return _UpdateMarkerClaim(owner=owner, created=False, original=original)
 
@@ -1867,7 +1960,7 @@ def _claim_update_marker(*, force: bool) -> _UpdateMarkerClaim:
 
 def _read_update_marker() -> dict[str, Any] | None:
     try:
-        data = json.loads(UPDATE_MARKER.read_text(encoding="utf-8"))
+        data = json.loads(_read_update_marker_bytes().decode("utf-8"))
     except (OSError, ValueError, TypeError):
         return None
     return data if isinstance(data, dict) else None
@@ -1889,9 +1982,9 @@ def _clear_update_marker(
 ) -> bool:
     if expected_bytes is not None:
         try:
-            if UPDATE_MARKER.read_bytes() != expected_bytes:
+            if _read_update_marker_bytes() != expected_bytes:
                 return False
-        except OSError:
+        except (OSError, ValueError):
             return False
     if expected_owner is not None or expected_kind is not None:
         data = _read_update_marker()
@@ -1959,7 +2052,12 @@ def _verify_deploy_manifest_hashes() -> None:
     if not manifest_path.exists():
         raise RuntimeError("Update unvollstaendig, DEPLOY_MANIFEST.json fehlt")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        manifest = _read_bounded_json_file(
+            manifest_path,
+            DEPLOY_MANIFEST_JSON_MAX_BYTES,
+            "deploy manifest",
+            encoding="utf-8-sig",
+        )
     except Exception as exc:
         raise RuntimeError(f"Update-Manifest konnte nicht gelesen werden: {exc}") from exc
     files = manifest.get("files")
@@ -2266,7 +2364,12 @@ def _release_manifest_paths(src_repo: Path) -> set[str]:
     if not manifest_path.exists():
         raise RuntimeError("Update-Repo enthaelt kein DEPLOY_MANIFEST.json")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        manifest = _read_bounded_json_file(
+            manifest_path,
+            DEPLOY_MANIFEST_JSON_MAX_BYTES,
+            "deploy manifest",
+            encoding="utf-8-sig",
+        )
     except Exception as exc:
         raise RuntimeError(f"Update-Manifest konnte nicht gelesen werden: {exc}") from exc
     return _manifest_paths_from_items(
@@ -2664,12 +2767,17 @@ def _restore_app_snapshot(snapshot: Path) -> bool:
             and marker.is_file()
         )
         if complete:
-            candidate = json.loads(marker.read_text(encoding="ascii"))
+            candidate = _read_bounded_json_file(
+                marker,
+                APP_SNAPSHOT_MANIFEST_MAX_BYTES,
+                "app snapshot manifest",
+                encoding="ascii",
+            )
             if isinstance(candidate, dict):
                 manifest = candidate
             else:
                 complete = False
-    except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError):
+    except (OSError, UnicodeError, ValueError, RuntimeError):
         complete = False
     if not complete or manifest is None:
         _print("Rollback skipped: no complete app snapshot exists.")
@@ -2996,8 +3104,8 @@ def main(argv: list[str] | None = None) -> int:
                     _bootstrap_from_private_repo(repo_url, branch, **update_kwargs)
                 if not claim.created and update_marker_exists(UPDATE_MARKER.parent):
                     try:
-                        marker_unchanged = UPDATE_MARKER.read_bytes() == claim.original
-                    except OSError as exc:
+                        marker_unchanged = _read_update_marker_bytes() == claim.original
+                    except (OSError, ValueError) as exc:
                         raise RuntimeError(
                             "Update-Recovery-Marker ist nach dem Update nicht sicher lesbar."
                         ) from exc

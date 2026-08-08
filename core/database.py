@@ -433,18 +433,29 @@ _conn_local = threading.local()
 _tight_conn_local = threading.local()
 
 
+def _close_failed_connection_init(conn: sqlite3.Connection) -> None:
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 def get_connection() -> sqlite3.Connection:
     conn = getattr(_conn_local, "conn", None)
     if conn is not None:
         return conn
     conn = sqlite3.connect(DB_PATH, timeout=20.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=20000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA cache_size=-20000")
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=20000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-20000")
+    except BaseException:
+        _close_failed_connection_init(conn)
+        raise
     _conn_local.conn = conn
     return conn
 
@@ -479,10 +490,14 @@ def _tight_connection() -> sqlite3.Connection:
     if conn is not None:
         return conn
     conn = sqlite3.connect(DB_PATH, timeout=API_RATE_DB_TIMEOUT_SEC)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute(f"PRAGMA busy_timeout={int(API_RATE_DB_TIMEOUT_SEC*1000)}")
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(f"PRAGMA busy_timeout={int(API_RATE_DB_TIMEOUT_SEC*1000)}")
+    except BaseException:
+        _close_failed_connection_init(conn)
+        raise
     _tight_conn_local.conn = conn
     return conn
 
@@ -5211,6 +5226,7 @@ def register_experiment_trial(
         payload = json.dumps(params, sort_keys=True, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise ValueError("experiment params must be finite JSON") from exc
+    conn = None
     try:
         conn = get_connection()
         conn.execute(
@@ -5221,7 +5237,19 @@ def register_experiment_trial(
         )
         conn.commit()
     except sqlite3.IntegrityError as exc:
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
         raise ValueError("experiment trial ids are immutable and unique") from exc
+    except Exception:
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
+        raise
 
 
 def list_experiment_trials(experiment_name: str | None = None) -> list[dict]:

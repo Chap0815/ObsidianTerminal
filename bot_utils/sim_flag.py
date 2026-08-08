@@ -14,6 +14,8 @@ import json
 import os
 from typing import Any, Optional
 
+from bot_utils.config import _read_config_json
+
 
 class CorruptConfigError(Exception):
     """Raised when bot_config.json exists but cannot be parsed."""
@@ -111,12 +113,15 @@ def read_simulation_flag(bot_name: str,
 
     if cfg_path is not None:
         try:
-            with open(str(cfg_path), encoding="utf-8-sig") as fh:
-                cfg = json.load(fh)
+            cfg = _read_config_json(str(cfg_path))
+            if not isinstance(cfg, dict):
+                raise ValueError("bot_config.json root must be an object")
+            if bot_name in cfg and not isinstance(cfg[bot_name], dict):
+                raise ValueError(f"{bot_name} config section must be an object")
         except FileNotFoundError:
             # No config file  fine, fall through to env
             cfg = None
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError) as e:
             # corrupt config is NOT a soft failure
             msg = (f"bot_config.json corrupt or unreadable: "
                     f"{type(e).__name__}: {e}. Refusing to fall back "
@@ -148,7 +153,7 @@ def read_simulation_flag(bot_name: str,
                 ) from e
             cfg = None
 
-        if isinstance(cfg, dict):
+        if cfg is not None:
             section = cfg.get(bot_name, {})
             raw_value = _find_simulation_value(section)
             coerced = _to_bool(raw_value)

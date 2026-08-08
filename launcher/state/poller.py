@@ -14,12 +14,12 @@ itself runs at ~1.5 s with per-source throttling:
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import threading
 import time
 
+from bot_utils.config import _read_config_json
 from launcher.config.settings import BOT_META, BOT_ORDER, CONFIG_FILE
 from launcher.core.runtime_status_values import (
     finite_float_or_none,
@@ -51,6 +51,26 @@ def _safe_error_text(exc: BaseException, limit: int = 200) -> str:
     except Exception:
         rendered = f"<unrenderable {type(exc).__name__}>"
     return rendered.replace("\r", " ").replace("\n", " ")[:max(0, limit)]
+
+
+def _close_exchange_quietly(exchange) -> None:
+    """Best-effort close for synchronous CCXT clients."""
+    if exchange is None:
+        return
+    try:
+        close = getattr(exchange, "close", None)
+        if callable(close):
+            close()
+            return
+    except Exception:
+        pass
+    try:
+        session = getattr(exchange, "session", None)
+        close = getattr(session, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
 
 
 def _pid_alive(pid: int) -> bool:
@@ -106,8 +126,7 @@ def _runtime_or_config_sim(bot: str, cfg: dict | None = None) -> bool:
         pass
     try:
         if cfg is None and os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r", encoding="utf-8-sig") as fh:
-                cfg = json.load(fh)
+            cfg = _read_config_json(CONFIG_FILE)
         if isinstance(cfg, dict):
             return bool(cfg.get(bot, {}).get("SIMULATION", True))
     except Exception:
@@ -129,6 +148,7 @@ class _ErrorLogCounter:
     """
     SEPARATOR = "=" * 20
     SEPARATOR_BYTES = SEPARATOR.encode("ascii")
+    READ_CHUNK_BYTES = 64 * 1024
 
     def __init__(self, path: str = "error_log.txt"):
         self.path = path
@@ -136,6 +156,37 @@ class _ErrorLogCounter:
         self._cached_count = 0
         self._cached_file_id: tuple[int, int] | None = None
         self._cached_mtime_ns = 0
+
+    def _count_range(self, start: int, length: int) -> int:
+        separator = self.SEPARATOR_BYTES
+        separator_len = len(separator)
+        remaining = max(0, int(length))
+        count = 0
+        pending = b""
+        with open(self.path, "rb") as stream:
+            stream.seek(max(0, int(start)))
+            while remaining > 0:
+                chunk = stream.read(min(self.READ_CHUNK_BYTES, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                pending += chunk
+                safe_start_limit = len(pending) - separator_len + 1
+                search_at = 0
+                consumed = 0
+                while safe_start_limit > 0:
+                    match_at = pending.find(separator, search_at)
+                    if match_at < 0 or match_at >= safe_start_limit:
+                        break
+                    count += 1
+                    search_at = match_at + separator_len
+                    consumed = search_at
+                discard = max(
+                    consumed,
+                    max(0, len(pending) - (separator_len - 1)),
+                )
+                pending = pending[discard:]
+        return count
 
     def count(self) -> int:
         import os as _os
@@ -172,9 +223,7 @@ class _ErrorLogCounter:
         if replaced or cur_size < self._cached_size or same_size_rewritten:
             # Rotated, truncated, or rewritten in place  recount from scratch.
             try:
-                with open(self.path, "rb") as f:
-                    content = f.read(cur_size)
-                self._cached_count = content.count(self.SEPARATOR_BYTES)
+                self._cached_count = self._count_range(0, cur_size)
                 self._cached_size = cur_size
                 self._cached_file_id = file_id
                 self._cached_mtime_ns = mtime_ns
@@ -198,14 +247,15 @@ class _ErrorLogCounter:
         try:
             # File sizes and seek offsets are bytes. Binary reads keep those
             # units consistent and cannot land inside a UTF-8 code point.
-            with open(self.path, "rb") as f:
-                f.seek(delta_start)
-                tail = f.read(cur_size - delta_start)
-            new_seps = tail.count(self.SEPARATOR_BYTES)
+            new_seps = self._count_range(
+                delta_start, cur_size - delta_start
+            )
             # Subtract separators already counted in the overlap region.
             if delta_start < self._cached_size:
-                overlap     = tail[:self._cached_size - delta_start]
-                new_seps   -= overlap.count(self.SEPARATOR_BYTES)
+                overlap_count = self._count_range(
+                    delta_start, self._cached_size - delta_start
+                )
+                new_seps = max(0, new_seps - overlap_count)
             self._cached_count += new_seps
             self._cached_size   = cur_size
             self._cached_file_id = file_id
@@ -257,7 +307,10 @@ class DataPoller:
         self._diag_seen: dict[str, float] = {}
         self._availability_states: dict[str, bool] = {}
 
-        self._spot_exchange   = None   # cached connection for unrealized fetch
+        self._exchange_lock = threading.Lock()
+        self._spot_exchange = None  # cached connection for unrealized fetch
+        self._equity_spot_exchange = None
+        self._equity_futures_exchange = None
         self._error_counter   = _ErrorLogCounter("error_log.txt")
         self._thread = threading.Thread(
             target=self._loop,
@@ -302,6 +355,33 @@ class DataPoller:
         if previous is not False:
             self._log_diag(unavailable_message)
 
+    def _get_cached_exchange(self, attr: str, factory):
+        """Return one owned client, closing a late creation during shutdown."""
+        with self._exchange_lock:
+            current = getattr(self, attr, None)
+            if current is not None:
+                return current
+            if not self.running:
+                raise RuntimeError("data poller is stopping")
+
+        candidate = factory()
+        with self._exchange_lock:
+            current = getattr(self, attr, None)
+            if current is None and self.running:
+                setattr(self, attr, candidate)
+                return candidate
+
+        _close_exchange_quietly(candidate)
+        if current is not None:
+            return current
+        raise RuntimeError("data poller stopped while creating exchange client")
+
+    def _discard_exchange(self, attr: str) -> None:
+        with self._exchange_lock:
+            exchange = getattr(self, attr, None)
+            setattr(self, attr, None)
+        _close_exchange_quietly(exchange)
+
     #  Main loop 
 
     def _loop(self) -> None:
@@ -328,8 +408,7 @@ class DataPoller:
                 cfg_snapshot = None
                 try:
                     if os.path.exists(CONFIG_FILE):
-                        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as fh:
-                            cfg_snapshot = json.load(fh)
+                        cfg_snapshot = _read_config_json(CONFIG_FILE)
                 except Exception:
                     cfg_snapshot = None
                 mode_is_sim = {
@@ -422,18 +501,20 @@ class DataPoller:
                     # SPOT bots: live ticker prices (one batch call per bot)
                     for spot_bot in ("TREND", "SPOT"):
                         try:
-                            if self._spot_exchange is None:
-                                from config.exchange_config import get_spot_exchange_connection  # type: ignore
-                                self._spot_exchange = get_spot_exchange_connection()
+                            from config.exchange_config import get_spot_exchange_connection  # type: ignore
+                            spot_exchange = self._get_cached_exchange(
+                                "_spot_exchange",
+                                get_spot_exchange_connection,
+                            )
                             unr[spot_bot] = get_unrealized_pnl_spot(
                                 BOT_META[spot_bot]["log_dir"],
-                                self._spot_exchange,
+                                spot_exchange,
                                 bot_name=spot_bot,
                                 mode_is_sim=mode_is_sim[spot_bot],
                             )
                         except Exception:
                             # Reset connection so the next cycle tries a fresh one
-                            self._spot_exchange = None
+                            self._discard_exchange("_spot_exchange")
                             unr[spot_bot] = self.cache.get("unrealized", {}).get(spot_bot, 0.0)
                     new_data["unrealized"] = unr
                     self._unrealized_next = now + 15.0
@@ -560,7 +641,10 @@ class DataPoller:
                             if live_spot:
                                 try:
                                     from config.exchange_config import get_exchange_connection  # type: ignore
-                                    ex_spot = get_exchange_connection()
+                                    ex_spot = self._get_cached_exchange(
+                                        "_equity_spot_exchange",
+                                        get_exchange_connection,
+                                    )
                                     if _HAS_EQUITY_UTILS:
                                         spot_equity = compute_spot_equity(ex_spot)
                                     else:
@@ -572,6 +656,9 @@ class DataPoller:
                                             "source": "free-only (legacy)",
                                         }
                                     if spot_equity is None:
+                                        self._discard_exchange(
+                                            "_equity_spot_exchange"
+                                        )
                                         # compute_spot_equity returns None on
                                         # API failure  log so the user can
                                         # see WHY the dashboard shows ''
@@ -586,6 +673,9 @@ class DataPoller:
                                             "spot_equity", True, ""
                                         )
                                 except Exception as _e_spot:
+                                    self._discard_exchange(
+                                        "_equity_spot_exchange"
+                                    )
                                     spot_equity = None
                                     self._set_availability(
                                         "spot_equity",
@@ -593,11 +683,18 @@ class DataPoller:
                                         f"spot equity: {type(_e_spot).__name__}: "
                                         f"{_safe_error_text(_e_spot)}",
                                     )
+                            else:
+                                self._discard_exchange(
+                                    "_equity_spot_exchange"
+                                )
 
                             if live_futures:
                                 try:
                                     from config.exchange_config import get_futures_exchange_connection  # type: ignore
-                                    ex_fut = get_futures_exchange_connection()
+                                    ex_fut = self._get_cached_exchange(
+                                        "_equity_futures_exchange",
+                                        get_futures_exchange_connection,
+                                    )
                                     if _HAS_EQUITY_UTILS:
                                         futures_equity = compute_futures_equity(ex_fut)
                                     else:
@@ -609,6 +706,9 @@ class DataPoller:
                                             "source": "free-only (legacy)",
                                         }
                                     if futures_equity is None:
+                                        self._discard_exchange(
+                                            "_equity_futures_exchange"
+                                        )
                                         self._set_availability(
                                             "futures_equity",
                                             False,
@@ -620,6 +720,9 @@ class DataPoller:
                                             "futures_equity", True, ""
                                         )
                                 except Exception as _e_fut:
+                                    self._discard_exchange(
+                                        "_equity_futures_exchange"
+                                    )
                                     futures_equity = None
                                     self._set_availability(
                                         "futures_equity",
@@ -627,6 +730,10 @@ class DataPoller:
                                         f"futures equity: {type(_e_fut).__name__}: "
                                         f"{_safe_error_text(_e_fut)}",
                                     )
+                            else:
+                                self._discard_exchange(
+                                    "_equity_futures_exchange"
+                                )
 
                             # Format strings for the sidebar.
                             # The headline number is the EQUITY (free + in
@@ -675,6 +782,10 @@ class DataPoller:
                                 # Both sides failed  surface this clearly
                                 new_data["balance_live"] = ""
                         else:
+                            self._discard_exchange("_equity_spot_exchange")
+                            self._discard_exchange(
+                                "_equity_futures_exchange"
+                            )
                             new_data["balance_live"]  = ""
                             new_data["balance_live_spot"]  = ""
                             new_data["balance_live_futures"] = ""
@@ -735,10 +846,15 @@ class DataPoller:
         self.running = False
         self._stop_event.set()
         thread = getattr(self, "_thread", None)
-        if thread is None or thread is threading.current_thread():
-            return
-        try:
-            if thread.is_alive():
-                thread.join(timeout=2.0)
-        except Exception:
-            pass
+        if thread is not None and thread is not threading.current_thread():
+            try:
+                if thread.is_alive():
+                    thread.join(timeout=2.0)
+            except Exception:
+                pass
+        for attr in (
+            "_spot_exchange",
+            "_equity_spot_exchange",
+            "_equity_futures_exchange",
+        ):
+            self._discard_exchange(attr)

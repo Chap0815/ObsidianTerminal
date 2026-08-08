@@ -5,6 +5,8 @@ import hashlib
 import math
 import threading
 import time
+import weakref
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Mapping, Sequence
 
@@ -13,7 +15,14 @@ from bot_utils.silent_log import silent_log
 
 
 _MEXC_FEE_TRUTH_LOCK = threading.Lock()
-_MEXC_FEE_TRUTHS: dict[tuple[int, str], FeeTruth] = {}
+_MEXC_FEE_TRUTHS: weakref.WeakKeyDictionary[
+    object, OrderedDict[str, FeeTruth]
+] = weakref.WeakKeyDictionary()
+_MEXC_FEE_TRUTH_FALLBACK: OrderedDict[
+    tuple[int, str], FeeTruth
+] = OrderedDict()
+_MEXC_FEE_TRUTH_FALLBACK_MAX = 512
+_MEXC_FEE_TRUTH_PER_EXCHANGE_MAX = 512
 
 
 def _finite_or_none(value) -> float | None:
@@ -189,15 +198,56 @@ def _mexc_private_fee_loader(exchange, symbol: str) -> dict[str, float] | None:
 
 def mexc_private_fee_quote(exchange, symbol: str, liquidity: str) -> FeeQuote:
     """Resolve MEXC account-tier fees with a conservative cached fallback."""
-    key = (id(exchange), str(symbol))
+    normalized_symbol = str(symbol)
     with _MEXC_FEE_TRUTH_LOCK:
-        truth = _MEXC_FEE_TRUTHS.get(key)
-        if truth is None:
-            truth = FeeTruth(
-                lambda: _mexc_private_fee_loader(exchange, symbol),
-                fallback_rate=0.001,
-            )
-            _MEXC_FEE_TRUTHS[key] = truth
+        try:
+            exchange_ref = weakref.ref(exchange)
+            hash(exchange)
+        except TypeError:
+            # Exotic extension/proxy objects may not support weak references
+            # or hashing. Preserve caching for them, but bound strong ownership
+            # so reconnect churn cannot grow process memory indefinitely.
+            key = (id(exchange), normalized_symbol)
+            truth = _MEXC_FEE_TRUTH_FALLBACK.get(key)
+            if truth is None:
+                truth = FeeTruth(
+                    lambda: _mexc_private_fee_loader(
+                        exchange, normalized_symbol
+                    ),
+                    fallback_rate=0.001,
+                )
+                _MEXC_FEE_TRUTH_FALLBACK[key] = truth
+                while (
+                    len(_MEXC_FEE_TRUTH_FALLBACK)
+                    > _MEXC_FEE_TRUTH_FALLBACK_MAX
+                ):
+                    _MEXC_FEE_TRUTH_FALLBACK.popitem(last=False)
+            else:
+                _MEXC_FEE_TRUTH_FALLBACK.move_to_end(key)
+        else:
+            per_exchange = _MEXC_FEE_TRUTHS.get(exchange)
+            if per_exchange is None:
+                per_exchange = OrderedDict()
+                _MEXC_FEE_TRUTHS[exchange] = per_exchange
+            truth = per_exchange.get(normalized_symbol)
+            if truth is None:
+                def weak_loader(
+                    ref=exchange_ref,
+                    cached_symbol=normalized_symbol,
+                ):
+                    owner = ref()
+                    if owner is None:
+                        return None
+                    return _mexc_private_fee_loader(owner, cached_symbol)
+
+                truth = FeeTruth(weak_loader, fallback_rate=0.001)
+                per_exchange[normalized_symbol] = truth
+                while (
+                    len(per_exchange) > _MEXC_FEE_TRUTH_PER_EXCHANGE_MAX
+                ):
+                    per_exchange.popitem(last=False)
+            else:
+                per_exchange.move_to_end(normalized_symbol)
     return truth.quote(liquidity)
 
 

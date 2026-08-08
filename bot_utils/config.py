@@ -255,6 +255,17 @@ def _resolve_config_path() -> str:
         return "bot_config.json"
 
 
+_CONFIG_JSON_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _read_config_json(path: str) -> dict:
+    with open(path, "rb") as fh:
+        raw = fh.read(_CONFIG_JSON_MAX_BYTES + 1)
+    if len(raw) > _CONFIG_JSON_MAX_BYTES:
+        raise ValueError("config JSON exceeds size limit")
+    return json.loads(raw.decode("utf-8-sig"))
+
+
 def load_runtime_config(bot_name: str, defaults: Dict[str, Any]) -> Dict[str, Any]:
     """Load bot_config.json overrides for `bot_name`, falling back to defaults.
 
@@ -278,8 +289,7 @@ def load_runtime_config(bot_name: str, defaults: Dict[str, Any]) -> Dict[str, An
 
     if os.path.exists(config_path):
         try:
-            with open(config_path, encoding="utf-8-sig") as f:
-                root_cfg = json.load(f)
+            root_cfg = _read_config_json(config_path)
             if not isinstance(root_cfg, dict):
                 raise ValueError("config root must be an object")
             user_cfg = root_cfg.get(bot_name, {})
@@ -365,8 +375,7 @@ class _ConfigCache:
         if st_mtime == self._mtime and self._raw:
             return
         try:
-            with open(self._path, encoding="utf-8-sig") as fh:
-                candidate = json.load(fh)
+            candidate = _read_config_json(self._path)
             if not isinstance(candidate, dict):
                 raise ValueError("bot_config.json root must be an object")
             self._raw = candidate

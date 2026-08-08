@@ -10,6 +10,7 @@ authoritative place.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import subprocess
@@ -742,6 +743,20 @@ def _safe_display_font() -> str:
 
 #  Config IO 
 
+_LAUNCHER_CONFIG_JSON_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _read_launcher_config_json(path: str):
+    with open(path, "rb") as stream:
+        raw = stream.read(_LAUNCHER_CONFIG_JSON_MAX_BYTES + 1)
+    if len(raw) > _LAUNCHER_CONFIG_JSON_MAX_BYTES:
+        raise ValueError("launcher config JSON exceeds size limit")
+    return json.loads(
+        raw.decode("utf-8-sig"),
+        parse_constant=_reject_json_constant,
+    )
+
+
 def effective_default_config() -> dict:
     """Return the user-facing default config.
 
@@ -753,8 +768,7 @@ def effective_default_config() -> dict:
     if not os.path.exists(DEFAULT_CONFIG_FILE):
         return json.loads(json.dumps(DEFAULT_CONFIG))
     try:
-        with open(DEFAULT_CONFIG_FILE, encoding="utf-8-sig") as f:
-            candidate = json.load(f, parse_constant=_reject_json_constant)
+        candidate = _read_launcher_config_json(DEFAULT_CONFIG_FILE)
     except Exception:
         return json.loads(json.dumps(DEFAULT_CONFIG))
     if not isinstance(candidate, dict):
@@ -780,8 +794,7 @@ def load_config() -> dict:
         save_config(cfg)
         return json.loads(json.dumps(cfg))
     try:
-        with open(CONFIG_FILE, encoding="utf-8-sig") as f:
-            cfg = json.load(f, parse_constant=_reject_json_constant)
+        cfg = _read_launcher_config_json(CONFIG_FILE)
     except Exception as e:
         raise RuntimeError(
             f"bot_config.json corrupt or unreadable: {e}. "
@@ -852,8 +865,7 @@ def _config_diff(old: dict, new: dict) -> dict:
 def _read_config_for_audit() -> dict:
     try:
         if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, encoding="utf-8-sig") as f:
-                data = json.load(f)
+            data = _read_launcher_config_json(CONFIG_FILE)
             return data if isinstance(data, dict) else {}
     except Exception:
         pass
@@ -999,9 +1011,19 @@ _CONFIG_PROCESS_LOCK = CONFIG_FILE + ".lock"
 _CONFIG_PROCESS_LOCK_STATE = threading.local()
 
 
+def _validated_config_lock_timeout(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("config lock timeout must be a number")
+    timeout = float(value)
+    if not math.isfinite(timeout) or not 0.0 <= timeout <= 300.0:
+        raise ValueError("config lock timeout must be between 0 and 300 seconds")
+    return timeout
+
+
 @contextmanager
 def _config_process_lock(timeout_s: float = 10.0):
     """Serialize config read-modify-write across launcher/tool processes."""
+    timeout_s = _validated_config_lock_timeout(timeout_s)
     depth = getattr(_CONFIG_PROCESS_LOCK_STATE, "depth", 0)
     if depth:
         _CONFIG_PROCESS_LOCK_STATE.depth = depth + 1
@@ -1049,13 +1071,16 @@ def _config_process_lock(timeout_s: float = 10.0):
         _CONFIG_PROCESS_LOCK_STATE.depth = 0
         try:
             if locked:
-                if os.name == "nt":
-                    import msvcrt
-                    fh.seek(0)
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
         finally:
             fh.close()
 

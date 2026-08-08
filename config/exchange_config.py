@@ -7,6 +7,7 @@ an SSL-shutdown workaround. Also provides the safe_* order/precision helpers
 and a global clock-skew self-heal that wraps ex.fetch2().
 """
 
+import math
 import os
 import tempfile
 import threading
@@ -289,8 +290,44 @@ def _apply_ssl_workaround(exchange):
 # gateway BEFORE matching, so the request never filled  retrying is collision-free.
 
 _TIME_RESYNC_LOCK = threading.Lock()
-_LAST_TIME_RESYNC = {"mono": 0.0}
+_LAST_TIME_RESYNC = {
+    "mono": 0.0,
+    "exchange_key": None,
+    "offset_ms": None,
+}
 _TIME_RESYNC_MIN_INTERVAL = 2.0   # don't refetch server time more than every 2s
+
+
+def _time_resync_exchange_key(ex) -> str:
+    venue = (
+        getattr(ex, "id", None)
+        or getattr(ex, "name", None)
+        or ex.__class__.__name__
+    )
+    return str(venue).strip().lower()
+
+
+def _finite_time_difference(ex) -> float | None:
+    try:
+        options = getattr(ex, "options", None)
+        raw = options.get("timeDifference") if isinstance(options, dict) else None
+        if isinstance(raw, bool):
+            return None
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _publish_clock_offset_ms(offset_ms: float) -> None:
+    from core.clock import set_exchange_offset_ms
+
+    set_exchange_offset_ms(offset_ms)
+    if abs(offset_ms) >= _CLOCK_DRIFT_WARN_MS:
+        _log_event(
+            f"[exchange] local clock differs from server by "
+            f"{offset_ms / 1000.0:+.1f}s  using exchange time as truth "
+            f"(self-healing; no action needed)", "WARN")
 
 
 def is_clock_skew_error(exc: BaseException) -> bool:
@@ -316,11 +353,27 @@ def resync_time_difference(ex) -> bool:
     + locked so a burst of concurrent skew errors triggers at most one
     fetch_time. Returns True when a fresh offset is in effect."""
     now = time.monotonic()
+    exchange_key = _time_resync_exchange_key(ex)
     with _TIME_RESYNC_LOCK:
-        if now - _LAST_TIME_RESYNC["mono"] < _TIME_RESYNC_MIN_INTERVAL:
-            # Another thread just resynced  the corrected offset is already in
-            # place; let the caller retry without a second fetch_time.
-            return True
+        if (
+            now - _LAST_TIME_RESYNC["mono"] < _TIME_RESYNC_MIN_INTERVAL
+            and _LAST_TIME_RESYNC.get("exchange_key") == exchange_key
+        ):
+            # CCXT stores timeDifference per client. Apply the venue's recent
+            # offset to this sibling client before allowing its signed retry.
+            cached_offset = _LAST_TIME_RESYNC.get("offset_ms")
+            try:
+                cached_offset = float(cached_offset)
+                options = getattr(ex, "options", None)
+                if not math.isfinite(cached_offset) or not isinstance(
+                    options, dict
+                ):
+                    raise ValueError("invalid cached exchange clock offset")
+                options["timeDifference"] = -cached_offset
+                _publish_clock_offset_ms(cached_offset)
+                return True
+            except (TypeError, ValueError, OverflowError):
+                pass
         try:
             if not try_consume_api_call(
                 "exchange_clock_resync_fetch_time",
@@ -329,12 +382,18 @@ def resync_time_difference(ex) -> bool:
                 return False
             ex._in_time_resync = True
             ex.load_time_difference()   # sets ex.options['timeDifference']
+            time_difference = _finite_time_difference(ex)
+            if time_difference is None:
+                return False
+            offset_ms = -time_difference
             _LAST_TIME_RESYNC["mono"] = now
+            _LAST_TIME_RESYNC["exchange_key"] = exchange_key
+            _LAST_TIME_RESYNC["offset_ms"] = offset_ms
             _log_event(
                 "[exchange] clock-skew self-heal: resynced server-time offset "
                 f"(timeDifference={ex.options.get('timeDifference')}ms)", "WARN")
             # Re-anchor the bot's own wall clock to the refreshed server time.
-            _publish_clock_offset(ex)
+            _publish_clock_offset_ms(offset_ms)
             return True
         except Exception as e:
             _silent("resync_time_difference", e)
@@ -398,13 +457,7 @@ def _publish_clock_offset(ex) -> None:
         return
     try:
         offset_ms = server_ms - time.time() * 1000.0
-        from core.clock import set_exchange_offset_ms
-        set_exchange_offset_ms(offset_ms)
-        if abs(offset_ms) >= _CLOCK_DRIFT_WARN_MS:
-            _log_event(
-                f"[exchange] local clock differs from server by "
-                f"{offset_ms / 1000.0:+.1f}s  using exchange time as truth "
-                f"(self-healing; no action needed)", "WARN")
+        _publish_clock_offset_ms(offset_ms)
     except Exception as e:
         _silent("publish_clock_offset", e)
 
@@ -536,10 +589,20 @@ def _is_rate_limited(err_str: str) -> bool:
 
 _ADMIN_LOCK = threading.Lock()
 _ADMIN_LAST = [0.0]
-try:
-    _ADMIN_MIN_GAP = float(os.getenv("ADMIN_CALL_MIN_GAP_SEC", "0.5"))
-except (TypeError, ValueError):
-    _ADMIN_MIN_GAP = 0.5
+_ADMIN_THROTTLE_MAX_BYTES = 128
+
+
+def _parse_admin_min_gap(value) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.5
+    return parsed if math.isfinite(parsed) and parsed >= 0.0 else 0.5
+
+
+_ADMIN_MIN_GAP = _parse_admin_min_gap(
+    os.getenv("ADMIN_CALL_MIN_GAP_SEC", "0.5")
+)
 _ADMIN_THROTTLE_FILE = os.path.join(tempfile.gettempdir(),
                                     "tradingbot_admin_throttle.lock")
 
@@ -556,10 +619,17 @@ def _throttle_admin() -> None:
         with portalocker.Lock(_ADMIN_THROTTLE_FILE, mode="a+", timeout=15) as fh:
             fh.seek(0)
             try:
-                last = float((fh.read() or "0").strip() or 0)
-            except (TypeError, ValueError):
+                raw = fh.read(_ADMIN_THROTTLE_MAX_BYTES + 1)
+                if len(raw) > _ADMIN_THROTTLE_MAX_BYTES:
+                    raise ValueError("admin throttle state exceeds size limit")
+                last = float((raw or "0").strip() or 0)
+                now = _t.time()
+                if not math.isfinite(last) or last < 0.0 or last > now:
+                    raise ValueError("admin throttle timestamp is invalid")
+            except (TypeError, ValueError, OverflowError):
                 last = 0.0
-            wait = _ADMIN_MIN_GAP - (_t.time() - last)
+                now = _t.time()
+            wait = _ADMIN_MIN_GAP - (now - last)
             if wait > 0:
                 _t.sleep(wait)
             fh.seek(0)

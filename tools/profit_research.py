@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import uuid
@@ -25,12 +26,68 @@ from trading.research_experiment_suite import (  # noqa: E402
     write_immutable_experiment_report,
 )
 
+RESEARCH_JSON_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-finite JSON constant is not allowed: {value}")
+
 
 def _json_file(path: str) -> dict:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    with Path(path).open("rb") as handle:
+        raw = handle.read(RESEARCH_JSON_MAX_BYTES + 1)
+    if len(raw) > RESEARCH_JSON_MAX_BYTES:
+        raise ValueError(
+            f"JSON input exceeds size limit ({RESEARCH_JSON_MAX_BYTES} bytes)"
+        )
+    payload = json.loads(
+        raw.decode("utf-8-sig"), parse_constant=_reject_json_constant
+    )
     if not isinstance(payload, dict):
         raise ValueError("JSON input must be an object")
     return payload
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return parsed
+
+
+def _finite_float(value: str, *, positive: bool) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise argparse.ArgumentTypeError("must be a finite number") from exc
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be a finite number")
+    if positive and parsed <= 0.0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    if not positive and parsed < 0.0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    return _finite_float(value, positive=True)
+
+
+def _nonnegative_float(value: str) -> float:
+    return _finite_float(value, positive=False)
 
 
 def _print(payload: dict) -> None:
@@ -69,8 +126,8 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     status = sub.add_parser("status", help="read-only readiness and data report")
-    status.add_argument("--minimum-cost-samples", type=int, default=50)
-    status.add_argument("--minimum-expectancy-rows", type=int, default=1200)
+    status.add_argument("--minimum-cost-samples", type=_positive_int, default=50)
+    status.add_argument("--minimum-expectancy-rows", type=_positive_int, default=1200)
     status.add_argument("--write-report", action="store_true")
 
     train = sub.add_parser(
@@ -78,24 +135,24 @@ def _parser() -> argparse.ArgumentParser:
     )
     train.add_argument("--bot", required=True)
     train.add_argument("--mode", required=True, choices=("LIVE", "SIM", "live", "sim"))
-    train.add_argument("--min-train", type=int, default=1000)
-    train.add_argument("--test-size", type=int, default=200)
-    train.add_argument("--purge-days", type=int, default=8)
-    train.add_argument("--schema-version", type=int)
+    train.add_argument("--min-train", type=_positive_int, default=1000)
+    train.add_argument("--test-size", type=_positive_int, default=200)
+    train.add_argument("--purge-days", type=_nonnegative_int, default=8)
+    train.add_argument("--schema-version", type=_positive_int)
 
     carry = sub.add_parser("carry-preview", help="SIM-only carry candidate preview")
-    carry.add_argument("--notional", type=float, default=100.0)
-    carry.add_argument("--funding-periods", type=int, default=3)
-    carry.add_argument("--taker-fee", type=float, default=0.001)
-    carry.add_argument("--maker-fee", type=float, default=0.0002)
-    carry.add_argument("--entry-slippage-bps", type=float, default=2.0)
-    carry.add_argument("--exit-slippage-bps", type=float, default=2.0)
+    carry.add_argument("--notional", type=_positive_float, default=100.0)
+    carry.add_argument("--funding-periods", type=_positive_int, default=3)
+    carry.add_argument("--taker-fee", type=_nonnegative_float, default=0.001)
+    carry.add_argument("--maker-fee", type=_nonnegative_float, default=0.0002)
+    carry.add_argument("--entry-slippage-bps", type=_nonnegative_float, default=2.0)
+    carry.add_argument("--exit-slippage-bps", type=_nonnegative_float, default=2.0)
 
     promotion = sub.add_parser(
         "promotion-check", help="evaluate evidence without deploying anything"
     )
     promotion.add_argument("--evidence", required=True)
-    promotion.add_argument("--minimum-samples", type=int, required=True)
+    promotion.add_argument("--minimum-samples", type=_positive_int, required=True)
     promotion.add_argument("--manual-live-approval", action="store_true")
 
     trial = sub.add_parser(
@@ -121,10 +178,10 @@ def _parser() -> argparse.ArgumentParser:
     experiments.add_argument(
         "--mode", required=True, choices=("LIVE", "SIM", "live", "sim")
     )
-    experiments.add_argument("--minimum-expectancy-rows", type=int, default=1200)
-    experiments.add_argument("--minimum-entry-rows", type=int, default=200)
-    experiments.add_argument("--minimum-cost-samples", type=int, default=50)
-    experiments.add_argument("--minimum-momentum-windows", type=int, default=30)
+    experiments.add_argument("--minimum-expectancy-rows", type=_positive_int, default=1200)
+    experiments.add_argument("--minimum-entry-rows", type=_positive_int, default=200)
+    experiments.add_argument("--minimum-cost-samples", type=_positive_int, default=50)
+    experiments.add_argument("--minimum-momentum-windows", type=_positive_int, default=30)
     experiments.add_argument("--write-report", action="store_true")
     return parser
 

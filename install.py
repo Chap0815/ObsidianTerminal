@@ -75,6 +75,8 @@ def head(m):
 PROJECT_ROOT = Path(__file__).parent.resolve()
 REQ_FILE = PROJECT_ROOT / "requirements.lock.txt"
 VENV_DIR = PROJECT_ROOT / ".venv"
+INSTALL_CONFIG_MAX_BYTES = 2 * 1024 * 1024
+INSTALL_ENV_MAX_BYTES = 1024 * 1024
 
 # Empfohlene Zielversion
 TARGET_PY = (3, 12, 10)
@@ -105,6 +107,16 @@ REQUIRED_IMPORTS = [import_name for _spec, import_name in REQUIRED] + [
 ]
 
 DEFAULT_MODEL = "qwen2.5:14b"
+
+
+def _read_install_text(
+    path: Path, max_bytes: int, label: str, *, errors: str = "strict"
+) -> str:
+    with path.open("rb") as stream:
+        raw = stream.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"{label} exceeds size limit ({max_bytes} bytes)")
+    return raw.decode("utf-8-sig", errors=errors)
 
 
 #
@@ -391,10 +403,23 @@ def _model_from_config() -> str:
     cfg_path = PROJECT_ROOT / "bot_config.json"
     try:
         if cfg_path.exists():
-            data = json.loads(cfg_path.read_text(encoding="utf-8"))
-            m = str(data.get("LLM_MODEL", "")).strip()
-            if m:
+            data = json.loads(_read_install_text(
+                cfg_path,
+                INSTALL_CONFIG_MAX_BYTES,
+                "bot_config.json",
+            ))
+            if not isinstance(data, dict):
+                raise ValueError("bot_config.json root must be an object")
+            raw_model = data.get("LLM_MODEL")
+            if not isinstance(raw_model, str):
+                raise ValueError("LLM_MODEL must be a string")
+            m = raw_model.strip()
+            if (
+                1 <= len(m) <= 200
+                and all(ch.isprintable() and not ch.isspace() for ch in m)
+            ):
                 return m
+            raise ValueError("LLM_MODEL has an invalid format")
     except Exception as e:
         warn(f"bot_config.json nicht lesbar ({e})  -  nutze Default {DEFAULT_MODEL}")
     return DEFAULT_MODEL
@@ -456,7 +481,16 @@ def check_env() -> bool:
         warn("Setup-Wizard ausfuehren:  python setup_wizard.pyw")
         return True
     ok(".env gefunden")
-    content = env.read_text(encoding="utf-8", errors="ignore")
+    try:
+        content = _read_install_text(
+            env,
+            INSTALL_ENV_MAX_BYTES,
+            ".env",
+            errors="ignore",
+        )
+    except (OSError, ValueError) as exc:
+        warn(f".env nicht lesbar ({exc})")
+        return True
     lines = content.splitlines()
     api_present = any(
         ln.startswith(("API_KEY=", "BITGET_API_KEY=")) and ln.split("=", 1)[1].strip()

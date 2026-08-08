@@ -15,11 +15,24 @@ and closing existing positions. State is reset by restarting the bot.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import threading
 import time
 from typing import Callable, Optional
+
+
+_SAFE_MODE_STATE_JSON_MAX_BYTES = 64 * 1024
+
+
+def _read_safe_mode_state_json(path: str) -> dict:
+    with open(path, "rb") as stream:
+        raw = stream.read(_SAFE_MODE_STATE_JSON_MAX_BYTES + 1)
+    if len(raw) > _SAFE_MODE_STATE_JSON_MAX_BYTES:
+        raise ValueError("safe-mode state JSON exceeds size limit")
+    data = json.loads(raw.decode("utf-8-sig"))
+    return data if isinstance(data, dict) else {}
 
 
 # Tunable thresholds from core.constants (single source of truth).
@@ -335,13 +348,11 @@ class SafeMode:
         if not self._alert_state_file:
             return
         try:
-            import json as _json
             from datetime import datetime as _dt, timezone as _tz
 
             if not os.path.exists(self._alert_state_file):
                 return
-            with open(self._alert_state_file, encoding="utf-8") as f:
-                data = _json.load(f) or {}
+            data = _read_safe_mode_state_json(self._alert_state_file)
             last_day = data.get("alert_sent_day")
             today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
             if last_day == today:

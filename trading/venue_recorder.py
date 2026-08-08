@@ -154,6 +154,26 @@ class SQLitePartitionWriter:
             first_cleanup_error: OSError | sqlite3.Error | None = None
             failed_cleanup_paths: set[Path] = set()
 
+            # A daily partition is immutable after its UTC day in the normal
+            # recorder flow. Close past-day handles even while the partition
+            # remains inside retention, so SQLite can checkpoint its WAL and
+            # the process does not accumulate one live connection per stream
+            # per retained day. A genuinely late event can reopen the file;
+            # the next hourly retention pass closes it again.
+            for path in list(self._connections):
+                partition_date = self._partition_date(path)
+                if (
+                    partition_date is None
+                    or partition_date.date() >= current.date()
+                ):
+                    continue
+                try:
+                    self._close_path(path)
+                except (OSError, sqlite3.Error) as exc:
+                    failed_cleanup_paths.add(path)
+                    if first_cleanup_error is None:
+                        first_cleanup_error = exc
+
             # A previous Windows cleanup may have removed the main database
             # while antivirus or another reader still held its WAL/SHM file.
             # Such sidecars are no longer reachable through the *.sqlite3
@@ -178,7 +198,11 @@ class SQLitePartitionWriter:
             partitions = sorted(self.root.glob("*/*.sqlite3"))
             for path in partitions:
                 partition_date = self._partition_date(path)
-                if partition_date is not None and partition_date.date() < cutoff:
+                if (
+                    path not in failed_cleanup_paths
+                    and partition_date is not None
+                    and partition_date.date() < cutoff
+                ):
                     try:
                         self._delete_partition(path)
                     except (OSError, sqlite3.Error) as exc:

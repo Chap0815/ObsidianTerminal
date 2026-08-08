@@ -20,6 +20,7 @@ from core.constants import NONCRYPTO_BASES, STOCK_TOKEN_BASES
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.circuit_breaker import extract_valid_top_of_book
 from bot_utils.safe_numeric import safe_positive_float
+from news.http_limits import read_bounded_json_response
 
 load_dotenv()
 
@@ -39,6 +40,45 @@ _HTTP_PROXIES = (
 
 def _http_get(url, timeout=15, **kwargs):
     return requests.get(url, timeout=timeout, proxies=_HTTP_PROXIES, **kwargs)
+
+
+_FG_MAX_RESPONSE_BYTES = 512 * 1024
+
+
+def _fetch_bounded_json(url: str, **kwargs):
+    response = None
+    reader_closes = False
+    try:
+        response = _http_get(url, stream=True, **kwargs)
+        checker = getattr(response, "raise_for_status", None)
+        if not callable(checker):
+            raise ValueError("response does not expose status validation")
+        checker()
+        reader_closes = callable(getattr(response, "iter_content", None))
+        return read_bounded_json_response(
+            response,
+            max_bytes=_FG_MAX_RESPONSE_BYTES,
+        )
+    finally:
+        closer = getattr(response, "close", None)
+        if callable(closer) and not reader_closes:
+            try:
+                closer()
+            except Exception:
+                pass
+
+
+def _normalized_fear_greed(value) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    normalized = int(round(parsed))
+    return normalized if 0 <= normalized <= 100 else None
 
 
 def _filter_log(msg: str, level: str = "INFO") -> None:
@@ -376,7 +416,7 @@ def _fetch_fg_from_cmc() -> Optional[int]:
     api_key = os.getenv("CMC_API_KEY", "").strip()
     if api_key:
         try:
-            r = _http_get(
+            payload = _fetch_bounded_json(
                 "https://pro-api.coinmarketcap.com/v3/fear-and-greed/historical"
                 "?limit=1",
                 timeout=10,
@@ -385,20 +425,15 @@ def _fetch_fg_from_cmc() -> Optional[int]:
                     "Accept": "application/json",
                 },
             )
-            r.raise_for_status()
-            payload = r.json()
             data = payload.get("data") or []
             if isinstance(data, list) and data:
                 entry = data[0]
                 if isinstance(entry, dict):
                     v = entry.get("value")
                     if v is not None:
-                        try:
-                            value = int(round(float(v)))
-                            if 0 <= value <= 100:
-                                return value
-                        except (TypeError, ValueError):
-                            pass
+                        value = _normalized_fear_greed(v)
+                        if value is not None:
+                            return value
         except Exception as e:
             _filter_log(
                 f"[Filter] CMC official API failed: {type(e).__name__}: {e} "
@@ -413,14 +448,12 @@ def _fetch_fg_from_cmc() -> Optional[int]:
         # timezone-aware UTC; a naive datetime's .timestamp() would assume
         # local time.
         today_ts = int(_dt.now(_tz.utc).timestamp())
-        r = _http_get(
+        payload = _fetch_bounded_json(
             "https://api.coinmarketcap.com/data-api/v3/fear-greed/chart"
             f"?start={today_ts - 86400}&end={today_ts}",
             timeout=10,
             headers={"User-Agent": "Mozilla/5.0 obsidian-bot"},
         )
-        r.raise_for_status()
-        payload = r.json()
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
         dl = data.get("dataList") or data.get("points") or data.get("history") or []
         if not dl or not isinstance(dl, list):
@@ -437,12 +470,9 @@ def _fetch_fg_from_cmc() -> Optional[int]:
             )
             if score is None:
                 continue
-            try:
-                v = int(round(float(score)))
-                if 0 <= v <= 100:
-                    return v
-            except (TypeError, ValueError):
-                continue
+            value = _normalized_fear_greed(score)
+            if value is not None:
+                return value
     except Exception as e:
         _filter_log(f"[Filter] CMC data-api failed: {type(e).__name__}: {e}", "WARN")
     return None
@@ -451,9 +481,10 @@ def _fetch_fg_from_cmc() -> Optional[int]:
 def _fetch_fg_from_alternative_me() -> Optional[int]:
     """Fetch from alternative.me (older established source, free API)."""
     try:
-        r = _http_get("https://api.alternative.me/fng/?limit=1", timeout=10)
-        r.raise_for_status()
-        return int(r.json()["data"][0]["value"])
+        payload = _fetch_bounded_json(
+            "https://api.alternative.me/fng/?limit=1", timeout=10
+        )
+        return _normalized_fear_greed(payload["data"][0]["value"])
     except Exception:
         return None
 
@@ -461,11 +492,12 @@ def _fetch_fg_from_alternative_me() -> Optional[int]:
 def _fetch_fg_from_coinybubble() -> Optional[int]:
     """Fetch from coinybubble (alternative.me mirror, used as fallback)."""
     try:
-        r = _http_get("https://api.coinybubble.com/v1/latest", timeout=10)
-        r.raise_for_status()
-        raw = r.json().get("actual_value")
+        payload = _fetch_bounded_json(
+            "https://api.coinybubble.com/v1/latest", timeout=10
+        )
+        raw = payload.get("actual_value")
         if raw is not None:
-            return int(round(float(raw)))
+            return _normalized_fear_greed(raw)
     except Exception:
         pass
     return None
@@ -473,7 +505,7 @@ def _fetch_fg_from_coinybubble() -> Optional[int]:
 
 def get_fear_greed() -> int:
     def fetch():
-        now = time.time()
+        now = time.monotonic()
         with _FG_CIRCUIT_LOCK:
             failures = _FG_CIRCUIT["failures"]
             open_until = _FG_CIRCUIT["open_until"]
@@ -541,7 +573,9 @@ def get_fear_greed() -> int:
         with _FG_CIRCUIT_LOCK:
             _FG_CIRCUIT["failures"] += 1
             if _FG_CIRCUIT["failures"] >= _FG_FAILURE_THRESHOLD:
-                _FG_CIRCUIT["open_until"] = time.time() + _FG_OPEN_DURATION_SEC
+                _FG_CIRCUIT["open_until"] = (
+                    time.monotonic() + _FG_OPEN_DURATION_SEC
+                )
                 _filter_log(
                     f"[Filter] F&G circuit breaker OPEN for {_FG_OPEN_DURATION_SEC}s",
                     "WARN",

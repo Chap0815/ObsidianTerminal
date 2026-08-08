@@ -4,13 +4,14 @@ llm_utils.py  LLM availability and keyword fallback.
 from __future__ import annotations
 
 import time
-import json
 import os
 import socket
 import threading
 import requests
 import ollama
+from bot_utils.config import _read_config_json
 from core.logger import log_event
+from news.http_limits import read_bounded_json_response
 from news.news_keywords import BEARISH_KEYWORDS, POSITIVE_KEYWORDS as _POSITIVE
 from core.constants import (
     OLLAMA_URL as _ollama_url_fn,
@@ -27,6 +28,15 @@ POSITIVE_KEYWORDS = list(_POSITIVE)
 
 
 OLLAMA_URL = _ollama_url_fn()
+_LLM_SLOT_FILE_MAX_BYTES = 1024
+
+
+def _read_llm_slot_payload(path: str) -> str:
+    with open(path, "rb") as stream:
+        raw = stream.read(_LLM_SLOT_FILE_MAX_BYTES + 1)
+    if len(raw) > _LLM_SLOT_FILE_MAX_BYTES:
+        raise ValueError("LLM slot file exceeds size limit")
+    return raw.decode("utf-8").strip()
 
 
 def _apply_no_think_if_needed(model: str, prompt: str) -> str:
@@ -76,20 +86,19 @@ def _get_model_name() -> str:
     config_path = _config_path()
     try:
         if os.path.exists(config_path):
-            with open(config_path, encoding="utf-8") as f:
-                cfg = json.load(f)
-                if not isinstance(cfg, dict):
-                    return LLM_MODEL_DEFAULT
-                model = cfg.get("LLM_MODEL")
-                if not isinstance(model, str):
-                    return LLM_MODEL_DEFAULT
-                model = model.strip()
-                if (
-                    not 1 <= len(model) <= 200
-                    or any(not ch.isprintable() or ch.isspace() for ch in model)
-                ):
-                    return LLM_MODEL_DEFAULT
-                return model
+            cfg = _read_config_json(config_path)
+            if not isinstance(cfg, dict):
+                return LLM_MODEL_DEFAULT
+            model = cfg.get("LLM_MODEL")
+            if not isinstance(model, str):
+                return LLM_MODEL_DEFAULT
+            model = model.strip()
+            if (
+                not 1 <= len(model) <= 200
+                or any(not ch.isprintable() or ch.isspace() for ch in model)
+            ):
+                return LLM_MODEL_DEFAULT
+            return model
     except Exception:
         pass
     return LLM_MODEL_DEFAULT
@@ -206,8 +215,7 @@ def _acquire_llm_slot():
                 return (lock_path, my_payload)
             except FileExistsError:
                 try:
-                    with open(lock_path, "r") as lf:
-                        parts = lf.read().strip().split(":")
+                    parts = _read_llm_slot_payload(lock_path).split(":")
                     holder_pid = int(parts[0]) if parts and parts[0].isdigit() else 0
                     holder_fp = parts[1] if len(parts) > 1 else ""
                     try:
@@ -451,13 +459,35 @@ def _model_names_from_payload(payload) -> list[str]:
     if not isinstance(models, list):
         return []
     names = []
-    for model in models:
+    for model in models[:256]:
         if not isinstance(model, dict):
             continue
         name = model.get("name")
         if isinstance(name, str) and name.strip():
-            names.append(name.strip())
+            names.append(name.strip()[:256])
     return names
+
+
+_OLLAMA_PROBE_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _bounded_ollama_probe_payload(response):
+    reader_closes = False
+    try:
+        if getattr(response, "status_code", None) != 200:
+            return None
+        reader_closes = callable(getattr(response, "iter_content", None))
+        return read_bounded_json_response(
+            response,
+            max_bytes=_OLLAMA_PROBE_MAX_BYTES,
+        )
+    finally:
+        closer = getattr(response, "close", None)
+        if callable(closer) and not reader_closes:
+            try:
+                closer()
+            except Exception:
+                pass
 
 
 def _do_one_ping() -> str:
@@ -474,9 +504,14 @@ def _do_one_ping() -> str:
     #  Step 1: daemon + installed models 
     for attempt in range(PING_MAX_FAILURES):
         try:
-            r = requests.get(f"{base_url}/api/tags", timeout=PING_TIMEOUT_SEC)
-            if r.status_code == 200:
-                installed = _model_names_from_payload(r.json())
+            r = requests.get(
+                f"{base_url}/api/tags",
+                timeout=PING_TIMEOUT_SEC,
+                stream=True,
+            )
+            payload = _bounded_ollama_probe_payload(r)
+            if payload is not None:
+                installed = _model_names_from_payload(payload)
                 break
         except Exception:
             installed = None
@@ -497,9 +532,14 @@ def _do_one_ping() -> str:
 
     #  Step 3: check if model is loaded in memory (hot vs cold) 
     try:
-        r2 = requests.get(f"{base_url}/api/ps", timeout=PING_TIMEOUT_SEC)
-        if r2.status_code == 200:
-            loaded = _model_names_from_payload(r2.json())
+        r2 = requests.get(
+            f"{base_url}/api/ps",
+            timeout=PING_TIMEOUT_SEC,
+            stream=True,
+        )
+        payload = _bounded_ollama_probe_payload(r2)
+        if payload is not None:
+            loaded = _model_names_from_payload(payload)
             is_hot = any(
                 _model_name_matches(model_cfg, name) for name in loaded
             )

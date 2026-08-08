@@ -29,8 +29,41 @@ import pandas as pd
 
 from tools.backtester import connect_exchange, get_top_volume_coins, fetch_history
 
-DAYS = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 180
+DEFAULT_DAYS = 180
+MAX_DAYS = 3650
+
+
+def _parse_xsec_days(args=None) -> int:
+    values = sys.argv[1:] if args is None else list(args)
+    if not values:
+        return DEFAULT_DAYS
+    try:
+        days = int(values[0])
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_DAYS
+    return days if 1 <= days <= MAX_DAYS else DEFAULT_DAYS
+
+
+DAYS = _parse_xsec_days()
 FEE_ONE_WAY = 0.0006  # futures taker 0.01% + slippage 0.05% per side
+
+
+def _validated_close_series(df):
+    if not isinstance(df, pd.DataFrame) or not {"dt", "close"}.issubset(df.columns):
+        return None
+    frame = df.loc[:, ["dt", "close"]].copy()
+    frame["dt"] = pd.to_datetime(frame["dt"], errors="coerce", utc=True)
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame = frame[
+        frame["dt"].notna()
+        & frame["close"].map(
+            lambda value: math.isfinite(float(value)) and float(value) > 0.0
+        )
+    ]
+    if frame.empty:
+        return None
+    frame = frame.drop_duplicates(subset="dt", keep="last").sort_values("dt")
+    return frame.set_index("dt")["close"].astype(float)
 
 
 def load_panel(ex, coins):
@@ -40,8 +73,9 @@ def load_panel(ex, coins):
         for f in as_completed(futs):
             try:
                 df = f.result()
-                if df is not None and not df.empty:
-                    hist[futs[f]] = df.set_index("dt")["close"]
+                series = _validated_close_series(df)
+                if series is not None:
+                    hist[futs[f]] = series
             except Exception:
                 pass
     panel = pd.DataFrame(hist).sort_index()

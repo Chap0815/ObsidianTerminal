@@ -21,11 +21,34 @@ _GRACE_PERIOD_SEC     = 24 * 3600    # 24 Stunden Stille nach erster Sichtung
 _PERSIST_INTERVAL_SEC = 60.0          # max. einmal pro Minute auf Disk schreiben
 _MAX_TRACKED          = 5000          # absolute Obergrenze (LRU prune)
 _RETENTION_SEC        = _GRACE_PERIOD_SEC * 30   # 30 Tage Historie
+_TRACKER_JSON_MAX_BYTES = 1024 * 1024
 
 _data: Dict[str, float] = {}          # symbol -> first_seen_epoch
 _lock = threading.Lock()
-_last_persist: float = 0.0
+_last_persist: float = time.monotonic() - _PERSIST_INTERVAL_SEC
 _dirty = False
+_persist_timer: threading.Timer | None = None
+
+
+def _flush_deferred() -> None:
+    global _persist_timer
+    with _lock:
+        _persist_timer = None
+        _persist_locked()
+
+
+def _schedule_persist_locked(delay: float) -> None:
+    """Schedule one daemon flush; caller holds ``_lock``."""
+    global _persist_timer
+    if _persist_timer is not None and _persist_timer.is_alive():
+        return
+    timer = threading.Timer(max(0.01, float(delay)), _flush_deferred)
+    timer.daemon = True
+    _persist_timer = timer
+    try:
+        timer.start()
+    except Exception:
+        _persist_timer = None
 
 
 def _validated_data(raw, now: float) -> Dict[str, float]:
@@ -44,14 +67,20 @@ def _validated_data(raw, now: float) -> Dict[str, float]:
     return clean
 
 
+def _read_tracker_data(now: float) -> Dict[str, float]:
+    with open(_TRACKER_FILE, "rb") as fh:
+        raw = fh.read(_TRACKER_JSON_MAX_BYTES + 1)
+    if len(raw) > _TRACKER_JSON_MAX_BYTES:
+        raise ValueError("symbol tracker JSON exceeds size limit")
+    return _validated_data(json.loads(raw.decode("utf-8-sig")), now)
+
+
 def _load() -> None:
     """Ldt die persistierten Daten beim Import. Fehlertolerant."""
     global _data
     try:
         if os.path.exists(_TRACKER_FILE):
-            with open(_TRACKER_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            _data = _validated_data(raw, time.time())
+            _data = _read_tracker_data(time.time())
     except Exception:
         _data = {}
 
@@ -60,9 +89,12 @@ def _persist_locked() -> None:
     """Caller MUST hold _lock. Schreibt atomar auf Disk, debounced."""
     global _last_persist, _dirty
     now = time.time()
+    persist_now = time.monotonic()
     if not _dirty:
         return
-    if (now - _last_persist) < _PERSIST_INTERVAL_SEC:
+    elapsed = persist_now - _last_persist
+    if elapsed < _PERSIST_INTERVAL_SEC:
+        _schedule_persist_locked(_PERSIST_INTERVAL_SEC - elapsed)
         return
     try:
         os.makedirs(os.path.dirname(_TRACKER_FILE) or ".", exist_ok=True)
@@ -76,8 +108,7 @@ def _persist_locked() -> None:
             disk_data: Dict[str, float] = {}
             try:
                 if os.path.exists(_TRACKER_FILE):
-                    with open(_TRACKER_FILE, "r", encoding="utf-8-sig") as f:
-                        disk_data = _validated_data(json.load(f), now)
+                    disk_data = _read_tracker_data(now)
             except Exception:
                 disk_data = {}
 
@@ -104,14 +135,15 @@ def _persist_locked() -> None:
                 snapshot = dict(sorted_items[:_MAX_TRACKED])
 
             if not atomic_save_json(_TRACKER_FILE, snapshot):
+                _schedule_persist_locked(_PERSIST_INTERVAL_SEC)
                 return
 
         _data.clear()
         _data.update(snapshot)
-        _last_persist = now
+        _last_persist = persist_now
         _dirty = False
     except Exception:
-        pass
+        _schedule_persist_locked(_PERSIST_INTERVAL_SEC)
 
 
 def record_seen(symbol: str) -> None:

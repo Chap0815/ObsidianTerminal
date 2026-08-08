@@ -41,7 +41,13 @@ guard_tool_entrypoint(__file__, __name__)
 import numpy as np
 
 from config.exchange_config import get_exchange_connection, get_active_exchange_name
-from tools.trend_check import _sig_price_ma, _sig_cross, _max_dd, COST
+from tools.trend_check import (
+    _sig_price_ma,
+    _sig_cross,
+    _max_dd,
+    _validated_trend_ohlc,
+    COST,
+)
 from tools.ohlcv_cache import get_series
 from tools.backtester import get_top_volume_coins
 
@@ -108,6 +114,33 @@ def backtest_lev(
     mm: float = MAINT_MARGIN,
 ) -> dict:
     """All-in long/flat with leverage; models liquidation on close-to-close moves."""
+    try:
+        closes = np.asarray(closes, dtype=float)
+        sig = np.asarray(sig, dtype=bool)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("closes and signal must be numeric vectors") from exc
+    if (
+        closes.ndim != 1
+        or sig.ndim != 1
+        or len(closes) < 2
+        or len(sig) != len(closes)
+        or not np.all(np.isfinite(closes))
+        or np.any(closes <= 0.0)
+    ):
+        raise ValueError("closes and signal must be aligned finite vectors")
+    checked = {}
+    for name, value in (("lev", lev), ("cost", cost), ("mm", mm)):
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be finite")
+        try:
+            checked[name] = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} must be finite") from exc
+        if not np.isfinite(checked[name]):
+            raise ValueError(f"{name} must be finite")
+    lev, cost, mm = checked["lev"], checked["cost"], checked["mm"]
+    if lev <= 0.0 or not 0.0 <= cost < 1.0 or not 0.0 < mm < 1.0:
+        raise ValueError("lev, cost, or mm is outside its valid range")
     n = len(closes)
     eq = peak = 1.0
     maxdd = 0.0
@@ -153,7 +186,13 @@ def backtest_lev(
     }
 
 
-def _load_data(ex, symbols: list[str], since_ms: int, min_bars: int) -> dict:
+def _load_data(
+    ex,
+    symbols: list[str],
+    since_ms: int,
+    min_bars: int,
+    until_ms: int,
+) -> dict:
     """Fetch daily OHLCV for each symbol via cache; return {coin: (c,h,l)}."""
     data = {}
     for sym in symbols:
@@ -162,7 +201,11 @@ def _load_data(ex, symbols: list[str], since_ms: int, min_bars: int) -> dict:
             bars = _fetch_daily(ex, sym, since_ms)
         except Exception:
             continue
-        bars = [b for b in bars if b[0] >= since_ms]
+        bars = _validated_trend_ohlc(
+            bars,
+            since_ms=since_ms,
+            until_ms=until_ms,
+        )
         if len(bars) < min_bars:
             continue
         arr = np.array(bars, dtype=float)
@@ -204,14 +247,14 @@ def _run_sweep(ex, days: int, custom_coins: list[str]) -> None:
 
     if custom_coins:
         syms = [f"{c}/USDT" for c in custom_coins if f"{c}/USDT" in ex.markets]
-        data = _load_data(ex, syms, since_ms, min_bars)
+        data = _load_data(ex, syms, since_ms, min_bars, now_ms)
         universe_sets["custom"] = data
         sweep_sizes = ["custom"]
     else:
         for n in UNIVERSE_SIZES:
             print(f"\n  Fetching top-{n} universe ...")
             syms = _get_symbols_for_size(ex, n, days, UNIVERSE_30)
-            data = _load_data(ex, syms, since_ms, min_bars)
+            data = _load_data(ex, syms, since_ms, min_bars, now_ms)
             universe_sets[n] = data
             print(
                 f"   {len(data)}/{len(syms)} coins qualified with >={min_bars} daily bars"

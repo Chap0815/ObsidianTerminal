@@ -25,7 +25,7 @@ from news.http_limits import (
     read_bounded_response,
     require_success,
 )
-from shared_limits import read_loopback_proxy_port
+from shared_limits import read_bounded_text_file, read_loopback_proxy_port
 
 # Load .env from PROJECT_ROOT explicitly.
 from core.paths import ENV_FILE
@@ -157,8 +157,7 @@ def load_prompt_template(*paths: str, fallback: str = "") -> str:
                 if cached[1]:
                     return cached[1]
                 continue
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read().strip()
+            content = read_bounded_text_file(path).strip()
             _PROMPT_CACHE[path] = (mtime, content)
             if content:
                 return content

@@ -15,6 +15,9 @@ from trading.profit_experiments import (
 )
 
 
+_EXPECTANCY_MODEL_JSON_MAX_BYTES = 1024 * 1024
+
+
 def save_expectancy_model(path: str | Path, model: LinearExpectancyModel) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -41,13 +44,16 @@ def save_expectancy_model(path: str | Path, model: LinearExpectancyModel) -> Non
 def load_expectancy_model(path: str | Path) -> LinearExpectancyModel | None:
     target = Path(path)
     try:
-        with open(target, encoding="utf-8") as handle:
-            payload = json.load(
-                handle,
-                parse_constant=lambda value: (_ for _ in ()).throw(
-                    ValueError(f"non-standard JSON constant: {value}")
-                ),
-            )
+        with open(target, "rb") as handle:
+            raw = handle.read(_EXPECTANCY_MODEL_JSON_MAX_BYTES + 1)
+        if len(raw) > _EXPECTANCY_MODEL_JSON_MAX_BYTES:
+            raise ValueError("expectancy model JSON exceeds size limit")
+        payload = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-standard JSON constant: {value}")
+            ),
+        )
         if not isinstance(payload, dict):
             return None
         for key in (

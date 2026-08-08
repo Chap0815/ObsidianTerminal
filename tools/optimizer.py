@@ -68,7 +68,23 @@ from core.logger import log_separator
 #  Deterministic optimizer runs (fixed seed)
 # monte_carlo_perturbation seeds its RNG with this so runs are reproducible.
 # Override via OPTIMIZER_SEED env.
-_OPTIMIZER_SEED = int(os.getenv("OPTIMIZER_SEED", "42"))
+def _optimizer_seed_from_env(raw=None) -> int:
+    value = os.getenv("OPTIMIZER_SEED", "42") if raw is None else raw
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 42
+
+
+_OPTIMIZER_SEED = _optimizer_seed_from_env()
+OPTIMIZER_CONFIG_MAX_BYTES = 2 * 1024 * 1024
+_OPTIMIZER_POSITION_LIMITS = {
+    "SPOT": 500.0,
+    "FUTURES": 500.0,
+    "CROSS": 500.0,
+    "TREND": 2500.0,
+    "FUTREND": 2500.0,
+}
 
 
 #  Lpez de Prado anti-overfit constants
@@ -1152,7 +1168,58 @@ class Progress:
 #  Haupt-Optimizer
 
 
-def _resolve_leverage(strategy: str, override: float = None) -> float:
+def _bounded_optimizer_number(value, low: float, high: float) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return max(low, min(high, number))
+
+
+def _validate_optimizer_run_inputs(
+    strategy,
+    days,
+    top_n,
+    k_folds,
+    holdout_frac,
+    om_window,
+    funding_8h,
+) -> None:
+    if strategy not in FULL_SPACE or strategy not in QUICK_SPACE:
+        raise ValueError(f"unsupported optimizer strategy {strategy!r}")
+    for name, value, minimum in (
+        ("days", days, 1),
+        ("top_n", top_n, 1),
+        ("k_folds", k_folds, 2),
+        ("om_window", om_window, 1),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}")
+    for name, value in (
+        ("holdout_frac", holdout_frac),
+        ("funding_8h", funding_8h),
+    ):
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be finite")
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} must be finite") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{name} must be finite")
+        if name == "holdout_frac" and not 0.0 <= number < 0.9:
+            raise ValueError("holdout_frac must be >= 0 and < 0.9")
+
+
+def _resolve_leverage(
+    strategy: str,
+    override: float = None,
+    live_config: dict | None = None,
+) -> float:
     """Determine the leverage the backtest should use.
 
     Priority: explicit CLI/arg override > the strategy's LIVE LEVERAGE in
@@ -1163,24 +1230,27 @@ def _resolve_leverage(strategy: str, override: float = None) -> float:
     liquidation/tail risk reflect the real position.
     """
     if override is not None:
-        try:
-            return max(1.0, float(override))
-        except (ValueError, TypeError):
-            pass
-    # bot_config.json lives in the project root (one level above tools/)
-    try:
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(root, "bot_config.json"), encoding="utf-8") as fh:
-            cfg = _json.load(fh)
-        lev = cfg.get(strategy, {}).get("LEVERAGE")
-        if lev is not None:
-            return max(1.0, float(lev))
-    except Exception:
-        pass
+        resolved = _bounded_optimizer_number(override, 1.0, 25.0)
+        if resolved is not None:
+            return resolved
+    section = (
+        _load_live_strategy_config(strategy)
+        if live_config is None
+        else live_config
+    )
+    if isinstance(section, dict):
+        resolved = _bounded_optimizer_number(section.get("LEVERAGE"), 1.0, 25.0)
+        if resolved is not None:
+            return resolved
     try:
         from tools.backtester import STRATEGY_DEFAULTS
 
-        return max(1.0, float(STRATEGY_DEFAULTS.get(strategy, {}).get("leverage", 1.0)))
+        resolved = _bounded_optimizer_number(
+            STRATEGY_DEFAULTS.get(strategy, {}).get("leverage", 1.0),
+            1.0,
+            25.0,
+        )
+        return resolved if resolved is not None else 1.0
     except Exception:
         return 1.0
 
@@ -1188,31 +1258,57 @@ def _resolve_leverage(strategy: str, override: float = None) -> float:
 def _load_live_strategy_config(strategy: str) -> dict:
     try:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(root, "bot_config.json"), encoding="utf-8-sig") as fh:
-            cfg = _json.load(fh)
+        with open(os.path.join(root, "bot_config.json"), "rb") as fh:
+            raw = fh.read(OPTIMIZER_CONFIG_MAX_BYTES + 1)
+        if len(raw) > OPTIMIZER_CONFIG_MAX_BYTES:
+            raise ValueError("optimizer config JSON exceeds size limit")
+        cfg = _json.loads(raw.decode("utf-8-sig"))
+        if not isinstance(cfg, dict):
+            return {}
         section = cfg.get(strategy, {})
         return section if isinstance(section, dict) else {}
     except Exception:
         return {}
 
 
-def _resolve_live_risk_params(strategy: str) -> dict:
-    section = _load_live_strategy_config(strategy)
+def _resolve_live_risk_params(
+    strategy: str, live_config: dict | None = None
+) -> dict:
+    section = (
+        _load_live_strategy_config(strategy)
+        if live_config is None
+        else live_config
+    )
+    if not isinstance(section, dict):
+        section = {}
     mapping = {
-        "POSITION_SIZE": "position_size",
-        "POSITION_SIZE_MAX": "position_size_max",
-        "MAX_OPEN_TRADES": "max_open_trades",
-        "MAX_NEW_TRADES_PER_TICK": "top_n_per_scan",
+        "MAX_OPEN_TRADES": ("max_open_trades", 1.0, 50.0, True),
+        "MAX_NEW_TRADES_PER_TICK": ("top_n_per_scan", 0.0, 50.0, True),
     }
     out = {}
-    for src, dst in mapping.items():
+    position_limit = _OPTIMIZER_POSITION_LIMITS.get(str(strategy).upper(), 500.0)
+    position_cap = None
+    if "POSITION_SIZE_MAX" in section:
+        position_cap = _bounded_optimizer_number(
+            section["POSITION_SIZE_MAX"], 0.0, position_limit
+        )
+        if position_cap is not None:
+            out["position_size_max"] = position_cap
+    if "POSITION_SIZE" in section:
+        position_size = _bounded_optimizer_number(
+            section["POSITION_SIZE"],
+            0.0,
+            position_cap if position_cap is not None else position_limit,
+        )
+        if position_size is not None:
+            out["position_size"] = position_size
+    for src, (dst, low, high, integer) in mapping.items():
         if src not in section:
             continue
-        try:
-            val = float(section[src])
-            out[dst] = int(val) if dst in {"max_open_trades", "top_n_per_scan"} else val
-        except (TypeError, ValueError):
+        val = _bounded_optimizer_number(section[src], low, high)
+        if val is None:
             continue
+        out[dst] = int(val) if integer else val
     return out
 
 
@@ -1231,11 +1327,21 @@ def run_optimizer(
     regime: bool = False,
     funding_8h: float = 0.0,
 ):
+    _validate_optimizer_run_inputs(
+        strategy,
+        days,
+        top_n,
+        k_folds,
+        holdout_frac,
+        om_window,
+        funding_8h,
+    )
 
     rt = calc_round_trip(use_maker, strategy)
     space = QUICK_SPACE[strategy] if quick else FULL_SPACE[strategy]
-    lev = _resolve_leverage(strategy, leverage)
-    live_risk_params = _resolve_live_risk_params(strategy)
+    live_config = _load_live_strategy_config(strategy)
+    lev = _resolve_leverage(strategy, leverage, live_config)
+    live_risk_params = _resolve_live_risk_params(strategy, live_config)
 
     log_separator("", 78, color="\033[96m")
     print(f"  STRATEGIE-OPTIMIZER v3  {strategy}")

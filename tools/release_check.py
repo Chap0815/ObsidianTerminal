@@ -81,6 +81,8 @@ FORBIDDEN_REL_PATHS = {
 }
 REQUIRED = REQUIRED_RELEASE_ITEMS
 _SHA256_REQUIREMENT_HASH_RE = re.compile(r"--hash=sha256:[0-9a-fA-F]{64}(?:\s|$)")
+RELEASE_METADATA_MAX_BYTES = 4 * 1024 * 1024
+RELEASE_TEXT_MAX_BYTES = 4 * 1024 * 1024
 
 
 def _sha256(path: Path) -> str:
@@ -91,12 +93,49 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _read_release_text(
+    path: Path,
+    *,
+    max_bytes: int,
+    label: str,
+    errors: str = "strict",
+) -> str:
+    with path.open("rb") as fh:
+        raw = fh.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"{label} exceeds size limit ({max_bytes} bytes)")
+    return raw.decode("utf-8-sig", errors=errors)
+
+
+def _canonical_manifest_path(value: object) -> str | None:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return None
+    if "\\" in value or "\x00" in value or ":" in value or value.startswith("/"):
+        return None
+    if any(part in {"", ".", ".."} for part in value.split("/")):
+        return None
+    return value
+
+
+def _resolved_within_root(path: Path, root: Path) -> Path | None:
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return resolved
+
+
 def _requirements_hash_errors(path: Path) -> list[str]:
     """Return lock-file errors that would weaken pip ``--require-hashes``."""
     errors: list[str] = []
     try:
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
-    except OSError as exc:
+        lines = _read_release_text(
+            path,
+            max_bytes=RELEASE_METADATA_MAX_BYTES,
+            label="requirements.lock.txt",
+        ).splitlines()
+    except (OSError, UnicodeError, ValueError) as exc:
         return [f"requirements.lock.txt unreadable: {exc}"]
     pins = 0
     for number, raw in enumerate(lines, 1):
@@ -268,7 +307,11 @@ def check_release(source: Path, strict_release_name: bool = False) -> tuple[list
     manifest_path = root / "DEPLOY_MANIFEST.json"
     if manifest_path.exists():
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+            manifest = json.loads(_read_release_text(
+                manifest_path,
+                max_bytes=RELEASE_METADATA_MAX_BYTES,
+                label="DEPLOY_MANIFEST.json",
+            ))
             if not manifest.get("build_id"):
                 errors.append("DEPLOY_MANIFEST.json has no build_id")
             files = manifest.get("files")
@@ -279,11 +322,22 @@ def check_release(source: Path, strict_release_name: bool = False) -> tuple[list
             else:
                 by_path = {}
                 for item in files:
-                    rel = item.get("path") if isinstance(item, dict) else None
-                    if not rel:
+                    raw_rel = item.get("path") if isinstance(item, dict) else None
+                    rel = _canonical_manifest_path(raw_rel)
+                    if raw_rel is None:
                         errors.append("DEPLOY_MANIFEST.json has file without path")
                         continue
-                    by_path[str(rel).replace("\\", "/")] = item
+                    if rel is None:
+                        errors.append(
+                            f"DEPLOY_MANIFEST.json unsafe manifest path: {raw_rel}"
+                        )
+                        continue
+                    if rel in by_path:
+                        errors.append(
+                            f"DEPLOY_MANIFEST.json duplicate manifest path: {rel}"
+                        )
+                        continue
+                    by_path[rel] = item
                 for rel in REQUIRED_MANIFEST_FILES:
                     rel_norm = rel.replace("\\", "/")
                     if rel_norm not in by_path:
@@ -321,9 +375,16 @@ def check_release(source: Path, strict_release_name: bool = False) -> tuple[list
                             f"DEPLOY_MANIFEST.json references missing file: {rel_norm}"
                         )
                         continue
+                    resolved_path = _resolved_within_root(path, root)
+                    if resolved_path is None:
+                        errors.append(
+                            "DEPLOY_MANIFEST.json path escapes release root: "
+                            f"{rel_norm}"
+                        )
+                        continue
                     try:
-                        size = path.stat().st_size
-                        digest = _sha256(path)
+                        size = resolved_path.stat().st_size
+                        digest = _sha256(resolved_path)
                     except OSError as exc:
                         errors.append(
                             f"DEPLOY_MANIFEST.json cannot hash {rel_norm}: {exc}"
@@ -355,6 +416,9 @@ def check_release(source: Path, strict_release_name: bool = False) -> tuple[list
 
     for path in paths:
         rel = path.relative_to(root)
+        if _resolved_within_root(path, root) is None:
+            errors.append(f"release path escapes release root: {rel}")
+            continue
         parts_lower = {part.lower() for part in rel.parts}
         forbidden_dirs_lower = {part.lower() for part in FORBIDDEN_DIRS}
         forbidden_rel_lower = {part.lower() for part in FORBIDDEN_REL_PATHS}
@@ -385,7 +449,15 @@ def check_release(source: Path, strict_release_name: bool = False) -> tuple[list
             continue
         if path.suffix.lower() in {".py", ".bat", ".iss", ".md", ".txt", ".json"}:
             try:
-                text = path.read_text(encoding="utf-8-sig", errors="replace")
+                text = _read_release_text(
+                    path,
+                    max_bytes=RELEASE_TEXT_MAX_BYTES,
+                    label=str(rel),
+                    errors="replace",
+                )
+            except ValueError as exc:
+                errors.append(str(exc))
+                continue
             except OSError:
                 continue
             if _has_mojibake(text):

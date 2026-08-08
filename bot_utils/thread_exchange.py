@@ -177,6 +177,9 @@ class ThreadLocalExchange:
         # deep-copied markets clone until close_all(), leaking RSS over uptime.
         self._clones: list = []
         self._clones_lock = threading.Lock()
+        # A process-wide generation invalidates TLS slots owned by every
+        # thread.  Deleting ``self._tls.clone`` only affects the caller.
+        self._clone_generation = 0
         self._markets_refresh_lock = threading.Lock()
 
     #  Public helpers 
@@ -191,11 +194,16 @@ class ThreadLocalExchange:
     def close_all(self) -> None:
         """Close the HTTP session of every clone. Idempotent."""
         with self._clones_lock:
+            self._clone_generation += 1
             clones = [c for (_t, c) in self._clones]
             self._clones.clear()
         # Drop the TLS slot so the next call rebuilds a clone
         try:
             del self._tls.clone
+        except AttributeError:
+            pass
+        try:
+            del self._tls.clone_generation
         except AttributeError:
             pass
         for c in clones:
@@ -211,6 +219,10 @@ class ThreadLocalExchange:
             return
         try:
             del self._tls.clone
+        except AttributeError:
+            pass
+        try:
+            del self._tls.clone_generation
         except AttributeError:
             pass
         with self._clones_lock:
@@ -291,21 +303,32 @@ class ThreadLocalExchange:
         with self._clones_lock:
             return len(self._clones)
 
-    def _index_clone(self, clone) -> None:
-        """Register a freshly built clone against its owning thread."""
-        with self._clones_lock:
-            self._clones.append((threading.current_thread(), clone))
-
     #  Internal: per-thread clone resolution 
 
     def _get_clone(self):
         clone = getattr(self._tls, "clone", None)
-        if clone is not None:
+        generation = self._clone_generation
+        if (
+            clone is not None
+            and getattr(self._tls, "clone_generation", None) == generation
+        ):
             return clone
-        clone = _build_clone(self._base)
-        self._tls.clone = clone
-        self._index_clone(clone)   # track owning thread for reaping
-        return clone
+        # Serialize build + registration with close_all().  Otherwise a clone
+        # built while close_all() clears the index can escape that close and
+        # remain live but untracked.
+        with self._clones_lock:
+            generation = self._clone_generation
+            clone = getattr(self._tls, "clone", None)
+            if (
+                clone is not None
+                and getattr(self._tls, "clone_generation", None) == generation
+            ):
+                return clone
+            clone = _build_clone(self._base)
+            self._tls.clone = clone
+            self._tls.clone_generation = generation
+            self._clones.append((threading.current_thread(), clone))
+            return clone
 
     #  Attribute proxying 
 

@@ -3,6 +3,20 @@
 import os
 
 API_RATE_HARD_MAX_PER_MINUTE = 100_000_000
+PROMPT_TEXT_MAX_BYTES = 256 * 1024
+
+
+def read_bounded_text_file(
+    path,
+    *,
+    max_bytes: int = PROMPT_TEXT_MAX_BYTES,
+    encoding: str = "utf-8",
+) -> str:
+    with open(path, "rb") as stream:
+        raw = stream.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError("text file exceeds size limit")
+    return raw.decode(encoding)
 
 
 def normalize_gate_mode(value) -> str:

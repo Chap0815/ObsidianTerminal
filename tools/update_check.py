@@ -24,14 +24,36 @@ UPDATE_STATUS_PATH = ROOT / "logs" / "update_status.json"
 CONFIG_PATHS = [
     CONFIG_PATH,
 ]
+_UPDATE_JSON_MAX_BYTES = 1024 * 1024
 
 
 def _read_json(path: Path) -> dict:
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        with open(path, "rb") as stream:
+            raw = stream.read(_UPDATE_JSON_MAX_BYTES + 1)
+        if len(raw) > _UPDATE_JSON_MAX_BYTES:
+            raise ValueError("update JSON exceeds size limit")
+        data = json.loads(raw.decode("utf-8-sig"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _parse_git_object_id(value: str) -> str:
+    candidate = str(value or "").strip()
+    if re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", candidate):
+        return candidate.lower()
+    return ""
+
+
+def _parse_ls_remote_output(value: str, expected_ref: str) -> str:
+    lines = [line.strip() for line in str(value or "").splitlines() if line.strip()]
+    if len(lines) != 1:
+        return ""
+    fields = lines[0].split()
+    if len(fields) != 2 or fields[1] != expected_ref:
+        return ""
+    return _parse_git_object_id(fields[0])
 
 
 def _repo_config() -> tuple[str, str]:
@@ -145,7 +167,10 @@ def check_update() -> dict:
             "message": detail.strip()[:300],
             "last_update": _last_update_status(),
         }
-    remote_hash = (remote.stdout.split() or [""])[0]
+    remote_hash = _parse_ls_remote_output(
+        remote.stdout,
+        f"refs/heads/{branch}",
+    )
     if not remote_hash:
         return {
             "ok": False,
@@ -159,7 +184,7 @@ def check_update() -> dict:
     if is_valid_git_worktree(ROOT):
         local = _run([git, "rev-parse", "HEAD"], timeout=15)
         if local.returncode == 0:
-            local_hash = local.stdout.strip()
+            local_hash = _parse_git_object_id(local.stdout)
         if local_hash and local_hash != remote_hash:
             ahead = _run([git, "merge-base", "--is-ancestor", remote_hash, "HEAD"], timeout=15)
             local_ahead = ahead.returncode == 0

@@ -44,6 +44,35 @@ def _utc_now_str() -> str:
 
 
 _LIVE_RESIDUAL_DUST_USDT = 1.0
+_POSITIONS_JSON_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _read_positions_json(path: str):
+    with open(path, "rb") as stream:
+        raw = stream.read(_POSITIONS_JSON_MAX_BYTES + 1)
+    if len(raw) > _POSITIONS_JSON_MAX_BYTES:
+        raise ValueError("position state JSON exceeds size limit")
+    return json.loads(raw.decode("utf-8-sig"))
+
+
+def _close_exchange_quietly(exchange) -> None:
+    """Best-effort close for a one-shot synchronous CCXT client."""
+    if exchange is None:
+        return
+    try:
+        close = getattr(exchange, "close", None)
+        if callable(close):
+            close()
+            return
+    except Exception:
+        pass
+    try:
+        session = getattr(exchange, "session", None)
+        close = getattr(session, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
 
 
 class _LauncherCloseBudgetUnavailable(RuntimeError):
@@ -454,8 +483,7 @@ def _json_state_has_open_position(path: str) -> bool:
     if not os.path.exists(path):
         return False
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = _read_positions_json(path)
     except Exception:
         return True
     if data is None:
@@ -532,8 +560,7 @@ def get_open_spot_positions(bot_name: str,
         path = _state_path_for(bot_name, effective_sim)
         if not os.path.exists(path):
             return []
-        with open(path, "r", encoding="utf-8") as f:
-            loaded_state = json.load(f)
+        loaded_state = _read_positions_json(path)
         if loaded_state is None:
             data = {}
         elif isinstance(loaded_state, dict):
@@ -636,6 +663,13 @@ def refresh_spot_positions_with_live_prices(positions: list) -> list:
             type(e).__name__,
         )
 
+    try:
+        return _refresh_spot_positions_with_exchange(positions, ex)
+    finally:
+        _close_exchange_quietly(ex)
+
+
+def _refresh_spot_positions_with_exchange(positions: list, ex) -> list:
     refreshed: list = []
     for p in positions:
         p2 = dict(p)
@@ -767,6 +801,13 @@ def refresh_positions_with_live_prices(positions: list) -> list:
             type(e).__name__,
         )
 
+    try:
+        return _refresh_futures_positions_with_exchange(positions, ex)
+    finally:
+        _close_exchange_quietly(ex)
+
+
+def _refresh_futures_positions_with_exchange(positions: list, ex) -> list:
     refreshed: list = []
     for p in positions:
         p2 = dict(p)
@@ -861,6 +902,29 @@ def direct_close_remaining_futures(
     reason: str = "Manual Stop",
     bot_name: str = "FUTURES",
 ) -> dict:
+    """Run the futures fallback close and release its one-shot client."""
+    owned_exchanges: list = []
+    try:
+        return _direct_close_remaining_futures(
+            log,
+            sim_only,
+            reason=reason,
+            bot_name=bot_name,
+            _owned_exchanges=owned_exchanges,
+        )
+    finally:
+        for exchange in owned_exchanges:
+            _close_exchange_quietly(exchange)
+
+
+def _direct_close_remaining_futures(
+    log,
+    sim_only: bool,
+    reason: str = "Manual Stop",
+    bot_name: str = "FUTURES",
+    *,
+    _owned_exchanges: list,
+) -> dict:
     """Close anything still in ``futures_state`` / ``trades.json`` directly.
 
     SCOPED to ``bot_name`` (default FUTURES). futures_state is shared with the
@@ -938,8 +1002,7 @@ def direct_close_remaining_futures(
     json_trades: dict = {}
     try:
         if os.path.exists(trades_file):
-            with open(trades_file, "r", encoding="utf-8") as f:
-                loaded_state = json.load(f)
+            loaded_state = _read_positions_json(trades_file)
             if loaded_state is None:
                 json_trades = {}
             elif isinstance(loaded_state, dict):
@@ -1088,6 +1151,7 @@ def direct_close_remaining_futures(
     try:
         from config.exchange_config import get_futures_exchange_connection  # type: ignore
         ex = get_futures_exchange_connection()
+        _owned_exchanges.append(ex)
     except Exception as e:
         log("warn", f"Exchange nicht erreichbar  nutze gespeicherte Werte: {e}")
 
@@ -2050,8 +2114,7 @@ def direct_close_remaining_futures(
         if failed_syms:
             cur = {}
             try:
-                with open(trades_file, encoding="utf-8") as fr:
-                    cur = json.load(fr) or {}
+                cur = _read_positions_json(trades_file) or {}
             except Exception as e:
                 log("warn", f"State re-read failed during cleanup: {e}")
             for sym in failed_syms:
@@ -2090,6 +2153,29 @@ def direct_close_remaining_spot(
     sim_only: bool,
     reason: str = "Manual Stop",
 ) -> dict:
+    """Run the spot fallback close and release its one-shot client."""
+    owned_exchanges: list = []
+    try:
+        return _direct_close_remaining_spot(
+            bot_name,
+            log,
+            sim_only,
+            reason=reason,
+            _owned_exchanges=owned_exchanges,
+        )
+    finally:
+        for exchange in owned_exchanges:
+            _close_exchange_quietly(exchange)
+
+
+def _direct_close_remaining_spot(
+    bot_name: str,
+    log,
+    sim_only: bool,
+    reason: str = "Manual Stop",
+    *,
+    _owned_exchanges: list,
+) -> dict:
     """Spot equivalent of :func:`direct_close_remaining_futures`.
 
     Anything still in ``{log_dir}/trades.json`` after a graceful shutdown
@@ -2109,8 +2195,7 @@ def direct_close_remaining_spot(
     json_trades: dict = {}
     try:
         if os.path.exists(trades_file):
-            with open(trades_file, "r", encoding="utf-8") as f:
-                loaded_state = json.load(f)
+            loaded_state = _read_positions_json(trades_file)
             if loaded_state is None:
                 json_trades = {}
             elif isinstance(loaded_state, dict):
@@ -2144,6 +2229,7 @@ def direct_close_remaining_spot(
         try:
             from config.exchange_config import get_spot_exchange_connection  # type: ignore
             ex = get_spot_exchange_connection()
+            _owned_exchanges.append(ex)
         except Exception as e:
             log("warn", f"Exchange unreachable - using stored values: {e}")
 
@@ -2770,8 +2856,7 @@ def direct_close_remaining_spot(
         if failed_syms:
             cur = {}
             try:
-                with open(trades_file, encoding="utf-8") as fr:
-                    cur = json.load(fr) or {}
+                cur = _read_positions_json(trades_file) or {}
             except Exception as e:
                 log("warn", f"State re-read failed during cleanup: {e}")
             for sym in failed_syms:

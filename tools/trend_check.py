@@ -35,6 +35,7 @@ Run
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -54,7 +55,49 @@ DEFAULT_DAYS = 365
 DEFAULT_COINS = ["BTC", "ETH", "BNB", "XRP", "SOL"]
 # Cost per position switch (one side), spot-taker-ish. Round trip = 2. Few
 # trades on daily trend, so this is minor. Override TREND_COST_PCT.
-COST = float(os.getenv("TREND_COST_PCT", "0.10")) / 100.0
+def _trend_cost_from_env(raw=None) -> float:
+    value = os.getenv("TREND_COST_PCT", "0.10") if raw is None else raw
+    if isinstance(value, bool):
+        return 0.001
+    try:
+        percent = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.001
+    if math.isfinite(percent) and 0.0 <= percent < 100.0:
+        return percent / 100.0
+    return 0.001
+
+
+COST = _trend_cost_from_env()
+
+
+def _validated_trend_ohlc(series, *, since_ms: int, until_ms: int) -> list:
+    if not isinstance(series, (list, tuple)):
+        return []
+    candles = {}
+    for row in series:
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
+            continue
+        if isinstance(row[0], bool):
+            continue
+        try:
+            timestamp = float(row[0])
+            open_, high, low, close = (float(row[index]) for index in range(1, 5))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if (
+            not timestamp.is_integer()
+            or not since_ms <= timestamp <= until_ms
+            or any(
+                not math.isfinite(value) or value <= 0.0
+                for value in (open_, high, low, close)
+            )
+            or high < max(open_, close)
+            or low > min(open_, close)
+        ):
+            continue
+        candles[int(timestamp)] = [int(timestamp), open_, high, low, close]
+    return [candles[timestamp] for timestamp in sorted(candles)]
 
 
 def _fetch_ohlc(ex, symbol: str, days: int) -> list:
@@ -70,7 +113,7 @@ def _fetch_ohlc(ex, symbol: str, days: int) -> list:
     except Exception as e:
         print(f"   [WARN] {symbol}: {type(e).__name__}: {e}")
         return []
-    return [b for b in series if since <= b[0] <= now_ms]
+    return _validated_trend_ohlc(series, since_ms=since, until_ms=now_ms)
 
 
 def _sma(a: np.ndarray, n: int) -> np.ndarray:

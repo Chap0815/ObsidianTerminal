@@ -8,20 +8,25 @@ MAX_RSS_RESPONSE_BYTES = 2 * 1024 * 1024
 _STREAM_CHUNK_BYTES = 64 * 1024
 
 
+def _close_response_quietly(response) -> None:
+    try:
+        closer = getattr(response, "close", None)
+        if callable(closer):
+            closer()
+    except Exception:
+        pass
+
+
 def require_success(response) -> None:
     """Raise for an HTTP failure and always release a streamed response."""
     checker = getattr(response, "raise_for_status", None)
     if not callable(checker):
+        _close_response_quietly(response)
         raise ValueError("response does not expose status validation")
     try:
         checker()
     except BaseException:
-        closer = getattr(response, "close", None)
-        if callable(closer):
-            try:
-                closer()
-            except Exception:
-                pass
+        _close_response_quietly(response)
         raise
 
 
@@ -86,7 +91,10 @@ def read_bounded_json_response(
     ):
         payload = read_bounded_response(response, max_bytes=max_bytes)
         return json.loads(payload)
-    decoder = getattr(response, "json", None)
-    if not callable(decoder):
-        raise ValueError("response does not expose JSON content")
-    return decoder()
+    try:
+        decoder = getattr(response, "json", None)
+        if not callable(decoder):
+            raise ValueError("response does not expose JSON content")
+        return decoder()
+    finally:
+        _close_response_quietly(response)

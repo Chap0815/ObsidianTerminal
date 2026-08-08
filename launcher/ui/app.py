@@ -29,9 +29,12 @@ import tkinter as tk
 import webbrowser
 from contextlib import suppress
 from datetime import datetime
+from pathlib import Path
 
 import customtkinter as ctk
 import requests as _req
+
+from bot_utils.config import _read_config_json
 
 try:
     import psutil  # noqa: F401  (used inside _refresh via HAS_PSUTIL)
@@ -58,6 +61,20 @@ def _ui_nonnegative_int(value, default: int = 0) -> int:
         return default
     return parsed if parsed >= 0 else default
 
+
+def _read_ui_configured_model(default: str) -> str:
+    try:
+        if not os.path.exists(CONFIG_FILE):
+            return default
+        config = _read_config_json(CONFIG_FILE)
+        raw_model = config.get("LLM_MODEL") if isinstance(config, dict) else None
+        if not isinstance(raw_model, str):
+            return default
+        model = raw_model.strip()
+        return model if 0 < len(model) <= 256 else default
+    except Exception:
+        return default
+
 # Modular launcher imports
 from launcher.config.settings import (
     BOT_META,
@@ -81,6 +98,33 @@ from launcher.config.settings import (
     subprocess_no_window_kwargs,
 )
 from launcher.tool_processes import ToolProcessRegistry, stop_tool_processes
+
+_ERROR_LOG_VIEW_MAX_BYTES = 1024 * 1024
+
+
+def _error_log_path() -> str:
+    return os.path.join(PROJECT_ROOT, "error_log.txt")
+
+
+def _read_error_log_tail(
+    path: str | None = None,
+    *,
+    max_bytes: int = _ERROR_LOG_VIEW_MAX_BYTES,
+) -> str:
+    target = path or _error_log_path()
+    limit = max(1, int(max_bytes))
+    with open(target, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        start = max(0, size - limit)
+        handle.seek(start)
+        raw = handle.read(limit)
+    if start:
+        _separator, found, tail = raw.partition(b"\n")
+        raw = tail if found else raw
+    text = raw.decode("utf-8", errors="replace").strip()
+    return f"[... error log truncated ...]\n{text}" if start else text
+
 # Defensive: PARAM_DEFS_TREND is new (v3.5). If an OLDER settings.py is
 # deployed alongside this app.py, a hard import would blank the entire UI.
 # Fall back to the spot param set so the launcher always loads.
@@ -100,12 +144,13 @@ try:
 except ImportError:
     PARAM_DEFS_FUTREND = PARAM_DEFS_FUTURES
 from launcher.core.process_manager import BotProcess, BoundedLogQueue
+from launcher.core.metrics_service import read_ollama_model_names
 from launcher.core.runtime_status_values import (
     finite_float_or_none,
     positive_int_or_zero,
     strict_bool_or_none,
 )
-from core.runtime_status import read_runtime_status
+from core.runtime_status import _read_json, read_runtime_status
 from launcher.core.system_monitor import HAS_PSUTIL
 from launcher.state.poller import DataPoller, _runtime_status_is_fresh
 from launcher.ui.components.widgets import (
@@ -118,6 +163,19 @@ from launcher.ui.components.widgets import (
 from launcher.ui.dialogs.prompt_editor import PromptEditor
 from launcher.ui.scaling import apply_scaling
 from launcher.ui.theme import force_dark_titlebar
+
+
+def _fetch_ollama_model_names(endpoint: str, *, timeout: float) -> list[str]:
+    path = str(endpoint or "").strip()
+    if not path.startswith("/") or any(ord(char) < 32 for char in path):
+        raise ValueError("invalid Ollama probe endpoint")
+    response = _req.get(
+        f"{OLLAMA_URL.rstrip('/')}{path}",
+        timeout=timeout,
+        stream=True,
+    )
+    names = read_ollama_model_names(response)
+    return names if names is not None else []
 
 
 ctk.set_appearance_mode("dark")
@@ -2305,8 +2363,8 @@ class ObsidianApp(ctk.CTk):
     @staticmethod
     def _current_dashboard_build_id() -> str:
         try:
-            with open(os.path.join(PROJECT_ROOT, "DEPLOY_MANIFEST.json"), "r", encoding="utf-8") as fh:
-                return str((json.load(fh) or {}).get("build_id") or "")
+            manifest = _read_json(Path(PROJECT_ROOT) / "DEPLOY_MANIFEST.json")
+            return str(manifest.get("build_id") or "")
         except Exception:
             return ""
 
@@ -2378,8 +2436,7 @@ class ObsidianApp(ctk.CTk):
         self, entry: dict[str, int | float]
     ) -> bool:
         try:
-            with open(self._dashboard_status_path(), "r", encoding="utf-8") as fh:
-                status = json.load(fh) or {}
+            status = _read_json(Path(self._dashboard_status_path()))
         except Exception:
             return False
         try:
@@ -3034,11 +3091,7 @@ class ObsidianApp(ctk.CTk):
         try:
             #  Step 1: probe what's loaded 
             try:
-                r = _rq.get(f"{OLLAMA_URL}/api/ps", timeout=2.0)
-                if r.status_code == 200:
-                    loaded = [m["name"] for m in r.json().get("models", [])]
-                else:
-                    loaded = []
+                loaded = _fetch_ollama_model_names("/api/ps", timeout=2.0)
             except Exception as e:
                 _log("warn", f"Ollama probe failed ({type(e).__name__})  "
                               f"new model will load on first bot request")
@@ -3217,13 +3270,7 @@ class ObsidianApp(ctk.CTk):
             from core.constants import LLM_MODEL_DEFAULT as _LLM_DEFAULT
         except Exception:
             _LLM_DEFAULT = "qwen2.5:14b"
-        current = _LLM_DEFAULT
-        try:
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, encoding="utf-8-sig") as f:
-                    current = json.load(f).get("LLM_MODEL", current)
-        except Exception:
-            pass
+        current = _read_ui_configured_model(_LLM_DEFAULT)
 
         # Show the currently-configured model prominently so the user can
         # tell at a glance whether their last "Apply" stuck.
@@ -3277,9 +3324,9 @@ class ObsidianApp(ctk.CTk):
             """Background worker: fetches model list, schedules UI update."""
             local_installed = []
             try:
-                r = _req.get(f"{OLLAMA_URL}/api/tags", timeout=2)
-                if r.status_code == 200:
-                    local_installed = [m["name"] for m in r.json().get("models", [])]
+                local_installed = _fetch_ollama_model_names(
+                    "/api/tags", timeout=2.0
+                )
             except Exception:
                 pass
             # Apply on UI thread
@@ -3340,6 +3387,7 @@ class ObsidianApp(ctk.CTk):
     #  ERROR LOG VIEWER 
 
     def _show_error_log(self):
+        error_log_path = _error_log_path()
         dlg = ctk.CTkToplevel(self)
         dlg.title("Error Log")
         dlg.geometry("780x520")
@@ -3361,8 +3409,8 @@ class ObsidianApp(ctk.CTk):
             log cleared" (the badge would reappear on the next poll).
             """
             try:
-                with open("error_log.txt", "w") as f:
-                    f.close()
+                with open(error_log_path, "w", encoding="utf-8"):
+                    pass
                 box.config(state="normal")
                 box.delete("1.0", "end")
                 box.insert("end", "Error log cleared.")
@@ -3422,10 +3470,9 @@ class ObsidianApp(ctk.CTk):
         sb.pack(side="right", fill="y")
         box.config(yscrollcommand=sb.set)
         box.config(state="normal")
-        if os.path.exists("error_log.txt"):
+        if os.path.exists(error_log_path):
             try:
-                with open("error_log.txt", encoding="utf-8") as f:
-                    content = f.read().strip()
+                content = _read_error_log_tail(error_log_path)
                 box.insert("end", content if content else "No errors logged.")
             except Exception:
                 box.insert("end", "Could not read error log.")
