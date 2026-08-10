@@ -2656,12 +2656,3 @@ class FuturesReconcileMixin:
             except Exception as e:
                 self._entry_recovery_blocked = True
                 self._log_error("periodic reconciliation", e)
-
-            # Execution markouts are persisted at fill time, so this bounded
-            # worker resumes cleanly after a process or Windows restart.
-            try:
-                from trading.execution_quality import process_due_tca_markouts
-
-                process_due_tca_markouts(self.ex, limit=25)
-            except Exception as e:
-                self._log_error("execution TCA markouts", e)

@@ -432,6 +432,9 @@ def _check_config(bot_name: str | None,
             ("MAX_NEW_TRADES_PER_TICK", 0.0, 50.0),
             ("ENTRY_QUALITY_FILTER_ENABLED", 0.0, 1.0),
             ("ENTRY_QUALITY_MIN_SCORE", 0.0, 100.0),
+            ("ENTRY_QUALITY_SHADOW_ENABLED", 0.0, 1.0),
+            ("ENTRY_QUALITY_SHADOW_MIN_SCORE", 0.0, 100.0),
+            ("SPOT_EXIT_SHADOW_ENABLED", 0.0, 1.0),
             ("XSEC_K", 1.0, 15.0),
             ("XSEC_LOOKBACK_HOURS", 6.0, 336.0),
             ("XSEC_REBALANCE_HOURS", 6.0, 336.0),
@@ -448,7 +451,11 @@ def _check_config(bot_name: str | None,
             if key not in section:
                 continue
             try:
-                if key == "ENTRY_QUALITY_FILTER_ENABLED":
+                if key in {
+                    "ENTRY_QUALITY_FILTER_ENABLED",
+                    "ENTRY_QUALITY_SHADOW_ENABLED",
+                    "SPOT_EXIT_SHADOW_ENABLED",
+                }:
                     bool_val = _to_bool(section.get(key))
                     if bool_val is None:
                         issues.append(_issue(

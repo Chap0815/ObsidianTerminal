@@ -97,6 +97,68 @@ class FuturesScanMixin:
         return self._bool_cfg_value(
             self.C("ENTRY_QUALITY_FILTER_ENABLED", True), True)
 
+    def _entry_quality_shadow_enabled(self) -> bool:
+        return (
+            str(getattr(self, "BOT_NAME", "")).upper() == "FUTURES"
+            and self._bool_cfg_value(
+                self.C("ENTRY_QUALITY_SHADOW_ENABLED", False), False
+            )
+        )
+
+    def _entry_quality_shadow_min_score(self) -> float:
+        raw = self._finite_float(
+            self.C("ENTRY_QUALITY_SHADOW_MIN_SCORE", 85.0), 85.0
+        )
+        return max(0.0, min(100.0, raw))
+
+    def _record_entry_quality_shadow(
+        self, *, quality: EntryQuality, entry_id: str, symbol: str,
+        direction: str,
+    ) -> None:
+        """Log an alternative score policy without changing admission."""
+        if not self._entry_quality_shadow_enabled():
+            return
+        try:
+            from core.logger import log_struct
+            from trading.entry_score_shadow import evaluate_entry_score_shadow
+
+            score_error = "score_error" in quality.reasons
+            decision = evaluate_entry_score_shadow(
+                score=quality.score,
+                min_score=self._entry_quality_shadow_min_score(),
+                score_error=score_error,
+            )
+            actual_min_score = self._entry_quality_min_score()
+            actual_filter_enabled = self._entry_quality_filter_enabled()
+            actual_would_block = (
+                not self.simulation
+                and actual_filter_enabled
+                and (score_error or quality.score < actual_min_score)
+            )
+            log_struct(
+                "futures_entry_score_shadow",
+                bot=self.BOT_NAME,
+                entry_id=entry_id,
+                symbol=symbol,
+                direction=direction,
+                mode="SIM" if self.simulation else "LIVE",
+                entry_quality_label=quality.label,
+                entry_quality_reasons=list(quality.reasons),
+                actual_filter_enabled=actual_filter_enabled,
+                actual_min_score=actual_min_score,
+                actual_would_block=actual_would_block,
+                **decision,
+            )
+        except Exception as exc:
+            if not getattr(self, "_entry_score_shadow_error_logged", False):
+                self._entry_score_shadow_error_logged = True
+                try:
+                    self._log_error(
+                        f"futures entry score shadow {symbol}", exc
+                    )
+                except Exception:
+                    pass
+
     @staticmethod
     def _spread_pct_from_ticker(ticker: dict | None) -> float | None:
         if not has_valid_spread_quotes(ticker):
@@ -743,6 +805,13 @@ class FuturesScanMixin:
             log_struct("futures_entry_quality", **quality_fields)
         except Exception:
             pass
+        FuturesScanMixin._record_entry_quality_shadow(
+            self,
+            quality=quality,
+            entry_id=entry_id,
+            symbol=sym,
+            direction=direction,
+        )
         if (not self.simulation and self._entry_quality_filter_enabled()
                 and ("score_error" in quality.reasons
                      or quality.score < self._entry_quality_min_score())):

@@ -146,7 +146,12 @@ def _candidate_events(root: Path, bot: str, mode: str) -> dict[str, dict]:
 
 
 def build_expectancy_candidates(
-    root: str | Path, *, bot: str, mode: str, schema_version: int = 1
+    root: str | Path,
+    *,
+    bot: str,
+    mode: str,
+    schema_version: int = 1,
+    strategy_exits_only: bool = True,
 ) -> list[CandidateLabel]:
     project = Path(root)
     normalized_bot = str(bot).strip().upper()
@@ -165,9 +170,15 @@ def build_expectancy_candidates(
     try:
         if not _table_exists(conn, "trades"):
             return []
+        trade_columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(trades)")
+        }
+        reason_sql = "reason" if "reason" in trade_columns else "NULL AS reason"
         trade_rows = conn.execute(
             "SELECT entry_id, sell_time, profit_usdt, invested_usdt, "
-            "COALESCE(is_partial,0) AS is_partial, is_sim "
+            "COALESCE(is_partial,0) AS is_partial, is_sim, "
+            + reason_sql
+            + " "
             "FROM trades WHERE entry_id IS NOT NULL ORDER BY sell_time"
         ).fetchall()
     finally:
@@ -185,6 +196,14 @@ def build_expectancy_candidates(
             continue
         if not any(int(row["is_partial"] or 0) == 0 for row in campaign):
             continue
+        terminal_rows = [
+            row for row in campaign if int(row["is_partial"] or 0) == 0
+        ]
+        if strategy_exits_only:
+            from trading.exit_evidence import is_strategy_exit
+
+            if not is_strategy_exit(terminal_rows[-1]["reason"]):
+                continue
         if any(row["is_sim"] != expected_is_sim for row in campaign):
             continue
         closed_values = [_utc_datetime(row["sell_time"]) for row in campaign]
@@ -280,26 +299,88 @@ def load_execution_cost_observations(
     except FileNotFoundError:
         return []
     try:
-        if not all(_table_exists(conn, table) for table in ("execution_tca", "order_intents")):
+        if not _table_exists(conn, "execution_tca") or not (
+            _table_exists(conn, "order_intents")
+            or _table_exists(conn, "expectancy_candidates")
+        ):
             return []
-        intent_columns = {
-            str(row["name"]) for row in conn.execute("PRAGMA table_info(order_intents)")
-        }
-        if normalized_bot is not None and not {"bot_name", "mode"} <= intent_columns:
-            return []
+        has_intents = _table_exists(conn, "order_intents")
+        has_candidates = _table_exists(conn, "expectancy_candidates")
+        intent_columns = (
+            {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(order_intents)")
+            }
+            if has_intents else set()
+        )
+        intent_join = (
+            "LEFT JOIN order_intents i ON i.intent_id=t.intent_id "
+            if has_intents else ""
+        )
+        candidate_join = (
+            "LEFT JOIN expectancy_candidates e ON e.entry_id=t.intent_id "
+            if has_candidates else ""
+        )
+        bot_expr = (
+            "COALESCE(i.bot_name,e.bot_name)" if has_intents and has_candidates
+            else ("i.bot_name" if has_intents else "e.bot_name")
+        )
+        mode_expr = (
+            "COALESCE(i.mode,e.mode)" if has_intents and has_candidates
+            else ("i.mode" if has_intents else "e.mode")
+        )
+        symbol_expr = (
+            "COALESCE(i.symbol,e.symbol)" if has_intents and has_candidates
+            else ("i.symbol" if has_intents else "e.symbol")
+        )
+        notional_expr = (
+            "i.filled_notional"
+            if has_intents and "filled_notional" in intent_columns
+            else "NULL"
+        )
         scope_sql = ""
         params: tuple = ()
         if normalized_bot is not None:
-            scope_sql = "AND UPPER(i.bot_name)=? AND UPPER(i.mode)=? "
+            scope_sql = (
+                f"AND UPPER({bot_expr})=? AND UPPER({mode_expr})=? "
+            )
             params = (normalized_bot, normalized_mode)
-        records = conn.execute(
-            "SELECT t.intent_id, t.stage, t.payload_json, i.symbol, "
-            "i.filled_notional FROM execution_tca t JOIN order_intents i "
-            "ON i.intent_id=t.intent_id WHERE t.stage IN ('arrival','fill') "
+        records = list(conn.execute(
+            "SELECT t.intent_id, t.stage, t.payload_json, "
+            f"{symbol_expr} AS symbol, {notional_expr} AS filled_notional "
+            "FROM execution_tca t "
+            + intent_join
+            + candidate_join
+            + "WHERE t.stage IN ('arrival','fill') "
             + scope_sql
             + "ORDER BY t.id DESC LIMIT ?",
             (*params, max(1, min(100_000, int(limit)))),
-        ).fetchall()
+        ).fetchall())
+        if (
+            has_candidates
+            and _table_exists(conn, "sim_execution_tca")
+            and normalized_mode in {None, "SIM"}
+        ):
+            sim_scope_sql = ""
+            sim_params: tuple = ()
+            if normalized_bot is not None:
+                sim_scope_sql = "AND UPPER(e.bot_name)=? AND UPPER(e.mode)=? "
+                sim_params = (normalized_bot, normalized_mode)
+            records.extend(
+                conn.execute(
+                    """SELECT t.entry_id AS intent_id, t.stage, t.payload_json,
+                              e.symbol AS symbol, NULL AS filled_notional
+                         FROM sim_execution_tca t
+                         JOIN expectancy_candidates e ON e.entry_id=t.entry_id
+                        WHERE t.stage IN ('arrival','fill') """
+                    + sim_scope_sql
+                    + "ORDER BY t.id DESC LIMIT ?",
+                    (
+                        *sim_params,
+                        max(1, min(100_000, int(limit))),
+                    ),
+                ).fetchall()
+            )
     finally:
         conn.close()
     paired: dict[str, dict[str, dict]] = defaultdict(dict)
@@ -319,6 +400,9 @@ def load_execution_cost_observations(
         if not isinstance(arrival, dict) or not isinstance(fill, dict):
             continue
         symbol, notional = metadata[intent_id]
+        observed_notional = _finite(notional)
+        if observed_notional is None or observed_notional <= 0.0:
+            observed_notional = _finite(arrival.get("notional_usdt"))
         try:
             observations.append(
                 ExecutionCostObservation(
@@ -326,7 +410,7 @@ def load_execution_cost_observations(
                     total_cost_bps=fill["total_cost_bps"],
                     spread_bps=arrival["spread_bps"],
                     depth_coverage=arrival["depth_coverage"],
-                    notional_usdt=notional,
+                    notional_usdt=observed_notional,
                     regime=str(arrival.get("regime") or "unknown"),
                     volatility_bps=arrival.get("volatility_bps") or 0.0,
                 )
@@ -699,6 +783,124 @@ def _registry_status(root: Path) -> dict:
     }
 
 
+def build_observation_readiness(
+    root: str | Path,
+    *,
+    bot: str,
+    mode: str,
+    minimum_observed_days: int = 30,
+    minimum_regimes: int = 2,
+) -> dict:
+    """Fail-closed coverage gate for any later strategy/OOS claim."""
+    project = Path(root)
+    normalized_bot = str(bot).strip().upper()
+    normalized_mode = str(mode).strip().upper()
+    if normalized_bot not in EXPECTANCY_FEATURES:
+        raise ValueError("unsupported bot")
+    if normalized_mode not in {"LIVE", "SIM"}:
+        raise ValueError("mode must be LIVE or SIM")
+    required_days = max(1, int(minimum_observed_days))
+    required_regimes = max(1, int(minimum_regimes))
+    candidate_times = sorted(
+        event["candidate_time"]
+        for event in _candidate_events(
+            project, normalized_bot, normalized_mode
+        ).values()
+        if isinstance(event.get("candidate_time"), datetime)
+    )
+    observed_days = sorted({stamp.date().isoformat() for stamp in candidate_times})
+    span_days = (
+        (candidate_times[-1].date() - candidate_times[0].date()).days + 1
+        if candidate_times
+        else 0
+    )
+    regimes: set[str] = set()
+    path = project / "data" / "trading_bot.db"
+    if candidate_times:
+        try:
+            conn = _read_connection(path)
+        except FileNotFoundError:
+            conn = None
+        if conn is not None:
+            try:
+                if _table_exists(conn, "market_regime"):
+                    for row in conn.execute(
+                        """SELECT regime FROM market_regime
+                            WHERE timestamp >= ? AND timestamp <= ?""",
+                        (
+                            candidate_times[0].strftime("%Y-%m-%d %H:%M:%S"),
+                            candidate_times[-1].strftime("%Y-%m-%d %H:%M:%S"),
+                        ),
+                    ):
+                        regime = str(row["regime"] or "").strip().upper()
+                        if regime and regime not in {"UNKNOWN", "CACHED_FG"}:
+                            regimes.add(regime)
+            finally:
+                conn.close()
+    days_ready = len(observed_days) >= required_days
+    regimes_ready = len(regimes) >= required_regimes
+    return {
+        "first_candidate_at": (
+            candidate_times[0].isoformat() if candidate_times else None
+        ),
+        "last_candidate_at": (
+            candidate_times[-1].isoformat() if candidate_times else None
+        ),
+        "calendar_span_days": span_days,
+        "observed_utc_days": len(observed_days),
+        "minimum_observed_days": required_days,
+        "regimes": sorted(regimes),
+        "minimum_regimes": required_regimes,
+        "days_ready": days_ready,
+        "regimes_ready": regimes_ready,
+        "ready": days_ready and regimes_ready,
+    }
+
+
+def build_exit_evidence_report(root: str | Path) -> dict:
+    """Separate strategy exits from shutdown/reconcile/risk observations."""
+    path = Path(root) / "data" / "trading_bot.db"
+    try:
+        conn = _read_connection(path)
+    except FileNotFoundError:
+        return {"terminal_exits": 0, "by_class": {}, "by_scope": {}}
+    try:
+        if not _table_exists(conn, "trades"):
+            return {"terminal_exits": 0, "by_class": {}, "by_scope": {}}
+        columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(trades)")
+        }
+        required = {"bot_name", "is_sim", "is_partial"}
+        if not required <= columns:
+            return {"terminal_exits": 0, "by_class": {}, "by_scope": {}}
+        reason_sql = "reason" if "reason" in columns else "NULL AS reason"
+        rows = conn.execute(
+            "SELECT bot_name, is_sim, " + reason_sql + " "
+            "FROM trades WHERE COALESCE(is_partial,0)=0"
+        ).fetchall()
+    finally:
+        conn.close()
+    from trading.exit_evidence import classify_exit_reason
+
+    by_class: Counter = Counter()
+    by_scope: dict[str, Counter] = defaultdict(Counter)
+    for row in rows:
+        exit_class = classify_exit_reason(row["reason"])
+        bot = str(row["bot_name"] or "UNKNOWN").strip().upper()
+        mode = "SIM" if int(row["is_sim"] or 0) == 1 else "LIVE"
+        by_class[exit_class] += 1
+        by_scope[f"{bot}|{mode}"][exit_class] += 1
+    return {
+        "terminal_exits": len(rows),
+        "by_class": dict(sorted(by_class.items())),
+        "by_scope": {
+            scope: dict(sorted(counts.items()))
+            for scope, counts in sorted(by_scope.items())
+        },
+        "training_label_policy": "strategy_exit_only",
+    }
+
+
 def build_research_status(
     root: str | Path,
     *,
@@ -724,6 +926,9 @@ def build_research_status(
                 "closed_labels_by_schema": schema_counts,
                 "minimum_rows": int(minimum_expectancy_rows),
                 "ready": len(labels) >= int(minimum_expectancy_rows),
+                "observation_readiness": build_observation_readiness(
+                    project, bot=bot, mode=mode
+                ),
             }
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -734,6 +939,7 @@ def build_research_status(
         "ofi": build_ofi_report(project),
         "carry": build_carry_preview(project),
         "expectancy": expectancy,
+        "exit_evidence": build_exit_evidence_report(project),
         "experiments": _registry_status(project),
         "safety": {
             "writes_live_model": False,

@@ -1022,6 +1022,8 @@ def _run_migrations(conn) -> None:
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_execution_tca_intent "
               "ON execution_tca(intent_id, measured_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_execution_tca_measured "
+              "ON execution_tca(measured_at, id)")
     c.execute("""
     CREATE TABLE IF NOT EXISTS execution_markouts (
         intent_id          TEXT NOT NULL,
@@ -1049,6 +1051,48 @@ def _run_migrations(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_execution_markouts_retry "
         "ON execution_markouts(status, next_attempt_at, due_at)"
     )
+    c.execute("CREATE INDEX IF NOT EXISTS idx_execution_markouts_measured "
+              "ON execution_markouts(status, measured_at, due_at)")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS sim_execution_tca (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        entry_id           TEXT NOT NULL,
+        measured_at        TEXT NOT NULL,
+        stage              TEXT NOT NULL,
+        payload_json       TEXT NOT NULL
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sim_execution_tca_entry "
+              "ON sim_execution_tca(entry_id, measured_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sim_execution_tca_measured "
+              "ON sim_execution_tca(measured_at, id)")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS sim_execution_markouts (
+        entry_id           TEXT NOT NULL,
+        horizon_seconds    INTEGER NOT NULL,
+        symbol             TEXT NOT NULL,
+        side               TEXT NOT NULL,
+        reference_price    REAL NOT NULL,
+        due_at             TEXT NOT NULL,
+        status             TEXT NOT NULL DEFAULT 'PENDING',
+        attempts           INTEGER NOT NULL DEFAULT 0,
+        last_error         TEXT,
+        next_attempt_at    TEXT,
+        measured_at        TEXT,
+        mark_price         REAL,
+        markout_bps        REAL,
+        PRIMARY KEY(entry_id, horizon_seconds)
+    )""")
+    _add_column_if_missing(
+        conn, "sim_execution_markouts", "next_attempt_at", "TEXT"
+    )
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sim_execution_markouts_due "
+              "ON sim_execution_markouts(status, due_at)")
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sim_execution_markouts_retry "
+        "ON sim_execution_markouts(status, next_attempt_at, due_at)"
+    )
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sim_execution_markouts_measured "
+              "ON sim_execution_markouts(status, measured_at, due_at)")
     c.execute("""
     CREATE TABLE IF NOT EXISTS portfolio_snapshot_header (
         snapshot_id        TEXT PRIMARY KEY,
@@ -1117,6 +1161,42 @@ def _run_migrations(conn) -> None:
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_expectancy_candidates_scope "
               "ON expectancy_candidates(bot_name, mode, candidate_time)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_expectancy_candidates_time "
+              "ON expectancy_candidates(candidate_time, entry_id)")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS candidate_microstructure (
+        entry_id           TEXT NOT NULL,
+        stage              TEXT NOT NULL,
+        bot_name           TEXT NOT NULL,
+        mode               TEXT NOT NULL,
+        symbol             TEXT NOT NULL,
+        measured_at        TEXT NOT NULL,
+        source             TEXT NOT NULL,
+        sequence_status    TEXT NOT NULL,
+        payload_json       TEXT NOT NULL,
+        PRIMARY KEY(entry_id, stage)
+    )""")
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_candidate_microstructure_scope "
+        "ON candidate_microstructure(bot_name, mode, measured_at)"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_candidate_microstructure_measured "
+        "ON candidate_microstructure(measured_at, entry_id, stage)"
+    )
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS venue_capture_priority (
+        symbol             TEXT PRIMARY KEY,
+        bot_name           TEXT NOT NULL,
+        mode               TEXT NOT NULL,
+        reason             TEXT NOT NULL,
+        requested_at       TEXT NOT NULL,
+        expires_at         TEXT NOT NULL
+    )""")
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_venue_capture_priority_expiry "
+        "ON venue_capture_priority(expires_at, requested_at)"
+    )
     c.execute("""
     CREATE TABLE IF NOT EXISTS carry_campaigns (
         campaign_id        TEXT PRIMARY KEY,
@@ -1128,7 +1208,7 @@ def _run_migrations(conn) -> None:
     # Record current schema version  every successful migration run leaves a
     # fingerprint, useful for diagnostics ("did the migration run?") and for
     # future versioned migrations.
-    _CURRENT_SCHEMA_VERSION = 5
+    _CURRENT_SCHEMA_VERSION = 7
     try:
         existing = conn.execute(
             "SELECT version FROM schema_versions WHERE version=?",
@@ -2031,13 +2111,374 @@ def save_expectancy_candidate(
                  FROM expectancy_candidates WHERE entry_id=?""",
             (normalized_entry_id,),
         ).fetchone()
-        return existing is not None and tuple(existing) == values
+        matches = existing is not None and tuple(existing) == values
+        conn.commit()
+        return matches
     except sqlite3.Error:
         try:
             conn.rollback()
         except Exception:
             pass
         return False
+
+
+def save_candidate_microstructure(
+    *,
+    entry_id: str,
+    bot_name: str,
+    mode: str,
+    symbol: str,
+    stage: str,
+    measured_at: str,
+    source: str,
+    sequence_status: str,
+    payload: dict,
+) -> bool:
+    """Persist one immutable causal snapshot stage, idempotently."""
+    try:
+        normalized_entry_id = _causal_entry_id_db(entry_id, required=True)
+        normalized_bot = _required_text_db(
+            bot_name, "bot_name", max_length=32
+        ).upper()
+        if normalized_bot not in _CANONICAL_BOTS:
+            raise ValueError("bot_name is unknown")
+        normalized_mode = _required_text_db(mode, "mode", max_length=8).upper()
+        if normalized_mode not in {"LIVE", "SIM"}:
+            raise ValueError("mode is unknown")
+        normalized_symbol = _required_text_db(symbol, "symbol", max_length=64)
+        normalized_stage = _required_text_db(stage, "stage", max_length=64)
+        normalized_time, _ = _trade_timestamp_db(measured_at, "measured_at")
+        normalized_source = _required_text_db(source, "source", max_length=64)
+        normalized_sequence = _required_text_db(
+            sequence_status, "sequence_status", max_length=64
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dictionary")
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not _INIT_DB_DONE:
+        init_db()
+    conn = get_connection()
+    values = (
+        normalized_entry_id,
+        normalized_stage,
+        normalized_bot,
+        normalized_mode,
+        normalized_symbol,
+        normalized_time,
+        normalized_source,
+        normalized_sequence,
+        encoded,
+    )
+    try:
+        cursor = conn.execute(
+            """INSERT INTO candidate_microstructure
+               (entry_id, stage, bot_name, mode, symbol, measured_at, source,
+                sequence_status, payload_json)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(entry_id, stage) DO NOTHING""",
+            values,
+        )
+        if cursor.rowcount > 0:
+            conn.commit()
+            return True
+        existing = conn.execute(
+            """SELECT entry_id, stage, bot_name, mode, symbol, measured_at,
+                      source, sequence_status, payload_json
+                 FROM candidate_microstructure
+                WHERE entry_id=? AND stage=?""",
+            (normalized_entry_id, normalized_stage),
+        ).fetchone()
+        matches = existing is not None and tuple(existing) == values
+        conn.commit()
+        return matches
+    except sqlite3.Error:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def request_venue_capture_priority(
+    *,
+    symbol: str,
+    bot_name: str,
+    mode: str,
+    reason: str,
+    ttl_seconds: int = 21_600,
+    max_rows: int = 256,
+) -> bool:
+    """Request bounded recorder priority without changing the trading universe."""
+    try:
+        normalized_symbol = _required_text_db(symbol, "symbol", max_length=64)
+        normalized_bot = _required_text_db(
+            bot_name, "bot_name", max_length=32
+        ).upper()
+        if normalized_bot not in _CANONICAL_BOTS:
+            raise ValueError("bot_name is unknown")
+        normalized_mode = _required_text_db(mode, "mode", max_length=8).upper()
+        if normalized_mode not in {"LIVE", "SIM"}:
+            raise ValueError("mode is unknown")
+        normalized_reason = _required_text_db(reason, "reason", max_length=64)
+        ttl = _positive_integer_db(ttl_seconds, "ttl_seconds")
+        row_limit = _positive_integer_db(max_rows, "max_rows")
+        if ttl > 7 * 86_400 or row_limit > 10_000:
+            raise ValueError("capture priority bounds are too large")
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not _INIT_DB_DONE:
+        init_db()
+    now = _utcnow()
+    requested_at = now.strftime("%Y-%m-%d %H:%M:%S")
+    expires_at = (now + timedelta(seconds=ttl)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM venue_capture_priority WHERE expires_at <= ?",
+            (requested_at,),
+        )
+        conn.execute(
+            """INSERT INTO venue_capture_priority
+               (symbol, bot_name, mode, reason, requested_at, expires_at)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(symbol) DO UPDATE SET
+                   bot_name=excluded.bot_name,
+                   mode=excluded.mode,
+                   reason=excluded.reason,
+                   requested_at=excluded.requested_at,
+                   expires_at=excluded.expires_at""",
+            (
+                normalized_symbol,
+                normalized_bot,
+                normalized_mode,
+                normalized_reason,
+                requested_at,
+                expires_at,
+            ),
+        )
+        conn.execute(
+            """DELETE FROM venue_capture_priority
+                WHERE symbol IN (
+                    SELECT symbol FROM venue_capture_priority
+                    ORDER BY requested_at DESC, symbol DESC
+                    LIMIT -1 OFFSET ?
+                )""",
+            (row_limit,),
+        )
+        conn.commit()
+        return True
+    except sqlite3.Error:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def list_venue_capture_priorities(limit: int = 8) -> list[str]:
+    """Return open-position then fresh-candidate recorder priorities."""
+    try:
+        row_limit = max(1, min(50, int(limit)))
+    except (TypeError, ValueError, OverflowError):
+        row_limit = 8
+    if not _INIT_DB_DONE:
+        init_db()
+    conn = get_connection()
+    now = _utcnow_str()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM venue_capture_priority WHERE expires_at <= ?", (now,)
+        )
+        active_rows = conn.execute(
+            """SELECT symbol, 0 AS source_order, opened_at AS priority_time
+                 FROM bot_open_positions
+                WHERE UPPER(COALESCE(state,'OPEN')) = 'OPEN'
+                UNION ALL
+               SELECT symbol, 0 AS source_order, opened_at AS priority_time
+                 FROM futures_state
+                ORDER BY source_order, priority_time DESC"""
+        ).fetchall()
+        requested_rows = conn.execute(
+            """SELECT symbol FROM venue_capture_priority
+               ORDER BY requested_at DESC, symbol DESC LIMIT ?""",
+            (row_limit,),
+        ).fetchall()
+        conn.commit()
+        priorities: list[str] = []
+        for row in (*active_rows, *requested_rows):
+            symbol = str(row["symbol"] or "").strip()
+            if symbol and symbol not in priorities:
+                priorities.append(symbol)
+            if len(priorities) >= row_limit:
+                break
+        return priorities
+    except sqlite3.Error:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return []
+
+
+def enforce_research_telemetry_retention(
+    *,
+    retention_days: int = 180,
+    max_expectancy_rows: int = 250_000,
+    max_candidate_rows: int = 250_000,
+    max_tca_rows: int = 1_000_000,
+    max_terminal_markout_rows: int = 1_000_000,
+) -> dict[str, int]:
+    """Bound research telemetry while preserving pending markout work."""
+    days = _positive_integer_db(retention_days, "retention_days")
+    expectancy_limit = _positive_integer_db(
+        max_expectancy_rows, "max_expectancy_rows"
+    )
+    candidate_limit = _positive_integer_db(
+        max_candidate_rows, "max_candidate_rows"
+    )
+    tca_limit = _positive_integer_db(max_tca_rows, "max_tca_rows")
+    markout_limit = _positive_integer_db(
+        max_terminal_markout_rows, "max_terminal_markout_rows"
+    )
+    if days > 3_650 or max(
+        expectancy_limit, candidate_limit, tca_limit, markout_limit
+    ) > 5_000_000:
+        raise ValueError("research retention bounds are too large")
+    if not _INIT_DB_DONE:
+        init_db()
+    cutoff = (_utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    now = _utcnow_str()
+    conn = get_connection()
+    deleted: dict[str, int] = {}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            "DELETE FROM candidate_microstructure WHERE measured_at < ?", (cutoff,)
+        )
+        deleted["candidate_age"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            """DELETE FROM candidate_microstructure
+                WHERE rowid IN (
+                    SELECT rowid FROM candidate_microstructure
+                    ORDER BY measured_at DESC, entry_id DESC, stage DESC
+                    LIMIT -1 OFFSET ?
+                )""",
+            (candidate_limit,),
+        )
+        deleted["candidate_cap"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            "DELETE FROM execution_tca WHERE measured_at < ?", (cutoff,)
+        )
+        deleted["tca_age"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            """DELETE FROM execution_tca
+                WHERE id IN (
+                    SELECT id FROM execution_tca
+                    ORDER BY measured_at DESC, id DESC LIMIT -1 OFFSET ?
+                )""",
+            (tca_limit,),
+        )
+        deleted["tca_cap"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            "DELETE FROM sim_execution_tca WHERE measured_at < ?", (cutoff,)
+        )
+        deleted["sim_tca_age"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            """DELETE FROM sim_execution_tca
+                WHERE id IN (
+                    SELECT id FROM sim_execution_tca
+                    ORDER BY measured_at DESC, id DESC LIMIT -1 OFFSET ?
+                )""",
+            (tca_limit,),
+        )
+        deleted["sim_tca_cap"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            """DELETE FROM execution_markouts
+                WHERE status IN ('COMPLETE','FAILED')
+                  AND COALESCE(measured_at, due_at) < ?""",
+            (cutoff,),
+        )
+        deleted["markout_age"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            """DELETE FROM execution_markouts
+                WHERE rowid IN (
+                    SELECT rowid FROM execution_markouts
+                    WHERE status IN ('COMPLETE','FAILED')
+                    ORDER BY COALESCE(measured_at,due_at) DESC,
+                             intent_id DESC, horizon_seconds DESC
+                    LIMIT -1 OFFSET ?
+                )""",
+            (markout_limit,),
+        )
+        deleted["markout_cap"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            """DELETE FROM sim_execution_markouts
+                WHERE status IN ('COMPLETE','FAILED')
+                  AND COALESCE(measured_at, due_at) < ?""",
+            (cutoff,),
+        )
+        deleted["sim_markout_age"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            """DELETE FROM sim_execution_markouts
+                WHERE rowid IN (
+                    SELECT rowid FROM sim_execution_markouts
+                    WHERE status IN ('COMPLETE','FAILED')
+                    ORDER BY COALESCE(measured_at,due_at) DESC,
+                             entry_id DESC, horizon_seconds DESC
+                    LIMIT -1 OFFSET ?
+                )""",
+            (markout_limit,),
+        )
+        deleted["sim_markout_cap"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            "DELETE FROM venue_capture_priority WHERE expires_at <= ?", (now,)
+        )
+        deleted["priority_expired"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            """DELETE FROM expectancy_candidates
+                WHERE candidate_time < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM execution_markouts m
+                       WHERE m.intent_id=expectancy_candidates.entry_id
+                         AND m.status='PENDING'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sim_execution_markouts m
+                       WHERE m.entry_id=expectancy_candidates.entry_id
+                         AND m.status='PENDING'
+                  )""",
+            (cutoff,),
+        )
+        deleted["expectancy_age"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            """DELETE FROM expectancy_candidates
+                WHERE entry_id IN (
+                    SELECT e.entry_id FROM expectancy_candidates e
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM execution_markouts m
+                          WHERE m.intent_id=e.entry_id AND m.status='PENDING'
+                     )
+                       AND NOT EXISTS (
+                         SELECT 1 FROM sim_execution_markouts m
+                          WHERE m.entry_id=e.entry_id AND m.status='PENDING'
+                     )
+                    ORDER BY e.candidate_time DESC, e.entry_id DESC
+                    LIMIT -1 OFFSET ?
+                )""",
+            (expectancy_limit,),
+        )
+        deleted["expectancy_cap"] = max(0, cursor.rowcount)
+        conn.commit()
+        return deleted
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def get_recent_trades(bot_name: str, limit: int = 60,
@@ -5034,9 +5475,10 @@ def schedule_execution_markouts(
 
 def list_due_execution_markouts(limit: int = 25) -> list[dict]:
     conn = get_connection()
+    row_limit = max(1, min(250, int(limit)))
     now = _utcnow_str()
-    return [
-        dict(row)
+    rows = [
+        {**dict(row), "telemetry_scope": "LIVE"}
         for row in conn.execute(
             """SELECT * FROM execution_markouts
                WHERE status='PENDING' AND due_at <= ?
@@ -5044,9 +5486,68 @@ def list_due_execution_markouts(limit: int = 25) -> list[dict]:
                ORDER BY COALESCE(next_attempt_at, due_at),
                         due_at, intent_id, horizon_seconds
                LIMIT ?""",
-            (now, now, max(1, min(250, int(limit)))),
+            (now, now, row_limit),
         ).fetchall()
     ]
+    rows.extend(list_due_simulated_execution_markouts(limit=row_limit))
+    rows.sort(
+        key=lambda row: (
+            str(row.get("due_at") or ""),
+            str(row.get("intent_id") or ""),
+            int(row.get("horizon_seconds") or 0),
+        )
+    )
+    return rows[:row_limit]
+
+
+def has_due_execution_markouts() -> bool:
+    """Return whether LIVE or SIM markout work is currently runnable.
+
+    This intentionally stays read-only so frequent schedulers do not contend
+    for SQLite's single writer lock while the queue is idle. The advisory lock
+    in ``process_due_tca_markouts`` remains the cross-process execution gate.
+    """
+    return execution_markout_due_summary()["due_count"] > 0
+
+
+def execution_markout_due_summary() -> dict:
+    """Summarize runnable LIVE/SIM markouts without taking a write lock."""
+    conn = get_connection()
+    now_dt = _utcnow()
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    row = conn.execute(
+        """SELECT COUNT(*) AS due_count, MIN(due_at) AS oldest_due_at
+             FROM (
+                   SELECT due_at FROM execution_markouts
+                    WHERE status='PENDING' AND due_at <= ?
+                      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                   UNION ALL
+                   SELECT due_at FROM sim_execution_markouts
+                    WHERE status='PENDING' AND due_at <= ?
+                      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                  )""",
+        (now, now, now, now),
+    ).fetchone()
+    due_count = max(0, int(row["due_count"] if row else 0))
+    oldest_due_at = str(row["oldest_due_at"] or "") if row else ""
+    oldest_overdue_seconds = 0.0
+    if oldest_due_at:
+        try:
+            oldest_dt = datetime.strptime(
+                oldest_due_at, "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+            oldest_overdue_seconds = max(
+                0.0, (now_dt - oldest_dt).total_seconds()
+            )
+        except (TypeError, ValueError, OverflowError):
+            oldest_overdue_seconds = 0.0
+    return {
+        "due_count": due_count,
+        "oldest_due_at": oldest_due_at or None,
+        "oldest_overdue_seconds": oldest_overdue_seconds,
+    }
 
 
 def complete_execution_markout(
@@ -5213,6 +5714,201 @@ def fail_execution_markout(
         identity_value=validated_intent_id,
         horizon=horizon,
         failure_reason=failure_reason,
+        attempt_limit=attempt_limit,
+        retryable=retryable,
+    )
+
+
+def record_simulated_execution_tca(
+    entry_id: str, stage: str, payload: dict
+) -> None:
+    """Persist research-only SIM TCA without manufacturing a LIVE order intent."""
+    validated_entry_id = _causal_entry_id_db(entry_id, required=True)
+    if not isinstance(stage, str) or not stage.strip():
+        raise ValueError("SIM TCA stage is required")
+    if not isinstance(payload, dict):
+        raise ValueError("SIM TCA payload must be a dictionary")
+    try:
+        encoded = json.dumps(payload, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SIM TCA payload must be finite JSON") from exc
+    conn = get_connection()
+    try:
+        candidate = conn.execute(
+            """SELECT 1 FROM expectancy_candidates
+                WHERE entry_id=? AND mode='SIM'""",
+            (validated_entry_id,),
+        ).fetchone()
+        if candidate is None:
+            raise ValueError("SIM TCA requires a persisted SIM candidate")
+        conn.execute(
+            """INSERT INTO sim_execution_tca
+               (entry_id, measured_at, stage, payload_json)
+               VALUES (?, ?, ?, ?)""",
+            (validated_entry_id, _utcnow_str(), stage.strip(), encoded),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def schedule_simulated_execution_markouts(
+    entry_id: str,
+    *,
+    symbol: str,
+    side: str,
+    reference_price: float,
+    horizons: tuple[int, ...] = (1, 10, 60, 300, 900),
+) -> None:
+    """Schedule restart-safe research markouts in the isolated SIM store."""
+    validated_entry_id = _causal_entry_id_db(entry_id, required=True)
+    validated_symbol = _order_id_text_db(symbol)
+    price = _optional_finite_db(reference_price)
+    normalized_side = str(side).strip().lower()
+    if validated_symbol is None:
+        raise ValueError("SIM markout symbol is required")
+    if price is None or price <= 0.0:
+        raise ValueError("SIM markout reference price must be positive and finite")
+    if normalized_side not in {"buy", "sell"}:
+        raise ValueError("SIM markout side must be buy or sell")
+    try:
+        raw_horizons = tuple(horizons)
+    except TypeError as exc:
+        raise ValueError("SIM markout horizons must be iterable") from exc
+    if not raw_horizons:
+        raise ValueError("at least one SIM markout horizon is required")
+    now = _utcnow()
+    rows = []
+    seen: set[int] = set()
+    for raw_horizon in raw_horizons:
+        horizon = _positive_integer_db(raw_horizon, "SIM markout horizon")
+        if horizon != raw_horizon or horizon in seen:
+            raise ValueError("SIM markout horizons must be unique integers")
+        seen.add(horizon)
+        rows.append(
+            (
+                validated_entry_id,
+                horizon,
+                validated_symbol,
+                normalized_side,
+                price,
+                (now + timedelta(seconds=horizon)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            )
+        )
+    conn = get_connection()
+    try:
+        candidate = conn.execute(
+            """SELECT 1 FROM expectancy_candidates
+                WHERE entry_id=? AND mode='SIM'""",
+            (validated_entry_id,),
+        ).fetchone()
+        if candidate is None:
+            raise ValueError("SIM markouts require a persisted SIM candidate")
+        conn.executemany(
+            """INSERT OR IGNORE INTO sim_execution_markouts
+               (entry_id, horizon_seconds, symbol, side, reference_price,
+                due_at, status)
+               VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
+            rows,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def list_due_simulated_execution_markouts(limit: int = 25) -> list[dict]:
+    conn = get_connection()
+    now = _utcnow_str()
+    return [
+        dict(row)
+        for row in conn.execute(
+            """SELECT entry_id AS intent_id, horizon_seconds, symbol, side,
+                      reference_price, due_at, status, attempts, last_error,
+                      next_attempt_at, measured_at, mark_price, markout_bps,
+                      'SIM' AS telemetry_scope
+                 FROM sim_execution_markouts
+                WHERE status='PENDING' AND due_at <= ?
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                ORDER BY COALESCE(next_attempt_at, due_at),
+                         due_at, entry_id, horizon_seconds
+                LIMIT ?""",
+            (now, now, max(1, min(250, int(limit)))),
+        ).fetchall()
+    ]
+
+
+def complete_simulated_execution_markout(
+    entry_id: str,
+    horizon_seconds: int,
+    *,
+    mark_price: float,
+    markout_bps: float,
+    tca_stage: str,
+    tca_payload: dict,
+) -> bool:
+    price = _optional_finite_db(mark_price)
+    bps = _optional_signed_finite_db(markout_bps)
+    horizon = _positive_integer_db(horizon_seconds, "SIM markout horizon")
+    stage = str(tca_stage).strip()
+    if price is None or price <= 0.0 or bps is None:
+        raise ValueError("SIM markout values must be finite")
+    if not stage or not isinstance(tca_payload, dict):
+        raise ValueError("SIM markout TCA stage and payload are required")
+    try:
+        encoded = json.dumps(tca_payload, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SIM markout TCA payload must be finite JSON") from exc
+    conn = get_connection()
+    measured_at = _utcnow_str()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """UPDATE sim_execution_markouts
+                  SET status='COMPLETE', measured_at=?, mark_price=?,
+                      markout_bps=?, attempts=attempts+1, last_error=NULL,
+                      next_attempt_at=NULL
+                WHERE entry_id=? AND horizon_seconds=? AND status='PENDING'""",
+            (measured_at, price, bps, str(entry_id), horizon),
+        )
+        if cursor.rowcount == 1:
+            conn.execute(
+                """INSERT INTO sim_execution_tca
+                   (entry_id, measured_at, stage, payload_json)
+                   VALUES (?, ?, ?, ?)""",
+                (str(entry_id), measured_at, stage, encoded),
+            )
+        conn.commit()
+        return cursor.rowcount == 1
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def fail_simulated_execution_markout(
+    entry_id: str,
+    horizon_seconds: int,
+    error: str,
+    *,
+    max_attempts: int = 5,
+    retryable: bool = False,
+) -> None:
+    validated_entry_id = _causal_entry_id_db(entry_id, required=True)
+    horizon = _positive_integer_db(horizon_seconds, "SIM markout horizon")
+    attempt_limit = _positive_integer_db(max_attempts, "SIM markout max attempts")
+    if not isinstance(retryable, bool):
+        raise ValueError("SIM markout retryable flag must be boolean")
+    if not isinstance(error, str) or not error.strip():
+        raise ValueError("SIM markout failure reason is required")
+    _record_markout_failure(
+        table="sim_execution_markouts",
+        identity_column="entry_id",
+        identity_value=validated_entry_id,
+        horizon=horizon,
+        failure_reason=error.strip()[:500],
         attempt_limit=attempt_limit,
         retryable=retryable,
     )

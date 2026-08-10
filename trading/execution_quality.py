@@ -399,7 +399,17 @@ def compute_fill_tca(
         expected = _positive_finite_or_none(arrival.expected_vwap)
         if expected is None:
             raise ValueError("expected VWAP must be positive and finite")
-        if (side == "buy" and expected < ask) or (side == "sell" and expected > bid):
+        below_buy_touch = (
+            side == "buy"
+            and expected < ask
+            and not math.isclose(expected, ask, rel_tol=1e-12)
+        )
+        above_sell_touch = (
+            side == "sell"
+            and expected > bid
+            and not math.isclose(expected, bid, rel_tol=1e-12)
+        )
+        if below_buy_touch or above_sell_touch:
             raise ValueError("expected VWAP is inconsistent with arrival side")
     fill = _positive_finite_or_none(average_fill_price)
     if fill is None:
@@ -431,7 +441,9 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
     from core.database import (
         acquire_advisory_lock,
         complete_execution_markout,
+        complete_simulated_execution_markout,
         fail_execution_markout,
+        fail_simulated_execution_markout,
         list_due_execution_markouts,
         release_advisory_lock,
     )
@@ -476,6 +488,13 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
                 silent_log("invalid due TCA markout row", exc)
                 continue
 
+            is_simulated = (
+                str(row.get("telemetry_scope") or "").upper() == "SIM"
+            )
+            fail_markout = (
+                fail_simulated_execution_markout
+                if is_simulated else fail_execution_markout
+            )
             try:
                 symbol = row.get("symbol")
                 if not isinstance(symbol, str) or not symbol.strip():
@@ -513,7 +532,7 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
             except Exception as exc:
                 failure_persisted = False
                 try:
-                    fail_execution_markout(
+                    fail_markout(
                         intent_id,
                         horizon,
                         f"{type(exc).__name__}: {exc}",
@@ -526,8 +545,12 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
                     break
                 continue
 
+            complete_markout = (
+                complete_simulated_execution_markout
+                if is_simulated else complete_execution_markout
+            )
             try:
-                if complete_execution_markout(
+                if complete_markout(
                     intent_id,
                     horizon,
                     mark_price=mark,
@@ -541,3 +564,112 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
         return completed
     finally:
         release_advisory_lock("execution_markout_worker", holder_id)
+
+
+def run_tca_markout_worker(
+    exchange,
+    shutdown_event,
+    *,
+    poll_interval_seconds: float = 1.0,
+    limit: int = 25,
+    max_overdue_seconds: float = 30.0,
+    health_callback: Callable[[dict], None] | None = None,
+) -> None:
+    """Poll restart-safe LIVE/SIM markouts near their due timestamps.
+
+    Idle polls are read-only. The existing advisory lock inside
+    ``process_due_tca_markouts`` serializes the rare due batches across bot
+    processes, while the shared API budget still gates every ticker request.
+    """
+    interval = _positive_finite_or_none(poll_interval_seconds)
+    if interval is None or not 0.1 <= interval <= 60.0:
+        raise ValueError(
+            "markout poll interval must be between 0.1 and 60 seconds"
+        )
+    overdue_limit = _positive_finite_or_none(max_overdue_seconds)
+    if overdue_limit is None or not 5.0 <= overdue_limit <= 3_600.0:
+        raise ValueError(
+            "markout overdue limit must be between 5 and 3600 seconds"
+        )
+    row_limit = max(1, min(250, int(limit)))
+    if not callable(getattr(shutdown_event, "is_set", None)) or not callable(
+        getattr(shutdown_event, "wait", None)
+    ):
+        raise ValueError("shutdown event must provide is_set() and wait()")
+
+    from core.database import (
+        close_thread_local_conn,
+        execution_markout_due_summary,
+    )
+
+    def _report_health(payload: dict) -> None:
+        if health_callback is None:
+            return
+        try:
+            health_callback(payload)
+        except Exception as exc:
+            silent_log("report TCA markout worker health", exc)
+
+    try:
+        while not shutdown_event.is_set():
+            wait_interval = interval
+            try:
+                summary = execution_markout_due_summary()
+                due_count = max(0, int(summary.get("due_count") or 0))
+                oldest_overdue = _finite_or_none(
+                    summary.get("oldest_overdue_seconds")
+                )
+                oldest_overdue = max(0.0, oldest_overdue or 0.0)
+                completed = 0
+                if due_count > 0:
+                    completed = process_due_tca_markouts(
+                        exchange, limit=row_limit
+                    )
+                    if completed <= 0:
+                        # Lock contention, API-budget denial and transient
+                        # failures all leave runnable rows behind. Avoid a
+                        # cross-process write/budget hot loop in those cases.
+                        wait_interval = max(interval, 5.0)
+                overdue_without_progress = (
+                    due_count > 0
+                    and completed <= 0
+                    and oldest_overdue > overdue_limit
+                )
+                _report_health({
+                    "ok": not overdue_without_progress,
+                    "reason": (
+                        "due_queue_overdue"
+                        if overdue_without_progress
+                        else ""
+                    ),
+                    "due_count": due_count,
+                    "oldest_due_at": summary.get("oldest_due_at"),
+                    "oldest_overdue_seconds": oldest_overdue,
+                    "completed": completed,
+                    "last_poll_monotonic": time.monotonic(),
+                    "last_poll_wall_ts": time.time(),
+                })
+            except Exception as exc:
+                silent_log("execution TCA markout worker", exc)
+                wait_interval = max(interval, 5.0)
+                _report_health({
+                    "ok": False,
+                    "reason": "worker_error",
+                    "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                    "due_count": 0,
+                    "oldest_due_at": None,
+                    "oldest_overdue_seconds": 0.0,
+                    "completed": 0,
+                    "last_poll_monotonic": time.monotonic(),
+                    "last_poll_wall_ts": time.time(),
+                })
+            if shutdown_event.wait(wait_interval):
+                break
+    finally:
+        close_thread_local_conn()
+        close_clone = getattr(exchange, "close_current_thread_clone", None)
+        if callable(close_clone):
+            try:
+                close_clone()
+            except Exception as exc:
+                silent_log("close TCA markout exchange clone", exc)

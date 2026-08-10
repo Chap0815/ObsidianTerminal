@@ -187,7 +187,9 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                     build_source=build_info.get("source", "fallback"),
                     max_trades=self.C("MAX_OPEN_TRADES"),
                     scan=self.C("SCAN_INTERVAL"),
-                    monitor=self.C("MONITOR_INTERVAL", self.DEFAULT_MONITOR_INTERVAL))
+                    monitor=self.C("MONITOR_INTERVAL", self.DEFAULT_MONITOR_INTERVAL),
+                    spot_exit_shadow_enabled=self.C(
+                        "SPOT_EXIT_SHADOW_ENABLED", False))
         log_event(
             f"Simulation: {self.simulation}  "
             f"Max trades: {self.C('MAX_OPEN_TRADES')}",

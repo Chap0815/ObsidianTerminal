@@ -81,6 +81,8 @@ class FuturesExchangeBot(FuturesBot):
         "SIMULATION":        True,
         "ENTRY_QUALITY_FILTER_ENABLED": True,
         "ENTRY_QUALITY_MIN_SCORE": 75.0,
+        "ENTRY_QUALITY_SHADOW_ENABLED": False,
+        "ENTRY_QUALITY_SHADOW_MIN_SCORE": 85.0,
         "PORTFOLIO_RISK_MODE": "shadow",
         "NET_EXPECTANCY_MODE": "shadow",
         "TIME_DECAY_MODE": "shadow",

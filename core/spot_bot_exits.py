@@ -180,6 +180,88 @@ def _filled_base_amount(order, wrapper_sold, requested_amount: float) -> float:
 class ExitsMixin:
     """Monitor thread + exit decision logic."""
 
+    def _spot_exit_shadow_enabled(self) -> bool:
+        if str(getattr(self, "BOT_NAME", "")).upper() != "SPOT":
+            return False
+        try:
+            from bot_utils.config import parse_explicit_bool
+
+            return parse_explicit_bool(
+                self.C("SPOT_EXIT_SHADOW_ENABLED", False)
+            ) is True
+        except Exception:
+            return False
+
+    def _record_spot_exit_shadow(
+        self, sym: str, d: dict, *, move_pct: float,
+        mfe_pct: float, mae_pct: float, now=None,
+    ) -> None:
+        """Persist first-hit SPOT counterfactuals without changing exits."""
+        if not ExitsMixin._spot_exit_shadow_enabled(self):
+            return
+        if d.get("partial_sold") or d.get("break_even"):
+            return
+        try:
+            from core.logger import log_struct
+            from trading.spot_exit_shadow import evaluate_spot_exit_shadow_rules
+
+            triggers = evaluate_spot_exit_shadow_rules(
+                buy_time=d.get("buy_time"),
+                move_pct=move_pct,
+                mfe_pct=mfe_pct,
+                mae_pct=mae_pct,
+                now=now,
+            )
+            raw_seen = d.get("spot_exit_shadow_triggered_rules", [])
+            if isinstance(raw_seen, (list, tuple, set)):
+                seen = {str(item) for item in raw_seen if str(item)}
+            elif isinstance(raw_seen, str):
+                seen = {item for item in raw_seen.split(",") if item}
+            else:
+                seen = set()
+            new_triggers = [
+                item for item in triggers
+                if str(item.get("rule")) not in seen
+            ]
+            if not new_triggers:
+                return
+
+            invested = _positive_finite(d.get("invested_usdt"), 0.0)
+            for trigger in new_triggers:
+                trigger_move = _finite_float(
+                    trigger.get("trigger_move_pct"), move_pct
+                )
+                log_struct(
+                    "spot_exit_shadow",
+                    bot=self.BOT_NAME,
+                    symbol=sym,
+                    mode="SIM" if self.simulation else "LIVE",
+                    entry_id=d.get("entry_id", ""),
+                    entry_quality_score=d.get("entry_quality_score"),
+                    entry_quality_label=d.get("entry_quality_label"),
+                    gross_pnl_usdt=invested * trigger_move / 100.0,
+                    actual_initial_stop_pct=self.C(
+                        "INITIAL_STOP_LOSS", -100.0),
+                    actual_activation_profit_pct=self.C(
+                        "ACTIVATION_PROFIT", 0.0),
+                    actual_trailing_distance_pct=self.C(
+                        "TRAILING_DISTANCE", 0.0),
+                    **trigger,
+                )
+                seen.add(str(trigger["rule"]))
+            persisted = sorted(seen)
+            self.state.update_many(
+                sym, {"spot_exit_shadow_triggered_rules": persisted}
+            )
+            d["spot_exit_shadow_triggered_rules"] = persisted
+        except Exception as exc:
+            if not getattr(self, "_spot_exit_shadow_error_logged", False):
+                self._spot_exit_shadow_error_logged = True
+                try:
+                    self._log_error(f"spot exit shadow {sym}", exc)
+                except Exception:
+                    pass
+
     def _retry_pending_partial_accounting(self, sym: str, d: dict) -> None:
         from bot_utils.trade_state import normalize_pending_accounting_items
         if not normalize_pending_accounting_items(
@@ -831,6 +913,17 @@ class ExitsMixin:
 
         highest = _positive_finite(d.get("highest"), buy)
         high_prof = ((highest - buy) / buy) * 100
+        lowest = _positive_finite(d.get("lowest"), min(buy, curr))
+        low_prof = ((lowest - buy) / buy) * 100
+
+        ExitsMixin._record_spot_exit_shadow(
+            self,
+            sym,
+            d,
+            move_pct=prof,
+            mfe_pct=max(0.0, high_prof),
+            mae_pct=min(0.0, low_prof),
+        )
 
         # Breakeven activation
         be_trigger = float(self.C("BREAKEVEN_TRIGGER", 0))

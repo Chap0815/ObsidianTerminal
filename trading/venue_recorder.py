@@ -274,6 +274,7 @@ class VenueRecorder:
         l2_sample_interval_seconds: float = 1.0,
         l2_stale_after_ms: int = 5_000,
         l2_collector_factory=None,
+        priority_loader=None,
     ) -> None:
         self.exchange = exchange
         self.writer = writer or SQLitePartitionWriter(
@@ -286,6 +287,7 @@ class VenueRecorder:
         self.micro_interval = max(1.0, float(micro_interval_seconds))
         self.overview_interval = max(self.micro_interval, float(overview_interval_seconds))
         self.log_event = log_event
+        self._priority_loader = priority_loader
         self._universe: list[str] = []
         self._cursor = 0
         self._next_retention_check = 0.0
@@ -330,6 +332,50 @@ class VenueRecorder:
         market = (getattr(self.exchange, "markets", None) or {}).get(symbol) or {}
         base = str(market.get("base") or str(symbol).split("/", 1)[0])
         return base.strip().upper() in NONCRYPTO_BASES
+
+    def _priority_symbols(self) -> list[str]:
+        try:
+            if self._priority_loader is None:
+                from core.database import list_venue_capture_priorities
+
+                requested = list_venue_capture_priorities(self.max_symbols)
+            else:
+                requested = self._priority_loader(self.max_symbols)
+        except Exception as exc:
+            self._log_gap("priority load gap", exc)
+            return []
+        markets = getattr(self.exchange, "markets", None) or {}
+        resolved = []
+        for raw in requested or ():
+            candidate = str(raw or "").strip()
+            symbol = candidate if candidate in markets else None
+            if symbol is None:
+                base = candidate.split("/", 1)[0].split("_", 1)[0].upper()
+                symbol = next(
+                    (
+                        market_symbol
+                        for market_symbol, market in markets.items()
+                        if str((market or {}).get("base") or "").strip().upper() == base
+                        and (market or {}).get("swap")
+                        and (market or {}).get("quote") == "USDT"
+                    ),
+                    None,
+                )
+            market = markets.get(symbol) if symbol is not None else None
+            if (
+                symbol is None
+                or not isinstance(market, dict)
+                or not market.get("swap")
+                or market.get("quote") != "USDT"
+                or market.get("active") is False
+                or self._is_noncrypto_swap(symbol)
+                or symbol in resolved
+            ):
+                continue
+            resolved.append(symbol)
+            if len(resolved) >= self.max_symbols:
+                break
+        return resolved
 
     def _log_gap(self, context: str, exc: Exception) -> None:
         if not self.log_event:
@@ -434,11 +480,15 @@ class VenueRecorder:
                 volume = 0.0
             candidates.append((volume, symbol, ticker))
         candidates.sort(reverse=True)
-        self._universe = [
+        volume_universe = [
             symbol
             for _volume, symbol, _ticker in candidates
             if not self._is_noncrypto_swap(symbol)
-        ][: self.max_symbols]
+        ]
+        priority_universe = self._priority_symbols()
+        self._universe = list(
+            dict.fromkeys((*priority_universe, *volume_universe))
+        )[: self.max_symbols]
         markets_payload = {}
         for _volume, symbol, ticker in candidates:
             info = ticker.get("info") if isinstance(ticker, dict) else {}
@@ -475,6 +525,7 @@ class VenueRecorder:
                 "funding_rate": _number(info.get("fundingRate")),
                 "next_settle_time": _number(info.get("nextSettleTime")),
                 "universe_member": symbol in self._universe,
+                "capture_priority": symbol in priority_universe,
             }
         overview_flags = []
         if invalid_tickers_payload:

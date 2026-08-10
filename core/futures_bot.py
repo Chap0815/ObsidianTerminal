@@ -1,5 +1,5 @@
 """
-core/futures_bot.py  Dual-thread futures trading bot base class.
+core/futures_bot.py  Concurrent futures trading bot base class.
 
 Replaces main_bot_futures.run_bot()'s ~300-line lifecycle. The class
 inherits exits/scan/reconcile mixins (analog to SpotBot) but is NOT
@@ -12,6 +12,7 @@ Architecture (same shape as SpotBot):
   Monitor-Thread  (every MONITOR_INTERVAL ~20s)  exits + liq guard
   Scan-Thread  (every SCAN_INTERVAL ~150s)  LONG/SHORT entries
   Reconcile-Thread  (every RECONCILE_INTERVAL ~600s)  drift check
+  Markout-Thread  (FUTURES owner only, every ~1s)  global LIVE/SIM TCA
   Main-Thread  heartbeat + shutdown coordination
 
 Plus futures-specific infrastructure built into the lifecycle:
@@ -77,6 +78,9 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
     RECONCILE_INTERVAL_SEC: int = 300   # orphan-adoption safety net cadence
     GC_LOCKS_INTERVAL_SEC: int = 300
     HEARTBEAT_INTERVAL_SEC: int = 60
+    MARKOUT_POLL_INTERVAL_SEC: float = 1.0
+    MARKOUT_MAX_OVERDUE_SEC: float = 30.0
+    MARKOUT_POLL_STALE_SEC: float = 15.0
 
     # Monitor / Scan defaults
     DEFAULT_MONITOR_INTERVAL: int = 20
@@ -111,6 +115,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         self._entry_recovery_generation = 0
         self._shutdown_lock = threading.Lock()
         self._cooldown_lock = threading.Lock()
+        self._markout_health_lock = threading.Lock()
         # populated in run()
         self.ex = None
         self.state: Optional[TradeState] = None
@@ -125,7 +130,19 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         self._monitor_thread: Optional[threading.Thread] = None
         self._scan_thread: Optional[threading.Thread] = None
         self._reconcile_thread: Optional[threading.Thread] = None
+        self._markout_thread: Optional[threading.Thread] = None
         self._venue_recorder_thread: Optional[threading.Thread] = None
+        self._markout_health = {
+            "ok": True,
+            "last_poll_monotonic": None,
+            "last_poll_wall_ts": None,
+            "consecutive_errors": 0,
+            "last_error": "",
+            "due_count": 0,
+            "oldest_due_at": None,
+            "oldest_overdue_seconds": 0.0,
+            "completed": 0,
+        }
         self._entry_recovery_blocked = False
 
     # Route through bot_utils.config.get_live_value so that user-edited values
@@ -184,10 +201,102 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 "error_type": type(exc).__name__,
             }
         strategy_ok = bool(strategy_health.get("ok", True))
-        status = "ready" if all(threads.values()) and strategy_ok else "degraded"
-        extra = ({"strategy_health": strategy_health}
-                 if strategy_health else {})
+        markout_health = self._markout_runtime_health()
+        markout_ok = bool(markout_health.get("ok", True))
+        status = (
+            "ready"
+            if all(threads.values()) and strategy_ok and markout_ok
+            else "degraded"
+        )
+        extra = {}
+        if strategy_health:
+            extra["strategy_health"] = strategy_health
+        if markout_health:
+            extra["markout_health"] = markout_health
         return status, extra
+
+    def _owns_markout_worker(self) -> bool:
+        """FUTURES is the deterministic owner of the global markout queue."""
+        return str(self.BOT_NAME).upper() == "FUTURES"
+
+    def _record_markout_worker_health(self, report: dict) -> None:
+        """Receive one sanitized progress report from the markout thread."""
+        if not isinstance(report, dict):
+            return
+        report_ok = bool(report.get("ok", False))
+        with self._markout_health_lock:
+            previous_errors = int(
+                self._markout_health.get("consecutive_errors") or 0
+            )
+            self._markout_health.update({
+                "ok": report_ok,
+                "last_poll_monotonic": report.get("last_poll_monotonic"),
+                "last_poll_wall_ts": report.get("last_poll_wall_ts"),
+                "consecutive_errors": (
+                    0 if report_ok else previous_errors + 1
+                ),
+                "last_error": (
+                    ""
+                    if report_ok
+                    else str(
+                        report.get("error")
+                        or report.get("reason")
+                        or "markout worker unhealthy"
+                    )[:200]
+                ),
+                "due_count": max(0, int(report.get("due_count") or 0)),
+                "oldest_due_at": report.get("oldest_due_at"),
+                "oldest_overdue_seconds": max(
+                    0.0,
+                    float(report.get("oldest_overdue_seconds") or 0.0),
+                ),
+                "completed": max(0, int(report.get("completed") or 0)),
+            })
+
+    def _markout_runtime_health(self) -> dict[str, Any]:
+        if not self._owns_markout_worker() or not hasattr(
+            self, "_markout_health_lock"
+        ):
+            return {}
+        with self._markout_health_lock:
+            snapshot = dict(self._markout_health)
+        last_poll = snapshot.get("last_poll_monotonic")
+        if last_poll is None:
+            return {
+                "ok": True,
+                "component": "execution_markout_worker",
+                "state": "starting",
+                **snapshot,
+            }
+        try:
+            poll_age = max(0.0, time.monotonic() - float(last_poll))
+        except (TypeError, ValueError, OverflowError):
+            poll_age = float("inf")
+        if poll_age > self.MARKOUT_POLL_STALE_SEC:
+            snapshot["ok"] = False
+            snapshot["reason"] = "poll_stale"
+        snapshot.update({
+            "component": "execution_markout_worker",
+            "poll_age_seconds": poll_age,
+        })
+        return snapshot
+
+    def _runtime_threads(self) -> dict[str, bool]:
+        """Report every production-critical futures lifecycle worker."""
+        threads = {
+            "monitor": bool(
+                self._monitor_thread and self._monitor_thread.is_alive()
+            ),
+            "scan": bool(self._scan_thread and self._scan_thread.is_alive()),
+            "reconcile": bool(
+                self._reconcile_thread and self._reconcile_thread.is_alive()
+            ),
+        }
+        if self._owns_markout_worker():
+            threads["markout"] = bool(
+                self._markout_thread and self._markout_thread.is_alive()
+            )
+        return threads
 
     #  Run 
 
@@ -296,6 +405,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 "PRE_ACTIVATION_MIN_MFE_PCT", 1.5),
             "pre_activation_giveback_pct": self.C(
                 "PRE_ACTIVATION_GIVEBACK_PCT", 0.75),
+            "entry_quality_shadow_enabled": self.C(
+                "ENTRY_QUALITY_SHADOW_ENABLED", False),
+            "entry_quality_shadow_min_score": self.C(
+                "ENTRY_QUALITY_SHADOW_MIN_SCORE", 85.0),
             "scan_interval": self.C("SCAN_INTERVAL"),
             "monitor_interval": self.C(
                 "MONITOR_INTERVAL", self.DEFAULT_MONITOR_INTERVAL),
@@ -446,6 +559,21 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             target=self._reconcile_loop, daemon=True,
             name=f"{self.BOT_NAME}Reconcile",
         )
+        if self._owns_markout_worker():
+            from trading.execution_quality import run_tca_markout_worker
+
+            self._markout_thread = threading.Thread(
+                target=run_tca_markout_worker,
+                args=(self.ex, self._shutdown_event),
+                kwargs={
+                    "poll_interval_seconds": self.MARKOUT_POLL_INTERVAL_SEC,
+                    "limit": 25,
+                    "max_overdue_seconds": self.MARKOUT_MAX_OVERDUE_SEC,
+                    "health_callback": self._record_markout_worker_health,
+                },
+                daemon=True,
+                name=f"{self.BOT_NAME}Markouts",
+            )
         if (
             self.BOT_NAME == "FUTURES"
             and str(self.C("VENUE_RECORDER_MODE", "enabled")).lower() == "enabled"
@@ -488,15 +616,16 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         self._monitor_thread.start()
         self._scan_thread.start()
         self._reconcile_thread.start()
+        if self._markout_thread is not None:
+            self._markout_thread.start()
         if self._venue_recorder_thread is not None:
             self._venue_recorder_thread.start()
 
-        log_event("Three threads running (monitor, scan, reconcile).", "START")
-        threads = {
-            "monitor": self._monitor_thread.is_alive(),
-            "scan": self._scan_thread.is_alive(),
-            "reconcile": self._reconcile_thread.is_alive(),
-        }
+        thread_names = "monitor, scan, reconcile"
+        if self._markout_thread is not None:
+            thread_names += ", markout"
+        log_event(f"Core threads running ({thread_names}).", "START")
+        threads = self._runtime_threads()
         status, strategy_health = self._runtime_status_health(threads)
         write_runtime_status(
             self.LOG_DIR, self.BOT_NAME,
@@ -535,11 +664,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                             state_rows=self.state.get_all(),
                             ticker_cache=self.ticker_cache,
                         )
-                        threads = {
-                            "monitor": self._monitor_thread.is_alive(),
-                            "scan": self._scan_thread.is_alive(),
-                            "reconcile": self._reconcile_thread.is_alive(),
-                        }
+                        threads = self._runtime_threads()
                         status, strategy_health = self._runtime_status_health(
                             threads)
                         if (not threads["monitor"]
@@ -568,11 +693,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                             state_rows=self.state.get_all(),
                             ticker_cache=self.ticker_cache,
                         )
-                        threads = {
-                            "monitor": self._monitor_thread.is_alive(),
-                            "scan": self._scan_thread.is_alive(),
-                            "reconcile": self._reconcile_thread.is_alive(),
-                        }
+                        threads = self._runtime_threads()
                         status, strategy_health = self._runtime_status_health(
                             threads)
                         if (not threads["monitor"]
@@ -614,6 +735,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             self._monitor_thread,
             self._scan_thread,
             self._reconcile_thread,
+            self._markout_thread,
             self._venue_recorder_thread,
         ):
             if t and t.is_alive():
@@ -621,11 +743,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         try:
             write_runtime_status(
                 self.LOG_DIR, self.BOT_NAME, "stopped", self.simulation,
-                threads={
-                    "monitor": bool(self._monitor_thread and self._monitor_thread.is_alive()),
-                    "scan": bool(self._scan_thread and self._scan_thread.is_alive()),
-                    "reconcile": bool(self._reconcile_thread and self._reconcile_thread.is_alive()),
-                })
+                threads=self._runtime_threads())
         except Exception:
             pass
         # Close all per-thread CCXT clones so their HTTP sessions release
