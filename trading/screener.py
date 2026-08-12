@@ -160,14 +160,14 @@ def _load_fail_cache():
         _fail_cache = {}
 
 
-def _save_fail_cache_locked(force: bool = False):
+def _save_fail_cache_locked(force: bool = False) -> bool:
     """Caller MUST hold _fail_cache_lock. Debounced."""
     global _fail_cache_dirty, _fail_cache_last_persist
     now = time.time()
     if not _fail_cache_dirty:
-        return
+        return True
     if not force and (now - _fail_cache_last_persist) < _FAIL_CACHE_PERSIST_INTERVAL:
-        return
+        return False
     try:
         os.makedirs(os.path.dirname(_FAIL_CACHE_FILE) or ".", exist_ok=True)
         with portalocker.Lock(
@@ -209,14 +209,32 @@ def _save_fail_cache_locked(force: bool = False):
                     }
 
             if not atomic_save_json(_FAIL_CACHE_FILE, merged):
-                return
+                return False
 
         _fail_cache.clear()
         _fail_cache.update(merged)
         _fail_cache_last_persist = now
         _fail_cache_dirty = False
+        return True
     except Exception:
-        pass
+        return False
+
+
+def flush_fail_cache_at_exit() -> bool:
+    """Make one synchronous final write for dirty indicator-failure state."""
+    with _fail_cache_lock:
+        persisted = _save_fail_cache_locked(force=True)
+        dirty = _fail_cache_dirty
+    if not persisted and dirty:
+        try:
+            from bot_utils.silent_log import silent_log
+            silent_log(
+                "indicator failure cache shutdown persistence",
+                OSError("dirty indicator failure state remains non-durable"),
+            )
+        except Exception:
+            pass
+    return persisted
 
 
 def _record_indicator_fail(symbol: str, timeframe: str) -> bool:
@@ -258,6 +276,7 @@ def _is_hard_suppressed(symbol: str, timeframe: str) -> bool:
 
 
 _load_fail_cache()
+atexit.register(flush_fail_cache_at_exit)
 
 # Per-bot scan-fail counter: {(bot_name, base_sym): count}
 _sym_scan_fails: dict = {}

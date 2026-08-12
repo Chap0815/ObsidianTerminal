@@ -6,6 +6,7 @@ history. Mark symbols as fresh for their first 24h and suppress expected
 indicator failures during that window.
 """
 from __future__ import annotations
+import atexit
 import json
 import math
 import os
@@ -28,6 +29,7 @@ _lock = threading.Lock()
 _last_persist: float = time.monotonic() - _PERSIST_INTERVAL_SEC
 _dirty = False
 _persist_timer: threading.Timer | None = None
+_persist_shutdown = False
 
 
 def _flush_deferred() -> None:
@@ -40,6 +42,8 @@ def _flush_deferred() -> None:
 def _schedule_persist_locked(delay: float) -> None:
     """Schedule one daemon flush; caller holds ``_lock``."""
     global _persist_timer
+    if _persist_shutdown:
+        return
     if _persist_timer is not None and _persist_timer.is_alive():
         return
     timer = threading.Timer(max(0.01, float(delay)), _flush_deferred)
@@ -85,17 +89,17 @@ def _load() -> None:
         _data = {}
 
 
-def _persist_locked() -> None:
+def _persist_locked() -> bool:
     """Caller MUST hold _lock. Schreibt atomar auf Disk, debounced."""
     global _last_persist, _dirty
     now = time.time()
     persist_now = time.monotonic()
     if not _dirty:
-        return
+        return True
     elapsed = persist_now - _last_persist
     if elapsed < _PERSIST_INTERVAL_SEC:
         _schedule_persist_locked(_PERSIST_INTERVAL_SEC - elapsed)
-        return
+        return False
     try:
         os.makedirs(os.path.dirname(_TRACKER_FILE) or ".", exist_ok=True)
         with portalocker.Lock(
@@ -136,14 +140,16 @@ def _persist_locked() -> None:
 
             if not atomic_save_json(_TRACKER_FILE, snapshot):
                 _schedule_persist_locked(_PERSIST_INTERVAL_SEC)
-                return
+                return False
 
         _data.clear()
         _data.update(snapshot)
         _last_persist = persist_now
         _dirty = False
+        return True
     except Exception:
         _schedule_persist_locked(_PERSIST_INTERVAL_SEC)
+        return False
 
 
 def record_seen(symbol: str) -> None:
@@ -183,13 +189,40 @@ def age_hours(symbol: str) -> float:
     return (time.time() - ts) / 3600.0
 
 
-def force_persist() -> None:
+def force_persist() -> bool:
     """Externer Trigger: schreib jetzt auf Disk (z.B. bei Shutdown)."""
     global _last_persist
     with _lock:
         _last_persist = 0.0
-        _persist_locked()
+        return _persist_locked()
+
+
+def flush_pending_at_exit() -> bool:
+    """Cancel the debounce timer and make one synchronous final write."""
+    global _last_persist, _persist_timer, _persist_shutdown
+    with _lock:
+        _persist_shutdown = True
+        timer = _persist_timer
+        _persist_timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        _last_persist = 0.0
+        persisted = _persist_locked()
+        if not persisted and _dirty:
+            try:
+                from bot_utils.silent_log import silent_log
+                silent_log(
+                    "symbol tracker shutdown persistence",
+                    OSError("dirty symbol tracker state remains non-durable"),
+                )
+            except Exception:
+                pass
+        return persisted
 
 
 # Auto-load beim Import
 _load()
+atexit.register(flush_pending_at_exit)

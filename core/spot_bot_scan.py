@@ -1480,8 +1480,16 @@ class ScanMixin:
                     0.0 if isinstance(raw_precision_amount, bool)
                     else float(raw_precision_amount)
                 )
+                if amount_coins > raw_amount_coins:
+                    amount_coins = 0.0
             except Exception:
-                amount_coins = raw_amount_coins
+                try:
+                    from config.exchange_config import safe_amount_to_precision
+                    amount_coins = safe_amount_to_precision(
+                        self.ex, f"{sym}/USDT", raw_amount_coins
+                    )
+                except Exception:
+                    amount_coins = 0.0
             if not math.isfinite(amount_coins) or amount_coins <= 0:
                 log_event(
                     f"Buy {sym}: invalid amount after precision  skip",

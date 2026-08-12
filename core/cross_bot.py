@@ -29,6 +29,7 @@ from core.futures_bot import FuturesBot
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.order_utils import order_id_text_or_none
 from bot_utils.safe_numeric import parse_ohlcv_closes
+from bot_utils.silent_log import silent_log
 from trading.xsec_signal import XSecParams, compute_target_book
 
 
@@ -1096,36 +1097,37 @@ class CrossBot(FuturesBot):
                            cand_l - catch_l, cand_s - catch_s))
         return catch_l + pairs, catch_s + pairs
 
-    def _topup_tick(self) -> None:
+    def _topup_tick(self) -> bool:
         """Fill missing legs toward K/side from the CURRENT signal - closes a
         one-sided gap first, then adds balanced pairs. Only opens new, claimable
         legs; never closes held/adopted ones (no churn). Works on a
-        restart-adopted book (no cached book needed)."""
+        restart-adopted book (no cached book needed). Returns True only for a
+        completed attempt or an intentional risk/shutdown/no-op skip."""
         from core.logger import log_event
         from core.database import is_claimed_by_other
         from trading.risk_manager import is_bot_paused
         if self.safe_mode is not None and self.safe_mode.is_active():
             log_event(f"[{self.BOT_NAME}] SAFE_MODE - top-up skipped "
                       f"({self.safe_mode.reason()})", "WAIT")
-            return
+            return True
         try:
             paused, why = is_bot_paused(
                 self.BOT_NAME, exchange=self.ex, simulation=self.simulation)
         except Exception as exc:
             log_event(f"[{self.BOT_NAME}] top-up skipped - risk gate "
                       f"unavailable ({type(exc).__name__})", "WARN")
-            return
+            return False
         if paused:
             log_event(f"[{self.BOT_NAME}] paused: {why}", "WAIT")
-            return
+            return True
         params = self._xsec_params()
         k = int(params.k_per_side)
         prices, sym_map = self._fetch_universe_prices(params.lookback_hours)
         if self._shutdown_event.is_set():
-            return
+            return True
         if not prices:
             log_event(f"[{self.BOT_NAME}] top-up: no universe data - skipped", "WARN")
-            return
+            return False
         book = compute_target_book(prices, self._recent_rebalance_returns, params)
         self._cross_regime_snapshot = CrossBot._cross_market_structure(
             book,
@@ -1134,7 +1136,7 @@ class CrossBot(FuturesBot):
             getattr(self, "_cross_funding_pct", {}),
         )
         if getattr(book, "is_flat", False):
-            return
+            return True
         cur = CrossBot._active_legs(self)
         active_sides = {
             base: CrossBot._safe_exchange_text(
@@ -1152,7 +1154,7 @@ class CrossBot(FuturesBot):
                 f"{invalid_sides} - no new legs opened",
                 "ERROR",
             )
-            return
+            return False
         active_notionals = {}
         invalid_notionals = []
         for base, row in cur.items():
@@ -1175,7 +1177,7 @@ class CrossBot(FuturesBot):
                 f"{sorted(invalid_notionals)} - no new legs opened",
                 "ERROR",
             )
-            return
+            return False
         held_l = sum(1 for side in active_sides.values() if side == "LONG")
         held_s = sum(1 for side in active_sides.values() if side == "SHORT")
 
@@ -1189,14 +1191,14 @@ class CrossBot(FuturesBot):
         add_l, add_s = self._topup_counts(held_l, held_s, k,
                                           len(cand_l), len(cand_s))
         if add_l <= 0 and add_s <= 0:
-            return
+            return True
         lev = self._leverage()
         equity = self._equity()
         gross = equity * lev * max(0.0, min(1.0, book.exposure_mult))
         gross = min(gross, equity * max(0.0, self._f("MAX_GROSS_EXPOSURE_PCT", 100.0)) / 100.0)
         notional = (gross / 2.0) / k if k > 0 else 0.0
         if notional <= 0:
-            return
+            return False
         retained_gross = sum(active_notionals.values())
         new_count = add_l + add_s
         if new_count > 0:
@@ -1206,21 +1208,29 @@ class CrossBot(FuturesBot):
                 log_event(f"[{self.BOT_NAME}] top-up skipped: retained gross "
                           f"{retained_gross:.1f} already reaches cap "
                           f"{gross:.1f}", "WAIT")
-                return
-        log_event(f"[{self.BOT_NAME}] top-up {self._topup_attempts}/{self._topup_max}: "
+                return True
+        attempt_no = self._topup_attempts + 1
+        log_event(f"[{self.BOT_NAME}] top-up {attempt_no}/{self._topup_max}: "
                   f"book {held_l}L/{held_s}S -> adding {add_l}L/{add_s}S", "SCAN")
         self._rebalance_in_progress = True
         operation_raised = False
+        attempt_started = False
         try:
             for b in cand_l[:add_l]:
                 if self._shutdown_event.is_set():
-                    return
+                    return True
+                if not attempt_started:
+                    self._topup_attempts = attempt_no
+                    attempt_started = True
                 CrossBot._open_leg_with_quality(
                     self, b, sym_map[b], "LONG", notional, prices[b][-1],
                     lev, book, prices, k)
             for b in cand_s[:add_s]:
                 if self._shutdown_event.is_set():
-                    return
+                    return True
+                if not attempt_started:
+                    self._topup_attempts = attempt_no
+                    attempt_started = True
                 CrossBot._open_leg_with_quality(
                     self, b, sym_map[b], "SHORT", notional, prices[b][-1],
                     lev, book, prices, k)
@@ -1276,15 +1286,20 @@ class CrossBot(FuturesBot):
                     )
                 except Exception:
                     pass
+        return True
 
     #  REBALANCE loop (reuses the 'Scan' thread) 
     def _strategy_runtime_health(self) -> dict:
         errors = max(0, int(getattr(
             self, "_cross_scan_consecutive_errors", 0) or 0))
+        slot_persist_pending = (
+            getattr(self, "_rebalance_slot_persist_pending", None) is not None
+        )
         return {
-            "ok": errors == 0,
+            "ok": errors == 0 and not slot_persist_pending,
             "component": "cross_scan",
             "consecutive_errors": errors,
+            "rebalance_slot_persist_pending": slot_persist_pending,
             "last_operation": str(getattr(
                 self, "_cross_scan_last_operation", "") or ""),
             "last_error": str(getattr(
@@ -1378,20 +1393,33 @@ class CrossBot(FuturesBot):
                         log_event(f"[{self.BOT_NAME}] manual rebalance requested "
                                   f"- rebalancing now", "SCAN")
                     operation = "rebalance"
-                    self._rebalance_tick()
-                    self._record_cross_scan_success(operation)
+                    completed = self._rebalance_tick()
+                    if completed is not True:
+                        self._record_cross_scan_failure(
+                            operation,
+                            RuntimeError("rebalance incomplete"),
+                            redact=redact,
+                        )
+                    else:
+                        self._record_cross_scan_success(operation)
                 elif (self._should_topup()
                       and (now - self._last_topup_attempt) >= 290.0):
                     # Own throttle so a rebalance-due-but-throttled partial book
                     # still gets filled instead of waiting out the rebalance gap.
                     self._last_topup_attempt = now
-                    self._topup_attempts += 1
-                    log_event(f"[{self.BOT_NAME}] top-up {self._topup_attempts}/"
-                              f"{self._topup_max}: book has {len(CrossBot._active_legs(self))} "
+                    log_event(f"[{self.BOT_NAME}] top-up check: book has "
+                              f"{len(CrossBot._active_legs(self))} "
                               f"leg(s) under target - filling balanced pairs", "SCAN")
                     operation = "topup"
-                    self._topup_tick()
-                    self._record_cross_scan_success(operation)
+                    completed = self._topup_tick()
+                    if completed is not True:
+                        self._record_cross_scan_failure(
+                            operation,
+                            RuntimeError("topup incomplete"),
+                            redact=redact,
+                        )
+                    else:
+                        self._record_cross_scan_success(operation)
             except Exception as e:
                 self._record_cross_scan_failure(operation, e, redact=redact)
                 log_event(f"Cross rebalance error: {e}", "WARN")
@@ -1413,28 +1441,28 @@ class CrossBot(FuturesBot):
             return True
         return False
 
-    def _rebalance_tick(self) -> None:
+    def _rebalance_tick(self) -> bool:
         from core.logger import log_event, log_struct
         from trading.risk_manager import is_bot_paused
 
         if self.safe_mode is not None and self.safe_mode.is_active():
             log_event(f"[{self.BOT_NAME}] SAFE_MODE - rebalance skipped "
                       f"({self.safe_mode.reason()})", "WAIT")
-            return
+            return True
         paused, why = is_bot_paused(
             self.BOT_NAME, exchange=self.ex, simulation=self.simulation)
         if paused:
             log_event(f"[{self.BOT_NAME}] paused: {why}", "WAIT")
-            return
+            return True
 
         params = self._xsec_params()
         prices, sym_map = self._fetch_universe_prices(params.lookback_hours)
         if self._shutdown_event.is_set():
-            return
+            return True
         if not prices:
             log_event(f"[{self.BOT_NAME}] no universe data - rebalance skipped "
                       f"(book held)", "WARN")
-            return
+            return False
 
         # 1. realize the PnL of the CURRENT book for the crash-filter signal,
         #    BEFORE we change it (so the filter learns from what just happened).
@@ -1514,7 +1542,7 @@ class CrossBot(FuturesBot):
                 f"slot remains due",
                 "WARN",
             )
-            return
+            return False
         # Only a committed real rebalance starts a fresh in-slot top-up budget.
         self._topup_attempts = 0
         self._recent_rebalance_returns = staged_returns
@@ -1566,6 +1594,7 @@ class CrossBot(FuturesBot):
             if self._telegram_enabled():
                 log_event(f"[{self.BOT_NAME}] telegram rebalance summary failed: {_te}",
                           "WARN")
+        return True
 
     #  Universe + prices 
     def _fetch_universe_prices(self, lookback: int) -> Tuple[Dict[str, List[float]], Dict[str, str]]:
@@ -2196,6 +2225,7 @@ class CrossBot(FuturesBot):
             symbol=base,
             mode=entry_mode,
             features=expectancy_features,
+            venue_symbol=full,
         )
 
         if self.simulation:
@@ -2211,7 +2241,39 @@ class CrossBot(FuturesBot):
                     reason="invalid_sim_amount", direction=side)
                 return
             from bot_utils.fee_math import taker_fee_rate
-            fees = amount * fill * taker_fee_rate(self.ex, full)
+            fee_rate = taker_fee_rate(self.ex, full)
+            fees = amount * fill * fee_rate
+            try:
+                from bot_utils import futures_contract_size
+                from trading.candidate_microstructure import (
+                    capture_simulated_entry_tca,
+                )
+
+                contract_size = futures_contract_size(self.ex, full)
+                tca_amount = notional / (fill * contract_size)
+                tca_recorded = capture_simulated_entry_tca(
+                    exchange=self.ex,
+                    entry_id=entry_id,
+                    bot_name=self.BOT_NAME,
+                    mode=entry_mode,
+                    symbol=full,
+                    side="buy" if side == "LONG" else "sell",
+                    amount=tca_amount,
+                    fill_price=fill,
+                    fee_rate=fee_rate,
+                    notional_usdt=notional,
+                    depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
+                )
+                if not tca_recorded:
+                    silent_log(
+                        f"{self.BOT_NAME} {base} SIM TCA entry {entry_id}",
+                        RuntimeError("SIM TCA was not recorded"),
+                    )
+            except Exception as exc:
+                silent_log(
+                    f"{self.BOT_NAME} {base} SIM TCA dispatch {entry_id}",
+                    exc,
+                )
         else:
             #  LIVE: cross-margin market order 
             from bot_utils import (FuturesOrderNotSubmitted,
@@ -3614,13 +3676,13 @@ class CrossBot(FuturesBot):
             if self._shutdown_event.wait(timeout=interval):
                 return
 
-    def _check_daily_killswitch(self, trades: dict) -> None:
+    def _check_daily_killswitch(self, trades: dict) -> bool:
         """Flatten the book + SAFE_MODE when today's realized+unrealized PnL
         breaches MAX_DAILY_LOSS. Throttled to ~60s. One-shot SAFE_MODE then
         blocks the next rebalance from re-opening."""
         now = time.time()
         if now - getattr(self, "_last_ks_check", 0.0) < 60.0:
-            return
+            return True
         self._last_ks_check = now
         try:
             from core.database import get_today_pnl
@@ -3666,7 +3728,7 @@ class CrossBot(FuturesBot):
                     f"snapshot for {sorted(invalid_bases)} - decision skipped",
                     "ERROR",
                 )
-                return
+                return False
             today = get_today_pnl(self.BOT_NAME, mode_is_sim=self.simulation)
             realized = CrossBot._safe_float(
                 self, (today or {}).get("total_profit"), 0.0)
@@ -3699,8 +3761,12 @@ class CrossBot(FuturesBot):
                         self._close_leg(base, trades[base], reason="daily-loss killswitch")
                 if CrossBot._active_legs(self):
                     self._last_ks_check = 0.0
+                    return False
+            return True
         except Exception as e:
+            self._last_ks_check = 0.0
             self._log_error("cross daily killswitch", e)
+            return False
 
     def _monitor_tick(self) -> None:
         from core.database import upsert_futures_state
@@ -4022,12 +4088,23 @@ class CrossBot(FuturesBot):
             return
         self._last_neutrality_check = now
 
+        try:
+            completed = CrossBot._neutrality_guard_once(self)
+        except Exception:
+            self._last_neutrality_check = 0.0
+            raise
+        if not completed:
+            self._last_neutrality_check = 0.0
+
+    def _neutrality_guard_once(self) -> bool:
+        """Run one trim and report whether the neutrality check completed."""
+
         from core.logger import log_event
         from bot_utils.futures_math import calc_unrealized_pnl
 
         trades = CrossBot._active_legs(self)
         if not trades:
-            return
+            return True
         tol = max(0.0, self._f("CROSS_NEUTRALITY_TOL_PCT", 15.0)) / 100.0
 
         legs = []   # (base, side, notional, upnl, state_dict)
@@ -4077,11 +4154,11 @@ class CrossBot(FuturesBot):
                 f"snapshot for {sorted(invalid_bases)} - no trim attempted",
                 "ERROR",
             )
-            return
+            return False
         if not math.isfinite(gross) or not math.isfinite(net):
-            return
+            return False
         if gross <= 0 or abs(net) / gross <= tol:
-            return
+            return True
 
         # Cut the worst-performing leg on the CURRENT heavy side first. A
         # whole-leg close can overshoot through zero, so recompute the heavy
@@ -4116,3 +4193,5 @@ class CrossBot(FuturesBot):
                 f"{tol*100:.0f}%)",
                 "ERROR",
             )
+            return False
+        return True

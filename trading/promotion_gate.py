@@ -46,6 +46,41 @@ def _finite(value) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _control_float(value, name: str) -> float:
+    number = _finite(value)
+    if number is None:
+        raise ValueError(f"{name} must be finite")
+    return number
+
+
+def _positive_integer(value, name: str) -> int:
+    number = _control_float(value, name)
+    if number <= 0.0 or not number.is_integer():
+        raise ValueError(f"{name} must be a positive integer")
+    return int(number)
+
+
+def _unit_interval(value, name: str) -> float:
+    number = _control_float(value, name)
+    if not 0.0 <= number <= 1.0:
+        raise ValueError(f"{name} must be between zero and one")
+    return number
+
+
+def _evidence_nonnegative_integer(value) -> int | None:
+    number = _finite(value)
+    if number is None or number < 0.0 or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _evidence_unit_interval(value) -> float | None:
+    number = _finite(value)
+    if number is None or not 0.0 <= number <= 1.0:
+        return None
+    return number
+
+
 def evaluate_promotion(
     evidence: PromotionEvidence,
     *,
@@ -57,10 +92,30 @@ def evaluate_promotion(
     minimum_calibration_slope: float = 0.80,
     maximum_calibration_slope: float = 1.20,
 ) -> PromotionDecision:
+    minimum_samples = _positive_integer(minimum_samples, "minimum_samples")
+    minimum_shadow_days = _positive_integer(
+        minimum_shadow_days, "minimum_shadow_days"
+    )
+    maximum_brier = _unit_interval(maximum_brier, "maximum_brier")
+    maximum_ece = _unit_interval(maximum_ece, "maximum_ece")
+    minimum_calibration_slope = _control_float(
+        minimum_calibration_slope, "minimum_calibration_slope"
+    )
+    maximum_calibration_slope = _control_float(
+        maximum_calibration_slope, "maximum_calibration_slope"
+    )
+    if minimum_calibration_slope <= 0.0:
+        raise ValueError("minimum_calibration_slope must be positive")
+    if maximum_calibration_slope <= 0.0:
+        raise ValueError("maximum_calibration_slope must be positive")
+    if minimum_calibration_slope > maximum_calibration_slope:
+        raise ValueError("calibration_slope range must be ordered")
+    if not isinstance(explicit_manual_live_approval, bool):
+        raise ValueError("explicit_manual_live_approval must be boolean")
     reasons = []
-    if not evidence.causality_passed:
+    if evidence.causality_passed is not True:
         reasons.append("causality gate failed")
-    coverage = _finite(evidence.coverage)
+    coverage = _evidence_unit_interval(evidence.coverage)
     if coverage is None or coverage < 0.95:
         reasons.append("coverage below 95%")
     oos_net = _finite(evidence.oos_net)
@@ -72,35 +127,29 @@ def evaluate_promotion(
     confidence_lower_bound = _finite(evidence.confidence_lower_bound)
     if confidence_lower_bound is None or confidence_lower_bound <= 0.0:
         reasons.append("clustered confidence lower bound is not positive")
-    dsr = _finite(evidence.dsr)
+    dsr = _evidence_unit_interval(evidence.dsr)
     if dsr is None or dsr < 0.95:
         reasons.append("DSR below 0.95")
-    pbo = _finite(evidence.pbo)
+    pbo = _evidence_unit_interval(evidence.pbo)
     if pbo is None or pbo > 0.25:
         reasons.append("PBO above 0.25")
-    concentration = _finite(evidence.max_symbol_profit_share)
+    concentration = _evidence_unit_interval(evidence.max_symbol_profit_share)
     if concentration is None or concentration > 0.25:
         reasons.append("symbol concentration above 25%")
-    if not evidence.cost_stress_passed:
+    if evidence.cost_stress_passed is not True:
         reasons.append("cost stress failed")
-    try:
-        shadow_days = int(evidence.forward_shadow_days)
-    except (TypeError, ValueError, OverflowError):
-        shadow_days = -1
-    if shadow_days < minimum_shadow_days:
+    shadow_days = _evidence_nonnegative_integer(evidence.forward_shadow_days)
+    if shadow_days is None or shadow_days < minimum_shadow_days:
         reasons.append("forward shadow is too short")
-    try:
-        sample_count = int(evidence.sample_count)
-    except (TypeError, ValueError, OverflowError):
-        sample_count = -1
-    if sample_count < minimum_samples:
+    sample_count = _evidence_nonnegative_integer(evidence.sample_count)
+    if sample_count is None or sample_count < minimum_samples:
         reasons.append("sample count below minimum")
-    brier = _finite(evidence.calibration_brier)
+    brier = _evidence_unit_interval(evidence.calibration_brier)
     if brier is None:
         reasons.append("calibration Brier score unavailable")
     elif brier > maximum_brier:
         reasons.append("calibration Brier score too high")
-    ece = _finite(evidence.calibration_ece)
+    ece = _evidence_unit_interval(evidence.calibration_ece)
     if ece is None:
         reasons.append("calibration ECE unavailable")
     elif ece > maximum_ece:
@@ -114,21 +163,20 @@ def evaluate_promotion(
         <= maximum_calibration_slope
     ):
         reasons.append("calibration slope outside allowed range")
-    if not evidence.tail_risk_passed:
+    if evidence.tail_risk_passed is not True:
         reasons.append("tail-risk evidence failed")
-    if not evidence.capacity_passed:
+    if evidence.capacity_passed is not True:
         reasons.append("capacity evidence failed")
-    if not evidence.regime_stability_passed:
+    if evidence.regime_stability_passed is not True:
         reasons.append("regime stability failed")
-    if not evidence.parameter_stability_passed:
+    if evidence.parameter_stability_passed is not True:
         reasons.append("parameter stability failed")
-    if not evidence.multiple_testing_adjusted:
+    if evidence.multiple_testing_adjusted is not True:
         reasons.append("multiple-testing adjustment missing")
-    try:
-        experiment_trials = int(evidence.experiment_trials)
-    except (TypeError, ValueError, OverflowError):
-        experiment_trials = 0
-    if experiment_trials < 1:
+    experiment_trials = _evidence_nonnegative_integer(
+        evidence.experiment_trials
+    )
+    if experiment_trials is None or experiment_trials < 1:
         reasons.append("experiment trial count unavailable")
     research_passed = not reasons
     return PromotionDecision(

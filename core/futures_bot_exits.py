@@ -17,6 +17,7 @@ from core.logger import _date as _utc_now_str
 
 import math
 import time
+from decimal import Decimal, ROUND_DOWN
 
 from bot_utils import (
     budget_exhausted,
@@ -910,6 +911,26 @@ class FuturesExitsMixin:
                 trades = self.state.get_all()
                 now = time.time()
 
+  # Killswitch  ADAPTIVE cadence: normally 60s, but tighten to
+                # ~8s once today's loss is past 70% of the limit, so a fast 20%
+                # drop can't overshoot the cap between checks. This runs even
+                # with an empty book so a just-realized loss still blocks the
+                # next entry.
+                if (now - last_killswitch) >= ks_interval:
+                    ks_ok = self._check_killswitch(trades)
+                    if ks_ok is not False:
+                        last_killswitch = now
+                        try:
+                            _today = getattr(self, "_ks_last_total", 0.0)
+                            _maxloss = float(self.C("MAX_DAILY_LOSS", -30.0))
+                            ks_interval = (
+                                8.0
+                                if (_maxloss < 0 and _today <= _maxloss * 0.7)
+                                else KILLSWITCH_INTERVAL
+                            )
+                        except Exception:
+                            ks_interval = KILLSWITCH_INTERVAL
+
                 if not trades:
                     idle_ticks += 1
                     if now - last_idle_log >= 300:
@@ -937,20 +958,8 @@ class FuturesExitsMixin:
                             "WARN",
                         )
 
-  # Killswitch  ADAPTIVE cadence: normally 60s, but tighten to
-                # ~8s once today's loss is past 70% of the limit, so a fast 20%
-                # drop can't overshoot the cap between checks.
-                if (now - last_killswitch) >= ks_interval:
-                    last_killswitch = now
-                    self._check_killswitch(trades)
-                    try:
-                        _today = getattr(self, "_ks_last_total", 0.0)
-                        _maxloss = float(self.C("MAX_DAILY_LOSS", -30.0))
-                        ks_interval = (8.0 if (_maxloss < 0 and _today <= _maxloss * 0.7)
-                                       else KILLSWITCH_INTERVAL)
-                    except Exception:
-                        ks_interval = KILLSWITCH_INTERVAL
-
+                # Killswitch evaluation runs above the empty-book branch so
+                # realized losses remain protected without open positions.
                 # Periodic funding persistence: refresh funding_paid every ~4h
                 # (between Bitget's 8h settlements) so that even an API outage
                 # at the close call still has a recent value to fall back on
@@ -984,7 +993,7 @@ class FuturesExitsMixin:
 
   #  Killswitch 
 
-    def _check_killswitch(self, trades: dict) -> None:
+    def _check_killswitch(self, trades: dict) -> bool:
         """Two-tier daily-loss killswitch.
 
   SOFT tier (MAX_DAILY_LOSS): trigger SAFE_MODE  stop opening NEW
@@ -1001,7 +1010,8 @@ class FuturesExitsMixin:
             from core.database import get_today_pnl, opened_today_local
             from core.logger import log_event
             if not getattr(self, "safe_mode", None):
-                return  # bot not fully initialized yet
+                return True  # bot not fully initialized yet
+            retry_required = False
             pnl_info = get_today_pnl(self.BOT_NAME, mode_is_sim=self.simulation)
             today_realized = pnl_info.get("total_profit", 0.0)
             # Add unrealized from open positions (best-effort). Track two totals:
@@ -1080,6 +1090,7 @@ class FuturesExitsMixin:
                 if not self.state.get_all():
                     self._hard_kill_fired = True
                 else:
+                    retry_required = True
                     log_event(
                         "HARD KILLSWITCH: positions remain after flatten - "
                         "will retry on next tick", "WARN"
@@ -1123,11 +1134,14 @@ class FuturesExitsMixin:
                         if not self.state.get_all():
                             self._hard_kill_fired = True
                         else:
+                            retry_required = True
                             log_event(
                                 "SYSTEMIC KILLSWITCH: positions remain after "
                                 "flatten - will retry on next tick", "WARN")
+            return not retry_required
         except Exception as e:
             self._log_error("killswitch check", e)
+            return False
 
     def _killswitch_price(self, sym: str, d: dict, entry: float) -> float:
         """Best-effort fresh price for daily-loss killswitch accounting.
@@ -2247,7 +2261,14 @@ class FuturesExitsMixin:
                             )
                             return False
                     except Exception:
-                        partial_amount = round(raw_partial, 4)
+                        try:
+                            partial_amount = float(
+                                Decimal(str(raw_partial)).quantize(
+                                    Decimal("0.0001"), rounding=ROUND_DOWN
+                                )
+                            )
+                        except (TypeError, ValueError, ArithmeticError):
+                            partial_amount = 0.0
                 if partial_amount <= 0:
                     log_event(f"{sym}: partial amount below exchange minimum - skip", "WARN")
                     return False

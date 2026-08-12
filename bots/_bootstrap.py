@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
 
 BOT_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BOT_PROJECT_ROOT not in sys.path:
@@ -57,6 +60,46 @@ def require_portalocker(*, exit_on_missing: bool = False) -> None:
         if exit_on_missing:
             sys.exit(message)
         raise RuntimeError(message)
+
+
+@contextmanager
+def bot_instance_guard(bot_name: str) -> Iterator[None]:
+    """Hold one OS-backed singleton lock for a bot's complete run."""
+    normalized = str(bot_name or "").strip().upper()
+    if not normalized or any(
+        char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+        for char in normalized
+    ):
+        raise SystemExit("Invalid bot name for instance lock")
+
+    import portalocker
+
+    lock_path = (
+        Path(BOT_PROJECT_ROOT)
+        / "logs"
+        / f".{normalized.lower()}_instance.lock"
+    )
+    lock = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = portalocker.Lock(
+            str(lock_path),
+            mode="a+",
+            timeout=0.0,
+            check_interval=0.05,
+            fail_when_locked=True,
+        )
+        lock.acquire()
+    except (portalocker.LockException, OSError) as exc:
+        raise SystemExit(
+            f"{normalized}: instance lock unavailable; "
+            "another bot instance may already be running"
+        ) from exc
+    try:
+        yield
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 def guard_pre_start(bot_name: str) -> None:

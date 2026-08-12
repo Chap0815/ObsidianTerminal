@@ -16,9 +16,11 @@ Start:  python -m bots.main_bot_trendfut
 from __future__ import annotations
 
 try:
-    from bots._bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
+    from bots._bootstrap import (bot_instance_guard, guard_pre_start,
+                                 prepare_entrypoint, require_portalocker)
 except ModuleNotFoundError:
-    from _bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
+    from _bootstrap import (bot_instance_guard, guard_pre_start,
+                            prepare_entrypoint, require_portalocker)
 
 prepare_entrypoint(__file__, __name__)
 
@@ -113,8 +115,9 @@ class TrendFuturesLauncher(TrendFuturesBot):
 
 
 def run_bot():
-    guard_pre_start("FUTREND")
-    TrendFuturesLauncher(simulation=read_simulation_flag("FUTREND")).run()
+    with bot_instance_guard("FUTREND"):
+        guard_pre_start("FUTREND")
+        TrendFuturesLauncher(simulation=read_simulation_flag("FUTREND")).run()
 
 
 if __name__ == "__main__":

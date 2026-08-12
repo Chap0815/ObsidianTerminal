@@ -132,6 +132,15 @@ def _fallback_count(now: float) -> int:
         return sum(1 for t in _call_log_fallback if t >= cutoff)
 
 
+def _fallback_remaining(now: float) -> int:
+    """Conservative local share while the global ledger is unavailable."""
+    expected_consumers = _read_expected_bot_count()
+    per_process_cap = max(
+        1, MAX_API_CALLS_PER_MINUTE // expected_consumers
+    )
+    return max(0, per_process_cap - _fallback_count(now))
+
+
 def _db_available() -> bool:
     return time.monotonic() >= _db_failed_until
 
@@ -161,12 +170,14 @@ def record_api_call(endpoint: str = "") -> None:
         # the consume always succeeds. The real gate is ``budget_exhausted()``
         # which queries the count via a SELECT  this avoids races where
         # two bots both pass the gate and both consume.
-        check_and_consume_global_api(
+        result = check_and_consume_global_api(
             _resolve_bot_name(),
             endpoint=endpoint,
             max_per_minute=10_000_000,
             ok=1,
         )
+        if result is None:
+            _mark_db_failed()
     except Exception:
         _mark_db_failed()
 
@@ -197,6 +208,9 @@ def record_api_error(
                 _resolve_bot_name(),
                 endpoint=endpoint,
             )
+            if marked is None:
+                _mark_db_failed()
+                return
             if marked:
                 return
             # Preserve one-call/one-row accounting even if the reserved row
@@ -215,12 +229,14 @@ def record_api_error(
 
     try:
         from core.database import check_and_consume_global_api
-        check_and_consume_global_api(
+        result = check_and_consume_global_api(
             _resolve_bot_name(),
             endpoint=endpoint,
             max_per_minute=10_000_000,
             ok=0,
         )
+        if result is None:
+            _mark_db_failed()
     except Exception:
         _mark_db_failed()
 
@@ -230,13 +246,13 @@ def budget_remaining() -> int:
 
     Queries the shared SQLite counter when available. The launcher poller AND
     all bots contribute, so this number reflects the true global budget  not a
-    per-process illusion.
+    per-process illusion. During a DB outage it reports this process's
+    conservative share, matching ``try_consume_api_call``.
     """
     now_mono = time.monotonic()
 
     if not _db_available():
-        used = _fallback_count(now_mono)
-        return max(0, MAX_API_CALLS_PER_MINUTE - used)
+        return _fallback_remaining(now_mono)
 
     try:
         from core.database import _tight_connection
@@ -260,8 +276,7 @@ def budget_remaining() -> int:
         return max(0, MAX_API_CALLS_PER_MINUTE - count)
     except Exception:
         _mark_db_failed()
-        used = _fallback_count(now_mono)
-        return max(0, MAX_API_CALLS_PER_MINUTE - used)
+        return _fallback_remaining(now_mono)
 
 
 def budget_exhausted() -> bool:
@@ -334,7 +349,10 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
             max_per_minute=MAX_API_CALLS_PER_MINUTE,
             ok=ok,
             return_reservation=True,
+            critical=critical,
         )
+        if ok_call is None:
+            raise RuntimeError("global API budget gate unavailable")
         if ok_call:
             # Mirror to fallback so a sudden DB outage still has recent
             # data to estimate from.
@@ -345,11 +363,8 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
                 else None
             )
             return _result(True, row_id)
-        # budget exhausted (or lock-timeout fail-closed in the DB gate).
-        # Let exit-critical calls proceed regardless.
-        if critical:
-            _fallback_record(now_mono)
-            return _result(True)
+        # The durable gate records critical bypasses even above the normal cap,
+        # so False here is a genuine non-critical budget denial.
         return _result(False)
     except Exception:
         _mark_db_failed()

@@ -13,6 +13,23 @@ import math
 import time
 
 
+_STATUS_RETRY_SECONDS = 60.0
+
+
+def _log_status_report_error(context: str, exc: Exception) -> None:
+    try:
+        from bot_utils.silent_log import silent_log
+
+        silent_log(context, exc)
+    except Exception:
+        pass
+
+
+def _retry_timestamp(now: float, interval_sec: float) -> float:
+    retry_delay = min(_STATUS_RETRY_SECONDS, interval_sec)
+    return now - max(0.0, interval_sec - retry_delay)
+
+
 def _finite_float_or_none(value):
     if isinstance(value, bool):
         return None
@@ -78,17 +95,24 @@ def maybe_send_hourly_status(*, bot_name: str, is_futures: bool,
 
     Default cadence is every 3h (10800s) for all bots."""
     now = time.time()
+    interval = _finite_float_or_none(interval_sec)
+    if interval is None or interval < 0.0:
+        interval = 10800.0
+    previous = _finite_float_or_none(last_sent)
+    if previous is None:
+        previous = 0.0
     if simulation:
         return now
-    if now - last_sent < interval_sec:
-        return last_sent
+    if now - previous < interval:
+        return previous
 
     try:
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
         from core.logger import send_telegram
         from core.database import get_today_pnl
-    except Exception:
-        return now   # mark as sent so we don't hammer imports every 2s
+    except Exception as exc:
+        _log_status_report_error("3h status imports", exc)
+        return _retry_timestamp(now, interval)
 
     try:
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -97,17 +121,22 @@ def maybe_send_hourly_status(*, bot_name: str, is_futures: bool,
         snapshot = state.get_all() if state is not None else {}
         lines, unreal = _positions_summary(snapshot, is_futures)
 
-        realized = 0.0
+        realized = None
         try:
-            realized = float(get_today_pnl(
+            realized = _finite_float_or_none(get_today_pnl(
                 bot_name, mode_is_sim=simulation).get("total_profit", 0.0) or 0.0)
-        except Exception:
-            pass
+            if realized is None:
+                raise ValueError("today PnL is not finite")
+        except Exception as exc:
+            _log_status_report_error("3h status realized PnL", exc)
 
         mode = "SIM" if simulation else "LIVE"
         sm = "  SAFE_MODE" if safe_mode_active else ""
+        realized_text = (
+            f"{realized:+.2f} USDT" if realized is not None else "unknown"
+        )
         header = (f" [{bot_name}] status 3h ({mode}){sm}\n"
-                  f"Open: {len(lines)}  Realized today: {realized:+.2f} USDT\n"
+                  f"Open: {len(lines)}  Realized today: {realized_text}\n"
                   f"Unrealized: {unreal:+.2f} USDT")
         # Cap the position list so a big book can't blow past Telegram's
         # message limit; the total still reflects ALL positions.
@@ -117,8 +146,11 @@ def maybe_send_hourly_status(*, bot_name: str, is_futures: bool,
             body += f"\n (+{len(lines) - MAX_LINES} more)"
         msg = header + ("\n" + body if body else "\n(no open positions)")
 
-        send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
-    except Exception:
+        accepted = send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
+        if accepted is False:
+            raise RuntimeError("3h status Telegram message was not accepted")
+    except Exception as exc:
         # Never let a status-report problem disturb the heartbeat loop.
-        pass
+        _log_status_report_error("3h status send", exc)
+        return _retry_timestamp(now, interval)
     return now

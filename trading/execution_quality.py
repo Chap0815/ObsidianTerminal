@@ -8,12 +8,14 @@ import time
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Callable, Mapping, Sequence
 
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.silent_log import silent_log
 
 
+_MARKOUT_LOCK_TTL_SECONDS = 120
 _MEXC_FEE_TRUTH_LOCK = threading.Lock()
 _MEXC_FEE_TRUTHS: weakref.WeakKeyDictionary[
     object, OrderedDict[str, FeeTruth]
@@ -23,6 +25,10 @@ _MEXC_FEE_TRUTH_FALLBACK: OrderedDict[
 ] = OrderedDict()
 _MEXC_FEE_TRUTH_FALLBACK_MAX = 512
 _MEXC_FEE_TRUTH_PER_EXCHANGE_MAX = 512
+
+
+def _markout_now_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def _finite_or_none(value) -> float | None:
@@ -436,7 +442,12 @@ def compute_fill_tca(
     )
 
 
-def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
+def process_due_tca_markouts(
+    exchange,
+    *,
+    limit: int = 25,
+    lock_state_callback: Callable[[str], None] | None = None,
+) -> int:
     """Measure persisted post-fill markouts; failed reads remain retryable."""
     from core.database import (
         acquire_advisory_lock,
@@ -445,7 +456,9 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
         fail_execution_markout,
         fail_simulated_execution_markout,
         list_due_execution_markouts,
+        quarantine_execution_markout,
         release_advisory_lock,
+        renew_advisory_lock,
     )
 
     completed = 0
@@ -453,16 +466,53 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
     holder_id = (
         f"markout:{threading.get_native_id()}:{time.monotonic_ns()}"
     )
+    lock_name = "execution_markout_worker"
+    # Trading REST calls are bounded at 10s and SQLite waits at 20s. Renewals
+    # bracket every row/persistence step; 120s keeps ample contention headroom
+    # while bounding hard-crash failover to roughly two minutes.
+    lock_ttl_seconds = _MARKOUT_LOCK_TTL_SECONDS
+
+    def _report_lock_state(state: str) -> None:
+        if lock_state_callback is None:
+            return
+        try:
+            lock_state_callback(state)
+        except Exception as exc:
+            silent_log("report TCA markout lock state", exc)
+
+    _report_lock_state("starting")
+
+    def _renew_worker_lease(stage: str) -> bool:
+        try:
+            renewed = renew_advisory_lock(
+                lock_name,
+                holder_id,
+                ttl_sec=lock_ttl_seconds,
+            )
+        except Exception as exc:
+            silent_log(f"renew TCA markout worker lock ({stage})", exc)
+            return False
+        if not renewed:
+            silent_log(
+                f"renew TCA markout worker lock ({stage})",
+                RuntimeError("worker lease lost"),
+            )
+            return False
+        return True
+
     try:
         if not acquire_advisory_lock(
-            "execution_markout_worker",
+            lock_name,
             holder_id,
-            ttl_sec=600,
+            ttl_sec=lock_ttl_seconds,
         ):
+            _report_lock_state("contended")
             return 0
     except Exception as exc:
+        _report_lock_state("error")
         silent_log("acquire TCA markout worker lock", exc)
         return 0
+    _report_lock_state("acquired")
 
     try:
         try:
@@ -471,10 +521,26 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
             silent_log("read due TCA markouts", exc)
             return 0
 
+        ticker_marks: dict[str, tuple[float, datetime]] = {}
         for row in due_rows[:row_limit]:
+            if not _renew_worker_lease("before_row"):
+                break
+            queue_rowid = None
+            telemetry_scope = ""
+            due_at_text = None
+            due_at_utc = None
             try:
                 if not isinstance(row, Mapping):
                     raise ValueError("markout row must be a mapping")
+                telemetry_scope = str(
+                    row.get("telemetry_scope") or ""
+                ).strip().upper()
+                raw_queue_rowid = row.get("queue_rowid")
+                queue_rowid = _nonnegative_integer_or_none(raw_queue_rowid)
+                if raw_queue_rowid is not None and (
+                    queue_rowid is None or queue_rowid <= 0
+                ):
+                    raise ValueError("markout queue rowid is invalid")
                 raw_intent_id = row.get("intent_id")
                 if raw_intent_id is None or isinstance(raw_intent_id, bool):
                     raise ValueError("markout intent id is invalid")
@@ -484,8 +550,56 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
                 )
                 if not intent_id or horizon is None or horizon <= 0:
                     raise ValueError("markout identity or horizon is invalid")
+                raw_attempts = row.get("attempts")
+                prior_attempts = _nonnegative_integer_or_none(raw_attempts)
+                if queue_rowid is not None and prior_attempts is None:
+                    raise ValueError("markout attempts is invalid")
+                prior_attempts = prior_attempts or 0
+                if queue_rowid is not None:
+                    for field_name, optional in (
+                        ("due_at", False),
+                        ("next_attempt_at", True),
+                    ):
+                        raw_timestamp = row.get(field_name)
+                        if raw_timestamp is None and optional:
+                            continue
+                        if not isinstance(raw_timestamp, str):
+                            raise ValueError(
+                                f"markout {field_name} is invalid"
+                            )
+                        try:
+                            parsed_datetime = datetime.strptime(
+                                raw_timestamp, "%Y-%m-%d %H:%M:%S"
+                            )
+                            parsed_timestamp = parsed_datetime.strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
+                        except (TypeError, ValueError, OverflowError) as exc:
+                            raise ValueError(
+                                f"markout {field_name} is invalid"
+                            ) from exc
+                        if parsed_timestamp != raw_timestamp:
+                            raise ValueError(
+                                f"markout {field_name} is invalid"
+                            )
+                        if field_name == "due_at":
+                            due_at_text = parsed_timestamp
+                            due_at_utc = parsed_datetime.replace(
+                                tzinfo=timezone.utc
+                            )
             except Exception as exc:
                 silent_log("invalid due TCA markout row", exc)
+                if queue_rowid is not None and telemetry_scope in {"LIVE", "SIM"}:
+                    try:
+                        quarantine_execution_markout(
+                            telemetry_scope,
+                            queue_rowid,
+                            f"{type(exc).__name__}: {exc}",
+                        )
+                    except Exception as persist_exc:
+                        silent_log(
+                            "quarantine invalid TCA markout row", persist_exc
+                        )
                 continue
 
             is_simulated = (
@@ -505,18 +619,52 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
                 normalized_side = _normalized_side_or_none(row.get("side"))
                 if normalized_side is None:
                     raise ValueError("markout side is invalid")
-                if not try_consume_api_call("execution_markout_fetch_ticker"):
-                    break
-                ticker = exchange.fetch_ticker(symbol.strip())
-                if not isinstance(ticker, Mapping):
-                    raise _RetryableMarkoutError("ticker payload unavailable")
-                mark = _first_positive_finite(
-                    ticker.get("mark"),
-                    ticker.get("last"),
-                    ticker.get("close"),
+                previous_error = str(row.get("last_error") or "").strip()
+                error_name, error_separator, _error_detail = (
+                    previous_error.partition(":")
                 )
-                if mark is None:
-                    raise _RetryableMarkoutError("mark price unavailable")
+                error_name = error_name.strip()[:100]
+                previous_error_type = (
+                    error_name
+                    if error_separator and error_name.isidentifier()
+                    else ""
+                )
+                symbol_key = symbol.strip()
+                ticker_observation = ticker_marks.get(symbol_key)
+                if ticker_observation is None:
+                    if not try_consume_api_call(
+                        "execution_markout_fetch_ticker"
+                    ):
+                        break
+                    ticker = exchange.fetch_ticker(symbol_key)
+                    if not isinstance(ticker, Mapping):
+                        raise _RetryableMarkoutError(
+                            "ticker payload unavailable"
+                        )
+                    mark = _first_positive_finite(
+                        ticker.get("mark"),
+                        ticker.get("last"),
+                        ticker.get("close"),
+                    )
+                    if mark is None:
+                        raise _RetryableMarkoutError(
+                            "mark price unavailable"
+                        )
+                    observed_at_utc = _markout_now_utc()
+                    if not isinstance(observed_at_utc, datetime):
+                        raise ValueError("markout observation time is invalid")
+                    if observed_at_utc.tzinfo is None:
+                        observed_at_utc = observed_at_utc.replace(
+                            tzinfo=timezone.utc
+                        )
+                    observed_at_utc = observed_at_utc.astimezone(
+                        timezone.utc
+                    ).replace(microsecond=0)
+                    ticker_observation = (mark, observed_at_utc)
+                    ticker_marks[symbol_key] = ticker_observation
+                else:
+                    mark, observed_at_utc = ticker_observation
+                observed_at = observed_at_utc.strftime("%Y-%m-%d %H:%M:%S")
                 sign = 1.0 if normalized_side == "buy" else -1.0
                 markout_bps = (
                     sign * (mark - reference) / reference * 10_000.0
@@ -528,8 +676,23 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
                     "reference_price": reference,
                     "mark_price": mark,
                     "markout_bps": markout_bps,
+                    "attempt_number": prior_attempts + 1,
+                    "recovered_after_retry": prior_attempts > 0,
                 }
+                if due_at_utc is not None and due_at_text is not None:
+                    payload.update({
+                        "due_at": due_at_text,
+                        "observed_at": observed_at,
+                        "measurement_lag_seconds": max(
+                            0.0,
+                            (observed_at_utc - due_at_utc).total_seconds(),
+                        ),
+                    })
+                if previous_error_type:
+                    payload["previous_error_type"] = previous_error_type
             except Exception as exc:
+                if not _renew_worker_lease("before_failure_persist"):
+                    break
                 failure_persisted = False
                 try:
                     fail_markout(
@@ -545,6 +708,8 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
                     break
                 continue
 
+            if not _renew_worker_lease("before_completion_persist"):
+                break
             complete_markout = (
                 complete_simulated_execution_markout
                 if is_simulated else complete_execution_markout
@@ -557,13 +722,43 @@ def process_due_tca_markouts(exchange, *, limit: int = 25) -> int:
                     markout_bps=markout_bps,
                     tca_stage=f"markout_{horizon}s",
                     tca_payload=payload,
+                    measured_at=observed_at,
                 ):
                     completed += 1
             except Exception as persist_exc:
                 silent_log("persist completed TCA markout", persist_exc)
+                if not _renew_worker_lease("before_completion_failure_persist"):
+                    break
+                failure_persisted = False
+                try:
+                    fail_markout(
+                        intent_id,
+                        horizon,
+                        (
+                            "PersistenceError: "
+                            f"{type(persist_exc).__name__}: {persist_exc}"
+                        ),
+                        retryable=True,
+                    )
+                    failure_persisted = True
+                except Exception as failure_exc:
+                    silent_log(
+                        "persist TCA markout completion retry", failure_exc
+                    )
+                if not failure_persisted:
+                    break
         return completed
     finally:
-        release_advisory_lock("execution_markout_worker", holder_id)
+        try:
+            released = release_advisory_lock(lock_name, holder_id)
+        except Exception as exc:
+            released = False
+            release_error = exc
+        else:
+            release_error = RuntimeError("worker lease release returned false")
+        if not released:
+            _report_lock_state("release_failed")
+            silent_log("release TCA markout worker lock", release_error)
 
 
 def run_tca_markout_worker(
@@ -610,9 +805,36 @@ def run_tca_markout_worker(
         except Exception as exc:
             silent_log("report TCA markout worker health", exc)
 
+    def _scope_health(summary: Mapping) -> dict[str, dict]:
+        raw_scopes = summary.get("scopes")
+        raw_scopes = raw_scopes if isinstance(raw_scopes, Mapping) else {}
+        result = {}
+        for scope in ("LIVE", "SIM"):
+            raw = raw_scopes.get(scope)
+            raw = raw if isinstance(raw, Mapping) else {}
+            try:
+                due = max(0, int(raw.get("due_count") or 0))
+            except (TypeError, ValueError, OverflowError):
+                due = 0
+            overdue = _finite_or_none(raw.get("oldest_overdue_seconds"))
+            oldest = raw.get("oldest_due_at")
+            result[scope] = {
+                "due_count": due,
+                "oldest_due_at": str(oldest)[:32] if oldest else None,
+                "oldest_overdue_seconds": max(0.0, overdue or 0.0),
+                "timestamps_valid": raw.get("timestamps_valid", True) is True,
+            }
+        return result
+
+    polls_total = 0
+    completed_total = 0
+    errors_total = 0
+    last_completed_wall_ts = None
+
     try:
         while not shutdown_event.is_set():
             wait_interval = interval
+            polls_total += 1
             try:
                 summary = execution_markout_due_summary()
                 due_count = max(0, int(summary.get("due_count") or 0))
@@ -620,36 +842,88 @@ def run_tca_markout_worker(
                     summary.get("oldest_overdue_seconds")
                 )
                 oldest_overdue = max(0.0, oldest_overdue or 0.0)
-                completed = 0
+                timestamps_valid = summary.get("timestamps_valid", True) is True
+                scopes = _scope_health(summary)
+                completed_batch = 0
+                batch_lock_state = "idle"
                 if due_count > 0:
-                    completed = process_due_tca_markouts(
-                        exchange, limit=row_limit
+                    batch_lock_state = "unknown"
+
+                    def _receive_lock_state(state: str) -> None:
+                        nonlocal batch_lock_state
+                        batch_lock_state = state
+
+                    completed_batch = process_due_tca_markouts(
+                        exchange,
+                        limit=row_limit,
+                        lock_state_callback=_receive_lock_state,
                     )
-                    if completed <= 0:
+                    if completed_batch > 0:
+                        completed_total += completed_batch
+                        last_completed_wall_ts = time.time()
+
+                    # Processing may complete rows or schedule retries without
+                    # increasing the completion count. Re-read the runnable
+                    # queue so health/backoff describe the post-attempt state.
+                    summary = execution_markout_due_summary()
+                    due_count = max(0, int(summary.get("due_count") or 0))
+                    oldest_overdue = _finite_or_none(
+                        summary.get("oldest_overdue_seconds")
+                    )
+                    oldest_overdue = max(0.0, oldest_overdue or 0.0)
+                    timestamps_valid = (
+                        summary.get("timestamps_valid", True) is True
+                    )
+                    scopes = _scope_health(summary)
+                    if due_count > 0 and completed_batch <= 0:
                         # Lock contention, API-budget denial and transient
                         # failures all leave runnable rows behind. Avoid a
                         # cross-process write/budget hot loop in those cases.
                         wait_interval = max(interval, 5.0)
-                overdue_without_progress = (
+                overdue_queue = (
                     due_count > 0
-                    and completed <= 0
-                    and oldest_overdue > overdue_limit
+                    and batch_lock_state != "contended"
+                    and (
+                        not timestamps_valid
+                        or oldest_overdue > overdue_limit
+                    )
                 )
+                lock_unhealthy = batch_lock_state in {
+                    "error",
+                    "release_failed",
+                }
+                if lock_unhealthy:
+                    errors_total += 1
+                if batch_lock_state == "release_failed":
+                    health_reason = "worker_lock_release_failed"
+                elif batch_lock_state == "error":
+                    health_reason = "worker_lock_error"
+                elif overdue_queue and not timestamps_valid:
+                    health_reason = "due_queue_time_invalid"
+                elif overdue_queue:
+                    health_reason = "due_queue_overdue"
+                else:
+                    health_reason = ""
                 _report_health({
-                    "ok": not overdue_without_progress,
-                    "reason": (
-                        "due_queue_overdue"
-                        if overdue_without_progress
-                        else ""
-                    ),
+                    "ok": not overdue_queue and not lock_unhealthy,
+                    "reason": health_reason,
                     "due_count": due_count,
                     "oldest_due_at": summary.get("oldest_due_at"),
                     "oldest_overdue_seconds": oldest_overdue,
-                    "completed": completed,
+                    "timestamps_valid": timestamps_valid,
+                    "scopes": scopes,
+                    "completed": completed_batch,
+                    "completed_batch": completed_batch,
+                    "completed_total": completed_total,
+                    "polls_total": polls_total,
+                    "errors_total": errors_total,
+                    "last_completed_wall_ts": last_completed_wall_ts,
                     "last_poll_monotonic": time.monotonic(),
                     "last_poll_wall_ts": time.time(),
+                    "lock_state": batch_lock_state,
                 })
             except Exception as exc:
+                errors_total += 1
                 silent_log("execution TCA markout worker", exc)
                 wait_interval = max(interval, 5.0)
                 _report_health({
@@ -659,14 +933,29 @@ def run_tca_markout_worker(
                     "due_count": 0,
                     "oldest_due_at": None,
                     "oldest_overdue_seconds": 0.0,
+                    "timestamps_valid": False,
+                    "scopes": _scope_health({}),
                     "completed": 0,
+                    "completed_batch": 0,
+                    "completed_total": completed_total,
+                    "polls_total": polls_total,
+                    "errors_total": errors_total,
+                    "last_completed_wall_ts": last_completed_wall_ts,
                     "last_poll_monotonic": time.monotonic(),
                     "last_poll_wall_ts": time.time(),
+                    "lock_state": "error",
                 })
             if shutdown_event.wait(wait_interval):
                 break
     finally:
-        close_thread_local_conn()
+        try:
+            db_closed = close_thread_local_conn()
+            if db_closed is False:
+                raise RuntimeError(
+                    "markout SQLite connection remains open after retries"
+                )
+        except Exception as exc:
+            silent_log("close TCA markout SQLite connection", exc)
         close_clone = getattr(exchange, "close_current_thread_clone", None)
         if callable(close_clone):
             try:

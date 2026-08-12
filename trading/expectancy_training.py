@@ -13,6 +13,77 @@ import numpy as np
 from trading.profit_experiments import LinearExpectancyModel
 
 
+def _positive_integer(value, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if not math.isfinite(number) or number <= 0.0 or not number.is_integer():
+        raise ValueError(f"{name} must be a positive integer")
+    return int(number)
+
+
+def normalize_walk_forward_sizes(min_train, test_size) -> tuple[int, int]:
+    normalized_min_train = _positive_integer(min_train, "min_train")
+    normalized_test_size = _positive_integer(test_size, "test_size")
+    if normalized_min_train < 30:
+        raise ValueError("min_train must be at least 30")
+    return normalized_min_train, normalized_test_size
+
+
+def normalize_calibration_controls(
+    calibration_fraction, min_calibration
+) -> tuple[float, int]:
+    if isinstance(calibration_fraction, bool):
+        raise ValueError(
+            "calibration_fraction must be between 0.05 and 0.50"
+        )
+    try:
+        normalized_fraction = float(calibration_fraction)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "calibration_fraction must be between 0.05 and 0.50"
+        ) from exc
+    if (
+        not math.isfinite(normalized_fraction)
+        or not 0.05 <= normalized_fraction <= 0.50
+    ):
+        raise ValueError(
+            "calibration_fraction must be between 0.05 and 0.50"
+        )
+    normalized_minimum = _positive_integer(
+        min_calibration, "min_calibration"
+    )
+    if normalized_minimum < 20:
+        raise ValueError("min_calibration must be at least 20")
+    return normalized_fraction, normalized_minimum
+
+
+def normalize_feature_order(feature_order) -> tuple[str, ...]:
+    if isinstance(feature_order, (str, bytes)):
+        raise ValueError("feature_order must contain unique non-empty strings")
+    try:
+        normalized = tuple(feature_order)
+    except TypeError as exc:
+        raise ValueError(
+            "feature_order must contain unique non-empty strings"
+        ) from exc
+    if (
+        not normalized
+        or any(
+            not isinstance(name, str)
+            or not name.strip()
+            or name != name.strip()
+            for name in normalized
+        )
+        or len(set(normalized)) != len(normalized)
+    ):
+        raise ValueError("feature_order must contain unique non-empty strings")
+    return normalized
+
+
 @dataclass(frozen=True)
 class CandidateLabel:
     candidate_time: datetime
@@ -69,6 +140,15 @@ def _validate_rows(
     for row in rows:
         if row.label_closed_time is None or row.net_return_bps is None:
             raise ValueError("training requires complete closed labels")
+        if (
+            not isinstance(row.candidate_time, datetime)
+            or row.candidate_time.tzinfo is None
+            or row.candidate_time.utcoffset() is None
+            or not isinstance(row.label_closed_time, datetime)
+            or row.label_closed_time.tzinfo is None
+            or row.label_closed_time.utcoffset() is None
+        ):
+            raise ValueError("training requires timezone-aware timestamps")
         try:
             values = [float(row.features[name]) for name in feature_order]
             outcome = float(row.net_return_bps)
@@ -120,17 +200,39 @@ def _fit_model(
     targets = np.asarray(
         [float(row.net_return_bps) for row in fitting_rows], dtype=float
     )
-    means = matrix.mean(axis=0)
-    scales = matrix.std(axis=0)
-    scales[scales < 1e-12] = 1.0
-    normalized = (matrix - means) / scales
+    magnitudes = np.max(np.abs(matrix), axis=0)
+    divisors = np.where(magnitudes > 0.0, magnitudes, 1.0)
+    scaled = matrix / divisors
+    scaled_means = scaled.mean(axis=0)
+    scaled_scales = scaled.std(axis=0)
+    scaled_scales[scaled_scales < 1e-12] = 1.0
+    means = scaled_means * divisors
+    scales = scaled_scales * divisors
+    normalized = (scaled - scaled_means) / scaled_scales
+    if not all(
+        np.all(np.isfinite(values))
+        for values in (means, scales, normalized)
+    ):
+        raise ValueError("feature normalization must remain finite")
     design = np.column_stack([np.ones(len(fitting_rows)), normalized])
-    penalty = np.eye(design.shape[1]) * max(0.0, float(ridge))
-    penalty[0, 0] = 0.0
-    coefficients = np.linalg.solve(
-        design.T @ design + penalty,
-        design.T @ targets,
+    target_magnitude = float(np.max(np.abs(targets)))
+    target_divisor = target_magnitude if target_magnitude > 0.0 else 1.0
+    scaled_targets = targets / target_divisor
+    regularizer = np.eye(design.shape[1]) * math.sqrt(ridge)
+    regularizer[0, 0] = 0.0
+    augmented_design = np.vstack([design, regularizer])
+    augmented_targets = np.concatenate(
+        [scaled_targets, np.zeros(design.shape[1])]
     )
+    try:
+        scaled_coefficients = np.linalg.lstsq(
+            augmented_design, augmented_targets, rcond=None
+        )[0]
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("ridge least-squares fit failed") from exc
+    coefficients = scaled_coefficients * target_divisor
+    if not np.all(np.isfinite(coefficients)):
+        raise ValueError("ridge coefficients must remain finite")
     calibration_matrix = np.asarray(
         [
             [float(row.features[name]) for name in feature_order]
@@ -138,14 +240,25 @@ def _fit_model(
         ],
         dtype=float,
     )
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        calibration_normalized = (
+            calibration_matrix / divisors - scaled_means
+        ) / scaled_scales
+    if not np.all(np.isfinite(calibration_normalized)):
+        raise ValueError("feature normalization must remain finite")
     calibration_design = np.column_stack(
-        [np.ones(len(calibration_rows)), (calibration_matrix - means) / scales]
+        [np.ones(len(calibration_rows)), calibration_normalized]
     )
-    raw_scores = calibration_design @ coefficients
+    raw_scores_scaled = calibration_design @ scaled_coefficients
+    if not np.all(np.isfinite(raw_scores_scaled)):
+        raise ValueError("calibration scores must remain finite")
     labels = np.asarray(
         [float(row.net_return_bps) > 0.0 for row in calibration_rows], dtype=float
     )
-    platt_intercept, platt_scale = _fit_platt(raw_scores, labels)
+    platt_intercept, scaled_platt_scale = _fit_platt(
+        raw_scores_scaled, labels
+    )
+    platt_scale = scaled_platt_scale / target_divisor
     fingerprint = hashlib.sha256(
         json.dumps(
             {
@@ -177,31 +290,58 @@ def _fit_model(
 
 
 def _fit_platt(scores: np.ndarray, labels: np.ndarray) -> tuple[float, float]:
+    if (
+        scores.ndim != 1
+        or labels.ndim != 1
+        or len(scores) != len(labels)
+        or not len(scores)
+        or not np.all(np.isfinite(scores))
+        or not np.all(np.isfinite(labels))
+    ):
+        raise ValueError("probability calibration inputs must be finite")
+    if not np.any(labels == 0.0) or not np.any(labels == 1.0):
+        raise ValueError("probability calibration requires both outcome classes")
+    score_magnitude = float(np.max(np.abs(scores)))
+    score_divisor = score_magnitude if score_magnitude > 0.0 else 1.0
+    normalized_scores = scores / score_divisor
     intercept = math.log((labels.sum() + 1.0) / ((1.0 - labels).sum() + 1.0))
     scale = 0.0
-    learning_rate = 0.01 / max(1.0, float(np.std(scores)))
+    learning_rate = 0.01 / max(1.0, float(np.std(normalized_scores)))
     for _ in range(1_000):
-        logits = np.clip(intercept + scale * scores, -35.0, 35.0)
+        logits = np.clip(intercept + scale * normalized_scores, -35.0, 35.0)
         probabilities = 1.0 / (1.0 + np.exp(-logits))
         errors = probabilities - labels
         intercept -= learning_rate * float(errors.mean())
-        scale -= learning_rate * float((errors * scores).mean())
-    return float(intercept), float(scale)
+        scale -= learning_rate * float((errors * normalized_scores).mean())
+    return float(intercept), float(scale / score_divisor)
 
 
 def _predict(model: LinearExpectancyModel, row: CandidateLabel) -> tuple[float, float]:
     values = np.asarray([float(row.features[name]) for name in model.feature_order])
     if model.feature_means:
-        values = (values - np.asarray(model.feature_means)) / np.asarray(
-            model.feature_scales
+        means = np.asarray(model.feature_means)
+        scales = np.asarray(model.feature_scales)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            normalized = (values - means) / scales
+            alternate = values / scales - means / scales
+        values = np.where(np.isfinite(normalized), normalized, alternate)
+        if not np.all(np.isfinite(values)):
+            raise ValueError("prediction normalization must remain finite")
+    with np.errstate(over="ignore", invalid="ignore"):
+        expected = model.intercept + float(
+            np.dot(values, model.coefficients)
         )
-    expected = model.intercept + float(np.dot(values, model.coefficients))
-    logit = np.clip(
-        model.probability_intercept + model.probability_scale * expected,
-        -35.0,
-        35.0,
-    )
-    return expected, float(1.0 / (1.0 + np.exp(-logit)))
+        raw_logit = (
+            model.probability_intercept
+            + model.probability_scale * expected
+        )
+    if not math.isfinite(expected) or not math.isfinite(raw_logit):
+        raise ValueError("prediction arithmetic must remain finite")
+    logit = np.clip(raw_logit, -35.0, 35.0)
+    probability = float(1.0 / (1.0 + np.exp(-logit)))
+    if not math.isfinite(probability):
+        raise ValueError("prediction arithmetic must remain finite")
+    return expected, probability
 
 
 def _calibration_metrics(
@@ -256,13 +396,20 @@ def expanding_walk_forward_fit(
     calibration_fraction: float = 0.20,
     min_calibration: int = 30,
 ) -> WalkForwardResult:
+    min_train, test_size = normalize_walk_forward_sizes(min_train, test_size)
+    calibration_fraction, min_calibration = normalize_calibration_controls(
+        calibration_fraction, min_calibration
+    )
+    feature_order = normalize_feature_order(feature_order)
+    if not isinstance(purge, timedelta) or purge < timedelta(0):
+        raise ValueError("purge must be non-negative")
+    try:
+        ridge_value = float(ridge)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ridge must be finite and non-negative") from exc
+    if isinstance(ridge, bool) or not math.isfinite(ridge_value) or ridge_value < 0.0:
+        raise ValueError("ridge must be finite and non-negative")
     validated = _validate_rows(rows, feature_order)
-    if min_train < 30 or test_size < 1:
-        raise ValueError("invalid walk-forward sizes")
-    if not 0.05 <= float(calibration_fraction) <= 0.50:
-        raise ValueError("calibration_fraction must be between 0.05 and 0.50")
-    if min_calibration < 20:
-        raise ValueError("min_calibration must be at least 20")
     if len(validated) < min_train + test_size:
         raise ValueError("insufficient labeled candidates for walk-forward")
     folds = []
@@ -272,7 +419,10 @@ def expanding_walk_forward_fit(
         test_rows = validated[test_start_index : test_start_index + test_size]
         if not test_rows:
             break
-        cutoff = test_rows[0].candidate_time - purge
+        try:
+            cutoff = test_rows[0].candidate_time - purge
+        except OverflowError as exc:
+            raise ValueError("purge exceeds candidate timestamp range") from exc
         training = [
             row
             for row in validated[:test_start_index]
@@ -286,7 +436,7 @@ def expanding_walk_forward_fit(
             calibration_fraction=calibration_fraction,
             min_calibration=min_calibration,
         )
-        model = _fit_model(fitting, calibration, feature_order, ridge)
+        model = _fit_model(fitting, calibration, feature_order, ridge_value)
         for row in test_rows:
             expected, probability = _predict(model, row)
             predictions.append(
@@ -321,7 +471,7 @@ def expanding_walk_forward_fit(
         min_calibration=min_calibration,
     )
     final_model = _fit_model(
-        final_fitting, final_calibration, feature_order, ridge
+        final_fitting, final_calibration, feature_order, ridge_value
     )
     metrics = _calibration_metrics(predictions)
     return WalkForwardResult(

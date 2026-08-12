@@ -841,6 +841,7 @@ class FuturesScanMixin:
             symbol=sym,
             mode=entry_mode,
             features=expectancy_features,
+            venue_symbol=symbol_full,
         )
 
         from trading.expectancy_runtime import evaluate_runtime_expectancy

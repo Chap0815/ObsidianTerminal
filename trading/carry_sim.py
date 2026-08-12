@@ -61,10 +61,16 @@ class CarryEngine:
 
     def start(self, campaign_id: str, terms: CarryTerms) -> CarryCampaign:
         try:
+            if isinstance(terms.expected_funding_rate, bool):
+                raise ValueError("boolean funding")
             funding_rate = float(terms.expected_funding_rate)
-            notional = float(terms.notional_usdt)
         except (TypeError, ValueError, OverflowError):
             funding_rate = math.nan
+        try:
+            if isinstance(terms.notional_usdt, bool):
+                raise ValueError("boolean notional")
+            notional = float(terms.notional_usdt)
+        except (TypeError, ValueError, OverflowError):
             notional = math.nan
         if not math.isfinite(funding_rate) or funding_rate <= 0.0:
             return CarryCampaign(
@@ -88,19 +94,22 @@ class CarryEngine:
             terms.minimum_liquidation_buffer_pct,
         )
         try:
+            if any(isinstance(value, bool) for value in numeric):
+                raise ValueError("boolean carry cost term")
+            parsed_numeric = tuple(float(value) for value in numeric)
             invalid_numeric = any(
-                isinstance(value, bool)
-                or not math.isfinite(float(value))
-                or float(value) < 0.0
-                for value in numeric
+                not math.isfinite(value) or value < 0.0
+                for value in parsed_numeric
             )
+            if isinstance(terms.expected_funding_periods, bool):
+                raise ValueError("boolean funding periods")
             expected_periods = float(terms.expected_funding_periods)
             invalid_periods = (
-                isinstance(terms.expected_funding_periods, bool)
-                or not math.isfinite(expected_periods)
+                not math.isfinite(expected_periods)
                 or expected_periods <= 0.0
             )
         except (TypeError, ValueError, OverflowError):
+            parsed_numeric = ()
             invalid_numeric = True
             invalid_periods = True
         if invalid_numeric or invalid_periods:
@@ -118,11 +127,28 @@ class CarryEngine:
             except (TypeError, ValueError, OverflowError):
                 pass
         if terms.capacity_usdt is not None and (
-            capacity is None or terms.notional_usdt > capacity
+            capacity is None or notional > capacity
         ):
             return CarryCampaign(
                 campaign_id, terms, CarryState.REJECTED, "carry capacity exceeded"
             )
+        terms = CarryTerms(
+            notional_usdt=notional,
+            expected_funding_rate=funding_rate,
+            taker_fee_rate=parsed_numeric[0],
+            maker_fee_rate=parsed_numeric[1],
+            expected_funding_periods=expected_periods,
+            entry_slippage_bps_per_leg=parsed_numeric[2],
+            exit_slippage_bps_per_leg=parsed_numeric[3],
+            borrow_rate_per_period=parsed_numeric[4],
+            transfer_cost_usdt=parsed_numeric[5],
+            max_basis_adverse_bps=parsed_numeric[6],
+            adl_stress_bps=parsed_numeric[7],
+            max_leg_mismatch_pct=parsed_numeric[8],
+            capacity_usdt=capacity,
+            liquidation_buffer_pct=parsed_numeric[9],
+            minimum_liquidation_buffer_pct=parsed_numeric[10],
+        )
         if terms.liquidation_buffer_pct < terms.minimum_liquidation_buffer_pct:
             return CarryCampaign(
                 campaign_id,
@@ -172,29 +198,110 @@ class CarryEngine:
         payload["state"] = campaign.state.value
         return payload
 
-    @staticmethod
-    def from_payload(payload: dict) -> CarryCampaign:
+    @classmethod
+    def from_payload(cls, payload: dict) -> CarryCampaign:
         data = dict(payload)
         terms = data.get("terms")
         if not isinstance(terms, dict):
             raise ValueError("carry payload has no terms")
-        data["terms"] = CarryTerms(**terms)
-        data["state"] = CarryState(str(data.get("state")))
+        try:
+            parsed_terms = CarryTerms(**terms)
+        except TypeError as exc:
+            raise ValueError("carry payload terms are invalid") from exc
+        validated = cls().start("__restart_validation__", parsed_terms)
+        if validated.state == CarryState.REJECTED:
+            raise ValueError(
+                f"carry payload terms are invalid: {validated.reason}"
+            )
+        data["terms"] = validated.terms
+        signed_fields = (
+            "realized_funding",
+            "projected_net_pnl",
+            "net_pnl",
+        )
+        nonnegative_fields = (
+            "spot_base",
+            "spot_entry",
+            "perp_base",
+            "perp_entry",
+            "fees_paid",
+            "slippage_cost",
+            "borrow_cost",
+            "transfer_cost",
+            "hedge_error_pct",
+        )
+        for field in (*signed_fields, *nonnegative_fields):
+            value = data.get(field, 0.0)
+            try:
+                if isinstance(value, bool):
+                    raise ValueError("boolean campaign value")
+                normalized = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    "carry payload campaign values are invalid"
+                ) from exc
+            if not math.isfinite(normalized) or (
+                field in nonnegative_fields and normalized < 0.0
+            ):
+                raise ValueError("carry payload campaign values are invalid")
+            data[field] = normalized
+        state = CarryState(str(data.get("state")))
+        if state in {
+            CarryState.SPOT_FILLED,
+            CarryState.HEDGED,
+            CarryState.UNWIND_REQUIRED,
+            CarryState.RECONCILED,
+        } and (data["spot_base"] <= 0.0 or data["spot_entry"] <= 0.0):
+            raise ValueError("carry payload state lacks spot fill evidence")
+        if state in {CarryState.HEDGED, CarryState.RECONCILED} and (
+            data["perp_base"] <= 0.0 or data["perp_entry"] <= 0.0
+        ):
+            raise ValueError("carry payload state lacks perp fill evidence")
+        data["state"] = state
         return CarryCampaign(**data)
 
     @classmethod
     def persist(cls, campaign: CarryCampaign) -> None:
         from core.database import save_carry_campaign
 
+        payload = cls.to_payload(campaign)
+        if campaign.state != CarryState.REJECTED:
+            validated = cls.from_payload(payload)
+            payload = cls.to_payload(validated)
         save_carry_campaign(
-            campaign.campaign_id, campaign.state.value, cls.to_payload(campaign)
+            campaign.campaign_id, campaign.state.value, payload
         )
 
     @classmethod
     def load_open(cls) -> list[CarryCampaign]:
         from core.database import load_open_carry_campaigns
 
-        return [cls.from_payload(payload) for payload in load_open_carry_campaigns()]
+        campaigns = []
+        for payload in load_open_carry_campaigns():
+            try:
+                campaign = cls.from_payload(payload)
+            except (TypeError, ValueError, OverflowError) as exc:
+                campaign_id = (
+                    str(payload.get("campaign_id") or "<unknown>")
+                    if isinstance(payload, dict)
+                    else "<unknown>"
+                )
+                campaign_id = campaign_id.replace("\r", " ").replace(
+                    "\n", " "
+                )[:100]
+                try:
+                    from core.logger import log_event
+
+                    log_event(
+                        f"[carry] skipping invalid open campaign "
+                        f"{campaign_id}: {type(exc).__name__}",
+                        "WARN",
+                    )
+                except Exception:
+                    pass
+                continue
+            campaigns.append(campaign)
+        return campaigns
 
     @staticmethod
     def fill_spot(
@@ -202,24 +309,44 @@ class CarryEngine:
     ) -> None:
         if campaign.state != CarryState.CAPITAL_RESERVED:
             raise ValueError("spot fill is not valid in current carry state")
-        campaign.spot_base = float(base_amount)
-        campaign.spot_entry = float(price)
+        try:
+            if isinstance(base_amount, bool) or isinstance(price, bool):
+                raise ValueError("boolean spot fill")
+            normalized_base = float(base_amount)
+            normalized_price = float(price)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "spot fill amount and price must be positive and finite"
+            ) from exc
         if (
-            not math.isfinite(campaign.spot_base)
-            or not math.isfinite(campaign.spot_entry)
-            or campaign.spot_base <= 0.0
-            or campaign.spot_entry <= 0.0
+            not math.isfinite(normalized_base)
+            or not math.isfinite(normalized_price)
+            or normalized_base <= 0.0
+            or normalized_price <= 0.0
         ):
-            raise ValueError("spot fill amount and price must be positive")
-        campaign.fees_paid += campaign.spot_base * campaign.spot_entry * (
-            campaign.terms.taker_fee_rate
+            raise ValueError(
+                "spot fill amount and price must be positive and finite"
+            )
+        notional = normalized_base * normalized_price
+        fees_paid = (
+            campaign.fees_paid
+            + notional * campaign.terms.taker_fee_rate
         )
-        campaign.slippage_cost += (
-            campaign.spot_base
-            * campaign.spot_entry
+        slippage_cost = (
+            campaign.slippage_cost
+            + notional
             * campaign.terms.entry_slippage_bps_per_leg
             / 10_000.0
         )
+        if not all(
+            math.isfinite(value)
+            for value in (notional, fees_paid, slippage_cost)
+        ) or notional <= 0.0:
+            raise ValueError("spot fill derived values must be finite")
+        campaign.spot_base = normalized_base
+        campaign.spot_entry = normalized_price
+        campaign.fees_paid = fees_paid
+        campaign.slippage_cost = slippage_cost
         campaign.state = CarryState.SPOT_FILLED
 
     @staticmethod
@@ -228,28 +355,56 @@ class CarryEngine:
     ) -> None:
         if campaign.state != CarryState.SPOT_FILLED:
             raise ValueError("perp fill is not valid in current carry state")
-        campaign.perp_base = float(base_amount)
-        campaign.perp_entry = float(price)
+        try:
+            if isinstance(base_amount, bool) or isinstance(price, bool):
+                raise ValueError("boolean perp fill")
+            normalized_base = float(base_amount)
+            normalized_price = float(price)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "perp fill amount and price must be positive and finite"
+            ) from exc
         if (
-            not math.isfinite(campaign.perp_base)
-            or not math.isfinite(campaign.perp_entry)
-            or campaign.perp_base <= 0.0
-            or campaign.perp_entry <= 0.0
+            not math.isfinite(normalized_base)
+            or not math.isfinite(normalized_price)
+            or normalized_base <= 0.0
+            or normalized_price <= 0.0
+            or not math.isfinite(campaign.spot_base)
+            or campaign.spot_base <= 0.0
         ):
-            raise ValueError("perp fill amount and price must be positive")
-        campaign.fees_paid += campaign.perp_base * campaign.perp_entry * (
-            campaign.terms.taker_fee_rate
+            raise ValueError(
+                "perp fill amount and price must be positive and finite"
+            )
+        notional = normalized_base * normalized_price
+        fees_paid = (
+            campaign.fees_paid
+            + notional * campaign.terms.taker_fee_rate
         )
-        campaign.slippage_cost += (
-            campaign.perp_base
-            * campaign.perp_entry
+        slippage_cost = (
+            campaign.slippage_cost
+            + notional
             * campaign.terms.entry_slippage_bps_per_leg
             / 10_000.0
         )
-        campaign.hedge_error_pct = abs(
-            campaign.perp_base - campaign.spot_base
+        hedge_error_pct = abs(
+            normalized_base - campaign.spot_base
         ) / campaign.spot_base
-        if campaign.hedge_error_pct > campaign.terms.max_leg_mismatch_pct:
+        if not all(
+            math.isfinite(value)
+            for value in (
+                notional,
+                fees_paid,
+                slippage_cost,
+                hedge_error_pct,
+            )
+        ) or notional <= 0.0:
+            raise ValueError("perp fill derived values must be finite")
+        campaign.perp_base = normalized_base
+        campaign.perp_entry = normalized_price
+        campaign.fees_paid = fees_paid
+        campaign.slippage_cost = slippage_cost
+        campaign.hedge_error_pct = hedge_error_pct
+        if hedge_error_pct > campaign.terms.max_leg_mismatch_pct:
             campaign.state = CarryState.UNWIND_REQUIRED
             campaign.reason = "hedge quantity mismatch"
             return
@@ -266,10 +421,18 @@ class CarryEngine:
     def accrue_funding(campaign: CarryCampaign, amount_usdt: float) -> None:
         if campaign.state != CarryState.HEDGED:
             raise ValueError("funding requires a hedged carry campaign")
-        amount = float(amount_usdt)
+        try:
+            if isinstance(amount_usdt, bool):
+                raise ValueError("boolean funding amount")
+            amount = float(amount_usdt)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("funding amount must be finite") from exc
         if not math.isfinite(amount):
             raise ValueError("funding amount must be finite")
-        campaign.realized_funding += amount
+        realized_funding = campaign.realized_funding + amount
+        if not math.isfinite(realized_funding):
+            raise ValueError("cumulative funding must be finite")
+        campaign.realized_funding = realized_funding
 
     @staticmethod
     def close(
@@ -281,39 +444,79 @@ class CarryEngine:
     ) -> CarryCampaign:
         if campaign.state != CarryState.HEDGED:
             raise ValueError("only a hedged carry campaign can close normally")
-        spot_exit = campaign.spot_base * float(spot_price)
-        perp_exit = campaign.perp_base * float(perp_price)
+        if (
+            isinstance(spot_price, bool)
+            or isinstance(perp_price, bool)
+            or isinstance(borrow_periods, bool)
+            or not isinstance(borrow_periods, int)
+            or borrow_periods < 0
+        ):
+            raise ValueError("invalid carry close inputs")
+        try:
+            normalized_spot_price = float(spot_price)
+            normalized_perp_price = float(perp_price)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("invalid carry close inputs") from exc
+        spot_exit = campaign.spot_base * normalized_spot_price
+        perp_exit = campaign.perp_base * normalized_perp_price
         if (
             not math.isfinite(spot_exit)
             or not math.isfinite(perp_exit)
             or spot_exit <= 0.0
             or perp_exit <= 0.0
-            or isinstance(borrow_periods, bool)
-            or borrow_periods < 0
         ):
             raise ValueError("invalid carry close inputs")
-        campaign.fees_paid += (spot_exit + perp_exit) * campaign.terms.taker_fee_rate
-        campaign.slippage_cost += (
-            (spot_exit + perp_exit)
+        fees_paid = (
+            campaign.fees_paid
+            + (spot_exit + perp_exit) * campaign.terms.taker_fee_rate
+        )
+        slippage_cost = (
+            campaign.slippage_cost
+            + (spot_exit + perp_exit)
             * campaign.terms.exit_slippage_bps_per_leg
             / 10_000.0
         )
-        campaign.borrow_cost += (
-            campaign.terms.notional_usdt
+        borrow_cost = (
+            campaign.borrow_cost
+            + campaign.terms.notional_usdt
             * campaign.terms.borrow_rate_per_period
             * int(borrow_periods)
         )
-        campaign.transfer_cost += campaign.terms.transfer_cost_usdt
-        spot_pnl = campaign.spot_base * (float(spot_price) - campaign.spot_entry)
-        perp_pnl = campaign.perp_base * (campaign.perp_entry - float(perp_price))
-        campaign.net_pnl = (
+        transfer_cost = (
+            campaign.transfer_cost + campaign.terms.transfer_cost_usdt
+        )
+        spot_pnl = campaign.spot_base * (
+            normalized_spot_price - campaign.spot_entry
+        )
+        perp_pnl = campaign.perp_base * (
+            campaign.perp_entry - normalized_perp_price
+        )
+        net_pnl = (
             spot_pnl
             + perp_pnl
             + campaign.realized_funding
-            - campaign.fees_paid
-            - campaign.slippage_cost
-            - campaign.borrow_cost
-            - campaign.transfer_cost
+            - fees_paid
+            - slippage_cost
+            - borrow_cost
+            - transfer_cost
         )
+        if not all(
+            math.isfinite(value)
+            for value in (
+                fees_paid,
+                slippage_cost,
+                borrow_cost,
+                transfer_cost,
+                spot_pnl,
+                perp_pnl,
+                net_pnl,
+            )
+        ):
+            raise ValueError("carry close derived values must be finite")
+        campaign.fees_paid = fees_paid
+        campaign.slippage_cost = slippage_cost
+        campaign.borrow_cost = borrow_cost
+        campaign.transfer_cost = transfer_cost
+        campaign.net_pnl = net_pnl
         campaign.state = CarryState.RECONCILED
         return campaign

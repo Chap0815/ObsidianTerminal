@@ -230,6 +230,8 @@ _STRUCT_WRITE_RETRY_MAX   = 5
 
 _STRUCT_WRITER_THREAD: threading.Thread = None
 _STRUCT_WRITER_LOCK = threading.Lock()
+_STRUCT_WRITER_RETRY_AT = 0.0
+_STRUCT_WRITER_RETRY_SECONDS = 60.0
 
 
 def _struct_log_writer() -> None:
@@ -300,15 +302,28 @@ def _struct_log_writer() -> None:
 
 def _ensure_struct_writer() -> None:
     """Start daemon thread on first use, not at import."""
-    global _STRUCT_WRITER_THREAD
+    global _STRUCT_WRITER_THREAD, _STRUCT_WRITER_RETRY_AT
     if _STRUCT_WRITER_THREAD and _STRUCT_WRITER_THREAD.is_alive():
         return
+    now = time.monotonic()
+    if now < _STRUCT_WRITER_RETRY_AT:
+        raise RuntimeError("structured log writer start retry deferred")
     with _STRUCT_WRITER_LOCK:
         if _STRUCT_WRITER_THREAD and _STRUCT_WRITER_THREAD.is_alive():
             return
-        _STRUCT_WRITER_THREAD = threading.Thread(
+        now = time.monotonic()
+        if now < _STRUCT_WRITER_RETRY_AT:
+            raise RuntimeError("structured log writer start retry deferred")
+        candidate = threading.Thread(
             target=_struct_log_writer, daemon=True, name="struct-log-writer")
-        _STRUCT_WRITER_THREAD.start()
+        try:
+            candidate.start()
+        except Exception:
+            _STRUCT_WRITER_THREAD = None
+            _STRUCT_WRITER_RETRY_AT = now + _STRUCT_WRITER_RETRY_SECONDS
+            raise
+        _STRUCT_WRITER_THREAD = candidate
+        _STRUCT_WRITER_RETRY_AT = 0.0
 
 
 def flush_structured_logs(timeout: float = 2.0) -> bool:
@@ -897,8 +912,16 @@ def _rotate_jsonl_if_needed(path: str) -> bool:
     )
 
 
-def log_struct(event: str, **fields) -> None:
-    _ensure_struct_writer()
+def _log_struct_submit_error(context: str, exc: Exception) -> None:
+    try:
+        from bot_utils.silent_log import silent_log
+
+        silent_log(context, exc)
+    except Exception:
+        pass
+
+
+def _build_struct_log_item(event: str, fields: dict) -> tuple[str, str]:
     record = {"ts": _date(), "event": _safe_log_text(event)}
     for k, v in fields.items():
         try:
@@ -929,6 +952,17 @@ def log_struct(event: str, **fields) -> None:
             except (TypeError, ValueError, OverflowError):
                 safe_record[k] = _redact_value(_safe_log_text(v), k)
         line = json.dumps(safe_record, ensure_ascii=False, allow_nan=False)
+    return line, path
+
+
+def log_struct(event: str, **fields) -> bool:
+    """Queue a structured event without leaking logger failures to callers."""
+    try:
+        _ensure_struct_writer()
+        line, path = _build_struct_log_item(event, fields)
+    except Exception as exc:
+        _log_struct_submit_error("structured log bootstrap", exc)
+        return False
     try:
         _STRUCT_LOG_QUEUE.put_nowait((line, path))
     except queue.Full:
@@ -936,6 +970,11 @@ def log_struct(event: str, **fields) -> None:
         # thread losing events stays visible (e.g. during back-testing storms
         # or a brief disk hang).
         _record_struct_queue_drop()
+        return False
+    except Exception as exc:
+        _log_struct_submit_error("structured log queue", exc)
+        return False
+    return True
 
 
 _STRUCT_DROP_COUNTER = [0]
@@ -1258,6 +1297,7 @@ _TRADE_LOG_LOCK = threading.Lock()
 _LEGACY_REBUILD_LOCK = threading.Lock()
 _LAST_LEGACY_REBUILD = 0.0
 _LEGACY_REBUILD_INTERVAL_SEC = 3600.0  # rebuild at most once per hour
+_LEGACY_REBUILD_RETRY_SEC = 60.0
 
 # Lock ordering: when more than one of the locks below must be held
 # simultaneously, always acquire in this order to prevent deadlock:
@@ -1328,11 +1368,21 @@ def _maybe_rebuild_legacy(jsonl_path: str, legacy_path: str) -> None:
     with _LEGACY_REBUILD_LOCK:
         if now - _LAST_LEGACY_REBUILD < _LEGACY_REBUILD_INTERVAL_SEC:
             return
+        try:
+            candidate = threading.Thread(
+                target=_legacy_rebuild_worker, args=(jsonl_path, legacy_path),
+                daemon=True, name="legacy-history-rebuild",
+            )
+            candidate.start()
+        except BaseException:
+            # A job that never started must not consume the full hourly slot.
+            # Keep a short retry delay to avoid hot-looping repeated failures.
+            _LAST_LEGACY_REBUILD = (
+                now - _LEGACY_REBUILD_INTERVAL_SEC
+                + _LEGACY_REBUILD_RETRY_SEC
+            )
+            raise
         _LAST_LEGACY_REBUILD = now
-    threading.Thread(
-        target=_legacy_rebuild_worker, args=(jsonl_path, legacy_path),
-        daemon=True, name="legacy-history-rebuild",
-    ).start()
 
 
 def save_trade(log_dir, symbol, buy_price, buy_time, sell_price,
@@ -1477,6 +1527,8 @@ _TG_OVERFLOW_LAST_WARN = 0.0
 
 _TG_WORKER_THREAD = None
 _TG_WORKER_LOCK = threading.Lock()
+_TG_WORKER_RETRY_AT = 0.0
+_TG_WORKER_RETRY_SECONDS = 60.0
 
 
 def _telegram_worker() -> None:
@@ -1554,15 +1606,67 @@ def _telegram_worker() -> None:
 
 
 def _ensure_tg_worker() -> None:
-    global _TG_WORKER_THREAD
+    global _TG_WORKER_THREAD, _TG_WORKER_RETRY_AT
     if _TG_WORKER_THREAD and _TG_WORKER_THREAD.is_alive():
         return
+    now = time.monotonic()
+    if now < _TG_WORKER_RETRY_AT:
+        raise RuntimeError("telegram worker start retry deferred")
     with _TG_WORKER_LOCK:
         if _TG_WORKER_THREAD and _TG_WORKER_THREAD.is_alive():
             return
-        _TG_WORKER_THREAD = threading.Thread(
+        now = time.monotonic()
+        if now < _TG_WORKER_RETRY_AT:
+            raise RuntimeError("telegram worker start retry deferred")
+        candidate = threading.Thread(
             target=_telegram_worker, daemon=True, name="telegram-worker")
-        _TG_WORKER_THREAD.start()
+        try:
+            candidate.start()
+        except Exception:
+            _TG_WORKER_THREAD = None
+            _TG_WORKER_RETRY_AT = now + _TG_WORKER_RETRY_SECONDS
+            raise
+        _TG_WORKER_THREAD = candidate
+        _TG_WORKER_RETRY_AT = 0.0
+
+
+def flush_telegram(timeout: float = 2.0) -> bool:
+    """Wait boundedly until every accepted Telegram alert was processed.
+
+    Delivery attempts remain bounded by the worker's own HTTP timeouts. This
+    helper only closes the clean-exit gap for already queued, promptly
+    deliverable alerts; it never lets a blocked network call hold process exit
+    past the caller's budget.
+    """
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(budget):
+        return False
+    deadline = time.monotonic() + max(0.0, budget)
+
+    while True:
+        try:
+            if _TG_QUEUE.unfinished_tasks == 0:
+                return True
+            _ensure_tg_worker()
+        except Exception:
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        time.sleep(min(0.01, remaining))
+
+
+def _flush_telegram_at_exit() -> None:
+    try:
+        flush_telegram(timeout=2.0)
+    except Exception:
+        pass
+
+
+atexit.register(_flush_telegram_at_exit)
 
 
 # Track Telegram failures so the user sees a prominent warning in the log
@@ -1645,7 +1749,8 @@ def _write_telegram_overflow(cid: str, msg: str) -> None:
     )
 
 
-def send_telegram(token, chat_id, msg) -> None:
+def send_telegram(token, chat_id, msg) -> bool:
+    """Queue a Telegram message and report whether every recipient was accepted."""
     global _TG_OVERFLOW_LAST_WARN
     token_text = _telegram_config_text(
         token,
@@ -1656,26 +1761,32 @@ def send_telegram(token, chat_id, msg) -> None:
         max_chars=_TELEGRAM_CHAT_IDS_MAX_CHARS,
     )
     if not token_text or not chat_ids_text:
-        return
+        return False
     msg = clean_user_text(msg, max_chars=_TELEGRAM_MESSAGE_MAX_CHARS)
     msg = clean_user_text(
         redact(msg),
         max_chars=_TELEGRAM_MESSAGE_MAX_CHARS,
     )
     if not msg:
-        return
-    _ensure_tg_worker()
+        return False
     # Multi-recipient: TELEGRAM_CHAT_ID may list several ids separated by
     # comma / semicolon / whitespace. Fan out one queue item per id so every
     # caller (all pass the single TELEGRAM_CHAT_ID value) reaches all chats.
     raw = chat_ids_text.replace(";", " ").replace(",", " ")
     ids = [c for c in raw.split() if c]
     if not ids:
-        return
+        return False
+    try:
+        _ensure_tg_worker()
+    except Exception as exc:
+        _log_struct_submit_error("telegram worker bootstrap", exc)
+        return False
+    accepted_all = True
     for cid in ids:
         try:
             _TG_QUEUE.put_nowait((token_text, cid, msg))
         except queue.Full:
+            accepted_all = False
             # Surface telegram queue overflow to the visible log (rate-limited)
             # so the user notices when alerts stop arriving.
             now_t = time.time()
@@ -1691,6 +1802,7 @@ def send_telegram(token, chat_id, msg) -> None:
                 _write_telegram_overflow(cid, msg)
             except Exception:
                 pass
+    return accepted_all
 
 
 # 

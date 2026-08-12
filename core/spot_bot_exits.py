@@ -404,8 +404,8 @@ class ExitsMixin:
                 # we want to trip even AFTER all positions closed at a
                 # loss so the bot doesn't keep opening new ones)
                 if (now - last_killswitch) >= KILLSWITCH_INTERVAL:
-                    last_killswitch = now
-                    self._check_daily_killswitch(trades)
+                    if self._check_daily_killswitch(trades) is not False:
+                        last_killswitch = now
 
                 if not trades:
                     idle_ticks += 1
@@ -455,7 +455,7 @@ class ExitsMixin:
             if self._shutdown_event.wait(timeout=monitor_interval):
                 return
 
-    def _check_daily_killswitch(self, trades: dict) -> None:
+    def _check_daily_killswitch(self, trades: dict) -> bool:
         """Daily-loss killswitch for SPOT bots.
 
         Triggers SAFE_MODE when today's realized + unrealized PnL falls
@@ -466,9 +466,9 @@ class ExitsMixin:
         try:
             from core.logger import log_event
             if not hasattr(self, "safe_mode") or self.safe_mode is None:
-                return  # bot not fully initialized yet
+                return True  # bot not fully initialized yet
             if self.safe_mode.is_active():
-                return  # already tripped  no need to re-check
+                return True  # already tripped  no need to re-check
 
             total_today = self._compute_today_pnl(trades)
             max_loss = float(self.C("MAX_DAILY_LOSS", -50.0))
@@ -482,8 +482,10 @@ class ExitsMixin:
                 self.safe_mode.trigger(
                     f"daily-loss killswitch ({total_today:+.2f} USDT)"
                 )
+            return True
         except Exception as e:
             self._log_error("spot killswitch check", e)
+            return False
 
     def _compute_today_pnl(self, trades: dict) -> float:
         """Return today's realized PnL + estimated unrealized for spot

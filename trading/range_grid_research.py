@@ -46,15 +46,39 @@ def _metrics(values: list[float]) -> dict:
 
 def _series(rows: Iterable[tuple[int, float, float, float]]) -> dict[int, tuple[float, float]]:
     result = {}
+    conflicted_timestamps = set()
     for row in rows:
         try:
             timestamp, raw_open, raw_close, _volume = row
-            timestamp = int(timestamp)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if isinstance(timestamp, bool):
+            continue
+        try:
+            timestamp_value = int(timestamp)
+            timestamp_number = float(timestamp)
         except (TypeError, ValueError, OverflowError):
             continue
         opening, close = _finite(raw_open), _finite(raw_close)
-        if opening is not None and close is not None and opening > 0.0 and close > 0.0:
-            result[timestamp] = (opening, close)
+        if (
+            not math.isfinite(timestamp_number)
+            or timestamp_number <= 0.0
+            or timestamp_number != timestamp_value
+            or opening is None
+            or close is None
+            or opening <= 0.0
+            or close <= 0.0
+        ):
+            continue
+        candidate = (opening, close)
+        if timestamp_value in conflicted_timestamps:
+            continue
+        existing = result.get(timestamp_value)
+        if existing is None:
+            result[timestamp_value] = candidate
+        elif existing != candidate:
+            result.pop(timestamp_value)
+            conflicted_timestamps.add(timestamp_value)
     return result
 
 
@@ -114,14 +138,14 @@ def evaluate_bounded_range_grid(
                 if position > 0.0:
                     gap_value = _gap_exit_bps(
                         position=position,
-                        last_mark=rows[cutoff][1],
-                        next_open=rows[entry_time][0],
+                        last_mark=rows[entry_time][0],
+                        next_open=rows[exit_time][0],
                         one_way_cost_bps=costs,
                     )
                     values.append(gap_value)
-                    bucket = portfolio_by_time.setdefault(entry_time, [])
+                    bucket = portfolio_by_time.setdefault(exit_time, [])
                     bucket.append(gap_value)
-                    last_portfolio_slot = (entry_time, len(bucket) - 1)
+                    last_portfolio_slot = (exit_time, len(bucket) - 1)
                     pooled_observations += 1
                     turnover += position
                     gap_exits += 1
@@ -135,7 +159,7 @@ def evaluate_bounded_range_grid(
                 if position > 0.0:
                     gap_value = _gap_exit_bps(
                         position=position,
-                        last_mark=rows[cutoff][1],
+                        last_mark=rows[entry_time][0],
                         next_open=rows[entry_time][0],
                         one_way_cost_bps=costs,
                     )

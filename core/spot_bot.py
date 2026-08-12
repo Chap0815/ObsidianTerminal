@@ -36,7 +36,7 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from functools import cached_property
+from functools import cached_property, partial
 from typing import Optional, Dict, Any
 
 from bot_utils import (
@@ -47,6 +47,9 @@ from bot_utils import (
     SafeMode,
 )
 from bot_utils.api_budget import try_consume_api_call
+from bot_utils.runtime_threads import (finalize_runtime_shutdown,
+                                       start_threads_or_shutdown)
+from bot_utils.silent_log import silent_log
 
 # Mixins: split across files to keep this module focused on lifecycle.
 from core.spot_bot_exits import ExitsMixin
@@ -144,6 +147,71 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
     def _log_error(self, context: str, exc: Exception) -> None:
         _ext_log_error(self.BOT_NAME, context, exc)
 
+    def _runtime_threads(self) -> dict[str, bool]:
+        return {
+            "monitor": bool(
+                self._monitor_thread and self._monitor_thread.is_alive()
+            ),
+            "scan": bool(self._scan_thread and self._scan_thread.is_alive()),
+            "reconcile": bool(
+                self._reconcile_thread and self._reconcile_thread.is_alive()
+            ),
+        }
+
+    def _publish_periodic_runtime_status(
+        self,
+        status_writer,
+        *,
+        log_snapshot: bool,
+    ) -> None:
+        """Supervise exits before optional observability/status publication."""
+        threads = self._runtime_threads()
+        if (
+            not threads["monitor"]
+            and self.safe_mode is not None
+            and not self.safe_mode.is_active()
+        ):
+            self.safe_mode.trigger(
+                "monitor thread stopped - exits not supervised"
+            )
+        try:
+            state_rows = self.state.get_all()
+            if log_snapshot:
+                from trading.runtime_observability import (
+                    log_runtime_observability,
+                )
+
+                observability = log_runtime_observability(
+                    bot_name=self.BOT_NAME,
+                    mode="SIM" if self.simulation else "LIVE",
+                    state_rows=state_rows,
+                    ticker_cache=self.ticker_cache,
+                )
+            else:
+                from trading.runtime_observability import (
+                    runtime_observability_snapshot,
+                )
+
+                observability = runtime_observability_snapshot(
+                    state_rows=state_rows,
+                    ticker_cache=self.ticker_cache,
+                )
+            status_writer(
+                self.LOG_DIR,
+                self.BOT_NAME,
+                "ready" if all(threads.values()) else "degraded",
+                self.simulation,
+                threads=threads,
+                extra={
+                    "open_positions": self.state.count(),
+                    "safe_mode": bool(self.safe_mode.is_active()),
+                    **observability,
+                },
+            )
+        except Exception as exc:
+            phase = "heartbeat" if log_snapshot else "periodic"
+            silent_log(f"{self.BOT_NAME} {phase} runtime status", exc)
+
     #  Run 
 
     def run(self) -> None:
@@ -158,6 +226,9 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         set_metrics_sim_mode(self.simulation)   # pin SIM/LIVE metrics namespace
         set_structured_log_dir(self.LOG_DIR)
         build_info = get_build_info()
+        write_runtime_status = partial(
+            write_runtime_status, build_info=build_info
+        )
         write_runtime_status(
             self.LOG_DIR, self.BOT_NAME, "starting", self.simulation,
             extra={"phase": "config_validate"})
@@ -337,16 +408,17 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             target=self._reconcile_loop, daemon=True,
             name=f"{self.BOT_NAME}Reconcile",
         )
-        self._monitor_thread.start()
-        self._scan_thread.start()
-        self._reconcile_thread.start()
+        start_threads_or_shutdown(
+            (
+                self._monitor_thread,
+                self._scan_thread,
+                self._reconcile_thread,
+            ),
+            self._shutdown_event,
+        )
 
         log_event("Three threads running (monitor, scan, reconcile).", "START")
-        threads = {
-            "monitor": self._monitor_thread.is_alive(),
-            "scan": self._scan_thread.is_alive(),
-            "reconcile": self._reconcile_thread.is_alive(),
-        }
+        threads = self._runtime_threads()
         write_runtime_status(
             self.LOG_DIR, self.BOT_NAME,
             "ready" if all(threads.values()) else "degraded",
@@ -370,67 +442,14 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                         f"Scan={'' if self._scan_thread.is_alive() else ''}",
                         "INFO"
                     )
-                    try:
-                        from trading.runtime_observability import (
-                            log_runtime_observability)
-                        observability = log_runtime_observability(
-                            bot_name=self.BOT_NAME,
-                            mode="SIM" if self.simulation else "LIVE",
-                            state_rows=self.state.get_all(),
-                            ticker_cache=self.ticker_cache,
-                        )
-                        threads = {
-                            "monitor": self._monitor_thread.is_alive(),
-                            "scan": self._scan_thread.is_alive(),
-                            "reconcile": self._reconcile_thread.is_alive(),
-                        }
-                        status = "ready" if all(threads.values()) else "degraded"
-                        if (not threads["monitor"]
-                                and self.safe_mode is not None
-                                and not self.safe_mode.is_active()):
-                            self.safe_mode.trigger(
-                                "monitor thread stopped - exits not supervised")
-                        write_runtime_status(
-                            self.LOG_DIR, self.BOT_NAME, status,
-                            self.simulation,
-                            threads=threads,
-                            extra={
-                                "open_positions": tc,
-                                "safe_mode": bool(self.safe_mode.is_active()),
-                                **observability,
-                            })
-                    except Exception:
-                        pass
+                    self._publish_periodic_runtime_status(
+                        write_runtime_status, log_snapshot=True
+                    )
                     last_heartbeat = now
                 if now - last_runtime_status >= 5.0:
-                    try:
-                        from trading.runtime_observability import (
-                            runtime_observability_snapshot)
-                        observability = runtime_observability_snapshot(
-                            state_rows=self.state.get_all(),
-                            ticker_cache=self.ticker_cache,
-                        )
-                        threads = {
-                            "monitor": self._monitor_thread.is_alive(),
-                            "scan": self._scan_thread.is_alive(),
-                            "reconcile": self._reconcile_thread.is_alive(),
-                        }
-                        status = "ready" if all(threads.values()) else "degraded"
-                        if (not threads["monitor"]
-                                and self.safe_mode is not None
-                                and not self.safe_mode.is_active()):
-                            self.safe_mode.trigger(
-                                "monitor thread stopped - exits not supervised")
-                        write_runtime_status(
-                            self.LOG_DIR, self.BOT_NAME, status,
-                            self.simulation, threads=threads,
-                            extra={
-                                "open_positions": self.state.count(),
-                                "safe_mode": bool(self.safe_mode.is_active()),
-                                **observability,
-                            })
-                    except Exception:
-                        pass
+                    self._publish_periodic_runtime_status(
+                        write_runtime_status, log_snapshot=False
+                    )
                     last_runtime_status = now
                 # Hourly Telegram status (realized + unrealized PnL + positions).
                 # Self-throttling; covers SPOT and TREND (both SpotBot).
@@ -456,25 +475,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                    self._reconcile_thread):
             if t and t.is_alive():
                 t.join(timeout=2)
-        try:
-            write_runtime_status(
-                self.LOG_DIR, self.BOT_NAME, "stopped", self.simulation,
-                threads={
-                    "monitor": bool(self._monitor_thread and self._monitor_thread.is_alive()),
-                    "scan": bool(self._scan_thread and self._scan_thread.is_alive()),
-                    "reconcile": bool(self._reconcile_thread and self._reconcile_thread.is_alive()),
-                })
-        except Exception:
-            pass
-        # Close all per-thread CCXT clones so their HTTP sessions release file
-        # descriptors. No-op for the fallback raw-exchange path.
-        try:
-            closer = getattr(self.ex, "close_all", None)
-            if callable(closer):
-                closer()
-        except Exception:
-            pass
-        log_event("Bot shutdown complete.", "INFO")
+        finalize_runtime_shutdown(self, write_runtime_status, log_event)
 
     #  Connection 
 
@@ -643,10 +644,16 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                         self._emergency_closed = True
                     self._emergency_in_progress = False
 
-        runner = threading.Thread(target=_close_runner,
-                                    daemon=True,
-                                    name=f"{self.BOT_NAME}EmergencyClose")
-        runner.start()
+        try:
+            runner = threading.Thread(target=_close_runner,
+                                      daemon=True,
+                                      name=f"{self.BOT_NAME}EmergencyClose")
+            runner.start()
+        except Exception as exc:
+            with self._shutdown_lock:
+                self._emergency_in_progress = False
+            self._log_error("Emergency close thread start", exc)
+            return
         runner.join(timeout=self.SHUTDOWN_DEADLINE_SEC)
 
         self._emergency_in_progress = runner.is_alive()

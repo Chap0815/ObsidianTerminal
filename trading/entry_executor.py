@@ -122,6 +122,32 @@ class _DatabaseJournal:
         return record_order_intent_fallback_evidence(intent_id, **fields)
 
 
+def _mark_recovery_required_after_error(
+    journal,
+    intent_id: str,
+    original_error: Exception,
+) -> None:
+    """Best-effort recovery marker that never masks the trading failure."""
+    try:
+        journal.transition(
+            intent_id,
+            "RECOVERY_REQUIRED",
+            error=f"{type(original_error).__name__}: {original_error}",
+        )
+    except Exception as journal_error:
+        try:
+            original_error.add_note(
+                "RECOVERY_REQUIRED journal update failed: "
+                f"{type(journal_error).__name__}"
+            )
+        except Exception:
+            pass
+        try:
+            silent_log("entry recovery journal", journal_error)
+        except Exception:
+            pass
+
+
 def _number(value, default=0.0) -> float:
     if isinstance(value, bool):
         return default
@@ -707,9 +733,7 @@ def execute_entry_order(
             _finalize_not_submitted_intent(journal, intent_id, exc)
             raise
         except Exception as exc:
-            journal.transition(
-                intent_id, "RECOVERY_REQUIRED", error=f"{type(exc).__name__}: {exc}"
-            )
+            _mark_recovery_required_after_error(journal, intent_id, exc)
             raise
 
     try:
@@ -1091,12 +1115,7 @@ def execute_entry_order(
         _finalize_not_submitted_intent(journal, intent_id, exc)
         raise
     except Exception as exc:
-        try:
-            journal.transition(
-                intent_id, "RECOVERY_REQUIRED", error=f"{type(exc).__name__}: {exc}"
-            )
-        except Exception:
-            pass
+        _mark_recovery_required_after_error(journal, intent_id, exc)
         raise
 
 
@@ -1157,6 +1176,7 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
     """Reconcile persisted intents without ever submitting a replacement order."""
     from bot_utils.futures_order import _find_order_by_client_id
     from core.database import (
+        get_order_intent,
         list_nonterminal_order_intents,
         record_order_intent_fallback_evidence,
         transition_order_intent,
@@ -1165,14 +1185,23 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
     unresolved = []
 
     def persisted_snapshot(intent_id: str, fallback: dict) -> dict:
-        return next(
-            (
-                row
-                for row in list_nonterminal_order_intents(bot_name)
-                if row.get("intent_id") == intent_id
-            ),
-            dict(fallback),
-        )
+        try:
+            row = get_order_intent(intent_id)
+        except (TypeError, ValueError):
+            # The identity came from durable storage.  Preserve fail-closed
+            # recovery of legacy/corrupt rows without penalizing the normal
+            # primary-key lookup path.
+            return next(
+                (
+                    candidate
+                    for candidate in list_nonterminal_order_intents(bot_name)
+                    if candidate.get("intent_id") == intent_id
+                ),
+                dict(fallback),
+            )
+        if row is not None and row.get("status") != "FINALIZED":
+            return row
+        return dict(fallback)
 
     for intent in list_nonterminal_order_intents(bot_name):
         intent_id = intent["intent_id"]

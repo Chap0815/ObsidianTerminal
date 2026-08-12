@@ -1246,8 +1246,16 @@ def spot_market_sell_safe(ex, symbol_pair: str, raw_amount: float,
     if safe_raw_amount <= 0:
         raise ValueError(f"amount {raw_amount} is not positive finite")
     try:
-        rounded = _positive_finite(
-            ex.amount_to_precision(symbol_pair, safe_raw_amount))
+        native_rounded = ex.amount_to_precision(
+            symbol_pair, safe_raw_amount
+        )
+        if isinstance(native_rounded, bool):
+            raise ValueError("native sell precision returned boolean")
+        native_dec = Decimal(str(native_rounded))
+        raw_dec = Decimal(str(safe_raw_amount))
+        if not native_dec.is_finite() or native_dec > raw_dec:
+            raise ValueError("native sell precision amplified the amount")
+        rounded = _positive_finite(native_rounded)
     except Exception:
         # Prefer market-metadata-derived step
         step = (_exchange_precision_step(ex, symbol_pair)
@@ -1352,7 +1360,11 @@ def spot_market_sell_safe(ex, symbol_pair: str, raw_amount: float,
                     precise = ex.amount_to_precision(symbol_pair, free)
                     if not isinstance(precise, bool):
                         parsed = float(precise)
-                        if math.isfinite(parsed) and parsed >= 0:
+                        if (
+                            math.isfinite(parsed)
+                            and parsed >= 0
+                            and Decimal(str(parsed)) <= Decimal(str(free))
+                        ):
                             capped = parsed
                 except Exception:
                     pass

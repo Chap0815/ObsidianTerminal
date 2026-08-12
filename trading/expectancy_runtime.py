@@ -18,6 +18,15 @@ from trading.profit_experiments import (
 _EXPECTANCY_MODEL_JSON_MAX_BYTES = 1024 * 1024
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def save_expectancy_model(path: str | Path, model: LinearExpectancyModel) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -53,6 +62,7 @@ def load_expectancy_model(path: str | Path) -> LinearExpectancyModel | None:
             parse_constant=lambda value: (_ for _ in ()).throw(
                 ValueError(f"non-standard JSON constant: {value}")
             ),
+            object_pairs_hook=_unique_json_object,
         )
         if not isinstance(payload, dict):
             return None
@@ -63,6 +73,8 @@ def load_expectancy_model(path: str | Path) -> LinearExpectancyModel | None:
             "feature_scales",
         ):
             if key in payload:
+                if not isinstance(payload[key], list):
+                    return None
                 payload[key] = tuple(payload[key])
         return LinearExpectancyModel(**payload)
     except (OSError, ValueError, TypeError, json.JSONDecodeError):

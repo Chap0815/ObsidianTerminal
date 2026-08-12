@@ -58,6 +58,14 @@ import threading
 from typing import Any
 
 
+def _log_close_failure(context: str, exc: BaseException) -> None:
+    try:
+        from bot_utils.silent_log import silent_log
+        silent_log(context, exc)
+    except Exception:
+        pass
+
+
 def _shallow_auth_cfg(exchange) -> dict:
     """Pull the auth-relevant fields from an exchange instance into a
     fresh dict suitable for the ``ccxt.<class>(config)`` constructor.
@@ -177,10 +185,13 @@ class ThreadLocalExchange:
         # deep-copied markets clone until close_all(), leaking RSS over uptime.
         self._clones: list = []
         self._clones_lock = threading.Lock()
+        self._close_lock = threading.Lock()
         # A process-wide generation invalidates TLS slots owned by every
         # thread.  Deleting ``self._tls.clone`` only affects the caller.
         self._clone_generation = 0
         self._markets_refresh_lock = threading.Lock()
+        self._closed = False
+        self._base_closed = False
 
     #  Public helpers 
 
@@ -191,59 +202,103 @@ class ThreadLocalExchange:
         not for fetch_*/create_* calls."""
         return self._base
 
-    def close_all(self) -> None:
-        """Close the HTTP session of every clone. Idempotent."""
-        with self._clones_lock:
-            self._clone_generation += 1
-            clones = [c for (_t, c) in self._clones]
-            self._clones.clear()
-        # Drop the TLS slot so the next call rebuilds a clone
-        try:
-            del self._tls.clone
-        except AttributeError:
-            pass
-        try:
-            del self._tls.clone_generation
-        except AttributeError:
-            pass
-        for c in clones:
-            self._close_one(c)
+    def close_all(self) -> bool:
+        """Close current clones while keeping the wrapper reusable."""
+        with self._close_lock:
+            with self._clones_lock:
+                self._clone_generation += 1
+                clones = list(self._clones)
+                self._clones.clear()
+            # Drop the TLS slot so the next call rebuilds a clone.
+            try:
+                del self._tls.clone
+            except AttributeError:
+                pass
+            try:
+                del self._tls.clone_generation
+            except AttributeError:
+                pass
+            failed = [item for item in clones if not self._close_one(item[1])]
+            if failed:
+                with self._clones_lock:
+                    self._clones.extend(failed)
+            return not failed
 
-    def close_current_thread_clone(self) -> None:
+    def shutdown(self) -> bool:
+        """Terminally close base + clones and reject future network clones."""
+        # Do not wait on _markets_refresh_lock here: a venue call inside
+        # load_markets may be exactly what is hanging during shutdown.
+        with self._close_lock:
+            with self._clones_lock:
+                if not self._closed:
+                    self._closed = True
+                    self._clone_generation += 1
+                clones = list(self._clones)
+                self._clones.clear()
+            try:
+                del self._tls.clone
+            except AttributeError:
+                pass
+            try:
+                del self._tls.clone_generation
+            except AttributeError:
+                pass
+            failed = [item for item in clones if not self._close_one(item[1])]
+            if not self._base_closed:
+                self._base_closed = self._close_one(self._base)
+            if failed:
+                with self._clones_lock:
+                    self._clones.extend(failed)
+            return not failed and self._base_closed
+
+    def close_current_thread_clone(self) -> bool:
         """Close + drop THIS thread's clone. Call from a transient
         worker thread's ``finally`` block (mirrors
         ``core.database.close_thread_local_conn``) so screener/pool threads
         don't leak a deep-copied markets clone each. Idempotent."""
         clone = getattr(self._tls, "clone", None)
         if clone is None:
-            return
-        try:
-            del self._tls.clone
-        except AttributeError:
-            pass
-        try:
-            del self._tls.clone_generation
-        except AttributeError:
-            pass
-        with self._clones_lock:
-            self._clones = [(t, c) for (t, c) in self._clones if c is not clone]
-        self._close_one(clone)
+            return True
+        with self._close_lock:
+            try:
+                del self._tls.clone
+            except AttributeError:
+                pass
+            try:
+                del self._tls.clone_generation
+            except AttributeError:
+                pass
+            with self._clones_lock:
+                owned = [(t, c) for (t, c) in self._clones if c is clone]
+                self._clones = [
+                    (t, c) for (t, c) in self._clones if c is not clone
+                ]
+            closed = self._close_one(clone)
+            if not closed and owned:
+                with self._clones_lock:
+                    self._clones.extend(owned)
+            return closed
 
     def reap_dead_thread_clones(self) -> int:
         """Close + drop clones whose owning thread has exited.
         Safe to call from a periodic maintenance tick. Returns # reaped."""
-        with self._clones_lock:
-            alive, dead = [], []
-            for t, c in self._clones:
-                (alive if t.is_alive() else dead).append((t, c))
-            self._clones = alive
-        for _t, c in dead:
-            self._close_one(c)
-        return len(dead)
+        with self._close_lock:
+            with self._clones_lock:
+                alive, dead = [], []
+                for t, c in self._clones:
+                    (alive if t.is_alive() else dead).append((t, c))
+                self._clones = alive
+            failed = [item for item in dead if not self._close_one(item[1])]
+            if failed:
+                with self._clones_lock:
+                    self._clones.extend(failed)
+            return len(dead) - len(failed)
 
     def load_markets(self, *args, **kwargs):
         """Refresh the canonical base and propagate one coherent snapshot."""
         with self._markets_refresh_lock:
+            if self._closed:
+                raise RuntimeError("exchange wrapper is shut down")
             markets = self._base.load_markets(*args, **kwargs)
             source_markets = getattr(self._base, "markets", None) or markets or {}
             source_currencies = getattr(self._base, "currencies", None) or {}
@@ -278,8 +333,13 @@ class ThreadLocalExchange:
             return markets
 
     @staticmethod
-    def _close_one(clone) -> None:
-        closer = getattr(clone, "close", None)
+    def _close_one(clone) -> bool:
+        close_error: BaseException | None = None
+        try:
+            closer = getattr(clone, "close", None)
+        except Exception as exc:
+            closer = None
+            close_error = exc
         if callable(closer):
             try:
                 result = closer()
@@ -287,17 +347,36 @@ class ThreadLocalExchange:
                 if inspect.iscoroutine(result):
                     try:
                         asyncio.run(result)
-                    except Exception:
+                    except Exception as exc:
+                        close_error = exc
                         result.close()
-                return
-            except Exception:
-                pass
-        sess = getattr(clone, "session", None)
+                    else:
+                        return True
+                else:
+                    return True
+            except Exception as exc:
+                close_error = exc
+        try:
+            sess = getattr(clone, "session", None)
+        except Exception as exc:
+            sess = None
+            close_error = exc
         if sess is not None:
             try:
-                sess.close()
-            except Exception:
-                pass
+                result = sess.close()
+                if inspect.iscoroutine(result):
+                    try:
+                        asyncio.run(result)
+                    except Exception:
+                        result.close()
+                        raise
+                return True
+            except Exception as exc:
+                close_error = exc
+        if close_error is None:
+            return True
+        _log_close_failure("thread-local exchange close", close_error)
+        return False
 
     def clone_count(self) -> int:
         with self._clones_lock:
@@ -306,6 +385,8 @@ class ThreadLocalExchange:
     #  Internal: per-thread clone resolution 
 
     def _get_clone(self):
+        if self._closed:
+            raise RuntimeError("exchange wrapper is shut down")
         clone = getattr(self._tls, "clone", None)
         generation = self._clone_generation
         if (
@@ -317,6 +398,8 @@ class ThreadLocalExchange:
         # built while close_all() clears the index can escape that close and
         # remain live but untracked.
         with self._clones_lock:
+            if self._closed:
+                raise RuntimeError("exchange wrapper is shut down")
             generation = self._clone_generation
             clone = getattr(self._tls, "clone", None)
             if (

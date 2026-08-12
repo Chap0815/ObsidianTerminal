@@ -851,12 +851,17 @@ class TradeState:
             self._trades[sym] = data
             rev, snapshot = self._snapshot_locked()
         status = self._persist_snapshot(rev, snapshot)
+        state_ok = status in ("persisted", "stale")
+        if not state_ok:
+            # Never publish a claim generation that the restart truth does not
+            # contain. The caller can clean up the in-memory candidate after
+            # the failed add, while the durable registry remains unchanged.
+            return False
         # Claim the coin in the shared multi-bot registry (outside the lock,
         # like the JSON write). This is what makes is_claimed_by_other() work
         # so another bot won't open the SAME perp and net against us.
         registry_ok = self._registry_upsert_current(sym)
-        state_ok = status in ("persisted", "stale")
-        if not registry_ok and status in ("persisted", "stale"):
+        if not registry_ok:
             registry_ok = self._mark_registry_pending(
                 sym, "registry_add_failed")
         return state_ok and registry_ok
@@ -907,6 +912,9 @@ class TradeState:
             return False
         if snapshot is not None:
             status = self._persist_snapshot(rev, snapshot)
+            state_ok = status in ("persisted", "stale")
+            if not state_ok:
+                return False
             # Keep the shared claim row in sync when a claim-relevant field
             # changed (e.g. amount/invested after a partial sell). Skipping the
             # frequent last_price/highest updates avoids hammering the DB.
@@ -916,7 +924,7 @@ class TradeState:
                 if not registry_ok:
                     registry_ok = self._mark_registry_pending(
                         sym, "registry_update_failed")
-            return status in ("persisted", "stale") and registry_ok
+            return registry_ok
         return False
 
     def update_many(self, sym: str, fields: dict) -> bool:
@@ -971,13 +979,16 @@ class TradeState:
             return False
         if snapshot is not None:
             status = self._persist_snapshot(rev, snapshot)
+            state_ok = status in ("persisted", "stale")
+            if not state_ok:
+                return False
             registry_ok = True
             if claim_row is not None:
                 registry_ok = self._registry_upsert_current(sym)
                 if not registry_ok:
                     registry_ok = self._mark_registry_pending(
                         sym, "registry_update_failed")
-            return status in ("persisted", "stale") and registry_ok
+            return registry_ok
         return False
 
     def release_claim_if_absent(self, sym: str) -> bool:

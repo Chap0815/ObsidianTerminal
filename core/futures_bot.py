@@ -12,7 +12,8 @@ Architecture (same shape as SpotBot):
   Monitor-Thread  (every MONITOR_INTERVAL ~20s)  exits + liq guard
   Scan-Thread  (every SCAN_INTERVAL ~150s)  LONG/SHORT entries
   Reconcile-Thread  (every RECONCILE_INTERVAL ~600s)  drift check
-  Markout-Thread  (FUTURES owner only, every ~1s)  global LIVE/SIM TCA
+  Markout-Thread  (every futures bot, every ~1s)  global LIVE/SIM TCA;
+                  advisory-lock serialized for cross-process failover
   Main-Thread  heartbeat + shutdown coordination
 
 Plus futures-specific infrastructure built into the lifecycle:
@@ -33,12 +34,13 @@ from __future__ import annotations
 
 import atexit
 import importlib
+import math
 import signal
 import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from functools import cached_property
+from functools import cached_property, partial
 from typing import Optional, Dict, Any
 
 from bot_utils import (
@@ -50,6 +52,9 @@ from bot_utils import (
     emergency_close_all_futures,
 )
 from bot_utils.api_budget import try_consume_api_call
+from bot_utils.runtime_threads import (finalize_runtime_shutdown,
+                                       start_threads_or_shutdown)
+from bot_utils.silent_log import silent_log
 from bot_utils.trade_state import state_exposure_count
 
 from core.futures_bot_exits import FuturesExitsMixin
@@ -81,6 +86,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
     MARKOUT_POLL_INTERVAL_SEC: float = 1.0
     MARKOUT_MAX_OVERDUE_SEC: float = 30.0
     MARKOUT_POLL_STALE_SEC: float = 15.0
+    VENUE_HEALTH_MIN_STALE_SEC: float = 30.0
 
     # Monitor / Scan defaults
     DEFAULT_MONITOR_INTERVAL: int = 20
@@ -88,6 +94,8 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
     # Ticker cache pool sizing (bounded backpressure)
     TICKER_POOL_SIZE: int = 8
     TICKER_INFLIGHT_MAX: int = 32
+    TICKER_HEALTH_FAILURE_THRESHOLD: int = 8
+    TICKER_HEALTH_SUCCESS_STALE_SEC: float = 30.0
 
     # Circuit breaker
     CB_FAILURE_THRESHOLD: int = 5
@@ -116,6 +124,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         self._shutdown_lock = threading.Lock()
         self._cooldown_lock = threading.Lock()
         self._markout_health_lock = threading.Lock()
+        self._venue_health_lock = threading.Lock()
         # populated in run()
         self.ex = None
         self.state: Optional[TradeState] = None
@@ -132,6 +141,9 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         self._reconcile_thread: Optional[threading.Thread] = None
         self._markout_thread: Optional[threading.Thread] = None
         self._venue_recorder_thread: Optional[threading.Thread] = None
+        self._markout_started_monotonic: float | None = None
+        self._venue_started_monotonic: float | None = None
+        self._venue_health_stale_sec = self.VENUE_HEALTH_MIN_STALE_SEC
         self._markout_health = {
             "ok": True,
             "last_poll_monotonic": None,
@@ -141,8 +153,26 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "due_count": 0,
             "oldest_due_at": None,
             "oldest_overdue_seconds": 0.0,
+            "timestamps_valid": True,
+            "reason": "",
+            "scopes": {
+                scope: {
+                    "due_count": 0,
+                    "oldest_due_at": None,
+                    "oldest_overdue_seconds": 0.0,
+                    "timestamps_valid": True,
+                }
+                for scope in ("LIVE", "SIM")
+            },
             "completed": 0,
+            "completed_batch": 0,
+            "completed_total": 0,
+            "polls_total": 0,
+            "errors_total": 0,
+            "last_completed_wall_ts": None,
+            "lock_state": "starting",
         }
+        self._venue_health: dict[str, Any] = {}
         self._entry_recovery_blocked = False
 
     # Route through bot_utils.config.get_live_value so that user-edited values
@@ -183,11 +213,36 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         """Subclass hook for live strategy-loop health beyond thread liveness."""
         return {}
 
+    def _ticker_runtime_health(self) -> dict[str, Any]:
+        """Expose a sustained ticker outage without flagging idle startup."""
+        cache = getattr(self, "ticker_cache", None)
+        health_fn = getattr(cache, "health", None)
+        if not callable(health_fn):
+            return {}
+        try:
+            health = health_fn(
+                failure_threshold=self.TICKER_HEALTH_FAILURE_THRESHOLD,
+                success_stale_after=self.TICKER_HEALTH_SUCCESS_STALE_SEC,
+            )
+            if not isinstance(health, dict):
+                return {
+                    "ok": False,
+                    "component": "ticker_cache",
+                    "error_type": "invalid_ticker_health_payload",
+                }
+            return health
+        except Exception as exc:
+            return {
+                "ok": False,
+                "component": "ticker_cache",
+                "error_type": type(exc).__name__,
+            }
+
     def _runtime_status_health(
         self,
         threads: dict[str, bool],
     ) -> tuple[str, dict[str, Any]]:
-        """Combine thread liveness with optional strategy-specific health."""
+        """Combine worker liveness with reported component health."""
         try:
             strategy_health = self._strategy_runtime_health()
             if not isinstance(strategy_health, dict):
@@ -200,30 +255,90 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 "ok": False,
                 "error_type": type(exc).__name__,
             }
-        strategy_ok = bool(strategy_health.get("ok", True))
+        strategy_ok = not strategy_health or strategy_health.get("ok") is True
+        ticker_health = self._ticker_runtime_health()
+        ticker_ok = not ticker_health or ticker_health.get("ok") is True
         markout_health = self._markout_runtime_health()
-        markout_ok = bool(markout_health.get("ok", True))
+        markout_ok = not markout_health or markout_health.get("ok") is True
+        venue_health = self._venue_runtime_health()
+        venue_ok = not venue_health or venue_health.get("ok") is True
         status = (
             "ready"
-            if all(threads.values()) and strategy_ok and markout_ok
+            if (
+                all(threads.values())
+                and strategy_ok
+                and ticker_ok
+                and markout_ok
+                and venue_ok
+            )
             else "degraded"
         )
         extra = {}
         if strategy_health:
             extra["strategy_health"] = strategy_health
+        if ticker_health:
+            extra["ticker_health"] = ticker_health
         if markout_health:
             extra["markout_health"] = markout_health
+        if venue_health:
+            extra["venue_health"] = venue_health
         return status, extra
 
     def _owns_markout_worker(self) -> bool:
-        """FUTURES is the deterministic owner of the global markout queue."""
-        return str(self.BOT_NAME).upper() == "FUTURES"
+        """Let any futures strategy provide failover for the global queue."""
+        return str(self.BOT_NAME).upper() in {"FUTURES", "CROSS", "FUTREND"}
 
     def _record_markout_worker_health(self, report: dict) -> None:
         """Receive one sanitized progress report from the markout thread."""
         if not isinstance(report, dict):
             return
-        report_ok = bool(report.get("ok", False))
+        report_ok = report.get("ok") is True
+
+        def nonnegative_int(value) -> int:
+            if isinstance(value, bool):
+                return 0
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        def nonnegative_float(value) -> float:
+            if isinstance(value, bool):
+                return 0.0
+            try:
+                parsed = float(value or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+            return max(0.0, parsed) if math.isfinite(parsed) else 0.0
+
+        raw_scopes = report.get("scopes")
+        raw_scopes = raw_scopes if isinstance(raw_scopes, dict) else {}
+        scopes = {}
+        for scope in ("LIVE", "SIM"):
+            raw = raw_scopes.get(scope)
+            raw = raw if isinstance(raw, dict) else {}
+            due_count = nonnegative_int(raw.get("due_count"))
+            overdue = nonnegative_float(raw.get("oldest_overdue_seconds"))
+            oldest = raw.get("oldest_due_at")
+            scopes[scope] = {
+                "due_count": due_count,
+                "oldest_due_at": str(oldest)[:32] if oldest else None,
+                "oldest_overdue_seconds": overdue,
+                "timestamps_valid": raw.get("timestamps_valid", True) is True,
+            }
+        allowed_reasons = {
+            "",
+            "due_queue_overdue",
+            "due_queue_time_invalid",
+            "worker_error",
+            "worker_lock_error",
+            "worker_lock_release_failed",
+        }
+        reason = str(report.get("reason") or "")
+        if report_ok:
+            reason = ""
+        elif reason not in allowed_reasons or not reason:
+            reason = "worker_error"
         with self._markout_health_lock:
             previous_errors = int(
                 self._markout_health.get("consecutive_errors") or 0
@@ -244,13 +359,30 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                         or "markout worker unhealthy"
                     )[:200]
                 ),
-                "due_count": max(0, int(report.get("due_count") or 0)),
-                "oldest_due_at": report.get("oldest_due_at"),
-                "oldest_overdue_seconds": max(
-                    0.0,
-                    float(report.get("oldest_overdue_seconds") or 0.0),
+                "due_count": nonnegative_int(report.get("due_count")),
+                "oldest_due_at": (
+                    str(report.get("oldest_due_at"))[:32]
+                    if report.get("oldest_due_at") else None
                 ),
-                "completed": max(0, int(report.get("completed") or 0)),
+                "oldest_overdue_seconds": nonnegative_float(
+                    report.get("oldest_overdue_seconds")
+                ),
+                "timestamps_valid": report.get("timestamps_valid", True) is True,
+                "reason": reason,
+                "scopes": scopes,
+                "completed": nonnegative_int(report.get("completed")),
+                "completed_batch": nonnegative_int(
+                    report.get("completed_batch")
+                ),
+                "completed_total": nonnegative_int(
+                    report.get("completed_total")
+                ),
+                "polls_total": nonnegative_int(report.get("polls_total")),
+                "errors_total": nonnegative_int(report.get("errors_total")),
+                "last_completed_wall_ts": report.get(
+                    "last_completed_wall_ts"
+                ),
+                "lock_state": str(report.get("lock_state") or "unknown")[:32],
             })
 
     def _markout_runtime_health(self) -> dict[str, Any]:
@@ -262,12 +394,26 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             snapshot = dict(self._markout_health)
         last_poll = snapshot.get("last_poll_monotonic")
         if last_poll is None:
-            return {
-                "ok": True,
+            started = getattr(self, "_markout_started_monotonic", None)
+            if started is None:
+                startup_age = 0.0
+            else:
+                try:
+                    startup_age = max(
+                        0.0, time.monotonic() - float(started)
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    startup_age = float("inf")
+            startup_stale = startup_age > self.MARKOUT_POLL_STALE_SEC
+            snapshot.update({
+                "ok": not startup_stale,
                 "component": "execution_markout_worker",
-                "state": "starting",
-                **snapshot,
-            }
+                "state": "stalled" if startup_stale else "starting",
+                "startup_age_seconds": startup_age,
+            })
+            if startup_stale:
+                snapshot["reason"] = "startup_poll_stale"
+            return snapshot
         try:
             poll_age = max(0.0, time.monotonic() - float(last_poll))
         except (TypeError, ValueError, OverflowError):
@@ -277,6 +423,122 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             snapshot["reason"] = "poll_stale"
         snapshot.update({
             "component": "execution_markout_worker",
+            "poll_age_seconds": poll_age,
+        })
+        return snapshot
+
+    def _record_venue_recorder_health(self, report: dict) -> None:
+        """Receive one bounded health report from the venue recorder."""
+        if not isinstance(report, dict):
+            return
+
+        def nonnegative_int(key: str) -> int:
+            try:
+                return max(0, int(report.get(key) or 0))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        with self._venue_health_lock:
+            self._venue_health = {
+                "ok": report.get("ok") is True,
+                "reason": str(report.get("reason") or "")[:64],
+                "last_poll_monotonic": report.get("last_poll_monotonic"),
+                "last_poll_wall_ts": report.get("last_poll_wall_ts"),
+                "rest_ok": report.get("rest_ok") is True,
+                "l2_enabled": report.get("l2_enabled") is True,
+                "l2_ok": report.get("l2_ok") is True,
+                "l2_data_healthy": report.get(
+                    "l2_data_healthy", True
+                ) is True,
+                "consecutive_capture_errors": nonnegative_int(
+                    "consecutive_capture_errors"
+                ),
+                "capture_errors_total": nonnegative_int(
+                    "capture_errors_total"
+                ),
+                "captures_total": nonnegative_int("captures_total"),
+                "overview_captures_total": nonnegative_int(
+                    "overview_captures_total"
+                ),
+                "overview_errors_total": nonnegative_int(
+                    "overview_errors_total"
+                ),
+                "microstructure_captures_total": nonnegative_int(
+                    "microstructure_captures_total"
+                ),
+                "microstructure_errors_total": nonnegative_int(
+                    "microstructure_errors_total"
+                ),
+                "last_capture_success_wall_ts": report.get(
+                    "last_capture_success_wall_ts"
+                ),
+                "last_capture_error": str(
+                    report.get("last_capture_error") or ""
+                )[:200],
+                "last_overview_error": str(
+                    report.get("last_overview_error") or ""
+                )[:200],
+                "last_microstructure_error": str(
+                    report.get("last_microstructure_error") or ""
+                )[:200],
+                "retention_ok": report.get("retention_ok", True) is True,
+                "retention_errors_total": nonnegative_int(
+                    "retention_errors_total"
+                ),
+                "last_retention_error": str(
+                    report.get("last_retention_error") or ""
+                )[:200],
+                "l2_consecutive_errors": nonnegative_int(
+                    "l2_consecutive_errors"
+                ),
+                "l2_errors_total": nonnegative_int("l2_errors_total"),
+                "last_l2_error": str(
+                    report.get("last_l2_error") or ""
+                )[:200],
+            }
+
+    def _venue_runtime_health(self) -> dict[str, Any]:
+        recorder_thread = getattr(self, "_venue_recorder_thread", None)
+        if recorder_thread is None or not hasattr(
+            self, "_venue_health_lock"
+        ):
+            return {}
+        with self._venue_health_lock:
+            snapshot = dict(self._venue_health)
+        stale_sec = max(
+            self.VENUE_HEALTH_MIN_STALE_SEC,
+            float(getattr(self, "_venue_health_stale_sec", 0.0) or 0.0),
+        )
+        last_poll = snapshot.get("last_poll_monotonic")
+        if last_poll is None:
+            started = getattr(self, "_venue_started_monotonic", None)
+            try:
+                startup_age = (
+                    0.0
+                    if started is None
+                    else max(0.0, time.monotonic() - float(started))
+                )
+            except (TypeError, ValueError, OverflowError):
+                startup_age = float("inf")
+            startup_stale = startup_age > stale_sec
+            snapshot.update({
+                "ok": not startup_stale,
+                "component": "venue_recorder",
+                "state": "stalled" if startup_stale else "starting",
+                "startup_age_seconds": startup_age,
+            })
+            if startup_stale:
+                snapshot["reason"] = "startup_poll_stale"
+            return snapshot
+        try:
+            poll_age = max(0.0, time.monotonic() - float(last_poll))
+        except (TypeError, ValueError, OverflowError):
+            poll_age = float("inf")
+        if poll_age > stale_sec:
+            snapshot["ok"] = False
+            snapshot["reason"] = "poll_stale"
+        snapshot.update({
+            "component": "venue_recorder",
             "poll_age_seconds": poll_age,
         })
         return snapshot
@@ -296,7 +558,68 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             threads["markout"] = bool(
                 self._markout_thread and self._markout_thread.is_alive()
             )
+        venue_recorder_thread = getattr(self, "_venue_recorder_thread", None)
+        if venue_recorder_thread is not None:
+            threads["venue_recorder"] = bool(
+                venue_recorder_thread.is_alive()
+            )
         return threads
+
+    def _publish_periodic_runtime_status(
+        self,
+        status_writer,
+        *,
+        log_snapshot: bool,
+    ) -> None:
+        """Supervise exits before optional observability/status publication."""
+        threads = self._runtime_threads()
+        if (
+            not threads["monitor"]
+            and self.safe_mode is not None
+            and not self.safe_mode.is_active()
+        ):
+            self.safe_mode.trigger(
+                "monitor thread stopped - exits not supervised"
+            )
+        try:
+            status, strategy_health = self._runtime_status_health(threads)
+            state_rows = self.state.get_all()
+            if log_snapshot:
+                from trading.runtime_observability import (
+                    log_runtime_observability,
+                )
+
+                observability = log_runtime_observability(
+                    bot_name=self.BOT_NAME,
+                    mode="SIM" if self.simulation else "LIVE",
+                    state_rows=state_rows,
+                    ticker_cache=self.ticker_cache,
+                )
+            else:
+                from trading.runtime_observability import (
+                    runtime_observability_snapshot,
+                )
+
+                observability = runtime_observability_snapshot(
+                    state_rows=state_rows,
+                    ticker_cache=self.ticker_cache,
+                )
+            status_writer(
+                self.LOG_DIR,
+                self.BOT_NAME,
+                status,
+                self.simulation,
+                threads=threads,
+                extra={
+                    "open_positions": state_exposure_count(self.state),
+                    "safe_mode": bool(self.safe_mode.is_active()),
+                    **observability,
+                    **strategy_health,
+                },
+            )
+        except Exception as exc:
+            phase = "heartbeat" if log_snapshot else "periodic"
+            silent_log(f"{self.BOT_NAME} {phase} runtime status", exc)
 
     #  Run 
 
@@ -314,6 +637,9 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         set_metrics_sim_mode(self.simulation)   # pin SIM/LIVE metrics namespace
         set_structured_log_dir(self.LOG_DIR)
         build_info = get_build_info()
+        write_runtime_status = partial(
+            write_runtime_status, build_info=build_info
+        )
         write_runtime_status(
             self.LOG_DIR, self.BOT_NAME, "starting", self.simulation,
             extra={"phase": "config_validate"})
@@ -606,6 +932,11 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 l2_stale_after_ms=int(
                     self.C("VENUE_L2_STALE_AFTER_MS", 5_000)
                 ),
+                health_callback=self._record_venue_recorder_health,
+            )
+            self._venue_health_stale_sec = max(
+                self.VENUE_HEALTH_MIN_STALE_SEC,
+                recorder.micro_interval * 3.0,
             )
             self._venue_recorder_thread = threading.Thread(
                 target=recorder.run,
@@ -613,17 +944,31 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 daemon=True,
                 name="FUTURESVenueRecorder",
             )
-        self._monitor_thread.start()
-        self._scan_thread.start()
-        self._reconcile_thread.start()
         if self._markout_thread is not None:
-            self._markout_thread.start()
+            self._markout_started_monotonic = time.monotonic()
         if self._venue_recorder_thread is not None:
-            self._venue_recorder_thread.start()
+            self._venue_started_monotonic = time.monotonic()
+        start_threads_or_shutdown(
+            (
+                thread
+                for thread in (
+                    self._monitor_thread,
+                    self._scan_thread,
+                    self._reconcile_thread,
+                    self._markout_thread,
+                    self._venue_recorder_thread,
+                )
+                if thread is not None
+            ),
+            self._shutdown_event,
+            wakeup_events=(self._reconcile_wakeup_event,),
+        )
 
         thread_names = "monitor, scan, reconcile"
         if self._markout_thread is not None:
             thread_names += ", markout"
+        if self._venue_recorder_thread is not None:
+            thread_names += ", venue recorder"
         log_event(f"Core threads running ({thread_names}).", "START")
         threads = self._runtime_threads()
         status, strategy_health = self._runtime_status_health(threads)
@@ -655,63 +1000,14 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                         f"{sm_marker}",
                         "INFO"
                     )
-                    try:
-                        from trading.runtime_observability import (
-                            log_runtime_observability)
-                        observability = log_runtime_observability(
-                            bot_name=self.BOT_NAME,
-                            mode="SIM" if self.simulation else "LIVE",
-                            state_rows=self.state.get_all(),
-                            ticker_cache=self.ticker_cache,
-                        )
-                        threads = self._runtime_threads()
-                        status, strategy_health = self._runtime_status_health(
-                            threads)
-                        if (not threads["monitor"]
-                                and self.safe_mode is not None
-                                and not self.safe_mode.is_active()):
-                            self.safe_mode.trigger(
-                                "monitor thread stopped - exits not supervised")
-                        write_runtime_status(
-                            self.LOG_DIR, self.BOT_NAME, status,
-                            self.simulation,
-                            threads=threads,
-                            extra={
-                                "open_positions": tc,
-                                "safe_mode": bool(self.safe_mode.is_active()),
-                                **observability,
-                                **strategy_health,
-                            })
-                    except Exception:
-                        pass
+                    self._publish_periodic_runtime_status(
+                        write_runtime_status, log_snapshot=True
+                    )
                     last_heartbeat = now
                 if now - last_runtime_status >= 5.0:
-                    try:
-                        from trading.runtime_observability import (
-                            runtime_observability_snapshot)
-                        observability = runtime_observability_snapshot(
-                            state_rows=self.state.get_all(),
-                            ticker_cache=self.ticker_cache,
-                        )
-                        threads = self._runtime_threads()
-                        status, strategy_health = self._runtime_status_health(
-                            threads)
-                        if (not threads["monitor"]
-                                and self.safe_mode is not None
-                                and not self.safe_mode.is_active()):
-                            self.safe_mode.trigger(
-                                "monitor thread stopped - exits not supervised")
-                        write_runtime_status(
-                            self.LOG_DIR, self.BOT_NAME, status,
-                            self.simulation, threads=threads,
-                            extra={
-                                "open_positions": state_exposure_count(self.state),
-                                "safe_mode": bool(self.safe_mode.is_active()),
-                                **observability,
-                                **strategy_health,
-                            })
-                    except Exception:
-                        pass
+                    self._publish_periodic_runtime_status(
+                        write_runtime_status, log_snapshot=False
+                    )
                     last_runtime_status = now
                 # Hourly Telegram status (realized + unrealized PnL + positions).
                 # Self-throttling; covers FUTURES and CROSS (both FuturesBot).
@@ -740,21 +1036,17 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         ):
             if t and t.is_alive():
                 t.join(timeout=2)
-        try:
-            write_runtime_status(
-                self.LOG_DIR, self.BOT_NAME, "stopped", self.simulation,
-                threads=self._runtime_threads())
-        except Exception:
-            pass
-        # Close all per-thread CCXT clones so their HTTP sessions release
-        # file descriptors.
-        try:
-            closer = getattr(self.ex, "close_all", None)
-            if callable(closer):
-                closer()
-        except Exception:
-            pass
-        log_event("Bot shutdown complete.", "INFO")
+        # A fetch that was already running during the signal handler may have
+        # completed while core threads were joining. Confirm pool teardown now
+        # so a non-daemon executor worker cannot be reported as cleanly closed.
+        finalize_runtime_shutdown(
+            self,
+            write_runtime_status,
+            log_event,
+            resource_closers={
+                "ticker_cache": self._shutdown_ticker_cache_if_flat,
+            },
+        )
 
     #  Exchange connect 
 
@@ -899,6 +1191,22 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
 
     #  Shutdown 
 
+    def _shutdown_ticker_cache_if_flat(self) -> bool:
+        """Keep price fetching alive while an emergency retry is still needed."""
+        if not getattr(self, "_emergency_closed", False):
+            return False
+        cache = getattr(self, "ticker_cache", None)
+        if cache is None:
+            return True
+        try:
+            shutdown_result = cache.shutdown()
+            if shutdown_result is False:
+                raise RuntimeError("ticker pool still has running work")
+            return True
+        except Exception as exc:
+            self._log_error("Ticker pool shutdown", exc)
+            return False
+
     def _shutdown_handler(self, signum=None, frame=None):
         """Signal handler  sets shutdown event and triggers emergency close.
 
@@ -939,6 +1247,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             )
             self._emergency_closed = True
             self._emergency_in_progress = False
+            self._shutdown_ticker_cache_if_flat()
             return
 
         log_event(
@@ -962,10 +1271,16 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                         self._emergency_closed = True
                     self._emergency_in_progress = False
 
-        runner = threading.Thread(target=_close_runner,
-                                    daemon=True,
-                                    name=f"{self.BOT_NAME}EmergencyClose")
-        runner.start()
+        try:
+            runner = threading.Thread(target=_close_runner,
+                                      daemon=True,
+                                      name=f"{self.BOT_NAME}EmergencyClose")
+            runner.start()
+        except Exception as exc:
+            with self._shutdown_lock:
+                self._emergency_in_progress = False
+            self._log_error("Emergency close thread start", exc)
+            return
         runner.join(timeout=self.SHUTDOWN_DEADLINE_SEC)
         self._emergency_in_progress = runner.is_alive()
         if result["done"] and result["failed_count"] == 0:
@@ -991,12 +1306,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     "WARN"
                 )
 
-        # Tear down ticker pool to kill non-daemon worker threads
-        if self.ticker_cache:
-            try:
-                self.ticker_cache.shutdown()
-            except Exception as e:
-                self._log_error("Ticker pool shutdown", e)
+        self._shutdown_ticker_cache_if_flat()
 
     def _emergency_close_all(self, reason: str = "Shutdown") -> None:
         from core.logger import log_event, log_sell, send_telegram, save_trade, log_struct

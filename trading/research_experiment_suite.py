@@ -110,6 +110,13 @@ def _finite(value) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _positive_sample_count(value) -> int:
+    number = _finite(value)
+    if number is None or number < 1.0 or not number.is_integer():
+        raise ValueError("minimum_samples must be a positive integer")
+    return int(number)
+
+
 def _utc_datetime(value) -> datetime | None:
     try:
         if isinstance(value, (int, float)) or str(value).strip().isdigit():
@@ -186,6 +193,7 @@ def evaluate_score_thresholds(
     minimum_samples: int = 200,
 ) -> dict:
     """Evaluate entry selectivity only; this does not claim exit hysteresis."""
+    required_samples = _positive_sample_count(minimum_samples)
     prepared = []
     for label in labels:
         score = _finite(label.features.get(score_feature))
@@ -196,7 +204,7 @@ def evaluate_score_thresholds(
     for threshold in sorted({_finite(value) for value in thresholds} - {None}):
         selected = [outcome for score, outcome in prepared if score >= threshold]
         metrics = _performance(selected)
-        data_ready = len(selected) >= max(1, int(minimum_samples))
+        data_ready = len(selected) >= required_samples
         rows.append(
             {
                 "threshold": threshold,
@@ -209,7 +217,7 @@ def evaluate_score_thresholds(
     return {
         "score_feature": score_feature,
         "available_labels": len(prepared),
-        "minimum_samples": max(1, int(minimum_samples)),
+        "minimum_samples": required_samples,
         "rows": rows,
         "research_only": True,
         "exit_hysteresis_claimed": False,
@@ -224,13 +232,19 @@ def evaluate_abstention_grid(
     probability_thresholds: Iterable[float] = (0.50, 0.55, 0.60, 0.65),
     minimum_samples: int = 200,
 ) -> dict:
-    prepared = [
-        prediction
-        for prediction in predictions
-        if _finite(prediction.probability_positive) is not None
-        and _finite(prediction.predicted_net_bps) is not None
-        and _finite(prediction.actual_net_bps) is not None
-    ]
+    required_samples = _positive_sample_count(minimum_samples)
+    prepared = []
+    for prediction in predictions:
+        probability = _finite(prediction.probability_positive)
+        predicted = _finite(prediction.predicted_net_bps)
+        actual = _finite(prediction.actual_net_bps)
+        if (
+            probability is not None
+            and 0.0 <= probability <= 1.0
+            and predicted is not None
+            and actual is not None
+        ):
+            prepared.append((probability, predicted, actual))
     rows = []
     valid_thresholds = []
     for value in probability_thresholds:
@@ -239,10 +253,9 @@ def evaluate_abstention_grid(
             valid_thresholds.append(threshold)
     for threshold in sorted(set(valid_thresholds)):
         selected = [
-            prediction.actual_net_bps
-            for prediction in prepared
-            if prediction.probability_positive >= threshold
-            and prediction.predicted_net_bps > 0.0
+            actual
+            for probability, predicted, actual in prepared
+            if probability >= threshold and predicted > 0.0
         ]
         metrics = _performance(selected)
         rows.append(
@@ -251,12 +264,12 @@ def evaluate_abstention_grid(
                 **{key: value for key, value in metrics.items() if key != "mean_net_bps"},
                 "mean_actual_net_bps": metrics["mean_net_bps"],
                 "coverage": len(selected) / len(prepared) if prepared else 0.0,
-                "ready": len(selected) >= max(1, int(minimum_samples)),
+                "ready": len(selected) >= required_samples,
             }
         )
     return {
         "oos_predictions": len(prepared),
-        "minimum_samples": max(1, int(minimum_samples)),
+        "minimum_samples": required_samples,
         "rows": rows,
         "research_only": True,
     }
@@ -266,6 +279,7 @@ def _series_map(
     rows: Iterable[tuple[int, float, float, float]],
 ) -> dict[int, tuple[float, float, float]]:
     mapped = {}
+    conflicted_timestamps = set()
     for row in rows:
         try:
             timestamp, open_price, close, volume = row
@@ -274,12 +288,18 @@ def _series_map(
         opening = _finite(open_price)
         price = _finite(close)
         amount = _finite(volume)
+        if isinstance(timestamp, bool):
+            continue
         try:
             timestamp_value = int(timestamp)
+            timestamp_number = float(timestamp)
         except (TypeError, ValueError, OverflowError):
             continue
         if (
-            opening is None
+            not math.isfinite(timestamp_number)
+            or timestamp_number <= 0.0
+            or timestamp_number != timestamp_value
+            or opening is None
             or opening <= 0.0
             or price is None
             or price <= 0.0
@@ -287,7 +307,15 @@ def _series_map(
             or amount < 0.0
         ):
             continue
-        mapped[timestamp_value] = (opening, price, amount)
+        candidate = (opening, price, amount)
+        if timestamp_value in conflicted_timestamps:
+            continue
+        existing = mapped.get(timestamp_value)
+        if existing is None:
+            mapped[timestamp_value] = candidate
+        elif existing != candidate:
+            mapped.pop(timestamp_value)
+            conflicted_timestamps.add(timestamp_value)
     return mapped
 
 
@@ -322,6 +350,7 @@ def evaluate_momentum_panel(
     point_in_time_universe_complete: bool = False,
     hold_rank_buffer: int = 3,
 ) -> dict:
+    universe_proven = point_in_time_universe_complete is True
     hour_ms = 3_600_000
     lookback_ms = max(1, int(lookback_hours)) * hour_ms
     tsmom_lookback_ms = max(1, int(tsmom_lookback_hours)) * hour_ms
@@ -652,7 +681,7 @@ def evaluate_momentum_panel(
         and cross_metrics["samples"] >= max(1, int(minimum_windows))
         and time_metrics["samples"] >= max(1, int(minimum_windows))
     )
-    ready = bool(data_sufficient and point_in_time_universe_complete)
+    ready = bool(data_sufficient and universe_proven)
     return {
         "symbols": len(series),
         "lookback_hours": max(1, int(lookback_hours)),
@@ -726,9 +755,7 @@ def evaluate_momentum_panel(
             "signal_cutoff": "completed_bar_close",
             "execution_price": "next_bar_open",
             "exit_price": "holding_window_end_open",
-            "point_in_time_universe_complete": bool(
-                point_in_time_universe_complete
-            ),
+            "point_in_time_universe_complete": universe_proven,
         },
         "research_only": True,
     }
@@ -744,8 +771,12 @@ def load_cached_ohlcv_panel(
     folder = Path(root) / "data" / "ohlcv_cache"
     panel = {}
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    symbol_limit = max(1, int(max_symbols))
+    bar_limit = max(1, int(max_bars))
     file_limit = max(1, int(maximum_file_bytes))
-    for path in sorted(folder.glob("*__1h.json"))[: max(1, int(max_symbols))]:
+    for path in sorted(folder.glob("*__1h.json")):
+        if len(panel) >= symbol_limit:
+            break
         try:
             with path.open("rb") as handle:
                 raw = handle.read(file_limit + 1)
@@ -756,19 +787,24 @@ def load_cached_ohlcv_panel(
             continue
         if not isinstance(payload, list):
             continue
-        rows = []
-        for bar in payload[-max(1, int(max_bars)) :]:
+        candidates = []
+        for bar in payload:
             if not isinstance(bar, list) or len(bar) < 6:
+                continue
+            if isinstance(bar[0], bool):
                 continue
             try:
                 timestamp = int(bar[0])
+                timestamp_number = float(bar[0])
             except (TypeError, ValueError, OverflowError):
                 continue
             open_price = _finite(bar[1])
             close = _finite(bar[4])
             volume = _finite(bar[5])
             if (
-                timestamp <= 0
+                not math.isfinite(timestamp_number)
+                or timestamp <= 0
+                or timestamp_number != timestamp
                 or timestamp + 3_600_000 > now_ms
                 or open_price is None
                 or open_price <= 0.0
@@ -778,9 +814,17 @@ def load_cached_ohlcv_panel(
                 or volume < 0.0
             ):
                 continue
-            rows.append((timestamp, open_price, close, volume))
+            candidates.append((timestamp, open_price, close, volume))
+        rows = [
+            (timestamp, opening, close, volume)
+            for timestamp, (opening, close, volume) in sorted(
+                _series_map(candidates).items()
+            )[-bar_limit:]
+        ]
         if rows:
             symbol = path.name.removesuffix("__1h.json")
+            if not symbol:
+                continue
             panel[symbol] = rows
     return panel
 
@@ -790,6 +834,7 @@ def evaluate_regime_shift(
     *,
     point_in_time_universe_complete: bool = False,
 ) -> dict:
+    universe_proven = point_in_time_universe_complete is True
     series = {symbol: _series_map(rows) for symbol, rows in panel.items()}
     by_time: dict[int, list[float]] = {}
     hour_ms = 3_600_000
@@ -798,29 +843,38 @@ def evaluate_regime_shift(
             previous = rows.get(timestamp - hour_ms)
             if previous is not None:
                 by_time.setdefault(timestamp, []).append(price / previous[1] - 1.0)
-    market_returns = [
-        statistics.mean(by_time[timestamp])
+    market_points = [
+        (timestamp, statistics.mean(by_time[timestamp]))
         for timestamp in sorted(by_time)
         if len(by_time[timestamp]) >= 5
     ]
+    market_returns = [value for _timestamp, value in market_points]
+    contiguous_returns = []
+    previous_timestamp = None
+    for timestamp, value in market_points:
+        if previous_timestamp is None or timestamp == previous_timestamp + hour_ms:
+            contiguous_returns.append(value)
+        else:
+            contiguous_returns = [value]
+        previous_timestamp = timestamp
     recent_count = 7 * 24
     prior_count = 28 * 24
-    if len(market_returns) < recent_count + prior_count:
+    required_count = recent_count + prior_count
+    if len(contiguous_returns) < required_count:
         return {
             "ready": False,
             "data_sufficient": False,
             "samples": len(market_returns),
-            "minimum_samples": recent_count + prior_count,
+            "contiguous_samples": len(contiguous_returns),
+            "minimum_samples": required_count,
             "shadow_alert": False,
             "method": "distribution_shift_shadow_v1",
             "causality": {
-                "point_in_time_universe_complete": bool(
-                    point_in_time_universe_complete
-                )
+                "point_in_time_universe_complete": universe_proven
             },
         }
-    recent = market_returns[-recent_count:]
-    prior = market_returns[-(recent_count + prior_count) : -recent_count]
+    recent = contiguous_returns[-recent_count:]
+    prior = contiguous_returns[-required_count:-recent_count]
     prior_vol = statistics.stdev(prior) if len(prior) > 1 else 0.0
     recent_vol = statistics.stdev(recent) if len(recent) > 1 else 0.0
     volatility_ratio = recent_vol / prior_vol if prior_vol > 0.0 else None
@@ -834,10 +888,11 @@ def evaluate_regime_shift(
         or (mean_shift_z is not None and mean_shift_z >= 0.5)
     )
     return {
-        "ready": bool(point_in_time_universe_complete),
+        "ready": universe_proven,
         "data_sufficient": True,
         "samples": len(market_returns),
-        "minimum_samples": recent_count + prior_count,
+        "contiguous_samples": len(contiguous_returns),
+        "minimum_samples": required_count,
         "recent_hours": recent_count,
         "prior_hours": prior_count,
         "volatility_ratio": volatility_ratio,
@@ -846,9 +901,7 @@ def evaluate_regime_shift(
         "method": "distribution_shift_shadow_v1",
         "changes_orders": False,
         "causality": {
-            "point_in_time_universe_complete": bool(
-                point_in_time_universe_complete
-            )
+            "point_in_time_universe_complete": universe_proven
         },
     }
 
@@ -867,6 +920,9 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
     grouped: dict[str, dict[str, dict]] = {}
     overview_counts: dict[str, int] = {}
     missing_settlement = 0
+    noncausal_settlement_observations = 0
+    unsettled_funding_periods: set[tuple[str, str]] = set()
+    analysis_time = datetime.now(timezone.utc)
     folder = root / "data" / "venue_native" / "overview"
     total_events = 0
     for path in folder.glob("*.sqlite3"):
@@ -874,12 +930,13 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
         try:
             conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
             rows = conn.execute(
-                "SELECT exchange_time, payload_json FROM venue_events "
+                "SELECT event_id, exchange_time, received_time, payload_json "
+                "FROM venue_events "
                 "WHERE length(CAST(payload_json AS BLOB)) <= ? "
-                "ORDER BY exchange_time",
+                "ORDER BY exchange_time, received_time, event_id",
                 (RESEARCH_VENUE_PAYLOAD_MAX_BYTES,),
             )
-            for exchange_time, encoded in rows:
+            for event_id, exchange_time, received_time, encoded in rows:
                 total_events += 1
                 try:
                     payload = json.loads(encoded)
@@ -900,20 +957,32 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
                     if settlement is None or isinstance(settlement, bool):
                         missing_settlement += 1
                         continue
-                    if isinstance(settlement, (int, float)):
-                        if (
-                            not math.isfinite(float(settlement))
-                            or float(settlement) <= 0.0
-                        ):
-                            missing_settlement += 1
-                            continue
-                        period_key = str(int(float(settlement)))
-                    else:
-                        period_key = str(settlement).strip()
-                    if not period_key:
+                    settlement_number = _finite(settlement)
+                    if isinstance(settlement, (int, float)) and settlement_number is None:
                         missing_settlement += 1
                         continue
-                    settlement_time = _utc_datetime(period_key)
+                    if settlement_number is not None:
+                        if settlement_number <= 0.0:
+                            missing_settlement += 1
+                            continue
+                        settlement_time = _utc_datetime(settlement_number)
+                        if settlement_time is None:
+                            missing_settlement += 1
+                            continue
+                        period_key = settlement_time.isoformat()
+                    else:
+                        period_key = str(settlement).strip()
+                        if not period_key:
+                            missing_settlement += 1
+                            continue
+                        settlement_time = _utc_datetime(period_key)
+                        if settlement_time is None:
+                            missing_settlement += 1
+                            continue
+                        period_key = settlement_time.isoformat()
+                    if settlement_time > analysis_time:
+                        unsettled_funding_periods.add((key, period_key))
+                        continue
                     index_price = _finite(market.get("index_price"))
                     fair_price = _finite(market.get("fair_price"))
                     basis_bps = (
@@ -922,14 +991,42 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
                         and fair_price is not None and fair_price > 0.0
                         else None
                     )
-                    grouped.setdefault(key, {})[period_key] = {
+                    snapshot_time = _utc_datetime(exchange_time)
+                    snapshot_received_time = _utc_datetime(received_time)
+                    if (
+                        snapshot_time is None
+                        or snapshot_received_time is None
+                        or snapshot_time > settlement_time
+                        or snapshot_received_time > settlement_time
+                    ):
+                        noncausal_settlement_observations += 1
+                        continue
+                    snapshot_order = (
+                        snapshot_time is not None,
+                        snapshot_time or datetime.min.replace(tzinfo=timezone.utc),
+                        snapshot_received_time is not None,
+                        snapshot_received_time
+                        or datetime.min.replace(tzinfo=timezone.utc),
+                        str(exchange_time),
+                        str(received_time),
+                        str(event_id),
+                    )
+                    candidate = {
                         "exchange_time": str(exchange_time),
                         "settlement_time": settlement_time,
                         "funding": funding,
                         "spot_verified": market.get("spot_available") is True,
                         "basis_bps": basis_bps,
                         "quote_volume": _finite(market.get("quote_volume")),
+                        "_snapshot_order": snapshot_order,
                     }
+                    periods = grouped.setdefault(key, {})
+                    previous = periods.get(period_key)
+                    if (
+                        previous is None
+                        or snapshot_order > previous["_snapshot_order"]
+                    ):
+                        periods[period_key] = candidate
         except (OSError, sqlite3.Error):
             continue
         finally:
@@ -1059,12 +1156,21 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
         )
         if ready:
             qualified.append(market_id)
-    summaries.sort(key=lambda row: (row["ready"], row["samples"]), reverse=True)
+    summaries.sort(
+        key=lambda row: (
+            not row["ready"],
+            -row["samples"],
+            row["market_id"],
+        )
+    )
+    qualified.sort()
     return {
         "overview_events": total_events,
         "minimum_market_samples": required,
         "minimum_independent_funding_periods": required,
         "observations_without_settlement_id": missing_settlement,
+        "noncausal_settlement_observations": noncausal_settlement_observations,
+        "unsettled_funding_periods": len(unsettled_funding_periods),
         "qualified_markets": qualified,
         "markets": summaries[:100],
     }

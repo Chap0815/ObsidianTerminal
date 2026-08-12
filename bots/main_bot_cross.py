@@ -11,9 +11,11 @@ Start:  python -m bots.main_bot_cross
 from __future__ import annotations
 
 try:
-    from bots._bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
+    from bots._bootstrap import (bot_instance_guard, guard_pre_start,
+                                 prepare_entrypoint, require_portalocker)
 except ModuleNotFoundError:
-    from _bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
+    from _bootstrap import (bot_instance_guard, guard_pre_start,
+                            prepare_entrypoint, require_portalocker)
 
 prepare_entrypoint(__file__, __name__)
 
@@ -88,8 +90,9 @@ class CrossMomentumBot(CrossBot):
 
 
 def run_bot():
-    guard_pre_start("CROSS")
-    CrossMomentumBot(simulation=read_simulation_flag("CROSS")).run()
+    with bot_instance_guard("CROSS"):
+        guard_pre_start("CROSS")
+        CrossMomentumBot(simulation=read_simulation_flag("CROSS")).run()
 
 
 if __name__ == "__main__":

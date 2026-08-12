@@ -12,16 +12,32 @@ from pathlib import Path
 from typing import Mapping
 
 from trading.carry_sim import CarryEngine, CarryTerms
-from trading.execution_cost_model import ExecutionCostObservation
+from trading.execution_cost_model import (
+    ExecutionCostObservation,
+    decode_execution_cost_payload,
+    execution_cost_stages_are_causal,
+    normalize_execution_cost_limit,
+    normalize_execution_cost_minimum_samples,
+    validate_execution_cost_arrival,
+    validate_execution_cost_fill,
+)
 from trading.execution_policy import (
     ExecutionPolicyEvidence,
     evaluate_shadow_execution_policy,
+)
+from trading.experiment_registry_contract import (
+    encode_experiment_params,
+    normalize_experiment_metadata,
 )
 from trading.expectancy_telemetry import (
     EXPECTANCY_FEATURES,
     EXPECTANCY_FEATURE_SCHEMAS,
 )
-from trading.expectancy_training import CandidateLabel, expanding_walk_forward_fit
+from trading.expectancy_training import (
+    CandidateLabel,
+    expanding_walk_forward_fit,
+    normalize_walk_forward_sizes,
+)
 from trading.orderflow_experiment import build_ofi_window
 from trading.promotion_gate import PromotionEvidence, evaluate_promotion
 
@@ -36,14 +52,42 @@ def _finite(value) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _positive_integer(value, name: str) -> int:
+    number = _finite(value)
+    if number is None or number <= 0.0 or not number.is_integer():
+        raise ValueError(f"{name} must be a positive integer")
+    return int(number)
+
+
+def _nonnegative_integer(value, name: str) -> int:
+    number = _finite(value)
+    if number is None or number < 0.0 or not number.is_integer():
+        raise ValueError(f"{name} must be a non-negative integer")
+    return int(number)
+
+
+def _positive_number(value, name: str) -> float:
+    number = _finite(value)
+    if number is None or number <= 0.0:
+        raise ValueError(f"{name} must be positive and finite")
+    return number
+
+
+def _nonnegative_number(value, name: str) -> float:
+    number = _finite(value)
+    if number is None or number < 0.0:
+        raise ValueError(f"{name} must be non-negative and finite")
+    return number
+
+
 def _utc_datetime(value) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _read_connection(path: Path) -> sqlite3.Connection:
@@ -61,7 +105,13 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     ).fetchone() is not None
 
 
-def _candidate_events(root: Path, bot: str, mode: str) -> dict[str, dict]:
+def _candidate_events(
+    root: Path,
+    bot: str,
+    mode: str,
+    *,
+    diagnostics: Counter | None = None,
+) -> dict[str, dict]:
     selected: dict[str, dict] = {}
     database = root / "data" / "trading_bot.db"
     try:
@@ -82,8 +132,12 @@ def _candidate_events(root: Path, bot: str, mode: str) -> dict[str, dict]:
                     candidate_time = _utc_datetime(row["candidate_time"])
                     try:
                         features = json.loads(row["features_json"])
-                        schema_version = int(row["schema_version"])
+                        schema_version = _positive_integer(
+                            row["schema_version"], "schema_version"
+                        )
                     except (TypeError, ValueError, json.JSONDecodeError, OverflowError):
+                        if diagnostics is not None:
+                            diagnostics["candidate_records_rejected"] += 1
                         continue
                     entry_id = str(row["entry_id"] or "").strip()
                     if entry_id and candidate_time is not None and isinstance(features, dict):
@@ -93,6 +147,8 @@ def _candidate_events(root: Path, bot: str, mode: str) -> dict[str, dict]:
                             "schema_version": schema_version,
                             "source": "sqlite",
                         }
+                    elif diagnostics is not None:
+                        diagnostics["candidate_records_rejected"] += 1
         finally:
             conn.close()
     logs = root / "logs"
@@ -113,6 +169,12 @@ def _candidate_events(root: Path, bot: str, mode: str) -> dict[str, dict]:
                 try:
                     event = json.loads(line)
                 except (TypeError, ValueError, json.JSONDecodeError):
+                    if diagnostics is not None:
+                        diagnostics["candidate_records_rejected"] += 1
+                    continue
+                if not isinstance(event, dict):
+                    if diagnostics is not None:
+                        diagnostics["candidate_records_rejected"] += 1
                     continue
                 if event.get("event") != "expectancy_candidate":
                     continue
@@ -126,10 +188,16 @@ def _candidate_events(root: Path, bot: str, mode: str) -> dict[str, dict]:
                 )
                 features = event.get("features")
                 try:
-                    schema_version = int(event.get("schema_version") or 1)
+                    schema_version = _positive_integer(
+                        event.get("schema_version", 1), "schema_version"
+                    )
                 except (TypeError, ValueError, OverflowError):
+                    if diagnostics is not None:
+                        diagnostics["candidate_records_rejected"] += 1
                     continue
                 if not entry_id or candidate_time is None or not isinstance(features, dict):
+                    if diagnostics is not None:
+                        diagnostics["candidate_records_rejected"] += 1
                     continue
                 current = selected.get(entry_id)
                 if current is None or (
@@ -156,10 +224,15 @@ def build_expectancy_candidates(
     project = Path(root)
     normalized_bot = str(bot).strip().upper()
     normalized_mode = str(mode).strip().upper()
-    schemas = EXPECTANCY_FEATURE_SCHEMAS.get(normalized_bot) or {}
-    feature_order = schemas.get(int(schema_version))
-    if feature_order is None or normalized_mode not in {"LIVE", "SIM"}:
-        raise ValueError("unsupported bot or mode")
+    selected_schema = _positive_integer(schema_version, "schema_version")
+    schemas = EXPECTANCY_FEATURE_SCHEMAS.get(normalized_bot)
+    if not schemas:
+        raise ValueError("unsupported bot")
+    feature_order = schemas.get(selected_schema)
+    if feature_order is None:
+        raise ValueError("unsupported expectancy schema version")
+    if normalized_mode not in {"LIVE", "SIM"}:
+        raise ValueError("unsupported mode")
     candidates = _candidate_events(project, normalized_bot, normalized_mode)
     if not candidates:
         return []
@@ -192,7 +265,13 @@ def build_expectancy_candidates(
         event = candidates.get(entry_id)
         if event is None or not campaign:
             continue
-        if int(event.get("schema_version") or 1) != int(schema_version):
+        try:
+            event_schema = _positive_integer(
+                event.get("schema_version"), "schema_version"
+            )
+        except ValueError:
+            continue
+        if event_schema != selected_schema:
             continue
         if not any(int(row["is_partial"] or 0) == 0 for row in campaign):
             continue
@@ -219,7 +298,14 @@ def build_expectancy_candidates(
         invested = sum(
             float(value) for value in invested_values if value is not None
         )
-        if invested <= 0.0:
+        if (
+            not math.isfinite(profit)
+            or not math.isfinite(invested)
+            or invested <= 0.0
+        ):
+            continue
+        net_return_bps = profit / invested * 10_000.0
+        if not math.isfinite(net_return_bps):
             continue
         if closed < event["candidate_time"]:
             continue
@@ -236,7 +322,7 @@ def build_expectancy_candidates(
                 candidate_time=event["candidate_time"],
                 label_closed_time=closed,
                 features=features,
-                net_return_bps=profit / invested * 10_000.0,
+                net_return_bps=net_return_bps,
             )
         )
     return sorted(labels, key=lambda row: row.candidate_time)
@@ -250,6 +336,7 @@ def select_expectancy_schema(
     minimum_rows: int,
 ) -> tuple[int, tuple[str, ...], list[CandidateLabel], dict[int, int]]:
     """Prefer the newest adequately sampled schema, without mixing versions."""
+    required = _positive_integer(minimum_rows, "minimum_rows")
     normalized_bot = str(bot).strip().upper()
     schemas = EXPECTANCY_FEATURE_SCHEMAS.get(normalized_bot)
     if not schemas:
@@ -260,7 +347,6 @@ def select_expectancy_schema(
         )
         for version in sorted(schemas)
     }
-    required = max(1, int(minimum_rows))
     adequate = [
         version for version, rows in labels_by_version.items()
         if len(rows) >= required
@@ -287,12 +373,10 @@ def load_execution_cost_observations(
     mode: str | None = None,
     limit: int = 10_000,
 ) -> list[ExecutionCostObservation]:
-    if (bot is None) != (mode is None):
-        raise ValueError("bot and mode must be supplied together")
-    normalized_bot = str(bot).strip().upper() if bot is not None else None
-    normalized_mode = str(mode).strip().upper() if mode is not None else None
-    if normalized_mode is not None and normalized_mode not in {"LIVE", "SIM"}:
-        raise ValueError("mode must be LIVE or SIM")
+    normalized_limit = normalize_execution_cost_limit(limit)
+    normalized_bot, normalized_mode = _normalize_execution_cost_scope(
+        bot, mode
+    )
     path = Path(root) / "data" / "trading_bot.db"
     try:
         conn = _read_connection(path)
@@ -312,6 +396,14 @@ def load_execution_cost_observations(
                 for row in conn.execute("PRAGMA table_info(order_intents)")
             }
             if has_intents else set()
+        )
+        execution_tca_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(execution_tca)")
+        }
+        measured_at_expr = (
+            "t.measured_at" if "measured_at" in execution_tca_columns
+            else "NULL"
         )
         intent_join = (
             "LEFT JOIN order_intents i ON i.intent_id=t.intent_id "
@@ -345,17 +437,18 @@ def load_execution_cost_observations(
                 f"AND UPPER({bot_expr})=? AND UPPER({mode_expr})=? "
             )
             params = (normalized_bot, normalized_mode)
-        records = list(conn.execute(
-            "SELECT t.intent_id, t.stage, t.payload_json, "
+        records = [("execution", row) for row in conn.execute(
+            "SELECT t.id AS tca_id, t.intent_id, t.stage, t.payload_json, "
+            f"{measured_at_expr} AS measured_at, "
             f"{symbol_expr} AS symbol, {notional_expr} AS filled_notional "
             "FROM execution_tca t "
             + intent_join
             + candidate_join
             + "WHERE t.stage IN ('arrival','fill') "
             + scope_sql
-            + "ORDER BY t.id DESC LIMIT ?",
-            (*params, max(1, min(100_000, int(limit)))),
-        ).fetchall())
+            + "ORDER BY julianday(measured_at) DESC, t.id DESC LIMIT ?",
+            (*params, normalized_limit),
+        ).fetchall()]
         if (
             has_candidates
             and _table_exists(conn, "sim_execution_tca")
@@ -367,57 +460,109 @@ def load_execution_cost_observations(
                 sim_scope_sql = "AND UPPER(e.bot_name)=? AND UPPER(e.mode)=? "
                 sim_params = (normalized_bot, normalized_mode)
             records.extend(
-                conn.execute(
-                    """SELECT t.entry_id AS intent_id, t.stage, t.payload_json,
+                ("sim", row)
+                for row in conn.execute(
+                    """SELECT t.id AS tca_id, t.entry_id AS intent_id,
+                              t.measured_at, t.stage, t.payload_json,
                               e.symbol AS symbol, NULL AS filled_notional
                          FROM sim_execution_tca t
                          JOIN expectancy_candidates e ON e.entry_id=t.entry_id
                         WHERE t.stage IN ('arrival','fill') """
                     + sim_scope_sql
-                    + "ORDER BY t.id DESC LIMIT ?",
+                    + "ORDER BY julianday(t.measured_at) DESC, t.id DESC LIMIT ?",
                     (
                         *sim_params,
-                        max(1, min(100_000, int(limit))),
+                        normalized_limit,
                     ),
                 ).fetchall()
             )
     finally:
         conn.close()
-    paired: dict[str, dict[str, dict]] = defaultdict(dict)
-    metadata = {}
-    for row in records:
+
+    def record_key(record) -> tuple[bool, datetime, int, str]:
+        source, row = record
+        measured_at = _utc_datetime(row["measured_at"])
         try:
-            payload = json.loads(row["payload_json"])
-        except (TypeError, ValueError, json.JSONDecodeError):
+            tca_id = int(row["tca_id"])
+        except (TypeError, ValueError, OverflowError):
+            tca_id = -1
+        return (
+            measured_at is not None,
+            measured_at or datetime.min.replace(tzinfo=timezone.utc),
+            tca_id,
+            source,
+        )
+
+    records = sorted(records, key=record_key, reverse=True)[:normalized_limit]
+    paired: dict[
+        tuple[str, str], dict[str, tuple[dict, object, object]]
+    ] = defaultdict(dict)
+    metadata = {}
+    for source, row in records:
+        try:
+            payload = decode_execution_cost_payload(row["payload_json"])
+        except ValueError:
             continue
-        if not isinstance(payload, dict):
-            continue
-        paired[str(row["intent_id"])].setdefault(str(row["stage"]), payload)
-        metadata[str(row["intent_id"])] = (row["symbol"], row["filled_notional"])
+        key = (source, str(row["intent_id"]))
+        paired[key].setdefault(
+            str(row["stage"]),
+            (payload, row["tca_id"], row["measured_at"]),
+        )
+        metadata[key] = (row["symbol"], row["filled_notional"])
     observations = []
-    for intent_id, stages in paired.items():
-        arrival, fill = stages.get("arrival"), stages.get("fill")
-        if not isinstance(arrival, dict) or not isinstance(fill, dict):
+    for key, stages in paired.items():
+        arrival_stage = stages.get("arrival")
+        fill_stage = stages.get("fill")
+        if arrival_stage is None or fill_stage is None:
             continue
-        symbol, notional = metadata[intent_id]
+        arrival, arrival_id, arrival_time = arrival_stage
+        fill, fill_id, fill_time = fill_stage
+        if not execution_cost_stages_are_causal(
+            arrival_id=arrival_id,
+            arrival_time=arrival_time,
+            fill_id=fill_id,
+            fill_time=fill_time,
+        ):
+            continue
+        symbol, notional = metadata[key]
         observed_notional = _finite(notional)
         if observed_notional is None or observed_notional <= 0.0:
             observed_notional = _finite(arrival.get("notional_usdt"))
         try:
+            validate_execution_cost_arrival(arrival)
+            validate_execution_cost_fill(fill)
             observations.append(
                 ExecutionCostObservation(
-                    symbol=str(symbol),
+                    symbol=symbol,
                     total_cost_bps=fill["total_cost_bps"],
                     spread_bps=arrival["spread_bps"],
                     depth_coverage=arrival["depth_coverage"],
                     notional_usdt=observed_notional,
-                    regime=str(arrival.get("regime") or "unknown"),
+                    regime=arrival.get("regime", "unknown"),
                     volatility_bps=arrival.get("volatility_bps") or 0.0,
                 )
             )
         except (KeyError, TypeError, ValueError):
             continue
     return observations
+
+
+def _normalize_execution_cost_scope(
+    bot, mode
+) -> tuple[str | None, str | None]:
+    if (bot is None) != (mode is None):
+        raise ValueError("bot and mode must be supplied together")
+    if bot is None:
+        return None, None
+    if not isinstance(bot, str) or not bot.strip():
+        raise ValueError("bot must be a non-empty string")
+    if not isinstance(mode, str):
+        raise ValueError("mode must be LIVE or SIM")
+    normalized_bot = bot.strip().upper()
+    normalized_mode = mode.strip().upper()
+    if normalized_mode not in {"LIVE", "SIM"}:
+        raise ValueError("mode must be LIVE or SIM")
+    return normalized_bot, normalized_mode
 
 
 def _quantile(values: list[float], probability: float) -> float | None:
@@ -439,18 +584,22 @@ def build_execution_cost_report(
     mode: str | None = None,
     minimum_samples: int = 50,
 ) -> dict:
-    observations = load_execution_cost_observations(root, bot=bot, mode=mode)
-    costs = [max(0.0, row.total_cost_bps) for row in observations]
+    required = normalize_execution_cost_minimum_samples(minimum_samples)
+    normalized_bot, normalized_mode = _normalize_execution_cost_scope(bot, mode)
+    observations = load_execution_cost_observations(
+        root, bot=normalized_bot, mode=normalized_mode
+    )
+    costs = [row.total_cost_bps for row in observations]
     by_symbol = Counter(row.symbol for row in observations)
     return {
         "scope": {
-            "bot": str(bot).strip().upper() if bot is not None else None,
-            "mode": str(mode).strip().upper() if mode is not None else None,
+            "bot": normalized_bot,
+            "mode": normalized_mode,
         },
         "valid_samples": len(observations),
-        "minimum_samples": max(5, int(minimum_samples)),
-        "ready": len(observations) >= max(5, int(minimum_samples)),
-        "median_cost_bps": statistics.median(costs) if costs else None,
+        "minimum_samples": required,
+        "ready": len(observations) >= required,
+        "median_cost_bps": _quantile(costs, 0.5),
         "p75_cost_bps": _quantile(costs, 0.75),
         "p95_cost_bps": _quantile(costs, 0.95),
         "symbol_samples": dict(sorted(by_symbol.items())),
@@ -468,11 +617,16 @@ def build_execution_policy_report(
     recorder.  ``maker_crossed_through`` is deliberately only a conservative
     fill proxy; it is never presented as reconstructed queue position.
     """
+    minimum = normalize_execution_cost_minimum_samples(minimum_samples)
     valid: list[dict] = []
     rejected = Counter()
     for row in _venue_rows(Path(root), "execution_shadow", limit=50_000):
         payload = row.get("payload") or {}
-        if row.get("flags"):
+        flags = row.get("flags") or ()
+        if "invalid_event_envelope" in flags:
+            rejected["invalid_event_envelope"] += 1
+            continue
+        if flags:
             rejected["quality_flags"] += 1
             continue
         if payload.get("sequence_valid") is not True:
@@ -507,31 +661,31 @@ def build_execution_policy_report(
             continue
         valid.append({**parsed, "crossed": bool(payload["maker_crossed_through"])})
 
-    minimum = max(5, int(minimum_samples))
     evidence = ExecutionPolicyEvidence(
         gross_edge_bps=(
-            statistics.median([row["gross_edge_bps"] for row in valid])
+            _quantile([row["gross_edge_bps"] for row in valid], 0.5)
             if valid else None
         ),
         taker_cost_bps=(
-            statistics.median([row["taker_cost_bps"] for row in valid])
+            _quantile([row["taker_cost_bps"] for row in valid], 0.5)
             if valid else None
         ),
         maker_fee_bps=(
-            statistics.median([row["maker_fee_bps"] for row in valid])
+            _quantile([row["maker_fee_bps"] for row in valid], 0.5)
             if valid else None
         ),
         maker_adverse_selection_bps=(
-            statistics.median(
-                [row["maker_adverse_selection_bps"] for row in valid]
-            ) if valid else None
+            _quantile(
+                [row["maker_adverse_selection_bps"] for row in valid], 0.5
+            )
+            if valid else None
         ),
         maker_fill_probability=(
             statistics.mean([float(row["crossed"]) for row in valid])
             if valid else None
         ),
         missed_fill_cost_bps=(
-            statistics.median([row["missed_fill_cost_bps"] for row in valid])
+            _quantile([row["missed_fill_cost_bps"] for row in valid], 0.5)
             if valid else None
         ),
         samples=len(valid),
@@ -565,10 +719,31 @@ def build_execution_policy_report(
     }
 
 
+def _venue_partition_key(path: Path) -> tuple[bool, datetime, str]:
+    try:
+        partition_day = datetime.strptime(path.stem, "%Y-%m-%d")
+    except ValueError:
+        return False, datetime.min, path.name
+    return True, partition_day, path.name
+
+
+def _venue_row_key(row: dict) -> tuple[bool, datetime, str, str]:
+    exchange_time = str(row["exchange_time"])
+    timestamp = _utc_datetime(exchange_time)
+    return (
+        timestamp is not None,
+        timestamp or datetime.min.replace(tzinfo=timezone.utc),
+        exchange_time,
+        str(row["market_id"]),
+    )
+
+
 def _venue_rows(root: Path, stream: str, *, limit: int) -> list[dict]:
     rows = []
     folder = root / "data" / "venue_native" / stream
-    for path in sorted(folder.glob("*.sqlite3"), reverse=True):
+    for path in sorted(
+        folder.glob("*.sqlite3"), key=_venue_partition_key, reverse=True
+    ):
         if len(rows) >= limit:
             break
         conn = None
@@ -576,7 +751,9 @@ def _venue_rows(root: Path, stream: str, *, limit: int) -> list[dict]:
             conn = _read_connection(path)
             fetched = conn.execute(
                 "SELECT market_id, exchange_time, quality_flags_json, payload_json "
-                "FROM venue_events ORDER BY exchange_time DESC LIMIT ?",
+                "FROM venue_events "
+                "ORDER BY julianday(exchange_time) DESC, exchange_time DESC "
+                "LIMIT ?",
                 (limit - len(rows),),
             ).fetchall()
         except (OSError, sqlite3.Error):
@@ -585,26 +762,44 @@ def _venue_rows(root: Path, stream: str, *, limit: int) -> list[dict]:
             if conn is not None:
                 conn.close()
         for row in fetched:
+            market_id = str(row["market_id"])
+            exchange_time = str(row["exchange_time"])
             try:
+                raw_flags = json.loads(row["quality_flags_json"])
+                if not isinstance(raw_flags, list) or any(
+                    not isinstance(flag, str) or not flag.strip()
+                    for flag in raw_flags
+                ):
+                    raise ValueError("invalid venue quality flags")
+                payload = decode_execution_cost_payload(row["payload_json"])
                 rows.append(
                     {
-                        "market_id": str(row["market_id"]),
-                        "exchange_time": str(row["exchange_time"]),
-                        "flags": tuple(json.loads(row["quality_flags_json"])),
-                        "payload": json.loads(row["payload_json"]),
+                        "market_id": market_id,
+                        "exchange_time": exchange_time,
+                        "flags": tuple(raw_flags),
+                        "payload": payload,
                     }
                 )
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-    return sorted(rows, key=lambda row: row["exchange_time"])
+            except (TypeError, ValueError, OverflowError):
+                rows.append(
+                    {
+                        "market_id": market_id,
+                        "exchange_time": exchange_time,
+                        "flags": ("invalid_event_envelope",),
+                        "payload": {},
+                    }
+                )
+    return sorted(rows, key=_venue_row_key)
 
 
 def build_ofi_report(
     root: str | Path, *, max_events: int = 5_000, max_windows: int = 500
 ) -> dict:
+    normalized_max_events = _positive_integer(max_events, "max_events")
+    normalized_max_windows = _positive_integer(max_windows, "max_windows")
     project = Path(root)
     depth_by_market: dict[str, list[dict]] = defaultdict(list)
-    for row in _venue_rows(project, "depth", limit=max_events):
+    for row in _venue_rows(project, "depth", limit=normalized_max_events):
         payload = row["payload"]
         bids, asks = payload.get("bids") or [], payload.get("asks") or []
         event_time = _utc_datetime(row["exchange_time"])
@@ -623,25 +818,62 @@ def build_ofi_report(
         depth_by_market[row["market_id"]].append(observation)
     trades_by_market: dict[str, list[dict]] = defaultdict(list)
     seen_trades = set()
-    for row in _venue_rows(project, "trades", limit=max_events):
-        for trade in (row["payload"].get("trades") or []):
+    for row in _venue_rows(project, "trades", limit=normalized_max_events):
+        if row["flags"]:
+            continue
+        payload = row["payload"]
+        trade_rows = payload.get("trades") if isinstance(payload, dict) else None
+        if not isinstance(trade_rows, (list, tuple)):
+            continue
+        for trade in trade_rows:
+            if not isinstance(trade, dict):
+                continue
+            timestamp = _finite(trade.get("timestamp"))
+            price = _finite(trade.get("price"))
+            amount = _finite(trade.get("amount"))
+            side = (
+                trade.get("side").strip().lower()
+                if isinstance(trade.get("side"), str)
+                else ""
+            )
+            if (
+                timestamp is None
+                or timestamp <= 0.0
+                or not timestamp.is_integer()
+                or price is None
+                or price <= 0.0
+                or amount is None
+                or amount <= 0.0
+                or side not in {"buy", "sell"}
+            ):
+                continue
+            try:
+                event_time = datetime.fromtimestamp(
+                    timestamp / 1000.0, tz=timezone.utc
+                )
+            except (OverflowError, OSError, ValueError):
+                continue
+            trade_id = (
+                trade.get("id").strip()
+                if isinstance(trade.get("id"), str)
+                else ""
+            )
             key = (
-                row["market_id"], str(trade.get("id") or ""),
-                trade.get("timestamp"), trade.get("price"), trade.get("amount"),
+                (row["market_id"], "id", trade_id)
+                if trade_id
+                else (
+                    row["market_id"], "fallback",
+                    timestamp, price, amount, side,
+                )
             )
             if key in seen_trades:
                 continue
             seen_trades.add(key)
-            timestamp = _finite(trade.get("timestamp"))
-            if timestamp is None or timestamp <= 0.0:
-                continue
             trades_by_market[row["market_id"]].append(
                 {
-                    "event_time": datetime.fromtimestamp(
-                        timestamp / 1000.0, tz=timezone.utc
-                    ),
-                    "side": trade.get("side"),
-                    "amount": trade.get("amount"),
+                    "event_time": event_time,
+                    "side": side,
+                    "amount": amount,
                 }
             )
     windows = []
@@ -675,7 +907,7 @@ def build_ofi_report(
                 }
             )
     windows.sort(key=lambda item: item["feature_cutoff"])
-    windows = windows[-max(1, int(max_windows)) :]
+    windows = windows[-normalized_max_windows:]
     return {
         "windows": len(windows),
         "promotable_windows": sum(bool(row["promotable"]) for row in windows),
@@ -696,21 +928,71 @@ def build_carry_preview(
     exit_slippage_bps_per_leg: float = 2.0,
     limit: int = 20,
 ) -> dict:
-    overview = _venue_rows(Path(root), "overview", limit=1)
+    normalized_limit = _positive_integer(limit, "limit")
+    normalized_notional = _positive_number(notional_usdt, "notional_usdt")
+    normalized_periods = _positive_number(
+        expected_funding_periods, "expected_funding_periods"
+    )
+    normalized_taker_fee = _nonnegative_number(
+        taker_fee_rate, "taker_fee_rate"
+    )
+    normalized_maker_fee = _nonnegative_number(
+        maker_fee_rate, "maker_fee_rate"
+    )
+    normalized_entry_slippage = _nonnegative_number(
+        entry_slippage_bps_per_leg, "entry_slippage_bps_per_leg"
+    )
+    normalized_exit_slippage = _nonnegative_number(
+        exit_slippage_bps_per_leg, "exit_slippage_bps_per_leg"
+    )
+    if expected_funding_periods_by_market is None:
+        normalized_periods_by_market = {}
+    elif not isinstance(expected_funding_periods_by_market, Mapping):
+        raise ValueError(
+            "expected_funding_periods_by_market must be a mapping"
+        )
+    else:
+        normalized_periods_by_market = {}
+        for market_id, periods in expected_funding_periods_by_market.items():
+            if (
+                not isinstance(market_id, str)
+                or not market_id.strip()
+                or market_id != market_id.strip()
+            ):
+                raise ValueError(
+                    "expected_funding_periods_by_market keys must be "
+                    "non-empty strings"
+                )
+            normalized_periods_by_market[market_id] = _positive_number(
+                periods, "expected_funding_periods_by_market"
+            )
+    overview = [
+        row
+        for row in _venue_rows(Path(root), "overview", limit=100)
+        if not row["flags"]
+    ]
     if not overview:
         return {"candidates": 0, "accepted": 0, "rows": [], "simulation_only": True}
-    markets = overview[-1]["payload"].get("markets") or {}
+    markets = {}
+    for row in reversed(overview):
+        payload = row["payload"]
+        candidate = payload.get("markets") if isinstance(payload, dict) else None
+        if isinstance(candidate, dict):
+            markets = candidate
+            break
     engine = CarryEngine()
     previews = []
     for market_id, market in markets.items():
-        funding = _finite((market or {}).get("funding_rate"))
+        if not isinstance(market, Mapping):
+            continue
+        funding = _finite(market.get("funding_rate"))
         if funding is None or funding <= 0.0:
             continue
-        if (market or {}).get("spot_available") is not True:
+        if market.get("spot_available") is not True:
             previews.append(
                 {
                     "market_id": str(market_id),
-                    "symbol": (market or {}).get("symbol"),
+                    "symbol": market.get("symbol"),
                     "funding_rate": funding,
                     "state": "REJECTED",
                     "reason": "spot market availability not verified",
@@ -718,25 +1000,23 @@ def build_carry_preview(
                 }
             )
             continue
-        market_periods = float(
-            (expected_funding_periods_by_market or {}).get(
-                str(market_id), expected_funding_periods
-            )
+        market_periods = normalized_periods_by_market.get(
+            str(market_id), normalized_periods
         )
         terms = CarryTerms(
-            notional_usdt=float(notional_usdt),
+            notional_usdt=normalized_notional,
             expected_funding_rate=funding,
-            taker_fee_rate=float(taker_fee_rate),
-            maker_fee_rate=float(maker_fee_rate),
+            taker_fee_rate=normalized_taker_fee,
+            maker_fee_rate=normalized_maker_fee,
             expected_funding_periods=market_periods,
-            entry_slippage_bps_per_leg=float(entry_slippage_bps_per_leg),
-            exit_slippage_bps_per_leg=float(exit_slippage_bps_per_leg),
+            entry_slippage_bps_per_leg=normalized_entry_slippage,
+            exit_slippage_bps_per_leg=normalized_exit_slippage,
         )
         campaign = engine.start(f"preview-{market_id}", terms)
         previews.append(
             {
                 "market_id": str(market_id),
-                "symbol": (market or {}).get("symbol"),
+                "symbol": market.get("symbol"),
                 "funding_rate": funding,
                 "expected_funding_periods": market_periods,
                 "state": campaign.state.value,
@@ -745,7 +1025,7 @@ def build_carry_preview(
             }
         )
     previews.sort(key=lambda row: row["projected_net_pnl"], reverse=True)
-    previews = previews[: max(1, int(limit))]
+    previews = previews[:normalized_limit]
     return {
         "candidates": len(previews),
         "accepted": sum(row["state"] == "CAPITAL_RESERVED" for row in previews),
@@ -799,12 +1079,18 @@ def build_observation_readiness(
         raise ValueError("unsupported bot")
     if normalized_mode not in {"LIVE", "SIM"}:
         raise ValueError("mode must be LIVE or SIM")
-    required_days = max(1, int(minimum_observed_days))
-    required_regimes = max(1, int(minimum_regimes))
+    required_days = _positive_integer(
+        minimum_observed_days, "minimum_observed_days"
+    )
+    required_regimes = _positive_integer(minimum_regimes, "minimum_regimes")
+    diagnostics: Counter = Counter()
     candidate_times = sorted(
         event["candidate_time"]
         for event in _candidate_events(
-            project, normalized_bot, normalized_mode
+            project,
+            normalized_bot,
+            normalized_mode,
+            diagnostics=diagnostics,
         ).values()
         if isinstance(event.get("candidate_time"), datetime)
     )
@@ -851,6 +1137,9 @@ def build_observation_readiness(
         "minimum_observed_days": required_days,
         "regimes": sorted(regimes),
         "minimum_regimes": required_regimes,
+        "candidate_records_rejected": diagnostics[
+            "candidate_records_rejected"
+        ],
         "days_ready": days_ready,
         "regimes_ready": regimes_ready,
         "ready": days_ready and regimes_ready,
@@ -907,6 +1196,9 @@ def build_research_status(
     minimum_cost_samples: int = 50,
     minimum_expectancy_rows: int = 1_200,
 ) -> dict:
+    required_expectancy_rows = _positive_integer(
+        minimum_expectancy_rows, "minimum_expectancy_rows"
+    )
     project = Path(root)
     expectancy = {}
     for bot in EXPECTANCY_FEATURES:
@@ -917,15 +1209,15 @@ def build_research_status(
                 project,
                 bot=bot,
                 mode=mode,
-                minimum_rows=minimum_expectancy_rows,
+                minimum_rows=required_expectancy_rows,
             )
             expectancy[bot][mode] = {
                 "candidate_events": len(events),
                 "closed_labels": len(labels),
                 "schema_version": selected,
                 "closed_labels_by_schema": schema_counts,
-                "minimum_rows": int(minimum_expectancy_rows),
-                "ready": len(labels) >= int(minimum_expectancy_rows),
+                "minimum_rows": required_expectancy_rows,
+                "ready": len(labels) >= required_expectancy_rows,
                 "observation_readiness": build_observation_readiness(
                     project, bot=bot, mode=mode
                 ),
@@ -965,15 +1257,21 @@ def train_expectancy_candidate(
     schemas = EXPECTANCY_FEATURE_SCHEMAS.get(normalized_bot)
     if schemas is None:
         raise ValueError("unsupported bot")
+    normalized_min_train, normalized_test_size = normalize_walk_forward_sizes(
+        min_train, test_size
+    )
+    normalized_purge_days = _nonnegative_integer(purge_days, "purge_days")
+    if normalized_purge_days > timedelta.max.days:
+        raise ValueError("purge_days exceeds timedelta range")
     if schema_version is None:
         selected_schema, feature_order, labels, schema_counts = select_expectancy_schema(
             project,
             bot=normalized_bot,
             mode=normalized_mode,
-            minimum_rows=int(min_train) + int(test_size),
+            minimum_rows=normalized_min_train + normalized_test_size,
         )
     else:
-        selected_schema = int(schema_version)
+        selected_schema = _positive_integer(schema_version, "schema_version")
         feature_order = schemas.get(selected_schema)
         if feature_order is None:
             raise ValueError("unsupported expectancy schema version")
@@ -987,9 +1285,9 @@ def train_expectancy_candidate(
     result = expanding_walk_forward_fit(
         labels,
         feature_order=feature_order,
-        min_train=int(min_train),
-        test_size=int(test_size),
-        purge=timedelta(days=max(0, int(purge_days))),
+        min_train=normalized_min_train,
+        test_size=normalized_test_size,
+        purge=timedelta(days=normalized_purge_days),
     )
     candidate_dir = project / "data" / "research" / "expectancy"
     candidate_dir.mkdir(parents=True, exist_ok=True)
@@ -1029,10 +1327,14 @@ def check_promotion(
     minimum_samples: int,
     manual_live_approval: bool = False,
 ) -> dict:
+    try:
+        normalized_evidence = PromotionEvidence(**dict(evidence))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("promotion evidence is invalid") from exc
     decision = evaluate_promotion(
-        PromotionEvidence(**dict(evidence)),
-        minimum_samples=int(minimum_samples),
-        explicit_manual_live_approval=bool(manual_live_approval),
+        normalized_evidence,
+        minimum_samples=minimum_samples,
+        explicit_manual_live_approval=manual_live_approval,
     )
     return {
         "research_passed": decision.research_passed,
@@ -1051,15 +1353,10 @@ def register_experiment_trial(
     status: str,
 ) -> dict:
     """Explicitly append one immutable research trial; never changes trading."""
-    normalized_status = str(status).strip().upper()
-    if normalized_status not in {"PLANNED", "RUNNING", "REJECTED", "COMPLETE"}:
-        raise ValueError("unsupported experiment status")
-    if not str(trial_id).strip() or not str(experiment_name).strip():
-        raise ValueError("trial id and experiment name are required")
-    try:
-        encoded = json.dumps(params, sort_keys=True, allow_nan=False)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("experiment params must be finite JSON") from exc
+    trial_id, experiment_name, normalized_status = normalize_experiment_metadata(
+        trial_id, experiment_name, status
+    )
+    encoded = encode_experiment_params(params)
     db_path = Path(root) / "data" / "trading_bot.db"
     if not db_path.is_file():
         raise FileNotFoundError(db_path)
@@ -1074,8 +1371,8 @@ def register_experiment_trial(
             "(trial_id, experiment_name, params_json, status, created_at) "
             "VALUES (?,?,?,?,?)",
             (
-                str(trial_id),
-                str(experiment_name),
+                trial_id,
+                experiment_name,
                 encoded,
                 normalized_status,
                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -1091,8 +1388,8 @@ def register_experiment_trial(
     finally:
         conn.close()
     return {
-        "trial_id": str(trial_id),
-        "experiment_name": str(experiment_name),
+        "trial_id": trial_id,
+        "experiment_name": experiment_name,
         "status": normalized_status,
         "trading_changed": False,
     }

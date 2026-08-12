@@ -45,13 +45,39 @@ class SQLitePartitionWriter:
         self._lock = threading.Lock()
 
     @staticmethod
-    def _day(event: VenueEvent) -> str:
-        day = str(event.exchange_time)[:10]
+    def _parse_event_time(value) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if not text:
+            return None
         try:
-            datetime.strptime(day, "%Y-%m-%d")
+            parsed = datetime.fromisoformat(
+                text[:-1] + "+00:00" if text.endswith("Z") else text
+            )
         except ValueError:
-            return "unknown-date"
-        return day
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+
+    @classmethod
+    def _storage_exchange_time(cls, event: VenueEvent) -> tuple[str, bool]:
+        exchange_time = cls._parse_event_time(event.exchange_time)
+        received_time = cls._parse_event_time(event.received_time)
+        needs_fallback = exchange_time is None or (
+            received_time is not None
+            and exchange_time > received_time + timedelta(seconds=30)
+        )
+        if needs_fallback and received_time is not None:
+            return str(event.received_time), True
+        return str(event.exchange_time), needs_fallback
+
+    @classmethod
+    def _day(cls, event: VenueEvent) -> str:
+        storage_time, _fallback = cls._storage_exchange_time(event)
+        parsed = cls._parse_event_time(storage_time)
+        return parsed.strftime("%Y-%m-%d") if parsed is not None else "unknown-date"
 
     def _path(self, event: VenueEvent) -> Path:
         return self.root / event.kind / f"{self._day(event)}.sqlite3"
@@ -88,34 +114,60 @@ class SQLitePartitionWriter:
 
     def write(self, event: VenueEvent) -> Path:
         path = self._path(event)
+        exchange_time, clock_fallback = self._storage_exchange_time(event)
         payload = json.dumps(
             event.payload, sort_keys=True, separators=(",", ":"), allow_nan=False
         )
-        flags = json.dumps(event.quality_flags, separators=(",", ":"))
+        quality_flags = tuple(event.quality_flags)
+        if (
+            clock_fallback
+            and "storage_exchange_time_fallback" not in quality_flags
+        ):
+            quality_flags = (*quality_flags, "storage_exchange_time_fallback")
+        flags = json.dumps(quality_flags, separators=(",", ":"))
+        values = (
+            event.event_id,
+            event.market_id,
+            exchange_time,
+            event.received_time,
+            int(event.schema_version),
+            flags,
+            payload,
+        )
         with self._lock:
             connection = self._connection(path)
-            connection.execute(
-                """INSERT OR IGNORE INTO venue_events
-                   (event_id, market_id, exchange_time, received_time,
-                    schema_version, quality_flags_json, payload_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    event.event_id,
-                    event.market_id,
-                    event.exchange_time,
-                    event.received_time,
-                    int(event.schema_version),
-                    flags,
-                    payload,
-                ),
-            )
-            connection.commit()
+            try:
+                cursor = connection.execute(
+                    """INSERT OR IGNORE INTO venue_events
+                       (event_id, market_id, exchange_time, received_time,
+                        schema_version, quality_flags_json, payload_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    values,
+                )
+                if cursor.rowcount == 0:
+                    existing = connection.execute(
+                        """SELECT event_id, market_id, exchange_time,
+                                  received_time, schema_version,
+                                  quality_flags_json, payload_json
+                             FROM venue_events WHERE event_id=?""",
+                        (event.event_id,),
+                    ).fetchone()
+                    if existing is None or tuple(existing) != values:
+                        raise ValueError(
+                            "venue event id conflicts with persisted evidence"
+                        )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
         return path
 
     def _close_path(self, path: Path) -> None:
-        connection = self._connections.pop(path, None)
+        connection = self._connections.get(path)
         if connection is not None:
             connection.close()
+            if self._connections.get(path) is connection:
+                self._connections.pop(path, None)
 
     @staticmethod
     def _partition_date(path: Path) -> datetime | None:
@@ -127,11 +179,10 @@ class SQLitePartitionWriter:
             return None
 
     def _delete_partition(self, path: Path) -> None:
+        # Never unlink a partition whose live handle could not be closed.
+        # Retention will retry the registered handle on its next pass.
+        self._close_path(path)
         first_error: OSError | sqlite3.Error | None = None
-        try:
-            self._close_path(path)
-        except (OSError, sqlite3.Error) as exc:
-            first_error = exc
         for candidate in (
             path,
             Path(f"{path}-wal"),
@@ -244,18 +295,26 @@ class SQLitePartitionWriter:
             if first_cleanup_error is not None:
                 raise first_cleanup_error
 
-    def close(self) -> None:
+    def close(self) -> bool:
         with self._lock:
-            for connection in self._connections.values():
-                try:
-                    connection.close()
-                except Exception:
-                    pass
-            self._connections.clear()
+            for attempt in range(2):
+                failed = False
+                for path in list(self._connections):
+                    try:
+                        self._close_path(path)
+                    except Exception:
+                        failed = True
+                if not failed:
+                    return True
+                if attempt == 0:
+                    time.sleep(0.01)
+            return False
 
 
 class VenueRecorder:
     """Exchange-neutral overview, REST microstructure, and shadow L2 capture."""
+
+    CAPTURE_FAILURE_THRESHOLD = 3
 
     def __init__(
         self,
@@ -275,6 +334,7 @@ class VenueRecorder:
         l2_stale_after_ms: int = 5_000,
         l2_collector_factory=None,
         priority_loader=None,
+        health_callback=None,
     ) -> None:
         self.exchange = exchange
         self.writer = writer or SQLitePartitionWriter(
@@ -287,7 +347,9 @@ class VenueRecorder:
         self.micro_interval = max(1.0, float(micro_interval_seconds))
         self.overview_interval = max(self.micro_interval, float(overview_interval_seconds))
         self.log_event = log_event
+        self._health_callback = health_callback
         self._priority_loader = priority_loader
+        self._last_priority_symbols: list[str] = []
         self._universe: list[str] = []
         self._cursor = 0
         self._next_retention_check = 0.0
@@ -343,7 +405,7 @@ class VenueRecorder:
                 requested = self._priority_loader(self.max_symbols)
         except Exception as exc:
             self._log_gap("priority load gap", exc)
-            return []
+            return list(self._last_priority_symbols)
         markets = getattr(self.exchange, "markets", None) or {}
         resolved = []
         for raw in requested or ():
@@ -375,6 +437,7 @@ class VenueRecorder:
             resolved.append(symbol)
             if len(resolved) >= self.max_symbols:
                 break
+        self._last_priority_symbols = list(resolved)
         return resolved
 
     def _log_gap(self, context: str, exc: Exception) -> None:
@@ -386,6 +449,14 @@ class VenueRecorder:
             )
         except Exception:
             pass
+
+    def _report_health(self, payload: dict) -> None:
+        if self._health_callback is None:
+            return
+        try:
+            self._health_callback(dict(payload))
+        except Exception as exc:
+            self._log_gap("health callback gap", exc)
 
     @staticmethod
     def _require_api_budget(endpoint: str) -> None:
@@ -408,11 +479,15 @@ class VenueRecorder:
         raw_event_clock = exchange_ms if exchange_ms is not None else ended_ms
         invalid_exchange_clock = False
         try:
-            if isinstance(raw_event_clock, bool):
-                raise ValueError("boolean event clock")
-            event_clock = int(raw_event_clock)
-            if event_clock <= 0 or event_clock > int(ended_ms) + 86_400_000:
+            event_clock_value = self._finite_number_or_none(raw_event_clock)
+            if (
+                event_clock_value is None
+                or event_clock_value <= 0
+                or not event_clock_value.is_integer()
+                or event_clock_value > int(ended_ms) + 86_400_000
+            ):
                 raise ValueError("event clock outside accepted range")
+            event_clock = int(event_clock_value)
             exchange_time = datetime.fromtimestamp(
                 event_clock / 1000, tz=timezone.utc
             ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -428,7 +503,10 @@ class VenueRecorder:
         digest = hashlib.blake2s(digest_input.encode("utf-8"), digest_size=8).hexdigest()
         return self.writer.write(
             VenueEvent(
-                event_id=f"{kind}:{market_id}:{event_clock}:{digest}",
+                event_id=(
+                    f"{kind}:{market_id}:{event_clock}:"
+                    f"{started_ms}:{ended_ms}:{digest}"
+                ),
                 kind=kind,
                 market_id=market_id,
                 exchange_time=exchange_time,
@@ -484,6 +562,12 @@ class VenueRecorder:
             symbol
             for _volume, symbol, _ticker in candidates
             if not self._is_noncrypto_swap(symbol)
+            and (
+                (getattr(self.exchange, "markets", None) or {})
+                .get(symbol, {})
+                .get("active")
+                is not False
+            )
         ]
         priority_universe = self._priority_symbols()
         self._universe = list(
@@ -532,11 +616,16 @@ class VenueRecorder:
             overview_flags.append("invalid_tickers_payload")
         if invalid_numeric_payload:
             overview_flags.append("invalid_numeric_payload")
+        latest_timestamp, invalid_exchange_timestamp = self._latest_timestamp(
+            candidates, ended
+        )
+        if invalid_exchange_timestamp:
+            overview_flags.append("invalid_exchange_timestamp")
         self._write_event(
             "overview",
             "",
             {"markets": markets_payload},
-            exchange_ms=self._latest_timestamp(candidates, ended),
+            exchange_ms=latest_timestamp,
             started_ms=started,
             ended_ms=ended,
             flags=tuple(overview_flags),
@@ -544,20 +633,24 @@ class VenueRecorder:
         )
         return len(candidates)
 
-    @staticmethod
-    def _latest_timestamp(candidates, fallback: int) -> int:
+    @classmethod
+    def _latest_timestamp(cls, candidates, fallback: int) -> tuple[int, bool]:
         timestamps = []
+        invalid_timestamp = False
         for _volume, _symbol, ticker in candidates:
             value = ticker.get("timestamp") if isinstance(ticker, dict) else None
-            if value is None or isinstance(value, bool):
+            if value is None:
                 continue
-            try:
-                timestamp = int(value)
-            except (TypeError, ValueError, OverflowError):
+            timestamp_value = cls._finite_number_or_none(value)
+            if (
+                timestamp_value is None
+                or timestamp_value <= 0
+                or not timestamp_value.is_integer()
+            ):
+                invalid_timestamp = True
                 continue
-            if timestamp > 0:
-                timestamps.append(timestamp)
-        return max(timestamps, default=int(fallback))
+            timestamps.append(int(timestamp_value))
+        return max(timestamps, default=int(fallback)), invalid_timestamp
 
     def capture_microstructure(self, symbol: str) -> tuple[Path, Path]:
         self._require_api_budget("venue_recorder_fetch_order_book")
@@ -581,11 +674,14 @@ class VenueRecorder:
                 book.get("timestamp") if isinstance(book, dict) else None
             )
             timestamp = self._finite_number_or_none(raw_timestamp)
-            if (
+            invalid_depth_timestamp = raw_timestamp is not None and (
                 timestamp is None
                 or timestamp <= 0
+                or not timestamp.is_integer()
                 or timestamp > ended_book + 86_400_000
-            ):
+            )
+            if invalid_depth_timestamp:
+                flags.append("invalid_exchange_timestamp")
                 timestamp = None
             normalized_book = {
                 "bids": [],
@@ -611,11 +707,20 @@ class VenueRecorder:
         trades = self.exchange.fetch_trades(symbol, limit=100)
         ended_trades = int(time.time() * 1000)
         normalized = []
-        seen = set()
+        seen: dict[tuple, tuple] = {}
         out_of_order = False
-        invalid_trade_payload = False
+        invalid_trade_payload = not isinstance(trades, (list, tuple))
+        truncated_trade_payload = False
+        conflicting_trade_id = False
         last_ts = -1
-        for trade in trades or []:
+        if isinstance(trades, (list, tuple)):
+            trade_rows = trades[:100]
+            if len(trades) > 100:
+                invalid_trade_payload = True
+                truncated_trade_payload = True
+        else:
+            trade_rows = ()
+        for trade in trade_rows:
             if not isinstance(trade, dict):
                 invalid_trade_payload = True
                 continue
@@ -632,6 +737,7 @@ class VenueRecorder:
             if (
                 timestamp_value is None
                 or timestamp_value <= 0
+                or not timestamp_value.is_integer()
                 or timestamp_value > ended_trades + 86_400_000
                 or price is None
                 or price <= 0
@@ -649,10 +755,19 @@ class VenueRecorder:
             if side not in {"buy", "sell"}:
                 side = None
                 invalid_trade_payload = True
-            dedup_key = trade_id or f"{timestamp}:{price}:{amount}"
-            if dedup_key in seen:
+            evidence = (timestamp, price, amount, side)
+            dedup_key = (
+                ("id", trade_id)
+                if trade_id is not None
+                else ("fallback", *evidence)
+            )
+            previous = seen.get(dedup_key)
+            if previous is not None:
+                if trade_id is not None and previous != evidence:
+                    invalid_trade_payload = True
+                    conflicting_trade_id = True
                 continue
-            seen.add(dedup_key)
+            seen[dedup_key] = evidence
             if timestamp < last_ts:
                 out_of_order = True
             last_ts = max(last_ts, timestamp)
@@ -670,6 +785,10 @@ class VenueRecorder:
             trade_flags.append("out_of_order")
         if invalid_trade_payload:
             trade_flags.append("invalid_trade_payload")
+        if conflicting_trade_id:
+            trade_flags.append("conflicting_trade_id")
+        if truncated_trade_payload:
+            trade_flags.append("truncated_trade_payload")
         trades_path = self._write_event(
             "trades",
             symbol,
@@ -684,42 +803,254 @@ class VenueRecorder:
     def run(self, shutdown_event: threading.Event) -> None:
         next_overview = 0.0
         l2_started = False
+        next_l2_start_attempt = 0.0
+        capture_errors_consecutive = 0
+        capture_errors_total = 0
+        captures_total = 0
+        overview_captures_total = 0
+        overview_errors_total = 0
+        microstructure_captures_total = 0
+        microstructure_errors_total = 0
+        last_capture_success_wall_ts = None
+        last_capture_error = ""
+        last_overview_error = ""
+        last_microstructure_error = ""
+        retention_ok = True
+        retention_errors_total = 0
+        last_retention_error = ""
+        l2_errors_consecutive = 0
+        l2_errors_total = 0
+        last_l2_error = ""
+
+        def note_l2_failure(exc: Exception) -> None:
+            nonlocal l2_errors_consecutive, l2_errors_total, last_l2_error
+            l2_errors_consecutive += 1
+            l2_errors_total += 1
+            last_l2_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+
+        def note_l2_success() -> None:
+            nonlocal l2_errors_consecutive, last_l2_error
+            l2_errors_consecutive = 0
+            last_l2_error = ""
+
         try:
             if self._l2_collector is not None:
                 try:
                     self._l2_collector.start(shutdown_event)
                     l2_started = True
+                    note_l2_success()
                 except Exception as exc:
+                    note_l2_failure(exc)
+                    next_l2_start_attempt = time.monotonic() + 30.0
                     self._log_gap("L2 start gap", exc)
             while not shutdown_event.is_set():
                 now = time.monotonic()
+                if self._l2_collector is not None:
+                    alive_marker = getattr(
+                        self._l2_collector, "is_alive", None
+                    )
+                    if l2_started and alive_marker is not None:
+                        alive_error = None
+                        try:
+                            collector_alive = bool(
+                                alive_marker()
+                                if callable(alive_marker)
+                                else alive_marker
+                            )
+                        except Exception as exc:
+                            collector_alive = False
+                            alive_error = exc
+                        if not collector_alive:
+                            l2_started = False
+                            stopped_error = (
+                                alive_error
+                                or RuntimeError(
+                                    "collector thread is not alive"
+                                )
+                            )
+                            note_l2_failure(stopped_error)
+                            self._log_gap("L2 collector stopped", stopped_error)
+                    if (
+                        not l2_started
+                        and now >= next_l2_start_attempt
+                        and not shutdown_event.is_set()
+                    ):
+                        try:
+                            self._l2_collector.start(shutdown_event)
+                        except Exception as exc:
+                            l2_started = False
+                            note_l2_failure(exc)
+                            next_l2_start_attempt = now + 30.0
+                            self._log_gap("L2 restart gap", exc)
+                        else:
+                            l2_started = True
+                            note_l2_success()
+                            # If this replacement dies immediately, do not
+                            # create one daemon thread per recorder cycle.
+                            next_l2_start_attempt = now + 30.0
+                            if self._universe:
+                                try:
+                                    self._l2_collector.update_symbols(
+                                        self._universe
+                                    )
+                                except Exception as exc:
+                                    note_l2_failure(exc)
+                                    self._log_gap(
+                                        "L2 symbol update gap", exc
+                                    )
+                                else:
+                                    note_l2_success()
                 if now >= self._next_retention_check:
                     retry_seconds = 3600.0
                     try:
                         enforce = getattr(self.writer, "enforce_retention", None)
                         if callable(enforce):
                             enforce()
+                        retention_ok = True
+                        last_retention_error = ""
                     except Exception as exc:
                         retry_seconds = 300.0
+                        retention_ok = False
+                        retention_errors_total += 1
+                        last_retention_error = (
+                            f"{type(exc).__name__}: {str(exc)[:160]}"
+                        )
                         self._log_gap("retention gap", exc)
                     finally:
                         self._next_retention_check = now + retry_seconds
                 try:
+                    overview_error = None
                     if now >= next_overview or not self._universe:
-                        self.capture_overview()
-                        next_overview = now + self.overview_interval
-                        if l2_started:
-                            try:
-                                self._l2_collector.update_symbols(self._universe)
-                            except Exception as exc:
-                                l2_started = False
-                                self._log_gap("L2 symbol update gap", exc)
+                        try:
+                            self.capture_overview()
+                        except Exception as exc:
+                            overview_error = exc
+                            overview_errors_total += 1
+                            last_overview_error = (
+                                f"{type(exc).__name__}: {str(exc)[:160]}"
+                            )
+                        else:
+                            overview_captures_total += 1
+                            last_overview_error = ""
+                            next_overview = now + self.overview_interval
+                            if l2_started:
+                                try:
+                                    self._l2_collector.update_symbols(self._universe)
+                                except Exception as exc:
+                                    note_l2_failure(exc)
+                                    self._log_gap("L2 symbol update gap", exc)
+                                else:
+                                    note_l2_success()
+                    micro_error = None
                     if self._universe:
                         symbol = self._universe[self._cursor % len(self._universe)]
                         self._cursor += 1
-                        self.capture_microstructure(symbol)
+                        try:
+                            self.capture_microstructure(symbol)
+                        except Exception as exc:
+                            micro_error = exc
+                            microstructure_errors_total += 1
+                            last_microstructure_error = (
+                                f"{type(exc).__name__}: {str(exc)[:160]}"
+                            )
+                        else:
+                            microstructure_captures_total += 1
+                            last_microstructure_error = ""
+                    if overview_error is not None:
+                        if micro_error is not None:
+                            self._log_gap(
+                                "microstructure gap after overview failure",
+                                micro_error,
+                            )
+                        raise overview_error
+                    if micro_error is not None:
+                        raise micro_error
+                    if not self._universe:
+                        raise RuntimeError(
+                            "venue recorder capture universe is empty"
+                        )
                 except Exception as exc:
+                    capture_errors_consecutive += 1
+                    capture_errors_total += 1
+                    last_capture_error = (
+                        f"{type(exc).__name__}: {str(exc)[:160]}"
+                    )
                     self._log_gap("capture gap", exc)
+                else:
+                    capture_errors_consecutive = 0
+                    captures_total += 1
+                    last_capture_success_wall_ts = time.time()
+                    last_capture_error = ""
+                rest_ok = (
+                    capture_errors_consecutive
+                    < self.CAPTURE_FAILURE_THRESHOLD
+                )
+                l2_enabled = self._l2_collector is not None
+                l2_data_healthy = not l2_enabled
+                if l2_enabled:
+                    healthy_marker = getattr(
+                        self._l2_collector, "is_healthy", None
+                    )
+                    if healthy_marker is None:
+                        l2_data_healthy = l2_started
+                    else:
+                        try:
+                            l2_data_healthy = bool(
+                                healthy_marker()
+                                if callable(healthy_marker)
+                                else healthy_marker
+                            )
+                        except Exception as exc:
+                            l2_data_healthy = False
+                            note_l2_failure(exc)
+                            self._log_gap("L2 health read gap", exc)
+                l2_ok = not l2_enabled or (
+                    l2_started
+                    and l2_errors_consecutive == 0
+                    and l2_data_healthy
+                )
+                reason = (
+                    "capture_error"
+                    if not rest_ok
+                    else "l2_unavailable"
+                    if not l2_ok
+                    else "retention_error"
+                    if not retention_ok
+                    else ""
+                )
+                self._report_health({
+                    "ok": rest_ok and l2_ok and retention_ok,
+                    "reason": reason,
+                    "rest_ok": rest_ok,
+                    "l2_enabled": l2_enabled,
+                    "l2_ok": l2_ok,
+                    "l2_data_healthy": l2_data_healthy,
+                    "consecutive_capture_errors": capture_errors_consecutive,
+                    "capture_errors_total": capture_errors_total,
+                    "captures_total": captures_total,
+                    "overview_captures_total": overview_captures_total,
+                    "overview_errors_total": overview_errors_total,
+                    "microstructure_captures_total": (
+                        microstructure_captures_total
+                    ),
+                    "microstructure_errors_total": (
+                        microstructure_errors_total
+                    ),
+                    "last_capture_success_wall_ts": (
+                        last_capture_success_wall_ts
+                    ),
+                    "last_capture_error": last_capture_error,
+                    "last_overview_error": last_overview_error,
+                    "last_microstructure_error": last_microstructure_error,
+                    "retention_ok": retention_ok,
+                    "retention_errors_total": retention_errors_total,
+                    "last_retention_error": last_retention_error,
+                    "l2_consecutive_errors": l2_errors_consecutive,
+                    "l2_errors_total": l2_errors_total,
+                    "last_l2_error": last_l2_error,
+                    "last_poll_monotonic": time.monotonic(),
+                    "last_poll_wall_ts": time.time(),
+                })
                 shutdown_event.wait(self.micro_interval)
         finally:
             if self._l2_collector is not None:
@@ -730,7 +1061,11 @@ class VenueRecorder:
             close = getattr(self.writer, "close", None)
             if callable(close):
                 try:
-                    close()
+                    closed = close()
+                    if closed is False:
+                        raise RuntimeError(
+                            "partition writer connections remain open"
+                        )
                 except Exception as exc:
                     self._log_gap("writer close gap", exc)
 

@@ -19,6 +19,7 @@ if __package__ in {None, ""}:
 from tools.release_requirements import (
     RELEASE_TOOL_FILES,
     REQUIRED_MANIFEST_FILES,
+    REQUIRED_RELEASE_DIRS,
     REQUIRED_RELEASE_ITEMS,
 )
 from tools.update_deploy_manifest import build_manifest
@@ -29,6 +30,7 @@ FORBIDDEN_DIRS = {
     ".pytest_cache",
     ".pytest_tmp_review",
     ".ruff_cache",
+    ".venv",
     "__pycache__",
     "backups",
     "data",
@@ -40,6 +42,7 @@ FORBIDDEN_DIRS = {
     "Output",
     "installer",
     "tests",
+    "venv",
     "docs",
     "BOT ADDITIONAL",
 }
@@ -65,12 +68,18 @@ FORBIDDEN_SUFFIXES = {
     ".sqlite3-wal",
 }
 FORBIDDEN_NAMES = {
+    ".update_synced.json",
     ".env",
     ".gitignore",
+    "AGENTS.md",
+    "PROJECT_MEMORY.md",
     "TODO.md",
     "README_GITHUB.md",
+    "cooldown.json",
+    "cooldown.json.lock",
     "pytest.ini",
     "structured.jsonl",
+    "structured.jsonl.rotation.lock",
 }
 FORBIDDEN_REL_PATHS = {
     "bot_config.json",
@@ -83,6 +92,19 @@ REQUIRED = REQUIRED_RELEASE_ITEMS
 _SHA256_REQUIREMENT_HASH_RE = re.compile(r"--hash=sha256:[0-9a-fA-F]{64}(?:\s|$)")
 RELEASE_METADATA_MAX_BYTES = 4 * 1024 * 1024
 RELEASE_TEXT_MAX_BYTES = 4 * 1024 * 1024
+RELEASE_TEXT_SUFFIXES = {
+    ".bat",
+    ".iss",
+    ".json",
+    ".md",
+    ".py",
+    ".pyw",
+    ".txt",
+    ".vbs",
+}
+RELEASE_TEXT_REL_PATHS = {"config/github_known_hosts"}
+RUNTIME_MODULE_ROOTS = ("bot_utils", "bots", "core", "trading", "launcher")
+REFERENCE_OPTIONAL_RELEASE_PATHS = {"UPDATE_SETUP.md", "update.bat"}
 
 
 def _sha256(path: Path) -> str:
@@ -288,7 +310,85 @@ def _is_forbidden_release_artifact(path: Path, root: Path) -> str | None:
     return None
 
 
-def check_release(source: Path, strict_release_name: bool = False) -> tuple[list[str], list[str]]:
+def _runtime_python_inventory(root: Path) -> set[str]:
+    return set(_runtime_python_files(root))
+
+
+def _runtime_python_files(root: Path) -> dict[str, Path]:
+    files: dict[str, Path] = {}
+    for directory in RUNTIME_MODULE_ROOTS:
+        module_root = root / directory
+        if not module_root.is_dir():
+            continue
+        for path in module_root.rglob("*.py"):
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, ValueError):
+                continue
+            files[path.relative_to(root).as_posix()] = resolved
+    return files
+
+
+def _runtime_inventory_errors(root: Path, reference: Path) -> list[str]:
+    release_files = _runtime_python_files(root)
+    reference_files = _runtime_python_files(reference)
+    release_modules = set(release_files)
+    reference_modules = set(reference_files)
+    errors = [
+        f"release missing reference runtime module: {rel}"
+        for rel in sorted(reference_modules - release_modules)
+    ]
+    errors.extend(
+        f"release has stale runtime module absent from reference: {rel}"
+        for rel in sorted(release_modules - reference_modules)
+    )
+    for rel in sorted(release_modules & reference_modules):
+        try:
+            release_hash = _sha256(release_files[rel])
+            reference_hash = _sha256(reference_files[rel])
+        except OSError as exc:
+            errors.append(f"cannot hash reference runtime module {rel}: {exc}")
+            continue
+        if release_hash != reference_hash:
+            errors.append(f"release runtime module differs from reference: {rel}")
+    return errors
+
+
+def _release_payload_reference_errors(root: Path, reference: Path) -> list[str]:
+    errors: list[str] = []
+    runtime_roots = {part.lower() for part in RUNTIME_MODULE_ROOTS}
+    for item in build_manifest(root).get("files", []):
+        rel = str(item["path"]).replace("\\", "/")
+        parts = rel.split("/")
+        if rel in REFERENCE_OPTIONAL_RELEASE_PATHS:
+            continue
+        if (
+            len(parts) > 1
+            and parts[0].lower() in runtime_roots
+            and rel.lower().endswith(".py")
+        ):
+            continue
+        reference_path = reference / rel
+        resolved = _resolved_within_root(reference_path, reference)
+        if resolved is None or not resolved.is_file():
+            errors.append(f"release payload absent from reference: {rel}")
+            continue
+        try:
+            reference_hash = _sha256(resolved)
+        except OSError as exc:
+            errors.append(f"cannot hash reference payload {rel}: {exc}")
+            continue
+        if item.get("sha256") != reference_hash:
+            errors.append(f"release payload differs from reference: {rel}")
+    return errors
+
+
+def check_release(
+    source: Path,
+    strict_release_name: bool = False,
+    reference_source: Path | None = None,
+) -> tuple[list[str], list[str]]:
     root = source.resolve()
     errors: list[str] = []
     warnings: list[str] = []
@@ -296,9 +396,27 @@ def check_release(source: Path, strict_release_name: bool = False) -> tuple[list
     if strict_release_name and not root.name.endswith("_Release"):
         errors.append(f"release source must be *_Release, got {root.name}")
 
+    if reference_source is not None:
+        reference = reference_source.resolve()
+        if not reference.is_dir():
+            errors.append(f"reference source is not a directory: {reference}")
+        elif reference == root:
+            errors.append("reference source must differ from release source")
+        elif reference.name.lower().endswith("_release"):
+            errors.append(
+                f"reference source must be a DEV tree, got {reference.name}"
+            )
+        else:
+            errors.extend(_runtime_inventory_errors(root, reference))
+            errors.extend(_release_payload_reference_errors(root, reference))
+
     for rel in REQUIRED:
-        if not (root / rel).exists():
-            errors.append(f"missing required release item: {rel}")
+        required_path = root / rel
+        if rel in REQUIRED_RELEASE_DIRS:
+            if not required_path.is_dir():
+                errors.append(f"missing required release directory: {rel}")
+        elif not required_path.is_file():
+            errors.append(f"missing required release file: {rel}")
 
     requirements_path = root / "requirements.lock.txt"
     if requirements_path.exists():
@@ -447,7 +565,10 @@ def check_release(source: Path, strict_release_name: bool = False) -> tuple[list
         if _is_backup_temp_artifact(path):
             errors.append(f"forbidden backup/temp artifact in release: {rel}")
             continue
-        if path.suffix.lower() in {".py", ".bat", ".iss", ".md", ".txt", ".json"}:
+        if (
+            path.suffix.lower() in RELEASE_TEXT_SUFFIXES
+            or rel_posix.lower() in RELEASE_TEXT_REL_PATHS
+        ):
             try:
                 text = _read_release_text(
                     path,
@@ -474,9 +595,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source", default=".")
     parser.add_argument("--strict-release-name", action="store_true")
     parser.add_argument("--simulate-copy", action="store_true")
+    parser.add_argument("--reference-source")
     args = parser.parse_args(argv)
     source = Path(args.source).resolve()
-    errors, warnings = check_release(source, strict_release_name=args.strict_release_name)
+    reference = (
+        Path(args.reference_source).resolve() if args.reference_source else None
+    )
+    errors, warnings = check_release(
+        source,
+        strict_release_name=args.strict_release_name,
+        reference_source=reference,
+    )
 
     if args.simulate_copy and not errors:
         with tempfile.TemporaryDirectory(prefix="obsidian_release_check_") as tmp:
@@ -485,13 +614,18 @@ def main(argv: list[str] | None = None) -> int:
                 source,
                 dst,
                 ignore=shutil.ignore_patterns(
-                    ".git", ".pytest_cache", ".ruff_cache", "__pycache__",
+                    ".git", ".pytest_cache", ".ruff_cache", ".venv",
+                    "venv", "__pycache__",
                     "data", "logs",
                     "optimizer_results", "research_kitraining", "research_run2",
                     "staging", "Output", "tests", "backups",
                 ),
             )
-            copied_errors, copied_warnings = check_release(dst, strict_release_name=False)
+            copied_errors, copied_warnings = check_release(
+                dst,
+                strict_release_name=False,
+                reference_source=reference,
+            )
             errors.extend(f"copy: {e}" for e in copied_errors)
             warnings.extend(f"copy: {w}" for w in copied_warnings)
 

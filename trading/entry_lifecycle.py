@@ -1,6 +1,7 @@
-"""Fail-soft correlation telemetry for one entry intent.
+"""Entry-intent identity plus fail-soft lifecycle telemetry.
 
-The identifier is observational only. Trading paths must never depend on it.
+The identifier is authoritative for journals, claims, and client-order IDs and
+must never be empty. Telemetry emission remains observational and fail-soft.
 """
 from __future__ import annotations
 
@@ -13,8 +14,31 @@ from typing import Any
 _TERMINAL_STAGES = frozenset((
     "opened", "blocked", "aborted", "order_failed", "state_failed",
 ))
+_MAX_TRACKED_ENTRIES = 4096
+_MAX_STAGES_PER_ENTRY = 32
 _lock = threading.Lock()
 _entries: dict[str, dict[str, Any]] = {}
+
+
+def _last_activity_key(item: tuple[str, dict[str, Any]]) -> tuple[float, str]:
+    entry_id, row = item
+    try:
+        last_at = float(row.get("last_at") or row.get("created_at") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        last_at = 0.0
+    return last_at, entry_id
+
+
+def _make_room_for_entry() -> None:
+    """Bound telemetry memory while preserving active attempts when possible."""
+    limit = max(1, int(_MAX_TRACKED_ENTRIES))
+    if len(_entries) < limit:
+        return
+    terminal = [item for item in _entries.items()
+                if item[1].get("terminal_at") is not None]
+    pool = terminal or list(_entries.items())
+    evicted_id, _ = min(pool, key=_last_activity_key)
+    _entries.pop(evicted_id, None)
 
 
 def _record_stage(entry_id: str, stage: str, fields: dict[str, Any]) -> None:
@@ -22,16 +46,24 @@ def _record_stage(entry_id: str, stage: str, fields: dict[str, Any]) -> None:
         return
     now = time.monotonic()
     with _lock:
-        row = _entries.setdefault(entry_id, {
-            "created_at": now,
-            "stages": [],
-            "opened_count": 0,
-        })
+        row = _entries.get(entry_id)
+        if row is None:
+            _make_room_for_entry()
+            row = {
+                "created_at": now,
+                "stages": [],
+                "opened_count": 0,
+            }
+            _entries[entry_id] = row
         row["last_at"] = now
         row["last_stage"] = stage
         row["bot"] = str(fields.get("bot") or row.get("bot") or "")
         row["symbol"] = str(fields.get("symbol") or row.get("symbol") or "")
-        row["stages"].append(stage)
+        stages = row["stages"]
+        stages.append(stage)
+        stage_limit = max(1, int(_MAX_STAGES_PER_ENTRY))
+        if len(stages) > stage_limit:
+            del stages[:-stage_limit]
         if stage == "candidate":
             row["candidate_at"] = now
         if stage == "order_attempt":
@@ -60,7 +92,10 @@ def lifecycle_health_snapshot(
                    if now - float(row.get("last_at") or now) > retention_sec]
         for entry_id in expired:
             _entries.pop(entry_id, None)
-        rows = {entry_id: dict(row) for entry_id, row in _entries.items()}
+        rows = {
+            entry_id: {**row, "stages": list(row.get("stages") or [])}
+            for entry_id, row in _entries.items()
+        }
 
     for entry_id, row in rows.items():
         label = f"{row.get('bot', '')}:{row.get('symbol', '')}:{entry_id[:8]}"
@@ -107,11 +142,22 @@ def new_entry_id(
     *, bot: str = "", symbol: str = "", mode: str = "",
     direction: str = "",
 ) -> str:
-    """Return a compact, process-independent identifier for one entry intent."""
-    try:
-        entry_id = uuid.uuid4().hex
-    except Exception:
-        return ""
+    """Return a non-empty, process-independent identifier for one entry intent."""
+    last_error = None
+    entry_id = ""
+    for factory in (uuid.uuid4, uuid.uuid1):
+        try:
+            candidate = str(factory().hex).strip().lower()
+            if (
+                len(candidate) == 32
+                and all(char in "0123456789abcdef" for char in candidate)
+            ):
+                entry_id = candidate
+                break
+        except Exception as exc:
+            last_error = exc
+    if not entry_id:
+        raise RuntimeError("entry id generation failed") from last_error
     if bot or symbol:
         try:
             _record_stage(entry_id, "candidate", {

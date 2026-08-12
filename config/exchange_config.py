@@ -1027,16 +1027,30 @@ def safe_amount_to_precision(ex, symbol: str, amount: float) -> float:
         return 0.0
 
     try:
-        min_amt = _market_amount_min(ex, symbol)
         amt_dec = Decimal(str(amount))
-        if min_amt is not None and amt_dec.is_finite() and amt_dec < min_amt:
+    except (TypeError, ValueError, ArithmeticError):
+        return 0.0
+    if not amt_dec.is_finite() or amt_dec <= 0:
+        return 0.0
+
+    try:
+        min_amt = _market_amount_min(ex, symbol)
+        if min_amt is not None and amt_dec < min_amt:
             return 0.0
     except Exception:
         pass
 
     # Step 1: native CCXT
     try:
-        return float(ex.amount_to_precision(symbol, amount))
+        native = ex.amount_to_precision(symbol, amount)
+        if isinstance(native, bool):
+            raise ValueError("native amount precision returned boolean")
+        native_dec = Decimal(str(native))
+        if not native_dec.is_finite() or native_dec < 0:
+            raise ValueError("native amount precision is invalid")
+        if native_dec > amt_dec:
+            raise ValueError("native amount precision amplified the amount")
+        return float(native_dec)
     except Exception as e1:
         _silent(f"amount_to_precision({symbol}, {amount})", e1)
 
@@ -1045,9 +1059,6 @@ def safe_amount_to_precision(ex, symbol: str, amount: float) -> float:
         step = _markets_precision_step(ex, symbol)
         if step is None or step <= 0:
             step = _DEFAULT_PRECISION_STEP
-        amt_dec = Decimal(str(amount))
-        if not amt_dec.is_finite():
-            return 0.0
         rounded = (amt_dec / step).to_integral_value(rounding=ROUND_DOWN) * step
         # Belt-and-suspenders: stringify and re-parse to drop any
         # exponential-notation drift before float-cast.

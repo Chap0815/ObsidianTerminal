@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from decimal import Decimal, ROUND_DOWN
 from threading import Lock
 from typing import Callable, Optional, Tuple
 
@@ -499,13 +500,20 @@ def _flatten_without_accounting(**kw):
             close_amount = _finite_precision_amount_or_none(
                 ex.amount_to_precision(symbol_full, amount)
             )
-            if close_amount is None:
+            if close_amount is None or Decimal(str(close_amount)) > Decimal(
+                str(amount)
+            ):
                 return (sym, "failed", 0.0,
                         "close lock held and close amount invalid")
         except Exception:
-            close_amount = round(amount, 4)
-        if close_amount <= 0 and amount > 0:
-            close_amount = round(amount, 4)
+            try:
+                close_amount = float(
+                    Decimal(str(amount)).quantize(
+                        Decimal("0.0001"), rounding=ROUND_DOWN
+                    )
+                )
+            except (TypeError, ValueError, ArithmeticError):
+                close_amount = 0.0
         if not math.isfinite(close_amount) or close_amount <= 0:
             return (sym, "failed", 0.0,
                     "close lock held and close amount invalid")

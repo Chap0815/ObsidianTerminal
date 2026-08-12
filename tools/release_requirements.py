@@ -67,6 +67,17 @@ REQUIRED_RELEASE_ITEMS = [
     "bots/main_bot_trendfut.py",
 ]
 
+REQUIRED_RELEASE_DIRS = {
+    "bot_utils",
+    "bots",
+    "config",
+    "core",
+    "launcher",
+    "news",
+    "tools",
+    "trading",
+}
+
 
 UPDATE_SMOKE_FILES = [
     "launcher.pyw",
@@ -143,5 +154,5 @@ def inno_tool_exclude_patterns(tool_files: list[str] | None = None) -> list[str]
 
 REQUIRED_MANIFEST_FILES = [
     rel for rel in REQUIRED_RELEASE_ITEMS
-    if rel != "DEPLOY_MANIFEST.json" and "." in rel.rsplit("/", 1)[-1]
+    if rel != "DEPLOY_MANIFEST.json" and rel not in REQUIRED_RELEASE_DIRS
 ]

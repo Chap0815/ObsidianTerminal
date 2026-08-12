@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 from typing import Dict, List, Optional, Set
 
 from bot_utils.safe_numeric import safe_positive_float
+from bot_utils.silent_log import silent_log
 from core.constants import TICKER_STALE_MAX_SEC
 from trading.l2_stream import build_public_async_config
 
@@ -26,6 +27,8 @@ _MAX_REST_WORKERS  = 8
 _WS_BASE_BACKOFF   = 2.0
 _WS_MAX_BACKOFF    = 120.0
 _WS_STABLE_RESET_SEC = 30.0
+_REST_RESTART_BACKOFF_SEC = 2.0
+_REST_RESTART_MAX_BACKOFF_SEC = 30.0
 
 
 def _ws_session_is_stable(
@@ -111,7 +114,12 @@ class WebSocketFeed:
             self._threads = [r for r in self._threads if r() is not None]
             with self._symbols_lock:
                 new_syms = [s for s in symbols if s not in self._symbols]
-                if not new_syms and self._running:
+                worker_started = (
+                    self._ws_thread_started
+                    if self._ws_mode
+                    else self._rest_thread_started
+                )
+                if not new_syms and self._running and worker_started:
                     return
                 self._symbols.update(new_syms)
                 current = list(self._symbols)
@@ -119,7 +127,13 @@ class WebSocketFeed:
             if self._ws_mode:
                 if not self._ws_thread_started:
                     self._ws_thread_started = True
-                    self._start_ws(current)
+                    try:
+                        self._start_ws(current)
+                    except Exception as exc:
+                        self._ws_thread_started = False
+                        self._ws_mode = False
+                        silent_log("start WebSocket ticker worker", exc)
+                        self._ensure_rest_poller()
             else:
                 self._ensure_rest_poller()
 
@@ -149,17 +163,36 @@ class WebSocketFeed:
                 loop.call_soon_threadsafe(loop.stop)
         self._close_rest_clones()
 
-    def _close_rest_clones(self) -> None:
+    def _close_rest_clones(self) -> bool:
         with self._rest_clones_lock:
             clones = list(self._rest_clones)
-            self._rest_clones.clear()
+        successful_ids: set[int] = set()
+        failed_ids: set[int] = set()
         for c in clones:
+            clone_id = id(c)
+            if clone_id in successful_ids or clone_id in failed_ids:
+                continue
             if c is self._exchange:
+                successful_ids.add(clone_id)
+                continue
+            close = getattr(c, "close", None)
+            if not callable(close):
+                successful_ids.add(clone_id)
                 continue
             try:
-                c.close()
-            except Exception:
-                pass
+                close()
+            except Exception as exc:
+                failed_ids.add(clone_id)
+                silent_log("close WebSocket REST clone", exc)
+            else:
+                successful_ids.add(clone_id)
+        with self._rest_clones_lock:
+            self._rest_clones = [
+                clone
+                for clone in self._rest_clones
+                if id(clone) not in successful_ids
+            ]
+        return not failed_ids
 
     def get_ticker(self, symbol: str) -> Optional[dict]:
         with self._cache_lock:
@@ -257,7 +290,10 @@ class WebSocketFeed:
                 with self._cache_lock:
                     self._cache.clear()
                 self._ws_mode = False
-                self._ensure_rest_poller()
+                try:
+                    self._ensure_rest_poller()
+                except Exception as fallback_exc:
+                    silent_log("start WebSocket REST fallback", fallback_exc)
             finally:
                 try:
                     self._loop.set_exception_handler(previous_handler)
@@ -278,11 +314,24 @@ class WebSocketFeed:
                             restart_symbols = list(self._symbols)
                         self._ws_thread_started = True
                 if restart_symbols is not None:
-                    self._start_ws(restart_symbols)
+                    try:
+                        self._start_ws(restart_symbols)
+                    except Exception as restart_exc:
+                        with self._start_lock:
+                            self._ws_thread_started = False
+                            self._ws_mode = False
+                        silent_log("restart WebSocket ticker worker", restart_exc)
+                        try:
+                            self._ensure_rest_poller()
+                        except Exception as fallback_exc:
+                            silent_log(
+                                "start WebSocket restart REST fallback",
+                                fallback_exc,
+                            )
 
         t = threading.Thread(target=_run, name="ws-feed-main", daemon=True)
-        self._threads.append(weakref.ref(t))
         t.start()
+        self._threads.append(weakref.ref(t))
 
     async def _ws_main(self, symbols: List[str]) -> None:
         import ccxt.pro as ccxt_pro
@@ -422,34 +471,63 @@ class WebSocketFeed:
             if self._rest_thread_started:
                 return
             self._rest_thread_started = True
-            t = threading.Thread(
-                target=self._rest_pool_loop, name="ws-feed-rest-pool",
-                daemon=True)
+            try:
+                t = threading.Thread(
+                    target=self._rest_pool_loop,
+                    name="ws-feed-rest-pool",
+                    daemon=True,
+                )
+                t.start()
+            except Exception:
+                self._rest_thread_started = False
+                raise
             self._threads.append(weakref.ref(t))
-            t.start()
+
+    def _wait_for_rest_restart(self, delay_seconds: float) -> bool:
+        remaining = max(0.0, float(delay_seconds))
+        while remaining > 0.0 and self._running and not self._ws_mode:
+            step = min(0.25, remaining)
+            time.sleep(step)
+            remaining -= step
+        return self._running and not self._ws_mode
 
     def _rest_pool_loop(self) -> None:
-        completed_normally = False
+        restart_backoff = _REST_RESTART_BACKOFF_SEC
         try:
-            self._rest_pool_session()
-            completed_normally = True
+            while True:
+                session_error = None
+                try:
+                    self._rest_pool_session()
+                except Exception as exc:
+                    session_error = exc
+                    silent_log("WebSocket REST poller session", exc)
+                finally:
+                    self._close_rest_clones()
+
+                if session_error is not None:
+                    if self._running and not self._ws_mode:
+                        self._wait_for_rest_restart(restart_backoff)
+                    restart_backoff = min(
+                        restart_backoff * 2.0,
+                        _REST_RESTART_MAX_BACKOFF_SEC,
+                    )
+                else:
+                    restart_backoff = _REST_RESTART_BACKOFF_SEC
+
+                with self._rest_poller_lock:
+                    if not self._running or self._ws_mode:
+                        self._rest_thread_started = False
+                        return
         finally:
-            self._close_rest_clones()
             with self._rest_poller_lock:
                 self._rest_thread_started = False
-                restart = (
-                    completed_normally and self._running and not self._ws_mode
-                )
-            # A concurrent start may have seen the old latch while that thread
-            # was still winding down.  Re-check under the poller lock.
-            if restart:
-                self._ensure_rest_poller()
 
     def _rest_pool_session(self) -> None:
         clones = [_clone_exchange(self._exchange)
                   for _ in range(_MAX_REST_WORKERS)]
         with self._rest_clones_lock:
-            self._rest_clones = list(clones)
+            # Keep unresolved clients from an earlier generation retryable.
+            self._rest_clones.extend(clones)
 
         # Bind each worker thread to one clone via thread-local
         _tls = threading.local()

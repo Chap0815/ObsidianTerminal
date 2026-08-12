@@ -31,6 +31,7 @@ from typing import Dict, List, Optional, Tuple
 from shared_limits import normalize_gate_mode
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.safe_numeric import parse_ohlcv_closes
+from bot_utils.silent_log import silent_log
 from bot_utils.trade_state import state_exposure_count
 from core.futures_bot import FuturesBot
 from core.cross_bot import _is_crypto_base   # shared crypto-only perp filter
@@ -906,6 +907,7 @@ class TrendFuturesBot(FuturesBot):
             symbol=base,
             mode=entry_mode,
             features=expectancy_features,
+            venue_symbol=full,
         )
         if not self.simulation:
             from trading.entry_admission import evaluate_entry_admission
@@ -1240,8 +1242,15 @@ class TrendFuturesBot(FuturesBot):
                             direction="LONG", recovered_after_error=True)
                         log_event(f"[{self.BOT_NAME}]  {base}: landed despite "
                                   f"error  tracked and monitoring enabled", "WARN")
-                except Exception:
-                    pass
+                except Exception as recovery_exc:
+                    # A failed lookup/reconciliation cannot prove that the
+                    # exchange rejected the order. Keep the provisional state
+                    # and claim until a later clientOrderId reconciliation can
+                    # establish the outcome.
+                    _outcome_unknown = True
+                    self._log_error(
+                        f"trend reconcile failed open {base}", recovery_exc
+                    )
                 if not _landed and _outcome_unknown:
                     log_event(
                         f"[{self.BOT_NAME}] {base}: entry outcome unknown; "
@@ -1297,7 +1306,36 @@ class TrendFuturesBot(FuturesBot):
                 fees = 0.0
         else:
             from bot_utils.fee_math import taker_fee_rate
-            fees = notional * taker_fee_rate(self.ex, full)
+            fee_rate = taker_fee_rate(self.ex, full)
+            fees = notional * fee_rate
+            try:
+                from trading.candidate_microstructure import (
+                    capture_simulated_entry_tca,
+                )
+
+                tca_recorded = capture_simulated_entry_tca(
+                    exchange=self.ex,
+                    entry_id=entry_id,
+                    bot_name=self.BOT_NAME,
+                    mode=entry_mode,
+                    symbol=full,
+                    side="buy",
+                    amount=contracts,
+                    fill_price=fill,
+                    fee_rate=fee_rate,
+                    notional_usdt=notional,
+                    depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
+                )
+                if not tca_recorded:
+                    silent_log(
+                        f"{self.BOT_NAME} {base} SIM TCA entry {entry_id}",
+                        RuntimeError("SIM TCA was not recorded"),
+                    )
+            except Exception as exc:
+                silent_log(
+                    f"{self.BOT_NAME} {base} SIM TCA dispatch {entry_id}",
+                    exc,
+                )
 
         actual_margin, margin_from_fill = filled_margin_usdt(
             amount, cs, fill, eff_lev, margin)
@@ -2327,13 +2365,13 @@ class TrendFuturesBot(FuturesBot):
             try:
                 trades = dict(self.state.get_all())
                 now = time.time()
+                if now - last_ks >= 60:
+                    try:
+                        if self._check_killswitch(trades) is not False:
+                            last_ks = now
+                    except Exception as e:
+                        self._log_error("trend killswitch", e)
                 if trades:
-                    if now - last_ks >= 60:
-                        last_ks = now
-                        try:
-                            self._check_killswitch(trades)
-                        except Exception as e:
-                            self._log_error("trend killswitch", e)
                     self._maybe_persist_funding_for_all(trades, now)
                     for base, d in trades.items():
                         if self._shutdown_event.is_set():

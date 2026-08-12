@@ -55,8 +55,8 @@ PROMPT_SPOT_DEFAULT: Path = PROMPTS_DIR / "spot_default.txt"
 PROMPT_FUTURES_DEFAULT:    Path = PROMPTS_DIR / "futures_default.txt"
 
 
-# Guard so ensure_runtime_dirs() is a no-op after the first call (it is
-# imported many times per bot boot; avoids re-issuing mkdir() syscalls).
+# Guard so ensure_runtime_dirs() is a no-op after the first explicit runtime
+# operation; importing path constants alone must remain filesystem read-only.
 _DIRS_ENSURED      = False
 _DIRS_ENSURED_LOCK = threading.Lock()
 
@@ -78,11 +78,6 @@ def ensure_runtime_dirs() -> None:
                   LLM_SLOTS_DIR, OPT_RESULTS):
             d.mkdir(parents=True, exist_ok=True)
         _DIRS_ENSURED = True
-
-
-# Auto-create runtime dirs on import  cheap, idempotent (guard-cached so
-# repeated imports skip the syscalls entirely).
-ensure_runtime_dirs()
 
 
 #  String aliases for legacy code that expects str (not Path) 

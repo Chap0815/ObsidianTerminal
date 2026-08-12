@@ -36,6 +36,10 @@ except Exception:
     pass
 
 
+def _canonical_json_path(path: str) -> str:
+    return os.path.realpath(os.path.abspath(os.path.normpath(os.fspath(path))))
+
+
 # 
 # Shared-connection wrapper
 # 
@@ -86,11 +90,13 @@ class _SingleWriterJSON:
 
     @classmethod
     def for_path(cls, path: str) -> "_SingleWriterJSON":
+        canonical_path = _canonical_json_path(path)
+        path_key = os.path.normcase(canonical_path)
         with cls._instances_lock:
-            inst = cls._instances.get(path)
+            inst = cls._instances.get(path_key)
             if inst is None:
-                inst = cls(path)
-                cls._instances[path] = inst
+                inst = cls(canonical_path)
+                cls._instances[path_key] = inst
             return inst
 
     def __init__(self, path: str):
@@ -107,11 +113,19 @@ class _SingleWriterJSON:
         )
         self._thread.start()
 
+    def _next_revision_locked(self) -> int:
+        highest = max(self._seq, self._floor_rev)
+        if self._latest is not None:
+            highest = max(highest, self._latest[0])
+        self._seq = highest + 1
+        return self._seq
+
     def submit(self, payload: dict, rev: int | None = None) -> None:
         with self._cv:
             if rev is None:
-                self._seq += 1
-                rev = self._seq
+                rev = self._next_revision_locked()
+            else:
+                self._seq = max(self._seq, rev)
             if rev < self._floor_rev:
                 return
             self._latest = (rev, payload)
@@ -120,8 +134,9 @@ class _SingleWriterJSON:
     def write_now(self, payload: dict, rev: int | None = None) -> bool:
         with self._cv:
             if rev is None:
-                self._seq += 1
-                rev = self._seq
+                rev = self._next_revision_locked()
+            else:
+                self._seq = max(self._seq, rev)
             self._floor_rev = max(self._floor_rev, rev)
             # Drop queued older snapshots so they cannot overwrite this
             # critical synchronous write after a close/remove.
@@ -266,7 +281,7 @@ class StateManager:
                 db_path = os.path.join(_root, "data", "trading_bot.db")
         self.bot_name   = bot_name
         self.log_dir    = log_dir
-        self.json_path  = json_path
+        self.json_path  = _canonical_json_path(json_path)
         self.db_path    = db_path
         self.write_json = write_json
         self.lock       = threading.Lock()
@@ -285,7 +300,7 @@ class StateManager:
             except Exception:
                 pass
         if write_json:
-            self._json_writer = _SingleWriterJSON.for_path(json_path)
+            self._json_writer = _SingleWriterJSON.for_path(self.json_path)
         else:
             self._json_writer = None
 
@@ -334,7 +349,6 @@ class StateManager:
         if self.write_json and self._json_writer:
             self._json_writer.submit(
                 {s: p.to_dict() for s, p in merged.items()},
-                rev=self._persist_rev,
             )
 
         return dict(self._positions)
@@ -342,21 +356,35 @@ class StateManager:
     def add(self, position: Position) -> None:
         # snapshot under lock, I/O outside
         with self.lock:
+            previous = self._positions.get(position.symbol)
             self._positions[position.symbol] = position
             snapshot = {s: p.to_dict() for s, p in self._positions.items()}
             rev = self._persist_rev = self._persist_rev + 1
         # Disk I/O outside lock
         persisted = True
+        superseded = False
         with self._persist_lock:
             if self._is_current_revision(rev):
                 persisted = self._write_sqlite_single(position)
                 if persisted and self.write_json and self._json_writer:
-                    self._json_writer.submit(snapshot, rev=rev)
+                    # Writer revisions are path-global. A StateManager is
+                    # recreated on an in-process bot restart and its local
+                    # persistence revision starts over, so passing ``rev``
+                    # here could make the surviving per-path writer reject a
+                    # valid new-session snapshot as stale.
+                    self._json_writer.submit(snapshot)
+            else:
+                superseded = True
+        if superseded:
+            return
         if not persisted:
             with self.lock:
                 current = self._positions.get(position.symbol)
                 if current is position:
-                    self._positions.pop(position.symbol, None)
+                    if previous is None:
+                        self._positions.pop(position.symbol, None)
+                    else:
+                        self._positions[position.symbol] = previous
             return
         self._emit("POSITION_OPENED", position)
 
@@ -384,7 +412,7 @@ class StateManager:
             if self._is_current_revision(rev):
                 persisted = self._write_sqlite_single(snapshot_pos)
                 if persisted and self.write_json and self._json_writer:
-                    self._json_writer.submit(snapshot, rev=rev)
+                    self._json_writer.submit(snapshot)
         if not persisted:
             with self.lock:
                 if symbol in self._positions:
@@ -408,9 +436,9 @@ class StateManager:
                 persisted = True if deleted is None else bool(deleted)
                 if persisted and self.write_json and self._json_writer:
                     if hasattr(self._json_writer, "write_now"):
-                        persisted = self._json_writer.write_now(snapshot, rev=rev)
+                        persisted = self._json_writer.write_now(snapshot)
                     else:
-                        self._json_writer.submit(snapshot, rev=rev)
+                        self._json_writer.submit(snapshot)
         if not persisted and pos is not None:
             with self.lock:
                 self._positions[symbol] = pos
@@ -446,7 +474,6 @@ class StateManager:
                 if persisted and self.write_json and self._json_writer:
                     self._json_writer.submit(
                         {s: p.to_dict() for s, p in snapshot.items()},
-                        rev=rev,
                     )
 
     def _is_current_revision(self, rev: int) -> bool:

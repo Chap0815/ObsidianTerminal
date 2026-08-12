@@ -98,11 +98,18 @@ def normalize_order_book(book: dict, *, depth_levels: int) -> dict:
         if isinstance(timestamp, bool):
             raise OrderBookValidationError("timestamp is boolean")
         try:
-            timestamp = int(timestamp)
+            timestamp_value = float(timestamp)
         except (TypeError, ValueError, OverflowError) as exc:
             raise OrderBookValidationError("timestamp is invalid") from exc
-        if timestamp <= 0:
-            raise OrderBookValidationError("timestamp must be positive")
+        if (
+            not math.isfinite(timestamp_value)
+            or timestamp_value <= 0
+            or not timestamp_value.is_integer()
+        ):
+            raise OrderBookValidationError(
+                "timestamp must be a finite positive integer"
+            )
+        timestamp = int(timestamp_value)
 
     nonce = book.get("nonce")
     if isinstance(nonce, bool):
@@ -161,6 +168,15 @@ class L2ShadowCollector:
         self._connection_epoch = 0
         self._health_lock = threading.Lock()
         self._health_seen_symbols: set[str] = set()
+        self._health_last_persist_monotonic: dict[str, float] = {}
+        sample_health_window = self.sample_interval * 3.0
+        if not math.isfinite(sample_health_window):
+            sample_health_window = 10.0
+        self._health_stale_after_seconds = max(
+            10.0,
+            sample_health_window,
+            self.stale_after_ms / 1000.0 * 2.0,
+        )
         self._health_error_type: str | None = None
         self._health_reconnect_attempts = 0
         self._health_ok_logged = False
@@ -171,6 +187,26 @@ class L2ShadowCollector:
     @property
     def is_alive(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
+
+    @property
+    def is_healthy(self) -> bool:
+        desired = set(self._symbol_snapshot())
+        now = time.monotonic()
+        with self._health_lock:
+            fresh = all(
+                symbol in self._health_last_persist_monotonic
+                and math.isfinite(self._health_last_persist_monotonic[symbol])
+                and 0.0
+                <= now - self._health_last_persist_monotonic[symbol]
+                <= self._health_stale_after_seconds
+                for symbol in desired
+            )
+            return bool(
+                desired
+                and self._health_ok_logged
+                and desired.issubset(self._health_seen_symbols)
+                and fresh
+            )
 
     def _log(self, message: str, level: str = "INFO") -> None:
         if not self.log_event:
@@ -199,6 +235,8 @@ class L2ShadowCollector:
                     state.pop(symbol, None)
         with self._health_lock:
             self._health_seen_symbols.intersection_update(active)
+            for symbol in set(self._health_last_persist_monotonic) - active:
+                self._health_last_persist_monotonic.pop(symbol, None)
             if active - previous:
                 # A newly selected stream belongs to a new validation
                 # generation; do not inherit the prior universe's healthy
@@ -238,6 +276,7 @@ class L2ShadowCollector:
         try:
             normalized = normalize_order_book(book, depth_levels=self.depth_levels)
         except OrderBookValidationError as exc:
+            self._mark_l2_unhealthy(symbol, type(exc).__name__)
             self._log_invalid_snapshot(symbol, exc)
             return False
 
@@ -262,6 +301,7 @@ class L2ShadowCollector:
 
         flags = ["sequence_unverified"]
         exchange_ms = normalized["timestamp"]
+        raw_future_exchange_ms = None
         received_time = self._iso8601(received_ms)
         if exchange_ms is None:
             flags.append("missing_exchange_timestamp")
@@ -280,6 +320,9 @@ class L2ShadowCollector:
                     flags.append("stale_exchange_timestamp")
                 elif age_ms < -30_000:
                     flags.append("future_exchange_timestamp")
+                    raw_future_exchange_ms = exchange_ms
+                    exchange_ms = received_ms
+                    exchange_time = received_time
         if nonce_monotonic is False:
             flags.append("non_monotonic_nonce")
 
@@ -297,6 +340,8 @@ class L2ShadowCollector:
             "updates_since_sample": updates,
             "sample_interval_ms": int(self.sample_interval * 1000),
         }
+        if raw_future_exchange_ms is not None:
+            payload["raw_exchange_timestamp_ms"] = raw_future_exchange_ms
         digest = hashlib.blake2s(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
             digest_size=8,
@@ -304,7 +349,7 @@ class L2ShadowCollector:
         event = VenueEvent(
             event_id=(
                 f"l2_stream:{self.exchange_id}:{self._market_id(symbol)}:"
-                f"{exchange_ms}:{digest}"
+                f"{exchange_ms}:{received_ms}:{digest}"
             ),
             kind="l2_stream",
             market_id=self._market_id(symbol),
@@ -329,8 +374,19 @@ class L2ShadowCollector:
                     concurrent_updates = self._updates_since_sample.get(symbol, 0)
                     self._updates_since_sample[symbol] = updates + concurrent_updates
             self._log(f"storage error for {symbol}: {type(exc).__name__}", "WARN")
+            self._mark_l2_unhealthy(symbol, type(exc).__name__)
             return False
-        self._mark_l2_healthy(symbol)
+        disqualifying_flags = set(flags) - {"sequence_unverified"}
+        if disqualifying_flags:
+            self._mark_l2_unhealthy(
+                symbol,
+                sorted(disqualifying_flags)[0],
+            )
+        else:
+            self._mark_l2_healthy(
+                symbol,
+                observed_at_monotonic=now_monotonic,
+            )
         return True
 
     def _log_invalid_snapshot(
@@ -371,15 +427,24 @@ class L2ShadowCollector:
     ) -> None:
         with self._health_lock:
             self._health_seen_symbols.clear()
+            self._health_last_persist_monotonic.clear()
             self._health_error_type = error_type
             self._health_reconnect_attempts = reconnect_attempts
             self._health_ok_logged = False
 
-    def _mark_l2_healthy(self, symbol: str) -> None:
+    def _mark_l2_healthy(
+        self,
+        symbol: str,
+        *,
+        observed_at_monotonic: float,
+    ) -> None:
         desired = set(self._symbol_snapshot())
         if not desired or symbol not in desired:
             return
         with self._health_lock:
+            self._health_last_persist_monotonic[symbol] = (
+                observed_at_monotonic
+            )
             if self._health_ok_logged:
                 return
             self._health_seen_symbols.add(symbol)
@@ -399,6 +464,16 @@ class L2ShadowCollector:
             f"({attempts} reconnect attempt{'s' if attempts != 1 else ''})",
             "OK",
         )
+
+    def _mark_l2_unhealthy(self, symbol: str, error_type: str) -> None:
+        desired = set(self._symbol_snapshot())
+        if not desired or symbol not in desired:
+            return
+        with self._health_lock:
+            self._health_seen_symbols.discard(symbol)
+            self._health_last_persist_monotonic.pop(symbol, None)
+            self._health_ok_logged = False
+            self._health_error_type = str(error_type or "InvalidL2Sample")[:100]
 
     def _make_async_exchange(self):
         config = build_public_async_config(self.exchange)
@@ -449,7 +524,10 @@ class L2ShadowCollector:
                     exception = task.exception()
                     if exception is not None:
                         raise exception
-                    if symbol in desired and not self._should_stop():
+                    if (
+                        symbol in set(self._symbol_snapshot())
+                        and not self._should_stop()
+                    ):
                         raise RuntimeError(f"L2 watcher ended unexpectedly for {symbol}")
         finally:
             for task in tasks.values():

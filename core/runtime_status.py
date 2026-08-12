@@ -252,17 +252,36 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
                          simulation: bool,
                          *,
                          threads: Mapping[str, Any] | None = None,
-                         extra: Mapping[str, Any] | None = None) -> None:
+                         extra: Mapping[str, Any] | None = None,
+                         build_info: Mapping[str, Any] | None = None,
+                         process_pid: int | None = None,
+                         process_run_id: str | None = None) -> None:
     try:
         path = runtime_status_path(log_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
-        build = get_build_info()
+        # Long-running bots pass the snapshot captured during startup so an
+        # on-disk sync cannot make already-loaded code advertise a newer build.
+        build = dict(build_info) if isinstance(build_info, Mapping) else get_build_info()
+        if process_pid is None:
+            status_pid = os.getpid()
+        elif isinstance(process_pid, bool):
+            status_pid = 0
+        else:
+            try:
+                status_pid = max(0, int(process_pid))
+            except (TypeError, ValueError, OverflowError):
+                status_pid = 0
+        status_run_id = (
+            os.getenv("BOT_RUN_ID", "")
+            if process_run_id is None
+            else str(process_run_id or "")[:_STATUS_MAX_STRING_CHARS]
+        )
         payload = {
             "bot": bot_name,
             "status": status,
             "simulation": bool(simulation),
-            "pid": os.getpid(),
-            "run_id": os.getenv("BOT_RUN_ID", ""),
+            "pid": status_pid,
+            "run_id": status_run_id,
             "updated_at": _utc_now(),
             "wall_ts": time.time(),
             "monotonic_ts": time.monotonic(),

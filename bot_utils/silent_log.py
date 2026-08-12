@@ -69,8 +69,8 @@ def silent_log(ctx: str, exc: Exception,
     safe_ctx = _safe_text(ctx, 240)
     key = (safe_ctx, type(exc).__name__)
     with _FAIL_LOCK:
-        last = _LAST_LOGGED.get(key, 0.0)
-        if (now - last) < interval:
+        last = _LAST_LOGGED.get(key)
+        if last is not None and (now - last) < interval:
             # Touch  bump to MRU position so it isn't evicted for
             # being old-by-insertion (it's still actively suppressing).
             _LAST_LOGGED.move_to_end(key)

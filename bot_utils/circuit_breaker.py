@@ -14,6 +14,7 @@ and closing existing positions. State is reset by restarting the bot.
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import math
@@ -24,6 +25,16 @@ from typing import Callable, Optional
 
 
 _SAFE_MODE_STATE_JSON_MAX_BYTES = 64 * 1024
+_SAFE_MODE_ALERT_PERSIST_RETRY_SEC = 30.0
+
+
+def _log_safe_mode_error(context: str, exc: Exception) -> None:
+    try:
+        from bot_utils.silent_log import silent_log
+
+        silent_log(context, exc)
+    except Exception:
+        pass
 
 
 def _read_safe_mode_state_json(path: str) -> dict:
@@ -304,6 +315,9 @@ class SafeMode:
         self._reason = "normal"
         self._alert_sent = False
         self._lock = threading.Lock()
+        self._alert_persist_pending = False
+        self._alert_persist_timer: Optional[threading.Timer] = None
+        self._alert_persist_shutdown = False
         self.bot_name = bot_name
         self._telegram_send = telegram_send
         self._telegram_token = telegram_token
@@ -326,6 +340,7 @@ class SafeMode:
                     state_dir, f"safe_mode_{bot_name.lower()}_{suffix}.json"
                 )
                 self._load_alert_state()
+                atexit.register(self.flush_alert_state_pending)
             except Exception:
                 self._alert_state_file = None
 
@@ -360,21 +375,78 @@ class SafeMode:
         except Exception:
             pass
 
-    def _save_alert_state(self) -> None:
+    def _save_alert_state(self) -> bool:
         """Persist that we sent a Telegram alert today (UTC)."""
         if not self._alert_state_file:
-            return
+            return True
         try:
             from datetime import datetime as _dt, timezone as _tz
             from bot_utils.state_persist import atomic_save_json
 
             today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
-            atomic_save_json(
+            persisted = atomic_save_json(
                 self._alert_state_file,
                 {"alert_sent_day": today, "reason": self._reason},
             )
-        except Exception:
-            pass
+            if not persisted:
+                raise OSError("safe-mode alert state persistence failed")
+            return True
+        except Exception as exc:
+            _log_safe_mode_error("safe-mode alert state persistence", exc)
+            return False
+
+    def _schedule_alert_state_retry(self) -> None:
+        with self._lock:
+            self._alert_persist_pending = True
+            if self._alert_persist_shutdown:
+                return
+            timer = self._alert_persist_timer
+            if timer is not None and timer.is_alive():
+                return
+            timer = threading.Timer(
+                _SAFE_MODE_ALERT_PERSIST_RETRY_SEC,
+                self._retry_alert_state_persist,
+            )
+            timer.daemon = True
+            self._alert_persist_timer = timer
+            try:
+                timer.start()
+            except Exception as exc:
+                self._alert_persist_timer = None
+                _log_safe_mode_error(
+                    "schedule safe-mode alert state persistence retry", exc
+                )
+
+    def _retry_alert_state_persist(self) -> None:
+        with self._lock:
+            self._alert_persist_timer = None
+            pending = self._alert_persist_pending
+        if not pending:
+            return
+        if self._save_alert_state():
+            with self._lock:
+                self._alert_persist_pending = False
+            return
+        self._schedule_alert_state_retry()
+
+    def flush_alert_state_pending(self) -> bool:
+        """Make one final synchronous attempt without scheduling a new retry."""
+        with self._lock:
+            self._alert_persist_shutdown = True
+            if not self._alert_persist_pending:
+                return True
+            timer = self._alert_persist_timer
+            self._alert_persist_timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        persisted = self._save_alert_state()
+        if persisted:
+            with self._lock:
+                self._alert_persist_pending = False
+        return persisted
 
     def record_slippage(
         self,
@@ -432,10 +504,17 @@ class SafeMode:
     def trigger(self, reason: str) -> None:
         """Enter SAFE_MODE. Idempotent  first call only sends the alert."""
         with self._lock:
-            if self._event.is_set():
-                return
-            self._event.set()
-            self._reason = reason
+            already_active = self._event.is_set()
+            if already_active:
+                persist_retry_pending = self._alert_persist_pending
+            else:
+                persist_retry_pending = False
+                self._event.set()
+                self._reason = reason
+        if already_active:
+            if persist_retry_pending:
+                self._schedule_alert_state_retry()
+            return
         if self._log_struct:
             try:
                 self._log_struct(
@@ -453,10 +532,8 @@ class SafeMode:
             except Exception:
                 pass
         if not self._alert_sent and self._telegram_send:
-            self._alert_sent = True
-            self._save_alert_state()
             try:
-                self._telegram_send(
+                accepted = self._telegram_send(
                     self._telegram_token,
                     self._telegram_chat_id,
                     f" [{self.bot_name}] SAFE_MODE activated\n"
@@ -464,5 +541,13 @@ class SafeMode:
                     f"No new entries until bot is restarted.\n"
                     f"Existing positions are still being monitored & closed.",
                 )
-            except Exception:
-                pass
+                if accepted is False:
+                    raise RuntimeError(
+                        "safe-mode Telegram alert was not accepted"
+                    )
+            except Exception as exc:
+                _log_safe_mode_error("safe-mode Telegram alert", exc)
+            else:
+                self._alert_sent = True
+                if not self._save_alert_state():
+                    self._schedule_alert_state_retry()

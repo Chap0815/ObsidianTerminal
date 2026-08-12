@@ -24,6 +24,7 @@ EXCLUDED_DIRS = {
     ".pytest_cache",
     ".pytest_tmp_review",
     ".ruff_cache",
+    ".venv",
     "__pycache__",
     "backups",
     "data",
@@ -37,6 +38,7 @@ EXCLUDED_DIRS = {
     "docs",
     "BOT ADDITIONAL",
     "tests",
+    "venv",
 }
 EXCLUDED_SUFFIXES = {
     ".db",
@@ -60,13 +62,19 @@ EXCLUDED_SUFFIXES = {
     ".sqlite3-wal",
 }
 EXCLUDED_NAMES = {
+    ".update_synced.json",
     ".env",
     ".gitignore",
+    "AGENTS.md",
     "DEPLOY_MANIFEST.json",
+    "PROJECT_MEMORY.md",
     "TODO.md",
     "README_GITHUB.md",
+    "cooldown.json",
+    "cooldown.json.lock",
     "pytest.ini",
     "structured.jsonl",
+    "structured.jsonl.rotation.lock",
 }
 EXCLUDED_REL_PATHS = {
     "bot_config.json",

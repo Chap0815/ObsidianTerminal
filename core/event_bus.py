@@ -135,7 +135,27 @@ class EventBus:
 
         self._watchdog = threading.Thread(
             target=self._watchdog_loop, name="event-bus-watchdog", daemon=True)
-        self._watchdog.start()
+        try:
+            self._watchdog.start()
+        except Exception as exc:
+            # Constructor failure must not strand already-started consumers
+            # that no caller can ever shut down because the bus was not
+            # returned. Close admission and wake every published worker.
+            self._accepting = False
+            self._stopped = True
+            self._shutdown_event.set()
+            for _ in self._worker_threads:
+                try:
+                    self._work_queue.put_nowait(_WORKER_STOP)
+                except queue.Full:
+                    break
+            for worker in self._worker_threads:
+                try:
+                    worker.join(timeout=1.0)
+                except (RuntimeError, AttributeError):
+                    pass
+            _log_handler_error("event_bus watchdog start", exc)
+            raise
 
     def subscribe(self, event_type: str, handler: Handler,
                   *, replace: bool = False) -> None:
@@ -245,6 +265,13 @@ class EventBus:
             with self._publish_condition:
                 self._publish_inflight -= 1
                 if self._publish_inflight == 0:
+                    # A bounded shutdown may have returned before this
+                    # already-admitted publisher finished. Complete the
+                    # terminal transition here so workers drain the accepted
+                    # queue and then leave instead of surviving forever with
+                    # admission and the watchdog already disabled.
+                    if not self._accepting:
+                        self._stopped = True
                     self._publish_condition.notify_all()
 
     def emit_sync(self, event_type: str, payload: dict = None,
@@ -277,11 +304,19 @@ class EventBus:
             events = [e for e in events if e.event_type == event_type]
         return [e.to_dict() for e in reversed(events[-limit:])]
 
-    def _spawn_worker(self, idx: int) -> None:
-        t = threading.Thread(target=self._worker,
-                             name=f"event-bus-worker-{idx}", daemon=True)
-        self._worker_threads.append(t)
-        t.start()
+    def _spawn_worker(self, idx: int) -> bool:
+        try:
+            candidate = threading.Thread(
+                target=self._worker,
+                name=f"event-bus-worker-{idx}",
+                daemon=True,
+            )
+            candidate.start()
+        except Exception as exc:
+            _log_handler_error("event_bus worker start", exc)
+            return False
+        self._worker_threads.append(candidate)
+        return True
 
     def _worker(self) -> None:
         while True:

@@ -28,6 +28,7 @@ import os
 import queue
 import re
 from collections import deque
+from collections.abc import Mapping
 from contextlib import contextmanager
 import signal
 import subprocess
@@ -57,6 +58,50 @@ _LEVEL_THEN_TIMESTAMP_RE = re.compile(
     r"BUY|SELL|WIN|LOSS)\s+\[\d{2}:\d{2}:\d{2}\]\s+",
     re.IGNORECASE,
 )
+
+
+def _clean_shutdown_proven(shutdown: object) -> bool:
+    if not isinstance(shutdown, Mapping):
+        return False
+    reasons = shutdown.get("reasons")
+    resources = shutdown.get("resources")
+    return (
+        shutdown.get("complete") is True
+        and shutdown.get("emergency_closed") is True
+        and shutdown.get("emergency_in_progress") is False
+        and isinstance(reasons, list)
+        and not reasons
+        and isinstance(resources, Mapping)
+        and bool(resources)
+        and all(result is True for result in resources.values())
+    )
+
+
+def _launcher_shutdown_payload(shutdown: object) -> tuple[str, dict]:
+    if not isinstance(shutdown, Mapping):
+        return "degraded", {
+            "complete": False,
+            "reasons": ["shutdown_evidence_unavailable"],
+            "resources": {},
+        }
+    payload = dict(shutdown)
+    if shutdown.get("complete") is False:
+        return "degraded", payload
+    if _clean_shutdown_proven(shutdown):
+        return "stopped", payload
+
+    reported_complete = payload.get("complete")
+    raw_reasons = payload.get("reasons")
+    reasons = list(raw_reasons) if isinstance(raw_reasons, list) else []
+    if "shutdown_evidence_inconsistent" not in reasons:
+        reasons.append("shutdown_evidence_inconsistent")
+    payload["complete"] = False
+    payload["reasons"] = reasons
+    if not isinstance(payload.get("resources"), Mapping):
+        payload["resources"] = {}
+    if reported_complete is not None:
+        payload["reported_complete"] = reported_complete
+    return "degraded", payload
 
 
 def _redact_ui_log_line(line: str) -> str:
@@ -467,36 +512,65 @@ class BotProcess:
         try:
             from launcher.config.settings import BOT_META
             from core.runtime_status import read_runtime_status, write_runtime_status
-            meta = BOT_META.get(self.bot_name, {})
-            log_dir = meta.get("log_dir")
-            if not log_dir:
-                return
-            last = read_runtime_status(log_dir)
-            expected_run_id = expected_run_id or ""
-            last_run_id = str(last.get("run_id") or "")
-            last_pid = positive_int_or_zero(last.get("pid"))
-            last_simulation = strict_bool_or_none(last.get("simulation"))
-            if expected_run_id and last_run_id and last_run_id != expected_run_id:
-                return
-            if expected_pid and last_pid and last_pid != expected_pid:
-                return
-            write_runtime_status(
-                log_dir,
-                self.bot_name,
-                "stopped",
-                True if last_simulation is None else last_simulation,
-                threads={"monitor": False, "scan": False, "reconcile": False},
-                extra={
+            with self._lifecycle_lock:
+                expected_run_id = expected_run_id or ""
+                expected_pid = positive_int_or_zero(expected_pid)
+                current_run_id = str(self.run_id or "")
+                current_pid = positive_int_or_zero(
+                    getattr(self.proc, "pid", 0)
+                )
+                if (
+                    expected_run_id
+                    and current_run_id
+                    and current_run_id != expected_run_id
+                ):
+                    return
+                if expected_pid and current_pid and current_pid != expected_pid:
+                    return
+
+                meta = BOT_META.get(self.bot_name, {})
+                log_dir = meta.get("log_dir")
+                if not log_dir:
+                    return
+                last = read_runtime_status(log_dir)
+                last_run_id = str(last.get("run_id") or "")
+                last_pid = positive_int_or_zero(last.get("pid"))
+                last_simulation = strict_bool_or_none(last.get("simulation"))
+                if (
+                    expected_run_id
+                    and last_run_id
+                    and last_run_id != expected_run_id
+                ):
+                    return
+                if expected_pid and last_pid and last_pid != expected_pid:
+                    return
+
+                status, shutdown = _launcher_shutdown_payload(
+                    last.get("shutdown")
+                )
+                extra = {
                     "open_positions": nonnegative_int_or_zero(
                         last.get("open_positions")
                     ),
                     "previous_status": str(last.get("status") or ""),
                     "stopped_by": "launcher",
                     "returncode": returncode,
-                    "pid": expected_pid or last_pid or 0,
-                    "run_id": expected_run_id or last_run_id,
-                },
-            )
+                    "shutdown": shutdown,
+                }
+                write_runtime_status(
+                    log_dir,
+                    self.bot_name,
+                    status,
+                    True if last_simulation is None else last_simulation,
+                    threads={
+                        "monitor": False,
+                        "scan": False,
+                        "reconcile": False,
+                    },
+                    process_pid=expected_pid or last_pid or 0,
+                    process_run_id=expected_run_id or last_run_id,
+                    extra=extra,
+                )
         except Exception as e:
             stderr = sys.stderr
             if stderr is not None:

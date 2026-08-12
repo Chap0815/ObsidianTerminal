@@ -26,6 +26,7 @@ import os
 import random
 import time
 import statistics
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List
@@ -41,13 +42,22 @@ from bot_utils.fee_math import taker_fee_rate
 # SIM_RANDOM_SEED=42 (or any int) to fix slippage noise and partial-fill
 # randomness across runs; without it, system entropy is used. A fixed seed
 # produces byte-identical results, keeping optimizer K-fold splits stable.
-def _make_rng() -> random.Random:
-    seed_env = os.environ.get("SIM_RANDOM_SEED")
-    if seed_env:
+def _make_rng(seed=None) -> random.Random:
+    raw_seed = os.environ.get("SIM_RANDOM_SEED") if seed is None else seed
+    if raw_seed not in (None, ""):
         try:
-            return random.Random(int(seed_env))
+            if isinstance(raw_seed, bool):
+                raise ValueError
+            if isinstance(raw_seed, int):
+                normalized_seed = raw_seed
+            elif isinstance(raw_seed, str):
+                normalized_seed = int(raw_seed.strip())
+            else:
+                raise ValueError
+            return random.Random(normalized_seed)
         except (TypeError, ValueError):
-            pass
+            if seed is not None:
+                raise ValueError("random_seed must be an integer") from None
     return random.Random()
 
 
@@ -67,6 +77,7 @@ def simulate_slippage(
     volume_24h_usdt: float = 0.0,
     order_size_usdt: float = 0.0,
     spread_pct: float = 0.1,
+    rng: random.Random | None = None,
 ) -> float:
     half_spread = price * (spread_pct / 100) / 2
     if volume_24h_usdt > 0 and order_size_usdt > 0:
@@ -75,19 +86,24 @@ def simulate_slippage(
         impact        = price * impact_pct / 100
     else:
         impact = 0.0
-    noise = price * _RNG.uniform(-0.0002, 0.0002)
+    source = _RNG if rng is None else rng
+    noise = price * source.uniform(-0.0002, 0.0002)
     if side.lower() in ("buy", "long"):
         return price + half_spread + impact + noise
     return price - half_spread - impact + noise
 
 
 def simulate_partial_fill(requested_amount: float, liquidity_score: float = 1.0,
-                          spread_pct: float = 0.1) -> float:
-    base_fill_rate  = min(1.0, max(0.5, liquidity_score))
-    spread_penalty  = min(0.3, spread_pct / 2.0)
+                          spread_pct: float = 0.1,
+                          rng: random.Random | None = None) -> float:
+    base_fill_rate  = min(1.0, max(0.0, liquidity_score))
+    if base_fill_rate <= 0.0:
+        return 0.0
+    spread_penalty  = min(0.3, max(0.0, spread_pct / 2.0))
     fill_rate       = base_fill_rate - spread_penalty
-    fill_rate       = max(0.01, min(1.0,
-                                    fill_rate + _RNG.uniform(-0.05, 0.05)))
+    source = _RNG if rng is None else rng
+    fill_rate       = max(0.0, min(1.0,
+                                   fill_rate + source.uniform(-0.05, 0.05)))
     return requested_amount * fill_rate
 
 
@@ -162,11 +178,29 @@ class SimulatedExchange:
         latency_ms:   float  = 0.0,
         partial_fill: bool   = True,
         maint_margin: float  = DEFAULT_MAINT_MARGIN,
+        random_seed: int | str | None = None,
     ):
         if taker_fee is None:
             taker_fee = DEFAULT_TAKER_FEE
         if maker_fee is None:
             maker_fee = DEFAULT_MAKER_FEE
+        capital_usdt = self._finite_control(capital_usdt, "capital_usdt")
+        taker_fee = self._finite_control(taker_fee, "taker_fee")
+        maker_fee = self._finite_control(maker_fee, "maker_fee")
+        latency_ms = self._finite_control(latency_ms, "latency_ms")
+        maint_margin = self._finite_control(maint_margin, "maint_margin")
+        if capital_usdt <= 0.0:
+            raise ValueError("capital_usdt must be positive")
+        if not 0.0 <= taker_fee < 1.0:
+            raise ValueError("taker_fee must be between zero and one")
+        if not -1.0 < maker_fee < 1.0:
+            raise ValueError("maker_fee must be between minus one and one")
+        if latency_ms < 0.0:
+            raise ValueError("latency_ms must be non-negative")
+        if not isinstance(partial_fill, bool):
+            raise ValueError("partial_fill must be boolean")
+        if not 0.0 <= maint_margin < 1.0:
+            raise ValueError("maint_margin must be between zero and one")
         self._ex           = real_exchange
         self._capital      = capital_usdt
         self._initial_cap  = capital_usdt
@@ -175,6 +209,8 @@ class SimulatedExchange:
         self._latency_ms   = latency_ms
         self._partial_fill = partial_fill
         self._maint_margin = maint_margin
+        self._rng          = _make_rng(random_seed)
+        self._state_lock   = threading.RLock()
 
         self._positions: Dict[str, SimPosition] = {}
         self._trades:    List[SimTrade]          = []
@@ -205,7 +241,8 @@ class SimulatedExchange:
     def _taker_for(self, symbol: str) -> float:
         """Per-symbol taker rate: prefer the real market taker, else the
         configured flat default (``self._taker``)."""
-        return taker_fee_rate(self._ex, symbol, self._taker)
+        rate = taker_fee_rate(self._ex, symbol, self._taker)
+        return rate if 0.0 <= rate < 1.0 else self._taker
 
     def _free_usdt(self) -> float:
         """Free capital. Both open paths deduct (margin + fee) from _capital,
@@ -215,11 +252,10 @@ class SimulatedExchange:
     def fetch_balance(self) -> dict:
         """``used`` here is purely informational (sum of currently-locked
         margins)  it does NOT reduce free."""
-        used = 0.0
-        for pos in self._positions.values():
-            used += pos.margin_locked
-        free  = self._free_usdt()
-        total = self._capital + used   # capital + locked margin = equity-ish
+        with self._state_lock:
+            used = sum(pos.margin_locked for pos in self._positions.values())
+            free = self._free_usdt()
+            total = self._capital + used  # capital + locked margin = equity-ish
         return {
             "USDT":  {"free": free, "used": used,  "total": total},
             "total": {"USDT": total},
@@ -228,26 +264,47 @@ class SimulatedExchange:
         }
 
     def create_market_buy_order(self, symbol, amount, params=None):
-        return self._execute_buy(symbol, amount, order_type="market")
+        with self._state_lock:
+            return self._execute_buy(symbol, amount, order_type="market")
 
     def create_limit_buy_order(self, symbol, amount, price, params=None):
-        return self._execute_buy(symbol, amount, "limit", limit_price=price)
+        with self._state_lock:
+            return self._execute_buy(symbol, amount, "limit", limit_price=price)
 
     def create_market_sell_order(self, symbol, amount, params=None):
-        return self._execute_sell(symbol, amount)
+        with self._state_lock:
+            return self._execute_sell(symbol, amount)
 
     def create_order(self, symbol, order_type, side, amount, params=None):
-        params = params or {}
-        side_l = side.lower()
-        if side_l == "buy":
-            return self._execute_buy(symbol, amount,
-                                     leverage=float(params.get("leverage", 1.0)))
-        if side_l == "sell":
-            if symbol in self._positions and self._positions[symbol].side == "buy":
-                return self._execute_sell(symbol, amount)
-            return self._execute_short_open(symbol, amount,
-                                            leverage=float(params.get("leverage", 1.0)))
-        return {"filled": 0, "average": 0, "status": "rejected"}
+        with self._state_lock:
+            if params is None:
+                params = {}
+            if (
+                not isinstance(params, dict)
+                or not isinstance(side, str)
+                or not isinstance(order_type, str)
+                or order_type.strip().lower() != "market"
+            ):
+                return self._rejected()
+            side_l = side.lower()
+            position = self._positions.get(symbol)
+            if side_l == "buy":
+                if position is not None:
+                    if position.side == "sell":
+                        return self._execute_sell(symbol, amount)
+                    return self._rejected()
+                return self._execute_buy(
+                    symbol, amount, leverage=params.get("leverage", 1.0)
+                )
+            if side_l == "sell":
+                if position is not None:
+                    if position.side == "buy":
+                        return self._execute_sell(symbol, amount)
+                    return self._rejected()
+                return self._execute_short_open(
+                    symbol, amount, leverage=params.get("leverage", 1.0)
+                )
+            return self._rejected()
 
     def fetch_open_orders(self, symbol=None):
         return []
@@ -258,21 +315,88 @@ class SimulatedExchange:
     # Helpers
     # 
 
+    @staticmethod
+    def _rejected() -> dict:
+        return {"filled": 0, "average": 0, "status": "rejected"}
+
+    @staticmethod
+    def _finite_control(value, name: str) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be finite")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} must be finite") from exc
+        if not math.isfinite(parsed):
+            raise ValueError(f"{name} must be finite")
+        return parsed
+
+    @staticmethod
+    def _positive_finite(value) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(parsed) or parsed <= 0.0:
+            return None
+        return parsed
+
     def _get_live_price(self, symbol: str) -> tuple:
         try:
             ticker = self._ex.fetch_ticker(symbol)
-            bid    = float(ticker.get("bid") or ticker.get("last") or 0)
-            ask    = float(ticker.get("ask") or ticker.get("last") or 0)
-            vol    = float(ticker.get("quoteVolume") or 0)
-            mid    = (bid + ask) / 2 if (bid and ask) else float(ticker.get("last") or 0)
-            spread = (ask - bid) / mid * 100 if mid > 0 else 0.1
+            if not isinstance(ticker, dict):
+                raise ValueError("ticker is not a mapping")
+
+            def _optional_number(name: str) -> float | None:
+                raw = ticker.get(name)
+                if raw is None:
+                    return None
+                if isinstance(raw, bool):
+                    raise ValueError(f"boolean {name}")
+                value = float(raw)
+                if not math.isfinite(value):
+                    raise ValueError(f"non-finite {name}")
+                return value
+
+            bid = _optional_number("bid")
+            ask = _optional_number("ask")
+            # Exchanges commonly use zero for an unavailable sided quote.
+            if bid == 0.0:
+                bid = None
+            if ask == 0.0:
+                ask = None
+            if bid is None or ask is None:
+                last = _optional_number("last")
+                if last is None or last <= 0.0:
+                    raise ValueError("ticker has no usable last price")
+                bid = last if bid is None else bid
+                ask = last if ask is None else ask
+            if bid <= 0.0 or ask <= 0.0 or bid > ask:
+                raise ValueError("ticker quotes are invalid or crossed")
+
+            volume = _optional_number("quoteVolume")
+            vol = 0.0 if volume is None else volume
+            if vol < 0.0:
+                raise ValueError("ticker volume is negative")
+            # Half-sums avoid overflow for otherwise valid large quotes.
+            mid = bid / 2.0 + ask / 2.0
+            if not math.isfinite(mid) or mid <= 0.0:
+                raise ValueError("ticker midpoint is invalid")
+            spread = (ask - bid) / mid * 100.0
+            if not math.isfinite(spread) or spread < 0.0:
+                raise ValueError("ticker spread is invalid")
             return mid, bid, ask, spread, vol
+        # A market-data/network failure is an unavailable quote, never a
+        # simulated fill. Keep this boundary fail-closed for exchange-specific
+        # exception types as well as malformed payloads.
         except Exception:
             return 0.0, 0.0, 0.0, 0.1, 0.0
 
     def _simulate_latency(self) -> None:
         if self._latency_ms > 0:
-            time.sleep(self._latency_ms / 1000 * _RNG.uniform(0.5, 1.5))
+            time.sleep(self._latency_ms / 1000 * self._rng.uniform(0.5, 1.5))
 
     # 
     # Liquidation check
@@ -338,24 +462,57 @@ class SimulatedExchange:
         margin == notional. For futures (leverage > 1) only the margin is
         locked, leaving the rest of capital free for further trades.
         """
+        if symbol in self._positions:
+            return self._rejected()
+        normalized_amount = self._positive_finite(amount)
+        normalized_leverage = self._positive_finite(leverage)
+        if (
+            normalized_amount is None
+            or normalized_leverage is None
+            or (
+                normalized_leverage > 1.0
+                and normalized_leverage * self._maint_margin >= 1.0
+            )
+        ):
+            return self._rejected()
+        if order_type == "limit":
+            normalized_limit = self._positive_finite(limit_price)
+            if normalized_limit is None:
+                return self._rejected()
+            limit_price = normalized_limit
+        amount = normalized_amount
+        leverage = normalized_leverage
         self._simulate_latency()
         mid, bid, ask, spread, vol = self._get_live_price(symbol)
         if mid <= 0:
-            return {"filled": 0, "average": 0, "status": "rejected"}
+            return self._rejected()
+        if order_type == "limit" and limit_price < ask:
+            return self._rejected()
+
+        order_size_usdt = amount * mid
+        if not math.isfinite(order_size_usdt):
+            return self._rejected()
 
         fill_price = simulate_slippage(
-            price=ask if order_type == "market" else (limit_price or ask),
+            price=mid,
             side="buy", volume_24h_usdt=vol,
-            order_size_usdt=amount * mid, spread_pct=spread,
+            order_size_usdt=order_size_usdt, spread_pct=spread,
+            rng=self._rng,
         )
+        if order_type == "limit":
+            fill_price = max(ask, fill_price)
+            if fill_price > limit_price:
+                return self._rejected()
+        if not math.isfinite(fill_price) or fill_price <= 0.0:
+            return self._rejected()
 
         actual_amount = amount
         if self._partial_fill:
             liq           = min(1.0, vol / max(1, amount * mid * 1000))
-            actual_amount = simulate_partial_fill(amount, liq, spread)
+            actual_amount = simulate_partial_fill(amount, liq, spread, self._rng)
 
         taker    = self._taker_for(symbol)
-        lev      = max(1.0, float(leverage or 1.0))
+        lev      = max(1.0, leverage)
         notional = actual_amount * fill_price
         margin   = notional / lev
         fee_usdt = notional * taker   # fee is on FULL notional, not margin
@@ -408,31 +565,51 @@ class SimulatedExchange:
         (margin + PnL_after_exit_fee). Net capital change across the round trip
         == PnL - entry_fee - exit_fee, for ANY leverage.
         """
+        normalized_amount = self._positive_finite(amount)
+        if normalized_amount is None:
+            return self._rejected()
+        amount = normalized_amount
         self._simulate_latency()
         mid, bid, ask, spread, vol = self._get_live_price(symbol)
         if mid <= 0:
-            return {"filled": 0, "average": 0, "status": "rejected"}
+            return self._rejected()
 
         pos = self._positions.get(symbol)
         if pos is None:
+            order_size_usdt = amount * mid
+            if not math.isfinite(order_size_usdt):
+                return self._rejected()
             fill_price = simulate_slippage(
-                price=bid, side="sell", volume_24h_usdt=vol,
-                order_size_usdt=amount * mid, spread_pct=spread)
+                price=mid, side="sell", volume_24h_usdt=vol,
+                order_size_usdt=order_size_usdt, spread_pct=spread,
+                rng=self._rng)
+            if not math.isfinite(fill_price) or fill_price <= 0.0:
+                return self._rejected()
             return {"filled": 0, "average": fill_price, "status": "rejected"}
 
         # Liquidation check BEFORE the close.
         if self._check_liquidation(pos, mid):
             return self._force_liquidate(symbol, pos)
 
+        effective_amount = min(amount, pos.amount)
+        order_size_usdt = effective_amount * mid
+        if not math.isfinite(order_size_usdt) or order_size_usdt <= 0.0:
+            return self._rejected()
+        close_side = "buy" if pos.side == "sell" else "sell"
         fill_price = simulate_slippage(
-            price=bid, side="sell", volume_24h_usdt=vol,
-            order_size_usdt=amount * mid, spread_pct=spread)
+            price=mid, side=close_side, volume_24h_usdt=vol,
+            order_size_usdt=order_size_usdt, spread_pct=spread,
+            rng=self._rng)
+        if not math.isfinite(fill_price) or fill_price <= 0.0:
+            return self._rejected()
 
-        sell_amount = min(float(amount), pos.amount)
+        sell_amount = effective_amount
         if self._partial_fill and sell_amount > 0:
             liq = min(1.0, vol / max(1, sell_amount * mid * 1000))
             sell_amount = min(pos.amount,
-                              simulate_partial_fill(sell_amount, liq, spread))
+                              simulate_partial_fill(
+                                  sell_amount, liq, spread, self._rng
+                              ))
         if sell_amount <= 0:
             return {"filled": 0, "average": fill_price, "status": "rejected"}
 
@@ -473,7 +650,9 @@ class SimulatedExchange:
             self._positions.pop(symbol, None)
 
         self._trades.append(SimTrade(
-            symbol=symbol, side="sell", amount=sell_amount,
+            symbol=symbol,
+            side=("buy_to_cover" if pos.side == "sell" else "sell"),
+            amount=sell_amount,
             entry_price=pos.entry_price, exit_price=fill_price,
             pnl_usdt=round(pnl, 4), fee_usdt=exit_fee + entry_fee_share,
             entry_time=pos.entry_time, exit_time=_utcnow(),
@@ -483,7 +662,7 @@ class SimulatedExchange:
 
         return {
             "id":           f"SIM-{int(time.time()*1000)}",
-            "symbol":       symbol, "side":   "sell",
+            "symbol":       symbol, "side":   close_side,
             "amount":       sell_amount, "filled": sell_amount,
             "average":      fill_price, "price":  fill_price,
             "status":       "closed",
@@ -502,18 +681,46 @@ class SimulatedExchange:
         deducts (margin + fee), and the close path (_execute_sell with
         pos.side == 'sell') returns margin + PnL just like for longs.
         """
+        if symbol in self._positions:
+            return self._rejected()
+        normalized_amount = self._positive_finite(amount)
+        normalized_leverage = self._positive_finite(leverage)
+        if (
+            normalized_amount is None
+            or normalized_leverage is None
+            or (
+                normalized_leverage > 1.0
+                and normalized_leverage * self._maint_margin >= 1.0
+            )
+        ):
+            return self._rejected()
+        amount = normalized_amount
+        leverage = normalized_leverage
         self._simulate_latency()
         mid, bid, ask, spread, vol = self._get_live_price(symbol)
         if mid <= 0:
-            return {"filled": 0, "average": 0, "status": "rejected"}
+            return self._rejected()
+
+        order_size_usdt = amount * mid
+        if not math.isfinite(order_size_usdt):
+            return self._rejected()
 
         fill_price = simulate_slippage(
-            price=bid, side="sell", volume_24h_usdt=vol,
-            order_size_usdt=amount * mid, spread_pct=spread)
+            price=mid, side="sell", volume_24h_usdt=vol,
+            order_size_usdt=order_size_usdt, spread_pct=spread,
+            rng=self._rng)
+        if not math.isfinite(fill_price) or fill_price <= 0.0:
+            return self._rejected()
+
+        requested_amount = amount
+        actual_amount = amount
+        if self._partial_fill:
+            liq = min(1.0, vol / max(1, amount * mid * 1000))
+            actual_amount = simulate_partial_fill(amount, liq, spread, self._rng)
 
         taker    = self._taker_for(symbol)
-        lev      = max(1.0, float(leverage or 1.0))
-        notional = amount * fill_price
+        lev      = max(1.0, leverage)
+        notional = actual_amount * fill_price
         margin   = notional / lev
         fee_usdt = notional * taker
 
@@ -522,27 +729,27 @@ class SimulatedExchange:
             denom = (fill_price / lev) + (fill_price * taker)
             if denom <= 0:
                 return {"filled": 0, "average": fill_price, "status": "cancelled"}
-            amount   = max(0.0, free_usdt / denom)
-            notional = amount * fill_price
+            actual_amount = max(0.0, free_usdt / denom)
+            notional = actual_amount * fill_price
             margin   = notional / lev
             fee_usdt = notional * taker
 
-        if amount <= 0:
+        if actual_amount <= 0:
             return {"filled": 0, "average": fill_price, "status": "cancelled"}
 
         # Deduct margin + fee from capital (same as longs).
         self._capital    -= (margin + fee_usdt)
         self._total_fees += fee_usdt
         self._positions[symbol] = SimPosition(
-            symbol=symbol, side="sell", amount=amount,
+            symbol=symbol, side="sell", amount=actual_amount,
             entry_price=fill_price, fee_usdt=fee_usdt,
-            leverage=lev, original_amount=amount,
+            leverage=lev, original_amount=actual_amount,
             margin_locked=margin,
         )
         return {
             "id":      f"SIM-{int(time.time()*1000)}",
             "symbol":  symbol, "side":    "sell",
-            "amount":  amount, "filled":  amount,
+            "amount":  requested_amount, "filled":  actual_amount,
             "average": fill_price, "price":   fill_price,
             "status":  "closed",
             "fee":     {"cost": fee_usdt, "currency": "USDT"},
@@ -553,20 +760,24 @@ class SimulatedExchange:
     # 
 
     def get_report(self) -> dict:
-        if not self._trades:
+        with self._state_lock:
+            trades = tuple(self._trades)
+            total_fees = self._total_fees
+            initial_capital = self._initial_cap
+        if not trades:
             return {"error": "no trades yet"}
 
-        pnls      = [t.pnl_usdt for t in self._trades]
+        pnls      = [t.pnl_usdt for t in trades]
         wins      = [p for p in pnls if p >= 0]
         losses    = [p for p in pnls if p < 0]
-        slippages = [t.slippage_pct for t in self._trades]
-        liquidated = sum(1 for t in self._trades if t.liquidated)
+        slippages = [t.slippage_pct for t in trades]
+        liquidated = sum(1 for t in trades if t.liquidated)
         total_pnl = sum(pnls)
 
         try:
             from collections import defaultdict as _dd
             daily = _dd(float)
-            for t in self._trades:
+            for t in trades:
                 day = (t.exit_time or "").split(" ")[0]
                 if day:
                     daily[day] += t.pnl_usdt
@@ -587,14 +798,14 @@ class SimulatedExchange:
             max_dd = max(max_dd, peak - cum)
 
         return {
-            "trade_count":      len(self._trades),
+            "trade_count":      len(trades),
             "win_count":        len(wins),
             "loss_count":       len(losses),
             "liquidation_count": liquidated,
-            "win_rate":         round(len(wins) / len(self._trades), 4),
+            "win_rate":         round(len(wins) / len(trades), 4),
             "total_pnl_usdt":   round(total_pnl, 2),
-            "net_capital_usdt": round(self._initial_cap + total_pnl, 2),
-            "total_fees_usdt":  round(self._total_fees, 2),
+            "net_capital_usdt": round(initial_capital + total_pnl, 2),
+            "total_fees_usdt":  round(total_fees, 2),
             "avg_win_usdt":     round(statistics.mean(wins),   4) if wins   else 0.0,
             "avg_loss_usdt":    round(statistics.mean(losses), 4) if losses else 0.0,
             "profit_factor":    (
@@ -605,8 +816,8 @@ class SimulatedExchange:
             "sharpe_ratio":     round(sharpe, 3) if sharpe else None,
             "avg_slippage_pct": round(statistics.mean(slippages), 4) if slippages else 0.0,
             "max_slippage_pct": round(max(slippages), 4) if slippages else 0.0,
-            "initial_capital":  self._initial_cap,
-            "return_pct":       round(total_pnl / self._initial_cap * 100, 2),
+            "initial_capital":  initial_capital,
+            "return_pct":       round(total_pnl / initial_capital * 100, 2),
         }
 
     def print_report(self) -> None:

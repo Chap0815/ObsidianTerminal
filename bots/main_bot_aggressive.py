@@ -14,9 +14,11 @@ Strategy parameters from optimizer-validated 60-day run:
 from __future__ import annotations
 
 try:
-    from bots._bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
+    from bots._bootstrap import (bot_instance_guard, guard_pre_start,
+                                 prepare_entrypoint, require_portalocker)
 except ModuleNotFoundError:
-    from _bootstrap import guard_pre_start, prepare_entrypoint, require_portalocker
+    from _bootstrap import (bot_instance_guard, guard_pre_start,
+                            prepare_entrypoint, require_portalocker)
 
 prepare_entrypoint(__file__, __name__)
 
@@ -81,8 +83,9 @@ class AggressiveBot(SpotBot):
 
 def run_bot():
     """Entry point  -  kept for backward compat with launcher scripts."""
-    guard_pre_start("SPOT")
-    AggressiveBot(simulation=read_simulation_flag("SPOT")).run()
+    with bot_instance_guard("SPOT"):
+        guard_pre_start("SPOT")
+        AggressiveBot(simulation=read_simulation_flag("SPOT")).run()
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ Public API:
 """
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
@@ -66,6 +67,9 @@ def should_cooldown_after_exit(reason: str, profit_usdt: float) -> bool:
 _COOLDOWN_LOCK = threading.Lock()
 _MAX_COOLDOWN_MINUTES = 366 * 24 * 60
 _COOLDOWN_JSON_MAX_BYTES = 1024 * 1024
+_COOLDOWN_PERSIST_RETRY_SEC = 30.0
+_cooldown_retry_timers: dict[str, threading.Timer] = {}
+_cooldown_retry_data: dict[str, dict] = {}
 
 
 def _read_cooldown_json(path: str):
@@ -209,6 +213,86 @@ def _file_lock(path: str, timeout: float = 5.0):
 
 #  Public API 
 
+def _schedule_cooldown_retry_locked(path: str) -> None:
+    """Schedule one daemon persistence retry; caller holds _COOLDOWN_LOCK."""
+    existing = _cooldown_retry_timers.get(path)
+    if existing is not None:
+        try:
+            if existing.is_alive():
+                return
+        except Exception:
+            pass
+    timer = threading.Timer(
+        _COOLDOWN_PERSIST_RETRY_SEC,
+        lambda: _retry_cooldown_persist(path),
+    )
+    timer.daemon = True
+    _cooldown_retry_timers[path] = timer
+    try:
+        timer.start()
+    except Exception as exc:
+        if _cooldown_retry_timers.get(path) is timer:
+            _cooldown_retry_timers.pop(path, None)
+        try:
+            from bot_utils.silent_log import silent_log
+            silent_log("schedule cooldown persistence retry", exc)
+        except Exception:
+            pass
+
+
+def _retry_cooldown_persist(path: str) -> None:
+    with _COOLDOWN_LOCK:
+        _cooldown_retry_timers.pop(path, None)
+        data = _cooldown_retry_data.get(path)
+        if data is not None:
+            _persist_with_retry_locked(path, data)
+
+
+def _persist_with_retry_locked(path: str, data: dict) -> bool:
+    """Persist now and retain the latest live mapping until it is durable."""
+    try:
+        persisted = bool(_persist(path, data))
+    except Exception:
+        persisted = False
+    if persisted:
+        _cooldown_retry_data.pop(path, None)
+        timer = _cooldown_retry_timers.pop(path, None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        return True
+    if not path:
+        return False
+    _cooldown_retry_data[path] = data
+    _schedule_cooldown_retry_locked(path)
+    return False
+
+
+def flush_pending_cooldowns() -> bool:
+    """Make one final synchronous attempt for all deferred snapshots."""
+    with _COOLDOWN_LOCK:
+        timers = list(_cooldown_retry_timers.values())
+        _cooldown_retry_timers.clear()
+        for timer in timers:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+        all_persisted = True
+        for path, data in list(_cooldown_retry_data.items()):
+            try:
+                persisted = bool(_persist(path, data))
+            except Exception:
+                persisted = False
+            if persisted:
+                _cooldown_retry_data.pop(path, None)
+            else:
+                all_persisted = False
+        return all_persisted
+
 def set_cooldown(cool: dict, symbol: str, minutes: int,
                  cooldown_file: str) -> bool:
     """Set a cooldown for ``minutes`` minutes from now."""
@@ -220,7 +304,7 @@ def set_cooldown(cool: dict, symbol: str, minutes: int,
     expiry_iso = (_utcnow() + timedelta(minutes=minutes)).isoformat()
     with _COOLDOWN_LOCK:
         cool[symbol] = expiry_iso
-        return _persist(cooldown_file, cool)
+        return _persist_with_retry_locked(cooldown_file, cool)
 
 
 def check_in_cooldown(cool: dict, symbol: str) -> bool:
@@ -254,7 +338,7 @@ def is_in_cooldown(cool: dict, symbol: str, cooldown_file: str) -> bool:
             cool.pop(symbol, None)
         except (TypeError, ValueError):
             cool.pop(symbol, None)
-        _persist(cooldown_file, cool)
+        _persist_with_retry_locked(cooldown_file, cool)
     return False
 
 
@@ -276,7 +360,7 @@ def purge_expired(cool: dict, cooldown_file: str) -> int:
                 cool.pop(sym, None)
                 removed += 1
         if removed > 0:
-            _persist(cooldown_file, cool)
+            _persist_with_retry_locked(cooldown_file, cool)
     return removed
 
 
@@ -370,3 +454,6 @@ def _atomic_write_json(path: str, data: dict) -> None:
                 os.remove(tmp)
         except OSError:
             pass
+
+
+atexit.register(flush_pending_cooldowns)

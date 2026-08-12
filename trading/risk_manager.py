@@ -116,8 +116,11 @@ _CONFIG_LOCK              = threading.RLock()
 
 _ADAPT_LAST_RUN: dict     = {}
 _ADAPT_LOCK               = threading.Lock()
+_ADAPT_RUNNING: set[str]  = set()
+_ADAPT_FAILURE_RETRY_UNTIL: dict[str, float] = {}
 # 10 min  bei vielen aufeinanderfolgenden SL soll wieder adaptiert werden
 _ADAPT_MIN_INTERVAL       = 600.0
+_ADAPT_FAILURE_RETRY_SEC  = 60.0
 
 _reflection_cache: dict   = {}
 _REFLECTION_LOCK          = threading.RLock()
@@ -608,7 +611,11 @@ def is_bot_paused(bot_name: str, exchange=None, simulation: bool = True) -> tupl
         if killed:
             return True, reason
     except Exception:
-        pass
+        return _cache_entry_telemetry_pause(
+            bot_name,
+            _time.monotonic(),
+            "Kill-switch evaluation unavailable",
+        )
 
     pnl = get_today_pnl(bot_name)
     if pnl["is_paused"]:
@@ -699,12 +706,36 @@ def get_reflection_context(bot_name: str) -> str:
 
 
 def analyze_and_adapt(bot_name: str, force: bool = False):
-    now = _time.monotonic()
+    started = _time.monotonic()
     with _ADAPT_LOCK:
-        last = _ADAPT_LAST_RUN.get(bot_name, 0.0)
-        if not force and (now - last) < _ADAPT_MIN_INTERVAL:
+        if bot_name in _ADAPT_RUNNING:
             return
-        _ADAPT_LAST_RUN[bot_name] = now
+        if not force and started < _ADAPT_FAILURE_RETRY_UNTIL.get(bot_name, 0.0):
+            return
+        last = _ADAPT_LAST_RUN.get(bot_name)
+        if (not force and last is not None
+                and (started - last) < _ADAPT_MIN_INTERVAL):
+            return
+        _ADAPT_RUNNING.add(bot_name)
+
+    completed = False
+    try:
+        _analyze_and_adapt_once(bot_name)
+        completed = True
+    finally:
+        finished = _time.monotonic()
+        with _ADAPT_LOCK:
+            _ADAPT_RUNNING.discard(bot_name)
+            if completed:
+                _ADAPT_LAST_RUN[bot_name] = finished
+                _ADAPT_FAILURE_RETRY_UNTIL.pop(bot_name, None)
+            else:
+                _ADAPT_FAILURE_RETRY_UNTIL[bot_name] = (
+                    finished + _ADAPT_FAILURE_RETRY_SEC
+                )
+
+
+def _analyze_and_adapt_once(bot_name: str) -> None:
 
     # Opt-out for strategies that don't use Kelly / RSI-threshold / blacklist /
     # bad-hours learning  e.g. the trend bot, which sizes from POSITION_SIZE
@@ -1196,6 +1227,36 @@ def _alert_kill_switch(bot_name: str, reason: str,
         pass
 
 
+def _cache_entry_telemetry_pause(
+    bot_name: str,
+    now: float,
+    reason: str,
+) -> tuple[bool, str]:
+    """Pause new entries briefly when a kill-switch input is unavailable."""
+    with _KILL_SWITCH_LOCK:
+        cached = _KILL_SWITCH_CACHE.get(bot_name)
+        try:
+            cached_until = float(cached.get("until", 0.0)) if cached else 0.0
+            cached_reason = str(cached.get("reason") or "") if cached else ""
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            cached_until = 0.0
+            cached_reason = ""
+        if cached_until > now and cached_reason:
+            return True, cached_reason
+        _KILL_SWITCH_CACHE[bot_name] = {
+            "until": now + 60.0,
+            "reason": reason,
+        }
+    try:
+        log_event(
+            f"[{bot_name}] {reason} - pausing entries 60s",
+            "WARN",
+        )
+    except Exception:
+        pass
+    return True, reason
+
+
 def check_kill_switches(bot_name: str, exchange=None,
                         simulation: bool = True) -> tuple:
     now = _time.monotonic()
@@ -1293,7 +1354,11 @@ def check_kill_switches(bot_name: str, exchange=None,
                 bot_name, reason, telegram_enabled=not simulation)
             return True, reason
     except Exception:
-        pass
+        return _cache_entry_telemetry_pause(
+            bot_name,
+            now,
+            "STOP: Kill-Switch: loss-streak telemetry unavailable",
+        )
 
     try:
         from core.database import get_connection
@@ -1325,7 +1390,11 @@ def check_kill_switches(bot_name: str, exchange=None,
                     bot_name, reason, telegram_enabled=not simulation)
                 return True, reason
     except Exception:
-        pass
+        return _cache_entry_telemetry_pause(
+            bot_name,
+            now,
+            "STOP: Kill-Switch: API risk telemetry unavailable",
+        )
 
     if exchange is not None:
         try:

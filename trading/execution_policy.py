@@ -23,6 +23,20 @@ def _finite(value, name: str) -> float:
     return number
 
 
+def _positive_integer(value, name: str) -> int:
+    number = _finite(value, name)
+    if number <= 0.0 or not number.is_integer():
+        raise ValueError(f"{name} must be a positive integer")
+    return int(number)
+
+
+def _nonnegative(value, name: str) -> float:
+    number = _finite(value, name)
+    if number < 0.0:
+        raise ValueError(f"{name} must be non-negative")
+    return number
+
+
 @dataclass(frozen=True)
 class ExecutionPolicyEvidence:
     gross_edge_bps: float | None
@@ -64,12 +78,20 @@ def evaluate_shadow_execution_policy(
     edge_safety_buffer_bps: float = 0.0,
 ) -> ExecutionPolicyDecision:
     """Choose a research recommendation from fully observed cost evidence."""
+    minimum = _positive_integer(minimum_samples, "minimum_samples")
+    maker_savings = _nonnegative(
+        minimum_maker_savings_bps, "minimum_maker_savings_bps"
+    )
+    edge_buffer = _nonnegative(
+        edge_safety_buffer_bps, "edge_safety_buffer_bps"
+    )
     reasons: list[str] = []
     try:
-        samples = int(evidence.samples)
-    except (TypeError, ValueError, OverflowError):
-        samples = -1
-    if samples < max(1, int(minimum_samples)):
+        samples = _positive_integer(evidence.samples, "samples")
+    except ValueError:
+        samples = 0
+        reasons.append("sample_count_invalid")
+    if samples and samples < minimum:
         reasons.append("sample_count_below_minimum")
     if evidence.sequence_valid is not True:
         reasons.append("sequence_valid_evidence_missing")
@@ -112,18 +134,39 @@ def evaluate_shadow_execution_policy(
     maker_cost_if_filled = (
         parsed["maker_fee_bps"] + parsed["maker_adverse_selection_bps"]
     )
+    missed_then_taker = parsed["missed_fill_cost_bps"] + taker_cost
     maker_cost = (
         probability * maker_cost_if_filled
         + (1.0 - probability)
-        * (parsed["missed_fill_cost_bps"] + taker_cost)
+        * missed_then_taker
     )
     best_cost = min(taker_cost, maker_cost)
     best_net_edge = parsed["gross_edge_bps"] - best_cost
-    if best_net_edge <= max(0.0, float(edge_safety_buffer_bps)):
+    maker_threshold = maker_cost + maker_savings
+    if not all(
+        math.isfinite(value)
+        for value in (
+            maker_cost_if_filled,
+            missed_then_taker,
+            maker_cost,
+            best_cost,
+            best_net_edge,
+            maker_threshold,
+        )
+    ):
+        return ExecutionPolicyDecision(
+            action="INSUFFICIENT_DATA",
+            expected_taker_cost_bps=taker_cost,
+            expected_maker_cost_bps=None,
+            expected_net_edge_bps=None,
+            samples=samples,
+            reasons=("derived_cost_nonfinite",),
+        )
+    if best_net_edge <= edge_buffer:
         action = "ABSTAIN"
         net_edge = best_net_edge
         reasons = ["net_edge_not_positive_after_execution"]
-    elif maker_cost + max(0.0, float(minimum_maker_savings_bps)) <= taker_cost:
+    elif maker_threshold <= taker_cost:
         action = "MAKER"
         net_edge = parsed["gross_edge_bps"] - maker_cost
         reasons = ["maker_expected_cost_lower"]

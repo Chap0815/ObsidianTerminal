@@ -1,0 +1,261 @@
+"""Best-effort candidate and SIM execution telemetry.
+
+This module is research-only.  Failures are observable but never block or
+alter an entry.  Unified order books remain snapshot/sequence-unverified.
+"""
+from __future__ import annotations
+
+import math
+import time
+from dataclasses import asdict
+from datetime import datetime, timezone
+
+
+def _positive(value, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be positive and finite")
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        raise ValueError(f"{name} must be positive and finite")
+    return parsed
+
+
+def _persist_sim_tca_capture_failure(
+    *,
+    entry_id: str,
+    bot_name: str,
+    mode: str,
+    symbol: str,
+    reason: str,
+    error_type: str,
+) -> bool:
+    try:
+        from core.database import save_candidate_microstructure
+
+        persisted = save_candidate_microstructure(
+            entry_id=entry_id,
+            bot_name=bot_name,
+            mode=mode,
+            symbol=symbol,
+            stage="arrival_book_unavailable",
+            measured_at=datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            source="sim_tca_capture",
+            sequence_status="capture_failed",
+            payload={
+                "bot_name": bot_name,
+                "error_type": str(error_type or "UnknownError")[:100],
+                "markouts_scheduled": True,
+                "mode": mode,
+                "reason": str(reason)[:100],
+                "research_simulated": True,
+            },
+        )
+        if not persisted:
+            raise RuntimeError("SIM TCA capture failure was not persisted")
+        return True
+    except Exception as exc:
+        try:
+            from bot_utils.silent_log import silent_log
+
+            silent_log("persist candidate simulated TCA failure", exc)
+        except Exception:
+            pass
+        return False
+
+
+def capture_simulated_entry_tca(
+    *,
+    exchange,
+    entry_id: str,
+    bot_name: str,
+    mode: str,
+    symbol: str,
+    side: str,
+    amount: float,
+    fill_price: float,
+    fee_rate: float,
+    notional_usdt: float | None = None,
+    depth_levels: int = 20,
+    consume_api=None,
+    record_tca=None,
+    schedule_markouts=None,
+    persist_snapshot=None,
+) -> bool:
+    """Record SIM arrival/fill/markouts without creating an order intent."""
+    default_persistence = False
+    markouts_scheduled = False
+    failure_reason = "capture_validation_failed"
+    try:
+        normalized_mode = str(mode).strip().upper()
+        normalized_bot = str(bot_name).strip().upper()
+        normalized_side = str(side).strip().lower()
+        normalized_entry_id = str(entry_id).strip()
+        normalized_symbol = str(symbol).strip()
+        if normalized_mode != "SIM":
+            raise ValueError("simulated TCA requires SIM mode")
+        if normalized_bot not in {"CROSS", "FUTREND"}:
+            raise ValueError("simulated TCA bot is unsupported")
+        if normalized_side not in {"buy", "sell"}:
+            raise ValueError("side must be buy or sell")
+        if not normalized_entry_id or not normalized_symbol:
+            raise ValueError("entry id and symbol are required")
+        requested_amount = _positive(amount, "amount")
+        reference = _positive(fill_price, "fill price")
+        fee = float(fee_rate)
+        if not math.isfinite(fee) or not 0.0 <= fee <= 0.01:
+            raise ValueError("fee rate is invalid")
+        notional = (
+            _positive(notional_usdt, "notional")
+            if notional_usdt is not None
+            else requested_amount * reference
+        )
+        levels = int(depth_levels)
+        if levels < 5 or levels > 100:
+            raise ValueError("depth levels must be between 5 and 100")
+
+        default_persistence = (
+            record_tca is None
+            and schedule_markouts is None
+            and persist_snapshot is None
+        )
+        if default_persistence:
+            from core.database import has_simulated_expectancy_candidate
+
+            if not has_simulated_expectancy_candidate(
+                normalized_entry_id, normalized_bot
+            ):
+                return False
+            failure_reason = "markout_schedule_failed"
+            from core.database import schedule_simulated_execution_markouts
+
+            schedule_simulated_execution_markouts(
+                normalized_entry_id,
+                symbol=normalized_symbol,
+                side=normalized_side,
+                reference_price=reference,
+            )
+            markouts_scheduled = True
+
+        failure_reason = "api_budget_check_failed"
+        if consume_api is None:
+            from bot_utils.api_budget import try_consume_api_call as consume
+        else:
+            consume = consume_api
+        if not consume("candidate_microstructure_fetch_order_book"):
+            if default_persistence and markouts_scheduled:
+                _persist_sim_tca_capture_failure(
+                    entry_id=normalized_entry_id,
+                    bot_name=normalized_bot,
+                    mode=normalized_mode,
+                    symbol=normalized_symbol,
+                    reason="api_budget_denied",
+                    error_type="ApiBudgetDenied",
+                )
+            return False
+        failure_reason = "orderbook_fetch_failed"
+        book = exchange.fetch_order_book(normalized_symbol, limit=levels)
+        failure_reason = "arrival_tca_invalid"
+        from trading.execution_quality import build_arrival_tca, compute_fill_tca
+
+        arrival = build_arrival_tca(
+            book,
+            side=normalized_side,
+            amount=requested_amount,
+            local_time_ms=int(time.time() * 1000),
+        )
+        fill = compute_fill_tca(
+            arrival,
+            average_fill_price=reference,
+            fee_rate=fee,
+        )
+        arrival_payload = {
+            **asdict(arrival),
+            "bot_name": normalized_bot,
+            "mode": normalized_mode,
+            "research_simulated": True,
+            "sequence_valid": False,
+            "sequence_status": "unverified_unified_orderbook",
+            "queue_position_claimed": False,
+            "notional_usdt": notional,
+        }
+        fill_payload = {
+            **asdict(fill),
+            "bot_name": normalized_bot,
+            "mode": normalized_mode,
+            "research_simulated": True,
+        }
+        measured_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        if default_persistence:
+            failure_reason = "bundle_persist_failed"
+            from core.database import persist_simulated_entry_tca_bundle
+
+            persist_simulated_entry_tca_bundle(
+                normalized_entry_id,
+                bot_name=normalized_bot,
+                symbol=normalized_symbol,
+                side=normalized_side,
+                reference_price=reference,
+                measured_at=measured_at,
+                arrival_payload=arrival_payload,
+                fill_payload=fill_payload,
+            )
+        else:
+            if record_tca is None:
+                from core.database import (
+                    record_simulated_execution_tca as tca_writer,
+                )
+            else:
+                tca_writer = record_tca
+            tca_writer(normalized_entry_id, "arrival", arrival_payload)
+            tca_writer(normalized_entry_id, "fill", fill_payload)
+
+            if persist_snapshot is None:
+                from core.database import (
+                    save_candidate_microstructure as snapshot_writer,
+                )
+            else:
+                snapshot_writer = persist_snapshot
+            snapshot_writer(
+                entry_id=normalized_entry_id,
+                bot_name=normalized_bot,
+                mode=normalized_mode,
+                symbol=normalized_symbol,
+                stage="arrival_book",
+                measured_at=measured_at,
+                source="sim_tca_rest_orderbook",
+                sequence_status="unverified_unified_orderbook",
+                payload=arrival_payload,
+            )
+
+            if schedule_markouts is None:
+                from core.database import (
+                    schedule_simulated_execution_markouts as scheduler,
+                )
+            else:
+                scheduler = schedule_markouts
+            scheduler(
+                normalized_entry_id,
+                symbol=normalized_symbol,
+                side=normalized_side,
+                reference_price=reference,
+            )
+        return True
+    except Exception as exc:
+        if default_persistence and markouts_scheduled:
+            _persist_sim_tca_capture_failure(
+                entry_id=normalized_entry_id,
+                bot_name=normalized_bot,
+                mode=normalized_mode,
+                symbol=normalized_symbol,
+                reason=failure_reason,
+                error_type=type(exc).__name__,
+            )
+        try:
+            from bot_utils.silent_log import silent_log
+
+            silent_log("candidate simulated TCA", exc)
+        except Exception:
+            pass
+        return False
