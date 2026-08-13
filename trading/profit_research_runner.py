@@ -15,9 +15,12 @@ from trading.carry_sim import CarryEngine, CarryTerms
 from trading.execution_cost_model import (
     ExecutionCostObservation,
     decode_execution_cost_payload,
+    execution_cost_payloads_match,
+    execution_cost_volatility_bps,
     execution_cost_stages_are_causal,
     normalize_execution_cost_limit,
     normalize_execution_cost_minimum_samples,
+    resolve_execution_cost_notional,
     validate_execution_cost_arrival,
     validate_execution_cost_fill,
 )
@@ -372,17 +375,34 @@ def load_execution_cost_observations(
     bot: str | None = None,
     mode: str | None = None,
     limit: int = 10_000,
+    rejection_counts: Counter | None = None,
 ) -> list[ExecutionCostObservation]:
     normalized_limit = normalize_execution_cost_limit(limit)
     normalized_bot, normalized_mode = _normalize_execution_cost_scope(
         bot, mode
     )
     path = Path(root) / "data" / "trading_bot.db"
+
+    def record_key(record) -> tuple[bool, datetime, int, str]:
+        source, row = record
+        measured_at = _utc_datetime(row["measured_at"])
+        try:
+            tca_id = int(row["tca_id"])
+        except (TypeError, ValueError, OverflowError):
+            tca_id = -1
+        return (
+            measured_at is not None,
+            measured_at or datetime.min.replace(tzinfo=timezone.utc),
+            tca_id,
+            source,
+        )
+
     try:
         conn = _read_connection(path)
     except FileNotFoundError:
         return []
     try:
+        conn.execute("BEGIN")
         if not _table_exists(conn, "execution_tca") or not (
             _table_exists(conn, "order_intents")
             or _table_exists(conn, "expectancy_candidates")
@@ -437,7 +457,7 @@ def load_execution_cost_observations(
                 f"AND UPPER({bot_expr})=? AND UPPER({mode_expr})=? "
             )
             params = (normalized_bot, normalized_mode)
-        records = [("execution", row) for row in conn.execute(
+        execution_select = (
             "SELECT t.id AS tca_id, t.intent_id, t.stage, t.payload_json, "
             f"{measured_at_expr} AS measured_at, "
             f"{symbol_expr} AS symbol, {notional_expr} AS filled_notional "
@@ -446,74 +466,125 @@ def load_execution_cost_observations(
             + candidate_join
             + "WHERE t.stage IN ('arrival','fill') "
             + scope_sql
-            + "ORDER BY julianday(measured_at) DESC, t.id DESC LIMIT ?",
-            (*params, normalized_limit),
-        ).fetchall()]
-        if (
+        )
+        candidate_records = [
+            ("execution", row)
+            for row in conn.execute(
+                execution_select
+                + "ORDER BY julianday(measured_at) DESC, t.id DESC LIMIT ?",
+                (*params, normalized_limit),
+            ).fetchall()
+        ]
+        has_sim_tca = (
             has_candidates
             and _table_exists(conn, "sim_execution_tca")
             and normalized_mode in {None, "SIM"}
-        ):
-            sim_scope_sql = ""
-            sim_params: tuple = ()
+        )
+        sim_select = ""
+        sim_scope_sql = ""
+        sim_params: tuple = ()
+        if has_sim_tca:
             if normalized_bot is not None:
                 sim_scope_sql = "AND UPPER(e.bot_name)=? AND UPPER(e.mode)=? "
                 sim_params = (normalized_bot, normalized_mode)
-            records.extend(
+            sim_select = (
+                """SELECT t.id AS tca_id, t.entry_id AS intent_id,
+                          t.measured_at, t.stage, t.payload_json,
+                          e.symbol AS symbol, NULL AS filled_notional
+                     FROM sim_execution_tca t
+                     JOIN expectancy_candidates e ON e.entry_id=t.entry_id
+                    WHERE t.stage IN ('arrival','fill') """
+                + sim_scope_sql
+            )
+            candidate_records.extend(
                 ("sim", row)
                 for row in conn.execute(
-                    """SELECT t.id AS tca_id, t.entry_id AS intent_id,
-                              t.measured_at, t.stage, t.payload_json,
-                              e.symbol AS symbol, NULL AS filled_notional
-                         FROM sim_execution_tca t
-                         JOIN expectancy_candidates e ON e.entry_id=t.entry_id
-                        WHERE t.stage IN ('arrival','fill') """
-                    + sim_scope_sql
+                    sim_select
                     + "ORDER BY julianday(t.measured_at) DESC, t.id DESC LIMIT ?",
-                    (
-                        *sim_params,
-                        normalized_limit,
-                    ),
+                    (*sim_params, normalized_limit),
                 ).fetchall()
             )
+        anchors = sorted(
+            candidate_records, key=record_key, reverse=True
+        )[:normalized_limit]
+        selected = defaultdict(set)
+        for source, row in anchors:
+            selected[source].add(str(row["intent_id"]))
+
+        records = []
+        for source, identifiers in selected.items():
+            ordered = sorted(identifiers)
+            for offset in range(0, len(ordered), 500):
+                chunk = ordered[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                if source == "execution":
+                    query = (
+                        execution_select
+                        + f"AND t.intent_id IN ({placeholders}) "
+                        + "ORDER BY julianday(measured_at) DESC, t.id DESC"
+                    )
+                    query_params = (*params, *chunk)
+                else:
+                    query = (
+                        sim_select
+                        + f"AND t.entry_id IN ({placeholders}) "
+                        + "ORDER BY julianday(t.measured_at) DESC, t.id DESC"
+                    )
+                    query_params = (*sim_params, *chunk)
+                records.extend(
+                    (source, row)
+                    for row in conn.execute(query, query_params).fetchall()
+                )
     finally:
-        conn.close()
-
-    def record_key(record) -> tuple[bool, datetime, int, str]:
-        source, row = record
-        measured_at = _utc_datetime(row["measured_at"])
         try:
-            tca_id = int(row["tca_id"])
-        except (TypeError, ValueError, OverflowError):
-            tca_id = -1
-        return (
-            measured_at is not None,
-            measured_at or datetime.min.replace(tzinfo=timezone.utc),
-            tca_id,
-            source,
-        )
+            if conn.in_transaction:
+                conn.rollback()
+        finally:
+            conn.close()
 
-    records = sorted(records, key=record_key, reverse=True)[:normalized_limit]
+    records = sorted(records, key=record_key, reverse=True)
     paired: dict[
         tuple[str, str], dict[str, tuple[dict, object, object]]
     ] = defaultdict(dict)
     metadata = {}
+    invalid_payloads: set[tuple[str, str]] = set()
+    conflicting_stages: set[tuple[str, str]] = set()
     for source, row in records:
+        key = (source, str(row["intent_id"]))
+        stage = str(row["stage"])
+        metadata[key] = (row["symbol"], row["filled_notional"])
         try:
             payload = decode_execution_cost_payload(row["payload_json"])
         except ValueError:
+            if stage not in paired[key]:
+                invalid_payloads.add(key)
             continue
-        key = (source, str(row["intent_id"]))
-        paired[key].setdefault(
-            str(row["stage"]),
-            (payload, row["tca_id"], row["measured_at"]),
-        )
-        metadata[key] = (row["symbol"], row["filled_notional"])
+        existing = paired[key].get(stage)
+        if existing is not None:
+            if not execution_cost_payloads_match(existing[0], payload):
+                conflicting_stages.add(key)
+            continue
+        paired[key][stage] = (payload, row["tca_id"], row["measured_at"])
     observations = []
     for key, stages in paired.items():
+        if key in invalid_payloads:
+            if rejection_counts is not None:
+                rejection_counts["invalid_payload"] += 1
+            continue
+        if key in conflicting_stages:
+            if rejection_counts is not None:
+                rejection_key = (
+                    "conflicting_sim_stage"
+                    if key[0] == "sim"
+                    else "conflicting_execution_stage"
+                )
+                rejection_counts[rejection_key] += 1
+            continue
         arrival_stage = stages.get("arrival")
         fill_stage = stages.get("fill")
         if arrival_stage is None or fill_stage is None:
+            if rejection_counts is not None:
+                rejection_counts["incomplete_pair"] += 1
             continue
         arrival, arrival_id, arrival_time = arrival_stage
         fill, fill_id, fill_time = fill_stage
@@ -523,14 +594,16 @@ def load_execution_cost_observations(
             fill_id=fill_id,
             fill_time=fill_time,
         ):
+            if rejection_counts is not None:
+                rejection_counts["noncausal_pair"] += 1
             continue
         symbol, notional = metadata[key]
-        observed_notional = _finite(notional)
-        if observed_notional is None or observed_notional <= 0.0:
-            observed_notional = _finite(arrival.get("notional_usdt"))
         try:
             validate_execution_cost_arrival(arrival)
             validate_execution_cost_fill(fill)
+            observed_notional = resolve_execution_cost_notional(
+                notional, arrival
+            )
             observations.append(
                 ExecutionCostObservation(
                     symbol=symbol,
@@ -539,10 +612,12 @@ def load_execution_cost_observations(
                     depth_coverage=arrival["depth_coverage"],
                     notional_usdt=observed_notional,
                     regime=arrival.get("regime", "unknown"),
-                    volatility_bps=arrival.get("volatility_bps") or 0.0,
+                    volatility_bps=execution_cost_volatility_bps(arrival),
                 )
             )
         except (KeyError, TypeError, ValueError):
+            if rejection_counts is not None:
+                rejection_counts["invalid_observation"] += 1
             continue
     return observations
 
@@ -586,19 +661,31 @@ def build_execution_cost_report(
 ) -> dict:
     required = normalize_execution_cost_minimum_samples(minimum_samples)
     normalized_bot, normalized_mode = _normalize_execution_cost_scope(bot, mode)
+    rejected = Counter()
     observations = load_execution_cost_observations(
-        root, bot=normalized_bot, mode=normalized_mode
+        root,
+        bot=normalized_bot,
+        mode=normalized_mode,
+        rejection_counts=rejected,
     )
     costs = [row.total_cost_bps for row in observations]
     by_symbol = Counter(row.symbol for row in observations)
+    total = len(observations) + sum(rejected.values())
+    quality_coverage = len(observations) / total if total else 0.0
     return {
         "scope": {
             "bot": normalized_bot,
             "mode": normalized_mode,
         },
         "valid_samples": len(observations),
+        "total_samples": total,
+        "quality_coverage": quality_coverage,
+        "minimum_quality_coverage": 0.95,
+        "rejected": dict(sorted(rejected.items())),
         "minimum_samples": required,
-        "ready": len(observations) >= required,
+        "ready": (
+            len(observations) >= required and quality_coverage >= 0.95
+        ),
         "median_cost_bps": _quantile(costs, 0.5),
         "p75_cost_bps": _quantile(costs, 0.75),
         "p95_cost_bps": _quantile(costs, 0.95),
@@ -727,7 +814,7 @@ def _venue_partition_key(path: Path) -> tuple[bool, datetime, str]:
     return True, partition_day, path.name
 
 
-def _venue_row_key(row: dict) -> tuple[bool, datetime, str, str]:
+def _venue_row_key(row: dict) -> tuple[bool, datetime, str, str, str]:
     exchange_time = str(row["exchange_time"])
     timestamp = _utc_datetime(exchange_time)
     return (
@@ -735,7 +822,16 @@ def _venue_row_key(row: dict) -> tuple[bool, datetime, str, str]:
         timestamp or datetime.min.replace(tzinfo=timezone.utc),
         exchange_time,
         str(row["market_id"]),
+        str(row["event_id"]),
     )
+
+
+_LATEST_VENUE_ROWS_SQL = (
+    "SELECT event_id, market_id, exchange_time, quality_flags_json, payload_json "
+    "FROM venue_events "
+    "ORDER BY exchange_time DESC, market_id DESC, event_id DESC "
+    "LIMIT ?"
+)
 
 
 def _venue_rows(root: Path, stream: str, *, limit: int) -> list[dict]:
@@ -750,10 +846,7 @@ def _venue_rows(root: Path, stream: str, *, limit: int) -> list[dict]:
         try:
             conn = _read_connection(path)
             fetched = conn.execute(
-                "SELECT market_id, exchange_time, quality_flags_json, payload_json "
-                "FROM venue_events "
-                "ORDER BY julianday(exchange_time) DESC, exchange_time DESC "
-                "LIMIT ?",
+                _LATEST_VENUE_ROWS_SQL,
                 (limit - len(rows),),
             ).fetchall()
         except (OSError, sqlite3.Error):
@@ -762,6 +855,7 @@ def _venue_rows(root: Path, stream: str, *, limit: int) -> list[dict]:
             if conn is not None:
                 conn.close()
         for row in fetched:
+            event_id = str(row["event_id"])
             market_id = str(row["market_id"])
             exchange_time = str(row["exchange_time"])
             try:
@@ -774,6 +868,7 @@ def _venue_rows(root: Path, stream: str, *, limit: int) -> list[dict]:
                 payload = decode_execution_cost_payload(row["payload_json"])
                 rows.append(
                     {
+                        "event_id": event_id,
                         "market_id": market_id,
                         "exchange_time": exchange_time,
                         "flags": tuple(raw_flags),
@@ -783,6 +878,7 @@ def _venue_rows(root: Path, stream: str, *, limit: int) -> list[dict]:
             except (TypeError, ValueError, OverflowError):
                 rows.append(
                     {
+                        "event_id": event_id,
                         "market_id": market_id,
                         "exchange_time": exchange_time,
                         "flags": ("invalid_event_envelope",),

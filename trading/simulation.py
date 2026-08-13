@@ -62,6 +62,9 @@ def _make_rng(seed=None) -> random.Random:
 
 
 _RNG = _make_rng()
+_ORDER_ID_LOCK = threading.Lock()
+_ORDER_ID_SEQUENCE = 0
+PNL_ZERO_TOLERANCE_USDT = 1e-9
 
 
 def _utcnow() -> str:
@@ -253,9 +256,16 @@ class SimulatedExchange:
         """``used`` here is purely informational (sum of currently-locked
         margins)  it does NOT reduce free."""
         with self._state_lock:
+            positions = self.fetch_positions()
             used = sum(pos.margin_locked for pos in self._positions.values())
             free = self._free_usdt()
-            total = self._capital + used  # capital + locked margin = equity-ish
+            unrealized = math.fsum(
+                value
+                for row in positions
+                if (value := row.get("unrealizedPnl")) is not None
+                and math.isfinite(value)
+            )
+            total = self._capital + used + unrealized
         return {
             "USDT":  {"free": free, "used": used,  "total": total},
             "total": {"USDT": total},
@@ -309,7 +319,75 @@ class SimulatedExchange:
     def fetch_open_orders(self, symbol=None):
         return []
     def fetch_positions(self, symbols=None):
-        return []
+        if symbols is None:
+            selected = None
+        elif isinstance(symbols, str):
+            selected = {symbols}
+        else:
+            try:
+                selected = {str(symbol) for symbol in symbols}
+            except TypeError:
+                return []
+        with self._state_lock:
+            snapshots = [
+                (
+                    symbol,
+                    pos.side,
+                    pos.amount,
+                    pos.entry_price,
+                    pos.leverage,
+                    pos.margin_locked,
+                    pos.liquidation_price(self._maint_margin),
+                )
+                for symbol, pos in self._positions.items()
+                if selected is None or symbol in selected
+            ]
+        rows = []
+        for (
+            symbol,
+            side,
+            amount,
+            entry_price,
+            leverage,
+            margin_locked,
+            liquidation_price,
+        ) in snapshots:
+            mark_price = self._get_live_price(symbol)[0]
+            market_data_available = mark_price > 0.0
+            if market_data_available:
+                notional = amount * mark_price
+                unrealized = (
+                    (mark_price - entry_price) * amount
+                    if side == "buy"
+                    else (entry_price - mark_price) * amount
+                )
+            else:
+                mark_price = None
+                notional = None
+                unrealized = None
+            rows.append({
+                "symbol": symbol,
+                "side": "long" if side == "buy" else "short",
+                "contracts": amount,
+                # The simulator models ``amount`` in base units rather than
+                # venue-specific derivative contract units.
+                "contractSize": 1.0,
+                "entryPrice": entry_price,
+                "markPrice": mark_price,
+                "notional": notional,
+                "leverage": leverage,
+                "initialMargin": margin_locked,
+                "collateral": margin_locked,
+                "unrealizedPnl": unrealized,
+                "liquidationPrice": liquidation_price,
+                "marginMode": "isolated",
+                "hedged": False,
+                "info": {
+                    "simulated": True,
+                    "marketDataAvailable": market_data_available,
+                },
+            })
+        return rows
 
     # 
     # Helpers
@@ -318,6 +396,16 @@ class SimulatedExchange:
     @staticmethod
     def _rejected() -> dict:
         return {"filled": 0, "average": 0, "status": "rejected"}
+
+    def _next_order_id(self, *, liquidation: bool = False) -> str:
+        global _ORDER_ID_SEQUENCE
+        with _ORDER_ID_LOCK:
+            _ORDER_ID_SEQUENCE += 1
+            prefix = "SIM-LIQ" if liquidation else "SIM"
+            return (
+                f"{prefix}-{int(time.time() * 1000)}-"
+                f"{os.getpid()}-{_ORDER_ID_SEQUENCE}"
+            )
 
     @staticmethod
     def _finite_control(value, name: str) -> float:
@@ -342,6 +430,45 @@ class SimulatedExchange:
         if not math.isfinite(parsed) or parsed <= 0.0:
             return None
         return parsed
+
+    @staticmethod
+    def _finite_values(*values: float) -> bool:
+        return all(math.isfinite(value) for value in values)
+
+    @classmethod
+    def _open_accounting(
+        cls,
+        actual_amount: float,
+        fill_price: float,
+        taker: float,
+        leverage: float,
+    ) -> tuple[float, float, float, float] | None:
+        notional = actual_amount * fill_price
+        margin = notional / leverage
+        fee_usdt = notional * taker
+        required_capital = margin + fee_usdt
+        if (
+            not cls._finite_values(
+                actual_amount,
+                fill_price,
+                taker,
+                leverage,
+                notional,
+                margin,
+                fee_usdt,
+                required_capital,
+            )
+            or actual_amount <= 0.0
+            or fill_price <= 0.0
+            or taker < 0.0
+            or leverage <= 0.0
+            or notional < 0.0
+            or margin < 0.0
+            or fee_usdt < 0.0
+            or required_capital < 0.0
+        ):
+            return None
+        return notional, margin, fee_usdt, required_capital
 
     def _get_live_price(self, symbol: str) -> tuple:
         try:
@@ -432,13 +559,13 @@ class SimulatedExchange:
         self._trades.append(SimTrade(
             symbol=symbol, side=("sell" if pos.side == "buy" else "buy_to_cover"),
             amount=pos.amount, entry_price=pos.entry_price,
-            exit_price=liq_price, pnl_usdt=round(pnl, 4),
+            exit_price=liq_price, pnl_usdt=pnl,
             fee_usdt=pos.fee_usdt + exit_fee, entry_time=pos.entry_time,
             exit_time=_utcnow(), is_partial=False, liquidated=True,
         ))
         self._positions.pop(symbol, None)
         return {
-            "id":           f"SIM-LIQ-{int(time.time()*1000)}",
+            "id":           self._next_order_id(liquidation=True),
             "symbol":       symbol, "side":   "liquidation",
             "amount":       pos.amount, "filled": pos.amount,
             "average":      liq_price, "price":  liq_price,
@@ -511,31 +638,49 @@ class SimulatedExchange:
             liq           = min(1.0, vol / max(1, amount * mid * 1000))
             actual_amount = simulate_partial_fill(amount, liq, spread, self._rng)
 
-        taker    = self._taker_for(symbol)
-        lev      = max(1.0, leverage)
-        notional = actual_amount * fill_price
-        margin   = notional / lev
-        fee_usdt = notional * taker   # fee is on FULL notional, not margin
+        taker = self._taker_for(symbol)
+        lev = max(1.0, leverage)
+        if not math.isfinite(actual_amount) or actual_amount > amount:
+            return self._rejected()
+        if actual_amount <= 0.0:
+            return {"filled": 0, "average": fill_price, "status": "cancelled"}
+        accounting = self._open_accounting(
+            actual_amount, fill_price, taker, lev
+        )
+        if accounting is None:
+            return self._rejected()
+        _notional, margin, fee_usdt, required_capital = accounting
 
         free_usdt = self._free_usdt()
-        if margin + fee_usdt > free_usdt:
+        if required_capital > free_usdt:
             # Scale down so (margin + fee) fits in free capital.
             # Per coin: margin_per_coin = fill_price / lev,
             # fee_per_coin    = fill_price * taker.
             denom = (fill_price / lev) + (fill_price * taker)
-            if denom <= 0:
+            if not math.isfinite(denom) or denom <= 0.0:
                 return {"filled": 0, "average": fill_price, "status": "cancelled"}
             actual_amount = max(0.0, free_usdt / denom)
-            notional      = actual_amount * fill_price
-            margin        = notional / lev
-            fee_usdt      = notional * taker
+            if actual_amount <= 0.0:
+                return {"filled": 0, "average": fill_price, "status": "cancelled"}
+            accounting = self._open_accounting(
+                actual_amount, fill_price, taker, lev
+            )
+            if accounting is None:
+                return self._rejected()
+            _notional, margin, fee_usdt, required_capital = accounting
 
         if actual_amount <= 0:
             return {"filled": 0, "average": fill_price, "status": "cancelled"}
 
+        slippage = abs((fill_price - mid) / mid * 100) if mid > 0 else 0.0
+        new_capital = self._capital - required_capital
+        new_total_fees = self._total_fees + fee_usdt
+        if not self._finite_values(slippage, new_capital, new_total_fees):
+            return self._rejected()
+
         # Capital reduces by margin + fee (NOT by full notional).
-        self._capital   -= (margin + fee_usdt)
-        self._total_fees += fee_usdt
+        self._capital = new_capital
+        self._total_fees = new_total_fees
         self._positions[symbol] = SimPosition(
             symbol=symbol, side="buy", amount=actual_amount,
             entry_price=fill_price, fee_usdt=fee_usdt,
@@ -543,9 +688,8 @@ class SimulatedExchange:
             margin_locked=margin,
         )
 
-        slippage = abs((fill_price - mid) / mid * 100) if mid > 0 else 0.0
         return {
-            "id":                f"SIM-{int(time.time()*1000)}",
+            "id":                self._next_order_id(),
             "symbol":            symbol, "side":   "buy",
             "amount":            amount, "filled": actual_amount,
             "average":           fill_price, "price":  fill_price,
@@ -612,6 +756,8 @@ class SimulatedExchange:
                               ))
         if sell_amount <= 0:
             return {"filled": 0, "average": fill_price, "status": "rejected"}
+        if not math.isfinite(sell_amount) or sell_amount > effective_amount:
+            return self._rejected()
 
         # Pro-rata margin share for partial closes. Use the current remaining
         # amount, not original_amount, otherwise a multi-step close leaks margin.
@@ -621,6 +767,7 @@ class SimulatedExchange:
             margin_share = pos.margin_locked * share
             entry_fee_share = pos.fee_usdt * share
         else:
+            share = 1.0
             margin_share = pos.margin_locked
             entry_fee_share = pos.fee_usdt
 
@@ -633,19 +780,52 @@ class SimulatedExchange:
             gross_pnl = (pos.entry_price - fill_price) * sell_amount
         pnl = gross_pnl - entry_fee_share - exit_fee
 
+        capital_delta = margin_share + gross_pnl - exit_fee
+        new_capital = self._capital + capital_delta
+        new_total_fees = self._total_fees + exit_fee
+        remaining_amount = pos.amount - sell_amount
+        remaining_entry_fee = max(0.0, pos.fee_usdt - entry_fee_share)
+        remaining_margin = max(0.0, pos.margin_locked - margin_share)
+        slippage = abs((fill_price - mid) / mid * 100) if mid > 0 else 0.0
+        trade_fee = exit_fee + entry_fee_share
+        if (
+            not self._finite_values(
+                share,
+                margin_share,
+                entry_fee_share,
+                revenue,
+                exit_fee,
+                gross_pnl,
+                pnl,
+                capital_delta,
+                new_capital,
+                new_total_fees,
+                remaining_amount,
+                remaining_entry_fee,
+                remaining_margin,
+                slippage,
+                trade_fee,
+            )
+            or not 0.0 < share <= 1.0
+            or margin_share < 0.0
+            or entry_fee_share < 0.0
+            or revenue < 0.0
+            or exit_fee < 0.0
+            or remaining_amount < 0.0
+        ):
+            return self._rejected()
+
         # Entry fee was already paid when the position opened. Capital therefore
         # recovers margin + gross PnL minus the exit fee; the trade row still
         # reports net PnL including the proportional entry fee.
-        self._capital    += (margin_share + gross_pnl - exit_fee)
-        self._total_fees += exit_fee
+        self._capital = new_capital
+        self._total_fees = new_total_fees
 
         is_partial = sell_amount < pos.amount
         if is_partial:
-            pos.amount        -= sell_amount
-            pos.fee_usdt      -= entry_fee_share
-            pos.fee_usdt       = max(0.0, pos.fee_usdt)
-            pos.margin_locked -= margin_share
-            pos.margin_locked  = max(0.0, pos.margin_locked)
+            pos.amount = remaining_amount
+            pos.fee_usdt = remaining_entry_fee
+            pos.margin_locked = remaining_margin
         else:
             self._positions.pop(symbol, None)
 
@@ -654,14 +834,14 @@ class SimulatedExchange:
             side=("buy_to_cover" if pos.side == "sell" else "sell"),
             amount=sell_amount,
             entry_price=pos.entry_price, exit_price=fill_price,
-            pnl_usdt=round(pnl, 4), fee_usdt=exit_fee + entry_fee_share,
+            pnl_usdt=pnl, fee_usdt=trade_fee,
             entry_time=pos.entry_time, exit_time=_utcnow(),
-            slippage_pct=abs((fill_price - mid) / mid * 100) if mid > 0 else 0.0,
+            slippage_pct=slippage,
             is_partial=is_partial, liquidated=False,
         ))
 
         return {
-            "id":           f"SIM-{int(time.time()*1000)}",
+            "id":           self._next_order_id(),
             "symbol":       symbol, "side":   close_side,
             "amount":       sell_amount, "filled": sell_amount,
             "average":      fill_price, "price":  fill_price,
@@ -718,28 +898,45 @@ class SimulatedExchange:
             liq = min(1.0, vol / max(1, amount * mid * 1000))
             actual_amount = simulate_partial_fill(amount, liq, spread, self._rng)
 
-        taker    = self._taker_for(symbol)
-        lev      = max(1.0, leverage)
-        notional = actual_amount * fill_price
-        margin   = notional / lev
-        fee_usdt = notional * taker
+        taker = self._taker_for(symbol)
+        lev = max(1.0, leverage)
+        if not math.isfinite(actual_amount) or actual_amount > amount:
+            return self._rejected()
+        if actual_amount <= 0.0:
+            return {"filled": 0, "average": fill_price, "status": "cancelled"}
+        accounting = self._open_accounting(
+            actual_amount, fill_price, taker, lev
+        )
+        if accounting is None:
+            return self._rejected()
+        _notional, margin, fee_usdt, required_capital = accounting
 
         free_usdt = self._free_usdt()
-        if margin + fee_usdt > free_usdt:
+        if required_capital > free_usdt:
             denom = (fill_price / lev) + (fill_price * taker)
-            if denom <= 0:
+            if not math.isfinite(denom) or denom <= 0.0:
                 return {"filled": 0, "average": fill_price, "status": "cancelled"}
             actual_amount = max(0.0, free_usdt / denom)
-            notional = actual_amount * fill_price
-            margin   = notional / lev
-            fee_usdt = notional * taker
+            if actual_amount <= 0.0:
+                return {"filled": 0, "average": fill_price, "status": "cancelled"}
+            accounting = self._open_accounting(
+                actual_amount, fill_price, taker, lev
+            )
+            if accounting is None:
+                return self._rejected()
+            _notional, margin, fee_usdt, required_capital = accounting
 
         if actual_amount <= 0:
             return {"filled": 0, "average": fill_price, "status": "cancelled"}
 
+        new_capital = self._capital - required_capital
+        new_total_fees = self._total_fees + fee_usdt
+        if not self._finite_values(new_capital, new_total_fees):
+            return self._rejected()
+
         # Deduct margin + fee from capital (same as longs).
-        self._capital    -= (margin + fee_usdt)
-        self._total_fees += fee_usdt
+        self._capital = new_capital
+        self._total_fees = new_total_fees
         self._positions[symbol] = SimPosition(
             symbol=symbol, side="sell", amount=actual_amount,
             entry_price=fill_price, fee_usdt=fee_usdt,
@@ -747,7 +944,7 @@ class SimulatedExchange:
             margin_locked=margin,
         )
         return {
-            "id":      f"SIM-{int(time.time()*1000)}",
+            "id":      self._next_order_id(),
             "symbol":  symbol, "side":    "sell",
             "amount":  requested_amount, "filled":  actual_amount,
             "average": fill_price, "price":   fill_price,
@@ -768,11 +965,14 @@ class SimulatedExchange:
             return {"error": "no trades yet"}
 
         pnls      = [t.pnl_usdt for t in trades]
-        wins      = [p for p in pnls if p >= 0]
-        losses    = [p for p in pnls if p < 0]
+        wins      = [p for p in pnls if p > PNL_ZERO_TOLERANCE_USDT]
+        losses    = [p for p in pnls if p < -PNL_ZERO_TOLERANCE_USDT]
+        breakeven = [
+            p for p in pnls if abs(p) <= PNL_ZERO_TOLERANCE_USDT
+        ]
         slippages = [t.slippage_pct for t in trades]
         liquidated = sum(1 for t in trades if t.liquidated)
-        total_pnl = sum(pnls)
+        total_pnl = math.fsum(pnls)
 
         try:
             from collections import defaultdict as _dd
@@ -801,6 +1001,7 @@ class SimulatedExchange:
             "trade_count":      len(trades),
             "win_count":        len(wins),
             "loss_count":       len(losses),
+            "breakeven_count":  len(breakeven),
             "liquidation_count": liquidated,
             "win_rate":         round(len(wins) / len(trades), 4),
             "total_pnl_usdt":   round(total_pnl, 2),
@@ -809,11 +1010,11 @@ class SimulatedExchange:
             "avg_win_usdt":     round(statistics.mean(wins),   4) if wins   else 0.0,
             "avg_loss_usdt":    round(statistics.mean(losses), 4) if losses else 0.0,
             "profit_factor":    (
-                round(sum(wins) / abs(sum(losses)), 3)
-                if losses and sum(losses) != 0 else None
+                round(math.fsum(wins) / abs(math.fsum(losses)), 3)
+                if losses and math.fsum(losses) != 0 else None
             ),
             "max_drawdown_usdt":round(max_dd, 2),
-            "sharpe_ratio":     round(sharpe, 3) if sharpe else None,
+            "sharpe_ratio":     round(sharpe, 3) if sharpe is not None else None,
             "avg_slippage_pct": round(statistics.mean(slippages), 4) if slippages else 0.0,
             "max_slippage_pct": round(max(slippages), 4) if slippages else 0.0,
             "initial_capital":  initial_capital,

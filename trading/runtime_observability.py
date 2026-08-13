@@ -614,15 +614,31 @@ _last_watchdog_fingerprint: tuple[str, ...] = ()
 _last_watchdog_log_at = 0.0
 
 
+def _state_entry_ids_or_none(
+    state_rows: Mapping[str, Mapping[str, Any]] | None,
+) -> set[str] | None:
+    """Return complete state evidence, or ``None`` when it is unavailable."""
+    if state_rows is None or not isinstance(state_rows, Mapping):
+        return None
+
+    entry_ids: set[str] = set()
+    try:
+        for row in state_rows.values():
+            if not isinstance(row, Mapping):
+                return None
+            entry_id = str(row.get("entry_id") or "")
+            if entry_id:
+                entry_ids.add(entry_id)
+    except Exception:
+        return None
+    return entry_ids
+
+
 def runtime_observability_snapshot(
     *, state_rows: Mapping[str, Mapping[str, Any]] | None = None,
     ticker_cache: Any = None,
 ) -> dict[str, Any]:
-    state_entry_ids = {
-        str(row.get("entry_id") or "")
-        for row in (state_rows or {}).values()
-        if str(row.get("entry_id") or "")
-    }
+    state_entry_ids = _state_entry_ids_or_none(state_rows)
     try:
         from trading.entry_lifecycle import lifecycle_health_snapshot
         lifecycle = lifecycle_health_snapshot(state_entry_ids=state_entry_ids)

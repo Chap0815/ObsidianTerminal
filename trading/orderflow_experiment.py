@@ -33,9 +33,16 @@ class OrderFlowWindow:
 
 def _aware_event_time(observation: dict) -> datetime:
     event_time = observation.get("event_time")
-    if not isinstance(event_time, datetime) or event_time.tzinfo is None:
-        raise ValueError("order-flow event time must be timezone-aware")
-    return event_time.astimezone(timezone.utc)
+    return _aware_datetime(event_time, "order-flow event time")
+
+
+def _aware_datetime(value, name: str) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    try:
+        return value.astimezone(timezone.utc)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{name} must be timezone-aware") from exc
 
 
 def _positive(value, name: str) -> float:
@@ -252,9 +259,24 @@ def label_fixed_horizon(
     total_cost_bps: float,
 ) -> float:
     """Return a causal virtual-entry net label in basis points."""
-    if entry_time <= window.feature_cutoff or entry_time < window.earliest_entry:
+    if not isinstance(window, ClockWindow):
+        raise ValueError("label window must be a ClockWindow")
+    feature_cutoff = _aware_datetime(
+        window.feature_cutoff, "feature cutoff"
+    )
+    earliest_entry = _aware_datetime(
+        window.earliest_entry, "earliest entry"
+    )
+    entry_timestamp = _aware_datetime(entry_time, "entry time")
+    exit_timestamp = _aware_datetime(exit_time, "exit time")
+    if earliest_entry <= feature_cutoff:
+        raise ValueError("earliest entry must follow the feature cutoff")
+    if (
+        entry_timestamp <= feature_cutoff
+        or entry_timestamp < earliest_entry
+    ):
         raise ValueError("entry must be strictly after the feature cutoff")
-    if exit_time <= entry_time:
+    if exit_timestamp <= entry_timestamp:
         raise ValueError("label horizon must end after entry")
     if any(
         isinstance(value, bool)
@@ -281,4 +303,6 @@ def label_fixed_horizon(
     else:
         raise ValueError("label side must be long/buy or short/sell")
     gross_bps = sign * (exit_value - entry) / entry * 10_000.0
-    return gross_bps - max(0.0, cost_bps)
+    net_bps = gross_bps - max(0.0, cost_bps)
+    _require_finite_derived(gross_bps, net_bps)
+    return net_bps

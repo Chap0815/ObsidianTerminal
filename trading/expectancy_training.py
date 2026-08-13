@@ -6,6 +6,7 @@ import json
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import Mapping
 
 import numpy as np
@@ -13,8 +14,12 @@ import numpy as np
 from trading.profit_experiments import LinearExpectancyModel
 
 
+def _is_boolean(value) -> bool:
+    return isinstance(value, (bool, np.bool_))
+
+
 def _positive_integer(value, name: str) -> int:
-    if isinstance(value, bool):
+    if _is_boolean(value):
         raise ValueError(f"{name} must be a positive integer")
     try:
         number = float(value)
@@ -36,7 +41,7 @@ def normalize_walk_forward_sizes(min_train, test_size) -> tuple[int, int]:
 def normalize_calibration_controls(
     calibration_fraction, min_calibration
 ) -> tuple[float, int]:
-    if isinstance(calibration_fraction, bool):
+    if _is_boolean(calibration_fraction):
         raise ValueError(
             "calibration_fraction must be between 0.05 and 0.50"
         )
@@ -131,6 +136,20 @@ class WalkForwardResult:
     calibration: CalibrationMetrics
 
 
+def _training_number(value) -> float:
+    if _is_boolean(value):
+        raise ValueError("training evidence must be finite numeric data")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "training evidence must be finite numeric data"
+        ) from exc
+    if not math.isfinite(number):
+        raise ValueError("training evidence must be finite numeric data")
+    return number
+
+
 def _validate_rows(
     rows: list[CandidateLabel], feature_order: tuple[str, ...]
 ) -> list[CandidateLabel]:
@@ -150,15 +169,21 @@ def _validate_rows(
         ):
             raise ValueError("training requires timezone-aware timestamps")
         try:
-            values = [float(row.features[name]) for name in feature_order]
-            outcome = float(row.net_return_bps)
-        except (KeyError, TypeError, ValueError) as exc:
+            raw_values = [row.features[name] for name in feature_order]
+        except (KeyError, TypeError) as exc:
             raise ValueError("training requires complete closed labels") from exc
-        if not all(math.isfinite(value) for value in values + [outcome]):
-            raise ValueError("training requires finite features and labels")
+        values = [_training_number(value) for value in raw_values]
+        outcome = _training_number(row.net_return_bps)
         if row.label_closed_time < row.candidate_time:
             raise ValueError("label closes before candidate")
-        validated.append(row)
+        validated.append(
+            CandidateLabel(
+                candidate_time=row.candidate_time,
+                label_closed_time=row.label_closed_time,
+                features=MappingProxyType(dict(zip(feature_order, values))),
+                net_return_bps=outcome,
+            )
+        )
     return sorted(validated, key=lambda row: row.candidate_time)
 
 
@@ -405,9 +430,9 @@ def expanding_walk_forward_fit(
         raise ValueError("purge must be non-negative")
     try:
         ridge_value = float(ridge)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("ridge must be finite and non-negative") from exc
-    if isinstance(ridge, bool) or not math.isfinite(ridge_value) or ridge_value < 0.0:
+    if _is_boolean(ridge) or not math.isfinite(ridge_value) or ridge_value < 0.0:
         raise ValueError("ridge must be finite and non-negative")
     validated = _validate_rows(rows, feature_order)
     if len(validated) < min_train + test_size:

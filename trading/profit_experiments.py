@@ -13,6 +13,16 @@ def _mode(value: str) -> str:
     return normalize_gate_mode(value)
 
 
+def _finite_number(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 @dataclass(frozen=True)
 class LinearExpectancyModel:
     feature_order: tuple[str, ...]
@@ -178,10 +188,23 @@ def time_decay_decision(
     mode: str = "shadow",
 ) -> TimeDecayDecision:
     normalized_mode = _mode(mode)
+    age = _finite_number(age_minutes)
+    max_age = _finite_number(max_age_minutes)
+    mfe = _finite_number(mfe_pct)
+    min_mfe = _finite_number(min_mfe_pct)
+    if (
+        age is None
+        or max_age is None
+        or mfe is None
+        or min_mfe is None
+        or age < 0.0
+        or max_age < 0.0
+    ):
+        return TimeDecayDecision(False, False, "time-decay inputs invalid")
     candidate = bool(
-        float(max_age_minutes) > 0.0
-        and float(age_minutes) >= float(max_age_minutes)
-        and float(mfe_pct) < float(min_mfe_pct)
+        max_age > 0.0
+        and age >= max_age
+        and mfe < min_mfe
     )
     should_exit = candidate and normalized_mode == "enforce"
     return TimeDecayDecision(

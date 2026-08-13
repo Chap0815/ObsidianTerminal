@@ -529,13 +529,28 @@ class TrendBot(SpotBot):
                     )
                     if spot_entry_rollback_was_fully_filled(
                             order, sold_amount):
-                        self._cleanup_rolled_back_entry_state(
-                            sym, "trend state write failed after live buy")
-                        log_event(
-                            f"Trend BUY {sym}: rollback sell filled after "
-                            f"state failure",
-                            "WARN",
+                        completed = (
+                            self._complete_verified_spot_entry_rollback(
+                                sym,
+                                entry_id=entry_id,
+                                reason=(
+                                    "trend state write failed after live buy"
+                                ),
+                            )
                         )
+                        if completed:
+                            log_event(
+                                f"Trend BUY {sym}: rollback sell and cleanup "
+                                "completed after state failure",
+                                "WARN",
+                            )
+                        else:
+                            log_event(
+                                f"Trend BUY {sym}: rollback sell verified "
+                                "flat but durable claim/state cleanup is "
+                                "incomplete",
+                                "ERROR",
+                            )
                     else:
                         log_event(
                             f"Trend BUY {sym}: CRITICAL rollback sell not "

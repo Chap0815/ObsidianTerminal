@@ -1393,7 +1393,13 @@ def run_research_experiments(
             grid,
             "bounded causal grid simulation is sample-ready"
             if grid["ready"]
-            else "insufficient contiguous OHLC observations for grid research",
+            else (
+                "invalid numeric grid evidence was excluded; "
+                "insufficient valid observations remain"
+                if grid.get("invalid_numeric_symbols")
+                or grid.get("portfolio_numeric_valid") is False
+                else "insufficient contiguous OHLC observations for grid research"
+            ),
         ),
     }
     ready_count = sum(result["ready"] for result in results.values())

@@ -1113,8 +1113,14 @@ class TrendFuturesBot(FuturesBot):
                     f"LIVE entry - aborting open",
                     "ERROR",
                 )
-                self._cleanup_untracked_entry_state(
+                cleaned = self._cleanup_untracked_entry_state(
                     base, "state write failed before entry")
+                if cleaned is not True:
+                    log_event(
+                        f"[{self.BOT_NAME}] {base}: pre-order entry "
+                        f"claim/state cleanup incomplete; kept for retry",
+                        "ERROR",
+                    )
                 return
             try:
                 emit_entry_lifecycle(
@@ -1153,10 +1159,19 @@ class TrendFuturesBot(FuturesBot):
                     stage="order_failed", mode=entry_mode,
                     reason=type(e).__name__, direction="LONG")
                 log_event(f"[{self.BOT_NAME}] {base}: open failed ({e})", "WARN")
-                self._log_error(f"trend open {base}", e)
+                try:
+                    self._log_error(f"trend open {base}", e)
+                except Exception:
+                    pass
                 if _not_submitted:
-                    self._cleanup_untracked_entry_state(
+                    cleaned = self._cleanup_untracked_entry_state(
                         base, "trend entry was not submitted")
+                    if cleaned is not True:
+                        log_event(
+                            f"[{self.BOT_NAME}] {base}: not-submitted entry "
+                            f"claim/state cleanup incomplete; kept for retry",
+                            "ERROR",
+                        )
                     return
                 # Orphan-prevention: create_order can RAISE after the order
                 # actually landed (lost response). Recover via clientOrderId.
@@ -1192,6 +1207,8 @@ class TrendFuturesBot(FuturesBot):
                         lookup_status.get("unavailable")
                     )
                     if recovery_unavailable:
+                        _outcome_unknown = True
+                    elif landed is None:
                         _outcome_unknown = True
                     elif (
                         landed is not None
@@ -1248,10 +1265,14 @@ class TrendFuturesBot(FuturesBot):
                     # and claim until a later clientOrderId reconciliation can
                     # establish the outcome.
                     _outcome_unknown = True
-                    self._log_error(
-                        f"trend reconcile failed open {base}", recovery_exc
-                    )
+                    try:
+                        self._log_error(
+                            f"trend reconcile failed open {base}", recovery_exc
+                        )
+                    except Exception:
+                        pass
                 if not _landed and _outcome_unknown:
+                    self._mark_futures_entry_recovery_pending()
                     log_event(
                         f"[{self.BOT_NAME}] {base}: entry outcome unknown; "
                         f"provisional state and claim kept pending "
@@ -1259,10 +1280,15 @@ class TrendFuturesBot(FuturesBot):
                         "ERROR",
                     )
                 elif not _landed:
-                    try:
-                        self.state.remove(base)
-                    except Exception:
-                        pass
+                    cleaned = self._cleanup_untracked_entry_state(
+                        base, "terminal-zero entry after trend open error"
+                    )
+                    if cleaned is not True:
+                        log_event(
+                            f"[{self.BOT_NAME}] {base}: terminal-zero entry "
+                            f"claim/state cleanup incomplete; kept for retry",
+                            "ERROR",
+                        )
                 return
             amount, fill, positions_unavailable, verified_source = (
                 self._verify_entry_fill(
@@ -1283,10 +1309,15 @@ class TrendFuturesBot(FuturesBot):
                     f"[{self.BOT_NAME}] {base}: order returned no fill and "
                     f"no exchange position was found - aborting state write",
                     "WARN")
-                try:
-                    self.state.remove(base)
-                except Exception:
-                    pass
+                cleaned = self._cleanup_untracked_entry_state(
+                    base, "verified zero-fill entry after trend open"
+                )
+                if cleaned is not True:
+                    log_event(
+                        f"[{self.BOT_NAME}] {base}: verified zero-fill entry "
+                        f"claim/state cleanup incomplete; kept for retry",
+                        "ERROR",
+                    )
                 return
             provisional = False
             if amount <= 0:
@@ -1369,6 +1400,7 @@ class TrendFuturesBot(FuturesBot):
             self._rollback_untracked_live_entry(
                 base, full, amount, eff_lev, margin_mode,
                 "state write failed after entry",
+                entry_id=entry_id,
             )
             return
         emit_entry_lifecycle(
@@ -1591,6 +1623,8 @@ class TrendFuturesBot(FuturesBot):
         leverage: float,
         margin_mode: str,
         reason: str,
+        *,
+        entry_id: str = "",
     ) -> bool:
         """Close a live entry when durable state could not be written."""
         from core.logger import log_event
@@ -1646,12 +1680,34 @@ class TrendFuturesBot(FuturesBot):
                 expected_position_side="LONG",
             )
             if closed:
-                self._cleanup_untracked_entry_state(base, reason)
+                cleaned = self._cleanup_untracked_entry_state(base, reason)
+                if cleaned is not True:
+                    log_event(
+                        f"[{self.BOT_NAME}] {base}: rollback verified flat "
+                        "but durable claim/state cleanup is incomplete",
+                        "ERROR",
+                    )
+                    return False
                 log_event(
                     f"[{self.BOT_NAME}] {base}: untracked live entry "
                     f"rollback verified flat ({reason})",
                     "WARN",
                 )
+                if entry_id:
+                    try:
+                        from trading.entry_lifecycle import emit_entry_lifecycle
+
+                        emit_entry_lifecycle(
+                            entry_id,
+                            bot=self.BOT_NAME,
+                            symbol=base,
+                            stage="aborted",
+                            mode="LIVE",
+                            reason="state_write_rollback_verified",
+                            direction="LONG",
+                        )
+                    except Exception:
+                        pass
                 return True
             log_event(
                 f"[{self.BOT_NAME}] {base}: rollback close not verified "

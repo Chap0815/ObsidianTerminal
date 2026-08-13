@@ -2318,6 +2318,37 @@ def save_trade_db(
         return False
 
 
+def _candidate_symbol_matches_db(candidate_symbol, evidence_symbol) -> bool:
+    if not isinstance(candidate_symbol, str) or not isinstance(evidence_symbol, str):
+        return False
+    candidate = candidate_symbol.strip().casefold()
+    evidence = evidence_symbol.strip().casefold()
+    if not candidate or not evidence:
+        return False
+    if candidate == evidence:
+        return True
+    candidate_base = candidate.partition("/")[0]
+    evidence_base = evidence.partition("/")[0]
+    return candidate_base == evidence_base and (
+        "/" not in candidate or "/" not in evidence
+    )
+
+
+def _candidate_scope_matches_db(
+    candidate_bot,
+    candidate_mode,
+    candidate_symbol,
+    evidence_bot,
+    evidence_mode,
+    evidence_symbol,
+) -> bool:
+    return (
+        candidate_bot == evidence_bot
+        and candidate_mode == evidence_mode
+        and _candidate_symbol_matches_db(candidate_symbol, evidence_symbol)
+    )
+
+
 def save_expectancy_candidate(
     *,
     entry_id: str,
@@ -2387,6 +2418,24 @@ def save_expectancy_candidate(
     )
     try:
         conn.execute("BEGIN IMMEDIATE")
+        child_scopes = conn.execute(
+            """SELECT DISTINCT bot_name, mode, symbol
+                 FROM candidate_microstructure WHERE entry_id=?""",
+            (normalized_entry_id,),
+        ).fetchall()
+        if any(
+            not _candidate_scope_matches_db(
+                normalized_bot,
+                normalized_mode,
+                normalized_symbol,
+                child["bot_name"],
+                child["mode"],
+                child["symbol"],
+            )
+            for child in child_scopes
+        ):
+            conn.rollback()
+            return False
         cursor = conn.execute(
             """INSERT INTO expectancy_candidates
                (entry_id, bot_name, symbol, mode, candidate_time,
@@ -2501,6 +2550,22 @@ def save_candidate_microstructure(
         encoded,
     )
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        candidate = conn.execute(
+            """SELECT bot_name, mode, symbol FROM expectancy_candidates
+                WHERE entry_id=?""",
+            (normalized_entry_id,),
+        ).fetchone()
+        if candidate is not None and not _candidate_scope_matches_db(
+            candidate["bot_name"],
+            candidate["mode"],
+            candidate["symbol"],
+            normalized_bot,
+            normalized_mode,
+            normalized_symbol,
+        ):
+            conn.rollback()
+            return False
         cursor = conn.execute(
             """INSERT INTO candidate_microstructure
                (entry_id, stage, bot_name, mode, symbol, measured_at, source,
@@ -2642,6 +2707,69 @@ def list_venue_capture_priorities(limit: int = 8) -> list[str]:
     return priorities
 
 
+def _delete_invalid_markout_histories_db(
+    conn,
+    *,
+    table: str,
+    identity_column: str,
+) -> int:
+    table = _safe_ident(table)
+    identity_column = _safe_ident(identity_column)
+    cursor = conn.execute(
+        f"""DELETE FROM {table}
+            WHERE {identity_column} IN (
+                SELECT DISTINCT bad.{identity_column} FROM {table} bad
+                 WHERE (
+                     bad.status IS NULL
+                     OR bad.status NOT IN ('PENDING','COMPLETE','FAILED')
+                     OR (
+                         bad.status IN ('COMPLETE','FAILED')
+                         AND (
+                             strftime(
+                                 '%Y-%m-%d %H:%M:%S', julianday(bad.due_at)
+                             ) IS NULL
+                             OR strftime(
+                                 '%Y-%m-%d %H:%M:%S', julianday(bad.due_at)
+                             ) != bad.due_at
+                             OR (
+                                 bad.status='COMPLETE'
+                                 AND (
+                                     strftime(
+                                         '%Y-%m-%d %H:%M:%S',
+                                         julianday(bad.measured_at)
+                                     ) IS NULL
+                                     OR strftime(
+                                         '%Y-%m-%d %H:%M:%S',
+                                         julianday(bad.measured_at)
+                                     ) != bad.measured_at
+                                 )
+                             )
+                             OR (
+                                 bad.status='FAILED'
+                                 AND (
+                                     strftime(
+                                         '%Y-%m-%d %H:%M:%S',
+                                         julianday(bad.failed_at)
+                                     ) IS NULL
+                                     OR strftime(
+                                         '%Y-%m-%d %H:%M:%S',
+                                         julianday(bad.failed_at)
+                                     ) != bad.failed_at
+                                 )
+                             )
+                         )
+                     )
+                 )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM {table} pending
+                        WHERE pending.{identity_column}=bad.{identity_column}
+                          AND pending.status='PENDING'
+                   )
+            )"""
+    )
+    return max(0, cursor.rowcount)
+
+
 def enforce_research_telemetry_retention(
     *,
     retention_days: int = 180,
@@ -2650,7 +2778,7 @@ def enforce_research_telemetry_retention(
     max_tca_rows: int = 1_000_000,
     max_terminal_markout_rows: int = 1_000_000,
 ) -> dict[str, int]:
-    """Bound research telemetry while preserving pending markout work."""
+    """Bound valid research telemetry while preserving pending and SIM parents."""
     days = _positive_integer_db(retention_days, "retention_days")
     expectancy_limit = _positive_integer_db(
         max_expectancy_rows, "max_expectancy_rows"
@@ -2674,6 +2802,81 @@ def enforce_research_telemetry_retention(
     deleted: dict[str, int] = {}
     try:
         conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """DELETE FROM candidate_microstructure
+                WHERE entry_id IN (
+                    SELECT e.entry_id FROM expectancy_candidates e
+                     WHERE (
+                         strftime(
+                             '%Y-%m-%d %H:%M:%S', julianday(e.candidate_time)
+                         ) IS NULL
+                         OR strftime(
+                             '%Y-%m-%d %H:%M:%S', julianday(e.candidate_time)
+                         ) != e.candidate_time
+                     )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM execution_markouts m
+                            WHERE m.intent_id=e.entry_id AND m.status='PENDING'
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM sim_execution_tca t
+                            WHERE t.entry_id=e.entry_id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM sim_execution_markouts m
+                            WHERE m.entry_id=e.entry_id
+                       )
+                )"""
+        )
+        deleted["candidate_invalid_parent"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            """DELETE FROM expectancy_candidates
+                 WHERE (
+                     strftime(
+                         '%Y-%m-%d %H:%M:%S', julianday(candidate_time)
+                     ) IS NULL
+                     OR strftime(
+                         '%Y-%m-%d %H:%M:%S', julianday(candidate_time)
+                     ) != candidate_time
+                 )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM execution_markouts m
+                        WHERE m.intent_id=expectancy_candidates.entry_id
+                          AND m.status='PENDING'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM sim_execution_tca t
+                        WHERE t.entry_id=expectancy_candidates.entry_id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM sim_execution_markouts m
+                        WHERE m.entry_id=expectancy_candidates.entry_id
+                   )"""
+        )
+        deleted["expectancy_invalid_time"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            """DELETE FROM candidate_microstructure
+                WHERE entry_id IN (
+                    SELECT DISTINCT c.entry_id FROM candidate_microstructure c
+                     WHERE (
+                         strftime(
+                             '%Y-%m-%d %H:%M:%S', julianday(c.measured_at)
+                         ) IS NULL
+                         OR strftime(
+                             '%Y-%m-%d %H:%M:%S', julianday(c.measured_at)
+                         ) != c.measured_at
+                     )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM execution_markouts m
+                            WHERE m.intent_id=c.entry_id AND m.status='PENDING'
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM sim_execution_markouts m
+                            WHERE m.entry_id=c.entry_id AND m.status='PENDING'
+                       )
+                )"""
+        )
+        deleted["candidate_invalid_time"] = max(0, cursor.rowcount)
         cursor = conn.execute(
             """DELETE FROM candidate_microstructure
                 WHERE entry_id IN (
@@ -2713,6 +2916,25 @@ def enforce_research_telemetry_retention(
         cursor = conn.execute(
             """DELETE FROM execution_tca
                 WHERE intent_id IN (
+                    SELECT DISTINCT t.intent_id FROM execution_tca t
+                     WHERE (
+                         strftime(
+                             '%Y-%m-%d %H:%M:%S', julianday(t.measured_at)
+                         ) IS NULL
+                         OR strftime(
+                             '%Y-%m-%d %H:%M:%S', julianday(t.measured_at)
+                         ) != t.measured_at
+                     )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM execution_markouts m
+                            WHERE m.intent_id=t.intent_id AND m.status='PENDING'
+                       )
+                )"""
+        )
+        deleted["tca_invalid_time"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            """DELETE FROM execution_tca
+                WHERE intent_id IN (
                     SELECT t.intent_id FROM execution_tca t
                      WHERE NOT EXISTS (
                          SELECT 1 FROM execution_markouts m
@@ -2740,6 +2962,25 @@ def enforce_research_telemetry_retention(
         cursor = conn.execute(
             """DELETE FROM sim_execution_tca
                 WHERE entry_id IN (
+                    SELECT DISTINCT t.entry_id FROM sim_execution_tca t
+                     WHERE (
+                         strftime(
+                             '%Y-%m-%d %H:%M:%S', julianday(t.measured_at)
+                         ) IS NULL
+                         OR strftime(
+                             '%Y-%m-%d %H:%M:%S', julianday(t.measured_at)
+                         ) != t.measured_at
+                     )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM sim_execution_markouts m
+                            WHERE m.entry_id=t.entry_id AND m.status='PENDING'
+                       )
+                )"""
+        )
+        deleted["sim_tca_invalid_time"] = max(0, cursor.rowcount)
+        cursor = conn.execute(
+            """DELETE FROM sim_execution_tca
+                WHERE entry_id IN (
                     SELECT t.entry_id FROM sim_execution_tca t
                      WHERE NOT EXISTS (
                          SELECT 1 FROM sim_execution_markouts m
@@ -2764,6 +3005,11 @@ def enforce_research_telemetry_retention(
             (tca_limit,),
         )
         deleted["sim_tca_cap"] = max(0, cursor.rowcount)
+        deleted["markout_invalid"] = _delete_invalid_markout_histories_db(
+            conn,
+            table="execution_markouts",
+            identity_column="intent_id",
+        )
         cursor = conn.execute(
             """DELETE FROM execution_markouts
                 WHERE status IN ('COMPLETE','FAILED')
@@ -2794,6 +3040,11 @@ def enforce_research_telemetry_retention(
             (markout_limit,),
         )
         deleted["markout_cap"] = max(0, cursor.rowcount)
+        deleted["sim_markout_invalid"] = _delete_invalid_markout_histories_db(
+            conn,
+            table="sim_execution_markouts",
+            identity_column="entry_id",
+        )
         cursor = conn.execute(
             """DELETE FROM sim_execution_markouts
                 WHERE status IN ('COMPLETE','FAILED')
@@ -2837,9 +3088,16 @@ def enforce_research_telemetry_retention(
                          AND m.status='PENDING'
                   )
                   AND NOT EXISTS (
+                      SELECT 1 FROM candidate_microstructure c
+                       WHERE c.entry_id=expectancy_candidates.entry_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sim_execution_tca t
+                       WHERE t.entry_id=expectancy_candidates.entry_id
+                  )
+                  AND NOT EXISTS (
                       SELECT 1 FROM sim_execution_markouts m
                        WHERE m.entry_id=expectancy_candidates.entry_id
-                         AND m.status='PENDING'
                   )""",
             (cutoff,),
         )
@@ -2853,8 +3111,16 @@ def enforce_research_telemetry_retention(
                           WHERE m.intent_id=e.entry_id AND m.status='PENDING'
                      )
                        AND NOT EXISTS (
+                         SELECT 1 FROM candidate_microstructure c
+                          WHERE c.entry_id=e.entry_id
+                     )
+                       AND NOT EXISTS (
+                         SELECT 1 FROM sim_execution_tca t
+                          WHERE t.entry_id=e.entry_id
+                     )
+                       AND NOT EXISTS (
                          SELECT 1 FROM sim_execution_markouts m
-                          WHERE m.entry_id=e.entry_id AND m.status='PENDING'
+                          WHERE m.entry_id=e.entry_id
                      )
                     ORDER BY e.candidate_time DESC, e.entry_id DESC
                     LIMIT -1 OFFSET ?
@@ -5739,6 +6005,140 @@ def _positive_integer_db(value, field_name: str) -> int:
     return parsed
 
 
+def _validate_markout_tca_evidence_db(
+    *,
+    horizon: int,
+    mark_price: float,
+    markout_bps: float,
+    stage,
+    payload: dict,
+    scope: str,
+) -> str:
+    normalized_stage = str(stage).strip()
+    if normalized_stage != f"markout_{horizon}s":
+        raise ValueError(f"{scope} markout TCA stage conflicts with horizon")
+    checks = (
+        ("mark_price", mark_price, _optional_finite_db, True),
+        ("markout_bps", markout_bps, _optional_signed_finite_db, False),
+    )
+    if "horizon_seconds" in payload:
+        try:
+            payload_horizon = _positive_integer_db(
+                payload["horizon_seconds"], "markout payload horizon"
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{scope} markout TCA horizon conflicts with completion"
+            ) from exc
+        if payload_horizon != horizon:
+            raise ValueError(
+                f"{scope} markout TCA horizon conflicts with completion"
+            )
+    for field_name, expected, parser, require_positive in checks:
+        if field_name not in payload:
+            continue
+        actual = parser(payload[field_name])
+        if (
+            actual is None
+            or (require_positive and actual <= 0.0)
+            or not math.isclose(
+                actual,
+                expected,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                f"{scope} markout TCA {field_name} conflicts with completion"
+            )
+    return normalized_stage
+
+
+def _validate_markout_completion_result_db(
+    pending,
+    *,
+    mark_price: float,
+    markout_bps: float,
+    payload: dict,
+    scope: str,
+) -> int:
+    reference = _optional_finite_db(pending["reference_price"])
+    side = str(pending["side"] or "").strip().lower()
+    raw_attempts = pending["attempts"]
+    try:
+        attempts = int(raw_attempts)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{scope} markout queue retry state is invalid") from exc
+    if (
+        reference is None
+        or reference <= 0.0
+        or side not in {"buy", "sell"}
+        or isinstance(raw_attempts, bool)
+        or attempts < 0
+        or attempts != raw_attempts
+    ):
+        raise ValueError(f"{scope} markout queue result inputs are invalid")
+    expected_attempt = attempts + 1
+    if "attempt_number" in payload:
+        try:
+            payload_attempt = _positive_integer_db(
+                payload["attempt_number"], "markout payload attempt number"
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{scope} markout TCA retry metadata conflicts with queue"
+            ) from exc
+        if payload_attempt != expected_attempt:
+            raise ValueError(
+                f"{scope} markout TCA retry metadata conflicts with queue"
+            )
+    if "recovered_after_retry" in payload and (
+        not isinstance(payload["recovered_after_retry"], bool)
+        or payload["recovered_after_retry"] is not (attempts > 0)
+    ):
+        raise ValueError(
+            f"{scope} markout TCA retry metadata conflicts with queue"
+        )
+    if "reference_price" in payload:
+        payload_reference = _optional_finite_db(payload["reference_price"])
+        if payload_reference is None or not math.isclose(
+            payload_reference,
+            reference,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                f"{scope} markout TCA reference_price conflicts with queue"
+            )
+    sign = 1.0 if side == "buy" else -1.0
+    expected_bps = sign * (mark_price - reference) / reference * 10_000.0
+    if not math.isclose(
+        markout_bps,
+        expected_bps,
+        rel_tol=1e-12,
+        abs_tol=1e-6,
+    ):
+        raise ValueError(f"{scope} markout result conflicts with queue")
+    return attempts
+
+
+def _validate_markout_completion_time_db(
+    pending,
+    *,
+    observed_at: str,
+    evidence_due_at: str | None,
+    scope: str,
+) -> None:
+    queue_due_at, queue_due = _trade_timestamp_db(
+        pending["due_at"], "markout queue due_at"
+    )
+    _, observed = _trade_timestamp_db(observed_at, "markout measured_at")
+    if evidence_due_at is not None and queue_due_at != evidence_due_at:
+        raise ValueError(f"{scope} markout due time conflicts with queue")
+    if observed < queue_due:
+        raise RuntimeError(f"{scope} markout observation precedes queue due time")
+
+
 def get_order_intent(intent_id: str) -> dict | None:
     validated_intent_id = _required_text_db(
         intent_id, "intent_id", max_length=64
@@ -5779,6 +6179,51 @@ def list_nonterminal_order_intents(
     return [dict(row) for row in conn.execute(query, tuple(params)).fetchall()]
 
 
+def _canonical_finite_json_object_db(raw) -> tuple[dict, str] | None:
+    try:
+        payload = json.loads(raw)
+        canonical = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload, canonical
+
+
+def _persist_execution_tca_stage(
+    conn,
+    intent_id: str,
+    measured_at: str,
+    stage: str,
+    encoded: str,
+) -> None:
+    desired = _canonical_finite_json_object_db(encoded)
+    if desired is None:
+        raise ValueError("TCA payload must be a finite JSON object")
+    existing_rows = conn.execute(
+        """SELECT payload_json FROM execution_tca
+             WHERE intent_id=? AND stage=? ORDER BY id""",
+        (intent_id, stage),
+    ).fetchall()
+    for row in existing_rows:
+        existing = _canonical_finite_json_object_db(row["payload_json"])
+        if existing is None or existing[1] != desired[1]:
+            raise ValueError("conflicting LIVE TCA evidence already exists")
+    if existing_rows:
+        return
+    conn.execute(
+        """INSERT INTO execution_tca
+           (intent_id, measured_at, stage, payload_json)
+           VALUES (?, ?, ?, ?)""",
+        (intent_id, measured_at, stage, encoded),
+    )
+
+
 def record_execution_tca(intent_id: str, stage: str, payload: dict) -> None:
     validated_intent_id = _order_id_text_db(intent_id)
     if validated_intent_id is None:
@@ -5794,11 +6239,13 @@ def record_execution_tca(intent_id: str, stage: str, payload: dict) -> None:
         raise ValueError("TCA payload must be finite JSON") from exc
     conn = get_connection()
     try:
-        conn.execute(
-            """INSERT INTO execution_tca
-               (intent_id, measured_at, stage, payload_json)
-               VALUES (?, ?, ?, ?)""",
-            (validated_intent_id, _utcnow_str(), validated_stage, encoded),
+        conn.execute("BEGIN IMMEDIATE")
+        _persist_execution_tca_stage(
+            conn,
+            validated_intent_id,
+            _utcnow_str(),
+            validated_stage,
+            encoded,
         )
         conn.commit()
     except Exception:
@@ -5807,20 +6254,23 @@ def record_execution_tca(intent_id: str, stage: str, payload: dict) -> None:
 
 
 def get_latest_execution_tca_payload(intent_id: str, stage: str) -> dict | None:
-    """Return the newest decoded TCA stage for restart-safe enrichment."""
+    """Return unambiguous finite TCA evidence for restart-safe enrichment."""
     conn = get_connection()
-    row = conn.execute(
+    rows = conn.execute(
         """SELECT payload_json FROM execution_tca
-             WHERE intent_id=? AND stage=? ORDER BY id DESC LIMIT 1""",
+             WHERE intent_id=? AND stage=? ORDER BY id""",
         (str(intent_id), str(stage)),
-    ).fetchone()
-    if row is None:
+    ).fetchall()
+    if not rows:
         return None
-    try:
-        payload = json.loads(row["payload_json"])
-    except (TypeError, ValueError, json.JSONDecodeError):
+    first = _canonical_finite_json_object_db(rows[0]["payload_json"])
+    if first is None:
         return None
-    return payload if isinstance(payload, dict) else None
+    for row in rows[1:]:
+        candidate = _canonical_finite_json_object_db(row["payload_json"])
+        if candidate is None or candidate[1] != first[1]:
+            return None
+    return first[0]
 
 
 def schedule_execution_markouts(
@@ -5881,13 +6331,40 @@ def schedule_execution_markouts(
         )
     conn = get_connection()
     try:
-        conn.executemany(
-            """INSERT OR IGNORE INTO execution_markouts
-               (intent_id, horizon_seconds, symbol, side, reference_price,
-                due_at, status)
-               VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
-            rows,
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        for row in rows:
+            (
+                row_intent_id,
+                horizon,
+                row_symbol,
+                row_side,
+                row_reference,
+                due_at,
+            ) = row
+            existing = conn.execute(
+                """SELECT symbol, side, reference_price
+                     FROM execution_markouts
+                    WHERE intent_id=? AND horizon_seconds=?""",
+                (row_intent_id, horizon),
+            ).fetchone()
+            expected = (row_symbol, row_side, row_reference)
+            if existing is None:
+                conn.execute(
+                    """INSERT INTO execution_markouts
+                       (intent_id, horizon_seconds, symbol, side,
+                        reference_price, due_at, status)
+                       VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
+                    (
+                        row_intent_id,
+                        horizon,
+                        row_symbol,
+                        row_side,
+                        row_reference,
+                        due_at,
+                    ),
+                )
+            elif tuple(existing) != expected:
+                raise ValueError("conflicting LIVE markout evidence already exists")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -6113,9 +6590,16 @@ def complete_execution_markout(
         raise ValueError("markout horizon must be a positive integer") from exc
     if horizon <= 0 or horizon != horizon_seconds:
         raise ValueError("markout horizon must be a positive integer")
-    stage = str(tca_stage).strip()
-    if not stage or not isinstance(tca_payload, dict):
+    if not isinstance(tca_payload, dict):
         raise ValueError("markout TCA stage and payload are required")
+    stage = _validate_markout_tca_evidence_db(
+        horizon=horizon,
+        mark_price=price,
+        markout_bps=bps,
+        stage=tca_stage,
+        payload=tca_payload,
+        scope="LIVE",
+    )
     try:
         encoded = json.dumps(tca_payload, sort_keys=True, allow_nan=False)
     except (TypeError, ValueError) as exc:
@@ -6128,15 +6612,33 @@ def complete_execution_markout(
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        if evidence_due_at is not None:
-            pending = conn.execute(
-                """SELECT due_at FROM execution_markouts
-                     WHERE intent_id=? AND horizon_seconds=?
-                       AND status='PENDING'""",
-                (str(intent_id), horizon),
-            ).fetchone()
-            if pending is not None and str(pending["due_at"]) != evidence_due_at:
-                raise ValueError("markout due time conflicts with queue")
+        pending = conn.execute(
+            """SELECT due_at, side, reference_price, attempts
+                 FROM execution_markouts
+                 WHERE intent_id=? AND horizon_seconds=?
+                   AND status='PENDING'""",
+            (str(intent_id), horizon),
+        ).fetchone()
+        if pending is not None:
+            _validate_markout_completion_time_db(
+                pending,
+                observed_at=observed_at,
+                evidence_due_at=evidence_due_at,
+                scope="LIVE",
+            )
+            prior_attempts = _validate_markout_completion_result_db(
+                pending,
+                mark_price=price,
+                markout_bps=bps,
+                payload=tca_payload,
+                scope="LIVE",
+            )
+            evidence_payload = dict(tca_payload)
+            evidence_payload["attempt_number"] = prior_attempts + 1
+            evidence_payload["recovered_after_retry"] = prior_attempts > 0
+            encoded = json.dumps(
+                evidence_payload, sort_keys=True, allow_nan=False
+            )
         cur = conn.execute(
             """UPDATE execution_markouts
                   SET status='COMPLETE', measured_at=?, failed_at=NULL, mark_price=?,
@@ -6146,11 +6648,12 @@ def complete_execution_markout(
             (observed_at, price, bps, str(intent_id), horizon),
         )
         if cur.rowcount == 1:
-            conn.execute(
-                """INSERT INTO execution_tca
-                   (intent_id, measured_at, stage, payload_json)
-                   VALUES (?, ?, ?, ?)""",
-                (str(intent_id), observed_at, stage, encoded),
+            _persist_execution_tca_stage(
+                conn,
+                str(intent_id),
+                observed_at,
+                stage,
+                encoded,
             )
         conn.commit()
         return cur.rowcount == 1
@@ -6275,6 +6778,53 @@ def fail_execution_markout(
     )
 
 
+def _persist_simulated_execution_tca_stage(
+    conn,
+    entry_id: str,
+    measured_at: str,
+    stage: str,
+    encoded: str,
+) -> None:
+    desired = _canonical_finite_json_object_db(encoded)
+    if desired is None:
+        raise ValueError("SIM TCA payload must be a finite JSON object")
+    existing_rows = conn.execute(
+        """SELECT payload_json FROM sim_execution_tca
+             WHERE entry_id=? AND stage=? ORDER BY id""",
+        (entry_id, stage),
+    ).fetchall()
+    for row in existing_rows:
+        existing = _canonical_finite_json_object_db(row["payload_json"])
+        if existing is None or existing[1] != desired[1]:
+            raise ValueError("conflicting SIM TCA evidence already exists")
+    if existing_rows:
+        return
+    conn.execute(
+        """INSERT INTO sim_execution_tca
+           (entry_id, measured_at, stage, payload_json)
+           VALUES (?, ?, ?, ?)""",
+        (entry_id, measured_at, stage, encoded),
+    )
+
+
+def _validate_sim_tca_payload_scope_db(payload: dict, bot_name: str) -> None:
+    payload_bot = payload.get("bot_name")
+    payload_mode = payload.get("mode")
+    research_simulated = payload.get("research_simulated")
+    if (
+        ("bot_name" in payload and (
+            not isinstance(payload_bot, str)
+            or payload_bot.strip().upper() != bot_name
+        ))
+        or ("mode" in payload and (
+            not isinstance(payload_mode, str)
+            or payload_mode.strip().upper() != "SIM"
+        ))
+        or ("research_simulated" in payload and research_simulated is not True)
+    ):
+        raise ValueError("SIM TCA payload scope conflicts with candidate")
+
+
 def record_simulated_execution_tca(
     entry_id: str, stage: str, payload: dict
 ) -> None:
@@ -6282,6 +6832,7 @@ def record_simulated_execution_tca(
     validated_entry_id = _causal_entry_id_db(entry_id, required=True)
     if not isinstance(stage, str) or not stage.strip():
         raise ValueError("SIM TCA stage is required")
+    validated_stage = stage.strip()
     if not isinstance(payload, dict):
         raise ValueError("SIM TCA payload must be a dictionary")
     try:
@@ -6290,18 +6841,21 @@ def record_simulated_execution_tca(
         raise ValueError("SIM TCA payload must be finite JSON") from exc
     conn = get_connection()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         candidate = conn.execute(
-            """SELECT 1 FROM expectancy_candidates
+            """SELECT bot_name FROM expectancy_candidates
                 WHERE entry_id=? AND mode='SIM'""",
             (validated_entry_id,),
         ).fetchone()
         if candidate is None:
             raise ValueError("SIM TCA requires a persisted SIM candidate")
-        conn.execute(
-            """INSERT INTO sim_execution_tca
-               (entry_id, measured_at, stage, payload_json)
-               VALUES (?, ?, ?, ?)""",
-            (validated_entry_id, _utcnow_str(), stage.strip(), encoded),
+        _validate_sim_tca_payload_scope_db(payload, candidate["bot_name"])
+        _persist_simulated_execution_tca_stage(
+            conn,
+            validated_entry_id,
+            _utcnow_str(),
+            validated_stage,
+            encoded,
         )
         conn.commit()
     except Exception:
@@ -6358,6 +6912,8 @@ def persist_simulated_entry_tca_bundle(
         raise ValueError("SIM markout reference price must be positive and finite")
     if not isinstance(arrival_payload, dict) or not isinstance(fill_payload, dict):
         raise ValueError("SIM TCA payloads must be dictionaries")
+    _validate_sim_tca_payload_scope_db(arrival_payload, normalized_bot)
+    _validate_sim_tca_payload_scope_db(fill_payload, normalized_bot)
     try:
         encoded_tca = {
             "arrival": json.dumps(
@@ -6409,28 +6965,25 @@ def persist_simulated_entry_tca_bundle(
     try:
         conn.execute("BEGIN IMMEDIATE")
         candidate = conn.execute(
-            """SELECT 1 FROM expectancy_candidates
+            """SELECT symbol FROM expectancy_candidates
                 WHERE entry_id=? AND bot_name=? AND mode='SIM'""",
             (validated_entry_id, normalized_bot),
         ).fetchone()
         if candidate is None:
             raise ValueError("SIM TCA requires a matching persisted candidate")
+        if not _candidate_symbol_matches_db(
+            candidate["symbol"], normalized_symbol
+        ):
+            raise ValueError("SIM TCA candidate symbol conflicts with venue symbol")
 
         for stage, encoded in encoded_tca.items():
-            existing = conn.execute(
-                """SELECT payload_json FROM sim_execution_tca
-                    WHERE entry_id=? AND stage=? ORDER BY id LIMIT 1""",
-                (validated_entry_id, stage),
-            ).fetchone()
-            if existing is None:
-                conn.execute(
-                    """INSERT INTO sim_execution_tca
-                       (entry_id, measured_at, stage, payload_json)
-                       VALUES (?, ?, ?, ?)""",
-                    (validated_entry_id, normalized_time, stage, encoded),
-                )
-            elif str(existing["payload_json"]) != encoded:
-                raise ValueError("conflicting SIM TCA evidence already exists")
+            _persist_simulated_execution_tca_stage(
+                conn,
+                validated_entry_id,
+                normalized_time,
+                stage,
+                encoded,
+            )
 
         snapshot_existing = conn.execute(
             """SELECT bot_name, mode, symbol, source, sequence_status,
@@ -6585,12 +7138,18 @@ def schedule_simulated_execution_markouts(
     try:
         conn.execute("BEGIN IMMEDIATE")
         candidate = conn.execute(
-            """SELECT 1 FROM expectancy_candidates
+            """SELECT symbol FROM expectancy_candidates
                 WHERE entry_id=? AND mode='SIM'""",
             (validated_entry_id,),
         ).fetchone()
         if candidate is None:
             raise ValueError("SIM markouts require a persisted SIM candidate")
+        if not _candidate_symbol_matches_db(
+            candidate["symbol"], validated_symbol
+        ):
+            raise ValueError(
+                "SIM markout candidate symbol conflicts with venue symbol"
+            )
         for row in rows:
             _, horizon, symbol_value, side_value, price_value, due_at = row
             existing = conn.execute(
@@ -6673,11 +7232,18 @@ def complete_simulated_execution_markout(
     price = _optional_finite_db(mark_price)
     bps = _optional_signed_finite_db(markout_bps)
     horizon = _positive_integer_db(horizon_seconds, "SIM markout horizon")
-    stage = str(tca_stage).strip()
     if price is None or price <= 0.0 or bps is None:
         raise ValueError("SIM markout values must be finite")
-    if not stage or not isinstance(tca_payload, dict):
+    if not isinstance(tca_payload, dict):
         raise ValueError("SIM markout TCA stage and payload are required")
+    stage = _validate_markout_tca_evidence_db(
+        horizon=horizon,
+        mark_price=price,
+        markout_bps=bps,
+        stage=tca_stage,
+        payload=tca_payload,
+        scope="SIM",
+    )
     try:
         encoded = json.dumps(tca_payload, sort_keys=True, allow_nan=False)
     except (TypeError, ValueError) as exc:
@@ -6689,15 +7255,33 @@ def complete_simulated_execution_markout(
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        if evidence_due_at is not None:
-            pending = conn.execute(
-                """SELECT due_at FROM sim_execution_markouts
-                     WHERE entry_id=? AND horizon_seconds=?
-                       AND status='PENDING'""",
-                (str(entry_id), horizon),
-            ).fetchone()
-            if pending is not None and str(pending["due_at"]) != evidence_due_at:
-                raise ValueError("SIM markout due time conflicts with queue")
+        pending = conn.execute(
+            """SELECT due_at, side, reference_price, attempts
+                 FROM sim_execution_markouts
+                 WHERE entry_id=? AND horizon_seconds=?
+                   AND status='PENDING'""",
+            (str(entry_id), horizon),
+        ).fetchone()
+        if pending is not None:
+            _validate_markout_completion_time_db(
+                pending,
+                observed_at=observed_at,
+                evidence_due_at=evidence_due_at,
+                scope="SIM",
+            )
+            prior_attempts = _validate_markout_completion_result_db(
+                pending,
+                mark_price=price,
+                markout_bps=bps,
+                payload=tca_payload,
+                scope="SIM",
+            )
+            evidence_payload = dict(tca_payload)
+            evidence_payload["attempt_number"] = prior_attempts + 1
+            evidence_payload["recovered_after_retry"] = prior_attempts > 0
+            encoded = json.dumps(
+                evidence_payload, sort_keys=True, allow_nan=False
+            )
         cursor = conn.execute(
             """UPDATE sim_execution_markouts
                   SET status='COMPLETE', measured_at=?, failed_at=NULL, mark_price=?,
@@ -6707,11 +7291,12 @@ def complete_simulated_execution_markout(
             (observed_at, price, bps, str(entry_id), horizon),
         )
         if cursor.rowcount == 1:
-            conn.execute(
-                """INSERT INTO sim_execution_tca
-                   (entry_id, measured_at, stage, payload_json)
-                   VALUES (?, ?, ?, ?)""",
-                (str(entry_id), observed_at, stage, encoded),
+            _persist_simulated_execution_tca_stage(
+                conn,
+                str(entry_id),
+                observed_at,
+                stage,
+                encoded,
             )
         conn.commit()
         return cursor.rowcount == 1

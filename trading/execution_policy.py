@@ -199,6 +199,12 @@ def evaluate_maker_cross_through(
     arrival = _finite(arrival_touch, "arrival_touch")
     if quote <= 0.0 or arrival <= 0.0:
         raise ValueError("maker price and arrival touch must be positive")
+    if (
+        normalized_side == "buy" and quote >= arrival
+    ) or (
+        normalized_side == "sell" and quote <= arrival
+    ):
+        raise ValueError("maker quote must be passive at arrival")
 
     crossed = False
     final_touch = None
@@ -223,10 +229,16 @@ def evaluate_maker_cross_through(
             break
     missed_cost = None
     if final_touch is not None:
-        sign = 1.0 if normalized_side == "buy" else -1.0
-        missed_cost = max(0.0, sign * (final_touch - arrival) / arrival * 10_000.0)
         if crossed:
             missed_cost = 0.0
+        else:
+            sign = 1.0 if normalized_side == "buy" else -1.0
+            derived_missed_cost = (
+                sign * (final_touch - arrival) / arrival * 10_000.0
+            )
+            if not math.isfinite(derived_missed_cost):
+                raise ValueError("derived missed fill cost must be finite")
+            missed_cost = max(0.0, derived_missed_cost)
     return MakerCrossThroughOutcome(
         crossed_through=crossed,
         queue_fill_claimed=False,

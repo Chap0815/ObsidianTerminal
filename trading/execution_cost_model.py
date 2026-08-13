@@ -77,6 +77,26 @@ def decode_execution_cost_payload(raw) -> dict:
     return payload
 
 
+def execution_cost_payloads_match(first: dict, second: dict) -> bool:
+    """Compare decoded JSON objects without depending on source formatting."""
+    try:
+        first_canonical = json.dumps(
+            first,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        second_canonical = json.dumps(
+            second,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return first_canonical == second_canonical
+
+
 def _execution_cost_timestamp(value) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -131,8 +151,8 @@ def validate_execution_cost_arrival(payload: dict) -> None:
     ask = _finite(payload["ask"], positive=True)
     mid = _finite(payload["mid"], positive=True)
     spread_bps = _finite(payload.get("spread_bps"))
-    if bid > ask:
-        raise ValueError("arrival quote geometry is crossed")
+    if bid >= ask:
+        raise ValueError("arrival quote geometry is crossed or locked")
     expected_mid = bid / 2.0 + ask / 2.0
     expected_spread = (ask - bid) / expected_mid * 10_000.0
     if (
@@ -162,6 +182,20 @@ def validate_execution_cost_fill(payload: dict) -> None:
         total_cost, expected_total, rel_tol=1e-9, abs_tol=1e-9
     ):
         raise ValueError("fill total_cost_bps is inconsistent")
+
+
+def resolve_execution_cost_notional(authoritative_value, arrival: dict) -> float:
+    """Use arrival notional only when legacy authoritative metadata is absent."""
+    if authoritative_value is not None:
+        return _finite(authoritative_value, positive=True)
+    return _finite(arrival.get("notional_usdt"), positive=True)
+
+
+def execution_cost_volatility_bps(arrival: dict) -> float:
+    """Normalize an absent legacy value without masking malformed values."""
+    if "volatility_bps" not in arrival:
+        return 0.0
+    return _finite(arrival["volatility_bps"])
 
 
 def _quote_symbol(value) -> str:
@@ -450,30 +484,49 @@ def load_execution_cost_observations(limit: int = 10_000) -> list[ExecutionCostO
 
     conn = get_connection()
     rows = conn.execute(
-        """SELECT t.intent_id, t.stage, t.payload_json,
+        """WITH recent AS (
+               SELECT t.intent_id FROM execution_tca AS t
+               JOIN order_intents AS i ON i.intent_id=t.intent_id
+                WHERE t.stage IN ('arrival', 'fill')
+                ORDER BY t.id DESC LIMIT ?
+           ), selected AS (
+               SELECT DISTINCT intent_id FROM recent
+           )
+           SELECT t.intent_id, t.stage, t.payload_json,
                   t.id AS tca_id, t.measured_at,
                   i.symbol, i.filled_notional
              FROM execution_tca AS t
+             JOIN selected AS s ON s.intent_id=t.intent_id
              JOIN order_intents AS i ON i.intent_id=t.intent_id
             WHERE t.stage IN ('arrival', 'fill')
-            ORDER BY t.id DESC LIMIT ?""",
+            ORDER BY t.id DESC""",
         (normalized_limit,),
-    ).fetchall()
+    )
     paired: dict[str, dict[str, tuple[dict, object, object]]] = {}
     metadata: dict[str, tuple[object, object]] = {}
+    invalid_payloads: set[str] = set()
+    conflicting_stages: set[str] = set()
     for row in rows:
         intent_id = str(row["intent_id"])
+        stage = str(row["stage"])
+        stages = paired.setdefault(intent_id, {})
+        metadata[intent_id] = (row["symbol"], row["filled_notional"])
         try:
             payload = decode_execution_cost_payload(row["payload_json"])
         except ValueError:
+            if stage not in stages:
+                invalid_payloads.add(intent_id)
             continue
-        paired.setdefault(intent_id, {}).setdefault(
-            str(row["stage"]),
-            (payload, row["tca_id"], row["measured_at"]),
-        )
-        metadata[intent_id] = (row["symbol"], row["filled_notional"])
+        existing = stages.get(stage)
+        if existing is not None:
+            if not execution_cost_payloads_match(existing[0], payload):
+                conflicting_stages.add(intent_id)
+            continue
+        stages[stage] = (payload, row["tca_id"], row["measured_at"])
     observations = []
     for intent_id, stages in paired.items():
+        if intent_id in invalid_payloads or intent_id in conflicting_stages:
+            continue
         arrival_stage = stages.get("arrival")
         fill_stage = stages.get("fill")
         if arrival_stage is None or fill_stage is None:
@@ -491,12 +544,9 @@ def load_execution_cost_observations(limit: int = 10_000) -> list[ExecutionCostO
         try:
             validate_execution_cost_arrival(arrival)
             validate_execution_cost_fill(fill)
-            try:
-                observed_notional = _finite(notional, positive=True)
-            except ValueError:
-                observed_notional = _finite(
-                    arrival.get("notional_usdt"), positive=True
-                )
+            observed_notional = resolve_execution_cost_notional(
+                notional, arrival
+            )
             observations.append(
                 ExecutionCostObservation(
                     symbol=symbol,
@@ -505,7 +555,7 @@ def load_execution_cost_observations(limit: int = 10_000) -> list[ExecutionCostO
                     depth_coverage=arrival["depth_coverage"],
                     notional_usdt=observed_notional,
                     regime=arrival.get("regime", "unknown"),
-                    volatility_bps=arrival.get("volatility_bps") or 0.0,
+                    volatility_bps=execution_cost_volatility_bps(arrival),
                 )
             )
         except (KeyError, TypeError, ValueError):

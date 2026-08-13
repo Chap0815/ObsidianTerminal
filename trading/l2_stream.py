@@ -20,7 +20,11 @@ from pathlib import Path
 from typing import Callable
 
 from bot_utils.api_budget import try_consume_api_call
-from trading.venue_recorder import SQLitePartitionWriter, VenueEvent
+from trading.venue_recorder import (
+    MAX_PARTITION_CLOCK_AGE_MS,
+    SQLitePartitionWriter,
+    VenueEvent,
+)
 
 
 class OrderBookValidationError(ValueError):
@@ -298,10 +302,11 @@ class L2ShadowCollector:
                 return False
             self._last_persist[symbol] = now_monotonic
             self._updates_since_sample[symbol] = 0
+            connection_epoch = self._connection_epoch
 
         flags = ["sequence_unverified"]
         exchange_ms = normalized["timestamp"]
-        raw_future_exchange_ms = None
+        raw_fallback_exchange_ms = None
         received_time = self._iso8601(received_ms)
         if exchange_ms is None:
             flags.append("missing_exchange_timestamp")
@@ -318,9 +323,13 @@ class L2ShadowCollector:
                 age_ms = received_ms - exchange_ms
                 if age_ms > self.stale_after_ms:
                     flags.append("stale_exchange_timestamp")
+                    if age_ms > MAX_PARTITION_CLOCK_AGE_MS:
+                        raw_fallback_exchange_ms = exchange_ms
+                        exchange_ms = received_ms
+                        exchange_time = received_time
                 elif age_ms < -30_000:
                     flags.append("future_exchange_timestamp")
-                    raw_future_exchange_ms = exchange_ms
+                    raw_fallback_exchange_ms = exchange_ms
                     exchange_ms = received_ms
                     exchange_time = received_time
         if nonce_monotonic is False:
@@ -336,12 +345,12 @@ class L2ShadowCollector:
             "sequence_valid": False,
             "sequence_status": "unverified_unified_orderbook",
             "stream_source": "ccxt_pro",
-            "connection_epoch": self._connection_epoch,
+            "connection_epoch": connection_epoch,
             "updates_since_sample": updates,
             "sample_interval_ms": int(self.sample_interval * 1000),
         }
-        if raw_future_exchange_ms is not None:
-            payload["raw_exchange_timestamp_ms"] = raw_future_exchange_ms
+        if raw_fallback_exchange_ms is not None:
+            payload["raw_exchange_timestamp_ms"] = raw_fallback_exchange_ms
         digest = hashlib.blake2s(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
             digest_size=8,
@@ -431,6 +440,25 @@ class L2ShadowCollector:
             self._health_error_type = error_type
             self._health_reconnect_attempts = reconnect_attempts
             self._health_ok_logged = False
+
+    def _begin_connection_epoch(
+        self,
+        *,
+        error_type: str | None,
+        reconnect_attempts: int,
+    ) -> None:
+        # A transport reconnect leaves an unobserved sequence gap. Start a
+        # fresh sampling generation so the first new snapshot is immediate and
+        # never compares its nonce with evidence from the previous connection.
+        with self._state_lock:
+            self._last_persist.clear()
+            self._last_nonce.clear()
+            self._updates_since_sample.clear()
+            self._connection_epoch += 1
+        self._begin_health_check(
+            error_type=error_type,
+            reconnect_attempts=reconnect_attempts,
+        )
 
     def _mark_l2_healthy(
         self,
@@ -581,9 +609,8 @@ class L2ShadowCollector:
                         "L2 load_markets API budget exhausted"
                     )
                 async_exchange = self._make_async_exchange()
-                self._connection_epoch += 1
                 await async_exchange.load_markets()
-                self._begin_health_check(
+                self._begin_connection_epoch(
                     error_type=last_error_type,
                     reconnect_attempts=reconnect_attempts,
                 )

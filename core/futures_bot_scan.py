@@ -216,6 +216,34 @@ class FuturesScanMixin:
             self._log_error(f"retry rolled-back futures entry cleanup {sym}", exc)
             return False
 
+    def _complete_verified_futures_entry_rollback(
+        self,
+        sym: str,
+        *,
+        entry_id: str,
+        direction: str,
+        reason: str,
+    ) -> bool:
+        """Close rollback recovery only after durable state/claim cleanup."""
+        cleaned = self._cleanup_rolled_back_futures_entry_state(sym, reason)
+        if cleaned is not True:
+            return False
+        try:
+            from trading.entry_lifecycle import emit_entry_lifecycle
+
+            emit_entry_lifecycle(
+                entry_id,
+                bot=self.BOT_NAME,
+                symbol=sym,
+                stage="aborted",
+                mode="LIVE",
+                reason="state_write_rollback_verified",
+                direction=direction,
+            )
+        except Exception:
+            pass
+        return True
+
     def _release_untracked_futures_entry_claim(
         self,
         sym: str,
@@ -1833,12 +1861,24 @@ class FuturesScanMixin:
                     stage="order_failed", mode=entry_mode,
                     reason=type(e).__name__, direction=direction)
                 log_event(f"Order {sym} failed: {e}", "WARN")
-                self._log_error(f"Open {sym}", e)
+                try:
+                    self._log_error(f"Open {sym}", e)
+                except Exception:
+                    pass
                 if _not_submitted:
-                    self._cleanup_rolled_back_futures_entry_state(
-                        sym, "futures entry was not submitted")
+                    cleaned = self._cleanup_rolled_back_futures_entry_state(
+                        sym, "futures entry was not submitted"
+                    )
+                    if cleaned is not True:
+                        self._mark_futures_entry_recovery_pending()
+                        log_event(
+                            f"{sym}: order was not submitted but durable "
+                            "claim/state cleanup is incomplete",
+                            "ERROR",
+                        )
                     return
                 _landed = False
+                _recovery_resolved = False
                 # ORPHAN PREVENTION: create_order can RAISE after the order
                 # actually LANDED (lost response on the final retry). Check by
                 # clientOrderId  if it filled, TRACK it (provisional) instead of
@@ -1875,6 +1915,8 @@ class FuturesScanMixin:
                         lookup_status.get("unavailable")
                     )
                     if recovery_unavailable:
+                        _outcome_unknown = True
+                    elif landed is None:
                         _outcome_unknown = True
                     elif (
                         landed is not None
@@ -1936,13 +1978,33 @@ class FuturesScanMixin:
                                     expected_position_side=direction,
                                 )
                                 if closed:
-                                    self._cleanup_rolled_back_futures_entry_state(
-                                        sym,
-                                        "landed order rolled back after state failure",
+                                    _recovery_resolved = True
+                                    completed = (
+                                        self._complete_verified_futures_entry_rollback(
+                                            sym,
+                                            entry_id=entry_id,
+                                            direction=direction,
+                                            reason=(
+                                                "landed order rolled back after "
+                                                "state failure"
+                                            ),
+                                        )
                                     )
-                                    log_event(
-                                        f" {sym}: landed order rolled back "
-                                        f"after state-write failure", "WARN")
+                                    if completed:
+                                        log_event(
+                                            f" {sym}: landed order rollback "
+                                            "and cleanup completed after "
+                                            "state-write failure",
+                                            "WARN",
+                                        )
+                                    else:
+                                        self._mark_futures_entry_recovery_pending()
+                                        log_event(
+                                            f" {sym}: landed order rollback "
+                                            "verified flat but durable "
+                                            "claim/state cleanup is incomplete",
+                                            "ERROR",
+                                        )
                                 else:
                                     _landed = True
                                     log_event(
@@ -1969,17 +2031,34 @@ class FuturesScanMixin:
                                 recovered_after_error=True)
                             log_event(f" {sym}: order landed despite error  "
                                       f"tracked provisionally", "WARN")
-                except Exception:
+                except Exception as recovery_exc:
+                    _outcome_unknown = True
+                    try:
+                        self._log_error(
+                            f"Recover futures entry {sym}", recovery_exc
+                        )
+                    except Exception:
+                        pass
+                if _recovery_resolved:
                     pass
-                if not _landed and _outcome_unknown:
+                elif not _landed and _outcome_unknown:
+                    self._mark_futures_entry_recovery_pending()
                     log_event(
                         f"{sym}: entry outcome unknown; claim kept pending "
                         f"clientOrderId reconciliation",
                         "ERROR",
                     )
                 elif not _landed:
-                    self._cleanup_rolled_back_futures_entry_state(
-                        sym, "futures entry failed before durable state")
+                    cleaned = self._cleanup_rolled_back_futures_entry_state(
+                        sym, "futures entry failed before durable state"
+                    )
+                    if cleaned is not True:
+                        self._mark_futures_entry_recovery_pending()
+                        log_event(
+                            f"{sym}: entry has confirmed zero fill but "
+                            "durable claim/state cleanup is incomplete",
+                            "ERROR",
+                        )
                 return
 
         #  Persist full trade record (overwrites provisional) 
@@ -2098,11 +2177,28 @@ class FuturesScanMixin:
                     expected_position_side=direction,
                 )
                 if closed:
-                    self._cleanup_rolled_back_futures_entry_state(
-                        sym, "state write failed after live futures entry")
-                    log_event(
-                        f"{sym}: rollback close verified after state failure",
-                        "WARN")
+                    completed = (
+                        self._complete_verified_futures_entry_rollback(
+                            sym,
+                            entry_id=entry_id,
+                            direction=direction,
+                            reason=(
+                                "state write failed after live futures entry"
+                            ),
+                        )
+                    )
+                    if completed:
+                        log_event(
+                            f"{sym}: rollback close and cleanup completed "
+                            "after state failure",
+                            "WARN",
+                        )
+                    else:
+                        log_event(
+                            f"{sym}: rollback verified flat but durable "
+                            "claim/state cleanup is incomplete",
+                            "ERROR",
+                        )
                 else:
                     log_event(
                         f"{sym}: CRITICAL rollback close not verified "

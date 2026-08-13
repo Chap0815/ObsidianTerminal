@@ -323,6 +323,33 @@ class ScanMixin:
             self._log_error(f"retry rolled-back entry cleanup {sym}", exc)
             return False
 
+    def _complete_verified_spot_entry_rollback(
+        self,
+        sym: str,
+        *,
+        entry_id: str,
+        reason: str,
+    ) -> bool:
+        """Close rollback recovery only after durable state/claim cleanup."""
+        cleaned = self._cleanup_rolled_back_entry_state(sym, reason)
+        if cleaned is not True:
+            return False
+        try:
+            from trading.entry_lifecycle import emit_entry_lifecycle
+
+            emit_entry_lifecycle(
+                entry_id,
+                bot=self.BOT_NAME,
+                symbol=sym,
+                stage="aborted",
+                mode="LIVE",
+                reason="state_write_rollback_verified",
+                direction="BUY",
+            )
+        except Exception:
+            pass
+        return True
+
     def _assess_spot_entry_signal(self, r, regime: dict):
         rsi_values = self._rsi_triplet(r)
         if rsi_values is None:
@@ -926,11 +953,23 @@ class ScanMixin:
                     bot_name=self.BOT_NAME,
                 )
                 if spot_entry_rollback_was_fully_filled(order, sold_amount):
-                    self._cleanup_rolled_back_entry_state(
-                        sym, "state write failed after live buy")
-                    log_event(
-                        f"Buy {sym}: rollback sell filled after state failure",
-                        "WARN")
+                    completed = self._complete_verified_spot_entry_rollback(
+                        sym,
+                        entry_id=entry_id,
+                        reason="state write failed after live buy",
+                    )
+                    if completed:
+                        log_event(
+                            f"Buy {sym}: rollback sell and cleanup completed "
+                            "after state failure",
+                            "WARN",
+                        )
+                    else:
+                        log_event(
+                            f"Buy {sym}: rollback sell verified flat but "
+                            "durable claim/state cleanup is incomplete",
+                            "ERROR",
+                        )
                 else:
                     log_event(
                         f"Buy {sym}: CRITICAL rollback sell not verified "

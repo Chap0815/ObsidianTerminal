@@ -16,6 +16,9 @@ from bot_utils.order_utils import order_id_text_or_none
 from core.constants import NONCRYPTO_BASES
 
 
+MAX_PARTITION_CLOCK_AGE_MS = 86_400_000
+
+
 @dataclass(frozen=True)
 class VenueEvent:
     event_id: str
@@ -61,6 +64,12 @@ class SQLitePartitionWriter:
             return None
         return parsed.astimezone(timezone.utc)
 
+    @staticmethod
+    def _canonical_utc(value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+
     @classmethod
     def _storage_exchange_time(cls, event: VenueEvent) -> tuple[str, bool]:
         exchange_time = cls._parse_event_time(event.exchange_time)
@@ -70,7 +79,9 @@ class SQLitePartitionWriter:
             and exchange_time > received_time + timedelta(seconds=30)
         )
         if needs_fallback and received_time is not None:
-            return str(event.received_time), True
+            return cls._canonical_utc(received_time), True
+        if exchange_time is not None:
+            return cls._canonical_utc(exchange_time), needs_fallback
         return str(event.exchange_time), needs_fallback
 
     @classmethod
@@ -112,6 +123,20 @@ class SQLitePartitionWriter:
         self._connections[path] = connection
         return connection
 
+    @classmethod
+    def _persisted_values_match(cls, existing: tuple, values: tuple) -> bool:
+        if existing == values:
+            return True
+        existing_time = cls._parse_event_time(existing[2])
+        requested_time = cls._parse_event_time(values[2])
+        return bool(
+            existing_time is not None
+            and requested_time is not None
+            and existing_time == requested_time
+            and existing[:2] == values[:2]
+            and existing[3:] == values[3:]
+        )
+
     def write(self, event: VenueEvent) -> Path:
         path = self._path(event)
         exchange_time, clock_fallback = self._storage_exchange_time(event)
@@ -152,7 +177,9 @@ class SQLitePartitionWriter:
                              FROM venue_events WHERE event_id=?""",
                         (event.event_id,),
                     ).fetchone()
-                    if existing is None or tuple(existing) != values:
+                    if existing is None or not self._persisted_values_match(
+                        tuple(existing), values
+                    ):
                         raise ValueError(
                             "venue event id conflicts with persisted evidence"
                         )
@@ -478,15 +505,24 @@ class VenueRecorder:
         market_id = market_id or self._market_id(self.exchange, symbol)
         raw_event_clock = exchange_ms if exchange_ms is not None else ended_ms
         invalid_exchange_clock = False
+        stale_exchange_clock = False
         try:
             event_clock_value = self._finite_number_or_none(raw_event_clock)
             if (
                 event_clock_value is None
                 or event_clock_value <= 0
                 or not event_clock_value.is_integer()
-                or event_clock_value > int(ended_ms) + 86_400_000
+                or event_clock_value
+                > int(ended_ms) + MAX_PARTITION_CLOCK_AGE_MS
             ):
                 raise ValueError("event clock outside accepted range")
+            if (
+                exchange_ms is not None
+                and event_clock_value
+                < int(ended_ms) - MAX_PARTITION_CLOCK_AGE_MS
+            ):
+                stale_exchange_clock = True
+                raise ValueError("event clock is stale")
             event_clock = int(event_clock_value)
             exchange_time = datetime.fromtimestamp(
                 event_clock / 1000, tz=timezone.utc
@@ -497,7 +533,12 @@ class VenueRecorder:
                 event_clock / 1000, tz=timezone.utc
             ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
             invalid_exchange_clock = exchange_ms is not None
-        if invalid_exchange_clock and "invalid_exchange_timestamp" not in flags:
+        if (
+            stale_exchange_clock
+            and "stale_exchange_timestamp" not in flags
+        ):
+            flags = (*flags, "stale_exchange_timestamp")
+        elif invalid_exchange_clock and "invalid_exchange_timestamp" not in flags:
             flags = (*flags, "invalid_exchange_timestamp")
         digest_input = json.dumps(payload, sort_keys=True, default=str)
         digest = hashlib.blake2s(digest_input.encode("utf-8"), digest_size=8).hexdigest()
@@ -539,6 +580,9 @@ class VenueRecorder:
                 invalid_numeric_payload = True
             return parsed
 
+        quote_volumes: dict[str, float | None] = {}
+        quote_volume_sources: dict[str, str] = {}
+
         for symbol, ticker in ticker_rows.items():
             market = (getattr(self.exchange, "markets", None) or {}).get(symbol) or {}
             if not market.get("swap") or market.get("quote") != "USDT":
@@ -546,17 +590,35 @@ class VenueRecorder:
             if not isinstance(ticker, dict):
                 invalid_numeric_payload = True
                 continue
-            raw_volume = (
-                ticker.get("quoteVolume")
-                if ticker.get("quoteVolume") is not None
-                else ticker.get("baseVolume")
-            )
-            volume = _number(raw_volume)
-            if volume is None or volume < 0:
-                if volume is not None:
+            raw_quote_volume = ticker.get("quoteVolume")
+            if raw_quote_volume is not None:
+                quote_volume = _number(raw_quote_volume)
+                quote_volume_source = "ticker_quote"
+                if quote_volume is None or quote_volume < 0.0:
                     invalid_numeric_payload = True
-                volume = 0.0
-            candidates.append((volume, symbol, ticker))
+                    quote_volume = None
+                    quote_volume_source = "invalid"
+            else:
+                base_volume = _number(ticker.get("baseVolume"))
+                last_price = _number(ticker.get("last"))
+                if base_volume is None or last_price is None:
+                    quote_volume = None
+                    quote_volume_source = "unavailable"
+                elif base_volume < 0.0 or last_price <= 0.0:
+                    invalid_numeric_payload = True
+                    quote_volume = None
+                    quote_volume_source = "invalid"
+                else:
+                    quote_volume = base_volume * last_price
+                    if not math.isfinite(quote_volume):
+                        invalid_numeric_payload = True
+                        quote_volume = None
+                        quote_volume_source = "invalid"
+                    else:
+                        quote_volume_source = "base_times_last"
+            quote_volumes[symbol] = quote_volume
+            quote_volume_sources[symbol] = quote_volume_source
+            candidates.append((quote_volume or 0.0, symbol, ticker))
         candidates.sort(reverse=True)
         volume_universe = [
             symbol
@@ -598,7 +660,8 @@ class VenueRecorder:
                 "last": _number(ticker.get("last")),
                 "bid": _number(ticker.get("bid")),
                 "ask": _number(ticker.get("ask")),
-                "quote_volume": _number(ticker.get("quoteVolume")),
+                "quote_volume": quote_volumes[symbol],
+                "quote_volume_source": quote_volume_sources[symbol],
                 "hold_volume": _number(info.get("holdVol")),
                 "index_price": _number(
                     info.get("indexPrice") or ticker.get("index")

@@ -16,6 +16,7 @@ from bot_utils.silent_log import silent_log
 
 
 _MARKOUT_LOCK_TTL_SECONDS = 120
+_BOOK_CLOCK_FUTURE_TOLERANCE_MS = 30_000
 _MEXC_FEE_TRUTH_LOCK = threading.Lock()
 _MEXC_FEE_TRUTHS: weakref.WeakKeyDictionary[
     object, OrderedDict[str, FeeTruth]
@@ -278,7 +279,8 @@ def depth_vwap(
     levels: Sequence[Sequence[float]], *, amount: float, side: str
 ) -> DepthEstimate:
     """Estimate executable VWAP from direction-appropriate ordered L2 levels."""
-    if _normalized_side_or_none(side) is None:
+    normalized_side = _normalized_side_or_none(side)
+    if normalized_side is None:
         raise ValueError("side must be buy or sell")
     requested = _positive_finite_or_none(amount)
     if requested is None:
@@ -286,6 +288,7 @@ def depth_vwap(
     remaining = requested
     notional = 0.0
     filled = 0.0
+    previous_price = None
     for level in levels:
         if remaining <= 0.0:
             break
@@ -299,13 +302,27 @@ def depth_vwap(
         available = _positive_finite_or_none(level[1])
         if price is None or available is None:
             continue
+        if previous_price is not None:
+            wrongly_sorted = (
+                price < previous_price
+                if normalized_side == "buy"
+                else price > previous_price
+            )
+            if wrongly_sorted:
+                raise ValueError("executable depth levels are not sorted")
+        previous_price = price
         take = min(remaining, available)
         notional += take * price
         filled += take
         remaining -= take
+        if not all(math.isfinite(value) for value in (notional, filled, remaining)):
+            raise ValueError("VWAP arithmetic is not finite")
     coverage = min(1.0, filled / requested)
+    vwap = notional / filled if filled else None
+    if vwap is not None and not math.isfinite(vwap):
+        raise ValueError("VWAP arithmetic is not finite")
     return DepthEstimate(
-        vwap=(notional / filled if filled else None),
+        vwap=vwap,
         coverage=coverage,
         filled_amount=filled,
         requested_amount=requested,
@@ -359,17 +376,17 @@ def build_arrival_tca(
         ask = _positive_finite_or_none(asks[0][0])
     except (IndexError, TypeError):
         bid = ask = None
-    if bid is None or ask is None or bid > ask:
+    if bid is None or ask is None or bid >= ask:
         raise ValueError("invalid top of book")
     mid = (bid + ask) / 2.0
     levels = asks if normalized_side == "buy" else bids
     estimate = depth_vwap(levels, amount=amount, side=normalized_side)
     exchange_time_ms = _nonnegative_integer_or_none(book.get("timestamp"))
-    age = (
-        max(0, validated_local_time_ms - exchange_time_ms)
-        if exchange_time_ms is not None
-        else None
-    )
+    age = None
+    if exchange_time_ms is not None:
+        clock_delta = validated_local_time_ms - exchange_time_ms
+        if clock_delta >= -_BOOK_CLOCK_FUTURE_TOLERANCE_MS:
+            age = max(0, clock_delta)
     return ArrivalTCA(
         side=normalized_side,
         amount=estimate.requested_amount,
@@ -396,7 +413,7 @@ def compute_fill_tca(
     bid = _positive_finite_or_none(arrival.bid)
     ask = _positive_finite_or_none(arrival.ask)
     mid = _positive_finite_or_none(arrival.mid)
-    if bid is None or ask is None or mid is None or bid > ask:
+    if bid is None or ask is None or mid is None or bid >= ask:
         raise ValueError("arrival prices must be positive, finite, and uncrossed")
     if not math.isclose(mid, (bid + ask) / 2.0, rel_tol=1e-12):
         raise ValueError("arrival midpoint is inconsistent with bid and ask")
@@ -522,6 +539,7 @@ def process_due_tca_markouts(
             return 0
 
         ticker_marks: dict[str, tuple[float, datetime]] = {}
+        ticker_failures: dict[str, str] = {}
         for row in due_rows[:row_limit]:
             if not _renew_worker_lease("before_row"):
                 break
@@ -541,6 +559,12 @@ def process_due_tca_markouts(
                     queue_rowid is None or queue_rowid <= 0
                 ):
                     raise ValueError("markout queue rowid is invalid")
+                if (
+                    telemetry_scope not in {"", "LIVE", "SIM"}
+                    or queue_rowid is not None
+                    and telemetry_scope not in {"LIVE", "SIM"}
+                ):
+                    raise ValueError("markout telemetry scope is invalid")
                 raw_intent_id = row.get("intent_id")
                 if raw_intent_id is None or isinstance(raw_intent_id, bool):
                     raise ValueError("markout intent id is invalid")
@@ -631,6 +655,9 @@ def process_due_tca_markouts(
                 )
                 symbol_key = symbol.strip()
                 ticker_observation = ticker_marks.get(symbol_key)
+                ticker_failure = ticker_failures.get(symbol_key)
+                if ticker_failure is not None:
+                    raise _RetryableMarkoutError(ticker_failure)
                 if ticker_observation is None:
                     if not try_consume_api_call(
                         "execution_markout_fetch_ticker"
@@ -638,18 +665,18 @@ def process_due_tca_markouts(
                         break
                     ticker = exchange.fetch_ticker(symbol_key)
                     if not isinstance(ticker, Mapping):
-                        raise _RetryableMarkoutError(
-                            "ticker payload unavailable"
-                        )
+                        ticker_failure = "ticker payload unavailable"
+                        ticker_failures[symbol_key] = ticker_failure
+                        raise _RetryableMarkoutError(ticker_failure)
                     mark = _first_positive_finite(
                         ticker.get("mark"),
                         ticker.get("last"),
                         ticker.get("close"),
                     )
                     if mark is None:
-                        raise _RetryableMarkoutError(
-                            "mark price unavailable"
-                        )
+                        ticker_failure = "mark price unavailable"
+                        ticker_failures[symbol_key] = ticker_failure
+                        raise _RetryableMarkoutError(ticker_failure)
                     observed_at_utc = _markout_now_utc()
                     if not isinstance(observed_at_utc, datetime):
                         raise ValueError("markout observation time is invalid")
@@ -738,7 +765,7 @@ def process_due_tca_markouts(
                             "PersistenceError: "
                             f"{type(persist_exc).__name__}: {persist_exc}"
                         ),
-                        retryable=True,
+                        retryable=not isinstance(persist_exc, ValueError),
                     )
                     failure_persisted = True
                 except Exception as failure_exc:

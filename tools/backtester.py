@@ -67,6 +67,7 @@ SLIPPAGE_PER_SIDE = BACKTEST_SLIPPAGE_PER_SIDE
 
 SPOT_TAKER_FEE = BACKTEST_SPOT_TAKER_FEE
 FUTURES_TAKER_FEE = BACKTEST_FUTURES_TAKER_FEE
+PNL_ZERO_TOLERANCE_PCT = 1e-12
 
 
 # Single source for per-strategy defaults.
@@ -403,17 +404,23 @@ def _closed_trade_record(
     gross: float,
     fees: float,
     funding: float,
+    notional: float,
     is_partial: bool,
     liquidated: bool,
 ) -> dict:
     total_cost = fees + funding
+    net = gross - total_cost
     return {
+        "position_id": trade.get("position_id"),
+        "symbol": trade.get("symbol"),
         "profit_pct": profit_pct,
+        "net_pct": (net / notional * 100.0) if notional > 0.0 else profit_pct,
+        "notional": notional,
         "gross": gross,
         "fees": fees,
         "funding": funding,
         "cost": total_cost,
-        "net": gross - total_cost,
+        "net": net,
         "is_partial": is_partial,
         "liquidated": liquidated,
         "exit_reason": reason,
@@ -594,6 +601,7 @@ def simulate_fast(
 
     open_trades = {}
     closed_trades = []
+    next_position_id = 1
     total_costs = 0.0
     total_gross = 0.0
     liquidations = 0
@@ -645,6 +653,7 @@ def simulate_fast(
                             gross_p,
                             fees,
                             0.0,
+                            notional,
                             False,
                             True,
                         )
@@ -652,7 +661,9 @@ def simulate_fast(
                         total_costs += rec["cost"]
                         total_gross += abs(gross_p)
                         liquidations += 1
-                        recent_full_nets.append(rec["net"])
+                        recent_full_nets.append(
+                            d.get("realized_net", 0.0) + rec["net"]
+                        )
                         del open_trades[sym]
                         continue
 
@@ -714,12 +725,21 @@ def simulate_fast(
                     funding_8h, side, notional, d.get("entry_now", now), now
                 )
                 rec = _closed_trade_record(
-                    d, now, reason, realized_prof, gross_p, fees, funding, False, False
+                    d,
+                    now,
+                    reason,
+                    realized_prof,
+                    gross_p,
+                    fees,
+                    funding,
+                    notional,
+                    False,
+                    False,
                 )
                 closed_trades.append(rec)
                 total_costs += rec["cost"]
                 total_gross += gross_p
-                recent_full_nets.append(rec["net"])
+                recent_full_nets.append(d.get("realized_net", 0.0) + rec["net"])
                 del open_trades[sym]
                 continue
 
@@ -739,12 +759,14 @@ def simulate_fast(
                     gross_p,
                     fees,
                     funding,
+                    notional,
                     True,
                     False,
                 )
                 closed_trades.append(rec)
                 total_costs += rec["cost"]
                 total_gross += gross_p
+                d["realized_net"] = d.get("realized_net", 0.0) + rec["net"]
                 d["partial"] = True
                 d["inv"] -= sa
                 d["break_even"] = True
@@ -825,6 +847,8 @@ def simulate_fast(
                 continue
             fill_price = next_open
             open_trades[sym] = {
+                "position_id": next_position_id,
+                "symbol": sym,
                 "buy": fill_price,
                 "highest": fill_price,
                 "lowest": fill_price,
@@ -835,9 +859,11 @@ def simulate_fast(
                 "entry_now": now,
                 "mfe_pct": 0.0,
                 "mae_pct": 0.0,
+                "realized_net": 0.0,
                 # precompute liquidation price at open
                 "liq_price": _liq_price(side, fill_price, leverage),
             }
+            next_position_id += 1
 
     if all_times and open_trades:
         end_time = all_times[-1]
@@ -873,6 +899,7 @@ def simulate_fast(
                 gross_p,
                 fees,
                 funding,
+                notional,
                 False,
                 False,
             )
@@ -893,51 +920,198 @@ def simulate_strategy(
     return simulate_fast(indexed, all_times, strategy, use_maker, params)
 
 
+def _empty_backtest_stats(invalid_reason: str | None = None) -> dict:
+    stats = {
+        "trades": 0,
+        "edge": False,
+        "net": -9999,
+        "roi": -9999,
+        "win_rate": 0,
+        "win_count": 0,
+        "loss_count": 0,
+        "breakeven_count": 0,
+        "sharpe": -9999,
+        "max_dd": 99,
+        "cost_pct": 99,
+        "liquidation_count": 0,
+        # Keys consumed by the optimizer's deep-validation suite
+        # (outlier / monte-carlo). Additive  no existing reader.
+        "trade_count": 0,
+        "best_trade": 0.0,
+        "avg_profit_pct": 0.0,
+        "std_profit_pct": 0.0,
+        "total_fees": 0.0,
+        "total_funding": 0.0,
+        "net_trades": [],
+        "position_net_trades": [],
+        "closed_trades": [],
+        "closed_positions": [],
+    }
+    if invalid_reason is not None:
+        stats["invalid_reason"] = invalid_reason
+    return stats
+
+
+def _finite_stats_number(value) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _stats_values_match(actual: float, expected: float) -> bool:
+    return _finite_stats_number(expected) and math.isclose(
+        actual,
+        expected,
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    )
+
+
+def _stats_trade_values_match(actual: float, expected: float) -> bool:
+    if not _finite_stats_number(expected):
+        return False
+    difference = abs(actual - expected)
+    tolerance = max(
+        1e-12,
+        8.0 * math.ulp(actual),
+        8.0 * math.ulp(expected),
+    )
+    return math.isfinite(difference) and difference <= tolerance
+
+
+def _closed_position_summaries(trades: list[dict]) -> list[dict] | None:
+    """Aggregate partial and terminal fills into independent positions."""
+    has_position_ids = [trade.get("position_id") is not None for trade in trades]
+    if not any(has_position_ids):
+        if any(trade["is_partial"] for trade in trades):
+            return None
+        return [
+            {
+                "position_id": index,
+                "entry_time": trade.get("entry_time"),
+                "exit_time": trade.get("exit_time"),
+                "net": trade["net"],
+                "net_pct": trade.get("net_pct", trade["profit_pct"]),
+            }
+            for index, trade in enumerate(trades, start=1)
+        ]
+    if not all(has_position_ids):
+        return None
+    groups: dict[int, list[dict]] = {}
+    for trade in trades:
+        position_id = trade.get("position_id")
+        if (
+            isinstance(position_id, bool)
+            or not isinstance(position_id, int)
+            or position_id < 1
+            or not _finite_stats_number(trade.get("notional"))
+            or trade["notional"] <= 0.0
+        ):
+            return None
+        groups.setdefault(position_id, []).append(trade)
+    summaries = []
+    for position_id, fragments in groups.items():
+        terminal = [trade for trade in fragments if trade["is_partial"] is False]
+        if len(terminal) != 1 or fragments[-1] is not terminal[0]:
+            return None
+        try:
+            net = math.fsum(trade["net"] for trade in fragments)
+            notional = math.fsum(trade["notional"] for trade in fragments)
+            net_pct = net / notional * 100.0
+        except (ArithmeticError, ValueError, ZeroDivisionError):
+            return None
+        if not all(_finite_stats_number(value) for value in (net, notional, net_pct)):
+            return None
+        summaries.append(
+            {
+                "position_id": position_id,
+                "entry_time": fragments[0].get("entry_time"),
+                "exit_time": terminal[0].get("exit_time"),
+                "net": net,
+                "net_pct": net_pct,
+            }
+        )
+    try:
+        summaries.sort(
+            key=lambda row: (_to_epoch_sec(row["exit_time"]), row["position_id"])
+        )
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    return summaries
+
+
 def _compute_stats(trades: list, total_costs: float, total_gross: float) -> dict:
     if not trades:
-        return {
-            "trades": 0,
-            "edge": False,
-            "net": -9999,
-            "roi": -9999,
-            "win_rate": 0,
-            "sharpe": -9999,
-            "max_dd": 99,
-            "cost_pct": 99,
-            "liquidation_count": 0,
-            # Keys consumed by the optimizer's deep-validation suite
-            # (outlier / monte-carlo). Additive  no existing reader.
-            "trade_count": 0,
-            "best_trade": 0.0,
-            "avg_profit_pct": 0.0,
-            "std_profit_pct": 0.0,
-            "total_fees": 0.0,
-            "total_funding": 0.0,
-            "net_trades": [],
-            "closed_trades": [],
-        }
+        return _empty_backtest_stats()
+    if not _finite_stats_number(total_costs) or not _finite_stats_number(total_gross):
+        return _empty_backtest_stats("nonfinite_trade_stats")
+    for trade in trades:
+        if not isinstance(trade, dict) or not isinstance(trade.get("is_partial"), bool):
+            return _empty_backtest_stats("nonfinite_trade_stats")
+        for field in ("profit_pct", "gross", "fees", "funding", "cost", "net"):
+            if not _finite_stats_number(trade.get(field)):
+                return _empty_backtest_stats("nonfinite_trade_stats")
+        for field in ("net_pct", "notional"):
+            if field in trade and not _finite_stats_number(trade[field]):
+                return _empty_backtest_stats("nonfinite_trade_stats")
+        expected_cost = trade["fees"] + trade["funding"]
+        expected_net = trade["gross"] - trade["cost"]
+        if (
+            not _stats_trade_values_match(trade["cost"], expected_cost)
+            or not _stats_trade_values_match(trade["net"], expected_net)
+        ):
+            return _empty_backtest_stats("inconsistent_trade_stats")
 
-    full = [t for t in trades if not t["is_partial"]] or trades
-    pcts = [t["profit_pct"] for t in full]
-    wins = [p for p in pcts if p >= 0]
-    loss = [p for p in pcts if p < 0]
+    try:
+        recorded_costs = math.fsum(t["cost"] for t in trades)
+        recorded_gross = math.fsum(t["gross"] for t in trades)
+    except (ArithmeticError, ValueError):
+        return _empty_backtest_stats("nonfinite_trade_stats")
+    if not _stats_values_match(
+        total_costs, recorded_costs
+    ) or not _stats_values_match(total_gross, recorded_gross):
+        return _empty_backtest_stats("inconsistent_trade_stats")
 
-    wr = len(wins) / len(full) if full else 0
-    avg_win = statistics.mean(wins) if wins else 0
-    avg_loss = abs(statistics.mean(loss)) if loss else 0.01
-    payoff = avg_win / avg_loss
-    exp_val = (wr * avg_win) - ((1 - wr) * avg_loss)
+    closed_positions = _closed_position_summaries(trades)
+    if closed_positions is None:
+        return _empty_backtest_stats("inconsistent_position_stats")
+    pcts = [position["net_pct"] for position in closed_positions]
+    position_nets = [position["net"] for position in closed_positions]
+    wins = [p for p in pcts if p > PNL_ZERO_TOLERANCE_PCT]
+    loss = [p for p in pcts if p < -PNL_ZERO_TOLERANCE_PCT]
+    breakeven = [p for p in pcts if abs(p) <= PNL_ZERO_TOLERANCE_PCT]
 
-    total_net = sum(t["net"] for t in trades)
-    total_fees = sum(t.get("fees", t.get("cost", 0.0)) for t in trades)
-    total_funding = sum(t.get("funding", 0.0) for t in trades)
-    gross_basis = sum(abs(t.get("gross", 0.0)) for t in trades)
-    cost_pct = (total_costs / gross_basis * 100) if gross_basis > 0 else 0
-    roi = (total_net / INITIAL_CAPITAL) * 100
+    try:
+        wr = len(wins) / len(closed_positions) if closed_positions else 0
+        loss_rate = len(loss) / len(closed_positions) if closed_positions else 0
+        avg_win = statistics.mean(wins) if wins else 0
+        avg_loss = abs(statistics.mean(loss)) if loss else 0.01
+        payoff = avg_win / avg_loss
+        exp_val = (wr * avg_win) - (loss_rate * avg_loss)
+
+        total_net = math.fsum(t["net"] for t in trades)
+        position_net_total = math.fsum(position_nets)
+        total_fees = math.fsum(
+            t.get("fees", t.get("cost", 0.0)) for t in trades
+        )
+        total_funding = math.fsum(t.get("funding", 0.0) for t in trades)
+        gross_basis = math.fsum(abs(t.get("gross", 0.0)) for t in trades)
+        cost_pct = (total_costs / gross_basis * 100) if gross_basis > 0 else 0
+        roi = (total_net / INITIAL_CAPITAL) * 100
+    except (ArithmeticError, ValueError):
+        return _empty_backtest_stats("nonfinite_trade_stats")
+    if not _stats_trade_values_match(total_net, position_net_total):
+        return _empty_backtest_stats("inconsistent_position_stats")
 
     curve = [INITIAL_CAPITAL]
     for p in [t["net"] for t in trades]:
-        curve.append(curve[-1] + p)
+        next_value = curve[-1] + p
+        if not _finite_stats_number(next_value):
+            return _empty_backtest_stats("nonfinite_trade_stats")
+        curve.append(next_value)
     peak, max_dd = curve[0], 0
     for c in curve:
         if c > peak:
@@ -948,23 +1122,55 @@ def _compute_stats(trades: list, total_costs: float, total_gross: float) -> dict
 
     all_nets = [t["net"] for t in trades]
     sharpe = 0.0
-    if len(all_nets) > 1:
-        sd = statistics.stdev(all_nets)
-        if sd > 0:
-            sharpe = statistics.mean(all_nets) / sd
+    try:
+        if len(position_nets) > 1:
+            sd = statistics.stdev(position_nets)
+            if sd > 0:
+                sharpe = statistics.mean(position_nets) / sd
+    except (ArithmeticError, ValueError):
+        return _empty_backtest_stats("nonfinite_trade_stats")
 
     # Distribution stats consumed by the optimizer's deep-validation suite
     # (regime-split / outlier-dependency / monte-carlo). Additive keys  no
     # existing reader depends on them, so this can't change current behaviour.
-    best_trade = max(pcts) if pcts else 0.0
-    avg_profit_pct = statistics.mean(pcts) if pcts else 0.0
-    std_profit_pct = statistics.stdev(pcts) if len(pcts) > 1 else 0.0
+    try:
+        best_trade = max(pcts) if pcts else 0.0
+        avg_profit_pct = statistics.mean(pcts) if pcts else 0.0
+        std_profit_pct = statistics.stdev(pcts) if len(pcts) > 1 else 0.0
+    except (ArithmeticError, ValueError):
+        return _empty_backtest_stats("nonfinite_trade_stats")
+
+    if not all(
+        _finite_stats_number(value)
+        for value in (
+            wr,
+            avg_win,
+            avg_loss,
+            payoff,
+            exp_val,
+            total_net,
+            total_fees,
+            total_funding,
+            gross_basis,
+            cost_pct,
+            roi,
+            max_dd,
+            sharpe,
+            best_trade,
+            avg_profit_pct,
+            std_profit_pct,
+        )
+    ):
+        return _empty_backtest_stats("nonfinite_trade_stats")
 
     return {
         "trades": len(trades),
-        "full_trades": len(full),
-        "trade_count": len(full),  # alias used by deep-validation
+        "full_trades": len(closed_positions),
+        "trade_count": len(closed_positions),  # alias used by deep-validation
         "win_rate": wr,
+        "win_count": len(wins),
+        "loss_count": len(loss),
+        "breakeven_count": len(breakeven),
         "avg_win": avg_win,
         "avg_loss": avg_loss,
         "payoff": payoff,
@@ -984,7 +1190,9 @@ def _compute_stats(trades: list, total_costs: float, total_gross: float) -> dict
         # Optimizer robustness diagnostics consume this as the additive PnL
         # series, so it must cover the same realized fills as total_net.
         "net_trades": all_nets,
+        "position_net_trades": position_nets,
         "closed_trades": trades,
+        "closed_positions": closed_positions,
         "edge": total_net > 0 and exp_val > 0,
     }
 

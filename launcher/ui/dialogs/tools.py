@@ -251,9 +251,13 @@ def optimizer_promotion_reasons(cfg: dict) -> list[str]:
     reasons = []
     for key in (
         "robust",
+        "deep_validation_complete",
         "deployment_validated",
         "deployment_trustworthy",
         "final_holdout_pass",
+        "holdout_net_consistent",
+        "holdout_sample_consistent",
+        "holdout_outcomes_consistent",
         "cost_stress_pass",
     ):
         if cfg.get(key) is not True:
@@ -265,8 +269,16 @@ def optimizer_promotion_reasons(cfg: dict) -> list[str]:
     holdout_trades = _finite_optimizer_number(cfg.get("holdout_trades"))
     if holdout_trades is None or not holdout_trades.is_integer():
         reasons.append("holdout trade count must be a finite integer")
-    elif holdout_trades < OPTIMIZER_MIN_HOLDOUT_TRADES:
-        reasons.append("holdout trade count is below minimum")
+    elif holdout_trades < 0.0:
+        reasons.append("holdout trade count must be nonnegative")
+
+    holdout_full_trades = _finite_optimizer_number(cfg.get("holdout_full_trades"))
+    if holdout_full_trades is None or not holdout_full_trades.is_integer():
+        reasons.append("holdout full-trade count must be a finite integer")
+    elif holdout_full_trades < OPTIMIZER_MIN_HOLDOUT_TRADES:
+        reasons.append("holdout full-trade count is below minimum")
+    elif holdout_trades is not None and holdout_full_trades > holdout_trades:
+        reasons.append("holdout full-trade count exceeds trade rows")
 
     dsr = _finite_optimizer_number(cfg.get("dsr"))
     if dsr is None or not 0.95 <= dsr <= 1.0:
@@ -287,7 +299,9 @@ def optimizer_promotion_reasons(cfg: dict) -> list[str]:
     return reasons
 
 
-def optimizer_config_from_complete_marker(line: str) -> dict | None:
+def optimizer_config_from_complete_marker(
+    line: str, *, expected_strategy: str | None = None
+) -> dict | None:
     """Parse only a complete, promotion-eligible single-line marker."""
     if not isinstance(line, str) or OPTIMIZER_BEST_CONFIG_START not in line:
         return None
@@ -302,6 +316,8 @@ def optimizer_config_from_complete_marker(line: str) -> dict | None:
     except Exception:
         return None
     if not isinstance(cfg, dict) or optimizer_promotion_reasons(cfg):
+        return None
+    if expected_strategy is not None and cfg.get("strategy") != expected_strategy:
         return None
     return cfg
 
@@ -325,6 +341,8 @@ def optimizer_best_config_updates(cfg: dict) -> tuple[dict, list[str]]:
 
 def apply_optimizer_best_config_to_app(app, strategy: str, cfg: dict) -> list[str]:
     """Apply optimizer-emitted keys to UI memory and persist only those keys."""
+    if not isinstance(cfg, dict) or cfg.get("strategy") != strategy:
+        raise ValueError("optimizer strategy mismatch")
     updates, applied = optimizer_best_config_updates(cfg)
     if not updates:
         return applied
@@ -378,6 +396,7 @@ def reset_optimizer_apply_run_state(parse_state: dict, apply_btn_ref: dict) -> b
         "trophy_lines_seen": 0,
         "run_generation": generation,
         "output_complete": False,
+        "expected_strategy": None,
     })
     return True
 
@@ -391,10 +410,15 @@ def finalize_optimizer_apply_run(
     """Publish a staged optimizer result only after a proven clean exit."""
     clean_exit = type(exit_code) is int and exit_code == 0
     cfg = parse_state.get("best_config")
+    expected_strategy = parse_state.get("expected_strategy")
     if (
         not clean_exit
         or parse_state.get("output_complete") is not True
         or not isinstance(cfg, dict)
+        or (
+            expected_strategy is not None
+            and cfg.get("strategy") != expected_strategy
+        )
         or optimizer_promotion_reasons(cfg)
     ):
         if clean_exit:
@@ -995,7 +1019,10 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         # Best-config marker  parse and stash; don't render
         if OPTIMIZER_BEST_CONFIG_START in line:
             parse_state["best_config"] = None
-            cfg = optimizer_config_from_complete_marker(line)
+            cfg = optimizer_config_from_complete_marker(
+                line,
+                expected_strategy=parse_state.get("expected_strategy"),
+            )
             if cfg is not None:
                 parse_state["best_config"] = cfg
             return
@@ -1344,6 +1371,9 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             status_var.set(" Cannot invalidate the previous optimizer result")
             status_lbl.configure(text_color=COLORS["danger"])
             return
+        parse_state["expected_strategy"] = (
+            bot if tool_name == "optimizer" else None
+        )
         run_generation = parse_state["run_generation"]
 
         # Phase switch: hide config, show output

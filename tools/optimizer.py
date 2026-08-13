@@ -14,11 +14,11 @@ Features:
 USAGE:
   python optimizer.py TREND
   python optimizer.py SPOT 60
-  python optimizer.py TREND 90 --maker
+  python optimizer.py FUTURES 90 --maker
   python optimizer.py SPOT 60 --top 20
-  python optimizer.py TREND --quick
-  python optimizer.py TREND --kfold 5     # 5 Folds statt 4
-  python optimizer.py TREND --no-sensitivity  # ohne Sensitivitts-Analyse
+  python optimizer.py FUTURES --quick
+  python optimizer.py FUTURES --kfold 5     # 5 Folds statt 4
+  python optimizer.py SPOT --no-sensitivity  # ohne Sensitivitts-Analyse
 
 DAUER:
   Standard (4 Folds + Sensitivity): ~30-90 Minuten TREND, ~10-25 Min. SPOT
@@ -36,7 +36,10 @@ import csv
 import json as _json
 import random as _random
 import statistics
+import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime
 
 _TOOL_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +64,7 @@ from tools.backtester import (
     simulate_fast,
     calc_round_trip,
     DEFAULT_DAYS,
+    PNL_ZERO_TOLERANCE_PCT,
     _compute_stats,
 )
 from core.logger import log_separator
@@ -163,6 +167,24 @@ def _norm_ppf(p: float) -> float:
     )
 
 
+def _invalid_dsr_result(
+    reason: str,
+    n_trials: int = 0,
+    valid_trial_count: int = 0,
+    invalid_trial_count: int = 0,
+) -> dict:
+    return {
+        "dsr": None,
+        "sr0": None,
+        "n_trials": n_trials,
+        "valid_trial_count": valid_trial_count,
+        "invalid_trial_count": invalid_trial_count,
+        "best_consistent": False,
+        "evidence_valid": False,
+        "reason": reason,
+    }
+
+
 def deflated_sharpe_ratio(
     sr_list: list, sr_best: float, n_obs: int, skew: float = 0.0, kurt: float = 3.0
 ) -> dict:
@@ -178,32 +200,116 @@ def deflated_sharpe_ratio(
     DSR = ( (sr_best - sr0)*sqrt(T-1) /
              sqrt(1 - skew*sr_best + ((kurt-1)/4)*sr_best^2) )
     """
-    finite = [s for s in sr_list if s is not None and math.isfinite(s)]
-    n = len(finite)
-    if n < 2 or n_obs is None or n_obs < 2:
-        return {"dsr": None, "sr0": None, "n_trials": n, "reason": "insufficient_stats"}
-    var_sr = statistics.variance(finite)
-    if var_sr <= 0.0:
-        return {"dsr": None, "sr0": None, "n_trials": n, "reason": "zero_variance"}
-    z1 = _norm_ppf(1.0 - 1.0 / n)
-    z2 = _norm_ppf(1.0 - 1.0 / (n * math.e))
-    sr0 = math.sqrt(var_sr) * ((1.0 - _EULER_GAMMA) * z1 + _EULER_GAMMA * z2)
-    denom = 1.0 - skew * sr_best + ((kurt - 1.0) / 4.0) * sr_best * sr_best
-    if denom <= 0.0:
-        return {
-            "dsr": None,
-            "sr0": sr0,
-            "n_trials": n,
-            "reason": "nonpositive_denominator",
-        }
-    z = (sr_best - sr0) * math.sqrt(n_obs - 1) / math.sqrt(denom)
-    return {"dsr": _norm_cdf(z), "sr0": sr0, "n_trials": n, "n_obs": n_obs}
+    if not isinstance(sr_list, (list, tuple)):
+        return _invalid_dsr_result("invalid_trial_container")
+    normalized = [_finite_optimizer_number(value) for value in sr_list]
+    invalid_trial_count = sum(value is None for value in normalized)
+    n = len(normalized)
+    valid_trial_count = n - invalid_trial_count
+    if invalid_trial_count:
+        return _invalid_dsr_result(
+            "invalid_trial_sharpe",
+            n_trials=n,
+            valid_trial_count=valid_trial_count,
+            invalid_trial_count=invalid_trial_count,
+        )
+    if n < 2:
+        return _invalid_dsr_result(
+            "insufficient_stats",
+            n_trials=n,
+            valid_trial_count=valid_trial_count,
+        )
+    if isinstance(n_obs, bool) or not isinstance(n_obs, int) or n_obs < 2:
+        return _invalid_dsr_result(
+            "invalid_observation_count",
+            n_trials=n,
+            valid_trial_count=valid_trial_count,
+        )
+    sr_best_value = _finite_optimizer_number(sr_best)
+    skew_value = _finite_optimizer_number(skew)
+    kurt_value = _finite_optimizer_number(kurt)
+    if sr_best_value is None or skew_value is None or kurt_value is None:
+        return _invalid_dsr_result(
+            "invalid_distribution_stats",
+            n_trials=n,
+            valid_trial_count=valid_trial_count,
+        )
+    if kurt_value < 1.0:
+        return _invalid_dsr_result(
+            "invalid_kurtosis",
+            n_trials=n,
+            valid_trial_count=valid_trial_count,
+        )
+    best_consistent = any(
+        math.isclose(sr_best_value, trial, rel_tol=1e-9, abs_tol=1e-12)
+        for trial in normalized
+    )
+    if not best_consistent:
+        return _invalid_dsr_result(
+            "selected_sharpe_missing_from_trials",
+            n_trials=n,
+            valid_trial_count=valid_trial_count,
+        )
+    try:
+        var_sr = statistics.variance(normalized)
+        if not math.isfinite(var_sr) or var_sr <= 0.0:
+            reason = "zero_variance" if var_sr == 0.0 else "invalid_variance"
+            return _invalid_dsr_result(
+                reason,
+                n_trials=n,
+                valid_trial_count=valid_trial_count,
+            )
+        z1 = _norm_ppf(1.0 - 1.0 / n)
+        z2 = _norm_ppf(1.0 - 1.0 / (n * math.e))
+        sr0 = math.sqrt(var_sr) * (
+            (1.0 - _EULER_GAMMA) * z1 + _EULER_GAMMA * z2
+        )
+        denom = (
+            1.0
+            - skew_value * sr_best_value
+            + ((kurt_value - 1.0) / 4.0) * sr_best_value * sr_best_value
+        )
+        if not math.isfinite(sr0) or not math.isfinite(denom):
+            raise ArithmeticError
+        if denom <= 0.0:
+            return _invalid_dsr_result(
+                "nonpositive_denominator",
+                n_trials=n,
+                valid_trial_count=valid_trial_count,
+            )
+        z = (sr_best_value - sr0) * math.sqrt(n_obs - 1) / math.sqrt(denom)
+        dsr = _norm_cdf(z)
+    except (ArithmeticError, OverflowError, ValueError):
+        return _invalid_dsr_result(
+            "invalid_dsr_summary",
+            n_trials=n,
+            valid_trial_count=valid_trial_count,
+        )
+    if not math.isfinite(z) or not math.isfinite(dsr) or not 0.0 <= dsr <= 1.0:
+        return _invalid_dsr_result(
+            "invalid_dsr_summary",
+            n_trials=n,
+            valid_trial_count=valid_trial_count,
+        )
+    return {
+        "dsr": dsr,
+        "sr0": sr0,
+        "n_trials": n,
+        "valid_trial_count": valid_trial_count,
+        "invalid_trial_count": 0,
+        "n_obs": n_obs,
+        "best_consistent": True,
+        "evidence_valid": True,
+    }
 
 
 def _logit(x: float) -> float:
     eps = 1e-9
     x = min(1.0 - eps, max(eps, x))
     return math.log(x / (1.0 - x))
+
+
+MAX_PBO_CSCV_FOLDS = 12
 
 
 def probability_of_backtest_overfitting(perf_matrix: list) -> dict:
@@ -217,41 +323,109 @@ def probability_of_backtest_overfitting(perf_matrix: list) -> dict:
     its OOS rank, and compute the logit of its relative OOS rank. PBO = fraction
     of partitions whose IS-best config lands at or below the OOS median.
     """
-    if not perf_matrix or len(perf_matrix) < 2:
+    if not isinstance(perf_matrix, (list, tuple)):
+        return {"pbo": None, "n_partitions": 0, "reason": "invalid_matrix"}
+    if len(perf_matrix) < 2:
         return {"pbo": None, "n_partitions": 0, "reason": "too_few_configs"}
+    if any(not isinstance(row, (list, tuple)) for row in perf_matrix):
+        return {"pbo": None, "n_partitions": 0, "reason": "invalid_matrix"}
     n_cfg = len(perf_matrix)
     k = len(perf_matrix[0])
     if k < 2 or any(len(row) != k for row in perf_matrix):
         return {"pbo": None, "n_partitions": 0, "reason": "ragged_or_too_few_folds"}
+    if k % 2:
+        return {"pbo": None, "n_partitions": 0, "reason": "odd_fold_count"}
+    # Exact CSCV is combinatorial: C(12, 6)=924, but C(16, 8)=12,870
+    # full candidate rankings. Keep diagnostics bounded and fail closed.
+    if k > MAX_PBO_CSCV_FOLDS:
+        return {"pbo": None, "n_partitions": 0, "reason": "too_many_folds"}
+    normalized_matrix = []
+    for row in perf_matrix:
+        normalized_row = []
+        for value in row:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return {
+                    "pbo": None,
+                    "n_partitions": 0,
+                    "reason": "invalid_performance",
+                }
+            number = float(value)
+            if not math.isfinite(number):
+                return {
+                    "pbo": None,
+                    "n_partitions": 0,
+                    "reason": "nonfinite_performance",
+                }
+            normalized_row.append(number)
+        normalized_matrix.append(normalized_row)
     half = k // 2
     if half < 1:
         return {"pbo": None, "n_partitions": 0, "reason": "too_few_folds"}
     all_folds = list(range(k))
     logits = []
-    below_median = 0
-    for is_idx in itertools.combinations(all_folds, half):
-        is_set = set(is_idx)
-        oos_idx = [j for j in all_folds if j not in is_set]
-        is_perf = [
-            statistics.mean(perf_matrix[c][j] for j in is_idx) for c in range(n_cfg)
-        ]
-        oos_perf = [
-            statistics.mean(perf_matrix[c][j] for j in oos_idx) for c in range(n_cfg)
-        ]
-        best_c = max(range(n_cfg), key=lambda c: is_perf[c])
-        ranked = sorted(range(n_cfg), key=lambda c: oos_perf[c])
-        oos_rank = ranked.index(best_c)  # 0 = worst OOS
-        rel_rank = (oos_rank + 1) / (n_cfg + 1)
-        logits.append(_logit(rel_rank))
-        if rel_rank <= 0.5:
-            below_median += 1
+    below_median = 0.0
+    try:
+        for is_idx in itertools.combinations(all_folds, half):
+            is_set = set(is_idx)
+            oos_idx = [j for j in all_folds if j not in is_set]
+            is_perf = [
+                statistics.mean(normalized_matrix[c][j] for j in is_idx)
+                for c in range(n_cfg)
+            ]
+            oos_perf = [
+                statistics.mean(normalized_matrix[c][j] for j in oos_idx)
+                for c in range(n_cfg)
+            ]
+            if not all(math.isfinite(value) for value in is_perf + oos_perf):
+                raise ArithmeticError
+            best_is = max(is_perf)
+            best_configs = [c for c in range(n_cfg) if is_perf[c] == best_is]
+
+            # Worker completion order must not decide equal-score ranks. Assign
+            # every OOS tie its average ascending rank, then weight all IS-best
+            # ties equally within this partition.
+            oos_ranks = [0.0] * n_cfg
+            ordered = sorted(range(n_cfg), key=lambda c: oos_perf[c])
+            start = 0
+            while start < n_cfg:
+                end = start + 1
+                while (
+                    end < n_cfg
+                    and oos_perf[ordered[end]] == oos_perf[ordered[start]]
+                ):
+                    end += 1
+                average_rank = (start + end - 1) / 2.0
+                for position in range(start, end):
+                    oos_ranks[ordered[position]] = average_rank
+                start = end
+            rel_ranks = [
+                (oos_ranks[c] + 1.0) / (n_cfg + 1.0) for c in best_configs
+            ]
+            logits.append(statistics.mean(_logit(rank) for rank in rel_ranks))
+            below_median += statistics.mean(rank <= 0.5 for rank in rel_ranks)
+    except (ArithmeticError, OverflowError, ValueError):
+        return {"pbo": None, "n_partitions": 0, "reason": "invalid_summary"}
     n_part = len(logits)
     if n_part == 0:
         return {"pbo": None, "n_partitions": 0, "reason": "no_partitions"}
+    pbo = below_median / n_part
+    median_logit = statistics.median(logits)
+    expected_partitions = math.comb(k, half)
+    if (
+        n_part != expected_partitions
+        or not math.isfinite(pbo)
+        or not 0.0 <= pbo <= 1.0
+        or not math.isfinite(median_logit)
+    ):
+        return {"pbo": None, "n_partitions": 0, "reason": "invalid_summary"}
     return {
-        "pbo": below_median / n_part,
+        "pbo": pbo,
         "n_partitions": n_part,
-        "median_logit": statistics.median(logits),
+        "expected_partitions": expected_partitions,
+        "median_logit": median_logit,
+        "config_count": n_cfg,
+        "fold_count": k,
+        "evidence_valid": True,
     }
 
 
@@ -259,17 +433,32 @@ def _sample_skew_kurt(xs: list) -> tuple:
     """Sample skewness and NON-excess kurtosis (Normal  3.0) of a return list.
     Returns (0.0, 3.0) when stats are undefined so DSR degrades to the Normal
     case rather than failing."""
-    n = len(xs)
+    if not isinstance(xs, (list, tuple)):
+        return float("nan"), float("nan")
+    normalized = [_finite_optimizer_number(value) for value in xs]
+    if any(value is None for value in normalized):
+        return float("nan"), float("nan")
+    n = len(normalized)
     if n < 3:
         return 0.0, 3.0
-    mean = statistics.mean(xs)
-    m2 = sum((x - mean) ** 2 for x in xs) / n
+    try:
+        mean = statistics.mean(normalized)
+        m2 = math.fsum((x - mean) ** 2 for x in normalized) / n
+    except (ArithmeticError, OverflowError, ValueError):
+        return float("nan"), float("nan")
+    if not math.isfinite(mean) or not math.isfinite(m2):
+        return float("nan"), float("nan")
     if m2 <= 0.0:
         return 0.0, 3.0
-    m3 = sum((x - mean) ** 3 for x in xs) / n
-    m4 = sum((x - mean) ** 4 for x in xs) / n
-    skew = m3 / (m2**1.5)
-    kurt = m4 / (m2**2)
+    try:
+        m3 = math.fsum((x - mean) ** 3 for x in normalized) / n
+        m4 = math.fsum((x - mean) ** 4 for x in normalized) / n
+        skew = m3 / (m2**1.5)
+        kurt = m4 / (m2**2)
+    except (ArithmeticError, OverflowError, ValueError):
+        return float("nan"), float("nan")
+    if not math.isfinite(skew) or not math.isfinite(kurt):
+        return float("nan"), float("nan")
     return skew, kurt
 
 
@@ -277,6 +466,7 @@ def _sample_skew_kurt(xs: list) -> tuple:
 # The optimizer is a long job (30-90 min). Each completed result is streamed to
 # a JSONL file as it's computed so a Ctrl+C / OOM never loses partial progress.
 _INCREMENTAL_PATH = None
+_INCREMENTAL_WRITE_LOCK = threading.Lock()
 
 
 def _set_incremental_path(strategy: str, days: int) -> None:
@@ -289,25 +479,20 @@ def _set_incremental_path(strategy: str, days: int) -> None:
     except OSError:
         log_dir = base
     _INCREMENTAL_PATH = os.path.join(
-        log_dir, f"optimizer_{strategy}_{days}d_{ts}.jsonl"
+        log_dir, f"optimizer_{strategy}_{days}d_{ts}_{os.getpid()}.jsonl"
     )
 
 
 def _persist_result(record: dict) -> None:
     """Append one optimizer result to disk."""
-    if not _INCREMENTAL_PATH:
+    path = _INCREMENTAL_PATH
+    if not path:
         return
     try:
-        # Drop non-JSON-serializable values defensively
-        safe = {}
-        for k, v in record.items():
-            try:
-                _json.dumps(v)
-                safe[k] = v
-            except (TypeError, ValueError):
-                safe[k] = str(v)
-        with open(_INCREMENTAL_PATH, "a", encoding="utf-8") as fh:
-            fh.write(_json.dumps(safe, default=str) + "\n")
+        line = _json.dumps(record, default=str) + "\n"
+        with _INCREMENTAL_WRITE_LOCK:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line)
     except Exception:
         # NEVER let persistence kill the optimizer
         pass
@@ -352,6 +537,33 @@ QUICK_SPACE = {
 }
 
 
+def _finite_optimizer_number(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _finite_optimizer_net(result: dict) -> float | None:
+    """Return a trustworthy simulation net value, or None for bad evidence."""
+    if not isinstance(result, dict):
+        return None
+    return _finite_optimizer_number(result.get("net"))
+
+
+def _optimizer_net_summary(values: list[float]) -> tuple[float, float, float] | None:
+    """Summarize finite nets without letting aggregate overflow pass as evidence."""
+    try:
+        avg = statistics.mean(values)
+        std = statistics.stdev(values) if len(values) > 1 else 0.0
+        consistency = 1 - (std / abs(avg)) if avg != 0 else 0.0
+    except (ArithmeticError, AttributeError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (avg, std, consistency)):
+        return None
+    return avg, std, max(0.0, min(1.0, consistency))
+
+
 #  Walk-Forward Validation
 # Walk-forward beats normal K-Fold for time-series strategy testing because
 # financial data is NOT IID  regimes, trends, volatility clusters mean a
@@ -383,17 +595,30 @@ def walk_forward_simulate(
     if slice_len < 10:
         # Not enough data  fall back to single backtest
         s = simulate_fast(indexed, all_times, strategy, use_maker, params)
+        net = _finite_optimizer_net(s)
+        valid_net = net is not None
+        safe_net = net if valid_net else 0.0
+        edge_count = int(isinstance(s, dict) and s.get("edge") is True)
+        all_profitable = bool(valid_net and safe_net > 0 and edge_count == 1)
         return {
             "slices": [s],
-            "slice_nets": [s.get("net", 0)],
-            "consistency": 1.0 if s.get("net", 0) > 0 else 0.0,
-            "all_profitable": s.get("net", 0) > 0,
+            "slice_nets": [safe_net],
+            "consistency": 1.0 if valid_net and safe_net > 0 else 0.0,
+            "profitable_count": int(valid_net and safe_net > 0),
+            "edge_count": edge_count,
+            "valid_slice_count": int(valid_net),
+            "invalid_slice_count": int(not valid_net),
+            "summary_valid": valid_net,
+            "all_profitable": all_profitable,
+            "robust": False,
             "fragility": "single-slice (data too short)",
         }
 
     embargo = int(total * EMBARGO_FRAC) if EMBARGO_FRAC > 0 else 0
     slice_nets = []
     slice_results = []
+    valid_slice_count = 0
+    edge_count = 0
     for step in range(n_steps):
         # Forward test slice: position (step+1) of (n_steps+1) total
         start = (step + 1) * slice_len
@@ -406,15 +631,29 @@ def walk_forward_simulate(
             period_times = all_times[start:end]
         period_data = filter_to_period(indexed, set(period_times))
         s = simulate_fast(period_data, period_times, strategy, use_maker, params)
-        slice_nets.append(s.get("net", 0))
+        net = _finite_optimizer_net(s)
+        if net is None:
+            slice_nets.append(0.0)
+        else:
+            slice_nets.append(net)
+            valid_slice_count += 1
+        edge_count += int(isinstance(s, dict) and s.get("edge") is True)
         slice_results.append(s)
 
     profitable_count = sum(1 for n in slice_nets if n > 0)
-    avg = statistics.mean(slice_nets)
-    std = statistics.stdev(slice_nets) if len(slice_nets) > 1 else 0
-    consistency = max(0.0, min(1.0, 1 - (std / abs(avg)) if avg != 0 else 0.0))
-    # Walk-forward "passes" if every forward slice was profitable AND the
-    # variance across slices is moderate (consistency > 0.3)
+    summary = _optimizer_net_summary(slice_nets)
+    summary_valid = summary is not None
+    avg, std, consistency = summary or (0.0, 0.0, 0.0)
+    invalid_slice_count = n_steps - valid_slice_count
+    all_profitable = (
+        summary_valid
+        and
+        valid_slice_count == n_steps
+        and profitable_count == n_steps
+        and edge_count == n_steps
+    )
+    # Walk-forward passes only with finite positive nets, explicit edge in every
+    # slice and moderate variance (consistency > 0.3).
     return {
         "slices": slice_results,
         "slice_nets": slice_nets,
@@ -422,8 +661,12 @@ def walk_forward_simulate(
         "std_net": std,
         "consistency": consistency,
         "profitable_count": profitable_count,
-        "all_profitable": profitable_count == n_steps,
-        "robust": profitable_count == n_steps and consistency > 0.3,
+        "edge_count": edge_count,
+        "valid_slice_count": valid_slice_count,
+        "invalid_slice_count": invalid_slice_count,
+        "summary_valid": summary_valid,
+        "all_profitable": all_profitable,
+        "robust": all_profitable and consistency > 0.3,
     }
 
 
@@ -445,7 +688,11 @@ def detect_regimes(indexed: dict, all_times: list) -> dict:
       BEAR: BTC 24h change < -3%
       CHOP: in between (low volatility / sideways)
     """
+    if not isinstance(indexed, dict):
+        return {"BULL": [], "BEAR": [], "CHOP": all_times[:]}
     btc_data = indexed.get("BTC", {}) or indexed.get("BTC/USDT", {}) or {}
+    if not isinstance(btc_data, dict):
+        return {"BULL": [], "BEAR": [], "CHOP": all_times[:]}
     if not btc_data:
         # No BTC reference  can't classify
         return {"BULL": [], "BEAR": [], "CHOP": all_times[:]}
@@ -453,7 +700,9 @@ def detect_regimes(indexed: dict, all_times: list) -> dict:
     buckets = {"BULL": [], "BEAR": [], "CHOP": []}
     for t in all_times:
         tick = btc_data.get(t)
-        chg = tick.get("change") if tick else None
+        chg = tick.get("change") if isinstance(tick, dict) else None
+        if chg is not None:
+            chg = _finite_optimizer_number(chg)
         if chg is None:
             buckets["CHOP"].append(t)
         elif chg > 3.0:
@@ -465,6 +714,44 @@ def detect_regimes(indexed: dict, all_times: list) -> dict:
     return buckets
 
 
+def _invalid_regime_split_result(
+    regimes: dict,
+    all_times: list,
+    reason: str,
+    invalid_source_sample_count: int = 0,
+) -> dict:
+    results = {}
+    tested_count = 0
+    for regime_name, regime_times in regimes.items():
+        if len(regime_times) < 10:
+            results[regime_name] = {
+                "net": 0.0,
+                "trades": 0,
+                "skipped": "insufficient_data",
+            }
+            continue
+        tested_count += 1
+        results[regime_name] = {
+            "net": 0.0,
+            "trades": 0,
+            "edge": False,
+            "ratio": len(regime_times) / max(1, len(all_times)),
+            "invalid_reason": reason,
+        }
+    return {
+        "regimes": results,
+        "profitable_count": 0,
+        "edge_count": 0,
+        "tested_count": tested_count,
+        "valid_regime_count": 0,
+        "invalid_regime_count": tested_count,
+        "invalid_source_sample_count": invalid_source_sample_count,
+        "evidence_valid": False,
+        "survives_all": False,
+        "reason": reason,
+    }
+
+
 def regime_split_simulate(
     indexed: dict, all_times: list, strategy: str, use_maker: bool, params: dict
 ) -> dict:
@@ -474,15 +761,57 @@ def regime_split_simulate(
     can fire after an entry even if the market regime changes. We then attribute
     each closed trade to the regime at entry time.
     """
+    if not isinstance(indexed, dict):
+        regimes = detect_regimes(indexed, all_times)
+        return _invalid_regime_split_result(
+            regimes, all_times, "invalid_regime_source", 1
+        )
+    btc_data = indexed.get("BTC", {}) or indexed.get("BTC/USDT", {}) or {}
+    invalid_source_sample_count = 0
+    if btc_data and not isinstance(btc_data, dict):
+        regimes = detect_regimes(indexed, all_times)
+        return _invalid_regime_split_result(
+            regimes, all_times, "invalid_regime_source", 1
+        )
+    if isinstance(btc_data, dict) and btc_data:
+        for timestamp in all_times:
+            tick = btc_data.get(timestamp)
+            if tick is None:
+                continue
+            if not isinstance(tick, dict):
+                invalid_source_sample_count += 1
+                continue
+            change = tick.get("change")
+            if change is not None and _finite_optimizer_number(change) is None:
+                invalid_source_sample_count += 1
     regimes = detect_regimes(indexed, all_times)
+    if invalid_source_sample_count:
+        return _invalid_regime_split_result(
+            regimes,
+            all_times,
+            "invalid_regime_source",
+            invalid_source_sample_count,
+        )
     regime_by_time = {
         t: regime_name
         for regime_name, regime_times in regimes.items()
         for t in regime_times
     }
     full = simulate_fast(indexed, all_times, strategy, use_maker, params)
-    closed = list(full.get("closed_trades", []) or [])
+    if not isinstance(full, dict) or full.get("invalid_reason") is not None:
+        return _invalid_regime_split_result(
+            regimes, all_times, "invalid_full_simulation"
+        )
+    closed = full.get("closed_trades")
+    if not isinstance(closed, list) or any(
+        not isinstance(trade, dict) for trade in closed
+    ):
+        return _invalid_regime_split_result(
+            regimes, all_times, "invalid_closed_trades"
+        )
     results = {}
+    valid_regime_count = 0
+    invalid_regime_count = 0
     for regime_name, regime_times in regimes.items():
         if len(regime_times) < 10:
             results[regime_name] = {
@@ -495,36 +824,87 @@ def regime_split_simulate(
             t for t in closed if regime_by_time.get(t.get("entry_time")) == regime_name
         ]
         if regime_trades:
-            s = _compute_stats(
-                regime_trades,
-                sum(float(t.get("cost", 0.0) or 0.0) for t in regime_trades),
-                sum(float(t.get("gross", 0.0) or 0.0) for t in regime_trades),
-            )
+            costs = [_finite_optimizer_number(t.get("cost")) for t in regime_trades]
+            gross = [_finite_optimizer_number(t.get("gross")) for t in regime_trades]
+            if any(value is None for value in costs + gross):
+                s = {"invalid_reason": "invalid_regime_trade"}
+            else:
+                try:
+                    total_costs = math.fsum(costs)
+                    total_gross = math.fsum(gross)
+                except (ArithmeticError, ValueError):
+                    s = {"invalid_reason": "invalid_regime_trade"}
+                else:
+                    s = _compute_stats(regime_trades, total_costs, total_gross)
         else:
             s = {"net": 0.0, "trade_count": 0, "edge": False}
+        net = _finite_optimizer_number(s.get("net"))
+        trade_count = s.get("trade_count")
+        edge = s.get("edge")
+        invalid_reason = s.get("invalid_reason")
+        if (
+            invalid_reason is not None
+            or net is None
+            or isinstance(trade_count, bool)
+            or not isinstance(trade_count, int)
+            or trade_count < 0
+            or not isinstance(edge, bool)
+        ):
+            invalid_regime_count += 1
+            results[regime_name] = {
+                "net": 0.0,
+                "trades": 0,
+                "edge": False,
+                "ratio": len(regime_times) / max(1, len(all_times)),
+                "invalid_reason": invalid_reason or "invalid_regime_stats",
+            }
+            continue
+        valid_regime_count += 1
         results[regime_name] = {
-            "net": s.get("net", 0),
-            "trades": s.get("trade_count", 0),
-            "edge": s.get("edge", False),
+            "net": net,
+            "trades": trade_count,
+            "edge": edge,
             "ratio": len(regime_times) / max(1, len(all_times)),
         }
     # "Survives all regimes" = profitable in every regime with sufficient data
     profitable_regimes = sum(
-        1 for r in results.values() if r.get("net", 0) > 0 and "skipped" not in r
+        1
+        for r in results.values()
+        if r.get("net", 0) > 0
+        and r.get("edge") is True
+        and "skipped" not in r
+        and "invalid_reason" not in r
+    )
+    edge_count = sum(
+        1
+        for result in results.values()
+        if result.get("edge") is True and "invalid_reason" not in result
     )
     tested_regimes = sum(1 for r in results.values() if "skipped" not in r)
+    evidence_valid = (
+        invalid_regime_count == 0
+        and valid_regime_count == tested_regimes
+        and invalid_source_sample_count == 0
+    )
     return {
         "regimes": results,
         "profitable_count": profitable_regimes,
+        "edge_count": edge_count,
         "tested_count": tested_regimes,
-        "survives_all": profitable_regimes == tested_regimes and tested_regimes >= 2,
+        "valid_regime_count": valid_regime_count,
+        "invalid_regime_count": invalid_regime_count,
+        "invalid_source_sample_count": invalid_source_sample_count,
+        "evidence_valid": evidence_valid,
+        "survives_all": evidence_valid
+        and profitable_regimes == tested_regimes
+        and tested_regimes >= 2,
     }
 
 
 #  Outlier-Dependency Test
 # A strategy whose entire edge comes from 1-2 lucky home-run trades is
 # fragile  in live trading those same outliers may never occur again.
-# Test: remove the top N trades and recompute net. If the strategy still
+# Test: remove the top N independent positions and recompute net. If the strategy still
 # profits, the edge is broadly distributed.
 
 
@@ -536,11 +916,47 @@ def outlier_dependency_test(
     params: dict,
     top_n_to_remove: list = (1, 5, 10),
 ) -> dict:
-    """Re-simulate while excluding the top N most-profitable trades."""
+    """Re-simulate and remove the top N independent position outcomes."""
     s_full = simulate_fast(indexed, all_times, strategy, use_maker, params)
-    full_net = s_full.get("net", 0)
+    if not isinstance(s_full, dict) or s_full.get("invalid_reason") is not None:
+        return _invalid_outlier_result("invalid_full_simulation")
+    full_net = _finite_optimizer_net(s_full)
+    raw_nets = s_full.get("position_net_trades")
+    if full_net is None or not isinstance(raw_nets, (list, tuple)):
+        return _invalid_outlier_result("invalid_net_evidence")
+    normalized_nets = [_finite_optimizer_number(value) for value in raw_nets]
+    invalid_trade_count = sum(value is None for value in normalized_nets)
+    if invalid_trade_count:
+        return _invalid_outlier_result(
+            "invalid_trade_net",
+            trade_count=len(raw_nets),
+            invalid_trade_count=invalid_trade_count,
+        )
+    try:
+        trade_net_sum = math.fsum(normalized_nets)
+    except (ArithmeticError, ValueError):
+        return _invalid_outlier_result(
+            "invalid_trade_net", trade_count=len(raw_nets)
+        )
+    if not math.isfinite(trade_net_sum) or not math.isclose(
+        full_net, trade_net_sum, rel_tol=1e-9, abs_tol=1e-9
+    ):
+        return _invalid_outlier_result(
+            "inconsistent_net_evidence", trade_count=len(raw_nets)
+        )
+    if (
+        not isinstance(top_n_to_remove, (list, tuple))
+        or 1 not in top_n_to_remove
+        or any(
+            isinstance(n, bool) or not isinstance(n, int) or n <= 0
+            for n in top_n_to_remove
+        )
+    ):
+        return _invalid_outlier_result(
+            "invalid_removal_scenarios", trade_count=len(raw_nets)
+        )
 
-    nets = sorted(s_full.get("net_trades") or [], reverse=True)
+    nets = sorted(normalized_nets, reverse=True)
     trade_count = len(nets)
 
     results = {}
@@ -548,12 +964,22 @@ def outlier_dependency_test(
         if trade_count < n + 5:
             results[f"remove_top_{n}"] = {"skipped": "too_few_trades"}
             continue
-        removed = sum(nets[:n])
-        adjusted_net = full_net - removed
+        try:
+            removed = math.fsum(nets[:n])
+            adjusted_net = full_net - removed
+            drop_pct = (removed / abs(full_net) * 100) if full_net else 0.0
+        except (ArithmeticError, ValueError, ZeroDivisionError):
+            return _invalid_outlier_result(
+                "invalid_scenario_summary", trade_count=trade_count
+            )
+        if not all(math.isfinite(value) for value in (removed, adjusted_net, drop_pct)):
+            return _invalid_outlier_result(
+                "invalid_scenario_summary", trade_count=trade_count
+            )
         results[f"remove_top_{n}"] = {
             "removed_net": removed,
             "adjusted_net": adjusted_net,
-            "drop_pct": (removed / abs(full_net) * 100) if full_net else 0,
+            "drop_pct": drop_pct,
             "still_positive": adjusted_net > 0,
         }
 
@@ -563,8 +989,28 @@ def outlier_dependency_test(
     return {
         "full_net": full_net,
         "trade_count": trade_count,
+        "valid_trade_count": trade_count,
+        "invalid_trade_count": 0,
+        "full_net_consistent": True,
+        "evidence_valid": True,
         "scenarios": results,
         "outlier_fragile": outlier_fragile,
+    }
+
+
+def _invalid_outlier_result(
+    reason: str, trade_count: int = 0, invalid_trade_count: int = 0
+) -> dict:
+    return {
+        "full_net": 0.0,
+        "trade_count": trade_count,
+        "valid_trade_count": max(0, trade_count - invalid_trade_count),
+        "invalid_trade_count": invalid_trade_count,
+        "full_net_consistent": False,
+        "evidence_valid": False,
+        "scenarios": {},
+        "outlier_fragile": None,
+        "reason": reason,
     }
 
 
@@ -576,23 +1022,70 @@ def outlier_dependency_test(
 # implementation needs per-trade detail).
 
 
+def _invalid_monte_carlo_result(
+    reason: str,
+    requested_runs: int | None = None,
+    trade_count: int = 0,
+    valid_trade_count: int = 0,
+    invalid_trade_count: int = 0,
+) -> dict:
+    return {
+        "requested_runs": requested_runs,
+        "runs": 0,
+        "positive_run_count": 0,
+        "positive_share": None,
+        "trade_count": trade_count,
+        "valid_trade_count": valid_trade_count,
+        "invalid_trade_count": invalid_trade_count,
+        "median_final": None,
+        "worst_decile": None,
+        "robust": None,
+        "concerning": None,
+        "method": "block_bootstrap",
+        "evidence_valid": False,
+        "reason": reason,
+    }
+
+
 def monte_carlo_perturbation(s_full: dict, n_runs: int = 100) -> dict:
-    """Block-bootstrap the REAL per-trade net returns and report the share of
+    """Block-bootstrap the REAL per-position net returns and report the share of
     resampled equity paths that end positive.
 
-    Resamples contiguous blocks of actual trade P&L (USDT) with replacement,
+    Resamples contiguous blocks of actual position P&L (USDT) with replacement,
     preserving the fat tails and local autocorrelation a Normal(avg, std)
     proxy destroys. Robust strategy >=90% positive; <70% concerning.
     """
-    nets = list(s_full.get("net_trades") or [])
-    trade_count = len(nets)
+    if isinstance(n_runs, bool) or not isinstance(n_runs, int) or n_runs <= 0:
+        return _invalid_monte_carlo_result("invalid_run_count")
+    if not isinstance(s_full, dict) or s_full.get("invalid_reason") is not None:
+        return _invalid_monte_carlo_result(
+            "invalid_full_simulation", requested_runs=n_runs
+        )
+    raw_nets = s_full.get("position_net_trades")
+    if not isinstance(raw_nets, (list, tuple)):
+        return _invalid_monte_carlo_result(
+            "invalid_trade_container", requested_runs=n_runs
+        )
+    normalized = [_finite_optimizer_number(value) for value in raw_nets]
+    invalid_trade_count = sum(value is None for value in normalized)
+    trade_count = len(normalized)
+    valid_trade_count = trade_count - invalid_trade_count
+    if invalid_trade_count:
+        return _invalid_monte_carlo_result(
+            "invalid_trade_net",
+            requested_runs=n_runs,
+            trade_count=trade_count,
+            valid_trade_count=valid_trade_count,
+            invalid_trade_count=invalid_trade_count,
+        )
+    nets = normalized
     if trade_count < 5:
-        return {
-            "runs": 0,
-            "positive_share": None,
-            "robust": None,
-            "reason": "insufficient_stats",
-        }
+        return _invalid_monte_carlo_result(
+            "insufficient_stats",
+            requested_runs=n_runs,
+            trade_count=trade_count,
+            valid_trade_count=valid_trade_count,
+        )
 
     rng = _random.Random(_OPTIMIZER_SEED)  # deterministic for reproducibility
     block = max(1, min(10, trade_count // 5))
@@ -603,20 +1096,41 @@ def monte_carlo_perturbation(s_full: dict, n_runs: int = 100) -> dict:
         while len(seq) < trade_count:
             start = rng.randrange(trade_count)
             seq.extend(nets[start : start + block])
-        eq = sum(seq[:trade_count])
+        try:
+            eq = math.fsum(seq[:trade_count])
+        except (ArithmeticError, ValueError):
+            return _invalid_monte_carlo_result(
+                "invalid_equity_summary",
+                requested_runs=n_runs,
+                trade_count=trade_count,
+                valid_trade_count=valid_trade_count,
+            )
+        if not math.isfinite(eq):
+            return _invalid_monte_carlo_result(
+                "invalid_equity_summary",
+                requested_runs=n_runs,
+                trade_count=trade_count,
+                valid_trade_count=valid_trade_count,
+            )
         final_equities.append(eq)
         if eq > 0:
             positive_runs += 1
     share = positive_runs / n_runs
     final_equities.sort()
     return {
+        "requested_runs": n_runs,
         "runs": n_runs,
+        "positive_run_count": positive_runs,
         "positive_share": share,
+        "trade_count": trade_count,
+        "valid_trade_count": valid_trade_count,
+        "invalid_trade_count": 0,
         "median_final": final_equities[n_runs // 2],
         "worst_decile": final_equities[max(0, n_runs // 10 - 1)],
         "robust": share >= 0.90,
         "concerning": share < 0.70,
         "method": "block_bootstrap",
+        "evidence_valid": True,
     }
 
 
@@ -637,7 +1151,31 @@ def split_into_folds(
     warmed from WITHIN the fold, and an EMBARGO gap of `embargo_frac` of the
     total length is dropped from the FRONT of each fold (except the first) to
     separate adjacent folds. Resulting fold time-sets are disjoint with a gap."""
-    n = len(all_times)
+    if not isinstance(all_times, (list, tuple)):
+        raise ValueError("all_times must be a chronological sequence")
+    if isinstance(k, bool) or not isinstance(k, int) or k < 2:
+        raise ValueError("k must be an integer >= 2")
+    if (
+        isinstance(purge_bars, bool)
+        or not isinstance(purge_bars, int)
+        or purge_bars < 0
+    ):
+        raise ValueError("purge_bars must be an integer >= 0")
+    if isinstance(embargo_frac, bool) or not isinstance(
+        embargo_frac, (int, float)
+    ):
+        raise ValueError("embargo_frac must be finite and in [0, 1)")
+    embargo_frac = float(embargo_frac)
+    if not math.isfinite(embargo_frac) or not 0.0 <= embargo_frac < 1.0:
+        raise ValueError("embargo_frac must be finite and in [0, 1)")
+    times = list(all_times)
+    numeric_times = [_optimizer_time_number(value) for value in times]
+    if any(value is None for value in numeric_times) or any(
+        current <= previous
+        for previous, current in zip(numeric_times, numeric_times[1:])
+    ):
+        raise ValueError("all_times must be finite, unique and strictly increasing")
+    n = len(times)
     fold_len = n // k
     embargo = int(n * embargo_frac) if embargo_frac > 0 else 0
     folds = []
@@ -647,7 +1185,7 @@ def split_into_folds(
         # Embargo gap before every fold after the first.
         purged_start = start + (embargo if i > 0 else 0) + max(0, purge_bars)
         if purged_start < end:
-            folds.append(all_times[purged_start:end])
+            folds.append(times[purged_start:end])
         else:
             folds.append([])
     return folds
@@ -661,6 +1199,22 @@ def filter_to_period(indexed: dict, time_set: set) -> dict:
     }
 
 
+def _optimizer_time_number(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            number = float(value)
+        else:
+            timestamp = getattr(value, "timestamp", None)
+            if not callable(timestamp):
+                return None
+            number = float(timestamp())
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def kfold_simulate(
     indexed: dict, folds: list, strategy: str, use_maker: bool, params: dict
 ) -> dict:
@@ -668,29 +1222,68 @@ def kfold_simulate(
     Testet die Config auf K unabhngigen Perioden.
     Eine Config gilt als robust wenn sie in ALLEN Folds profitabel ist.
     """
+    if not folds:
+        return {
+            "fold_nets": [],
+            "fold_results": [],
+            "edge_count": 0,
+            "valid_fold_count": 0,
+            "invalid_fold_count": 0,
+            "summary_valid": False,
+            "profit_count": 0,
+            "avg_net": 0.0,
+            "std_net": 0.0,
+            "consistency": 0.0,
+            "robust": False,
+        }
     fold_results = []
     for period_times in folds:
         period_data = filter_to_period(indexed, set(period_times))
         s = simulate_fast(period_data, period_times, strategy, use_maker, params)
+        s["period_start_ts"] = (
+            _optimizer_time_number(period_times[0]) if period_times else None
+        )
+        s["period_end_ts"] = (
+            _optimizer_time_number(period_times[-1]) if period_times else None
+        )
         fold_results.append(s)
 
-    nets = [s.get("net", -9999) for s in fold_results]
-    edge_count = sum(1 for s in fold_results if s.get("edge"))
+    nets = []
+    valid_fold_count = 0
+    for result in fold_results:
+        net = _finite_optimizer_net(result)
+        if net is None:
+            nets.append(-9999.0)
+        else:
+            nets.append(net)
+            valid_fold_count += 1
+    invalid_fold_count = len(folds) - valid_fold_count
+    edge_count = sum(
+        1
+        for result in fold_results
+        if isinstance(result, dict) and result.get("edge") is True
+    )
     profit_cnt = sum(1 for n in nets if n > 0)
-    avg_net = statistics.mean(nets)
-    std_net = statistics.stdev(nets) if len(nets) > 1 else 0
-    consistency = 1 - (std_net / abs(avg_net)) if avg_net != 0 else 0
-    consistency = max(0, min(1, consistency))  # auf [0,1] beschrnken
+    summary = _optimizer_net_summary(nets)
+    summary_valid = summary is not None
+    avg_net, std_net, consistency = summary or (0.0, 0.0, 0.0)
 
     return {
         "fold_nets": nets,
         "fold_results": fold_results,
         "edge_count": edge_count,
+        "valid_fold_count": valid_fold_count,
+        "invalid_fold_count": invalid_fold_count,
+        "summary_valid": summary_valid,
         "profit_count": profit_cnt,
         "avg_net": avg_net,
         "std_net": std_net,
         "consistency": consistency,
-        "robust": profit_cnt == len(folds),
+        "robust": bool(folds)
+        and summary_valid
+        and valid_fold_count == len(folds)
+        and profit_cnt == len(folds)
+        and edge_count == len(folds),
     }
 
 
@@ -708,32 +1301,417 @@ def holdout_simulate(
 FINAL_HOLDOUT_MIN_TRADES = 30
 
 
+def _candidate_rank_number(value) -> float:
+    number = _finite_optimizer_number(value)
+    return number if number is not None else float("-inf")
+
+
+def _candidate_tie_key(candidate: dict) -> str:
+    try:
+        return _json.dumps(
+            candidate.get("params") or {},
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return type(candidate.get("params")).__name__
+
+
+def _candidate_ranking_error(candidate) -> str | None:
+    """Return why a candidate is unsafe to rank, or None for valid evidence."""
+    if not isinstance(candidate, dict):
+        return "candidate must be a mapping"
+
+    params = candidate.get("params")
+    if not isinstance(params, dict):
+        return "params must be a mapping"
+    try:
+        _json.dumps(
+            params,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return "params must be deterministic JSON"
+
+    stats = candidate.get("stats")
+    if not isinstance(stats, dict) or _finite_optimizer_net(stats) is None:
+        return "stats.net must be a finite number"
+
+    kfold = candidate.get("kfold")
+    if not isinstance(kfold, dict):
+        return "kfold must be a mapping"
+    robust = kfold.get("robust")
+    if not isinstance(robust, bool):
+        return "kfold.robust must be boolean"
+
+    missing = object()
+    deep_complete = candidate.get("deep_validation_complete", missing)
+    if deep_complete is not missing and not isinstance(deep_complete, bool):
+        return "deep_validation_complete must be boolean when present"
+
+    if not robust:
+        return None
+    if _finite_optimizer_number(candidate.get("score")) is None:
+        return "robust candidate score must be a finite number"
+
+    fold_nets = kfold.get("fold_nets")
+    fold_results = kfold.get("fold_results")
+    if (
+        not isinstance(fold_nets, (list, tuple))
+        or len(fold_nets) < 2
+        or not isinstance(fold_results, (list, tuple))
+        or len(fold_results) != len(fold_nets)
+    ):
+        return "robust candidate requires at least two matching fold results"
+
+    finite_nets = [_finite_optimizer_number(value) for value in fold_nets]
+    if any(value is None or value <= 0.0 for value in finite_nets):
+        return "robust candidate requires finite positive fold nets"
+    for fold_result, fold_net in zip(fold_results, finite_nets):
+        result_net = _finite_optimizer_net(fold_result)
+        if (
+            result_net is None
+            or fold_result.get("edge") is not True
+            or not math.isclose(result_net, fold_net, rel_tol=1e-9, abs_tol=1e-9)
+        ):
+            return "robust candidate fold result evidence is inconsistent"
+
+    fold_count = len(fold_nets)
+    expected_counts = {
+        "valid_fold_count": fold_count,
+        "invalid_fold_count": 0,
+        "profit_count": fold_count,
+        "edge_count": fold_count,
+    }
+    for name, expected in expected_counts.items():
+        value = kfold.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+            return f"robust candidate {name} is inconsistent"
+    if kfold.get("summary_valid") is not True:
+        return "robust candidate summary_valid must be true"
+
+    summary = _optimizer_net_summary(finite_nets)
+    if summary is None:
+        return "robust candidate fold summary is invalid"
+    for name, expected in zip(("avg_net", "std_net", "consistency"), summary):
+        value = _finite_optimizer_number(kfold.get(name))
+        if value is None or not math.isclose(
+            value, expected, rel_tol=1e-9, abs_tol=1e-9
+        ):
+            return f"robust candidate {name} is inconsistent"
+    return None
+
+
 def rank_optimizer_candidates(results: list[dict]) -> list[dict]:
     """Rank candidates using training and inner-validation evidence only.
 
     Final-holdout fields are deliberately ignored. Once the winner is frozen,
     holdout failure is a NO-GO rather than a reason to promote the runner-up.
     """
-    robust = [r for r in results if r.get("kfold", {}).get("robust")]
-    fragile = [r for r in results if not r.get("kfold", {}).get("robust")]
-    robust.sort(key=lambda r: float(r.get("score", float("-inf"))), reverse=True)
+    if not isinstance(results, (list, tuple)):
+        return []
+
+    robust = []
+    fragile = []
+    for candidate in results:
+        error = _candidate_ranking_error(candidate)
+        if error is not None:
+            if isinstance(candidate, dict):
+                candidate["ranking_evidence_valid"] = False
+                candidate["ranking_error"] = error
+            continue
+        candidate["ranking_evidence_valid"] = True
+        candidate.pop("ranking_error", None)
+        if candidate["kfold"]["robust"] is True:
+            robust.append(candidate)
+        else:
+            fragile.append(candidate)
+    robust.sort(
+        key=lambda r: (
+            0 if r.get("deep_validation_complete") is not False else 1,
+            -_candidate_rank_number(r.get("score")),
+            _candidate_tie_key(r),
+        ),
+    )
     fragile.sort(
-        key=lambda r: float(r.get("stats", {}).get("net", float("-inf"))),
-        reverse=True,
+        key=lambda r: (
+            -_candidate_rank_number(r.get("stats", {}).get("net")),
+            _candidate_tie_key(r),
+        ),
     )
     return robust + fragile
 
 
+def select_deep_validation_candidates(
+    results: list[dict], top_n: int
+) -> list[dict]:
+    """Select the ranked robust top-K, independent of worker completion order."""
+    if isinstance(top_n, bool) or not isinstance(top_n, int) or top_n < 1:
+        raise ValueError("top_n must be an integer >= 1")
+    ranked_robust = [
+        row
+        for row in rank_optimizer_candidates(results)
+        if row["kfold"]["robust"] is True
+    ]
+    deep_k = min(len(ranked_robust), max(top_n, 10))
+    return ranked_robust[:deep_k]
+
+
+def _finite_holdout_number(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _holdout_values_match(actual: float, expected: float) -> bool:
+    try:
+        difference = abs(actual - expected)
+        tolerance = max(
+            1e-12,
+            8.0 * math.ulp(actual),
+            8.0 * math.ulp(expected),
+        )
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(difference) and difference <= tolerance
+
+
+def _holdout_trade_totals(
+    stats: dict,
+) -> tuple[float, float, float, float, float] | None:
+    trades = stats.get("closed_trades") or []
+    if not isinstance(trades, list) or not trades:
+        return None
+    gross_values = []
+    cost_values = []
+    net_values = []
+    fee_values = []
+    funding_values = []
+    for trade in trades:
+        if not isinstance(trade, dict):
+            return None
+        gross = _finite_holdout_number(trade.get("gross"))
+        fees = _finite_holdout_number(trade.get("fees"))
+        funding = _finite_holdout_number(trade.get("funding"))
+        cost = _finite_holdout_number(trade.get("cost"))
+        recorded_net = _finite_holdout_number(trade.get("net"))
+        if None in (gross, fees, funding, cost, recorded_net) or fees < 0.0:
+            return None
+        expected_cost = fees + funding
+        expected_net = gross - cost
+        if (
+            not math.isfinite(expected_cost)
+            or not math.isfinite(expected_net)
+            or not _holdout_values_match(cost, expected_cost)
+            or not _holdout_values_match(recorded_net, expected_net)
+        ):
+            return None
+        gross_values.append(gross)
+        cost_values.append(cost)
+        net_values.append(recorded_net)
+        fee_values.append(fees)
+        funding_values.append(funding)
+    try:
+        gross = math.fsum(gross_values)
+        costs = math.fsum(cost_values)
+        net = math.fsum(net_values)
+        fees = math.fsum(fee_values)
+        funding = math.fsum(funding_values)
+    except (OverflowError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (gross, costs, net, fees, funding)):
+        return None
+    return gross, costs, net, fees, funding
+
+
+def _holdout_aggregates_consistent(
+    stats: dict, totals: tuple[float, float, float, float, float] | None
+) -> bool:
+    if totals is None:
+        return False
+    reported = tuple(
+        _finite_holdout_number(stats.get(name))
+        for name in ("gross", "costs", "net", "total_fees", "total_funding")
+    )
+    return all(
+        actual is not None and _holdout_values_match(actual, expected)
+        for actual, expected in zip(reported, totals)
+    )
+
+
+def _holdout_position_outcomes(stats: dict) -> tuple[list[float], list[float]] | None:
+    """Rebuild independent position returns from partial and terminal fills."""
+    trades = stats.get("closed_trades")
+    net_trades = stats.get("net_trades")
+    position_net_trades = stats.get("position_net_trades")
+    closed_positions = stats.get("closed_positions")
+    if (
+        not isinstance(trades, list)
+        or not trades
+        or not isinstance(net_trades, list)
+        or len(net_trades) != len(trades)
+        or not isinstance(position_net_trades, list)
+        or not isinstance(closed_positions, list)
+    ):
+        return None
+    groups: dict[int, list[dict]] = {}
+    for index, trade in enumerate(trades):
+        position_id = trade.get("position_id") if isinstance(trade, dict) else None
+        recorded_net = (
+            _finite_holdout_number(trade.get("net"))
+            if isinstance(trade, dict)
+            else None
+        )
+        series_net = _finite_holdout_number(net_trades[index])
+        notional = (
+            _finite_holdout_number(trade.get("notional"))
+            if isinstance(trade, dict)
+            else None
+        )
+        if (
+            isinstance(position_id, bool)
+            or not isinstance(position_id, int)
+            or position_id < 1
+            or not isinstance(trade.get("is_partial"), bool)
+            or recorded_net is None
+            or series_net is None
+            or notional is None
+            or notional <= 0.0
+            or not _holdout_values_match(series_net, recorded_net)
+        ):
+            return None
+        groups.setdefault(position_id, []).append(trade)
+    reconstructed = []
+    for position_id, fragments in groups.items():
+        terminal = [trade for trade in fragments if trade["is_partial"] is False]
+        if len(terminal) != 1 or fragments[-1] is not terminal[0]:
+            return None
+        try:
+            position_net = math.fsum(float(trade["net"]) for trade in fragments)
+            position_notional = math.fsum(
+                float(trade["notional"]) for trade in fragments
+            )
+            position_pct = position_net / position_notional * 100.0
+        except (ArithmeticError, TypeError, ValueError, ZeroDivisionError):
+            return None
+        if not all(
+            math.isfinite(value)
+            for value in (position_net, position_notional, position_pct)
+        ):
+            return None
+        exit_time = _optimizer_time_number(terminal[0].get("exit_time"))
+        if exit_time is None:
+            return None
+        reconstructed.append(
+            (exit_time, position_id, position_pct, position_net)
+        )
+    reconstructed.sort(key=lambda row: (row[0], row[1]))
+    position_pcts = [row[2] for row in reconstructed]
+    position_nets = [row[3] for row in reconstructed]
+    if (
+        len(position_nets) < 1
+        or len(position_net_trades) != len(position_nets)
+        or len(closed_positions) != len(position_nets)
+    ):
+        return None
+    for index, (_exit_time, position_id, _position_pct, _position_net) in enumerate(
+        reconstructed
+    ):
+        reported_net = _finite_holdout_number(position_net_trades[index])
+        summary = closed_positions[index]
+        if not isinstance(summary, dict):
+            return None
+        summary_net = _finite_holdout_number(summary.get("net"))
+        summary_pct = _finite_holdout_number(summary.get("net_pct"))
+        if (
+            summary.get("position_id") != position_id
+            or reported_net is None
+            or summary_net is None
+            or summary_pct is None
+            or not _holdout_values_match(reported_net, position_nets[index])
+            or not _holdout_values_match(summary_net, position_nets[index])
+            or not _holdout_values_match(summary_pct, position_pcts[index])
+        ):
+            return None
+    return position_pcts, position_nets
+
+
+def _holdout_full_trade_count(stats: dict) -> int | None:
+    """Reproduce the independent full-close sample from exact trade evidence."""
+    trades = stats.get("closed_trades")
+    if not isinstance(trades, list) or not trades:
+        return None
+    groups: dict[int, list[dict]] = {}
+    for trade in trades:
+        position_id = trade.get("position_id") if isinstance(trade, dict) else None
+        if (
+            isinstance(position_id, bool)
+            or not isinstance(position_id, int)
+            or position_id < 1
+            or not isinstance(trade.get("is_partial"), bool)
+        ):
+            return None
+        groups.setdefault(position_id, []).append(trade)
+    if any(
+        len([trade for trade in fragments if trade["is_partial"] is False]) != 1
+        or fragments[-1]["is_partial"] is not False
+        for fragments in groups.values()
+    ):
+        return None
+    full_trade_count = len(groups)
+    for name in ("full_trades", "trade_count"):
+        reported = _finite_holdout_number(stats.get(name))
+        if (
+            reported is None
+            or reported < 0.0
+            or not reported.is_integer()
+            or int(reported) != full_trade_count
+        ):
+            return None
+    return full_trade_count
+
+
+def _holdout_outcomes_consistent(stats: dict, full_trade_count: int | None) -> bool:
+    """Reproduce outcome counts, win rate and additive PnL from trade rows."""
+    outcomes = _holdout_position_outcomes(stats)
+    if full_trade_count is None or outcomes is None:
+        return False
+    position_pcts, _position_nets = outcomes
+    if len(position_pcts) != full_trade_count:
+        return False
+    expected_counts = (
+        sum(pct > PNL_ZERO_TOLERANCE_PCT for pct in position_pcts),
+        sum(pct < -PNL_ZERO_TOLERANCE_PCT for pct in position_pcts),
+        sum(abs(pct) <= PNL_ZERO_TOLERANCE_PCT for pct in position_pcts),
+    )
+    reported_counts = []
+    for name in ("win_count", "loss_count", "breakeven_count"):
+        reported = _finite_holdout_number(stats.get(name))
+        if reported is None or reported < 0.0 or not reported.is_integer():
+            return False
+        reported_counts.append(int(reported))
+    expected_win_rate = expected_counts[0] / full_trade_count
+    reported_win_rate = _finite_holdout_number(stats.get("win_rate"))
+    return tuple(reported_counts) == expected_counts and bool(
+        reported_win_rate is not None
+        and 0.0 <= reported_win_rate <= 1.0
+        and _holdout_values_match(reported_win_rate, expected_win_rate)
+    )
+
+
 def _holdout_cost_stress_pass(stats: dict) -> bool:
     """Require profitability after doubling every measured execution cost."""
-    trades = stats.get("closed_trades") or []
-    if not trades:
+    totals = _holdout_trade_totals(stats)
+    if totals is None:
         return False
-    try:
-        gross = sum(float(trade["gross"]) for trade in trades)
-        costs = sum(float(trade["cost"]) for trade in trades)
-    except (KeyError, TypeError, ValueError):
-        return False
+    gross, costs, _net, _fees, _funding = totals
     return costs >= 0.0 and gross - (2.0 * costs) > 0.0
 
 
@@ -741,26 +1719,135 @@ def freeze_and_evaluate_final_holdout(
     candidates: list[dict], evaluator, *, min_trades: int = FINAL_HOLDOUT_MIN_TRADES
 ) -> dict:
     """Freeze one winner, evaluate it once, and attach fail-closed evidence."""
+    if isinstance(min_trades, bool) or not isinstance(min_trades, int) or min_trades < 1:
+        raise ValueError("min_trades must be an integer >= 1")
     ranked = rank_optimizer_candidates(candidates)
     if not ranked:
         raise ValueError("no optimizer candidates to freeze")
     winner = ranked[0]
-    try:
-        holdout = evaluator(winner["params"])
-    except Exception:
-        holdout = None
-    holdout = holdout if isinstance(holdout, dict) else {}
-    trades = int(holdout.get("trades", 0) or 0)
-    cost_stress_pass = _holdout_cost_stress_pass(holdout)
+    deep_validation_error = _deep_validation_admission_error(winner)
+    deep_validation_complete = deep_validation_error is None
+    winner["deep_validation_admission_error"] = deep_validation_error
+    holdout_evaluation_attempted = False
+    holdout_evaluation_error = None
+    if not deep_validation_complete:
+        holdout = {
+            "skipped": True,
+            "reason": "deep_validation_incomplete",
+        }
+    else:
+        holdout_evaluation_attempted = True
+        try:
+            holdout = evaluator(winner["params"])
+        except Exception as exc:
+            holdout = {}
+            try:
+                detail = str(exc)[:160]
+            except Exception:
+                detail = "<unprintable exception>"
+            holdout_evaluation_error = f"{type(exc).__name__}: {detail}"
+        if not isinstance(holdout, dict):
+            holdout_evaluation_error = (
+                "InvalidResult: holdout evaluator returned "
+                f"{type(holdout).__name__}, expected mapping"
+            )
+            holdout = {}
+    holdout_net = _finite_holdout_number(holdout.get("net"))
+    trade_number = _finite_holdout_number(holdout.get("trades"))
+    trade_count_valid = bool(
+        trade_number is not None
+        and trade_number >= 0.0
+        and trade_number.is_integer()
+    )
+    trades = int(trade_number) if trade_count_valid else 0
+    closed_trades = holdout.get("closed_trades")
+    trade_count_consistent = bool(
+        isinstance(closed_trades, list) and len(closed_trades) == trades
+    )
+    trade_totals = _holdout_trade_totals(holdout)
+    holdout_trade_accounting_valid = trade_totals is not None
+    holdout_aggregates_consistent = _holdout_aggregates_consistent(
+        holdout, trade_totals
+    )
+    holdout_full_trade_count = _holdout_full_trade_count(holdout)
+    holdout_sample_consistent = holdout_full_trade_count is not None
+    holdout_outcomes_consistent = _holdout_outcomes_consistent(
+        holdout, holdout_full_trade_count
+    )
+    skipped = holdout.get("skipped", False)
+    holdout_net_consistent = bool(
+        holdout_net is not None
+        and trade_totals is not None
+        and _holdout_values_match(holdout_net, trade_totals[2])
+    )
+    holdout_evidence_valid = bool(
+        holdout_evaluation_attempted
+        and holdout_evaluation_error is None
+        and isinstance(skipped, bool)
+        and not skipped
+        and holdout_net is not None
+        and trade_count_valid
+        and trade_count_consistent
+        and holdout_trade_accounting_valid
+        and holdout_aggregates_consistent
+        and holdout_sample_consistent
+        and holdout_outcomes_consistent
+        and holdout_net_consistent
+    )
+    if (
+        holdout_evaluation_attempted
+        and holdout_evaluation_error is None
+        and not holdout_evidence_valid
+    ):
+        if not holdout_trade_accounting_valid:
+            holdout_evaluation_error = (
+                "InvalidEvidence: inconsistent per-trade holdout accounting"
+            )
+        elif not holdout_aggregates_consistent:
+            holdout_evaluation_error = (
+                "InvalidEvidence: inconsistent aggregate holdout accounting"
+            )
+        elif not holdout_sample_consistent:
+            holdout_evaluation_error = (
+                "InvalidEvidence: inconsistent holdout full-trade sample"
+            )
+        elif not holdout_outcomes_consistent:
+            holdout_evaluation_error = (
+                "InvalidEvidence: inconsistent holdout outcome summary"
+            )
+        else:
+            holdout_evaluation_error = (
+                "InvalidEvidence: incomplete holdout trade evidence"
+            )
+    cost_stress_pass = bool(
+        holdout_evidence_valid and _holdout_cost_stress_pass(holdout)
+    )
     final_pass = bool(
-        not holdout.get("skipped")
-        and float(holdout.get("net", 0.0) or 0.0) > 0.0
-        and trades >= int(min_trades)
+        skipped is False
+        and holdout_evidence_valid
+        and holdout_net is not None
+        and holdout_net > 0.0
+        and trade_count_valid
+        and trade_count_consistent
+        and holdout_net_consistent
+        and holdout_full_trade_count is not None
+        and holdout_full_trade_count >= min_trades
         and cost_stress_pass
-        and winner.get("kfold", {}).get("robust")
+        and winner.get("kfold", {}).get("robust") is True
+        and deep_validation_complete
     )
     winner["holdout"] = holdout
+    winner["holdout_evaluation_attempted"] = holdout_evaluation_attempted
+    winner["holdout_evaluation_error"] = holdout_evaluation_error
+    winner["holdout_evidence_valid"] = holdout_evidence_valid
+    winner["holdout_trade_accounting_valid"] = holdout_trade_accounting_valid
+    winner["holdout_aggregates_consistent"] = holdout_aggregates_consistent
+    winner["holdout_sample_consistent"] = holdout_sample_consistent
+    winner["holdout_outcomes_consistent"] = holdout_outcomes_consistent
+    winner["holdout_net"] = holdout_net
+    winner["holdout_net_consistent"] = holdout_net_consistent
     winner["holdout_trades"] = trades
+    winner["holdout_full_trades"] = holdout_full_trade_count or 0
     winner["cost_stress_pass"] = cost_stress_pass
     winner["final_holdout_pass"] = final_pass
     winner["deployment_validated"] = final_pass
@@ -776,26 +1863,68 @@ def build_pbo_block_matrix(
     four folds. Split every fold's ordered trade returns into contiguous blocks
     and exclude candidates without enough observations rather than padding.
     """
-    matrix = []
+    prepared = []
     for result in results:
         folds = result.get("kfold", {}).get("fold_results") or []
         if not folds:
             continue
         per_fold = max(1, math.ceil(minimum_blocks / len(folds)))
         blocks = []
+        boundaries = []
         complete = True
         for fold in folds:
-            returns = [float(value) for value in (fold.get("net_trades") or [])]
-            if len(returns) < per_fold:
+            start = _optimizer_time_number(fold.get("period_start_ts"))
+            end = _optimizer_time_number(fold.get("period_end_ts"))
+            positions = fold.get("closed_positions") or []
+            if (
+                start is None
+                or end is None
+                or end <= start
+                or not isinstance(positions, list)
+                or len(positions) < per_fold
+            ):
                 complete = False
                 break
-            for block_index in range(per_fold):
-                start = block_index * len(returns) // per_fold
-                end = (block_index + 1) * len(returns) // per_fold
-                blocks.append(sum(returns[start:end]))
+            fold_blocks = [0.0] * per_fold
+            for position in positions:
+                if not isinstance(position, dict):
+                    complete = False
+                    break
+                exit_time = _optimizer_time_number(position.get("exit_time"))
+                try:
+                    if isinstance(position.get("net"), bool):
+                        raise TypeError
+                    net = float(position["net"])
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    complete = False
+                    break
+                if (
+                    exit_time is None
+                    or exit_time < start
+                    or exit_time > end
+                    or not math.isfinite(net)
+                ):
+                    complete = False
+                    break
+                if exit_time >= end:
+                    block_index = per_fold - 1
+                else:
+                    block_index = int(
+                        (exit_time - start) * per_fold / (end - start)
+                    )
+                fold_blocks[block_index] += net
+            if not complete:
+                break
+            boundaries.append((start, end))
+            blocks.extend(fold_blocks)
         if complete and len(blocks) >= minimum_blocks:
-            matrix.append(blocks)
-    return matrix
+            prepared.append((tuple(boundaries), blocks))
+    if not prepared:
+        return []
+    reference_boundaries = prepared[0][0]
+    if any(boundaries != reference_boundaries for boundaries, _ in prepared[1:]):
+        return []
+    return [blocks for _, blocks in prepared]
 
 
 #  Sensitivitts-Analyse
@@ -817,7 +1946,9 @@ def sensitivity_check(
     Hohe Standardabweichung     = fragil (overfit)
     """
     base_s = simulate_fast(indexed, all_times, strategy, use_maker, base_params)
-    base_net = base_s.get("net", 0)
+    base_net_value = _finite_optimizer_net(base_s)
+    base_net_valid = base_net_value is not None
+    base_net = base_net_value if base_net_valid else 0.0
 
     perturbations = []  # (param_name, delta, new_net, change_pct)
 
@@ -839,10 +1970,21 @@ def sensitivity_check(
             new_params = dict(base_params)
             new_params[param] = values[new_idx]
             s = simulate_fast(indexed, all_times, strategy, use_maker, new_params)
-            new_net = s.get("net", 0)
-            change_pct = (
-                ((new_net - base_net) / abs(base_net) * 100) if base_net != 0 else 0
-            )
+            new_net_value = _finite_optimizer_net(s)
+            new_net_valid = new_net_value is not None
+            new_net = new_net_value if new_net_valid else 0.0
+            change_pct = None
+            if base_net_valid and new_net_valid:
+                try:
+                    change = (
+                        ((new_net - base_net) / abs(base_net) * 100)
+                        if base_net != 0
+                        else 0.0
+                    )
+                except ArithmeticError:
+                    change = float("nan")
+                if math.isfinite(change):
+                    change_pct = change
             perturbations.append(
                 {
                     "param": param,
@@ -851,27 +1993,52 @@ def sensitivity_check(
                     "delta": delta,
                     "new_net": new_net,
                     "change_pct": change_pct,
+                    "evidence_valid": change_pct is not None,
                 }
             )
 
     if not perturbations:
         return {
+            "base_net": base_net,
+            "base_net_valid": base_net_valid,
             "perturbations": [],
+            "valid_perturbation_count": 0,
+            "invalid_perturbation_count": 0,
             "max_change": 0,
             "avg_change": 0,
             "robust": False,
-            "rating": "",
+            "rating": "" if base_net_valid else " INSUFFICIENT EVIDENCE",
         }
 
-    changes = [abs(p["change_pct"]) for p in perturbations]
-    max_change = max(changes)
-    avg_change = statistics.mean(changes)
+    changes = [
+        abs(p["change_pct"])
+        for p in perturbations
+        if p["change_pct"] is not None
+    ]
+    valid_count = len(changes)
+    invalid_count = len(perturbations) - valid_count
+    try:
+        max_change = max(changes) if changes else 0.0
+        avg_change = statistics.mean(changes) if changes else 0.0
+        summary_valid = math.isfinite(max_change) and math.isfinite(avg_change)
+    except (ArithmeticError, AttributeError, TypeError, ValueError):
+        max_change = 0.0
+        avg_change = 0.0
+        summary_valid = False
+    evidence_complete = (
+        base_net_valid
+        and invalid_count == 0
+        and valid_count == len(perturbations)
+        and summary_valid
+    )
 
     # Bewertung:
     #  < 15% durchschnittliche nderung  ROBUST
     #  < 30%  DURCHSCHNITTLICH
     #  30%  FRAGIL (overfit)
-    if avg_change < 15:
+    if not evidence_complete:
+        rating = " INSUFFICIENT EVIDENCE"
+    elif avg_change < 15:
         rating = " ROBUST"
     elif avg_change < 30:
         rating = " DURCHSCHNITTLICH"
@@ -880,11 +2047,14 @@ def sensitivity_check(
 
     return {
         "base_net": base_net,
+        "base_net_valid": base_net_valid,
         "perturbations": perturbations,
+        "valid_perturbation_count": valid_count,
+        "invalid_perturbation_count": invalid_count,
         "max_change": max_change,
         "avg_change": avg_change,
         "rating": rating,
-        "robust": avg_change < 15,
+        "robust": evidence_complete and avg_change < 15,
     }
 
 
@@ -911,45 +2081,394 @@ def robustness_score(
     The point: a strategy that scores 50% lower but survives ALL these tests
     is better than the apparent winner that crumbles on shifted regimes.
     """
-    if not kfold["robust"]:
+    invalid_score = float("-inf")
+    if not isinstance(s_full, dict) or not isinstance(kfold, dict):
+        return invalid_score
+    for evidence_name, evidence in (
+        ("walk_forward", walk_forward),
+        ("regime_split", regime_split),
+        ("outlier_test", outlier_test),
+        ("monte_carlo", monte_carlo),
+    ):
+        if evidence is not None and (
+            not isinstance(evidence, dict)
+            or _deep_validation_evidence_error(evidence_name, evidence) is not None
+        ):
+            return invalid_score
+    robust = kfold.get("robust")
+    if not isinstance(robust, bool):
+        return invalid_score
+    if not robust:
         # Configs die nicht in allen Folds profitabel sind: starkes Penalty
-        return s_full.get("net", -9999) * 0.1
+        net = _finite_optimizer_net(s_full)
+        if net is None:
+            return invalid_score
+        score = net * 0.1
+        return score if math.isfinite(score) else invalid_score
 
-    avg_net = kfold["avg_net"]
-    consist = kfold["consistency"]
-    sharpe = max(0, s_full.get("sharpe", 0))
-    dd = max(0.1, s_full.get("max_dd", 99))
+    avg_net = _finite_optimizer_number(kfold.get("avg_net"))
+    consist = _finite_optimizer_number(kfold.get("consistency"))
+    sharpe_value = _finite_optimizer_number(s_full.get("sharpe"))
+    dd_value = _finite_optimizer_number(s_full.get("max_dd"))
+    if None in (avg_net, consist, sharpe_value, dd_value):
+        return invalid_score
+    if not 0.0 <= consist <= 1.0:
+        return invalid_score
+    sharpe = max(0.0, sharpe_value)
+    dd = max(0.1, dd_value)
 
     score = avg_net * consist * (1 + sharpe) * (1 - dd / 100)
 
     # Walk-forward modifier
-    if walk_forward:
-        if walk_forward.get("all_profitable"):
+    if walk_forward is not None:
+        if not isinstance(walk_forward, dict):
+            return invalid_score
+        all_profitable = walk_forward.get("all_profitable")
+        profitable_count = walk_forward.get("profitable_count")
+        if (
+            not isinstance(all_profitable, bool)
+            or isinstance(profitable_count, bool)
+            or not isinstance(profitable_count, int)
+            or profitable_count < 0
+        ):
+            return invalid_score
+        if all_profitable:
             score *= 1.2
-        elif walk_forward.get("profitable_count", 0) <= 1:
+        elif profitable_count <= 1:
             score *= 0.5  # only 1 of N forward slices profitable = serious red flag
 
     # Regime survival modifier
-    if regime_split:
-        if regime_split.get("survives_all"):
+    if regime_split is not None:
+        if not isinstance(regime_split, dict):
+            return invalid_score
+        survives_all = regime_split.get("survives_all")
+        profitable_count = regime_split.get("profitable_count")
+        if (
+            not isinstance(survives_all, bool)
+            or isinstance(profitable_count, bool)
+            or not isinstance(profitable_count, int)
+            or profitable_count < 0
+        ):
+            return invalid_score
+        if survives_all:
             score *= 1.3
-        elif regime_split.get("profitable_count", 0) == 0:
+        elif profitable_count == 0:
             score *= 0.3  # profitable in zero regimes = lucky aggregate only
 
     # Outlier dependency penalty
-    if outlier_test and outlier_test.get("outlier_fragile") is True:
-        score *= 0.5
+    if outlier_test is not None:
+        if not isinstance(outlier_test, dict) or not isinstance(
+            outlier_test.get("outlier_fragile"), bool
+        ):
+            return invalid_score
+        if outlier_test["outlier_fragile"]:
+            score *= 0.5
 
     # Monte-Carlo modifier
-    if monte_carlo:
-        share = monte_carlo.get("positive_share")
-        if share is not None:
-            if share >= 0.90:
-                score *= 1.1
-            elif share < 0.70:
-                score *= 0.7
+    if monte_carlo is not None:
+        if not isinstance(monte_carlo, dict):
+            return invalid_score
+        share = _finite_optimizer_number(monte_carlo.get("positive_share"))
+        if share is None or not 0.0 <= share <= 1.0:
+            return invalid_score
+        if share >= 0.90:
+            score *= 1.1
+        elif share < 0.70:
+            score *= 0.7
 
-    return score
+    return score if math.isfinite(score) else invalid_score
+
+
+_DEEP_VALIDATION_CHECKS = (
+    "walk_forward",
+    "regime_split",
+    "outlier_test",
+    "monte_carlo",
+)
+
+
+def _deep_validation_evidence_error(name: str, result: dict) -> str | None:
+    def _finite_number(value) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
+    if name == "walk_forward":
+        slices = result.get("slice_nets")
+        invalid_count = result.get("invalid_slice_count")
+        valid_count = result.get("valid_slice_count")
+        profitable_count = result.get("profitable_count")
+        edge_count = result.get("edge_count")
+        summary_valid = result.get("summary_valid")
+        all_profitable = result.get("all_profitable")
+        if (
+            not isinstance(slices, (list, tuple))
+            or len(slices) < 2
+            or any(_finite_number(value) is None for value in slices)
+            or isinstance(invalid_count, bool)
+            or not isinstance(invalid_count, int)
+            or invalid_count != 0
+            or isinstance(valid_count, bool)
+            or not isinstance(valid_count, int)
+            or valid_count != len(slices)
+            or isinstance(profitable_count, bool)
+            or not isinstance(profitable_count, int)
+            or not 0 <= profitable_count <= valid_count
+            or isinstance(edge_count, bool)
+            or not isinstance(edge_count, int)
+            or not 0 <= edge_count <= valid_count
+            or summary_valid is not True
+            or not isinstance(all_profitable, bool)
+            or all_profitable
+            != (
+                profitable_count == len(slices)
+                and edge_count == len(slices)
+            )
+        ):
+            return "walk-forward requires complete finite net and edge evidence"
+    elif name == "regime_split":
+        tested = result.get("tested_count")
+        profitable = result.get("profitable_count")
+        edge_count = result.get("edge_count")
+        valid_count = result.get("valid_regime_count")
+        invalid_count = result.get("invalid_regime_count")
+        invalid_source_count = result.get("invalid_source_sample_count")
+        survives_all = result.get("survives_all")
+        if (
+            isinstance(tested, bool)
+            or not isinstance(tested, int)
+            or tested < 2
+            or isinstance(profitable, bool)
+            or not isinstance(profitable, int)
+            or not 0 <= profitable <= tested
+            or isinstance(edge_count, bool)
+            or not isinstance(edge_count, int)
+            or not profitable <= edge_count <= tested
+            or isinstance(valid_count, bool)
+            or not isinstance(valid_count, int)
+            or valid_count != tested
+            or isinstance(invalid_count, bool)
+            or not isinstance(invalid_count, int)
+            or invalid_count != 0
+            or isinstance(invalid_source_count, bool)
+            or not isinstance(invalid_source_count, int)
+            or invalid_source_count != 0
+            or result.get("evidence_valid") is not True
+            or not isinstance(survives_all, bool)
+            or survives_all != (profitable == tested)
+        ):
+            return "regime split requires complete finite regime evidence"
+    elif name == "outlier_test":
+        trade_count = result.get("trade_count")
+        valid_count = result.get("valid_trade_count")
+        invalid_count = result.get("invalid_trade_count")
+        full_net = _finite_number(result.get("full_net"))
+        scenarios = result.get("scenarios")
+        top_one = scenarios.get("remove_top_1") if isinstance(scenarios, dict) else None
+        removed_net = (
+            _finite_number(top_one.get("removed_net"))
+            if isinstance(top_one, dict)
+            else None
+        )
+        adjusted_net = (
+            _finite_number(top_one.get("adjusted_net"))
+            if isinstance(top_one, dict)
+            else None
+        )
+        drop_pct = (
+            _finite_number(top_one.get("drop_pct"))
+            if isinstance(top_one, dict)
+            else None
+        )
+        still_positive = (
+            top_one.get("still_positive") if isinstance(top_one, dict) else None
+        )
+        outlier_fragile = result.get("outlier_fragile")
+        scenario_consistent = False
+        if None not in (full_net, removed_net, adjusted_net, drop_pct):
+            try:
+                expected_adjusted = full_net - removed_net
+                expected_drop_pct = (
+                    removed_net / abs(full_net) * 100 if full_net else 0.0
+                )
+                scenario_consistent = (
+                    math.isfinite(expected_adjusted)
+                    and math.isfinite(expected_drop_pct)
+                    and math.isclose(
+                        adjusted_net,
+                        expected_adjusted,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                    and math.isclose(
+                        drop_pct,
+                        expected_drop_pct,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                    and still_positive == (adjusted_net > 0)
+                )
+            except (ArithmeticError, TypeError, ValueError, ZeroDivisionError):
+                scenario_consistent = False
+        if (
+            isinstance(trade_count, bool)
+            or not isinstance(trade_count, int)
+            or trade_count < 6
+            or isinstance(valid_count, bool)
+            or not isinstance(valid_count, int)
+            or valid_count != trade_count
+            or isinstance(invalid_count, bool)
+            or not isinstance(invalid_count, int)
+            or invalid_count != 0
+            or full_net is None
+            or result.get("full_net_consistent") is not True
+            or result.get("evidence_valid") is not True
+            or removed_net is None
+            or adjusted_net is None
+            or drop_pct is None
+            or not isinstance(still_positive, bool)
+            or not scenario_consistent
+            or not isinstance(outlier_fragile, bool)
+            or outlier_fragile != (still_positive is False)
+        ):
+            return "outlier test requires complete finite trade evidence"
+    elif name == "monte_carlo":
+        runs = result.get("runs")
+        requested_runs = result.get("requested_runs")
+        positive_run_count = result.get("positive_run_count")
+        share = _finite_number(result.get("positive_share"))
+        trade_count = result.get("trade_count")
+        valid_trade_count = result.get("valid_trade_count")
+        invalid_trade_count = result.get("invalid_trade_count")
+        median_final = _finite_number(result.get("median_final"))
+        worst_decile = _finite_number(result.get("worst_decile"))
+        robust = result.get("robust")
+        concerning = result.get("concerning")
+        if (
+            isinstance(requested_runs, bool)
+            or not isinstance(requested_runs, int)
+            or requested_runs <= 0
+            or isinstance(runs, bool)
+            or not isinstance(runs, int)
+            or runs <= 0
+            or runs != requested_runs
+            or isinstance(positive_run_count, bool)
+            or not isinstance(positive_run_count, int)
+            or not 0 <= positive_run_count <= runs
+            or share is None
+            or not 0.0 <= share <= 1.0
+            or not math.isclose(
+                share,
+                positive_run_count / runs,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            or isinstance(trade_count, bool)
+            or not isinstance(trade_count, int)
+            or trade_count < 5
+            or isinstance(valid_trade_count, bool)
+            or not isinstance(valid_trade_count, int)
+            or valid_trade_count != trade_count
+            or isinstance(invalid_trade_count, bool)
+            or not isinstance(invalid_trade_count, int)
+            or invalid_trade_count != 0
+            or median_final is None
+            or worst_decile is None
+            or worst_decile > median_final
+            or not isinstance(robust, bool)
+            or robust != (share >= 0.90)
+            or not isinstance(concerning, bool)
+            or concerning != (share < 0.70)
+            or result.get("method") != "block_bootstrap"
+            or result.get("evidence_valid") is not True
+        ):
+            return "monte-carlo requires complete finite bootstrap evidence"
+    return None
+
+
+def _deep_validation_admission_error(candidate: dict) -> str | None:
+    """Require explicit, internally valid deep evidence before holdout access."""
+    kfold = candidate.get("kfold")
+    if not isinstance(kfold, dict) or kfold.get("robust") is not True:
+        return "kfold.robust is not explicitly true"
+    if candidate.get("deep_validation_complete") is not True:
+        return "deep_validation_complete is not explicitly true"
+    errors = candidate.get("deep_validation_errors")
+    if not isinstance(errors, dict) or errors:
+        return "deep_validation_errors must be an empty mapping"
+    for name in _DEEP_VALIDATION_CHECKS:
+        evidence = candidate.get(name)
+        if not isinstance(evidence, dict):
+            return f"{name} evidence is missing"
+        evidence_error = _deep_validation_evidence_error(name, evidence)
+        if evidence_error is not None:
+            return evidence_error
+    expected_score = robustness_score(
+        candidate.get("stats"),
+        kfold,
+        walk_forward=candidate.get("walk_forward"),
+        regime_split=candidate.get("regime_split"),
+        outlier_test=candidate.get("outlier_test"),
+        monte_carlo=candidate.get("monte_carlo"),
+    )
+    actual_score = _finite_optimizer_number(candidate.get("score"))
+    if actual_score is None or not math.isfinite(expected_score) or not math.isclose(
+        actual_score, expected_score, rel_tol=1e-9, abs_tol=1e-9
+    ):
+        return "deep validation score is inconsistent"
+    return None
+
+
+def evaluate_deep_validation_candidate(
+    candidate: dict, validators: dict
+) -> dict:
+    """Run all deep checks and make incomplete evidence explicitly fail closed."""
+    errors = {}
+    for name in _DEEP_VALIDATION_CHECKS:
+        validator = validators.get(name)
+        try:
+            if not callable(validator):
+                raise TypeError("validator is unavailable")
+            result = validator()
+            if not isinstance(result, dict):
+                raise TypeError("validator result is not a mapping")
+            evidence_error = _deep_validation_evidence_error(name, result)
+            if evidence_error is not None:
+                errors[name] = f"InsufficientEvidence: {evidence_error}"
+        except Exception as exc:
+            result = None
+            errors[name] = f"{type(exc).__name__}: {str(exc)[:160]}"
+        candidate[name] = result
+
+    score = None
+    if not errors:
+        try:
+            score = _finite_optimizer_number(robustness_score(
+                candidate["stats"],
+                candidate["kfold"],
+                walk_forward=candidate["walk_forward"],
+                regime_split=candidate["regime_split"],
+                outlier_test=candidate["outlier_test"],
+                monte_carlo=candidate["monte_carlo"],
+            ))
+        except Exception as exc:
+            try:
+                detail = str(exc)[:160]
+            except Exception:
+                detail = "<unprintable exception>"
+            errors["robustness_score"] = f"{type(exc).__name__}: {detail}"
+        if score is None and "robustness_score" not in errors:
+            errors["robustness_score"] = (
+                "InsufficientEvidence: score is not a finite number"
+            )
+    candidate["deep_validation_errors"] = errors
+    candidate["deep_validation_complete"] = not errors
+    candidate["score"] = score if score is not None else float("-inf")
+    return candidate
 
 
 #  Hilfsfunktionen
@@ -989,8 +2508,28 @@ def _cmd(p, strategy, days, use_maker):
 #  CSV-Export
 
 
+@contextmanager
+def _atomic_csv_writer(filename: str):
+    temp_filename = f"{filename}.{uuid.uuid4().hex}.tmp"
+    temp_created = False
+    try:
+        with open(temp_filename, "x", newline="", encoding="utf-8") as handle:
+            temp_created = True
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_filename, filename)
+        temp_created = False
+    finally:
+        if temp_created:
+            try:
+                os.remove(temp_filename)
+            except OSError:
+                pass
+
+
 def export_csv(results, strategy, days, k_folds):
-    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     # optimizer_results/ lives at PROJECT ROOT (read by the launcher UI), not
     # inside tools/.
     try:
@@ -1004,32 +2543,24 @@ def export_csv(results, strategy, days, k_folds):
         )
     os.makedirs(results_dir, exist_ok=True)
 
-    # Alte Runs aufrumen: behalte nur die letzten 20 CSVs pro Strategy
-    try:
-        prefix = f"optimizer_{strategy.lower()}_"
-        existing = sorted(
-            [
-                f
-                for f in os.listdir(results_dir)
-                if f.startswith(prefix) and f.endswith(".csv")
-            ],
-            reverse=True,
-        )
-        for old in existing[19:]:  # behalte 19 (+ neue = 20)
-            try:
-                os.remove(os.path.join(results_dir, old))
-            except Exception:
-                pass
-    except Exception:
-        pass
-
     filename = os.path.join(
-        results_dir, f"optimizer_{strategy.lower()}_{days}d_{ts}.csv"
+        results_dir,
+        f"optimizer_{strategy.lower()}_{days}d_{ts}_p{os.getpid()}_"
+        f"{uuid.uuid4().hex[:12]}.csv",
     )
     fields = [
         "rank",
         "robust",
+        "deep_validation_complete",
         "deployment_validated",
+        "holdout_evaluation_attempted",
+        "holdout_evidence_valid",
+        "holdout_trade_accounting_valid",
+        "holdout_aggregates_consistent",
+        "holdout_sample_consistent",
+        "holdout_outcomes_consistent",
+        "holdout_full_trades",
+        "holdout_evaluation_error",
         "holdout_net",
         "avg_net",
         "std_net",
@@ -1052,24 +2583,57 @@ def export_csv(results, strategy, days, k_folds):
         "fold_nets",
         "cli_command",
     ]
-    with open(filename, "w", newline="", encoding="utf-8") as f:
+    with _atomic_csv_writer(filename) as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for i, r in enumerate(results):
             s = r["stats"]
             p = r["params"]
             kf = r["kfold"]
+            holdout_net = _finite_holdout_number(r.get("holdout_net"))
             w.writerow(
                 {
                     "rank": i + 1,
                     "robust": "Ja" if kf["robust"] else "Nein",
+                    "deep_validation_complete": (
+                        "Ja" if r.get("deep_validation_complete") is True
+                        else "Nein"
+                    ),
                     "deployment_validated": "Ja"
                     if r.get("deployment_validated")
                     else "Nein",
+                    "holdout_evaluation_attempted": (
+                        "Ja" if r.get("holdout_evaluation_attempted") is True
+                        else "Nein"
+                    ),
+                    "holdout_evidence_valid": (
+                        "Ja" if r.get("holdout_evidence_valid") is True else "Nein"
+                    ),
+                    "holdout_trade_accounting_valid": (
+                        "Ja" if r.get("holdout_trade_accounting_valid") is True
+                        else "Nein"
+                    ),
+                    "holdout_aggregates_consistent": (
+                        "Ja" if r.get("holdout_aggregates_consistent") is True
+                        else "Nein"
+                    ),
+                    "holdout_sample_consistent": (
+                        "Ja" if r.get("holdout_sample_consistent") is True else "Nein"
+                    ),
+                    "holdout_outcomes_consistent": (
+                        "Ja"
+                        if r.get("holdout_outcomes_consistent") is True
+                        else "Nein"
+                    ),
+                    "holdout_full_trades": int(
+                        r.get("holdout_full_trades", 0) or 0
+                    ),
+                    "holdout_evaluation_error": (
+                        r.get("holdout_evaluation_error") or ""
+                    ),
                     "holdout_net": (
-                        round((r.get("holdout") or {}).get("net", 0), 2)
-                        if r.get("holdout")
-                        and not (r.get("holdout") or {}).get("skipped")
+                        round(holdout_net, 2)
+                        if holdout_net is not None
                         else ""
                     ),
                     "avg_net": round(kf["avg_net"], 2),
@@ -1094,6 +2658,27 @@ def export_csv(results, strategy, days, k_folds):
                     "cli_command": r.get("cmd", ""),
                 }
             )
+
+    # Only prune old results after the new CSV is durably published.
+    try:
+        prefix = f"optimizer_{strategy.lower()}_"
+        current_name = os.path.basename(filename)
+        previous = sorted(
+            [
+                name
+                for name in os.listdir(results_dir)
+                if name.startswith(prefix) and name.endswith(".csv")
+                and name != current_name
+            ],
+            reverse=True,
+        )
+        for old in previous[19:]:
+            try:
+                os.remove(os.path.join(results_dir, old))
+            except OSError:
+                pass
+    except OSError:
+        pass
     rel_filename = os.path.relpath(filename)
     print(f"  Ergebnisse gespeichert: {rel_filename}")
     return filename
@@ -1188,6 +2773,7 @@ def _validate_optimizer_run_inputs(
     holdout_frac,
     om_window,
     funding_8h,
+    leverage=None,
 ) -> None:
     if strategy not in FULL_SPACE or strategy not in QUICK_SPACE:
         raise ValueError(f"unsupported optimizer strategy {strategy!r}")
@@ -1213,6 +2799,15 @@ def _validate_optimizer_run_inputs(
             raise ValueError(f"{name} must be finite")
         if name == "holdout_frac" and not 0.0 <= number < 0.9:
             raise ValueError("holdout_frac must be >= 0 and < 0.9")
+    if leverage is not None:
+        if isinstance(leverage, bool):
+            raise ValueError("leverage must be finite and between 1 and 25")
+        try:
+            leverage_number = float(leverage)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("leverage must be finite and between 1 and 25") from exc
+        if not math.isfinite(leverage_number) or not 1.0 <= leverage_number <= 25.0:
+            raise ValueError("leverage must be finite and between 1 and 25")
 
 
 def _resolve_leverage(
@@ -1335,6 +2930,7 @@ def run_optimizer(
         holdout_frac,
         om_window,
         funding_8h,
+        leverage,
     )
 
     rt = calc_round_trip(use_maker, strategy)
@@ -1531,8 +3127,13 @@ def run_optimizer(
     )
 
     # Sortierung: zuerst robuste Configs, dann nach Score
-    robust_cfgs = [r for r in results if r["kfold"]["robust"]]
     sorted_results = rank_optimizer_candidates(results)
+    robust_cfgs = [r for r in sorted_results if r["kfold"]["robust"]]
+    deep_candidates = select_deep_validation_candidates(results, top_n)
+    for candidate in robust_cfgs:
+        candidate["deep_validation_selected"] = False
+        candidate["deep_validation_complete"] = False
+        candidate["deep_validation_errors"] = {}
 
     #  Deep robustness validation on the top candidates
     # walk_forward / regime_split / outlier / monte_carlo feed robustness_score's
@@ -1541,49 +3142,33 @@ def run_optimizer(
     # negligible beside the grid). The enriched score feeds back into the ranking
     # so a config that survives out-of-sample outranks a k-fold winner that
     # crumbles.
-    deep_k = min(len(robust_cfgs), max(top_n, 10))
+    deep_k = len(deep_candidates)
     if deep_k > 0:
         print(
             f"\n Deep-validating top {deep_k} robust config(s) "
             f"(walk-forward  regime  outlier  monte-carlo)"
         )
-        for r in robust_cfgs[:deep_k]:
+        for r in deep_candidates:
+            r["deep_validation_selected"] = True
             p = r["params"]
-
-            def _safe(fn):
-                try:
-                    return fn()
-                except Exception:
-                    return None
-
-            wf = _safe(
-                lambda params=p: walk_forward_simulate(
-                    indexed, tune_times, strategy, use_maker, params
-                )
-            )
-            rs = _safe(
-                lambda params=p: regime_split_simulate(
-                    indexed, tune_times, strategy, use_maker, params
-                )
-            )
-            ot = _safe(
-                lambda params=p: outlier_dependency_test(
-                    indexed, tune_times, strategy, use_maker, params
-                )
-            )
-            mc = _safe(lambda result=r: monte_carlo_perturbation(result["stats"]))
-            r["walk_forward"] = wf
-            r["regime_split"] = rs
-            r["outlier_test"] = ot
-            r["monte_carlo"] = mc
-            # Recompute score WITH the deep modifiers.
-            r["score"] = robustness_score(
-                r["stats"],
-                r["kfold"],
-                walk_forward=wf,
-                regime_split=rs,
-                outlier_test=ot,
-                monte_carlo=mc,
+            evaluate_deep_validation_candidate(
+                r,
+                {
+                    "walk_forward": lambda params=p: walk_forward_simulate(
+                        indexed, tune_times, strategy, use_maker, params
+                    ),
+                    "regime_split": lambda params=p: regime_split_simulate(
+                        indexed, tune_times, strategy, use_maker, params
+                    ),
+                    "outlier_test": lambda params=p: outlier_dependency_test(
+                        indexed, tune_times, strategy, use_maker, params
+                    ),
+                    "monte_carlo": (
+                        lambda result=r: monte_carlo_perturbation(
+                            result["stats"]
+                        )
+                    ),
+                },
             )
         # Deep evidence can change the winner, but holdout evidence cannot.
         sorted_results = rank_optimizer_candidates(results)
@@ -1681,15 +3266,17 @@ def run_optimizer(
     bkf = best["kfold"]
 
     #  Lpez de Prado trust diagnostics: DSR + PBO
-    # The best Sharpe is the MAX over all tested configs  selection-inflated.
-    # DSR deflates it by the expected max under the null; PBO (via CSCV over the
-    # k folds) estimates the probability the apparent edge is overfit. Both are
-    # diagnostics layered ON TOP of the robust gate  they do NOT change it.
+    # The selected candidate's Sharpe belongs to the full tested universe. DSR
+    # deflates it by the expected maximum under the null; PBO (via CSCV over
+    # the k folds) estimates the probability the apparent edge is overfit. Both
+    # are diagnostics layered ON TOP of the robust gate  they do NOT change it.
     sr_list = [
-        r["stats"].get("sharpe", 0.0) for r in results if r["stats"].get("trades")
+        r["stats"].get("sharpe", 0.0)
+        for r in results
+        if r["stats"].get("trade_count")
     ]
     sr_best = bs.get("sharpe", 0.0)
-    best_nets = list(bs.get("net_trades") or [])
+    best_nets = list(bs.get("position_net_trades") or [])
     n_obs = len(best_nets)
     skew_b, kurt_b = _sample_skew_kurt(best_nets)
     dsr = deflated_sharpe_ratio(sr_list, sr_best, n_obs, skew=skew_b, kurt=kurt_b)
@@ -1701,12 +3288,14 @@ def run_optimizer(
     pbo_val = pbo.get("pbo")
     deployment_trustworthy = bool(
         bkf["robust"]
+        and best.get("deep_validation_complete") is True
         and best.get("final_holdout_pass") is True
         and best.get("cost_stress_pass") is True
         and dsr_val is not None
         and dsr_val >= 0.95
         and pbo_val is not None
         and pbo_val <= 0.25
+        and pbo.get("evidence_valid") is True
     )
     best["dsr"] = dsr
     best["pbo"] = pbo
@@ -1752,6 +3341,14 @@ def run_optimizer(
     )
 
     # Deep-validation summary
+    if best.get("deep_validation_complete") is False:
+        error_names = ", ".join(
+            sorted((best.get("deep_validation_errors") or {}).keys())
+        )
+        print(
+            "     Deep-Validation: UNVOLLSTAENDIG"
+            + (f" ({error_names})" if error_names else " (nicht ausgewaehlt)")
+        )
     wf = best.get("walk_forward") or {}
     rs = best.get("regime_split") or {}
     mc = best.get("monte_carlo") or {}
@@ -1764,7 +3361,10 @@ def run_optimizer(
                 + (
                     " alle Slices profitabel"
                     if wf.get("all_profitable")
-                    else f" {wf.get('profitable_count', '?')}/{n_sl} Slices +"
+                    else (
+                        f" {wf.get('profitable_count', '?')}/{n_sl} Slices +, "
+                        f"{wf.get('edge_count', '?')}/{n_sl} Edge"
+                    )
                 )
             )
         if rs:
@@ -1802,12 +3402,22 @@ def run_optimizer(
     # Out-of-sample holdout  the honest deployment test.
     hd = best.get("holdout")
     if holdout_times:
-        if hd and not hd.get("skipped"):
-            _ok = hd.get("net", 0) > 0
+        if best.get("holdout_evaluation_error"):
+            print(
+                "  Holdout (OOS):  FEHLER  "
+                f"{best['holdout_evaluation_error']}"
+            )
+        elif hd and not hd.get("skipped"):
+            holdout_net = best.get("holdout_net")
+            _ok = holdout_net is not None and holdout_net > 0.0
+            holdout_net_text = (
+                f"{holdout_net:+.2f}" if holdout_net is not None else "n/a"
+            )
             print(
                 f"  Holdout (OOS): {'' if _ok else ''} Netto "
-                f"{hd.get('net', 0):+.2f} USDT | WR {hd.get('win_rate', 0):.1%} | "
-                f"{hd.get('trades', 0)} Trades  "
+                f"{holdout_net_text} USDT | WR {hd.get('win_rate', 0):.1%} | "
+                f"{hd.get('trades', 0)} Zeilen / "
+                f"{best.get('holdout_full_trades', 0)} Full-Trades  "
                 f"{'DEPLOYMENT-VALIDATED' if best.get('deployment_validated') else 'NICHT besttigt (out-of-sample fragil)'}"
             )
         else:
@@ -1837,10 +3447,34 @@ def run_optimizer(
         "win_rate": float(bs.get("win_rate", 0)),
         "sharpe": float(bs.get("sharpe", 0)),
         "robust": bool(bkf["robust"]),
-        "holdout_net": (
-            float(hd.get("net", 0)) if hd and not hd.get("skipped") else None
+        "deep_validation_complete": bool(
+            best.get("deep_validation_complete", False)
         ),
+        "holdout_net": best.get("holdout_net"),
         "holdout_trades": int(best.get("holdout_trades", 0) or 0),
+        "holdout_full_trades": int(best.get("holdout_full_trades", 0) or 0),
+        "holdout_evaluation_attempted": bool(
+            best.get("holdout_evaluation_attempted", False)
+        ),
+        "holdout_evidence_valid": bool(
+            best.get("holdout_evidence_valid", False)
+        ),
+        "holdout_trade_accounting_valid": bool(
+            best.get("holdout_trade_accounting_valid", False)
+        ),
+        "holdout_aggregates_consistent": bool(
+            best.get("holdout_aggregates_consistent", False)
+        ),
+        "holdout_sample_consistent": bool(
+            best.get("holdout_sample_consistent", False)
+        ),
+        "holdout_outcomes_consistent": bool(
+            best.get("holdout_outcomes_consistent", False)
+        ),
+        "holdout_evaluation_error": best.get("holdout_evaluation_error"),
+        "holdout_net_consistent": bool(
+            best.get("holdout_net_consistent", False)
+        ),
         "cost_stress_pass": bool(best.get("cost_stress_pass", False)),
         "final_holdout_pass": bool(best.get("final_holdout_pass", False)),
         "deployment_validated": bool(best.get("deployment_validated", False)),
@@ -1888,6 +3522,98 @@ def run_optimizer(
 
 #  CLI
 
+
+_OPTIMIZER_CLI_BOOLEAN_OPTIONS = {
+    "--maker": ("use_maker", True),
+    "--quick": ("quick", True),
+    "--no-sensitivity": ("do_sensitivity", False),
+    "--own-momentum": ("own_momentum", True),
+    "--regime": ("regime", True),
+}
+_OPTIMIZER_CLI_VALUE_OPTIONS = {
+    "--top": ("top_n", int),
+    "--kfold": ("k_folds", int),
+    "--leverage": ("leverage", float),
+    "--holdout": ("holdout_frac", float),
+    "--om-window": ("om_window", int),
+    "--funding": ("funding_8h", float),
+}
+
+
+def _parse_optimizer_cli_args(args: list[str]) -> dict:
+    """Parse optimizer CLI arguments without silently replacing bad input."""
+    if not isinstance(args, (list, tuple)) or not args:
+        raise ValueError("optimizer strategy is required")
+    strategy = args[0]
+    if strategy not in ("TREND", "SPOT", "FUTURES"):
+        raise ValueError(f"unsupported optimizer strategy {strategy!r}")
+
+    cursor = 1
+    days = DEFAULT_DAYS
+    if cursor < len(args) and not str(args[cursor]).startswith("--"):
+        try:
+            days = int(args[cursor])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("days must be an integer >= 1") from exc
+        cursor += 1
+
+    if strategy == "TREND":
+        if cursor != len(args):
+            raise ValueError("TREND optimizer route accepts only an optional day count")
+        _validate_optimizer_run_inputs(strategy, days, 10, 4, 0.2, 8, 0.0)
+        return {"strategy": strategy, "days": days}
+
+    parsed = {
+        "strategy": strategy,
+        "days": days,
+        "use_maker": False,
+        "top_n": 10,
+        "k_folds": 4,
+        "quick": False,
+        "do_sensitivity": True,
+        "leverage": None,
+        "holdout_frac": 0.2,
+        "own_momentum": False,
+        "om_window": 8,
+        "regime": False,
+        "funding_8h": 0.0,
+    }
+    seen = set()
+    while cursor < len(args):
+        option = args[cursor]
+        if option in seen:
+            raise ValueError(f"duplicate optimizer option {option}")
+        if option in _OPTIMIZER_CLI_BOOLEAN_OPTIONS:
+            name, value = _OPTIMIZER_CLI_BOOLEAN_OPTIONS[option]
+            parsed[name] = value
+            seen.add(option)
+            cursor += 1
+            continue
+        if option not in _OPTIMIZER_CLI_VALUE_OPTIONS:
+            raise ValueError(f"unknown optimizer option {option!r}")
+        if cursor + 1 >= len(args) or str(args[cursor + 1]).startswith("--"):
+            raise ValueError(f"optimizer option {option} requires a value")
+        name, converter = _OPTIMIZER_CLI_VALUE_OPTIONS[option]
+        try:
+            parsed[name] = converter(args[cursor + 1])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"invalid value for optimizer option {option}") from exc
+        seen.add(option)
+        cursor += 2
+
+    _validate_optimizer_run_inputs(
+        parsed["strategy"],
+        parsed["days"],
+        parsed["top_n"],
+        parsed["k_folds"],
+        parsed["holdout_frac"],
+        parsed["om_window"],
+        parsed["funding_8h"],
+        parsed["leverage"],
+    )
+    return parsed
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args or args[0] not in ("TREND", "SPOT", "FUTURES"):
@@ -1913,82 +3639,26 @@ if __name__ == "__main__":
         print("  python optimizer.py TREND  # voll, K=4, mit Sensitivitt")
         print("    python optimizer.py SPOT 60 --maker # mit Maker-Orders")
         print("    python optimizer.py FUTURES 30 --quick    # Futures-Suchraum")
-        print("    python optimizer.py TREND --kfold 5    # 5 Perioden statt 4")
-        print("    python optimizer.py TREND --quick      # ~1/8 Suchraum")
-        print("    python optimizer.py TREND --no-sensitivity  # ohne Robustheits-Test")
+        print("    python optimizer.py FUTURES --kfold 5  # 5 Perioden statt 4")
+        print("    python optimizer.py FUTURES --quick    # ~1/8 Suchraum")
+        print("    python optimizer.py SPOT --no-sensitivity  # ohne Robustheits-Test")
+        print("    python optimizer.py TREND 90           # separater SMA-Sweep")
         sys.exit(1)
 
-    strategy = args[0]
+    try:
+        cli = _parse_optimizer_cli_args(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    strategy = cli["strategy"]
     if strategy == "TREND":
         # TREND trades the SMA-ensemble, not the momentum grid below  route to
         # the validator's robustness sweep so tuning reflects the live signal.
         from tools import trend_check
 
-        _days = args[1] if len(args) > 1 and args[1].isdigit() else str(DEFAULT_DAYS)
+        _days = str(cli["days"])
         sys.argv = ["trend_check", _days, "--sweep"]
         trend_check.main()
         sys.exit(0)
-    days = int(args[1]) if len(args) > 1 and args[1].isdigit() else DEFAULT_DAYS
-    use_maker = "--maker" in args
-    quick = "--quick" in args
-    do_sensitivity = "--no-sensitivity" not in args
-
-    top_n = 10
-    k_folds = 4
-    if "--top" in args:
-        try:
-            top_n = int(args[args.index("--top") + 1])
-        except (ValueError, IndexError):
-            pass
-    if "--kfold" in args:
-        try:
-            k_folds = int(args[args.index("--kfold") + 1])
-        except (ValueError, IndexError):
-            pass
-
-    leverage = None  # None  resolve from bot_config.json inside run_optimizer
-    if "--leverage" in args:
-        try:
-            leverage = float(args[args.index("--leverage") + 1])
-        except (ValueError, IndexError):
-            pass
-
-    holdout_frac = 0.2  # fraction of the most-recent data reserved out-of-sample
-    if "--holdout" in args:
-        try:
-            holdout_frac = float(args[args.index("--holdout") + 1])
-        except (ValueError, IndexError):
-            pass
-
-    own_momentum = "--own-momentum" in args
-    om_window = 8
-    if "--om-window" in args:
-        try:
-            om_window = int(args[args.index("--om-window") + 1])
-        except (ValueError, IndexError):
-            pass
-
-    regime = "--regime" in args
-
-    funding_8h = 0.0
-    if "--funding" in args:
-        try:
-            funding_8h = float(args[args.index("--funding") + 1])
-        except (ValueError, IndexError):
-            pass
-
-    run_optimizer(
-        strategy,
-        days,
-        use_maker=use_maker,
-        top_n=top_n,
-        k_folds=k_folds,
-        quick=quick,
-        do_sensitivity=do_sensitivity,
-        leverage=leverage,
-        holdout_frac=holdout_frac,
-        own_momentum=own_momentum,
-        om_window=om_window,
-        regime=regime,
-        funding_8h=funding_8h,
-    )
+    run_optimizer(**cli)

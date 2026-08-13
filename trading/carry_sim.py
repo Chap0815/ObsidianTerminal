@@ -246,17 +246,50 @@ class CarryEngine:
                 raise ValueError("carry payload campaign values are invalid")
             data[field] = normalized
         state = CarryState(str(data.get("state")))
+        spot_filled = data["spot_base"] > 0.0 and data["spot_entry"] > 0.0
+        perp_filled = data["perp_base"] > 0.0 and data["perp_entry"] > 0.0
+        if (data["spot_base"] > 0.0) != (data["spot_entry"] > 0.0):
+            raise ValueError("carry payload state has partial spot fill evidence")
+        if (data["perp_base"] > 0.0) != (data["perp_entry"] > 0.0):
+            raise ValueError("carry payload state has partial perp fill evidence")
+        if state == CarryState.CAPITAL_RESERVED and (spot_filled or perp_filled):
+            raise ValueError("carry payload state has premature fill evidence")
+        if state == CarryState.SPOT_FILLED and (not spot_filled or perp_filled):
+            raise ValueError("carry payload state has inconsistent fill evidence")
         if state in {
-            CarryState.SPOT_FILLED,
             CarryState.HEDGED,
-            CarryState.UNWIND_REQUIRED,
             CarryState.RECONCILED,
-        } and (data["spot_base"] <= 0.0 or data["spot_entry"] <= 0.0):
+        } and (not spot_filled or not perp_filled):
+            raise ValueError("carry payload state lacks hedged fill evidence")
+        if state == CarryState.UNWIND_REQUIRED and not spot_filled:
             raise ValueError("carry payload state lacks spot fill evidence")
-        if state in {CarryState.HEDGED, CarryState.RECONCILED} and (
-            data["perp_base"] <= 0.0 or data["perp_entry"] <= 0.0
-        ):
-            raise ValueError("carry payload state lacks perp fill evidence")
+        if perp_filled:
+            hedge_error = abs(data["perp_base"] - data["spot_base"]) / data[
+                "spot_base"
+            ]
+            if (
+                not math.isfinite(hedge_error)
+                or not math.isclose(
+                    data["hedge_error_pct"],
+                    hedge_error,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError("carry payload hedge error is inconsistent")
+            if (
+                state in {CarryState.HEDGED, CarryState.RECONCILED}
+                and hedge_error > data["terms"].max_leg_mismatch_pct
+            ):
+                raise ValueError("carry payload hedge mismatch exceeds tolerance")
+            if (
+                state == CarryState.UNWIND_REQUIRED
+                and hedge_error <= data["terms"].max_leg_mismatch_pct
+            ):
+                raise ValueError("carry payload unwind state lacks hedge mismatch")
+            data["hedge_error_pct"] = hedge_error
+        elif data["hedge_error_pct"] != 0.0:
+            raise ValueError("carry payload hedge error lacks perp fill evidence")
         data["state"] = state
         return CarryCampaign(**data)
 
