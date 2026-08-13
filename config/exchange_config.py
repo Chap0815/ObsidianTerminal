@@ -527,6 +527,54 @@ def get_futures_exchange_connection():
     return _finalize_connection(exchange_class(config))
 
 
+def get_public_futures_exchange_connection(exchange_name: str | None = None):
+    """Unauthenticated public USDT-perpetual connection for research tools.
+
+    Historical OHLCV and ticker snapshots are public market data.  Building
+    them must therefore not depend on live-trading credentials or a Bitget
+    passphrase.  Keep this separate from the authenticated runtime connection
+    so order-capable callers retain the existing fail-closed configuration.
+    """
+    if exchange_name is None:
+        exchange_name = _get("EXCHANGE", default="bitget")
+    if not isinstance(exchange_name, str) or not exchange_name.strip():
+        raise ValueError("Public futures exchange must be a non-empty name")
+    exchange_name = exchange_name.strip().lower()
+    if exchange_name not in _FUTURES_TYPE_MAP:
+        raise ValueError(
+            f"Exchange '{exchange_name}' does not currently support futures "
+            f"in this bot. Supported: {', '.join(_FUTURES_TYPE_MAP.keys())}"
+        )
+
+    try:
+        recv_window = int(_get("RECV_WINDOW_MS", default="15000"))
+    except (TypeError, ValueError):
+        recv_window = 15000
+    config = {
+        "enableRateLimit": True,
+        "timeout": 30000,
+        "options": {
+            "defaultType": _FUTURES_TYPE_MAP[exchange_name],
+            "adjustForTimeDifference": True,
+            "recvWindow": recv_window,
+        },
+    }
+    if exchange_name == "bitget":
+        config["options"]["productType"] = "USDT-FUTURES"
+    if _get("USE_PROXY", default="false").lower() == "true":
+        proxy_url = (
+            f"http://{_get('PROXY_HOST', default='127.0.0.1')}:"
+            f"{_get('PROXY_PORT', default='10808')}"
+        )
+        config["proxies"] = {"http": proxy_url, "https": proxy_url}
+
+    try:
+        exchange_class = getattr(ccxt, exchange_name)
+    except AttributeError:
+        raise ValueError(f"Unknown exchange '{exchange_name}'")
+    return _finalize_connection(exchange_class(config))
+
+
 def get_active_exchange_name() -> str:
     return _get("EXCHANGE", default="bitget").lower()
 

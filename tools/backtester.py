@@ -35,7 +35,13 @@ from core.clock import backtest_asof_ms
 from core.logger import log_event, log_separator
 from tools.ohlcv_cache import get_series
 from bot_utils.futures_funding import count_funding_settlements
-from bot_utils.indicators import rsi as ind_rsi, macd_signal as ind_macd_signal
+from bot_utils.futures_math import funding_oi_filter
+from trading.entry_quality import score_futures_entry
+from bot_utils.indicators import (
+    atr as ind_atr,
+    macd_signal as ind_macd_signal,
+    rsi as ind_rsi,
+)
 from core.constants import (
     DEFAULT_TAKER_FEE,
     DEFAULT_MAKER_FEE,
@@ -51,6 +57,7 @@ from core.constants import (
     MAX_24H_PUMP_PCT,
     TOP_N_VOLUME_COINS_BACKTEST,
     DEFAULT_MAINT_MARGIN,
+    MAX_SPREAD_PCT,
 )
 
 
@@ -228,6 +235,94 @@ def get_top_volume_coins(exchange, n: int = None, days: int = None) -> list:
         return []
 
 
+def get_top_futures_volume_coins(
+    exchange, n: int = None, days: int = None
+) -> list:
+    """Rank active, linear USDT perpetuals while excluding RWA contracts.
+
+    Bitget exposes tokenized stocks and commodities alongside crypto swaps.
+    Those contracts are unsuitable for the bot's crypto FUTURES universe even
+    though they can dominate quote-volume rankings.
+    """
+    if n is None:
+        n = TOP_N_VOLUME_COINS_BACKTEST
+    try:
+        tickers = exchange.fetch_tickers()
+        markets = getattr(exchange, "markets", None) or {}
+        ranked = []
+        for symbol, ticker in tickers.items():
+            market = markets.get(symbol) or {}
+            try:
+                quote_volume = float(ticker.get("quoteVolume") or 0.0)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                continue
+            if (
+                market.get("swap") is not True
+                or market.get("linear") is not True
+                or market.get("active") is not True
+                or market.get("quote") != "USDT"
+                or market.get("settle") != "USDT"
+                or _is_rwa_futures_market(market)
+                or not math.isfinite(quote_volume)
+                or quote_volume < MIN_VOLUME_USDT
+            ):
+                continue
+            ranked.append((symbol, quote_volume))
+        ranked.sort(key=lambda item: (-item[1], item[0]))
+
+        if days and days > 0:
+            eff_now = backtest_asof_ms()
+            if eff_now is None:
+                try:
+                    eff_now = exchange.milliseconds()
+                except Exception:
+                    eff_now = int(_time.time() * 1000)
+            window_start_ms = eff_now - days * 86_400_000
+            filtered = []
+            dropped = 0
+            for symbol, _volume in ranked:
+                listing = _market_listing_ms(markets.get(symbol))
+                if 0 < listing > window_start_ms:
+                    dropped += 1
+                    continue
+                filtered.append(symbol)
+                if len(filtered) >= n:
+                    break
+            if dropped:
+                print(
+                    f"   [listing-age] dropped {dropped} futures contract(s) "
+                    "listed after window start (metadata pre-filter)"
+                )
+            return filtered[:n]
+        return [symbol for symbol, _volume in ranked[:n]]
+    except Exception as e:
+        log_event(f"Futures Coin-Pool: {e}", "WARN")
+        return []
+
+
+def _is_rwa_futures_market(market: dict) -> bool:
+    """Detect venue-specific tokenized TradFi contracts conservatively."""
+    if not isinstance(market, dict):
+        return False
+    info = market.get("info") or {}
+    if not isinstance(info, dict):
+        return False
+    if str(info.get("isRwa", "")).strip().upper() == "YES":
+        return True
+    if str(info.get("typeLabel", "")).strip() == "2":
+        return True
+    concepts = info.get("conceptPlate")
+    if isinstance(concepts, str):
+        concepts = [concepts]
+    if not isinstance(concepts, (list, tuple, set)):
+        return False
+    normalized = " ".join(str(value).strip().lower() for value in concepts)
+    return any(
+        marker in normalized
+        for marker in ("tradfi", "stock", "metals", "commodit", "forex")
+    )
+
+
 def filter_universe_by_history(history: dict, days: int, now_ms: int = None) -> dict:
     """Drop coins whose FIRST 1h bar is later than the window start  i.e. they
     did not trade for the full `days` window. First-bar timestamp is the reliable
@@ -309,15 +404,31 @@ def precompute_index(history: dict) -> tuple:
         times = df["dt"].tolist()
         n = len(df)
 
-        # EMA50 extension (#2) and volume surge (#5), computed like the live
-        # screener so the backtest mirrors the real entry filters. Defensive
-        # fillna  warmup bars are neutral (ratio 0 / surge 1) and never block
-        # on missing data.
+        # Entry evidence computed on the closed signal bar.  The live screener
+        # compares that bar's volume with the *preceding* 20 bars; including the
+        # signal bar in its own denominator systematically muted large surges in
+        # backtests.  Warm-up evidence stays explicitly neutral.
         _ema = df["close"].ewm(span=50, adjust=False).mean()
         ema_ratios = ((df["close"] / _ema - 1.0) * 100).fillna(0.0).tolist()
+        atr_pcts = (
+            (ind_atr(df["high"], df["low"], df["close"], 14) / df["close"] * 100)
+            .fillna(0.0)
+            .tolist()
+        )
+        candle_ranges = df["high"] - df["low"]
+        candle_bodies = (df["close"] - df["open"]).abs()
+        body_ratios = (
+            (candle_bodies / candle_ranges.where(candle_ranges > 0.0))
+            .fillna(1.0)
+            .tolist()
+        )
+        candle_dirs = [
+            -1.0 if close < open_ else (1.0 if close > open_ else 0.0)
+            for open_, close in zip(opens, closes)
+        ]
         if "volume" in df.columns:
             _vol = df["volume"]
-            _vol_avg = _vol.rolling(20, min_periods=5).mean()
+            _vol_avg = _vol.shift(1).rolling(20, min_periods=20).mean()
             vol_surges = (
                 (_vol / _vol_avg)
                 .replace([float("inf"), float("-inf")], 1.0)
@@ -344,9 +455,143 @@ def precompute_index(history: dict) -> tuple:
                 "macd_h": macds[i],
                 "ema_ratio": ema_ratios[i],
                 "vol_surge": vol_surges[i],
+                "atr_pct": atr_pcts[i],
+                "body_ratio": body_ratios[i],
+                "candle_dir": candle_dirs[i],
             }
         indexed[sym] = lookup
     return indexed, sorted(all_ts)
+
+
+def _passes_futures_screener_parity(
+    tick: dict, side: str, change: float
+) -> bool:
+    """Apply the causal 1h quality gates shared with the live screener.
+
+    Multi-timeframe RSI and database-derived history scores are intentionally
+    outside this helper because an immutable 1h OHLCV dataset cannot reproduce
+    them.  Missing or malformed evidence fails closed when parity is requested.
+    """
+
+    values = {}
+    for name in ("vol_surge", "atr_pct", "ema_ratio", "body_ratio", "candle_dir"):
+        value = tick.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        value = float(value)
+        if not math.isfinite(value):
+            return False
+        values[name] = value
+
+    if side == "LONG":
+        return bool(
+            values["vol_surge"] >= 1.30
+            and 1.0 <= values["atr_pct"] <= 8.0
+            and values["body_ratio"] >= 0.30
+        )
+    if side == "SHORT":
+        return bool(
+            values["vol_surge"] >= 1.0
+            and 1.0 <= values["atr_pct"] <= 8.0
+            and values["ema_ratio"] <= 1.0
+            and values["body_ratio"] >= 0.30
+            and values["candle_dir"] < 0.0
+            and change >= -15.0
+        )
+    return False
+
+
+def _passes_capture_replay_policy(
+    tick: dict,
+    side: str,
+    *,
+    minimum_quality_score: float | None,
+) -> bool:
+    """Apply live multi-timeframe/funding admission to capture replay ticks."""
+    fields = ("rsi_15m", "rsi", "rsi_4h", "ema_ratio", "vol_surge", "change")
+    values = {}
+    for field in fields:
+        value = tick.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        value = float(value)
+        if not math.isfinite(value):
+            return False
+        values[field] = value
+    funding_pct = tick.get("funding_rate_pct")
+    if isinstance(funding_pct, bool) or not isinstance(funding_pct, (int, float)):
+        return False
+    funding_pct = float(funding_pct)
+    if not math.isfinite(funding_pct):
+        return False
+    spread_pct = tick.get("spread_pct")
+    if isinstance(spread_pct, bool) or not isinstance(spread_pct, (int, float)):
+        return False
+    spread_pct = float(spread_pct)
+    if not math.isfinite(spread_pct) or not 0.0 <= spread_pct <= MAX_SPREAD_PCT:
+        return False
+    btc_change = tick.get("btc_change")
+    if isinstance(btc_change, bool) or not isinstance(btc_change, (int, float)):
+        return False
+    btc_change = float(btc_change)
+    if not math.isfinite(btc_change):
+        return False
+
+    rsis = (values["rsi_15m"], values["rsi"], values["rsi_4h"])
+    is_long = side == "LONG"
+    if side not in {"LONG", "SHORT"}:
+        return False
+    aligned = sum(
+        1
+        for value in rsis
+        if (50.0 <= value <= 75.0 if is_long else 25.0 <= value <= 50.0)
+    )
+    score = aligned
+    extension = values["ema_ratio"] if is_long else -values["ema_ratio"]
+    if extension > 18.0 or values["vol_surge"] < 1.0:
+        return False
+    if 0.0 <= extension <= 8.1:
+        score += 1
+    if values["vol_surge"] >= 1.8:
+        score += 1
+    relative = (
+        values["change"] - btc_change
+        if is_long
+        else btc_change - values["change"]
+    )
+    if relative < -2.0:
+        return False
+    if relative >= 3.0:
+        score += 1
+    if abs(funding_pct) >= 0.0001:
+        paying = funding_pct > 0.0 if is_long else funding_pct < 0.0
+        score += -1 if paying else 1
+    confidence = "HIGH" if score >= 4 else "MEDIUM" if score >= 2 else "LOW"
+    if confidence == "LOW" or (aligned < 2 and confidence != "HIGH"):
+        return False
+    if is_long and all(value > limit for value, limit in zip(rsis, (80, 75, 70))):
+        return False
+    if not is_long and all(value < limit for value, limit in zip(rsis, (20, 25, 30))):
+        return False
+    if not funding_oi_filter(side, funding_pct, None, confidence)[0]:
+        return False
+    if minimum_quality_score is not None:
+        quality = score_futures_entry(
+            direction=side,
+            confidence=confidence,
+            rsi_15m=values["rsi_15m"],
+            rsi_1h=values["rsi"],
+            rsi_4h=values["rsi_4h"],
+            change_pct=values["change"],
+            btc_change_pct=btc_change,
+            funding_rate_pct=funding_pct,
+            oi_change_pct=None,
+            spread_pct=spread_pct,
+            regime=None,
+        )
+        if quality.score < minimum_quality_score:
+            return False
+    return True
 
 
 #
@@ -385,8 +630,26 @@ def _holding_hours(entry_time, exit_time) -> float:
 
 
 def _funding_cost(
-    funding_8h: float, side: str, notional: float, entry_time, exit_time
+    funding_8h: float,
+    side: str,
+    notional: float,
+    entry_time,
+    exit_time,
+    *,
+    symbol: str | None = None,
+    funding_timeline=None,
 ) -> float:
+    if funding_timeline is not None:
+        if not symbol:
+            raise ValueError("historical funding requires a symbol")
+        return funding_timeline.charge(
+            symbol,
+            side,
+            notional,
+            entry_time,
+            exit_time,
+            require_complete=True,
+        ).cost_usdt
     if not funding_8h:
         return 0.0
     n_settle = count_funding_settlements(
@@ -525,6 +788,11 @@ def simulate_fast(
     funding_8h = _finite_backtest_value(
         p.get("funding_rate_8h", 0.0) or 0.0, 0.0
     )
+    funding_timeline = p.get("historical_funding_timeline")
+    if funding_timeline is not None and not callable(
+        getattr(funding_timeline, "charge", None)
+    ):
+        raise ValueError("historical_funding_timeline must provide charge()")
     position_limit = _backtest_position_limit(strategy)
     position_size = _bounded_backtest_float(
         p.get("position_size", POSITION_SIZE) or POSITION_SIZE,
@@ -590,6 +858,19 @@ def simulate_fast(
         return _backtest_env_float(_name, _d)
 
     _is_fut = strategy == "FUTURES"
+    _screener_parity_on = _is_fut and _truthy(
+        p.get("futures_screener_parity", False)
+    )
+    _capture_quality_min = None
+    if p.get("capture_replay") is True and _truthy(
+        p.get("entry_quality_filter_enabled", True)
+    ):
+        _capture_quality_min = _bounded_backtest_float(
+            p.get("entry_quality_min_score", 75.0),
+            75.0,
+            0.0,
+            100.0,
+        )
     _ext_on = _is_fut and _flag_on("FUT_EXT_FILTER")
     _ext_max = _flag_val("FUT_MAX_EXT_PCT", 18.0)
     _vol_on = _is_fut and _flag_on("FUT_VOL_FILTER")
@@ -722,7 +1003,13 @@ def simulate_fast(
                 gross_p = notional * (realized_prof / 100)
                 fees = notional * RT
                 funding = _funding_cost(
-                    funding_8h, side, notional, d.get("entry_now", now), now
+                    funding_8h,
+                    side,
+                    notional,
+                    d.get("entry_now", now),
+                    now,
+                    symbol=sym,
+                    funding_timeline=funding_timeline,
                 )
                 rec = _closed_trade_record(
                     d,
@@ -749,7 +1036,13 @@ def simulate_fast(
                 gross_p = notional * (act / 100)
                 fees = notional * RT
                 funding = _funding_cost(
-                    funding_8h, side, notional, d.get("entry_now", now), now
+                    funding_8h,
+                    side,
+                    notional,
+                    d.get("entry_now", now),
+                    now,
+                    symbol=sym,
+                    funding_timeline=funding_timeline,
                 )
                 rec = _closed_trade_record(
                     d,
@@ -778,6 +1071,11 @@ def simulate_fast(
             d["lowest"] = curr_lowest
 
         # Buy check
+        if p.get("capture_replay") is True and not any(
+            tick_map.get(now, {}).get("scan_due") is True
+            for tick_map in indexed.values()
+        ):
+            continue
         if len(open_trades) >= max_open_trades:
             continue
 
@@ -808,6 +1106,21 @@ def simulate_fast(
             if sym in open_trades:
                 continue
 
+            if _screener_parity_on:
+                if not _passes_futures_screener_parity(
+                    tick,
+                    side,
+                    chg,
+                ):
+                    continue
+            if p.get("capture_replay") is True:
+                if not _passes_capture_replay_policy(
+                    tick,
+                    side,
+                    minimum_quality_score=_capture_quality_min,
+                ):
+                    continue
+
             #  Macro-regime gate: don't fight BTC's trend
             if regime_on and _btc_sym is not None:
                 _bt = indexed[_btc_sym].get(now)
@@ -835,9 +1148,11 @@ def simulate_fast(
                         if _rs < _rs_min:
                             continue  # #3 weak rel-strength  skip
 
-            candidates.append(
-                (abs(chg), sym, tick["price"], tick.get("next_open"), side)
+            entry_price = tick.get(
+                "long_entry_price" if side == "LONG" else "short_entry_price",
+                tick.get("next_open"),
             )
+            candidates.append((abs(chg), sym, tick["price"], entry_price, side))
 
         candidates.sort(reverse=True)
         for _, sym, signal_price, next_open, side in candidates[:top_n_per_scan]:
@@ -889,7 +1204,13 @@ def simulate_fast(
             gross_p = notional * (profit_pct / 100.0)
             fees = notional * RT
             funding = _funding_cost(
-                funding_8h, side, notional, d.get("entry_now", end_time), end_time
+                funding_8h,
+                side,
+                notional,
+                d.get("entry_now", end_time),
+                end_time,
+                symbol=sym,
+                funding_timeline=funding_timeline,
             )
             rec = _closed_trade_record(
                 d,
@@ -991,6 +1312,7 @@ def _closed_position_summaries(trades: list[dict]) -> list[dict] | None:
         return [
             {
                 "position_id": index,
+                "symbol": trade.get("symbol"),
                 "entry_time": trade.get("entry_time"),
                 "exit_time": trade.get("exit_time"),
                 "net": trade["net"],
@@ -1017,6 +1339,9 @@ def _closed_position_summaries(trades: list[dict]) -> list[dict] | None:
         terminal = [trade for trade in fragments if trade["is_partial"] is False]
         if len(terminal) != 1 or fragments[-1] is not terminal[0]:
             return None
+        symbol = fragments[0].get("symbol")
+        if any(trade.get("symbol") != symbol for trade in fragments[1:]):
+            return None
         try:
             net = math.fsum(trade["net"] for trade in fragments)
             notional = math.fsum(trade["notional"] for trade in fragments)
@@ -1028,6 +1353,7 @@ def _closed_position_summaries(trades: list[dict]) -> list[dict] | None:
         summaries.append(
             {
                 "position_id": position_id,
+                "symbol": symbol,
                 "entry_time": fragments[0].get("entry_time"),
                 "exit_time": terminal[0].get("exit_time"),
                 "net": net,

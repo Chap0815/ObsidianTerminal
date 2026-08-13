@@ -32,15 +32,16 @@ import os
 import time
 import math
 import itertools
+import multiprocessing
 import csv
 import json as _json
 import random as _random
 import statistics
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 _TOOL_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _TOOL_PROJECT_ROOT not in sys.path:
@@ -55,9 +56,13 @@ try:
 except Exception:
     _scipy_norm = None
 
-from config.exchange_config import get_spot_exchange_connection
+from config.exchange_config import (
+    get_public_futures_exchange_connection,
+    get_spot_exchange_connection,
+)
 from tools.backtester import (
     fetch_history,
+    get_top_futures_volume_coins,
     get_top_volume_coins,
     filter_universe_by_history,
     precompute_index,
@@ -66,6 +71,12 @@ from tools.backtester import (
     DEFAULT_DAYS,
     PNL_ZERO_TOLERANCE_PCT,
     _compute_stats,
+)
+from tools.simulation_workspace import (
+    ReproducibleRun,
+    freeze_history_dataset,
+    load_history_dataset,
+    split_boundaries,
 )
 from core.logger import log_separator
 
@@ -680,6 +691,16 @@ def walk_forward_simulate(
 # uses BTC change_% from the indexed data  no extra fetch needed.
 
 
+def _btc_regime_reference(indexed: dict):
+    """Return the exact BTC series used by spot or linear-perpetual datasets."""
+    if not isinstance(indexed, dict):
+        return None
+    for symbol in ("BTC", "BTC/USDT", "BTC/USDT:USDT"):
+        if symbol in indexed:
+            return indexed[symbol]
+    return None
+
+
 def detect_regimes(indexed: dict, all_times: list) -> dict:
     """Classify each timestamp as BULL/BEAR/CHOP using BTC change_%.
 
@@ -688,16 +709,11 @@ def detect_regimes(indexed: dict, all_times: list) -> dict:
       BEAR: BTC 24h change < -3%
       CHOP: in between (low volatility / sideways)
     """
-    if not isinstance(indexed, dict):
-        return {"BULL": [], "BEAR": [], "CHOP": all_times[:]}
-    btc_data = indexed.get("BTC", {}) or indexed.get("BTC/USDT", {}) or {}
-    if not isinstance(btc_data, dict):
-        return {"BULL": [], "BEAR": [], "CHOP": all_times[:]}
-    if not btc_data:
-        # No BTC reference  can't classify
-        return {"BULL": [], "BEAR": [], "CHOP": all_times[:]}
-
     buckets = {"BULL": [], "BEAR": [], "CHOP": []}
+    btc_data = _btc_regime_reference(indexed)
+    if not isinstance(btc_data, dict) or not btc_data:
+        # Missing reference data is not evidence for a sideways market.
+        return buckets
     for t in all_times:
         tick = btc_data.get(t)
         chg = tick.get("change") if isinstance(tick, dict) else None
@@ -766,24 +782,21 @@ def regime_split_simulate(
         return _invalid_regime_split_result(
             regimes, all_times, "invalid_regime_source", 1
         )
-    btc_data = indexed.get("BTC", {}) or indexed.get("BTC/USDT", {}) or {}
+    btc_data = _btc_regime_reference(indexed)
     invalid_source_sample_count = 0
-    if btc_data and not isinstance(btc_data, dict):
+    if not isinstance(btc_data, dict) or not btc_data:
         regimes = detect_regimes(indexed, all_times)
         return _invalid_regime_split_result(
             regimes, all_times, "invalid_regime_source", 1
         )
-    if isinstance(btc_data, dict) and btc_data:
-        for timestamp in all_times:
-            tick = btc_data.get(timestamp)
-            if tick is None:
-                continue
-            if not isinstance(tick, dict):
-                invalid_source_sample_count += 1
-                continue
-            change = tick.get("change")
-            if change is not None and _finite_optimizer_number(change) is None:
-                invalid_source_sample_count += 1
+    for timestamp in all_times:
+        tick = btc_data.get(timestamp)
+        if not isinstance(tick, dict):
+            invalid_source_sample_count += 1
+            continue
+        change = tick.get("change")
+        if change is not None and _finite_optimizer_number(change) is None:
+            invalid_source_sample_count += 1
     regimes = detect_regimes(indexed, all_times)
     if invalid_source_sample_count:
         return _invalid_regime_split_result(
@@ -922,7 +935,13 @@ def outlier_dependency_test(
         return _invalid_outlier_result("invalid_full_simulation")
     full_net = _finite_optimizer_net(s_full)
     raw_nets = s_full.get("position_net_trades")
-    if full_net is None or not isinstance(raw_nets, (list, tuple)):
+    closed_positions = s_full.get("closed_positions")
+    if (
+        full_net is None
+        or not isinstance(raw_nets, (list, tuple))
+        or not isinstance(closed_positions, list)
+        or len(closed_positions) != len(raw_nets)
+    ):
         return _invalid_outlier_result("invalid_net_evidence")
     normalized_nets = [_finite_optimizer_number(value) for value in raw_nets]
     invalid_trade_count = sum(value is None for value in normalized_nets)
@@ -944,6 +963,71 @@ def outlier_dependency_test(
         return _invalid_outlier_result(
             "inconsistent_net_evidence", trade_count=len(raw_nets)
         )
+
+    symbol_rows: dict[str, list[float]] = {}
+    for position, position_net in zip(closed_positions, normalized_nets):
+        if not isinstance(position, dict):
+            return _invalid_outlier_result(
+                "invalid_symbol_evidence", trade_count=len(raw_nets)
+            )
+        symbol = position.get("symbol")
+        recorded_net = _finite_optimizer_number(position.get("net"))
+        if (
+            not isinstance(symbol, str)
+            or not symbol.strip()
+            or recorded_net is None
+            or not math.isclose(
+                recorded_net, position_net, rel_tol=1e-9, abs_tol=1e-9
+            )
+        ):
+            return _invalid_outlier_result(
+                "invalid_symbol_evidence", trade_count=len(raw_nets)
+            )
+        symbol_rows.setdefault(symbol.strip(), []).append(recorded_net)
+    try:
+        symbol_nets = {
+            symbol: math.fsum(values)
+            for symbol, values in sorted(symbol_rows.items())
+        }
+        symbol_net_sum = math.fsum(symbol_nets.values())
+        positive_symbol_net = math.fsum(
+            max(value, 0.0) for value in symbol_nets.values()
+        )
+    except (ArithmeticError, ValueError):
+        return _invalid_outlier_result(
+            "invalid_symbol_summary", trade_count=len(raw_nets)
+        )
+    if (
+        not symbol_nets
+        or not math.isfinite(symbol_net_sum)
+        or not math.isfinite(positive_symbol_net)
+        or positive_symbol_net <= 0.0
+        or not math.isclose(symbol_net_sum, full_net, rel_tol=1e-9, abs_tol=1e-9)
+    ):
+        return _invalid_outlier_result(
+            "invalid_symbol_summary", trade_count=len(raw_nets)
+        )
+    dominant_symbol, dominant_symbol_net = max(
+        symbol_nets.items(), key=lambda item: (item[1], item[0])
+    )
+    dominant_positive_share = dominant_symbol_net / positive_symbol_net
+    symbol_adjusted_net = full_net - dominant_symbol_net
+    if not all(
+        math.isfinite(value)
+        for value in (
+            dominant_symbol_net,
+            dominant_positive_share,
+            symbol_adjusted_net,
+        )
+    ):
+        return _invalid_outlier_result(
+            "invalid_symbol_summary", trade_count=len(raw_nets)
+        )
+    symbol_fragile = bool(
+        len(symbol_nets) < 2
+        or dominant_positive_share > MAX_DOMINANT_SYMBOL_POSITIVE_SHARE
+        or symbol_adjusted_net <= 0.0
+    )
     if (
         not isinstance(top_n_to_remove, (list, tuple))
         or 1 not in top_n_to_remove
@@ -995,6 +1079,18 @@ def outlier_dependency_test(
         "evidence_valid": True,
         "scenarios": results,
         "outlier_fragile": outlier_fragile,
+        "symbol_nets": symbol_nets,
+        "symbol_count": len(symbol_nets),
+        "symbol_net_consistent": True,
+        "positive_symbol_net": positive_symbol_net,
+        "dominant_symbol": dominant_symbol,
+        "dominant_symbol_net": dominant_symbol_net,
+        "dominant_positive_share": dominant_positive_share,
+        "remove_dominant_symbol": {
+            "adjusted_net": symbol_adjusted_net,
+            "still_positive": symbol_adjusted_net > 0.0,
+        },
+        "symbol_fragile": symbol_fragile,
     }
 
 
@@ -1010,6 +1106,15 @@ def _invalid_outlier_result(
         "evidence_valid": False,
         "scenarios": {},
         "outlier_fragile": None,
+        "symbol_nets": {},
+        "symbol_count": 0,
+        "symbol_net_consistent": False,
+        "positive_symbol_net": 0.0,
+        "dominant_symbol": None,
+        "dominant_symbol_net": 0.0,
+        "dominant_positive_share": None,
+        "remove_dominant_symbol": {},
+        "symbol_fragile": None,
         "reason": reason,
     }
 
@@ -1047,7 +1152,9 @@ def _invalid_monte_carlo_result(
     }
 
 
-def monte_carlo_perturbation(s_full: dict, n_runs: int = 100) -> dict:
+def monte_carlo_perturbation(
+    s_full: dict, n_runs: int = 100, seed: int | None = None
+) -> dict:
     """Block-bootstrap the REAL per-position net returns and report the share of
     resampled equity paths that end positive.
 
@@ -1087,7 +1194,10 @@ def monte_carlo_perturbation(s_full: dict, n_runs: int = 100) -> dict:
             valid_trade_count=valid_trade_count,
         )
 
-    rng = _random.Random(_OPTIMIZER_SEED)  # deterministic for reproducibility
+    run_seed = _OPTIMIZER_SEED if seed is None else seed
+    if isinstance(run_seed, bool) or not isinstance(run_seed, int):
+        return _invalid_monte_carlo_result("invalid_seed")
+    rng = _random.Random(run_seed)  # deterministic for reproducibility
     block = max(1, min(10, trade_count // 5))
     positive_runs = 0
     final_equities = []
@@ -1205,6 +1315,21 @@ def _optimizer_time_number(value) -> float | None:
     try:
         if isinstance(value, (int, float)):
             number = float(value)
+        elif isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            parsed = datetime.fromisoformat(
+                raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+            )
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            number = float(parsed.timestamp())
+        elif isinstance(value, datetime):
+            parsed = value
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            number = float(parsed.timestamp())
         else:
             timestamp = getattr(value, "timestamp", None)
             if not callable(timestamp):
@@ -1215,8 +1340,18 @@ def _optimizer_time_number(value) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _prepare_kfold_data(indexed: dict, folds: list) -> list[dict]:
+    return [filter_to_period(indexed, set(period_times)) for period_times in folds]
+
+
 def kfold_simulate(
-    indexed: dict, folds: list, strategy: str, use_maker: bool, params: dict
+    indexed: dict,
+    folds: list,
+    strategy: str,
+    use_maker: bool,
+    params: dict,
+    *,
+    prepared_folds: list[dict] | None = None,
 ) -> dict:
     """
     Testet die Config auf K unabhngigen Perioden.
@@ -1236,9 +1371,12 @@ def kfold_simulate(
             "consistency": 0.0,
             "robust": False,
         }
+    if prepared_folds is None:
+        prepared_folds = _prepare_kfold_data(indexed, folds)
+    if len(prepared_folds) != len(folds):
+        raise ValueError("prepared fold data must match fold boundaries")
     fold_results = []
-    for period_times in folds:
-        period_data = filter_to_period(indexed, set(period_times))
+    for period_times, period_data in zip(folds, prepared_folds):
         s = simulate_fast(period_data, period_times, strategy, use_maker, params)
         s["period_start_ts"] = (
             _optimizer_time_number(period_times[0]) if period_times else None
@@ -1299,6 +1437,7 @@ def holdout_simulate(
 
 
 FINAL_HOLDOUT_MIN_TRADES = 30
+MAX_DOMINANT_SYMBOL_POSITIVE_SHARE = 0.50
 
 
 def _candidate_rank_number(value) -> float:
@@ -1707,12 +1846,32 @@ def _holdout_outcomes_consistent(stats: dict, full_trade_count: int | None) -> b
 
 
 def _holdout_cost_stress_pass(stats: dict) -> bool:
-    """Require profitability after doubling every measured execution cost."""
+    """Require profit after conservative per-trade execution-cost stress.
+
+    Fees and adverse funding charges are doubled. Beneficial funding credits
+    are removed instead of doubled into a larger synthetic profit.
+    """
     totals = _holdout_trade_totals(stats)
     if totals is None:
         return False
-    gross, costs, _net, _fees, _funding = totals
-    return costs >= 0.0 and gross - (2.0 * costs) > 0.0
+    trades = stats.get("closed_trades")
+    if not isinstance(trades, list) or not trades:
+        return False
+    stressed_rows = []
+    for trade in trades:
+        if not isinstance(trade, dict):
+            return False
+        gross = _finite_holdout_number(trade.get("gross"))
+        fees = _finite_holdout_number(trade.get("fees"))
+        funding = _finite_holdout_number(trade.get("funding"))
+        if None in (gross, fees, funding) or fees < 0.0:
+            return False
+        stressed_rows.append(gross - (2.0 * fees) - (2.0 * max(funding, 0.0)))
+    try:
+        stressed_net = math.fsum(stressed_rows)
+    except (ArithmeticError, ValueError):
+        return False
+    return math.isfinite(stressed_net) and stressed_net > 0.0
 
 
 def freeze_and_evaluate_final_holdout(
@@ -2157,11 +2316,15 @@ def robustness_score(
 
     # Outlier dependency penalty
     if outlier_test is not None:
-        if not isinstance(outlier_test, dict) or not isinstance(
-            outlier_test.get("outlier_fragile"), bool
+        if (
+            not isinstance(outlier_test, dict)
+            or not isinstance(outlier_test.get("outlier_fragile"), bool)
+            or not isinstance(outlier_test.get("symbol_fragile"), bool)
         ):
             return invalid_score
         if outlier_test["outlier_fragile"]:
+            score *= 0.5
+        if outlier_test["symbol_fragile"]:
             score *= 0.5
 
     # Monte-Carlo modifier
@@ -2288,6 +2451,24 @@ def _deep_validation_evidence_error(name: str, result: dict) -> str | None:
             top_one.get("still_positive") if isinstance(top_one, dict) else None
         )
         outlier_fragile = result.get("outlier_fragile")
+        symbol_nets = result.get("symbol_nets")
+        symbol_count = result.get("symbol_count")
+        positive_symbol_net = _finite_number(result.get("positive_symbol_net"))
+        dominant_symbol = result.get("dominant_symbol")
+        dominant_symbol_net = _finite_number(result.get("dominant_symbol_net"))
+        dominant_share = _finite_number(result.get("dominant_positive_share"))
+        remove_symbol = result.get("remove_dominant_symbol")
+        symbol_adjusted_net = (
+            _finite_number(remove_symbol.get("adjusted_net"))
+            if isinstance(remove_symbol, dict)
+            else None
+        )
+        symbol_still_positive = (
+            remove_symbol.get("still_positive")
+            if isinstance(remove_symbol, dict)
+            else None
+        )
+        symbol_fragile = result.get("symbol_fragile")
         scenario_consistent = False
         if None not in (full_net, removed_net, adjusted_net, drop_pct):
             try:
@@ -2314,6 +2495,83 @@ def _deep_validation_evidence_error(name: str, result: dict) -> str | None:
                 )
             except (ArithmeticError, TypeError, ValueError, ZeroDivisionError):
                 scenario_consistent = False
+        symbol_scenario_consistent = False
+        if (
+            isinstance(symbol_nets, dict)
+            and symbol_nets
+            and all(
+                isinstance(symbol, str)
+                and bool(symbol.strip())
+                and symbol == symbol.strip()
+                and _finite_number(value) is not None
+                for symbol, value in symbol_nets.items()
+            )
+            and isinstance(dominant_symbol, str)
+            and dominant_symbol in symbol_nets
+            and None not in (
+                full_net,
+                positive_symbol_net,
+                dominant_symbol_net,
+                dominant_share,
+                symbol_adjusted_net,
+            )
+        ):
+            try:
+                normalized_symbol_nets = {
+                    symbol: float(value) for symbol, value in symbol_nets.items()
+                }
+                expected_dominant = max(
+                    normalized_symbol_nets.items(),
+                    key=lambda item: (item[1], item[0]),
+                )
+                expected_positive = math.fsum(
+                    max(value, 0.0) for value in normalized_symbol_nets.values()
+                )
+                expected_symbol_adjusted = full_net - dominant_symbol_net
+                expected_share = dominant_symbol_net / expected_positive
+                expected_symbol_fragile = bool(
+                    len(normalized_symbol_nets) < 2
+                    or expected_share > MAX_DOMINANT_SYMBOL_POSITIVE_SHARE
+                    or expected_symbol_adjusted <= 0.0
+                )
+                symbol_scenario_consistent = (
+                    expected_positive > 0.0
+                    and math.isclose(
+                        math.fsum(normalized_symbol_nets.values()),
+                        full_net,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                    and dominant_symbol == expected_dominant[0]
+                    and math.isclose(
+                        dominant_symbol_net,
+                        expected_dominant[1],
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                    and math.isclose(
+                        positive_symbol_net,
+                        expected_positive,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                    and math.isclose(
+                        dominant_share,
+                        expected_share,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                    and math.isclose(
+                        symbol_adjusted_net,
+                        expected_symbol_adjusted,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                    and symbol_still_positive == (symbol_adjusted_net > 0.0)
+                    and symbol_fragile == expected_symbol_fragile
+                )
+            except (ArithmeticError, TypeError, ValueError, ZeroDivisionError):
+                symbol_scenario_consistent = False
         if (
             isinstance(trade_count, bool)
             or not isinstance(trade_count, int)
@@ -2334,8 +2592,23 @@ def _deep_validation_evidence_error(name: str, result: dict) -> str | None:
             or not scenario_consistent
             or not isinstance(outlier_fragile, bool)
             or outlier_fragile != (still_positive is False)
+            or isinstance(symbol_count, bool)
+            or not isinstance(symbol_count, int)
+            or not isinstance(symbol_nets, dict)
+            or symbol_count != len(symbol_nets)
+            or result.get("symbol_net_consistent") is not True
+            or positive_symbol_net is None
+            or dominant_symbol_net is None
+            or dominant_share is None
+            or not 0.0 <= dominant_share <= 1.0
+            or symbol_adjusted_net is None
+            or not isinstance(symbol_still_positive, bool)
+            or not isinstance(symbol_fragile, bool)
+            or not symbol_scenario_consistent
         ):
-            return "outlier test requires complete finite trade evidence"
+            return (
+                "outlier test requires complete finite trade and symbol evidence"
+            )
     elif name == "monte_carlo":
         runs = result.get("runs")
         requested_runs = result.get("requested_runs")
@@ -2407,6 +2680,16 @@ def _deep_validation_admission_error(candidate: dict) -> str | None:
         evidence_error = _deep_validation_evidence_error(name, evidence)
         if evidence_error is not None:
             return evidence_error
+    if candidate["walk_forward"].get("all_profitable") is not True:
+        return "walk-forward did not survive every slice"
+    if candidate["regime_split"].get("survives_all") is not True:
+        return "regime split did not survive every tested regime"
+    if candidate["outlier_test"].get("outlier_fragile") is not False:
+        return "performance depends on a single position outlier"
+    if candidate["outlier_test"].get("symbol_fragile") is not False:
+        return "performance is concentrated in one symbol"
+    if candidate["monte_carlo"].get("robust") is not True:
+        return "monte-carlo robustness threshold was not met"
     expected_score = robustness_score(
         candidate.get("stats"),
         kfold,
@@ -2552,6 +2835,10 @@ def export_csv(results, strategy, days, k_folds):
         "rank",
         "robust",
         "deep_validation_complete",
+        "deep_validation_admission_error",
+        "symbol_concentration_pass",
+        "dominant_symbol",
+        "dominant_positive_share",
         "deployment_validated",
         "holdout_evaluation_attempted",
         "holdout_evidence_valid",
@@ -2590,6 +2877,7 @@ def export_csv(results, strategy, days, k_folds):
             s = r["stats"]
             p = r["params"]
             kf = r["kfold"]
+            outlier = r.get("outlier_test") or {}
             holdout_net = _finite_holdout_number(r.get("holdout_net"))
             w.writerow(
                 {
@@ -2598,6 +2886,21 @@ def export_csv(results, strategy, days, k_folds):
                     "deep_validation_complete": (
                         "Ja" if r.get("deep_validation_complete") is True
                         else "Nein"
+                    ),
+                    "deep_validation_admission_error": (
+                        r.get("deep_validation_admission_error") or ""
+                    ),
+                    "symbol_concentration_pass": (
+                        "Ja" if outlier.get("symbol_fragile") is False else "Nein"
+                    ),
+                    "dominant_symbol": outlier.get("dominant_symbol") or "",
+                    "dominant_positive_share": (
+                        outlier.get("dominant_positive_share")
+                        if _finite_optimizer_number(
+                            outlier.get("dominant_positive_share")
+                        )
+                        is not None
+                        else ""
                     ),
                     "deployment_validated": "Ja"
                     if r.get("deployment_validated")
@@ -2707,8 +3010,13 @@ class Progress:
         # Emit ticks at every 1% OR every 5 seconds  whichever comes first
         self._last_emit = 0.0
         self._last_pct = -1
+        self._lock = threading.Lock()
 
     def update(self, net):
+        with self._lock:
+            self._update_locked(net)
+
+    def _update_locked(self, net):
         self.done += 1
         if self.best is None or net > self.best:
             self.best = net
@@ -2907,6 +3215,205 @@ def _resolve_live_risk_params(
     return out
 
 
+def _validate_reproducible_run_inputs(
+    *,
+    workspace,
+    dataset,
+    resume,
+    seed,
+    workers,
+    backend,
+    exchange,
+) -> None:
+    if workspace is not None and (not isinstance(workspace, str) or not workspace.strip()):
+        raise ValueError("workspace must be a non-empty path")
+    if dataset is not None and (not isinstance(dataset, str) or not dataset.strip()):
+        raise ValueError("dataset must be a non-empty path")
+    if not isinstance(resume, bool):
+        raise ValueError("resume must be boolean")
+    if resume and dataset is None:
+        raise ValueError("resume requires an explicit immutable dataset")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ValueError("seed must be an integer")
+    if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= 256:
+        raise ValueError("workers must be an integer between 1 and 256")
+    if backend not in {"process", "thread"}:
+        raise ValueError("backend must be 'process' or 'thread'")
+    if exchange is not None and (
+        not isinstance(exchange, str) or not exchange.strip()
+    ):
+        raise ValueError("exchange must be a non-empty name")
+    if (workspace is not None or dataset is not None) and exchange is None:
+        raise ValueError(
+            "reproducible optimizer runs require an explicit exchange"
+        )
+
+
+def _canonical_exchange_name(value) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("exchange identity is missing")
+    normalized = "".join(char for char in value.strip().lower() if char.isalnum())
+    aliases = {
+        "mexcglobal": "mexc",
+        "gate": "gateio",
+        "kucoinfutures": "kucoin",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _validate_dataset_exchange(dataset_manifest: dict, expected_exchange: str) -> str:
+    if not isinstance(dataset_manifest, dict):
+        raise ValueError("dataset manifest is invalid")
+    provenance = dataset_manifest.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("dataset exchange provenance is missing")
+    recorded = provenance.get("exchange_id") or provenance.get("exchange")
+    actual = _canonical_exchange_name(recorded)
+    expected = _canonical_exchange_name(expected_exchange)
+    if actual != expected:
+        raise ValueError(
+            f"dataset exchange mismatch: expected {expected}, found {actual}"
+        )
+    return actual
+
+
+def _history_cutoff_utc(history: dict) -> datetime:
+    latest = None
+    for frame in history.values():
+        if frame is None or frame.empty or "ts" not in frame.columns:
+            continue
+        try:
+            value = int(frame["ts"].iloc[-1])
+        except (IndexError, TypeError, ValueError, OverflowError):
+            continue
+        latest = value if latest is None else max(latest, value)
+    if latest is None:
+        raise ValueError("cannot derive immutable cutoff from empty history")
+    cutoff_ms = ((latest // 3_600_000) + 1) * 3_600_000
+    return datetime.fromtimestamp(cutoff_ms / 1000.0, tz=timezone.utc)
+
+
+def _production_baseline_params(
+    strategy: str,
+    leverage: float,
+    live_config: dict,
+    live_risk_params: dict,
+    *,
+    own_momentum: bool,
+    om_window: int,
+    regime: bool,
+    funding_8h: float,
+) -> dict:
+    from tools.backtester import STRATEGY_DEFAULTS
+
+    defaults = STRATEGY_DEFAULTS[strategy]
+    params = {
+        "min_pump": defaults["pump"],
+        "activation_profit": defaults["act"],
+        "trailing_distance": defaults["trail"],
+        "stop_loss": -abs(defaults["stop"]),
+        "partial_pct": defaults["part"],
+        "rsi_max": defaults["rsi"],
+        "leverage": leverage,
+    }
+    supported = {
+        "MIN_PUMP": ("min_pump", 0.0, 100.0),
+        "ACTIVATION_PROFIT": ("activation_profit", 0.0, 100.0),
+        "TRAILING_DISTANCE": ("trailing_distance", 0.0, 100.0),
+        "PARTIAL_SELL_PCT": ("partial_pct", 0.0, 1.0),
+        "RSI_MAX": ("rsi_max", 0.0, 100.0),
+        "BREAKEVEN_TRIGGER": ("breakeven_trigger", 0.0, 100.0),
+    }
+    if isinstance(live_config, dict):
+        for source, (target, low, high) in supported.items():
+            if source not in live_config:
+                continue
+            value = _bounded_optimizer_number(live_config[source], low, high)
+            if value is not None:
+                params[target] = value
+        if "INITIAL_STOP_LOSS" in live_config:
+            stop = _bounded_optimizer_number(
+                live_config["INITIAL_STOP_LOSS"], -100.0, 100.0
+            )
+            if stop is not None:
+                params["stop_loss"] = -abs(stop)
+        if live_config.get("OWN_MOMENTUM_FILTER") is True:
+            params["own_momentum_filter"] = True
+            window = _bounded_optimizer_number(
+                live_config.get("OWN_MOMENTUM_WINDOW"), 1.0, 1_000.0
+            )
+            if window is not None:
+                params["own_momentum_window"] = int(window)
+    params.update(live_risk_params)
+    if own_momentum:
+        params["own_momentum_filter"] = True
+        params["own_momentum_window"] = om_window
+    if regime:
+        params["regime_filter"] = True
+    if funding_8h:
+        params["funding_rate_8h"] = funding_8h
+    return params
+
+
+def _reproducible_code_files() -> list[str]:
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return [
+        os.path.join(root, "tools", "optimizer.py"),
+        os.path.join(root, "tools", "backtester.py"),
+        os.path.join(root, "tools", "simulation_workspace.py"),
+        os.path.join(root, "bot_utils", "indicators.py"),
+        os.path.join(root, "bot_utils", "futures_funding.py"),
+        os.path.join(root, "core", "constants.py"),
+        os.path.join(root, "trading", "simulation.py"),
+    ]
+
+
+_GRID_WORKER_CONTEXT = None
+
+
+def _initialize_grid_worker(
+    indexed, tune_times, folds, prepared_folds, strategy, use_maker
+) -> None:
+    global _GRID_WORKER_CONTEXT
+    _GRID_WORKER_CONTEXT = (
+        indexed,
+        tune_times,
+        folds,
+        prepared_folds,
+        strategy,
+        use_maker,
+    )
+
+
+def _simulate_grid_candidate(task) -> dict:
+    if _GRID_WORKER_CONTEXT is None:
+        raise RuntimeError("optimizer grid worker was not initialized")
+    candidate_index, params = task
+    indexed, tune_times, folds, prepared_folds, strategy, use_maker = (
+        _GRID_WORKER_CONTEXT
+    )
+    stats = simulate_fast(indexed, tune_times, strategy, use_maker, params)
+    kfold = kfold_simulate(
+        indexed,
+        folds,
+        strategy,
+        use_maker,
+        params,
+        prepared_folds=prepared_folds,
+    )
+    return {
+        "candidate_index": candidate_index,
+        "params": params,
+        "stats": stats,
+        "kfold": kfold,
+        "score": robustness_score(stats, kfold),
+    }
+
+
+def _simulate_grid_chunk(tasks) -> list[dict]:
+    return [_simulate_grid_candidate(task) for task in tasks]
+
+
 def run_optimizer(
     strategy: str,
     days: int = DEFAULT_DAYS,
@@ -2921,6 +3428,14 @@ def run_optimizer(
     om_window: int = 8,
     regime: bool = False,
     funding_8h: float = 0.0,
+    workspace: str | None = None,
+    dataset: str | None = None,
+    resume: bool = False,
+    seed: int | None = None,
+    workers: int = 8,
+    backend: str = "process",
+    futures_screener_parity: bool = False,
+    exchange: str | None = None,
 ):
     _validate_optimizer_run_inputs(
         strategy,
@@ -2931,6 +3446,28 @@ def run_optimizer(
         om_window,
         funding_8h,
         leverage,
+    )
+    _validate_reproducible_run_inputs(
+        workspace=workspace,
+        dataset=dataset,
+        resume=resume,
+        seed=seed,
+        workers=workers,
+        backend=backend,
+        exchange=exchange,
+    )
+    expected_exchange = (
+        _canonical_exchange_name(exchange) if exchange is not None else None
+    )
+    if not isinstance(futures_screener_parity, bool):
+        raise ValueError("futures_screener_parity must be boolean")
+    if futures_screener_parity and strategy != "FUTURES":
+        raise ValueError("futures screener parity is available only for FUTURES")
+    run_seed = _OPTIMIZER_SEED if seed is None else seed
+    effective_executor = (
+        "sequential"
+        if workers == 1
+        else ("process_spawn" if backend == "process" else "thread_pool")
     )
 
     rt = calc_round_trip(use_maker, strategy)
@@ -2947,6 +3484,7 @@ def run_optimizer(
         f"Sensitivitt: {'Ja' if do_sensitivity else 'Nein'} | "
         f"Modus: {'Quick' if quick else 'Voll'}"
     )
+    print(f"  Parallelisierung: {workers} Worker via {effective_executor}")
     if strategy == "FUTURES":
         _src = "CLI" if leverage is not None else "bot_config.json"
         print(
@@ -2976,6 +3514,8 @@ def run_optimizer(
             _p["regime_filter"] = True
         if funding_8h:
             _p["funding_rate_8h"] = funding_8h
+        if futures_screener_parity:
+            _p["futures_screener_parity"] = True
     if funding_8h:
         print(
             f"  Funding-Sensitivitt AKTIV  {funding_8h * 100:.4f}%/8h auf das "
@@ -2995,6 +3535,12 @@ def run_optimizer(
         )
     if regime:
         print("  Regime-Gate AKTIV  LONG nur wenn BTC>EMA50, SHORT nur wenn BTC<EMA50")
+    if futures_screener_parity:
+        print(
+            "  Futures-Screener-Paritaet AKTIV  konservative kausale 1h-Volumen-, "
+            "ATR-, Kerzenkoerper-, EMA- und SHORT-Gates; Quiet-Regime ohne "
+            "historisches F&G nicht abgesenkt"
+        )
 
     # Display labels: FUTURES uses "min_move" in UI, internally still min_pump
     _display_labels = {
@@ -3007,49 +3553,134 @@ def run_optimizer(
     print(f"\n  Kombinationen:    {len(p_list):,}")
     print(f"  Simulationen total: {len(p_list) * k_folds:,} ({k_folds} K-Fold)\n")
 
-    # Verbindung  get_spot_exchange_connection() is a legacy-named alias that
-    # actually returns whatever EXCHANGE is configured (.env), so the backtest
-    # uses the SAME venue the bot trades on.
-    print(" Verbinde mit Exchange...")
-    ex = get_spot_exchange_connection()
-    ex.timeout = 30000
-    for attempt in range(1, 4):
-        try:
-            ex.load_markets()
-            print(f"  Verbunden mit {getattr(ex, 'name', None) or 'Exchange'}\n")
-            break
-        except Exception as e:
-            if attempt == 3:
-                print(f"\n Verbindung fehlgeschlagen: {e}")
-                sys.exit(1)
-            print(f"  Timeout  warte 5s ({attempt}/3)...")
-            time.sleep(5)
-
-    # Daten laden
-    print(" Lade Top-Volumen-Coins...")
-    coins = get_top_volume_coins(ex, n=30, days=days)
-    print(f"   {len(coins)} Coins")
-    print("  SURVIVORSHIP BIAS (reduziert): Universum = HEUTIGE Top-Volumen-Coins.")
-    print(
-        f"     Listing-Age-Filter entfernt Coins die VOR {days}d noch nicht handelten,"
-    )
-    print("  aber DELISTETE Coins fehlen weiterhin  NICHT vollstndig unverzerrt.\n")
-
-    print(f" Lade {days}-Tage-Historie...")
-    t_load = time.time()
-    history = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(fetch_history, ex, c, days): c for c in coins}
-        for f in as_completed(futures):
-            coin = futures[f]
+    dataset_manifest = None
+    dataset_path = os.path.abspath(dataset) if dataset is not None else None
+    workspace_path = os.path.abspath(workspace) if workspace is not None else None
+    if dataset_path is not None:
+        if workspace_path is None:
+            workspace_path = os.path.dirname(os.path.dirname(dataset_path))
+        print(f" Lade und verifiziere unveraenderliches Dataset: {dataset_path}")
+        t_load = time.time()
+        history, dataset_manifest = load_history_dataset(dataset_path)
+        _validate_dataset_exchange(dataset_manifest, expected_exchange)
+        print(
+            f"   {len(history)} Coins in {time.time() - t_load:.1f}s | "
+            f"Fingerprint {dataset_manifest['dataset_fingerprint']}\n"
+        )
+    else:
+        # Network data is allowed only for constructing a new snapshot; all
+        # reproducible simulation work uses that immutable snapshot.
+        print(" Verbinde mit Exchange...")
+        ex = (
+            get_public_futures_exchange_connection(expected_exchange)
+            if strategy == "FUTURES"
+            else get_spot_exchange_connection()
+        )
+        ex.timeout = 30000
+        for attempt in range(1, 4):
             try:
-                df = f.result()
-                if df is not None and not df.empty:
-                    history[coin] = df
+                ex.load_markets()
+                if expected_exchange is not None:
+                    connected_exchange = _canonical_exchange_name(
+                        str(getattr(ex, "id", None) or getattr(ex, "name", ""))
+                    )
+                    if connected_exchange != expected_exchange:
+                        raise ValueError(
+                            "connected exchange mismatch: expected "
+                            f"{expected_exchange}, found {connected_exchange}"
+                        )
+                print(f"  Verbunden mit {getattr(ex, 'name', None) or 'Exchange'}\n")
+                break
             except Exception as e:
-                print(f"   [WARN] {coin}: {type(e).__name__}: {e}")
-    history = filter_universe_by_history(history, days)
-    print(f"   {len(history)} Coins in {time.time() - t_load:.1f}s\n")
+                if attempt == 3:
+                    print(f"\n Verbindung fehlgeschlagen: {e}")
+                    sys.exit(1)
+                print(f"  Timeout  warte 5s ({attempt}/3)...")
+                time.sleep(5)
+
+        print(" Lade Top-Volumen-Coins...")
+        target_coin_count = 30
+        if strategy == "FUTURES":
+            # Fetch a wider ranked pool because the reliable first-bar check
+            # below may remove newly listed contracts.
+            coins = get_top_futures_volume_coins(
+                ex, n=target_coin_count * 2, days=days
+            )
+        else:
+            coins = get_top_volume_coins(ex, n=target_coin_count, days=days)
+        print(f"   {len(coins)} Coins")
+        print("  SURVIVORSHIP BIAS (reduziert): Universum = HEUTIGE Top-Volumen-Coins.")
+        print(
+            f"     Listing-Age-Filter entfernt Coins die VOR {days}d noch nicht handelten,"
+        )
+        print("  aber DELISTETE Coins fehlen weiterhin  NICHT vollstndig unverzerrt.\n")
+
+        print(f" Lade {days}-Tage-Historie mit {workers} Worker(n)...")
+        t_load = time.time()
+        history = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(fetch_history, ex, c, days): c for c in coins}
+            for f in as_completed(futures):
+                coin = futures[f]
+                try:
+                    df = f.result()
+                    if df is not None and not df.empty:
+                        history[coin] = df
+                except Exception as e:
+                    print(f"   [WARN] {coin}: {type(e).__name__}: {e}")
+        history = filter_universe_by_history(history, days)
+        if strategy == "FUTURES":
+            # Restore quote-volume order after concurrent downloads and keep
+            # the top N contracts that passed the full-history backstop.
+            history = {
+                symbol: history[symbol]
+                for symbol in coins
+                if symbol in history
+            }
+            history = dict(list(history.items())[:target_coin_count])
+        print(f"   {len(history)} Coins in {time.time() - t_load:.1f}s\n")
+        if workspace_path is not None:
+            dataset_root = freeze_history_dataset(
+                history,
+                workspace_path,
+                cutoff_utc=_history_cutoff_utc(history),
+                provenance=(
+                    {
+                        "exchange": getattr(ex, "name", None) or "Exchange",
+                        "exchange_id": _canonical_exchange_name(
+                            str(getattr(ex, "id", None) or expected_exchange or "")
+                        ),
+                        "market_type": "linear_usdt_perpetual",
+                        "days": days,
+                        "universe_rule": (
+                            "active_linear_usdt_swap_non_rwa_quote_volume_"
+                            "with_listing_age_filter"
+                        ),
+                        "authenticated": False,
+                        "survivorship_bias": True,
+                    }
+                    if strategy == "FUTURES"
+                    else {
+                        "exchange": getattr(ex, "name", None) or "Exchange",
+                        "days": days,
+                        "universe_rule": (
+                            "current_top_quote_volume_with_listing_age_filter"
+                        ),
+                        "survivorship_bias": True,
+                    }
+                ),
+            )
+            dataset_path = str(dataset_root)
+            history, dataset_manifest = load_history_dataset(dataset_root)
+            print(
+                "  Dataset eingefroren und rueckverifiziert: "
+                f"{dataset_manifest['dataset_fingerprint']}\n"
+            )
+        else:
+            print(
+                "  WARNUNG: ohne --workspace ist dieser Lauf nicht "
+                "dataset-reproduzierbar und nicht promotionsfaehig.\n"
+            )
 
     # Vorindexierung
     print(" Vorindexierung...")
@@ -3080,6 +3711,7 @@ def run_optimizer(
 
     # K-Fold Splits  over the TUNING window only (holdout stays unseen)
     folds = split_into_folds(tune_times, k=k_folds)
+    prepared_folds = _prepare_kfold_data(indexed, folds)
     print(f"  K-Fold Split ({k_folds} Perioden):")
     for i, fold in enumerate(folds, 1):
         if fold:
@@ -3088,6 +3720,88 @@ def run_optimizer(
                 f"({fold[0].strftime('%Y-%m-%d')}  {fold[-1].strftime('%Y-%m-%d')})"
             )
     print()
+
+    baseline_params = _production_baseline_params(
+        strategy,
+        lev,
+        live_config,
+        live_risk_params,
+        own_momentum=own_momentum,
+        om_window=om_window,
+        regime=regime,
+        funding_8h=funding_8h,
+    )
+    if futures_screener_parity:
+        baseline_params["futures_screener_parity"] = True
+    reproducible_run = None
+    if dataset_manifest is not None and workspace_path is not None:
+        run_config = {
+            "strategy": strategy,
+            "days": days,
+            "use_maker": use_maker,
+            "top_n": top_n,
+            "k_folds": k_folds,
+            "quick": quick,
+            "do_sensitivity": do_sensitivity,
+            "holdout_frac": holdout_frac,
+            "own_momentum": own_momentum,
+            "om_window": om_window,
+            "regime": regime,
+            "funding_8h": funding_8h,
+            "exchange": expected_exchange,
+            "futures_screener_parity": futures_screener_parity,
+            "round_trip_cost_rate": rt,
+            "purge_bars": PURGE_BARS,
+            "embargo_frac": EMBARGO_FRAC,
+            "resolved_leverage": lev,
+            "resolved_live_risk": live_risk_params,
+            "production_baseline": baseline_params,
+            "parameter_space": space,
+            "requested_parallel_backend": backend,
+            "effective_executor": effective_executor,
+        }
+        reproducible_run = ReproducibleRun(
+            workspace_path,
+            dataset_path,
+            run_config=run_config,
+            splits=split_boundaries(tune_times, folds, holdout_times),
+            seed=run_seed,
+            workers=workers,
+            code_files=_reproducible_code_files(),
+            resume=resume,
+        )
+        print(f"  Reproduzierbarer Run: {reproducible_run.run_id}")
+
+    # The unchanged production baseline is always evaluated before the grid.
+    # A reproducible resume reuses only evidence bound to the exact run spec.
+    baseline_evidence = reproducible_run.baseline() if reproducible_run else None
+    if baseline_evidence is None:
+        baseline_stats = simulate_fast(
+            indexed, tune_times, strategy, use_maker, baseline_params
+        )
+        baseline_kfold = kfold_simulate(
+            indexed,
+            folds,
+            strategy,
+            use_maker,
+            baseline_params,
+            prepared_folds=prepared_folds,
+        )
+        baseline_result = {
+            "stats": baseline_stats,
+            "kfold": baseline_kfold,
+            "score": robustness_score(baseline_stats, baseline_kfold),
+        }
+        if reproducible_run is not None:
+            reproducible_run.record_baseline(baseline_params, baseline_result)
+        print(
+            "  Produktionsbaseline abgeschlossen: "
+            f"Netto {baseline_stats.get('net', 0.0):+.2f} USDT"
+        )
+    else:
+        if baseline_evidence.get("params") != baseline_params:
+            raise ValueError("stored baseline conflicts with resolved production config")
+        print("  Produktionsbaseline aus gebundenem Run-Manifest verifiziert")
 
     # Open a per-run JSONL where every config result is appended incrementally
     # so a crash/abort doesn't lose the full run.
@@ -3104,21 +3818,96 @@ def run_optimizer(
     progress = Progress(len(p_list), label="Optimize")
     results = []
 
-    def _run(params):
-        # Tuning window only  the holdout slice never enters selection.
-        s_full = simulate_fast(indexed, tune_times, strategy, use_maker, params)
-        kf = kfold_simulate(indexed, folds, strategy, use_maker, params)
-        sc = robustness_score(s_full, kf)
-        progress.update(s_full.get("net", -9999))
-        rec = {"params": params, "stats": s_full, "kfold": kf, "score": sc}
-        # persist this result immediately
+    pending = []
+    for candidate_index, params in enumerate(p_list):
+        cached = (
+            reproducible_run.checkpoint(candidate_index, params)
+            if reproducible_run is not None
+            else None
+        )
+        if cached is None:
+            pending.append((candidate_index, params))
+        else:
+            results.append(cached)
+            progress.update(cached.get("stats", {}).get("net", -9999))
+
+    def _persist_completed_candidate(rec):
+        candidate_index = rec["candidate_index"]
+        params = rec["params"]
+        progress.update(rec.get("stats", {}).get("net", -9999))
+        if reproducible_run is not None:
+            reproducible_run.record_checkpoint(candidate_index, params, rec)
         _persist_result(rec)
         return rec
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futs = [pool.submit(_run, p) for p in p_list]
-        for f in as_completed(futs):
-            results.append(f.result())
+    def _simulate_local_candidate(task):
+        candidate_index, params = task
+        stats = simulate_fast(indexed, tune_times, strategy, use_maker, params)
+        kfold = kfold_simulate(
+            indexed,
+            folds,
+            strategy,
+            use_maker,
+            params,
+            prepared_folds=prepared_folds,
+        )
+        return {
+            "candidate_index": candidate_index,
+            "params": params,
+            "stats": stats,
+            "kfold": kfold,
+            "score": robustness_score(stats, kfold),
+        }
+
+    if backend == "process" and workers > 1 and pending:
+        spawn_context = multiprocessing.get_context("spawn")
+        chunksize = max(1, min(16, math.ceil(len(pending) / (workers * 8))))
+        chunks = (
+            pending[offset : offset + chunksize]
+            for offset in range(0, len(pending), chunksize)
+        )
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=spawn_context,
+            initializer=_initialize_grid_worker,
+            initargs=(
+                indexed,
+                tune_times,
+                folds,
+                prepared_folds,
+                strategy,
+                use_maker,
+            ),
+        ) as pool:
+            in_flight = {}
+            for _ in range(workers * 2):
+                chunk = next(chunks, None)
+                if chunk is None:
+                    break
+                in_flight[pool.submit(_simulate_grid_chunk, chunk)] = chunk
+            while in_flight:
+                future = next(as_completed(tuple(in_flight)))
+                in_flight.pop(future)
+                for record in future.result():
+                    results.append(_persist_completed_candidate(record))
+                chunk = next(chunks, None)
+                if chunk is not None:
+                    in_flight[pool.submit(_simulate_grid_chunk, chunk)] = chunk
+    else:
+        if backend == "thread" and workers > 1 and pending:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(_simulate_local_candidate, task) for task in pending]
+                for future in as_completed(futures):
+                    results.append(_persist_completed_candidate(future.result()))
+        else:
+            for task in pending:
+                results.append(
+                    _persist_completed_candidate(_simulate_local_candidate(task))
+                )
+
+    # Completion order is intentionally discarded.  Stable grid order makes
+    # score ties and all downstream selection byte-reproducible across workers.
+    results.sort(key=lambda result: result["candidate_index"])
 
     elapsed = time.time() - t_sim
     print(
@@ -3165,7 +3954,7 @@ def run_optimizer(
                     ),
                     "monte_carlo": (
                         lambda result=r: monte_carlo_perturbation(
-                            result["stats"]
+                            result["stats"], seed=run_seed
                         )
                     ),
                 },
@@ -3398,6 +4187,21 @@ def run_optimizer(
                     else " breit verteilte Edge"
                 )
             )
+        if ot.get("symbol_fragile") is not None:
+            dominant_share = ot.get("dominant_positive_share")
+            share_text = (
+                f"{dominant_share:.1%}"
+                if isinstance(dominant_share, (int, float))
+                and not isinstance(dominant_share, bool)
+                and math.isfinite(float(dominant_share))
+                else "n/a"
+            )
+            print(
+                "     Symbol-Dep.:  "
+                f"{ot.get('dominant_symbol', 'n/a')} {share_text} der "
+                "positiven Symbol-PnL  "
+                + ("FRAGIL" if ot["symbol_fragile"] else "verteilt")
+            )
 
     # Out-of-sample holdout  the honest deployment test.
     hd = best.get("holdout")
@@ -3450,6 +4254,16 @@ def run_optimizer(
         "deep_validation_complete": bool(
             best.get("deep_validation_complete", False)
         ),
+        "deep_validation_admission_error": best.get(
+            "deep_validation_admission_error"
+        ),
+        "symbol_concentration_pass": (
+            ot.get("symbol_fragile") is False
+            if isinstance(ot, dict) and ot
+            else False
+        ),
+        "dominant_symbol": ot.get("dominant_symbol"),
+        "dominant_positive_share": ot.get("dominant_positive_share"),
         "holdout_net": best.get("holdout_net"),
         "holdout_trades": int(best.get("holdout_trades", 0) or 0),
         "holdout_full_trades": int(best.get("holdout_full_trades", 0) or 0),
@@ -3529,6 +4343,8 @@ _OPTIMIZER_CLI_BOOLEAN_OPTIONS = {
     "--no-sensitivity": ("do_sensitivity", False),
     "--own-momentum": ("own_momentum", True),
     "--regime": ("regime", True),
+    "--resume": ("resume", True),
+    "--futures-screener-parity": ("futures_screener_parity", True),
 }
 _OPTIMIZER_CLI_VALUE_OPTIONS = {
     "--top": ("top_n", int),
@@ -3537,6 +4353,12 @@ _OPTIMIZER_CLI_VALUE_OPTIONS = {
     "--holdout": ("holdout_frac", float),
     "--om-window": ("om_window", int),
     "--funding": ("funding_8h", float),
+    "--workspace": ("workspace", str),
+    "--dataset": ("dataset", str),
+    "--seed": ("seed", int),
+    "--workers": ("workers", int),
+    "--backend": ("backend", str),
+    "--exchange": ("exchange", str),
 }
 
 
@@ -3577,6 +4399,7 @@ def _parse_optimizer_cli_args(args: list[str]) -> dict:
         "om_window": 8,
         "regime": False,
         "funding_8h": 0.0,
+        "futures_screener_parity": False,
     }
     seen = set()
     while cursor < len(args):
@@ -3611,6 +4434,17 @@ def _parse_optimizer_cli_args(args: list[str]) -> dict:
         parsed["funding_8h"],
         parsed["leverage"],
     )
+    _validate_reproducible_run_inputs(
+        workspace=parsed.get("workspace"),
+        dataset=parsed.get("dataset"),
+        resume=parsed.get("resume", False),
+        seed=parsed.get("seed"),
+        workers=parsed.get("workers", 8),
+        backend=parsed.get("backend", "process"),
+        exchange=parsed.get("exchange"),
+    )
+    if parsed["futures_screener_parity"] and strategy != "FUTURES":
+        raise ValueError("futures screener parity is available only for FUTURES")
     return parsed
 
 
@@ -3621,6 +4455,9 @@ if __name__ == "__main__":
         print("       [--maker] [--top N] [--kfold K] [--leverage N]")
         print("       [--no-sensitivity] [--quick] [--holdout F]")
         print("       [--own-momentum] [--om-window N] [--regime] [--funding R]")
+        print("       [--futures-screener-parity]")
+        print("       [--workspace PATH] [--dataset PATH] [--exchange NAME] [--resume]")
+        print("       [--seed N] [--workers N] [--backend process|thread]")
         print(
             "  --funding R     : model funding R per 8h (e.g. 0.0003) as a "
             "cost sweep on the notional per hold-duration (default 0 = off)"
@@ -3630,10 +4467,21 @@ if __name__ == "__main__":
             "(default 0.2; 0 disables)"
         )
         print(
+            "  --workspace PATH: freeze inputs and bind manifests/checkpoints below PATH"
+        )
+        print("  --dataset PATH  : run offline from a verified immutable dataset")
+        print("  --exchange NAME : bind reproducible data and runs to this venue")
+        print("  --resume        : resume the exact matching dataset/config/code run")
+        print("  --workers N     : CPU workers (benchmark 1/8/16/24/32 on the 9950X)")
+        print("  --backend MODE  : process for real CPU parallelism; thread saves RAM")
+        print(
             "  --own-momentum  : A/B test the own-momentum overlay "
             "(block entries after N net-negative closes)"
         )
         print("  --leverage N : override leverage (default: read from bot_config.json)")
+        print(
+            "  --futures-screener-parity: reproduce causal 1h live screener gates"
+        )
         print()
         print("  Beispiele:")
         print("  python optimizer.py TREND  # voll, K=4, mit Sensitivitt")

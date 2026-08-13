@@ -1,8 +1,8 @@
 {
-  "build_id": "f1367990828a742e",
-  "created_at": "2026-08-13 08:34:04",
+  "build_id": "ba846078e2d74ac2",
+  "created_at": "2026-08-13 19:42:22",
   "source": "update_deploy_manifest.py",
-  "file_count": 184,
+  "file_count": 188,
   "files": [
     {
       "path": "bot_config.default.json",
@@ -206,8 +206,8 @@
     },
     {
       "path": "config/exchange_config.py",
-      "sha256": "977d1380781283548d4833def52b38a4f861d7a172bb046b3e52bc721947ab19",
-      "bytes": 40908
+      "sha256": "4f453b778d4db2e35c20c7fea0e90d799ac060bd2f2d152cff5683cd1cbe82bd",
+      "bytes": 42884
     },
     {
       "path": "config/github_known_hosts",
@@ -291,8 +291,8 @@
     },
     {
       "path": "core/pre_start_check.py",
-      "sha256": "900c67d91d363faf84c6f17b4917e6a4337020eacbbd9a5f50b738ef55f84c2b",
-      "bytes": 26387
+      "sha256": "b3f4cc9624d7e4f8f1b1a6c64209325a357f9bb2724ec6945b9e4b1c89b0aa12",
+      "bytes": 27293
     },
     {
       "path": "core/process_identity.py",
@@ -606,8 +606,8 @@
     },
     {
       "path": "tools/backtester.py",
-      "sha256": "5e4bbda7276823c434573e83fe89da2e07f0eca98f9d8fdd48276967bd2861e4",
-      "bytes": 49456
+      "sha256": "e6e59135b554974270a97a429ba080ffe324754e8cab2e636da77af76f7816e2",
+      "bytes": 60857
     },
     {
       "path": "tools/check_connection.py",
@@ -625,14 +625,19 @@
       "bytes": 2354
     },
     {
+      "path": "tools/futures_capture_replay.py",
+      "sha256": "fa8c12e8a7b43624ae4ff5cfedce32de52145a4e76d03cf951851ee49c6d5ceb",
+      "bytes": 4101
+    },
+    {
       "path": "tools/ohlcv_cache.py",
-      "sha256": "a60a9950d3f28d76669b8bae42fa74e35d3e781a6db35f685a81778eddff1276",
-      "bytes": 9036
+      "sha256": "8337cc64425c2d918db1c8dedc27f8c778262ae1a3d2d451ac9bce496c273bd3",
+      "bytes": 11935
     },
     {
       "path": "tools/optimizer.py",
-      "sha256": "c9c1c2e2064ef26864c35d5982904a4b051019dd89ca7dc8c8fdf15544d1cc69",
-      "bytes": 136999
+      "sha256": "fb52fccd491b8f9f1bb6d95b2acd6dab23e6223df74bd087c7277cc4ff78643a",
+      "bytes": 170542
     },
     {
       "path": "tools/profit_research.py",
@@ -646,13 +651,18 @@
     },
     {
       "path": "tools/release_requirements.py",
-      "sha256": "b0203f363efdc9ab2f17f469576dfa3bda82c1c7a5c055c5439fca3eec97ab9d",
-      "bytes": 4388
+      "sha256": "ecd820b72551fb91bab3a9106f32ef4f7bea116f77fc36fab122a4ac1c1f2fe1",
+      "bytes": 4538
     },
     {
       "path": "tools/selftest.py",
       "sha256": "1734f3e2a455a85b0bd662db0e46d38eda5fd3c46268c87a85f2cc12a55e8f3e",
       "bytes": 4106
+    },
+    {
+      "path": "tools/simulation_workspace.py",
+      "sha256": "d03948b3a29f35723a5f18be8f521238db65116835e66d82f6de0f88b4594d5e",
+      "bytes": 22085
     },
     {
       "path": "tools/trend_check.py",
@@ -790,6 +800,11 @@
       "bytes": 11037
     },
     {
+      "path": "trading/futures_capture_replay.py",
+      "sha256": "eef593df36f3859eb430f285da4c6309651ecd4d7f0afcd4790e571d96e29c0a",
+      "bytes": 27559
+    },
+    {
       "path": "trading/futures_exit_shadow.py",
       "sha256": "7f9280c6d73d837923b37b2a70e1223f05ee2cde69ce148e4c2c7cf8f60c4cb7",
       "bytes": 4027
@@ -803,6 +818,11 @@
       "path": "trading/futures_peak_trail.py",
       "sha256": "c096cb72cc080270e9b1dc553f247e48e2f434ba68849bdf10ea0bdd9129ec96",
       "bytes": 4364
+    },
+    {
+      "path": "trading/historical_futures_evidence.py",
+      "sha256": "e265675b561231c84f270dcdcd0ae916209822b9bc1f87236ac089080191a200",
+      "bytes": 18489
     },
     {
       "path": "trading/l2_stream.py",

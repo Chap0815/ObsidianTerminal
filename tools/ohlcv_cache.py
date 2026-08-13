@@ -3,8 +3,9 @@
 Every backtest tool (optimizer / xsec / trend checks + the OOS red-team) fetches
 the SAME symbols/timeframes over the same long windows. Hitting the exchange
 fresh each run hammers the API and trips MEXC's 429 rate limit, dropping coins
-and corrupting results. This module fetches each ``(symbol, timeframe)`` ONCE,
-caches the full series to disk, and serves every later run from cache 
+and corrupting results. This module fetches each
+``(exchange, symbol, timeframe)`` series once, caches it to disk, and serves
+every later run from cache
 decoupling the heavy compute from the flaky network.
 
 The cache stores the fetched history asof-agnostically; ``get_series`` clips it
@@ -27,15 +28,59 @@ _CACHE_DIR = os.path.join(
 
 _TF_MS = {"1h": 3_600_000, "1d": 86_400_000}
 _CACHE_JSON_MAX_BYTES = 50_000_000
+# Bitget's historical-candle endpoint returns at most 200 rows.  Passing a
+# larger limit does not merely clamp the row count: it shifts the returned
+# window forward, which can silently skip candles during forward pagination.
+# A conservative cross-exchange page size keeps ``since`` authoritative.
+_OHLCV_PAGE_LIMIT = 200
 
 # Transient errors worth retrying with backoff (rate limit / DDoS guard / net).
 _RETRY = (ccxt.RateLimitExceeded, ccxt.DDoSProtection, ccxt.NetworkError,
           ccxt.ExchangeNotAvailable)
 
 
-def _path(symbol: str, timeframe: str) -> str:
+def _is_retryable_fetch_error(exc: Exception) -> bool:
+    if isinstance(exc, _RETRY):
+        return True
+    message = str(exc).strip().lower()
+    return any(
+        marker in message
+        for marker in (
+            "requests are too frequent",
+            "too many requests",
+            '"code":510',
+            '"code": 510',
+        )
+    )
+
+
+def _exchange_cache_namespace(exchange) -> str:
+    """Return a stable, path-safe venue identity for cache isolation."""
+    raw = getattr(exchange, "id", None) or getattr(exchange, "name", None)
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("exchange cache identity is missing")
+    namespace = "".join(
+        character
+        for character in raw.strip().lower()
+        if character.isalnum() or character in {"-", "_"}
+    )
+    if not namespace:
+        raise ValueError("exchange cache identity is invalid")
+    return namespace[:64]
+
+
+def _path(
+    symbol: str,
+    timeframe: str,
+    cache_namespace: str | None = None,
+) -> str:
     safe = symbol.replace("/", "_").replace(":", "-")
-    return os.path.join(_CACHE_DIR, f"{safe}__{timeframe}.json")
+    root = (
+        os.path.join(_CACHE_DIR, cache_namespace)
+        if cache_namespace is not None
+        else _CACHE_DIR
+    )
+    return os.path.join(root, f"{safe}__{timeframe}.json")
 
 
 def _valid_ohlcv_row(row, *, since_ms: int, until_ms: int) -> bool:
@@ -61,8 +106,15 @@ def _valid_ohlcv_row(row, *, since_ms: int, until_ms: int) -> bool:
     )
 
 
-def _load(symbol: str, timeframe: str):
-    p = _path(symbol, timeframe)
+def _load(
+    symbol: str,
+    timeframe: str,
+    cache_namespace: str | None = None,
+):
+    tf_ms = _TF_MS.get(timeframe)
+    if tf_ms is None:
+        return None
+    p = _path(symbol, timeframe, cache_namespace)
     if not os.path.exists(p):
         return None
     try:
@@ -80,19 +132,25 @@ def _load(symbol: str, timeframe: str):
             ):
                 return None
             timestamp = int(float(bar[0]))
-            if previous_timestamp is not None and timestamp <= previous_timestamp:
-                return None
+            if previous_timestamp is not None:
+                if timestamp - previous_timestamp != tf_ms:
+                    return None
             previous_timestamp = timestamp
         return bars
     except Exception:
         return None
 
 
-def _save(symbol: str, timeframe: str, bars: list) -> None:
+def _save(
+    symbol: str,
+    timeframe: str,
+    bars: list,
+    cache_namespace: str | None = None,
+) -> None:
     tmp = None
     try:
-        os.makedirs(_CACHE_DIR, exist_ok=True)
-        p = _path(symbol, timeframe)
+        p = _path(symbol, timeframe, cache_namespace)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
         with portalocker.Lock(
             f"{p}.lock",
             mode="a",
@@ -100,7 +158,10 @@ def _save(symbol: str, timeframe: str, bars: list) -> None:
             check_interval=0.05,
             fail_when_locked=False,
         ):
-            merged = {bar[0]: bar for bar in (_load(symbol, timeframe) or [])}
+            merged = {
+                bar[0]: bar
+                for bar in (_load(symbol, timeframe, cache_namespace) or [])
+            }
             merged.update({bar[0]: bar for bar in bars})
             rows = [merged[timestamp] for timestamp in sorted(merged)]
             tmp = f"{p}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -129,7 +190,9 @@ def _fetch_ohlcv_backoff(exchange, symbol, timeframe, since, limit, retries=6):
         try:
             return exchange.fetch_ohlcv(
                 symbol, timeframe=timeframe, since=since, limit=limit)
-        except _RETRY:
+        except Exception as exc:
+            if not _is_retryable_fetch_error(exc):
+                raise
             if attempt == retries - 1:
                 raise
             _time.sleep(delay)
@@ -169,19 +232,32 @@ def _paginate(exchange, symbol, timeframe, since_ms, until_ms) -> list:
     rl_sleep = max(0.05, getattr(exchange, "rateLimit", 100) / 1000.0)
     out, since, prev_last = {}, since_ms, None
     span = max(1, int((until_ms - since_ms) // tf_ms))
-    max_pages = span // 100 + 8
+    max_pages = math.ceil(span / _OHLCV_PAGE_LIMIT) + 8
     for _ in range(max_pages):
+        # Venues differ on whether ``since`` itself is included, and Bitget's
+        # historical endpoint has exhibited both behaviours across one series.
+        # Fetch one candle of overlap and clip it below so either contract
+        # produces the exact requested first timestamp without page gaps.
+        request_since = max(0, since - tf_ms)
         raw_batch = _fetch_ohlcv_backoff(
-            exchange, symbol, timeframe, since, 1000
+            exchange, symbol, timeframe, request_since, _OHLCV_PAGE_LIMIT
         )
         batch = _validated_ohlcv_batch(
             raw_batch,
             since_ms=since,
             until_ms=until_ms,
-            limit=1000,
+            limit=_OHLCV_PAGE_LIMIT,
         )
         if not batch:
             break
+        timestamps = [int(float(row[0])) for row in batch]
+        if timestamps[0] - since >= tf_ms or any(
+            current - previous != tf_ms
+            for previous, current in zip(timestamps, timestamps[1:])
+        ):
+            # Missing candles change elapsed-time semantics and must never be
+            # cached or passed to a backtest as a continuous market history.
+            return []
         for c in batch:
             out[c[0]] = c
         last = batch[-1][0]
@@ -222,7 +298,8 @@ def get_series(exchange, symbol: str, timeframe: str, since_ms: int) -> list:
         real_now = int(_time.time() * 1000)
     closed_until_ms = (real_now // tf_ms) * tf_ms
 
-    cached = _load(symbol, timeframe)
+    cache_namespace = _exchange_cache_namespace(exchange)
+    cached = _load(symbol, timeframe, cache_namespace)
     if cached:
         cached = [bar for bar in cached if int(float(bar[0])) < closed_until_ms]
     merged = {b[0]: b for b in cached} if cached else {}
@@ -251,6 +328,11 @@ def get_series(exchange, symbol: str, timeframe: str, since_ms: int) -> list:
     if not merged:
         return []
     bars = [merged[k] for k in sorted(merged)]
+    if any(
+        int(float(current[0])) - int(float(previous[0])) != tf_ms
+        for previous, current in zip(bars, bars[1:])
+    ):
+        return []
     if changed:
-        _save(symbol, timeframe, bars)
+        _save(symbol, timeframe, bars, cache_namespace)
     return bars

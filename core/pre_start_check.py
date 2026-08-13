@@ -231,6 +231,27 @@ def _check_runtime(bot_name: str, meta: dict, *, cleanup: bool = False) -> list[
         if matches_expected:
             return [_issue("error", "bot_already_running",
                            f"{bot_name}: runtime_status reports live pid {pid}")]
+        returncode = status.get("returncode")
+        threads = status.get("threads")
+        shutdown = status.get("shutdown")
+        launcher_confirmed_exit = (
+            status.get("stopped_by") == "launcher"
+            and isinstance(returncode, int)
+            and not isinstance(returncode, bool)
+            and bool(str(status.get("run_id") or ""))
+            and isinstance(threads, dict)
+            and bool(threads)
+            and all(value is False for value in threads.values())
+            and isinstance(shutdown, dict)
+            and shutdown.get("complete") is False
+        )
+        if launcher_confirmed_exit:
+            return [_issue(
+                "warn",
+                "runtime_launcher_exit_confirmed",
+                f"{bot_name}: launcher confirmed prior pid {pid} exited "
+                f"with returncode {returncode}; stale/reused pid ignored",
+            )]
         if age_sec < 300:
             return [_issue(
                 "error", "bot_runtime_pid_alive",
