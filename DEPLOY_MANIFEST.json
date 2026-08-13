@@ -1,6 +1,6 @@
 {
-  "build_id": "ba846078e2d74ac2",
-  "created_at": "2026-08-13 19:42:22",
+  "build_id": "61e6201180ce5b53",
+  "created_at": "2026-08-13 20:15:12",
   "source": "update_deploy_manifest.py",
   "file_count": 188,
   "files": [
@@ -446,8 +446,8 @@
     },
     {
       "path": "launcher/ui/app.py",
-      "sha256": "66632120dc199b3442a9f2513bfb0d83dfdf7ce82df85a11e4c9b84a03c29ac7",
-      "bytes": 203058
+      "sha256": "62f62febb6b37a1173ea92379d1b9f51162ead8f2872bc7de4101cbcf6bd0dc1",
+      "bytes": 205423
     },
     {
       "path": "launcher/ui/components/__init__.py",
@@ -486,8 +486,8 @@
     },
     {
       "path": "launcher/ui/logging_panel.py",
-      "sha256": "1512ab93c1e13ecd621d28062564b75e56ad4196ad0014c563f54082b318b9c9",
-      "bytes": 14007
+      "sha256": "ba759ebb135d58c571b1d59ede2bf217c5211da0dc03a7273492778887e6c875",
+      "bytes": 23943
     },
     {
       "path": "launcher/ui/scaling.py",

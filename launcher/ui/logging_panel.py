@@ -17,8 +17,10 @@ hands in, but keep no global state.
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime
 import re
+import time
 
 import tkinter as tk
 
@@ -57,6 +59,265 @@ _EXPLICIT_LEVEL_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
+
+_DISPLAY_SEPARATOR_RE = re.compile(r"^\s*[-=_*#]{8,}\s*$")
+_DISPLAY_HEARTBEAT_RE = re.compile(
+    r"(?:\bheartbeat\b.*\bopen:\s*\d+|"
+    r"\bopen trades?:\s*.*\b(?:balance|next scan):)",
+    re.IGNORECASE,
+)
+_DISPLAY_MONITOR_RE = re.compile(
+    r"\b(?:monitor(?:ing)?(?:[- ]?tick| idle)?|tick\s*#\d+)\b",
+    re.IGNORECASE,
+)
+_DISPLAY_ANALYSIS_RE = re.compile(
+    r"\b(?:analyz(?:e|ing|is|ed)|analys(?:e|ing|is|iere|iert)|"
+    r"signal check|"
+    r"(?:ai|ki|llm|keyword fallback)\s+(?:says?|sagt)\s+(?:wait|hold)|"
+    r"result:\s*(?:wait|hold))\b",
+    re.IGNORECASE,
+)
+_DISPLAY_SKIP_RE = re.compile(
+    r"\b(?:skip(?:ped|ping)?|blacklist(?:ed)?|cooldown(?: active)?|"
+    r"insufficient[^|]{0,80}(?:history|data|bars?|candles?)|"
+    r"has no (?:(?:15m|1h|4h)\s+)?candle|"
+    r"(?:held|claimed) by another bot|"
+    r"(?:funding filter|quality gate) excluded|"
+    r"\b(?:long|short|buy|entry)?\s*blocked\b|"
+    r"\bblocked (?:entry|by)\b)\b",
+    re.IGNORECASE,
+)
+_DISPLAY_IMPORTANT_STATE_RE = re.compile(
+    r"\b(?:safe[_ -]?mode|kill[- ]?switch|circuit breaker|"
+    r"pause(?:d)?|pausiert|risk gate unavailable|daily[- ]loss|"
+    r"max(?:imum|\.)? trades?|bad hour|market[- ]filter|markt-filter|"
+    r"api budget exhausted|shutdown|stopp(?:ed|ing)|started|running|ready|"
+    r"recovered|connection established)\b",
+    re.IGNORECASE,
+)
+
+
+class LiveLogDisplayFilter:
+    """Condense routine bot stdout without changing durable audit logs.
+
+    This filter is deliberately display-only. Errors, critical messages, trade
+    events and state transitions always pass through. High-volume analysis,
+    skip and monitor chatter is counted and rendered as a periodic summary.
+    The caller can bypass the policy with ``detailed=True`` at any time.
+    """
+
+    _CATEGORY_LABELS = {
+        "analysis": "analysis",
+        "skipped": "skipped",
+        "monitor": "monitor",
+        "scan": "scan",
+        "wait": "wait",
+        "heartbeat": "status",
+        "formatting": "formatting",
+        "repeated_warning": "repeated warnings",
+        "repeated_state": "unchanged state",
+    }
+    _NEVER_FILTER = frozenset({
+        "error", "critical", "buy", "sell", "win", "loss", "ok",
+    })
+
+    def __init__(
+        self,
+        *,
+        summary_interval_seconds: float = 20.0,
+        warning_repeat_window_seconds: float = 120.0,
+        state_repeat_window_seconds: float = 300.0,
+        max_warning_fingerprints: int = 512,
+    ) -> None:
+        self.summary_interval_seconds = max(
+            1.0, float(summary_interval_seconds)
+        )
+        self.warning_repeat_window_seconds = max(
+            1.0, float(warning_repeat_window_seconds)
+        )
+        self.state_repeat_window_seconds = max(
+            1.0, float(state_repeat_window_seconds)
+        )
+        self.max_warning_fingerprints = max(
+            16, int(max_warning_fingerprints)
+        )
+        self._pending: Counter[str] = Counter()
+        self._pending_first_at: float | None = None
+        self._pending_last_at: float | None = None
+        self._last_summary_at: float | None = None
+        self._warning_seen_at: dict[str, float] = {}
+        self._state_seen_at: dict[str, float] = {}
+
+    @staticmethod
+    def _fingerprint(line: str) -> str:
+        text = str(line or "")
+        text = _EMBEDDED_LEVEL_RE.sub("", text, count=1)
+        text = _LEADING_LEVEL_RE.sub("", text, count=1)
+        text = _BARE_LEVEL_RE.sub("", text, count=1)
+        return re.sub(r"\s+", " ", text).strip().casefold()
+
+    @staticmethod
+    def _routine_category(line: str, severity: str) -> str | None:
+        text = str(line or "")
+        explicit = _explicit_level(text)
+        if _DISPLAY_SEPARATOR_RE.fullmatch(text):
+            return "formatting"
+        if _DISPLAY_HEARTBEAT_RE.search(text):
+            return "heartbeat"
+        if _DISPLAY_IMPORTANT_STATE_RE.search(text):
+            return None
+        if severity == "monitor" or _DISPLAY_MONITOR_RE.search(text):
+            return "monitor"
+        if _DISPLAY_ANALYSIS_RE.search(text):
+            return "analysis"
+        if _DISPLAY_SKIP_RE.search(text):
+            return "skipped"
+        if explicit == "SCAN":
+            if re.search(r"\b(?:complete|completed|opened|failed)\b", text,
+                         re.IGNORECASE):
+                return None
+            return "scan"
+        if explicit == "WAIT":
+            return "wait"
+        return None
+
+    def _summary(self) -> str | None:
+        total = sum(self._pending.values())
+        if total <= 0:
+            return None
+        ordered = sorted(
+            self._pending.items(), key=lambda item: (-item[1], item[0])
+        )
+        details = ", ".join(
+            f"{self._CATEGORY_LABELS.get(category, category)}: {count}"
+            for category, count in ordered
+        )
+        first_at = self._pending_first_at
+        last_at = self._pending_last_at
+        self._pending.clear()
+        self._pending_first_at = None
+        self._pending_last_at = None
+        noun = "message" if total == 1 else "messages"
+        duration = 0.0
+        if first_at is not None and last_at is not None:
+            duration = max(0.0, last_at - first_at)
+        return (
+            f"INFO [Activity] {total} routine {noun} condensed "
+            f"over {duration:.0f}s ({details}). "
+            "Enable Details for raw output."
+        )
+
+    def _summary_if_due(self, current: float) -> tuple[str, ...]:
+        if not self._pending:
+            return ()
+        if self._last_summary_at is None:
+            self._last_summary_at = current
+            return ()
+        if current - self._last_summary_at < self.summary_interval_seconds:
+            return ()
+        summary = self._summary()
+        self._last_summary_at = current
+        return (summary,) if summary else ()
+
+    def poll_due(self, *, now: float | None = None) -> tuple[str, ...]:
+        """Emit a due summary even when no further bot line arrives."""
+        current = time.monotonic() if now is None else float(now)
+        return self._summary_if_due(current)
+
+    def _remember_warning(self, fingerprint: str, current: float) -> bool:
+        previous = self._warning_seen_at.get(fingerprint)
+        self._warning_seen_at[fingerprint] = current
+        cutoff = current - self.warning_repeat_window_seconds
+        if len(self._warning_seen_at) > self.max_warning_fingerprints:
+            self._warning_seen_at = {
+                key: seen
+                for key, seen in self._warning_seen_at.items()
+                if seen >= cutoff
+            }
+            if len(self._warning_seen_at) > self.max_warning_fingerprints:
+                newest = sorted(
+                    self._warning_seen_at.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:self.max_warning_fingerprints]
+                self._warning_seen_at = dict(newest)
+        return previous is not None and current - previous < (
+            self.warning_repeat_window_seconds
+        )
+
+    def _remember_state(self, fingerprint: str, current: float) -> bool:
+        previous = self._state_seen_at.get(fingerprint)
+        self._state_seen_at[fingerprint] = current
+        if len(self._state_seen_at) > self.max_warning_fingerprints:
+            cutoff = current - self.state_repeat_window_seconds
+            self._state_seen_at = {
+                key: seen
+                for key, seen in self._state_seen_at.items()
+                if seen >= cutoff
+            }
+        return previous is not None and current - previous < (
+            self.state_repeat_window_seconds
+        )
+
+    def _suppress(self, category: str, current: float) -> tuple[str, ...]:
+        self._pending[category] += 1
+        if self._pending_first_at is None:
+            self._pending_first_at = current
+        self._pending_last_at = current
+        return self._summary_if_due(current)
+
+    def push(
+        self,
+        line: str,
+        severity: str,
+        *,
+        detailed: bool = False,
+        now: float | None = None,
+    ) -> tuple[str, ...]:
+        """Return zero or more user-visible lines for one raw stdout line."""
+        current = time.monotonic() if now is None else float(now)
+        text = str(line or "")
+        if detailed:
+            summary = self._summary()
+            self._last_summary_at = current
+            return ((summary,) if summary else ()) + (text,)
+
+        normalized_severity = str(severity or "info").lower()
+        if (
+            normalized_severity not in self._NEVER_FILTER | {"warn"}
+            and _DISPLAY_IMPORTANT_STATE_RE.search(text)
+        ):
+            fingerprint = self._fingerprint(text)
+            if fingerprint and self._remember_state(fingerprint, current):
+                return self._suppress("repeated_state", current)
+        category = None
+        if normalized_severity not in self._NEVER_FILTER | {"warn"}:
+            category = self._routine_category(text, normalized_severity)
+        if category is not None:
+            return self._suppress(category, current)
+
+        if normalized_severity == "warn":
+            fingerprint = self._fingerprint(text)
+            if fingerprint and self._remember_warning(fingerprint, current):
+                return self._suppress("repeated_warning", current)
+
+        output = list(self._summary_if_due(current))
+        output.append(text)
+        return tuple(output)
+
+    def flush(self) -> tuple[str, ...]:
+        """Render the currently pending condensation summary, if any."""
+        summary = self._summary()
+        return (summary,) if summary else ()
+
+    def reset(self) -> None:
+        self._pending.clear()
+        self._pending_first_at = None
+        self._pending_last_at = None
+        self._warning_seen_at.clear()
+        self._state_seen_at.clear()
+        self._last_summary_at = None
 
 
 def _explicit_level(line: str) -> str | None:

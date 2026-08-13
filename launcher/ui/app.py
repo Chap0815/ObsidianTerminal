@@ -1523,6 +1523,22 @@ class ObsidianApp(ctk.CTk):
                        button_color=COLORS["text"], width=36, height=18
                        ).pack(side="right", padx=(8, 0))
 
+        details_var = ctk.BooleanVar(value=False)
+        details_switch = ctk.CTkSwitch(
+            log_head, text="Details", variable=details_var,
+            font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+            text_color=COLORS["text_dim"],
+            progress_color=accent,
+            button_color=COLORS["text"], width=36, height=18,
+        )
+        details_switch.pack(side="right", padx=(8, 0))
+        attach_tooltip(
+            details_switch,
+            "Aus: relevante Ereignisse mit verdichteten Routinemeldungen.\n"
+            "An: ungefilterte Bot-Ausgabe ab diesem Zeitpunkt.",
+            delay_ms=400,
+        )
+
         ctk.CTkButton(log_head, text="Clear", width=58, height=22,
                        font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                        fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -1624,6 +1640,8 @@ class ObsidianApp(ctk.CTk):
         self._write_log_to_box(log_box, auto_var, "system",
                                  f"{meta['label']} bot ready. Click Start to begin.")
 
+        from launcher.ui.logging_panel import LiveLogDisplayFilter
+
         body_widgets = [hero_wrap, spark_row, param_wrap, restart_hint,
                          sep_6, actions, sep_8, log_outer]
 
@@ -1651,6 +1669,8 @@ class ObsidianApp(ctk.CTk):
             "restart_hint": restart_hint,
             "log_box":      log_box,
             "auto_var":     auto_var,
+            "details_var":  details_var,
+            "log_filter":   LiveLogDisplayFilter(),
             "sim_btn":      sim_btn,
             "save_btn":     save_btn,
             "unsaved_lbl":  unsaved_lbl,
@@ -2927,6 +2947,10 @@ class ObsidianApp(ctk.CTk):
         log_box.config(state="normal")
         log_box.delete("1.0", "end")
         log_box.config(state="disabled")
+        display_filter = card.get("log_filter")
+        reset = getattr(display_filter, "reset", None)
+        if callable(reset):
+            reset()
 
     #  LLM MODEL SELECTOR 
 
@@ -3704,6 +3728,7 @@ class ObsidianApp(ctk.CTk):
     def _refresh(self):
         # Logs verarbeiten
         now_ts = time.time()
+        now_monotonic = time.monotonic()
         self._sync_sim_state()
         for bot in BOT_ORDER:
             card = self.cards[bot]
@@ -3722,7 +3747,6 @@ class ObsidianApp(ctk.CTk):
                     line = q.get_nowait()
                     sev = self._classify_severity(line)
                     clean = re.sub(r'\x1b\[[0-9;]*m', '', line)
-                    self._log_to_card(card, sev, clean)
 
                     # AI-Mode aus Logs ableiten
                     mode = self._detect_ai_mode_from_log(clean)
@@ -3730,9 +3754,41 @@ class ObsidianApp(ctk.CTk):
                         card["ai_mode"] = mode
                         card["ai_mode_ts"] = now_ts
 
+                    display_filter = card.get("log_filter")
+                    details_var = card.get("details_var")
+                    detailed = bool(details_var.get()) if details_var else False
+                    if display_filter is None:
+                        visible_lines = (clean,)
+                    else:
+                        visible_lines = display_filter.push(
+                            clean,
+                            sev,
+                            detailed=detailed,
+                            now=now_monotonic,
+                        )
+                    for visible_line in visible_lines:
+                        visible_severity = self._classify_severity(visible_line)
+                        self._log_to_card(
+                            card, visible_severity, visible_line
+                        )
+
                     count += 1
                 except queue.Empty:
                     break
+
+            display_filter = card.get("log_filter")
+            details_var = card.get("details_var")
+            detailed = bool(details_var.get()) if details_var else False
+            if display_filter is not None:
+                due_lines = (
+                    display_filter.flush()
+                    if detailed
+                    else display_filter.poll_due(now=now_monotonic)
+                )
+                for due_line in due_lines:
+                    self._log_to_card(
+                        card, self._classify_severity(due_line), due_line
+                    )
 
         cache = self.poller.get_all()
         global_llm = cache.get("llm") or {"online": False}
