@@ -6987,6 +6987,9 @@ def record_simulated_execution_tca(
         raise
 
 
+_SIM_TCA_BOTS = frozenset({"CROSS", "FUTREND", "SPOT", "TREND"})
+
+
 def has_simulated_expectancy_candidate(entry_id: str, bot_name: str) -> bool:
     """Read-only causal preflight for production SIM execution telemetry."""
     try:
@@ -6994,7 +6997,7 @@ def has_simulated_expectancy_candidate(entry_id: str, bot_name: str) -> bool:
         normalized_bot = _required_text_db(
             bot_name, "bot_name", max_length=32
         ).upper()
-        if normalized_bot not in {"CROSS", "FUTREND"}:
+        if normalized_bot not in _SIM_TCA_BOTS:
             return False
     except (TypeError, ValueError, OverflowError):
         return False
@@ -7024,7 +7027,7 @@ def persist_simulated_entry_tca_bundle(
     normalized_bot = _required_text_db(
         bot_name, "bot_name", max_length=32
     ).upper()
-    if normalized_bot not in {"CROSS", "FUTREND"}:
+    if normalized_bot not in _SIM_TCA_BOTS:
         raise ValueError("simulated TCA bot is unsupported")
     normalized_symbol = _required_text_db(symbol, "symbol", max_length=64)
     normalized_side = str(side).strip().lower()

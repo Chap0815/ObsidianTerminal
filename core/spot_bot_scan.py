@@ -28,6 +28,7 @@ from bot_utils import (
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.network_retry import RetryForbiddenError
 from bot_utils.order_utils import strict_order_snapshot_equal
+from bot_utils.silent_log import silent_log
 
 
 class _SpotBuyBudgetUnavailable(RuntimeError):
@@ -1468,6 +1469,35 @@ class ScanMixin:
             except Exception:
                 _TKR = 0.001
             entry_fee = invested_usdt * _TKR
+            if entry_id:
+                try:
+                    from trading.candidate_microstructure import (
+                        capture_simulated_entry_tca,
+                    )
+
+                    tca_recorded = capture_simulated_entry_tca(
+                        exchange=self.ex,
+                        entry_id=entry_id,
+                        bot_name=self.BOT_NAME,
+                        mode="SIM",
+                        symbol=f"{sym}/USDT",
+                        side="buy",
+                        amount=amount,
+                        fill_price=sim_fill_price,
+                        fee_rate=_TKR,
+                        notional_usdt=invested_usdt,
+                        depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
+                    )
+                    if not tca_recorded:
+                        silent_log(
+                            f"{self.BOT_NAME} {sym} SIM TCA entry {entry_id}",
+                            RuntimeError("SIM TCA was not recorded"),
+                        )
+                except Exception as exc:
+                    silent_log(
+                        f"{self.BOT_NAME} {sym} SIM TCA dispatch {entry_id}",
+                        exc,
+                    )
             return amount, sim_fill_price, amount, invested_usdt, entry_fee
 
         # Pre-trade spread gate: refuse a market buy into a blown-out/vacuum

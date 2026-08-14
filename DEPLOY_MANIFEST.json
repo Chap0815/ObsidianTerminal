@@ -1,6 +1,6 @@
 {
-  "build_id": "4472c2dd3eaa681d",
-  "created_at": "2026-08-14 12:37:02",
+  "build_id": "415ed8aabeb8874d",
+  "created_at": "2026-08-14 13:17:57",
   "source": "update_deploy_manifest.py",
   "file_count": 188,
   "files": [
@@ -246,8 +246,8 @@
     },
     {
       "path": "core/database.py",
-      "sha256": "450a8282b311737b058918d05510a56c87b2dfd4fcfe6e8d3474974a8bf0f241",
-      "bytes": 295975
+      "sha256": "378ee48e872f8c9fa09bfac8772d5ecc002e16e93ae6c347335173d05dd60e6b",
+      "bytes": 296028
     },
     {
       "path": "core/event_bus.py",
@@ -306,8 +306,8 @@
     },
     {
       "path": "core/spot_bot.py",
-      "sha256": "fceee23c00ccb3bd2667974bce70d60a3755212349feeee8297814b129178e66",
-      "bytes": 29661
+      "sha256": "f4fc424d5928cf204335b7725933fe273060b9c7024cbe3b49603736c0a17728",
+      "bytes": 37723
     },
     {
       "path": "core/spot_bot_exits.py",
@@ -321,8 +321,8 @@
     },
     {
       "path": "core/spot_bot_scan.py",
-      "sha256": "97976bc4be1995f80a17084260f86ee36d254e31f8041229fc3d5501ee1f136d",
-      "bytes": 84576
+      "sha256": "f926714485b8a8ca4c0110a034b72999f9a09fd5d7b296d330c3d30b399ce76a",
+      "bytes": 85856
     },
     {
       "path": "core/state_manager.py",
@@ -711,8 +711,8 @@
     },
     {
       "path": "trading/candidate_microstructure.py",
-      "sha256": "879f9bb99623bb01dbec3efd51fa29884542c119e5353a972ff8defa1489f4ef",
-      "bytes": 9196
+      "sha256": "f72b862e1d5c069e3cb43318f25fe61cd5a827717fa084d2bc5b096ff32b3bd4",
+      "bytes": 9276
     },
     {
       "path": "trading/carry_sim.py",

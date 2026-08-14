@@ -1,5 +1,5 @@
 """
-core/spot_bot.py  Dual-thread spot trading bot base class.
+core/spot_bot.py  Multi-thread spot trading bot base class.
 
 Replaces the duplicated run_bot() loops in main_bot_balanced.py and
 main_bot_aggressive.py with a single SpotBot class.
@@ -8,6 +8,7 @@ Architecture (mirrors futures bot v6.1):
   MONITOR-Thread  (every MONITOR_INTERVAL ~20s)  exits only
   SCAN-Thread  (every SCAN_INTERVAL ~150s)  new entries only
   RECONCILE-Thread  (every RECONCILE_INTERVAL_SEC ~600s)  drift check
+  MARKOUT-Thread  restart-safe execution-evidence processing + failover
   MAIN-Thread  heartbeat + shutdown coordination
 
 Open positions are no longer blocked behind slow LLM-analysis scan cycles.
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import atexit
 import importlib
+import math
 import signal
 import sys
 import threading
@@ -84,6 +86,9 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
     RECONCILE_INTERVAL_SEC: int = 300  # 5 min  orphan-adoption safety net cadence
     GC_LOCKS_INTERVAL_SEC: int = 300   # 5 min
     HEARTBEAT_INTERVAL_SEC: int = 60   # main-thread heartbeat
+    MARKOUT_POLL_INTERVAL_SEC: float = 1.0
+    MARKOUT_MAX_OVERDUE_SEC: float = 30.0
+    MARKOUT_POLL_STALE_SEC: float = 15.0
     # Hard deadline for emergency_close_all during shutdown, so a hanging
     # exchange API can't block the bot forever (and force a kill -9 that could
     # corrupt trades.json mid-write).
@@ -109,6 +114,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         self._shutdown_event = threading.Event()
         self._shutdown_lock = threading.Lock()
         self._cooldown_lock = threading.Lock()
+        self._markout_health_lock = threading.Lock()
         # populated in run()
         self.ex = None
         # Spot uses batched ticker fetches instead of FuturesBot's TickerCache.
@@ -124,6 +130,36 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         self._monitor_thread: Optional[threading.Thread] = None
         self._scan_thread: Optional[threading.Thread] = None
         self._reconcile_thread: Optional[threading.Thread] = None
+        self._markout_thread: Optional[threading.Thread] = None
+        self._markout_started_monotonic: float | None = None
+        self._markout_health = {
+            "ok": True,
+            "last_poll_monotonic": None,
+            "last_poll_wall_ts": None,
+            "consecutive_errors": 0,
+            "last_error": "",
+            "due_count": 0,
+            "oldest_due_at": None,
+            "oldest_overdue_seconds": 0.0,
+            "timestamps_valid": True,
+            "reason": "",
+            "scopes": {
+                scope: {
+                    "due_count": 0,
+                    "oldest_due_at": None,
+                    "oldest_overdue_seconds": 0.0,
+                    "timestamps_valid": True,
+                }
+                for scope in ("LIVE", "SIM")
+            },
+            "completed": 0,
+            "completed_batch": 0,
+            "completed_total": 0,
+            "polls_total": 0,
+            "errors_total": 0,
+            "last_completed_wall_ts": None,
+            "lock_state": "starting",
+        }
 
     # Convenience: config access as attribute-style. Routes through
     # bot_utils.config.get_live_value so user-edited values in the launcher's
@@ -156,7 +192,139 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             "reconcile": bool(
                 self._reconcile_thread and self._reconcile_thread.is_alive()
             ),
+            "markout": bool(
+                self._markout_thread and self._markout_thread.is_alive()
+            ),
         }
+
+    def _record_markout_worker_health(self, report: dict) -> None:
+        """Receive one bounded health report from the shared queue worker."""
+        if not isinstance(report, dict):
+            return
+
+        def nonnegative_int(value) -> int:
+            if isinstance(value, bool):
+                return 0
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        def nonnegative_float(value) -> float:
+            if isinstance(value, bool):
+                return 0.0
+            try:
+                parsed = float(value or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+            return max(0.0, parsed) if math.isfinite(parsed) else 0.0
+
+        raw_scopes = report.get("scopes")
+        raw_scopes = raw_scopes if isinstance(raw_scopes, dict) else {}
+        scopes = {}
+        for scope in ("LIVE", "SIM"):
+            raw = raw_scopes.get(scope)
+            raw = raw if isinstance(raw, dict) else {}
+            oldest = raw.get("oldest_due_at")
+            scopes[scope] = {
+                "due_count": nonnegative_int(raw.get("due_count")),
+                "oldest_due_at": str(oldest)[:32] if oldest else None,
+                "oldest_overdue_seconds": nonnegative_float(
+                    raw.get("oldest_overdue_seconds")
+                ),
+                "timestamps_valid": raw.get("timestamps_valid", True) is True,
+            }
+        report_ok = report.get("ok") is True
+        allowed_reasons = {
+            "",
+            "due_queue_overdue",
+            "due_queue_time_invalid",
+            "worker_error",
+            "worker_lock_error",
+            "worker_lock_release_failed",
+        }
+        reason = str(report.get("reason") or "")
+        if report_ok:
+            reason = ""
+        elif reason not in allowed_reasons or not reason:
+            reason = "worker_error"
+        with self._markout_health_lock:
+            previous_errors = nonnegative_int(
+                self._markout_health.get("consecutive_errors")
+            )
+            self._markout_health.update({
+                "ok": report_ok,
+                "last_poll_monotonic": report.get("last_poll_monotonic"),
+                "last_poll_wall_ts": report.get("last_poll_wall_ts"),
+                "consecutive_errors": 0 if report_ok else previous_errors + 1,
+                "last_error": (
+                    "" if report_ok else str(
+                        report.get("error")
+                        or report.get("reason")
+                        or "markout worker unhealthy"
+                    )[:200]
+                ),
+                "due_count": nonnegative_int(report.get("due_count")),
+                "oldest_due_at": (
+                    str(report.get("oldest_due_at"))[:32]
+                    if report.get("oldest_due_at") else None
+                ),
+                "oldest_overdue_seconds": nonnegative_float(
+                    report.get("oldest_overdue_seconds")
+                ),
+                "timestamps_valid": report.get("timestamps_valid", True) is True,
+                "reason": reason,
+                "scopes": scopes,
+                "completed": nonnegative_int(report.get("completed")),
+                "completed_batch": nonnegative_int(
+                    report.get("completed_batch")
+                ),
+                "completed_total": nonnegative_int(
+                    report.get("completed_total")
+                ),
+                "polls_total": nonnegative_int(report.get("polls_total")),
+                "errors_total": nonnegative_int(report.get("errors_total")),
+                "last_completed_wall_ts": report.get(
+                    "last_completed_wall_ts"
+                ),
+                "lock_state": str(report.get("lock_state") or "unknown")[:32],
+            })
+
+    def _markout_runtime_health(self) -> dict[str, Any]:
+        with self._markout_health_lock:
+            snapshot = dict(self._markout_health)
+        last_poll = snapshot.get("last_poll_monotonic")
+        if last_poll is None:
+            started = self._markout_started_monotonic
+            try:
+                startup_age = (
+                    0.0 if started is None
+                    else max(0.0, time.monotonic() - float(started))
+                )
+            except (TypeError, ValueError, OverflowError):
+                startup_age = float("inf")
+            startup_stale = startup_age > self.MARKOUT_POLL_STALE_SEC
+            snapshot.update({
+                "ok": not startup_stale,
+                "component": "execution_markout_worker",
+                "state": "stalled" if startup_stale else "starting",
+                "startup_age_seconds": startup_age,
+            })
+            if startup_stale:
+                snapshot["reason"] = "startup_poll_stale"
+            return snapshot
+        try:
+            poll_age = max(0.0, time.monotonic() - float(last_poll))
+        except (TypeError, ValueError, OverflowError):
+            poll_age = float("inf")
+        if poll_age > self.MARKOUT_POLL_STALE_SEC:
+            snapshot["ok"] = False
+            snapshot["reason"] = "poll_stale"
+        snapshot.update({
+            "component": "execution_markout_worker",
+            "poll_age_seconds": poll_age,
+        })
+        return snapshot
 
     def _publish_periodic_runtime_status(
         self,
@@ -196,15 +364,21 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                     state_rows=state_rows,
                     ticker_cache=self.ticker_cache,
                 )
+            markout_health = self._markout_runtime_health()
             status_writer(
                 self.LOG_DIR,
                 self.BOT_NAME,
-                "ready" if all(threads.values()) else "degraded",
+                (
+                    "ready"
+                    if all(threads.values()) and markout_health.get("ok") is True
+                    else "degraded"
+                ),
                 self.simulation,
                 threads=threads,
                 extra={
                     "open_positions": self.state.count(),
                     "safe_mode": bool(self.safe_mode.is_active()),
+                    "markout_health": markout_health,
                     **observability,
                 },
             )
@@ -244,7 +418,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
 
         log_separator("", color=self.BOT_COLOR)
         log_event(
-            f"{self.BOT_NAME}-Bot v2 started (dual-thread architecture)",
+            f"{self.BOT_NAME}-Bot v2 started (multi-thread architecture)",
             "START"
         )
         log_event(
@@ -408,23 +582,50 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             target=self._reconcile_loop, daemon=True,
             name=f"{self.BOT_NAME}Reconcile",
         )
+        from trading.execution_quality import run_tca_markout_worker
+
+        self._markout_thread = threading.Thread(
+            target=run_tca_markout_worker,
+            args=(self.ex, self._shutdown_event),
+            kwargs={
+                "poll_interval_seconds": self.MARKOUT_POLL_INTERVAL_SEC,
+                "limit": 25,
+                "max_overdue_seconds": self.MARKOUT_MAX_OVERDUE_SEC,
+                "health_callback": self._record_markout_worker_health,
+            },
+            daemon=True,
+            name=f"{self.BOT_NAME}Markouts",
+        )
+        self._markout_started_monotonic = time.monotonic()
         start_threads_or_shutdown(
             (
                 self._monitor_thread,
                 self._scan_thread,
                 self._reconcile_thread,
+                self._markout_thread,
             ),
             self._shutdown_event,
         )
 
-        log_event("Three threads running (monitor, scan, reconcile).", "START")
+        log_event(
+            "Four threads running (monitor, scan, reconcile, markout).",
+            "START",
+        )
         threads = self._runtime_threads()
+        markout_health = self._markout_runtime_health()
         write_runtime_status(
             self.LOG_DIR, self.BOT_NAME,
-            "ready" if all(threads.values()) else "degraded",
+            (
+                "ready"
+                if all(threads.values()) and markout_health.get("ok") is True
+                else "degraded"
+            ),
             self.simulation,
             threads=threads,
-            extra={"open_positions": self.state.count()})
+            extra={
+                "open_positions": self.state.count(),
+                "markout_health": markout_health,
+            })
 
         #  Main thread: heartbeat + shutdown wait 
         try:
@@ -467,12 +668,16 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             self._shutdown_handler(signum="KeyboardInterrupt")
 
         log_event("Waiting for threads to finish...", "INFO")
-        # All three threads are daemon=True, so Python reaps them at interpreter
+        # All four threads are daemon=True, so Python reaps them at interpreter
         # exit anyway. This join is best-effort (gives them a chance to write a
         # last log line); 2s is plenty since the loops check _shutdown_event
         # every iteration.
-        for t in (self._monitor_thread, self._scan_thread,
-                   self._reconcile_thread):
+        for t in (
+            self._monitor_thread,
+            self._scan_thread,
+            self._reconcile_thread,
+            self._markout_thread,
+        ):
             if t and t.is_alive():
                 t.join(timeout=2)
         finalize_runtime_shutdown(self, write_runtime_status, log_event)

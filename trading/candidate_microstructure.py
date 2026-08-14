@@ -11,6 +11,9 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 
 
+_SUPPORTED_SIM_TCA_BOTS = frozenset({"CROSS", "FUTREND", "SPOT", "TREND"})
+
+
 def _positive(value, name: str) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be positive and finite")
@@ -95,7 +98,7 @@ def capture_simulated_entry_tca(
         normalized_symbol = str(symbol).strip()
         if normalized_mode != "SIM":
             raise ValueError("simulated TCA requires SIM mode")
-        if normalized_bot not in {"CROSS", "FUTREND"}:
+        if normalized_bot not in _SUPPORTED_SIM_TCA_BOTS:
             raise ValueError("simulated TCA bot is unsupported")
         if normalized_side not in {"buy", "sell"}:
             raise ValueError("side must be buy or sell")
