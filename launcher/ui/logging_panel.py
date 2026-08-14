@@ -227,8 +227,12 @@ class LiveLogDisplayFilter:
 
     def _remember_warning(self, fingerprint: str, current: float) -> bool:
         previous = self._warning_seen_at.get(fingerprint)
-        self._warning_seen_at[fingerprint] = current
         cutoff = current - self.warning_repeat_window_seconds
+        if previous is not None and current - previous < (
+            self.warning_repeat_window_seconds
+        ):
+            return True
+        self._warning_seen_at[fingerprint] = current
         if len(self._warning_seen_at) > self.max_warning_fingerprints:
             self._warning_seen_at = {
                 key: seen
@@ -242,12 +246,14 @@ class LiveLogDisplayFilter:
                     reverse=True,
                 )[:self.max_warning_fingerprints]
                 self._warning_seen_at = dict(newest)
-        return previous is not None and current - previous < (
-            self.warning_repeat_window_seconds
-        )
+        return False
 
     def _remember_state(self, fingerprint: str, current: float) -> bool:
         previous = self._state_seen_at.get(fingerprint)
+        if previous is not None and current - previous < (
+            self.state_repeat_window_seconds
+        ):
+            return True
         self._state_seen_at[fingerprint] = current
         if len(self._state_seen_at) > self.max_warning_fingerprints:
             cutoff = current - self.state_repeat_window_seconds
@@ -256,9 +262,14 @@ class LiveLogDisplayFilter:
                 for key, seen in self._state_seen_at.items()
                 if seen >= cutoff
             }
-        return previous is not None and current - previous < (
-            self.state_repeat_window_seconds
-        )
+            if len(self._state_seen_at) > self.max_warning_fingerprints:
+                newest = sorted(
+                    self._state_seen_at.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:self.max_warning_fingerprints]
+                self._state_seen_at = dict(newest)
+        return False
 
     def _suppress(self, category: str, current: float) -> tuple[str, ...]:
         self._pending[category] += 1
@@ -289,8 +300,15 @@ class LiveLogDisplayFilter:
             and _DISPLAY_IMPORTANT_STATE_RE.search(text)
         ):
             fingerprint = self._fingerprint(text)
-            if fingerprint and self._remember_state(fingerprint, current):
-                return self._suppress("repeated_state", current)
+            if fingerprint:
+                state_seen_before = fingerprint in self._state_seen_at
+                if self._remember_state(fingerprint, current):
+                    return self._suppress("repeated_state", current)
+                if state_seen_before:
+                    output = list(self.flush())
+                    self._last_summary_at = current
+                    output.append(text)
+                    return tuple(output)
         category = None
         if normalized_severity not in self._NEVER_FILTER | {"warn"}:
             category = self._routine_category(text, normalized_severity)
@@ -299,8 +317,15 @@ class LiveLogDisplayFilter:
 
         if normalized_severity == "warn":
             fingerprint = self._fingerprint(text)
-            if fingerprint and self._remember_warning(fingerprint, current):
-                return self._suppress("repeated_warning", current)
+            if fingerprint:
+                warning_seen_before = fingerprint in self._warning_seen_at
+                if self._remember_warning(fingerprint, current):
+                    return self._suppress("repeated_warning", current)
+                if warning_seen_before:
+                    output = list(self.flush())
+                    self._last_summary_at = current
+                    output.append(text)
+                    return tuple(output)
 
         output = list(self._summary_if_due(current))
         output.append(text)

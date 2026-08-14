@@ -19,6 +19,8 @@ import math
 import time as _time
 import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _TOOL_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _TOOL_PROJECT_ROOT not in sys.path:
@@ -35,8 +37,19 @@ from core.clock import backtest_asof_ms
 from core.logger import log_event, log_separator
 from tools.ohlcv_cache import get_series
 from bot_utils.futures_funding import count_funding_settlements
-from bot_utils.futures_math import funding_oi_filter
+from bot_utils.futures_math import (
+    distance_to_liquidation_pct,
+    funding_oi_filter,
+)
 from trading.entry_quality import score_futures_entry
+from trading.futures_peak_trail import (
+    peak_trail_hit,
+    validate_peak_trail_config,
+)
+from trading.futures_mfe_fallback import (
+    mfe_fallback_hit,
+    validate_mfe_fallback_config,
+)
 from bot_utils.indicators import (
     atr as ind_atr,
     macd_signal as ind_macd_signal,
@@ -115,6 +128,32 @@ def calc_round_trip(use_maker: bool = False, strategy: str = "TREND") -> float:
     buy = (maker if use_maker else taker) + SLIPPAGE_PER_SIDE
     sell = taker + SLIPPAGE_PER_SIDE
     return buy + sell
+
+
+def _round_trip_cost_rate(
+    params: dict,
+    *,
+    use_maker: bool,
+    strategy: str,
+) -> float:
+    """Return the configured all-in round-trip rate, failing closed on junk.
+
+    ``round_trip_cost_bps`` is research-only input for empirically calibrated
+    fee/slippage scenarios.  The normal production backtest path remains on
+    the historical constants when the override is absent.
+    """
+    raw = params.get("round_trip_cost_bps")
+    if raw is None:
+        return calc_round_trip(use_maker, strategy)
+    if isinstance(raw, bool):
+        raise ValueError("round_trip_cost_bps must be a finite number")
+    try:
+        bps = float(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("round_trip_cost_bps must be a finite number") from exc
+    if not math.isfinite(bps) or not 0.0 <= bps <= 1_000.0:
+        raise ValueError("round_trip_cost_bps must be between 0 and 1000")
+    return bps / 10_000.0
 
 
 def fetch_history(exchange, symbol: str, days: int) -> pd.DataFrame:
@@ -629,6 +668,47 @@ def _holding_hours(entry_time, exit_time) -> float:
     return max(0.0, (_to_epoch_sec(exit_time) - _to_epoch_sec(entry_time)) / 3600.0)
 
 
+def _backtest_utc_datetime(value) -> datetime:
+    return datetime.fromtimestamp(_to_epoch_sec(value), timezone.utc)
+
+
+def _backtest_local_day(value, timezone_name: str) -> str:
+    """Return the runtime daily-PnL bucket for a simulation timestamp."""
+    try:
+        tz = ZoneInfo(str(timezone_name))
+    except (TypeError, ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError("daily_loss_timezone must be a valid IANA timezone") from exc
+    return _backtest_utc_datetime(value).astimezone(tz).strftime("%Y-%m-%d")
+
+
+def _backtest_unrealized_gross(trade: dict, current: float, leverage: float) -> float:
+    entry = float(trade.get("buy") or 0.0)
+    margin = float(trade.get("inv") or 0.0)
+    if entry <= 0.0 or margin <= 0.0 or current <= 0.0:
+        return 0.0
+    move = (
+        (entry - current) / entry
+        if trade.get("side", "LONG") == "SHORT"
+        else (current - entry) / entry
+    )
+    return margin * leverage * move
+
+
+def _own_momentum_replay_blocked(
+    recent_full_rows: list[tuple[float, float]],
+    window: int,
+    minimum_loss_pct: float,
+) -> bool:
+    """Mirror risk_manager's terminal-row PnL/invested deadband exactly."""
+    if len(recent_full_rows) < window:
+        return False
+    selected = recent_full_rows[-window:]
+    total_net = sum(row[0] for row in selected)
+    total_invested = sum(row[1] for row in selected)
+    threshold = -(minimum_loss_pct / 100.0) * total_invested
+    return total_invested > 0.0 and total_net < threshold
+
+
 def _funding_cost(
     funding_8h: float,
     side: str,
@@ -745,6 +825,51 @@ def _backtest_position_limit(strategy: str) -> float:
     return 2500.0 if str(strategy).upper() in {"TREND", "FUTREND"} else 500.0
 
 
+def _backtest_cooldown_expiry(now, minutes: int):
+    """Return an expiry in the timestamp domain used by the simulation."""
+    if isinstance(now, bool):
+        raise TypeError("backtest timestamp cannot be boolean")
+    if isinstance(now, (int, float)):
+        # Historical backtester integer timestamps are Unix milliseconds.
+        return now + minutes * 60_000
+    return now + timedelta(minutes=minutes)
+
+
+def _liq_safety_exit_price(
+    *,
+    side: str,
+    entry: float,
+    liquidation_price: float,
+    safety_pct: float,
+) -> float | None:
+    if liquidation_price <= 0.0 or not 0.0 < safety_pct <= 100.0:
+        return None
+    initial_distance = distance_to_liquidation_pct(
+        entry, liquidation_price, side
+    )
+    if initial_distance <= 0.0:
+        return None
+    remaining = initial_distance * safety_pct / 100.0 / 100.0
+    denominator = 1.0 - remaining if side == "LONG" else 1.0 + remaining
+    if denominator <= 0.0:
+        return None
+    price = liquidation_price / denominator
+    return price if math.isfinite(price) and price > 0.0 else None
+
+
+def _protective_exit_requires_cooldown(reason: str, net: float) -> bool:
+    """Apply the runtime outcome-gated cooldown classifier to replay reasons."""
+    runtime_reason = {
+        "liquidation": "Liq protection",
+        "stoploss": "Stop-Loss",
+        "trailing": "Trailing Stop",
+        "break_even": "Break-Even Stop",
+    }.get(str(reason), str(reason))
+    from trading.cooldown_utils import should_cooldown_after_exit
+
+    return should_cooldown_after_exit(runtime_reason, net)
+
+
 def simulate_fast(
     indexed: dict,
     all_times: list,
@@ -753,7 +878,11 @@ def simulate_fast(
     params: dict = None,
 ) -> dict:
     p = params or {}
-    RT = calc_round_trip(use_maker, strategy)
+    RT = _round_trip_cost_rate(
+        p,
+        use_maker=use_maker,
+        strategy=strategy,
+    )
     defaults = STRATEGY_DEFAULTS.get(strategy, STRATEGY_DEFAULTS["TREND"])
 
     leverage = _bounded_backtest_float(
@@ -771,6 +900,13 @@ def simulate_fast(
     trail = _finite_backtest_value(
         p.get("trailing_distance", defaults["trail"]), defaults["trail"]
     )
+    post_partial_trail = _finite_backtest_value(
+        p.get("post_partial_trailing_distance", trail), trail
+    )
+    if post_partial_trail <= 0.0 or (
+        act > 0.0 and post_partial_trail >= act
+    ):
+        post_partial_trail = trail
     default_stop = -abs(defaults["stop"])
     stop_loss = _finite_backtest_value(p.get("stop_loss", default_stop), default_stop)
     part_pct = _finite_backtest_value(
@@ -820,6 +956,40 @@ def simulate_fast(
         1,
         50,
     )
+    cooldown_after_stop_minutes = _bounded_backtest_int(
+        p.get("cooldown_after_stop_minutes", 0),
+        0,
+        0,
+        1440,
+    )
+    peak_trail_config, peak_trail_error = validate_peak_trail_config(
+        enabled=(
+            strategy == "FUTURES"
+            and p.get("pre_activation_giveback_stop_enabled", False)
+        ),
+        activation_mfe_pct=p.get("pre_activation_min_mfe_pct", 1.5),
+        giveback_pct=p.get("pre_activation_giveback_pct", 0.75),
+    )
+    if peak_trail_error:
+        raise ValueError(f"invalid pre-activation giveback config: {peak_trail_error}")
+    mfe_fallback_config, mfe_fallback_error = validate_mfe_fallback_config(
+        enabled=(
+            strategy == "FUTURES"
+            and p.get("mfe_fallback_stop_enabled", False)
+        ),
+        min_age_minutes=p.get("mfe_fallback_min_age_minutes", 45.0),
+        min_mfe_pct=p.get("mfe_fallback_min_mfe_pct", 0.8),
+        exit_move_pct=p.get("mfe_fallback_exit_move_pct", -1.5),
+        initial_stop_loss_pct=stop_loss,
+    )
+    if mfe_fallback_error:
+        raise ValueError(f"invalid MFE fallback config: {mfe_fallback_error}")
+    liq_safety_pct = _bounded_backtest_float(
+        p.get("liq_safety_pct", 0.0),
+        0.0,
+        0.0,
+        100.0,
+    )
 
     #  Own-momentum overlay (opt-in)  mirrors risk_manager.own_momentum_blocked:
     # block NEW entries while the last `om_window` FULL closes are net-negative,
@@ -838,6 +1008,29 @@ def simulate_fast(
         3,
         50,
     )
+    om_min_loss_pct = max(
+        0.0,
+        _finite_backtest_value(
+            p.get("own_momentum_min_loss_pct", 0.5),
+            0.5,
+        ),
+    )
+    daily_loss_limit = _finite_backtest_value(
+        p.get("max_daily_loss", 0.0),
+        0.0,
+    )
+    daily_loss_on = strategy == "FUTURES" and daily_loss_limit < 0.0
+    daily_loss_hard_mult = _bounded_backtest_float(
+        p.get("max_daily_loss_hard_mult", 1.5),
+        1.5,
+        1.0,
+        5.0,
+    )
+    daily_loss_timezone = str(p.get("daily_loss_timezone", "UTC"))
+    if daily_loss_on:
+        # Resolve once before processing any events; invalid runtime evidence
+        # must fail closed instead of silently moving the reset boundary.
+        _backtest_local_day(0, daily_loss_timezone)
 
     #  Macro-regime gate (opt-in)  only go LONG when BTC is above its EMA50
     # (uptrend) and only SHORT when BTC is below it. Momentum-long bleeds in
@@ -846,17 +1039,9 @@ def simulate_fast(
     regime_on = _truthy(p.get("regime_filter", False))
     regime_min = _finite_backtest_value(p.get("regime_min", 0.0) or 0.0, 0.0)
 
-    #  Entry-signal reworks ported from the live bot (#2/#3/#5)
-    # FUTURES only  these mirror _assess_entry_signal's HARD gates so the
-    # optimizer tests the same entry logic as live. Toggle with the SAME env
-    # vars as live (default ON, lenient). #1 (LLM veto) and #4 (funding) cannot
-    # be modelled here (no LLM / no funding data) and are simply not applied.
-    def _flag_on(_name):
-        return os.getenv(_name, "1").strip().lower() not in ("0", "false", "no", "off")
-
-    def _flag_val(_name, _d):
-        return _backtest_env_float(_name, _d)
-
+    # Entry-signal hard gates ported from the live bot (#2/#3/#5).  Their
+    # resolved runtime values must arrive through params so workstation env
+    # drift cannot alter a hash-bound replay after its run ID was computed.
     _is_fut = strategy == "FUTURES"
     _screener_parity_on = _is_fut and _truthy(
         p.get("futures_screener_parity", False)
@@ -871,38 +1056,192 @@ def simulate_fast(
             0.0,
             100.0,
         )
-    _ext_on = _is_fut and _flag_on("FUT_EXT_FILTER")
-    _ext_max = _flag_val("FUT_MAX_EXT_PCT", 18.0)
-    _vol_on = _is_fut and _flag_on("FUT_VOL_FILTER")
-    _vol_min = _flag_val("FUT_MIN_VOL_SURGE", 1.0)
-    _rs_on = _is_fut and _flag_on("FUT_RS_FILTER")
-    _rs_min = _flag_val("FUT_MIN_RS_PCT", -2.0)
+    _ext_on = _is_fut and _truthy(
+        p.get("futures_extension_filter", True)
+    )
+    _ext_max = _finite_backtest_value(
+        p.get("futures_max_extension_pct", 18.0), 18.0
+    )
+    _vol_on = _is_fut and _truthy(
+        p.get("futures_volume_filter", True)
+    )
+    _vol_min = _finite_backtest_value(
+        p.get("futures_min_volume_surge", 1.0), 1.0
+    )
+    _rs_on = _is_fut and _truthy(
+        p.get("futures_relative_strength_filter", True)
+    )
+    _rs_min = _finite_backtest_value(
+        p.get("futures_min_relative_strength_pct", -2.0), -2.0
+    )
+    _long_btc_floor_raw = p.get("futures_long_min_btc_change_pct")
+    _long_btc_floor = None
+    if _long_btc_floor_raw is not None:
+        if isinstance(_long_btc_floor_raw, bool):
+            raise ValueError(
+                "futures_long_min_btc_change_pct must be a finite number"
+            )
+        try:
+            _long_btc_floor = float(_long_btc_floor_raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "futures_long_min_btc_change_pct must be a finite number"
+            ) from exc
+        if not math.isfinite(_long_btc_floor):
+            raise ValueError(
+                "futures_long_min_btc_change_pct must be a finite number"
+            )
+    _allow_long = p.get("futures_allow_long", True)
+    _allow_short = p.get("futures_allow_short", True)
+    if not isinstance(_allow_long, bool) or not isinstance(_allow_short, bool):
+        raise ValueError("futures side permissions must be boolean")
+    if _is_fut and not (_allow_long or _allow_short):
+        raise ValueError("futures side permissions cannot disable both sides")
     # BTC series for the relative-strength gate (#3)  first BTC/* symbol found.
     _btc_sym = next((s for s in indexed if s.upper().startswith("BTC/")), None)
 
     open_trades = {}
+    cooldown_until = {}
     closed_trades = []
     next_position_id = 1
     total_costs = 0.0
     total_gross = 0.0
     liquidations = 0
-    # Rolling NET of fully-closed (non-partial) trades for the own-momentum gate.
-    recent_full_nets: list = []
+    # Runtime get_recent_trades() returns only terminal DB rows.  In particular,
+    # a prior partial fragment is not folded into either terminal PnL or margin.
+    recent_full_rows: list[tuple[float, float]] = []
+    daily_realized_by_day: dict[str, float] = {}
+    daily_loss_soft_active = False
+    daily_loss_hard_active = False
+    entry_filter_counts = {
+        key: 0
+        for key in (
+            "signals",
+            "already_open",
+            "screener_parity",
+            "capture_policy",
+            "regime",
+            "side_permission",
+            "long_btc_floor",
+            "extension",
+            "volume_surge",
+            "relative_strength",
+            "candidates",
+            "positions_opened",
+        )
+    }
+    risk_gate_counts = {
+        "own_momentum_blocked_scans": 0,
+        "daily_soft_trips": 0,
+        "daily_soft_blocked_scans": 0,
+        "daily_hard_trips": 0,
+        "daily_hard_positions_closed": 0,
+    }
+
+    def _evaluate_daily_loss(now) -> None:
+        nonlocal daily_loss_soft_active, daily_loss_hard_active
+        if not daily_loss_on:
+            return
+        day = _backtest_local_day(now, daily_loss_timezone)
+        realized_today = daily_realized_by_day.get(day, 0.0)
+        unrealized_all = 0.0
+        unrealized_today = 0.0
+        for sym, trade in open_trades.items():
+            tick = indexed.get(sym, {}).get(now)
+            if tick is None:
+                continue
+            unrealized = _backtest_unrealized_gross(
+                trade, float(tick["price"]), leverage
+            )
+            unrealized_all += unrealized
+            if _backtest_local_day(
+                trade.get("entry_now", now), daily_loss_timezone
+            ) == day:
+                unrealized_today += unrealized
+        if (
+            realized_today + unrealized_today <= daily_loss_limit
+            and not daily_loss_soft_active
+        ):
+            # SafeMode remains active for the process lifetime once tripped.
+            daily_loss_soft_active = True
+            risk_gate_counts["daily_soft_trips"] += 1
+        if (
+            realized_today + unrealized_all
+            <= daily_loss_limit * daily_loss_hard_mult
+            and not daily_loss_hard_active
+        ):
+            daily_loss_hard_active = True
+            risk_gate_counts["daily_hard_trips"] += 1
+
+    def _flatten_for_daily_loss(now) -> None:
+        nonlocal total_costs, total_gross
+        if not daily_loss_hard_active:
+            return
+        day = _backtest_local_day(now, daily_loss_timezone)
+        for sym, trade in list(open_trades.items()):
+            tick = indexed.get(sym, {}).get(now)
+            if tick is None:
+                continue
+            exit_price = float(tick["price"])
+            entry = float(trade.get("buy") or 0.0)
+            if entry <= 0.0 or exit_price <= 0.0:
+                continue
+            side = trade.get("side", "LONG")
+            profit_pct = (
+                (entry - exit_price) / entry * 100.0
+                if side == "SHORT"
+                else (exit_price - entry) / entry * 100.0
+            )
+            notional = float(trade.get("inv") or 0.0) * leverage
+            gross_p = notional * profit_pct / 100.0
+            fees = notional * RT
+            funding = _funding_cost(
+                funding_8h,
+                side,
+                notional,
+                trade.get("entry_now", now),
+                now,
+                symbol=sym,
+                funding_timeline=funding_timeline,
+            )
+            rec = _closed_trade_record(
+                trade,
+                now,
+                "daily_loss_hard",
+                profit_pct,
+                gross_p,
+                fees,
+                funding,
+                notional,
+                False,
+                False,
+            )
+            closed_trades.append(rec)
+            total_costs += rec["cost"]
+            total_gross += gross_p
+            recent_full_rows.append(
+                (rec["net"], float(trade.get("inv") or 0.0))
+            )
+            daily_realized_by_day[day] = (
+                daily_realized_by_day.get(day, 0.0) + rec["net"]
+            )
+            risk_gate_counts["daily_hard_positions_closed"] += 1
+            del open_trades[sym]
 
     for now in all_times:
+        # Exchange liquidation has priority over every software exit.  Update
+        # excursions once here, then remove liquidated positions before the
+        # runtime-equivalent daily-loss calculation.
         for sym in list(open_trades.keys()):
             tick = indexed.get(sym, {}).get(now)
             if tick is None:
                 continue
-
+            d = open_trades[sym]
+            side = d.get("side", "LONG")
             curr = tick["price"]
             bar_high = tick.get("high", curr)
             bar_low = tick.get("low", curr)
-            d = open_trades[sym]
-            side = d.get("side", "LONG")
             _update_excursions(d, side, bar_high, bar_low)
-
-            # Liquidation check FIRST (before any other exit logic).
             if leverage > 1.0:
                 liq = d.get("liq_price")
                 if liq is not None:
@@ -940,13 +1279,45 @@ def simulate_fast(
                         )
                         closed_trades.append(rec)
                         total_costs += rec["cost"]
-                        total_gross += abs(gross_p)
+                        total_gross += gross_p
                         liquidations += 1
-                        recent_full_nets.append(
-                            d.get("realized_net", 0.0) + rec["net"]
+                        recent_full_rows.append(
+                            (rec["net"], float(d.get("inv") or 0.0))
                         )
+                        day = _backtest_local_day(now, daily_loss_timezone)
+                        daily_realized_by_day[day] = (
+                            daily_realized_by_day.get(day, 0.0) + rec["net"]
+                        )
+                        if (
+                            cooldown_after_stop_minutes > 0
+                            and _protective_exit_requires_cooldown(
+                                "liquidation", rec["net"]
+                            )
+                        ):
+                            cooldown_until[sym] = _backtest_cooldown_expiry(
+                                now, cooldown_after_stop_minutes
+                            )
                         del open_trades[sym]
                         continue
+
+        _evaluate_daily_loss(now)
+        _flatten_for_daily_loss(now)
+
+        # A hard trip is process-lifetime terminal for new entries. Positions
+        # lacking a current captured price remain open and are retried next tick.
+        if daily_loss_hard_active:
+            continue
+
+        for sym in list(open_trades.keys()):
+            tick = indexed.get(sym, {}).get(now)
+            if tick is None:
+                continue
+
+            curr = tick["price"]
+            bar_high = tick.get("high", curr)
+            bar_low = tick.get("low", curr)
+            d = open_trades[sym]
+            side = d.get("side", "LONG")
 
             prev_highest = d["highest"]
             prev_lowest = d.get("lowest", d["buy"])
@@ -966,6 +1337,17 @@ def simulate_fast(
             curr_highest = max(prev_highest, bar_high)
             curr_lowest = min(prev_lowest, bar_low)
             full_exits = []
+            liq_safety_price = _liq_safety_exit_price(
+                side=side,
+                entry=d["buy"],
+                liquidation_price=d.get("liq_price") or 0.0,
+                safety_pct=liq_safety_pct,
+            )
+            if liq_safety_price is not None:
+                if side == "SHORT" and bar_high >= liq_safety_price:
+                    full_exits.append(("liquidation_protection", liq_safety_price))
+                elif side != "SHORT" and bar_low <= liq_safety_price:
+                    full_exits.append(("liquidation_protection", liq_safety_price))
             if strategy in ("TREND", "FUTURES", "SPOT"):
                 if side == "SHORT":
                     sl_price = d["buy"] * (1 - stop_loss / 100)
@@ -980,13 +1362,34 @@ def simulate_fast(
                     full_exits.append(("break_even", d["buy"]))
                 elif side != "SHORT" and bar_low <= d["buy"]:
                     full_exits.append(("break_even", d["buy"]))
+            if not d["partial"] and not d.get("break_even"):
+                current_move = (
+                    (d["buy"] - curr) / d["buy"] * 100.0
+                    if side == "SHORT"
+                    else (curr - d["buy"]) / d["buy"] * 100.0
+                )
+                if peak_trail_hit(
+                    move_pct=current_move,
+                    mfe_pct=d.get("mfe_pct", 0.0),
+                    config=peak_trail_config,
+                ):
+                    full_exits.append(("pre_activation_giveback", curr))
+                if mfe_fallback_hit(
+                    buy_time=_backtest_utc_datetime(d["entry_now"]),
+                    move_pct=current_move,
+                    mfe_pct=d.get("mfe_pct", 0.0),
+                    config=mfe_fallback_config,
+                    now=_backtest_utc_datetime(now),
+                ):
+                    full_exits.append(("aged_mfe_fallback", curr))
             if d.get("mfe_pct", 0.0) >= act:
+                effective_trail = post_partial_trail if d["partial"] else trail
                 if side == "SHORT":
-                    trail_level = curr_lowest * (1 + trail / 100)
+                    trail_level = curr_lowest * (1 + effective_trail / 100)
                     if bar_high >= trail_level:
                         full_exits.append(("trailing", trail_level))
                 else:
-                    trail_level = curr_highest * (1 - trail / 100)
+                    trail_level = curr_highest * (1 - effective_trail / 100)
                     if bar_low <= trail_level:
                         full_exits.append(("trailing", trail_level))
             if full_exits:
@@ -1026,7 +1429,20 @@ def simulate_fast(
                 closed_trades.append(rec)
                 total_costs += rec["cost"]
                 total_gross += gross_p
-                recent_full_nets.append(d.get("realized_net", 0.0) + rec["net"])
+                recent_full_rows.append(
+                    (rec["net"], float(d.get("inv") or 0.0))
+                )
+                day = _backtest_local_day(now, daily_loss_timezone)
+                daily_realized_by_day[day] = (
+                    daily_realized_by_day.get(day, 0.0) + rec["net"]
+                )
+                if (
+                    cooldown_after_stop_minutes > 0
+                    and _protective_exit_requires_cooldown(reason, rec["net"])
+                ):
+                    cooldown_until[sym] = _backtest_cooldown_expiry(
+                        now, cooldown_after_stop_minutes
+                    )
                 del open_trades[sym]
                 continue
 
@@ -1059,6 +1475,10 @@ def simulate_fast(
                 closed_trades.append(rec)
                 total_costs += rec["cost"]
                 total_gross += gross_p
+                day = _backtest_local_day(now, daily_loss_timezone)
+                daily_realized_by_day[day] = (
+                    daily_realized_by_day.get(day, 0.0) + rec["net"]
+                )
                 d["realized_net"] = d.get("realized_net", 0.0) + rec["net"]
                 d["partial"] = True
                 d["inv"] -= sa
@@ -1070,6 +1490,14 @@ def simulate_fast(
             d["highest"] = curr_highest
             d["lowest"] = curr_lowest
 
+        # A close/partial can cross the limit through realized fees or funding
+        # even when pre-exit gross unrealized PnL did not. Runtime's entry gate
+        # reads the freshly booked daily bucket, so replay must re-evaluate here.
+        _evaluate_daily_loss(now)
+        _flatten_for_daily_loss(now)
+        if daily_loss_hard_active:
+            continue
+
         # Buy check
         if p.get("capture_replay") is True and not any(
             tick_map.get(now, {}).get("scan_due") is True
@@ -1078,14 +1506,18 @@ def simulate_fast(
             continue
         if len(open_trades) >= max_open_trades:
             continue
+        if daily_loss_soft_active:
+            risk_gate_counts["daily_soft_blocked_scans"] += 1
+            continue
 
         # Own-momentum overlay (opt-in): exits above already ran; only block
         # NEW entries while the last `om_window` full closes are net-negative.
-        if (
-            om_on
-            and len(recent_full_nets) >= om_window
-            and sum(recent_full_nets[-om_window:]) < 0
+        if om_on and _own_momentum_replay_blocked(
+            recent_full_rows,
+            om_window,
+            om_min_loss_pct,
         ):
+            risk_gate_counts["own_momentum_blocked_scans"] += 1
             continue
 
         candidates = []
@@ -1093,6 +1525,11 @@ def simulate_fast(
             tick = tick_map.get(now)
             if tick is None or tick["change"] is None:
                 continue
+            cooldown_expiry = cooldown_until.get(sym)
+            if cooldown_expiry is not None:
+                if now < cooldown_expiry:
+                    continue
+                cooldown_until.pop(sym, None)
             chg = tick["change"]
             side = None
             if min_pump <= chg <= MAX_24H_PUMP:
@@ -1103,7 +1540,9 @@ def simulate_fast(
                     side = "SHORT"
             if side is None:
                 continue
+            entry_filter_counts["signals"] += 1
             if sym in open_trades:
+                entry_filter_counts["already_open"] += 1
                 continue
 
             if _screener_parity_on:
@@ -1112,6 +1551,7 @@ def simulate_fast(
                     side,
                     chg,
                 ):
+                    entry_filter_counts["screener_parity"] += 1
                     continue
             if p.get("capture_replay") is True:
                 if not _passes_capture_replay_policy(
@@ -1119,6 +1559,7 @@ def simulate_fast(
                     side,
                     minimum_quality_score=_capture_quality_min,
                 ):
+                    entry_filter_counts["capture_policy"] += 1
                     continue
 
             #  Macro-regime gate: don't fight BTC's trend
@@ -1127,25 +1568,45 @@ def simulate_fast(
                 if _bt is not None:
                     _btrend = _bt.get("ema_ratio", 0.0)
                     if side == "LONG" and _btrend < regime_min:
+                        entry_filter_counts["regime"] += 1
                         continue
                     if side == "SHORT" and _btrend > -regime_min:
+                        entry_filter_counts["regime"] += 1
                         continue
 
             #  Ported entry filters (#2/#3/#5)  FUTURES only
             if _is_fut:
                 _is_long = side == "LONG"
+                if (_is_long and not _allow_long) or (
+                    not _is_long and not _allow_short
+                ):
+                    entry_filter_counts["side_permission"] += 1
+                    continue
+                if (
+                    _is_long
+                    and _long_btc_floor is not None
+                    and _finite_backtest_value(
+                        tick.get("btc_change"), -math.inf
+                    )
+                    < _long_btc_floor
+                ):
+                    entry_filter_counts["long_btc_floor"] += 1
+                    continue
                 if _ext_on:
                     _er = tick.get("ema_ratio", 0.0)
                     _ext = _er if _is_long else -_er
                     if _ext > _ext_max:
+                        entry_filter_counts["extension"] += 1
                         continue  # #2 over-extended  skip
                 if _vol_on and tick.get("vol_surge", 1.0) < _vol_min:
+                    entry_filter_counts["volume_surge"] += 1
                     continue  # #5 weak volume  skip
                 if _rs_on and _btc_sym is not None:
                     _btc_c = indexed[_btc_sym].get(now, {}).get("change")
                     if _btc_c is not None:
                         _rs = (chg - _btc_c) if _is_long else (_btc_c - chg)
                         if _rs < _rs_min:
+                            entry_filter_counts["relative_strength"] += 1
                             continue  # #3 weak rel-strength  skip
 
             entry_price = tick.get(
@@ -1153,6 +1614,7 @@ def simulate_fast(
                 tick.get("next_open"),
             )
             candidates.append((abs(chg), sym, tick["price"], entry_price, side))
+            entry_filter_counts["candidates"] += 1
 
         candidates.sort(reverse=True)
         for _, sym, signal_price, next_open, side in candidates[:top_n_per_scan]:
@@ -1178,6 +1640,7 @@ def simulate_fast(
                 # precompute liquidation price at open
                 "liq_price": _liq_price(side, fill_price, leverage),
             }
+            entry_filter_counts["positions_opened"] += 1
             next_position_id += 1
 
     if all_times and open_trades:
@@ -1231,6 +1694,8 @@ def simulate_fast(
 
     stats = _compute_stats(closed_trades, total_costs, total_gross)
     stats["liquidation_count"] = liquidations
+    stats["entry_filter_counts"] = entry_filter_counts
+    stats["risk_gate_counts"] = risk_gate_counts
     return stats
 
 
@@ -1258,6 +1723,9 @@ def _empty_backtest_stats(invalid_reason: str | None = None) -> dict:
         # Keys consumed by the optimizer's deep-validation suite
         # (outlier / monte-carlo). Additive  no existing reader.
         "trade_count": 0,
+        "full_trades": 0,
+        "gross": 0.0,
+        "costs": 0.0,
         "best_trade": 0.0,
         "avg_profit_pct": 0.0,
         "std_profit_pct": 0.0,

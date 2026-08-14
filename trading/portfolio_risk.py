@@ -85,6 +85,7 @@ class PortfolioDecision:
     size_multiplier: float
     gross_after: float
     net_after: float
+    reservation_ceiling_usdt: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -220,6 +221,7 @@ def evaluate_entry(
     cluster: str = "other",
     beta: float = 1.0,
     strategy_multiplier: float = 1.0,
+    pending_reserved_notional: float = 0.0,
     now: datetime | None = None,
 ) -> PortfolioDecision:
     """Evaluate a new entry; exits do not call this function."""
@@ -228,6 +230,7 @@ def evaluate_entry(
     requested_value = _finite_number(requested_notional)
     multiplier_value = _finite_number(strategy_multiplier)
     beta_value = _finite_number(beta)
+    pending_reserved_value = _finite_number(pending_reserved_notional)
     requested = max(0.0, requested_value or 0.0)
     multiplier = max(0.0, min(1.0, multiplier_value or 0.0))
     if requested_value is None or requested_value < 0.0:
@@ -237,6 +240,9 @@ def evaluate_entry(
     if beta_value is None:
         reasons.append("candidate beta is invalid")
         beta_value = 0.0
+    if pending_reserved_value is None or pending_reserved_value < 0.0:
+        reasons.append("pending reserved notional is invalid")
+        pending_reserved_value = 0.0
     normalized_side = _safe_upper_text(side)
     if normalized_side not in {"LONG", "SHORT"}:
         reasons.append("candidate side is invalid")
@@ -305,6 +311,48 @@ def evaluate_entry(
         reasons.append("portfolio snapshot timestamp is invalid")
     if limits_valid and snapshot_age > max_age:
         reasons.append("portfolio snapshot is stale")
+    reservation_ceiling = 0.0
+    if not reasons and snapshot.known and equity > 0.0:
+        side_sign = _side_sign(side)
+        cluster_before = sum(
+            notional
+            for position, notional, _position_beta in position_rows
+            if position.cluster == cluster
+        )
+        beta_before = sum(
+            _side_sign(position.side) * notional * position_beta
+            for position, notional, position_beta in position_rows
+        )
+        beta_coefficient = side_sign * beta_value
+        capacities = [
+            max_gross / 100.0 * equity - gross,
+            (free_value or 0.0) - min_free / 100.0 * equity,
+            max_cluster / 100.0 * equity - cluster_before,
+            max_net / 100.0 * equity - side_sign * net,
+        ]
+        if beta_coefficient > 0.0:
+            capacities.append(
+                (max_beta / 100.0 * equity - beta_before)
+                / beta_coefficient
+            )
+        elif beta_coefficient < 0.0:
+            capacities.append(
+                (max_beta / 100.0 * equity + beta_before)
+                / -beta_coefficient
+            )
+        try:
+            finite_capacities = [
+                value for value in capacities if math.isfinite(value)
+            ]
+            if len(finite_capacities) == len(capacities):
+                reservation_ceiling = pending_reserved_value + max(
+                    0.0,
+                    min(finite_capacities),
+                )
+                if not math.isfinite(reservation_ceiling):
+                    reservation_ceiling = 0.0
+        except (TypeError, ValueError, OverflowError):
+            reservation_ceiling = 0.0
     if equity <= 0.0:
         reasons.append("account equity is unavailable")
     elif limits_valid:
@@ -339,4 +387,5 @@ def evaluate_entry(
         size_multiplier=multiplier if allowed else 0.0,
         gross_after=gross_after,
         net_after=net_after,
+        reservation_ceiling_usdt=reservation_ceiling,
     )

@@ -359,6 +359,10 @@ def verify_replay_dataset(dataset_root: str | Path) -> dict:
     if fingerprint != _sha256_bytes(_canonical_bytes(payload)) or root.name != fingerprint:
         raise ValueError("replay dataset fingerprint mismatch")
     expected = {"dataset_manifest.json"}
+    manifest_paths = set()
+    series_identities = set()
+    series_timeframes = {}
+    funding_symbols = set()
     for group in ("overview", "series", "funding"):
         items = payload.get(group)
         if not isinstance(items, list) or not items:
@@ -366,16 +370,62 @@ def verify_replay_dataset(dataset_root: str | Path) -> dict:
         for item in items:
             if not isinstance(item, dict) or not isinstance(item.get("path"), str):
                 raise ValueError(f"invalid replay {group} manifest entry")
-            path = (root / item["path"]).resolve()
+            relative = item["path"]
+            if relative in manifest_paths:
+                raise ValueError("replay dataset manifest paths must be unique")
+            manifest_paths.add(relative)
+            if group == "series":
+                symbol = item.get("symbol")
+                timeframe = item.get("timeframe")
+                if (
+                    not isinstance(symbol, str)
+                    or not symbol.strip()
+                    or timeframe not in _TIMEFRAME_MS
+                ):
+                    raise ValueError("invalid replay series identity")
+                identity = (symbol, timeframe)
+                if identity in series_identities:
+                    raise ValueError("replay series identities must be unique")
+                series_identities.add(identity)
+                series_timeframes.setdefault(symbol, set()).add(timeframe)
+                expected_name = hashlib.sha256(
+                    f"{symbol}\0{timeframe}".encode()
+                ).hexdigest()
+                if relative != f"series/{expected_name}.json":
+                    raise ValueError("replay series path conflicts with identity")
+            elif group == "funding":
+                symbol = item.get("symbol")
+                if not isinstance(symbol, str) or not symbol.strip():
+                    raise ValueError("invalid replay funding identity")
+                if symbol in funding_symbols:
+                    raise ValueError("replay funding identities must be unique")
+                funding_symbols.add(symbol)
+                expected_name = hashlib.sha256(symbol.encode("utf-8")).hexdigest()
+                if relative != f"funding/{expected_name}.json":
+                    raise ValueError("replay funding path conflicts with identity")
+            elif not relative.startswith("overview/"):
+                raise ValueError("replay overview path conflicts with group")
+            candidate = root / relative
+            if candidate.is_symlink() or candidate.parent.is_symlink():
+                raise ValueError(f"replay dataset file missing or linked: {relative}")
+            path = candidate.resolve()
             try:
                 path.relative_to(root)
             except ValueError as exc:
                 raise ValueError("replay dataset path escapes root") from exc
-            if path.is_symlink() or not path.is_file():
-                raise ValueError(f"replay dataset file missing: {item['path']}")
+            if not path.is_file():
+                raise ValueError(f"replay dataset file missing: {relative}")
             if path.stat().st_size != item.get("bytes") or _sha256_file(path) != item.get("sha256"):
-                raise ValueError(f"replay dataset file fingerprint mismatch: {item['path']}")
-            expected.add(item["path"])
+                raise ValueError(f"replay dataset file fingerprint mismatch: {relative}")
+            expected.add(relative)
+    required_timeframes = set(_TIMEFRAME_MS)
+    if not series_timeframes or any(
+        timeframes != required_timeframes
+        for timeframes in series_timeframes.values()
+    ):
+        raise ValueError("replay dataset timeframe coverage is incomplete")
+    if funding_symbols != set(series_timeframes):
+        raise ValueError("replay funding symbols must match OHLCV symbols")
     actual = {
         path.relative_to(root).as_posix()
         for path in root.rglob("*")
@@ -664,7 +714,6 @@ def build_capture_replay_index(
             "historical listing/active/RWA metadata predating recorder schema is unavailable",
             "intra-scan extrema use captured last prices, not continuous trades",
             "runtime risk/bad-hour/regime gates are not reconstructed",
-            "pre-activation giveback and aged-MFE exits remain outside backtester lifecycle",
         ],
     }
     return indexed, sorted({time for ticks in indexed.values() for time in ticks}), report

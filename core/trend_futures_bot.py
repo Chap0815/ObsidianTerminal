@@ -1089,6 +1089,10 @@ class TrendFuturesBot(FuturesBot):
                 intent_id=entry_id,
                 notional_usdt=float(margin) * float(lev_cap),
                 mode=entry_mode,
+                reservation_ceiling_usdt=(
+                    admission.portfolio.reservation_ceiling_usdt
+                    if portfolio_mode == "enforce" else None
+                ),
             ):
                 log_event(f"[{self.BOT_NAME}] {base}: claimed by another bot "
                           f" skip", "WAIT")

@@ -268,6 +268,52 @@ def _read_config_json(path: str) -> dict:
     return json.loads(raw.decode("utf-8-sig"))
 
 
+def merge_runtime_config(
+    bot_name: str,
+    defaults: Dict[str, Any],
+    root_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Apply the exact runtime merge/clamp contract to an already-read root.
+
+    Keeping this transformation pure lets research tools bind a specific
+    ``bot_config.json`` snapshot without redirecting the live loader's global
+    path or reimplementing its coercion and safety clamps.
+    """
+    if not isinstance(root_cfg, dict):
+        raise ValueError("config root must be an object")
+    user_cfg = root_cfg.get(bot_name, {})
+    if not isinstance(user_cfg, dict):
+        raise ValueError(f"{bot_name} section must be an object")
+
+    cfg = dict(defaults)
+    for key in defaults:
+        if key not in user_cfg:
+            continue
+        value = user_cfg[key]
+        # This is deliberately the same tolerant, type-aware conversion used
+        # by the runtime loader. Invalid values survive until the shared clamp
+        # below replaces them with the fail-safe per-key default.
+        try:
+            if isinstance(value, bool):
+                cfg[key] = value
+            elif isinstance(defaults.get(key), bool):
+                cfg[key] = _coerce_bool(value, bool(defaults.get(key)))
+            elif key in _INT_FIELDS:
+                cfg[key] = int(value)
+            elif isinstance(value, str):
+                cfg[key] = value
+            else:
+                cfg[key] = float(value)
+        except (TypeError, ValueError, OverflowError):
+            cfg[key] = value
+
+    for key in _CLAMPS:
+        if key in cfg:
+            cfg[key] = _clamp(key, cfg[key])
+    _enforce_invariants(cfg)
+    return cfg
+
+
 def load_runtime_config(bot_name: str, defaults: Dict[str, Any]) -> Dict[str, Any]:
     """Load bot_config.json overrides for `bot_name`, falling back to defaults.
 
@@ -286,50 +332,17 @@ def load_runtime_config(bot_name: str, defaults: Dict[str, Any]) -> Dict[str, An
     dict
         Merged config  a new dict, safe to mutate.
     """
-    cfg = dict(defaults)
     config_path = _resolve_config_path()
-
-    if os.path.exists(config_path):
-        try:
-            root_cfg = _read_config_json(config_path)
-            if not isinstance(root_cfg, dict):
-                raise ValueError("config root must be an object")
-            user_cfg = root_cfg.get(bot_name, {})
-            if not isinstance(user_cfg, dict):
-                raise ValueError(f"{bot_name} section must be an object")
-        except Exception as e:
-            raise RuntimeError(
-                f"bot_config.json corrupt or unreadable: {e}. "
-                f"Refusing to start {bot_name} with defaults."
-            ) from e
-        for k in defaults:
-            if k not in user_cfg:
-                continue
-            v = user_cfg[k]
-            # Type-aware + per-key tolerant. A non-numeric value (e.g.
-            # TREND_UNIVERSE="BTC,ETH,...") must NOT blow up the WHOLE
-            # config load. Strings/bools pass through; only numeric fields
-            # are coerced.
-            try:
-                if isinstance(v, bool):
-                    cfg[k] = v
-                elif isinstance(defaults.get(k), bool):
-                    cfg[k] = _coerce_bool(v, bool(defaults.get(k)))
-                elif k in _INT_FIELDS:
-                    cfg[k] = int(v)
-                elif isinstance(v, str):
-                    cfg[k] = v
-                else:
-                    cfg[k] = float(v)
-            except (TypeError, ValueError, OverflowError):
-                cfg[k] = v
-
-    for _k in _CLAMPS:
-        if _k in cfg:
-            cfg[_k] = _clamp(_k, cfg[_k])
-    _enforce_invariants(cfg)
-
-    return cfg
+    if not os.path.exists(config_path):
+        return merge_runtime_config(bot_name, defaults, {})
+    try:
+        root_cfg = _read_config_json(config_path)
+        return merge_runtime_config(bot_name, defaults, root_cfg)
+    except Exception as e:
+        raise RuntimeError(
+            f"bot_config.json corrupt or unreadable: {e}. "
+            f"Refusing to start {bot_name} with defaults."
+        ) from e
 
 
 #  HOT-RELOAD CACHE 

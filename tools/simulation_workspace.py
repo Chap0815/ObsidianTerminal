@@ -25,7 +25,7 @@ from typing import Any, Iterable
 
 
 DATASET_SCHEMA_VERSION = 1
-RUN_SCHEMA_VERSION = 2
+RUN_SCHEMA_VERSION = 3
 MANIFEST_MAX_BYTES = 16 * 1024 * 1024
 _HOUR_MS = 3_600_000
 _HISTORY_COLUMNS = (
@@ -433,25 +433,53 @@ class ReproducibleRun:
         workers: int,
         code_files: Iterable[str | os.PathLike],
         resume: bool = False,
+        dataset_verifier=None,
     ) -> None:
         if isinstance(seed, bool) or not isinstance(seed, int):
             raise ValueError("seed must be an integer")
         if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= 256:
             raise ValueError("workers must be an integer between 1 and 256")
-        dataset = verify_history_dataset(dataset_root)
-        code = []
+        verifier = dataset_verifier or verify_history_dataset
+        if not callable(verifier):
+            raise ValueError("dataset_verifier must be callable")
+        dataset = verifier(dataset_root)
+        if (
+            not isinstance(dataset, dict)
+            or not isinstance(dataset.get("dataset_fingerprint"), str)
+            or not dataset["dataset_fingerprint"]
+        ):
+            raise ValueError("dataset verifier returned an invalid manifest")
+        resolved_code_files = []
         for raw_path in code_files:
             path = Path(raw_path).expanduser().resolve()
             if path.is_symlink() or not path.is_file():
                 raise ValueError(f"code fingerprint file is missing: {path}")
+            resolved_code_files.append(path)
+        if not resolved_code_files:
+            raise ValueError("code fingerprint files must not be empty")
+        if len(set(resolved_code_files)) != len(resolved_code_files):
+            raise ValueError("code fingerprint files must be unique")
+        try:
+            code_root = Path(os.path.commonpath(
+                [str(path.parent) for path in resolved_code_files]
+            ))
+        except ValueError as exc:
+            raise ValueError(
+                "code fingerprint files must share a stable root"
+            ) from exc
+        code = []
+        for path in resolved_code_files:
+            relative = path.relative_to(code_root).as_posix()
             code.append(
                 {
-                    "name": path.name,
+                    "path": relative,
                     "bytes": path.stat().st_size,
                     "sha256": _sha256_file(path),
                 }
             )
-        code.sort(key=lambda item: (item["name"], item["sha256"]))
+        if len({item["path"] for item in code}) != len(code):
+            raise ValueError("code fingerprint identities must be unique")
+        code.sort(key=lambda item: (item["path"], item["sha256"]))
         spec = {
             "schema_version": RUN_SCHEMA_VERSION,
             "dataset_fingerprint": dataset["dataset_fingerprint"],
@@ -516,16 +544,31 @@ class ReproducibleRun:
             raise ValueError(f"{label} evidence integrity check failed")
         return body
 
-    def baseline(self) -> dict | None:
+    def baseline(self, expected_params: dict | None = None) -> dict | None:
         path = self.root / "baseline.json"
         if not path.exists():
             return None
         value = self._verify_evidence(_read_json(path), label="baseline")
         if value.get("run_id") != self.run_id:
             raise ValueError("baseline is bound to a different run")
+        stored_params = value.get("params")
+        result = value.get("result")
+        if (
+            not isinstance(stored_params, dict)
+            or not isinstance(result, dict)
+            or value.get("params_hash") != self._params_hash(stored_params)
+        ):
+            raise ValueError("baseline evidence contract is invalid")
+        if expected_params is not None:
+            if not isinstance(expected_params, dict):
+                raise ValueError("expected baseline params must be an object")
+            if value["params_hash"] != self._params_hash(expected_params):
+                raise ValueError("baseline conflicts with expected parameters")
         return self._seal_evidence(value)
 
     def record_baseline(self, params: dict, result: dict) -> dict:
+        if not isinstance(params, dict) or not isinstance(result, dict):
+            raise ValueError("baseline params and result must be objects")
         value = self._seal_evidence({
             "run_id": self.run_id,
             "params_hash": self._params_hash(params),
@@ -543,6 +586,8 @@ class ReproducibleRun:
         return value
 
     def checkpoint(self, index: int, params: dict) -> dict | None:
+        if not isinstance(params, dict):
+            raise ValueError("checkpoint params must be an object")
         path = self._checkpoint_path(index)
         if not path.exists():
             return None
@@ -555,9 +600,14 @@ class ReproducibleRun:
             or value.get("params_hash") != self._params_hash(params)
         ):
             raise ValueError(f"checkpoint {index} conflicts with deterministic grid")
-        return value.get("record")
+        record = value.get("record")
+        if not isinstance(record, dict):
+            raise ValueError(f"checkpoint {index} record contract is invalid")
+        return record
 
     def record_checkpoint(self, index: int, params: dict, record: dict) -> None:
+        if not isinstance(params, dict) or not isinstance(record, dict):
+            raise ValueError("checkpoint params and record must be objects")
         if self.baseline() is None:
             raise RuntimeError("production baseline must complete before optimization")
         value = self._seal_evidence({

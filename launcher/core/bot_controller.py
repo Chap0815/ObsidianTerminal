@@ -288,6 +288,24 @@ def start_bot(app, name: str) -> None:
             log_to_card(card, "error", "Start aborted by pre-start check")
             return
 
+    # Close the previous run's display-only aggregation and start the new run
+    # with fresh warning/state fingerprints.  This never touches durable logs.
+    display_filter = card.get("log_filter")
+    try:
+        flush = getattr(display_filter, "flush", None)
+        if callable(flush):
+            for pending_line in flush():
+                log_to_card(card, "info", pending_line)
+    except Exception:
+        # A cosmetic display helper must never prevent a validated bot start.
+        pass
+    try:
+        reset = getattr(display_filter, "reset", None)
+        if callable(reset):
+            reset()
+    except Exception:
+        # Reset failure is display-only and must not stop the bot either.
+        pass
     log_to_card(card, "system", "Loading: " + format_start_params(name, snapshot))
     bot.start(current_config_snapshot=snapshot)
 

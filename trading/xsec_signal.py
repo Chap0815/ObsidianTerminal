@@ -122,6 +122,57 @@ def crash_exposure(recent_rebalance_returns: List[float],
     return 0.0 if statistics.mean(window) < 0.0 else 1.0
 
 
+def advance_crash_history(
+    recent_rebalance_returns: List[float],
+    realized_return: Optional[float],
+    *,
+    was_crash_flat: bool,
+    slot_advanced: bool,
+    max_history: int = 50,
+) -> List[float]:
+    """Return the next bounded own-momentum history.
+
+    A crash-flat book has no realized price move.  Recording one neutral sample
+    per *new anchored rebalance slot* lets the bounded filter cool down without
+    inventing profit and without allowing repeated polls/manual retries to age
+    the history.  This also makes the live transition reproducible in replay.
+    """
+    if not isinstance(recent_rebalance_returns, list):
+        raise ValueError("recent rebalance returns must be a list")
+    if isinstance(max_history, bool) or not isinstance(max_history, int):
+        raise ValueError("max_history must be an integer")
+    if max_history <= 0 or max_history > 1_000:
+        raise ValueError("max_history is outside the supported range")
+    if not isinstance(was_crash_flat, bool) or not isinstance(slot_advanced, bool):
+        raise ValueError("crash-flat transition flags must be boolean")
+
+    history = []
+    for raw_return in recent_rebalance_returns[-max_history:]:
+        if isinstance(raw_return, bool):
+            raise ValueError("rebalance history contains a boolean")
+        try:
+            value = float(raw_return)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("rebalance history contains a non-number") from exc
+        if not math.isfinite(value):
+            raise ValueError("rebalance history contains a non-finite value")
+        history.append(value)
+
+    if realized_return is not None:
+        if isinstance(realized_return, bool):
+            raise ValueError("realized return must be finite numeric")
+        try:
+            value = float(realized_return)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("realized return must be finite numeric") from exc
+        if not math.isfinite(value):
+            raise ValueError("realized return must be finite numeric")
+        history.append(value)
+    elif was_crash_flat and slot_advanced:
+        history.append(0.0)
+    return history[-max_history:]
+
+
 def compute_target_book(prices_by_symbol: Dict[str, List[float]],
                         recent_rebalance_returns: List[float],
                         params: XSecParams) -> TargetBook:

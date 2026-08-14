@@ -117,6 +117,7 @@ RELEASE_TOOL_FILES = {
     "tools/dashboard.py",
     "tools/ensure_git.py",
     "tools/futures_capture_replay.py",
+    "tools/futures_capture_phase2.py",
     "tools/ohlcv_cache.py",
     "tools/optimizer.py",
     "tools/profit_research.py",

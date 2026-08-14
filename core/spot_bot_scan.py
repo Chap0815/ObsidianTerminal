@@ -845,6 +845,10 @@ class ScanMixin:
                 intent_id=entry_id,
                 notional_usdt=trade_usdt,
                 mode=entry_mode,
+                reservation_ceiling_usdt=(
+                    admission.portfolio.reservation_ceiling_usdt
+                    if portfolio_mode == "enforce" else None
+                ),
             ):
                 log_event(f"{sym} claimed by another bot  skip "
                           f"(coexistence)", "WAIT")

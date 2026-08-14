@@ -48,6 +48,8 @@ def _read_config(path: Path | None) -> dict:
 
 
 def _json_safe(value):
+    if isinstance(value, Path):
+        return str(value)
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, datetime):

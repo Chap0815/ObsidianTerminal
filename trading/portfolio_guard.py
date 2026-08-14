@@ -74,6 +74,112 @@ def _symbol_cluster(symbol: str) -> str:
     return "majors" if base in {"BTC", "ETH"} else "alts"
 
 
+def _symbol_base(symbol) -> str:
+    try:
+        value = str(symbol).strip().upper().split(":")[0].split("/")[0]
+    except Exception:
+        return ""
+    return value
+
+
+def _active_reservation_rows(account_type: str) -> tuple[dict, ...]:
+    from core.database import active_portfolio_reservations
+
+    return active_portfolio_reservations(account_type)
+
+
+def _snapshot_with_active_reservations(
+    snapshot: PortfolioSnapshot,
+    rows,
+) -> tuple[PortfolioSnapshot, float]:
+    """Overlay only the still-unrepresented portion of durable reservations."""
+    if not isinstance(rows, (list, tuple)):
+        raise ValueError("active portfolio reservations must be a sequence")
+    reserved_by_key = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("active portfolio reservation must be an object")
+        symbol = str(row.get("symbol") or "").strip()
+        base = _symbol_base(symbol)
+        side = str(row.get("side") or "").strip().upper()
+        notional = _finite(row.get("notional_usdt"))
+        if (
+            not base
+            or side not in {"LONG", "SHORT"}
+            or notional is None
+            or notional <= 0.0
+        ):
+            raise ValueError("active portfolio reservation is malformed")
+        key = (base, side)
+        reserved_by_key[key] = reserved_by_key.get(key, 0.0) + notional
+        if not math.isfinite(reserved_by_key[key]):
+            raise ValueError("active portfolio reservation total is invalid")
+    active_reservation_total = math.fsum(reserved_by_key.values())
+    if not math.isfinite(active_reservation_total):
+        raise ValueError("active portfolio reservation total is invalid")
+    represented_by_key = {}
+    for position in snapshot.positions:
+        base = _symbol_base(position.symbol)
+        side = str(position.side or "").strip().upper()
+        notional = _finite(position.notional_usdt)
+        if (
+            not base
+            or side not in {"LONG", "SHORT"}
+            or notional is None
+            or notional < 0.0
+        ):
+            # The pure portfolio evaluator owns the authoritative malformed
+            # snapshot decision.  Do not hide it behind reservation merging.
+            continue
+        key = (base, side)
+        represented_by_key[key] = represented_by_key.get(key, 0.0) + notional
+    additions_by_key = {}
+    pending_total = 0.0
+    for (base, side), reserved in sorted(reserved_by_key.items()):
+        pending = max(0.0, reserved - represented_by_key.get((base, side), 0.0))
+        if pending <= 0.0:
+            continue
+        pending_total += pending
+        if not math.isfinite(pending_total):
+            raise ValueError("active portfolio reservation total is invalid")
+        additions_by_key[(base, side)] = PortfolioPosition(
+            symbol=base,
+            side=side,
+            notional_usdt=pending,
+            cluster=_symbol_cluster(base),
+        )
+    if not additions_by_key:
+        return snapshot, active_reservation_total
+    merged_positions = []
+    consumed_keys = set()
+    for position in snapshot.positions:
+        key = (_symbol_base(position.symbol), str(position.side or "").strip().upper())
+        addition = additions_by_key.get(key)
+        if addition is None or key in consumed_keys:
+            merged_positions.append(position)
+            continue
+        merged_positions.append(
+            replace(
+                position,
+                notional_usdt=position.notional_usdt + addition.notional_usdt,
+            )
+        )
+        consumed_keys.add(key)
+    merged_positions.extend(
+        addition
+        for key, addition in additions_by_key.items()
+        if key not in consumed_keys
+    )
+    return (
+        replace(
+            snapshot,
+            free_usdt=snapshot.free_usdt - pending_total,
+            positions=tuple(merged_positions),
+        ),
+        active_reservation_total,
+    )
+
+
 def _balance_value(balance: dict, group: str, currency: str = "USDT") -> float | None:
     direct = balance.get(currency)
     if isinstance(direct, dict):
@@ -354,13 +460,28 @@ def evaluate_exchange_entry(
     limits: PortfolioLimits | None = None,
     account_type: str = "futures",
     persist=None,
+    reservation_reader=None,
 ) -> PortfolioDecision:
     normalized_mode = normalize_gate_mode(mode)
+    normalized_account = str(account_type).strip().lower()
     snapshot = (
         collect_spot_snapshot(exchange)
-        if str(account_type).strip().lower() == "spot"
+        if normalized_account == "spot"
         else collect_futures_snapshot(exchange)
     )
+    reader = reservation_reader or _active_reservation_rows
+    active_reservation_total = 0.0
+    try:
+        snapshot, active_reservation_total = _snapshot_with_active_reservations(
+            snapshot,
+            reader(normalized_account),
+        )
+    except Exception:
+        snapshot = replace(
+            snapshot,
+            known=False,
+            reason="active portfolio reservations unavailable",
+        )
     decision = evaluate_entry(
         snapshot,
         requested_notional,
@@ -369,6 +490,7 @@ def evaluate_exchange_entry(
         limits or PortfolioLimits(),
         mode=normalized_mode,
         cluster=_symbol_cluster(symbol),
+        pending_reserved_notional=active_reservation_total,
     )
     writer = persist or _persist_default
     try:

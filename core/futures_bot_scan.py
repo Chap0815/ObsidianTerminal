@@ -1266,6 +1266,10 @@ class FuturesScanMixin:
                     mode=entry_mode,
                     contract_size=contract_size,
                     oversize_notional_ceiling=entry_notional_ceiling,
+                    reservation_ceiling_usdt=(
+                        portfolio_decision.reservation_ceiling_usdt
+                        if portfolio_mode == "enforce" else None
+                    ),
                 ):
                     log_event(f"{sym} claimed by another bot  skip "
                               f"(coexistence)", "WAIT")

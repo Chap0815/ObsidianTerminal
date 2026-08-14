@@ -11,11 +11,14 @@ Run: PYTHONIOENCODING=utf-8 python -m tools.xsec_momentum [days]
 
 # ruff: noqa: E402  # update barrier must run before project/runtime imports
 
+import argparse
+import json
 import math
 import os
 import statistics
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 _TOOL_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _TOOL_PROJECT_ROOT not in sys.path:
@@ -28,6 +31,12 @@ guard_tool_entrypoint(__file__, __name__)
 import pandas as pd
 
 from tools.backtester import connect_exchange, get_top_volume_coins, fetch_history
+from tools.simulation_workspace import load_history_dataset
+from trading.xsec_signal import (
+    XSecParams,
+    advance_crash_history,
+    compute_target_book,
+)
 
 DEFAULT_DAYS = 180
 MAX_DAYS = 3650
@@ -46,6 +55,292 @@ def _parse_xsec_days(args=None) -> int:
 
 DAYS = _parse_xsec_days()
 FEE_ONE_WAY = 0.0006  # futures taker 0.01% + slippage 0.05% per side
+
+
+def _canonical_exchange(value) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("dataset exchange provenance is missing")
+    normalized = "".join(char for char in value.lower() if char.isalnum())
+    return {"mexcglobal": "mexc"}.get(normalized, normalized)
+
+
+def _validate_xsec_dataset_manifest(manifest: dict, expected_exchange: str) -> dict:
+    if not isinstance(manifest, dict):
+        raise ValueError("dataset manifest is invalid")
+    payload = manifest.get("fingerprint_payload")
+    provenance = manifest.get("provenance")
+    if not isinstance(payload, dict) or payload.get("kind") != "optimizer_ohlcv_1h":
+        raise ValueError("CROSS replay requires an immutable 1h optimizer dataset")
+    if not isinstance(provenance, dict):
+        raise ValueError("dataset provenance is missing")
+    recorded = provenance.get("exchange_id") or provenance.get("exchange")
+    actual = _canonical_exchange(recorded)
+    expected = _canonical_exchange(expected_exchange)
+    if actual != expected:
+        raise ValueError(
+            f"dataset exchange mismatch: expected {expected}, found {actual}",
+        )
+    return {
+        "exchange": actual,
+        "survivorship_bias": provenance.get("survivorship_bias") is True,
+    }
+
+
+def _panel_from_history(history: dict) -> pd.DataFrame:
+    series = {}
+    for symbol in sorted(history):
+        frame = history[symbol]
+        validated = _validated_close_series(frame)
+        if validated is None:
+            raise ValueError(f"invalid replay series: {symbol}")
+        series[symbol] = validated
+    panel = pd.DataFrame(series).sort_index()
+    if panel.empty or not panel.index.is_monotonic_increasing or not panel.index.is_unique:
+        raise ValueError("replay panel has an invalid UTC timeline")
+    return panel
+
+
+def _target_weights(book, k: int) -> dict[str, float]:
+    if book.exposure_mult <= 0.0:
+        return {}
+    if len(book.longs) != len(book.shorts) or len(book.longs) != k:
+        raise ValueError("replay target book is not fully dollar-neutral")
+    leg_weight = 0.5 / k
+    weights = {symbol: leg_weight for symbol in book.longs}
+    weights.update({symbol: -leg_weight for symbol in book.shorts})
+    return weights
+
+
+def _weight_turnover(previous: dict[str, float], target: dict[str, float]) -> float:
+    value = math.fsum(
+        abs(target.get(symbol, 0.0) - previous.get(symbol, 0.0))
+        for symbol in set(previous) | set(target)
+    )
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError("non-finite portfolio turnover")
+    return value
+
+
+def run_stateful_replay(
+    prices: pd.DataFrame,
+    lookback: int,
+    rebalance: int,
+    k: int,
+    *,
+    fee_one_way: float = FEE_ONE_WAY,
+    funding_per_day: float = 0.0006,
+    crash_filter: bool = True,
+    crash_window: int = 4,
+    initial_recent_returns: list[float] | None = None,
+    liquidate_at_end: bool = True,
+) -> dict:
+    """Replay the live CROSS signal as an anchored, stateful portfolio."""
+    integers = (lookback, rebalance, k, crash_window)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in integers):
+        raise ValueError("CROSS replay periods and K must be integers")
+    if lookback <= 0 or rebalance <= 0 or k <= 0 or crash_window <= 0:
+        raise ValueError("CROSS replay periods and K must be positive")
+    for name, value in (
+        ("fee_one_way", fee_one_way),
+        ("funding_per_day", funding_per_day),
+    ):
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be finite and non-negative")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} must be finite and non-negative") from exc
+        if not math.isfinite(numeric) or numeric < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+    fee_one_way = float(fee_one_way)
+    funding_per_day = float(funding_per_day)
+    if not isinstance(crash_filter, bool) or not isinstance(liquidate_at_end, bool):
+        raise ValueError("CROSS replay flags must be boolean")
+    if not isinstance(prices, pd.DataFrame) or prices.empty:
+        raise ValueError("prices must be a non-empty DataFrame")
+    if not prices.index.is_monotonic_increasing or not prices.index.is_unique:
+        raise ValueError("prices must have a unique ascending timeline")
+
+    recent = advance_crash_history(
+        list(initial_recent_returns or []),
+        None,
+        was_crash_flat=False,
+        slot_advanced=False,
+    )
+    params = XSecParams(
+        lookback_hours=lookback,
+        k_per_side=k,
+        crash_filter=crash_filter,
+        crash_window=crash_window,
+    )
+    previous_weights: dict[str, float] = {}
+    periods = []
+    index = lookback
+    while index + rebalance < len(prices):
+        histories = {
+            symbol: prices[symbol].iloc[: index + 1].tolist()
+            for symbol in prices.columns
+        }
+        book = compute_target_book(histories, recent, params)
+        target = _target_weights(book, k)
+        entry = prices.iloc[index]
+        exit_row = prices.iloc[index + rebalance]
+        gross = 0.0
+        for symbol, weight in target.items():
+            p0 = float(entry[symbol])
+            p1 = float(exit_row[symbol])
+            if not all(math.isfinite(value) and value > 0.0 for value in (p0, p1)):
+                raise ValueError(f"selected replay leg has a missing price: {symbol}")
+            gross += weight * (p1 / p0 - 1.0)
+        turnover = _weight_turnover(previous_weights, target)
+        fees = turnover * fee_one_way
+        funding = (
+            funding_per_day * (rebalance / 24.0)
+            if target
+            else 0.0
+        )
+        net = gross - fees - funding
+        if not all(math.isfinite(value) for value in (gross, fees, funding, net)):
+            raise ValueError("non-finite CROSS replay accounting")
+        periods.append(
+            {
+                "entry_utc": prices.index[index].isoformat(),
+                "exit_utc": prices.index[index + rebalance].isoformat(),
+                "exposure": float(book.exposure_mult),
+                "longs": list(book.longs),
+                "shorts": list(book.shorts),
+                "turnover": turnover,
+                "gross": gross,
+                "fees": fees,
+                "funding": funding,
+                "net": net,
+            },
+        )
+        recent = advance_crash_history(
+            recent,
+            gross if target else None,
+            was_crash_flat=not target,
+            slot_advanced=True,
+        )
+        previous_weights = target
+        index += rebalance
+
+    if not periods:
+        raise ValueError("dataset is too short for the requested CROSS replay")
+    terminal_turnover = 0.0
+    if liquidate_at_end and previous_weights:
+        terminal_turnover = _weight_turnover(previous_weights, {})
+        terminal_fee = terminal_turnover * fee_one_way
+        periods[-1]["turnover"] += terminal_turnover
+        periods[-1]["fees"] += terminal_fee
+        periods[-1]["net"] -= terminal_fee
+
+    return {
+        "periods": periods,
+        "period_count": len(periods),
+        "terminal_turnover": terminal_turnover,
+        "recent_returns": recent,
+    }
+
+
+def _replay_metrics(periods: list[dict]) -> dict:
+    if not periods:
+        return {
+            "periods": 0,
+            "gross": 0.0,
+            "fees": 0.0,
+            "funding": 0.0,
+            "net": 0.0,
+            "max_drawdown": 0.0,
+            "positive_periods": 0,
+        }
+    equity = peak = 1.0
+    max_drawdown = 0.0
+    for period in periods:
+        equity *= 1.0 + period["net"]
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, (peak - equity) / peak)
+    return {
+        "periods": len(periods),
+        "gross": math.fsum(period["gross"] for period in periods),
+        "fees": math.fsum(period["fees"] for period in periods),
+        "funding": math.fsum(period["funding"] for period in periods),
+        "net": math.fsum(period["net"] for period in periods),
+        "compounded_return": equity - 1.0,
+        "max_drawdown": max_drawdown,
+        "positive_periods": sum(period["net"] > 0.0 for period in periods),
+    }
+
+
+def _offline_replay(argv: list[str]) -> dict:
+    parser = argparse.ArgumentParser(description="Immutable MEXC CROSS replay")
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--exchange", default="mexc")
+    parser.add_argument("--lookback", type=int, default=24)
+    parser.add_argument("--rebalance", type=int, default=48)
+    parser.add_argument("--k", type=int, default=2)
+    parser.add_argument("--fee-one-way", type=float, default=0.0006)
+    parser.add_argument("--funding-per-day", type=float, default=0.0006)
+    parser.add_argument("--crash-window", type=int, default=4)
+    parser.add_argument("--no-crash-filter", action="store_true")
+    parser.add_argument("--output")
+    args = parser.parse_args(argv)
+
+    history, manifest = load_history_dataset(args.dataset)
+    provenance = _validate_xsec_dataset_manifest(manifest, args.exchange)
+    replay = run_stateful_replay(
+        _panel_from_history(history),
+        args.lookback,
+        args.rebalance,
+        args.k,
+        fee_one_way=args.fee_one_way,
+        funding_per_day=args.funding_per_day,
+        crash_filter=not args.no_crash_filter,
+        crash_window=args.crash_window,
+    )
+    periods = replay["periods"]
+    train_end = max(1, int(len(periods) * 0.60))
+    validation_end = max(train_end + 1, int(len(periods) * 0.80))
+    validation_end = min(validation_end, len(periods))
+    report = {
+        "schema_version": 1,
+        "classification": "exploratory_only",
+        "dataset_fingerprint": manifest["dataset_fingerprint"],
+        "dataset": provenance,
+        "parameters": {
+            "lookback_hours": args.lookback,
+            "rebalance_hours": args.rebalance,
+            "k_per_side": args.k,
+            "fee_one_way": args.fee_one_way,
+            "funding_per_day": args.funding_per_day,
+            "crash_filter": not args.no_crash_filter,
+            "crash_window": args.crash_window,
+            "liquidate_at_end": True,
+        },
+        "metrics": {
+            "all": _replay_metrics(periods),
+            "train": _replay_metrics(periods[:train_end]),
+            "validation": _replay_metrics(periods[train_end:validation_end]),
+            "holdout": _replay_metrics(periods[validation_end:]),
+        },
+        "terminal_turnover": replay["terminal_turnover"],
+        "periods": periods,
+        "limitations": [
+            "survivorship_biased_universe"
+            if provenance["survivorship_bias"]
+            else "point_in_time_universe_not_proven",
+            "fixed_conservative_funding_drag",
+            "close_only_execution_without_orderbook_depth",
+        ],
+    }
+    raw = json.dumps(report, allow_nan=False, separators=(",", ":"), sort_keys=True)
+    if args.output:
+        output = Path(args.output).expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+        temporary.write_text(raw, encoding="utf-8")
+        os.replace(temporary, output)
+    return report
 
 
 def _validated_close_series(df):
@@ -209,6 +504,10 @@ def apply_filter(rets, kind, W=4, target=0.04):
 
 
 def main():
+    if "--dataset" in sys.argv[1:]:
+        report = _offline_replay(sys.argv[1:])
+        print(json.dumps(report, allow_nan=False, indent=2, sort_keys=True))
+        return
     ex = connect_exchange()
     coins = get_top_volume_coins(ex, n=120)  # breiteres Universum
     print(f"Coins angefragt: {len(coins)} | loading {DAYS}d ...")

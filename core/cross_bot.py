@@ -20,7 +20,10 @@ proves out over weeks of paper trading.
 """
 from __future__ import annotations
 
+import base64
+import json
 import math
+import struct
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -30,7 +33,94 @@ from bot_utils.api_budget import try_consume_api_call
 from bot_utils.order_utils import order_id_text_or_none
 from bot_utils.safe_numeric import parse_ohlcv_closes
 from bot_utils.silent_log import silent_log
-from trading.xsec_signal import XSecParams, compute_target_book
+from core.constants import NONCRYPTO_BASES, STOCK_TOKEN_BASES
+from trading.xsec_signal import (
+    XSecParams,
+    advance_crash_history,
+    compute_target_book,
+)
+
+
+_REBALANCE_STATE_PARAM = "REBALANCE_STATE_V2"
+_REBALANCE_STATE_SCHEMA = 1
+
+
+def _encode_rebalance_state(slot: int, recent_returns, crash_flat: bool) -> str:
+    if isinstance(slot, bool) or not isinstance(slot, int) or slot < -1:
+        raise ValueError("rebalance slot must be an integer >= -1")
+    if not isinstance(recent_returns, list) or len(recent_returns) > 50:
+        raise ValueError("recent_returns must be a bounded list")
+    history = advance_crash_history(
+        recent_returns,
+        None,
+        was_crash_flat=False,
+        slot_advanced=False,
+    )
+    if not isinstance(crash_flat, bool):
+        raise ValueError("crash_flat must be boolean")
+    return json.dumps(
+        {
+            "crash_flat": crash_flat,
+            "history_b64": base64.b64encode(
+                struct.pack(f">{len(history)}d", *history),
+            ).decode("ascii"),
+            "history_count": len(history),
+            "schema": _REBALANCE_STATE_SCHEMA,
+            "slot": slot,
+        },
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _decode_rebalance_state(raw: str) -> tuple[int, List[float], bool]:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("rebalance state must be non-empty text")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("rebalance state is not valid JSON") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "crash_flat", "history_b64", "history_count", "schema", "slot",
+    }:
+        raise ValueError("rebalance state has an invalid shape")
+    if (
+        isinstance(payload["schema"], bool)
+        or payload["schema"] != _REBALANCE_STATE_SCHEMA
+    ):
+        raise ValueError("rebalance state schema is unsupported")
+    slot = payload["slot"]
+    crash_flat = payload["crash_flat"]
+    if isinstance(slot, bool) or not isinstance(slot, int) or slot < -1:
+        raise ValueError("rebalance state slot is invalid")
+    if not isinstance(crash_flat, bool):
+        raise ValueError("rebalance state crash flag is invalid")
+    history_count = payload["history_count"]
+    history_b64 = payload["history_b64"]
+    if (
+        isinstance(history_count, bool)
+        or not isinstance(history_count, int)
+        or not 0 <= history_count <= 50
+        or not isinstance(history_b64, str)
+    ):
+        raise ValueError("rebalance state history is invalid")
+    try:
+        packed = base64.b64decode(history_b64, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("rebalance state history encoding is invalid") from exc
+    if len(packed) != history_count * 8:
+        raise ValueError("rebalance state history length is invalid")
+    raw_recent = list(
+        struct.unpack(f">{history_count}d", packed) if history_count else (),
+    )
+    recent = advance_crash_history(
+        raw_recent,
+        None,
+        was_crash_flat=False,
+        slot_advanced=False,
+    )
+    return slot, recent, crash_flat
 
 
 #  Crypto-only universe filter 
@@ -39,7 +129,6 @@ from trading.xsec_signal import XSecParams, compute_target_book
 # market-neutral book never longs/shorts e.g. USOIL/UKOIL. Exact bases only (no
 # bare "OIL"/"GAS"/"GOLD" which collide with real crypto tickers). Extend via
 # env CROSS_EXCLUDE_BASES="FOO,BAR".
-from core.constants import NONCRYPTO_BASES, STOCK_TOKEN_BASES
 _NONCRYPTO_BASES = set(NONCRYPTO_BASES)   # shared list; CROSS adds its env extension
 _STOCK_TOKEN_BASES = set(STOCK_TOKEN_BASES)
 try:
@@ -1001,6 +1090,110 @@ class CrossBot(FuturesBot):
         except (TypeError, ValueError):
             return 72 * 3600
 
+    def _load_rebalance_state(self) -> bool:
+        """Load the crash-filter and cadence state once, failing closed."""
+        if getattr(self, "_rebalance_state_loaded", False):
+            return True
+        try:
+            from core.database import get_param, get_param_text
+
+            raw = get_param_text(self.BOT_NAME, _REBALANCE_STATE_PARAM, "")
+            if raw:
+                slot, recent, crash_flat = _decode_rebalance_state(raw)
+            else:
+                legacy = get_param(self.BOT_NAME, "REBALANCE_SLOT", -1)
+                if isinstance(legacy, bool):
+                    raise ValueError("legacy rebalance slot is boolean")
+                slot = int(legacy)
+                if slot < -1 or float(slot) != float(legacy):
+                    raise ValueError("legacy rebalance slot is invalid")
+                existing_recent = getattr(self, "_recent_rebalance_returns", [])
+                recent = advance_crash_history(
+                    existing_recent,
+                    None,
+                    was_crash_flat=False,
+                    slot_advanced=False,
+                )
+                crash_flat = getattr(self, "_cross_crash_flat", False)
+                if not isinstance(crash_flat, bool):
+                    raise ValueError("in-memory crash flag is invalid")
+        except Exception as exc:
+            self._rebalance_state_load_error = type(exc).__name__
+            return False
+        self._last_rebalance_slot = slot
+        self._recent_rebalance_returns = recent
+        self._cross_crash_flat = crash_flat
+        self._rebalance_state_load_error = ""
+        self._rebalance_state_loaded = True
+        return True
+
+    def _persist_rebalance_state(self, slot: int) -> bool:
+        payload = _encode_rebalance_state(
+            slot,
+            getattr(self, "_recent_rebalance_returns", []),
+            getattr(self, "_cross_crash_flat", False),
+        )
+        try:
+            from core.database import set_param
+
+            set_param(
+                self.BOT_NAME,
+                _REBALANCE_STATE_PARAM,
+                payload,
+                reason="cross rebalance state committed",
+            )
+        except Exception:
+            self._rebalance_state_persist_pending = (slot, payload)
+            return False
+        self._rebalance_state_persist_pending = None
+        # Keep the legacy numeric marker current for a recoverable downgrade.
+        try:
+            set_param(
+                self.BOT_NAME,
+                "REBALANCE_SLOT",
+                slot,
+                reason="cross rebalance applied",
+            )
+        except Exception:
+            self._rebalance_slot_persist_pending = slot
+        else:
+            self._rebalance_slot_persist_pending = None
+        return True
+
+    def _retry_rebalance_state_persistence(self) -> None:
+        pending = getattr(self, "_rebalance_state_persist_pending", None)
+        if pending is not None:
+            slot, payload = pending
+            try:
+                from core.database import set_param
+
+                set_param(
+                    self.BOT_NAME,
+                    _REBALANCE_STATE_PARAM,
+                    payload,
+                    reason="cross rebalance state persistence retry",
+                )
+            except Exception:
+                return
+            self._rebalance_state_persist_pending = None
+            self._rebalance_slot_persist_pending = slot
+
+        pending_slot = getattr(self, "_rebalance_slot_persist_pending", None)
+        if pending_slot is None:
+            return
+        try:
+            from core.database import set_param
+
+            set_param(
+                self.BOT_NAME,
+                "REBALANCE_SLOT",
+                pending_slot,
+                reason="cross rebalance slot persistence retry",
+            )
+        except Exception:
+            return
+        self._rebalance_slot_persist_pending = None
+
     def _due_for_rebalance(self) -> bool:
         """Anchored to a fixed epoch grid AND PERSISTED across restarts.
 
@@ -1012,30 +1205,8 @@ class CrossBot(FuturesBot):
         """
         iv = self._rebalance_interval_sec()
         slot = int(time.time()) // iv
-        pending_slot = getattr(
-            self, "_rebalance_slot_persist_pending", None,
-        )
-        if pending_slot is not None:
-            try:
-                from core.database import set_param
-                set_param(
-                    self.BOT_NAME,
-                    "REBALANCE_SLOT",
-                    pending_slot,
-                    reason="cross rebalance slot persistence retry",
-                )
-            except Exception:
-                pass
-            else:
-                self._rebalance_slot_persist_pending = None
-        slot_marker_unavailable = False
-        if self._last_rebalance_slot is None:
-            try:
-                from core.database import get_param
-                self._last_rebalance_slot = int(
-                    get_param(self.BOT_NAME, "REBALANCE_SLOT", -1))
-            except Exception:
-                slot_marker_unavailable = True
+        CrossBot._retry_rebalance_state_persistence(self)
+        state_unavailable = not CrossBot._load_rebalance_state(self)
         # Rebalance when the slot advances OR when we currently hold NOTHING.
         # The empty-book case cannot accumulate (nothing to stack onto), so
         # (re)establishing a book after a restart - or after the crash-filter /
@@ -1045,8 +1216,10 @@ class CrossBot(FuturesBot):
             empty = (len(CrossBot._active_legs(self)) == 0)
         except Exception:
             empty = False
-        if slot_marker_unavailable:
-            return empty
+        if state_unavailable:
+            return False
+        if bool(getattr(self, "_cross_crash_flat", False)):
+            return slot != self._last_rebalance_slot
         return slot != self._last_rebalance_slot or empty
 
     def _mark_rebalanced(self) -> None:
@@ -1056,17 +1229,13 @@ class CrossBot(FuturesBot):
         iv = self._rebalance_interval_sec()
         slot = int(time.time()) // iv
         self._last_rebalance_slot = slot
-        try:
-            from core.database import set_param
-            set_param(self.BOT_NAME, "REBALANCE_SLOT", slot,
-                      reason="cross rebalance applied")
-        except Exception as exc:
-            self._rebalance_slot_persist_pending = slot
+        if not CrossBot._persist_rebalance_state(self, slot):
+            exc = RuntimeError("rebalance state persistence failed")
             try:
                 from core.logger import log_event
                 log_event(
-                    f"[{self.BOT_NAME}] rebalance slot persistence failed "
-                    f"({type(exc).__name__}) - retry pending",
+                    f"[{self.BOT_NAME}] rebalance state persistence failed "
+                    "- retry pending",
                     "ERROR",
                 )
             except Exception:
@@ -1077,8 +1246,6 @@ class CrossBot(FuturesBot):
                     log_error("cross persist rebalance slot", exc)
             except Exception:
                 pass
-        else:
-            self._rebalance_slot_persist_pending = None
 
     def _should_topup(self) -> bool:
         """True when we hold a partial book (some legs, but UNDER target K/side)
@@ -1319,11 +1486,24 @@ class CrossBot(FuturesBot):
         slot_persist_pending = (
             getattr(self, "_rebalance_slot_persist_pending", None) is not None
         )
+        state_persist_pending = (
+            getattr(self, "_rebalance_state_persist_pending", None) is not None
+        )
+        state_load_error = str(
+            getattr(self, "_rebalance_state_load_error", "") or ""
+        )
         return {
-            "ok": errors == 0 and not slot_persist_pending,
+            "ok": (
+                errors == 0
+                and not slot_persist_pending
+                and not state_persist_pending
+                and not state_load_error
+            ),
             "component": "cross_scan",
             "consecutive_errors": errors,
             "rebalance_slot_persist_pending": slot_persist_pending,
+            "rebalance_state_persist_pending": state_persist_pending,
+            "rebalance_state_load_error": state_load_error,
             "last_operation": str(getattr(
                 self, "_cross_scan_last_operation", "") or ""),
             "last_error": str(getattr(
@@ -1369,12 +1549,18 @@ class CrossBot(FuturesBot):
         # init crash-filter history + slot marker
         if not hasattr(self, "_recent_rebalance_returns"):
             self._recent_rebalance_returns: List[float] = []
+        self._cross_crash_flat = False
+        self._rebalance_state_loaded = False
+        self._rebalance_state_load_error = ""
+        self._rebalance_state_persist_pending = None
+        self._rebalance_slot_persist_pending = None
         # Realized move-fractions of legs closed EARLY (disaster-stop / daily
         # killswitch) since the last rebalance. Folded into the book-return that
         # feeds the crash filter so a stopped-out loser isn't invisible to it.
         if not hasattr(self, "_closed_leg_moves_since_rebalance"):
             self._closed_leg_moves_since_rebalance: List[float] = []
         self._last_rebalance_slot = None
+        CrossBot._load_rebalance_state(self)
         # Suppress the monitor's neutrality-guard while a rebalance is mid-flight
         # (the book is transiently one-sided during the sequential opens) and for
         # a short settle window afterwards.
@@ -1406,6 +1592,8 @@ class CrossBot(FuturesBot):
             operation = "poll"
             try:
                 forced = self._consume_force_rebalance()
+                if forced and not CrossBot._load_rebalance_state(self):
+                    raise RuntimeError("cross rebalance state unavailable")
                 now = time.time()
                 rebal_ready = forced or (now - self._last_rebalance_attempt) >= 290.0
                 if (forced or self._due_for_rebalance()) and rebal_ready:
@@ -1494,10 +1682,17 @@ class CrossBot(FuturesBot):
             getattr(self, "_closed_leg_moves_since_rebalance", []),
         )
         realized = self._book_return_since_last()
-        staged_returns = list(self._recent_rebalance_returns)
-        if realized is not None:
-            staged_returns.append(realized)
-            staged_returns = staged_returns[-50:]
+        last_slot = getattr(self, "_last_rebalance_slot", None)
+        slot_advanced = last_slot is None
+        if last_slot is not None:
+            current_slot = int(time.time()) // CrossBot._rebalance_interval_sec(self)
+            slot_advanced = current_slot != last_slot
+        staged_returns = advance_crash_history(
+            list(self._recent_rebalance_returns),
+            realized,
+            was_crash_flat=bool(getattr(self, "_cross_crash_flat", False)),
+            slot_advanced=slot_advanced,
+        )
 
         # 2. target book from the pure signal module
         book = compute_target_book(prices, staged_returns, params)
@@ -1570,6 +1765,7 @@ class CrossBot(FuturesBot):
         # Only a committed real rebalance starts a fresh in-slot top-up budget.
         self._topup_attempts = 0
         self._recent_rebalance_returns = staged_returns
+        self._cross_crash_flat = bool(book.exposure_mult <= 0.0)
         if realized is not None:
             current_closed_moves = list(
                 getattr(self, "_closed_leg_moves_since_rebalance", []),
@@ -2446,6 +2642,10 @@ class CrossBot(FuturesBot):
                 intent_id=entry_id,
                 notional_usdt=float(margin) * float(lev),
                 mode=entry_mode,
+                reservation_ceiling_usdt=(
+                    admission.portfolio.reservation_ceiling_usdt
+                    if portfolio_mode == "enforce" else None
+                ),
             ):
                 log_event(f"[{self.BOT_NAME}] {base}: claimed by another bot "
                           f"- skip", "WAIT")

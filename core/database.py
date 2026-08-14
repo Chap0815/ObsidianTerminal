@@ -4696,7 +4696,8 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
                allow_existing_owner: bool = False, *, intent_id: str | None = None,
                notional_usdt: float = 0.0, reservation_mode: str = "LIVE",
                contract_size: float | None = None,
-               oversize_notional_ceiling: float | None = None) -> bool:
+               oversize_notional_ceiling: float | None = None,
+               reservation_ceiling_usdt: float | None = None) -> bool:
     if not isinstance(bot_name, str) or not bot_name.strip():
         return False
     if not isinstance(symbol, str) or not symbol.strip():
@@ -4713,6 +4714,7 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
     normalized_reservation_mode = "LIVE"
     validated_contract_size = None
     validated_oversize_ceiling = None
+    validated_reservation_ceiling = None
     if intent_id is not None:
         if not isinstance(intent_id, str) or not intent_id.strip():
             return False
@@ -4737,6 +4739,16 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
             if (
                 validated_oversize_ceiling is None
                 or validated_oversize_ceiling <= 0.0
+            ):
+                return False
+        if reservation_ceiling_usdt is not None:
+            validated_reservation_ceiling = _optional_finite_db(
+                reservation_ceiling_usdt
+            )
+            if (
+                validated_reservation_ceiling is None
+                or validated_reservation_ceiling < 0.0
+                or normalized_position_type == "FUTURES"
             ):
                 return False
     # Swap-guard: a real bot_name is never a market symbol. A market-shaped
@@ -4769,6 +4781,10 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
             claim_extra["entry_oversize_notional_ceiling"] = (
                 validated_oversize_ceiling
             )
+        if validated_reservation_ceiling is not None:
+            claim_extra["portfolio_reservation_ceiling_usdt"] = (
+                validated_reservation_ceiling
+            )
         claim_extra_json = json.dumps(
             claim_extra,
             sort_keys=True,
@@ -4795,6 +4811,60 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
             conn.commit()
         conn.execute("BEGIN IMMEDIATE")
         now_str = claim_opened_at or _utcnow_str()
+        if validated_reservation_ceiling is not None:
+            active_rows = conn.execute(
+                """SELECT reservation.notional_usdt,
+                          reservation.mode, claim.position_type
+                     FROM portfolio_reservations AS reservation
+                     LEFT JOIN bot_open_positions AS claim
+                       ON claim.bot_name=reservation.bot_name
+                      AND claim.symbol=reservation.symbol
+                    WHERE reservation.status='ACTIVE'"""
+            ).fetchall()
+            active_notionals = []
+            target_is_futures = _is_futures_ptype(normalized_position_type)
+            reservation_evidence_valid = True
+            for active_row in active_rows:
+                row = dict(active_row)
+                active_mode = str(row.get("mode") or "").strip().upper()
+                active_position_type = str(
+                    row.get("position_type") or ""
+                ).strip().upper()
+                if (
+                    active_mode != "LIVE"
+                    or active_position_type
+                    not in {"SPOT", "FUTURES", "LONG", "SHORT"}
+                ):
+                    reservation_evidence_valid = False
+                    break
+                active_is_futures = _is_futures_ptype(active_position_type)
+                if active_is_futures != target_is_futures:
+                    continue
+                active_value = _optional_finite_db(row.get("notional_usdt"))
+                if active_value is None or active_value <= 0.0:
+                    reservation_evidence_valid = False
+                    break
+                active_notionals.append(active_value)
+            if not reservation_evidence_valid:
+                conn.rollback()
+                return False
+            try:
+                reserved_total = math.fsum(active_notionals)
+                reserved_after = reserved_total + reserved
+            except (ArithmeticError, ValueError, OverflowError):
+                conn.rollback()
+                return False
+            tolerance = max(
+                1e-9,
+                abs(validated_reservation_ceiling) * 1e-12,
+            )
+            if (
+                not math.isfinite(reserved_after)
+                or reserved_after
+                > validated_reservation_ceiling + tolerance
+            ):
+                conn.rollback()
+                return False
         if allow_existing_owner:
             rows = conn.execute(
                 f"""SELECT bot_name FROM bot_open_positions
@@ -4867,7 +4937,8 @@ def claim_symbol_for_entry(bot_name: str, symbol: str,
                            notional_usdt: float = 0.0,
                            mode: str = "LIVE",
                            contract_size: float | None = None,
-                           oversize_notional_ceiling: float | None = None) -> bool:
+                           oversize_notional_ceiling: float | None = None,
+                           reservation_ceiling_usdt: float | None = None) -> bool:
     """Atomic pre-order entry claim (INSERTWHERE NOT EXISTS, symbol+class scoped).
 
     SIM/LIVE design + a KNOWN, ACCEPTED limitation: callers gate this behind
@@ -4893,7 +4964,60 @@ def claim_symbol_for_entry(bot_name: str, symbol: str,
         reservation_mode=mode,
         contract_size=contract_size,
         oversize_notional_ceiling=oversize_notional_ceiling,
+        reservation_ceiling_usdt=reservation_ceiling_usdt,
     )
+
+
+def active_portfolio_reservations(account_type: str) -> tuple[dict, ...]:
+    """Return validated ACTIVE LIVE reservations for one account wallet."""
+    if not isinstance(account_type, str):
+        raise ValueError("portfolio reservation account type is invalid")
+    normalized_account = account_type.strip().lower()
+    if normalized_account not in {"spot", "futures"}:
+        raise ValueError("portfolio reservation account type is invalid")
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT reservation.intent_id, reservation.symbol,
+                  reservation.notional_usdt, reservation.mode,
+                  claim.position_type
+             FROM portfolio_reservations AS reservation
+             LEFT JOIN bot_open_positions AS claim
+               ON claim.bot_name=reservation.bot_name
+              AND claim.symbol=reservation.symbol
+            WHERE reservation.status='ACTIVE'
+            ORDER BY reservation.created_at, reservation.reservation_id"""
+    ).fetchall()
+    result = []
+    for raw_row in rows:
+        row = dict(raw_row)
+        mode = str(row.get("mode") or "").strip().upper()
+        position_type = str(row.get("position_type") or "").strip().upper()
+        if (
+            mode != "LIVE"
+            or position_type not in {"SPOT", "FUTURES", "LONG", "SHORT"}
+        ):
+            raise ValueError("active portfolio reservation is malformed")
+        is_futures = _is_futures_ptype(position_type)
+        if is_futures != (normalized_account == "futures"):
+            continue
+        notional = _optional_finite_db(row.get("notional_usdt"))
+        symbol = str(row.get("symbol") or "").strip()
+        intent = str(row.get("intent_id") or "").strip()
+        if (
+            position_type == "FUTURES"
+            or notional is None
+            or notional <= 0.0
+            or not symbol
+            or not intent
+        ):
+            raise ValueError("active portfolio reservation is malformed")
+        result.append({
+            "intent_id": intent,
+            "symbol": symbol,
+            "side": position_type if position_type in {"LONG", "SHORT"} else "LONG",
+            "notional_usdt": notional,
+        })
+    return tuple(result)
 
 
 def release_portfolio_reservation(intent_id: str, status: str = "RELEASED") -> None:

@@ -19,6 +19,7 @@ from typing import Any, Iterable, Sequence
 
 KNOWN_TOOL_MODULES = (
     "tools.backtester",
+    "tools.futures_capture_phase2",
     "tools.optimizer",
     "tools.selftest",
     "tools.trend_check",

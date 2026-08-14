@@ -3774,7 +3774,10 @@ def run_optimizer(
 
     # The unchanged production baseline is always evaluated before the grid.
     # A reproducible resume reuses only evidence bound to the exact run spec.
-    baseline_evidence = reproducible_run.baseline() if reproducible_run else None
+    baseline_evidence = (
+        reproducible_run.baseline(baseline_params)
+        if reproducible_run else None
+    )
     if baseline_evidence is None:
         baseline_stats = simulate_fast(
             indexed, tune_times, strategy, use_maker, baseline_params

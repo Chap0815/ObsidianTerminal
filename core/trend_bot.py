@@ -411,6 +411,10 @@ class TrendBot(SpotBot):
                     intent_id=entry_id,
                     notional_usdt=coin_size,
                     mode=entry_mode,
+                    reservation_ceiling_usdt=(
+                        admission.portfolio.reservation_ceiling_usdt
+                        if portfolio_mode == "enforce" else None
+                    ),
                 ):
                     from core.logger import log_event as _lev
                     _lev(f"Trend: {sym} claimed by another bot  skip "
