@@ -959,7 +959,19 @@ def _find_order_by_client_id(
     ``lookup_status``. The order wrapper is stricter still: any unresolved
     non-reduce-only create outcome is blocked because an instant market fill
     may legitimately be absent from open-order results."""
-    def _mark_unavailable() -> None:
+    source_status: dict[str, str] = {}
+
+    def _set_source(source: str, state: str) -> None:
+        source_status[source] = state
+        if isinstance(lookup_status, dict):
+            lookup_status["sources"] = dict(source_status)
+
+    def _set_result(state: str) -> None:
+        if isinstance(lookup_status, dict):
+            lookup_status["result"] = state
+
+    def _mark_unavailable(source: str = "request") -> None:
+        _set_source(source, "unavailable")
         if isinstance(lookup_status, dict):
             lookup_status["unavailable"] = True
 
@@ -967,27 +979,31 @@ def _find_order_by_client_id(
         _mark_unavailable()
         return None
 
-    def _budgeted(endpoint: str, fn):
+    def _budgeted(endpoint: str, source: str, fn):
         try:
             allowed = try_consume_api_call(endpoint, critical=True)
         except Exception:
-            _mark_unavailable()
+            _mark_unavailable(source)
             return None
         if not allowed:
-            _mark_unavailable()
+            _mark_unavailable(source)
+            if isinstance(lookup_status, dict):
+                lookup_status["budget_denied"] = True
             return None
         return fn()
 
-    def _recovery_rows(raw):
+    def _recovery_rows(raw, source: str):
         if not isinstance(raw, list):
-            _mark_unavailable()
+            _mark_unavailable(source)
             return ()
         rows = []
         for row in raw:
             if not isinstance(row, dict):
-                _mark_unavailable()
+                _mark_unavailable(source)
                 continue
             rows.append(row)
+        if source_status.get(source) != "unavailable":
+            _set_source(source, "empty")
         return rows
 
     terminal_zero_fill = None
@@ -1066,6 +1082,7 @@ def _find_order_by_client_id(
             try:
                 raw = _budgeted(
                     "order_recovery_mexc_external_oid",
+                    "mexc_exact",
                     lambda: native({"symbol": market_id, "externalOid": cid}),
                 )
                 data = raw.get("data") if isinstance(raw, dict) else None
@@ -1152,9 +1169,25 @@ def _find_order_by_client_id(
                     }
                     selected = _select_recovery_candidate(native_order)
                     if selected is not None:
+                        state = (
+                            "conflict"
+                            if selected.get("_bot_recovery_conflict") is True
+                            else "found"
+                        )
+                        _set_source("mexc_exact", state)
+                        _set_result(state)
                         return selected
+                    _set_source("mexc_exact", "found")
+                elif (
+                    isinstance(raw, dict)
+                    and raw.get("success") is True
+                    and raw.get("data") in (None, [])
+                ):
+                    _set_source("mexc_exact", "empty")
+                elif source_status.get("mexc_exact") != "unavailable":
+                    _mark_unavailable("mexc_exact")
             except Exception as e:
-                _mark_unavailable()
+                _mark_unavailable("mexc_exact")
                 if log_event:
                     try:
                         log_event(
@@ -1167,12 +1200,20 @@ def _find_order_by_client_id(
     try:
         selected = _select_recovery_batch(_recovery_rows(_budgeted(
             "order_recovery_fetch_open_orders",
+            "open_orders",
             lambda: ex.fetch_open_orders(symbol_full),
-        )))
+        ), "open_orders"))
         if selected is not None:
+            state = (
+                "conflict"
+                if selected.get("_bot_recovery_conflict") is True
+                else "found"
+            )
+            _set_source("open_orders", state)
+            _set_result(state)
             return selected
     except Exception as e:
-        _mark_unavailable()
+        _mark_unavailable("open_orders")
         if log_event:
             try:
                 log_event(f"clientOrderId lookup (open orders) failed for "
@@ -1185,12 +1226,20 @@ def _find_order_by_client_id(
         if has.get("fetchOrders"):
             selected = _select_recovery_batch(_recovery_rows(_budgeted(
                 "order_recovery_fetch_orders",
+                "orders",
                 lambda: ex.fetch_orders(symbol_full, limit=20),
-            )))
+            ), "orders"))
             if selected is not None:
+                state = (
+                    "conflict"
+                    if selected.get("_bot_recovery_conflict") is True
+                    else "found"
+                )
+                _set_source("orders", state)
+                _set_result(state)
                 return selected
     except Exception as e:
-        _mark_unavailable()
+        _mark_unavailable("orders")
         if log_event:
             try:
                 log_event(f"clientOrderId lookup (history) failed for "
@@ -1206,12 +1255,20 @@ def _find_order_by_client_id(
         if has.get("fetchClosedOrders"):
             selected = _select_recovery_batch(_recovery_rows(_budgeted(
                 "order_recovery_fetch_closed_orders",
+                "closed_orders",
                 lambda: ex.fetch_closed_orders(symbol_full, limit=20),
-            )))
+            ), "closed_orders"))
             if selected is not None:
+                state = (
+                    "conflict"
+                    if selected.get("_bot_recovery_conflict") is True
+                    else "found"
+                )
+                _set_source("closed_orders", state)
+                _set_result(state)
                 return selected
     except Exception as e:
-        _mark_unavailable()
+        _mark_unavailable("closed_orders")
         if log_event:
             try:
                 log_event(f"clientOrderId lookup (closed orders) failed for "
@@ -1224,8 +1281,9 @@ def _find_order_by_client_id(
                 trade
                 for trade in _recovery_rows(_budgeted(
                     "order_recovery_fetch_my_trades",
+                    "my_trades",
                     lambda: ex.fetch_my_trades(symbol_full, limit=20),
-                ))
+                ), "my_trades")
                 if _order_client_id_matches(trade, cid)
             ]
             if matching_trades:
@@ -1237,16 +1295,30 @@ def _find_order_by_client_id(
                 )
                 selected = _select_recovery_candidate(recovered)
                 if selected is not None:
+                    state = (
+                        "conflict"
+                        if selected.get("_bot_recovery_conflict") is True
+                        else "found"
+                    )
+                    _set_source("my_trades", state)
+                    _set_result(state)
                     return selected
     except Exception as e:
-        _mark_unavailable()
+        _mark_unavailable("my_trades")
         if log_event:
             try:
                 log_event(f"clientOrderId lookup (my trades) failed for "
                           f"{symbol_full}: {type(e).__name__}", "WARN")
             except Exception:
                 pass
-    return terminal_zero_fill
+    if terminal_zero_fill is not None:
+        _set_result("found")
+        return terminal_zero_fill
+    result = "unavailable" if any(
+        state == "unavailable" for state in source_status.values()
+    ) else "empty"
+    _set_result(result)
+    return None
 
 
 def create_order_with_retry(ex,

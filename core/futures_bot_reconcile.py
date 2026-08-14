@@ -1058,6 +1058,110 @@ def _row_with_unpriced_futures_partials(state_row: dict) -> dict:
 
 class FuturesReconcileMixin:
 
+    def _store_entry_recovery_health(self, health: dict, blocked: bool) -> None:
+        snapshot = dict(health) if isinstance(health, dict) else {
+            "ok": False,
+            "component": "entry_recovery",
+            "state": "blocked",
+            "reason": "invalid_health_payload",
+            "unresolved_count": 1,
+        }
+        lock = getattr(self, "_entry_recovery_lock", None)
+        if lock is None:
+            self._entry_recovery_health = snapshot
+            self._entry_recovery_blocked = bool(blocked)
+        else:
+            with lock:
+                self._entry_recovery_health = snapshot
+                self._entry_recovery_blocked = bool(blocked)
+
+    def _log_entry_recovery_health(
+        self,
+        log_event,
+        health: dict,
+        *,
+        context: str,
+    ) -> None:
+        evidence = health.get("evidence_counts")
+        if not isinstance(evidence, dict):
+            evidence = {}
+
+        def bounded_int(value, minimum: int = 0) -> int:
+            if isinstance(value, bool):
+                return minimum
+            try:
+                parsed = int(value or 0)
+            except (TypeError, ValueError, OverflowError):
+                return minimum
+            return max(minimum, min(parsed, 2_147_483_647))
+
+        key = (
+            health.get("ok") is True,
+            str(health.get("state") or ""),
+            str(health.get("reason") or ""),
+            bounded_int(health.get("unresolved_count")),
+            health.get("budget_denied") is True,
+            tuple(sorted(
+                (str(k)[:32], bounded_int(v))
+                for k, v in list(evidence.items())[:8]
+            )),
+        )
+        now = time.monotonic()
+        previous = getattr(self, "_entry_recovery_last_log_key", None)
+        last_at = float(
+            getattr(self, "_entry_recovery_last_log_monotonic", 0.0) or 0.0
+        )
+        reminder = float(
+            getattr(self, "ENTRY_RECOVERY_LOG_REMINDER_SEC", 300.0)
+        )
+        changed = key != previous
+        due = now - last_at >= max(30.0, reminder)
+        self._entry_recovery_last_log_key = key
+        if health.get("ok") is True:
+            if previous is not None and previous[0] is False:
+                self._entry_recovery_last_log_monotonic = now
+                log_event(
+                    f"[{self.BOT_NAME}] entry recovery clear; "
+                    "new entries may resume after position reconciliation",
+                    "OK",
+                )
+            return
+        if not (changed or due):
+            return
+        self._entry_recovery_last_log_monotonic = now
+        count = bounded_int(health.get("unresolved_count"), minimum=1)
+        age = bounded_int(health.get("oldest_age_seconds"))
+        retry = health.get("next_retry_seconds")
+        retry_text = "unknown"
+        if isinstance(retry, (int, float)) and not isinstance(retry, bool):
+            retry_value = float(retry)
+            if math.isfinite(retry_value):
+                retry_text = str(max(0, math.ceil(retry_value)))
+        reason = str(health.get("reason") or "unresolved_intents")[:64]
+        budget = "; API budget denied" if health.get("budget_denied") else ""
+        level = "ERROR" if changed else "WARN"
+        log_event(
+            f"[{self.BOT_NAME}] entry recovery blocked ({context}): "
+            f"{count} unresolved, oldest={age}s, next_retry={retry_text}s, "
+            f"reason={reason}{budget}",
+            level,
+        )
+
+    def _entry_recovery_retry_wait_seconds(self) -> float:
+        if not bool(getattr(self, "_entry_recovery_blocked", False)):
+            return float(getattr(self, "RECONCILE_INTERVAL_SEC", 300))
+        lock = getattr(self, "_entry_recovery_lock", None)
+        if lock is None:
+            health = getattr(self, "_entry_recovery_health", {})
+        else:
+            with lock:
+                health = dict(getattr(self, "_entry_recovery_health", {}) or {})
+        retry = health.get("next_retry_seconds") if isinstance(health, dict) else None
+        if not isinstance(retry, (int, float)) or isinstance(retry, bool):
+            retry = float(getattr(self, "ENTRY_RECOVERY_RETRY_BASE_SEC", 15))
+        maximum = float(getattr(self, "ENTRY_RECOVERY_RETRY_MAX_SEC", 300))
+        return max(1.0, min(maximum, float(retry)))
+
     def _refresh_entry_recovery_barrier(
         self,
         log_event,
@@ -1075,37 +1179,122 @@ class FuturesReconcileMixin:
                     getattr(self, "_entry_recovery_generation", 0)
                 )
         if bool(getattr(self, "simulation", True)):
-            self._entry_recovery_blocked = False
+            FuturesReconcileMixin._store_entry_recovery_health(self, {
+                "ok": True,
+                "component": "entry_recovery",
+                "state": "clear",
+                "reason": "",
+                "unresolved_count": 0,
+            }, False)
             return True, recovery_generation
+        claimed = []
         try:
+            from core.database import (
+                claim_due_order_intent_recoveries,
+                order_intent_recovery_health,
+                record_order_intent_recovery_evidence,
+            )
             from trading.entry_executor import recover_nonterminal_order_intents
 
-            unresolved = recover_nonterminal_order_intents(
-                self.ex,
+            claimed = claim_due_order_intent_recoveries(
                 self.BOT_NAME,
-                log_event=log_event,
+                base_delay_seconds=int(getattr(
+                    self, "ENTRY_RECOVERY_RETRY_BASE_SEC", 15
+                )),
+                max_delay_seconds=int(getattr(
+                    self, "ENTRY_RECOVERY_RETRY_MAX_SEC", 300
+                )),
+                limit=int(getattr(self, "ENTRY_RECOVERY_BATCH_MAX", 8)),
             )
+            if claimed:
+                report: dict = {}
+                recover_nonterminal_order_intents(
+                    self.ex,
+                    self.BOT_NAME,
+                    log_event=log_event,
+                    intent_ids={row["intent_id"] for row in claimed},
+                    recovery_report=report,
+                )
+                for row in claimed:
+                    item = report.get(row["intent_id"]) or {
+                        "evidence_state": "attempt_error",
+                        "sources": {},
+                        "budget_denied": False,
+                    }
+                    record_order_intent_recovery_evidence(
+                        row["intent_id"],
+                        bot_name=self.BOT_NAME,
+                        evidence_state=item["evidence_state"],
+                        sources=item.get("sources"),
+                        budget_denied=item.get("budget_denied") is True,
+                    )
+            health = order_intent_recovery_health(
+                self.BOT_NAME,
+                max_retry_seconds=int(getattr(
+                    self, "ENTRY_RECOVERY_RETRY_MAX_SEC", 300
+                )),
+            )
+            if not claimed and health.get("ok") is True:
+                # A zero-work pass performs no venue I/O in production, but
+                # still closes the generation race with an entry that became
+                # uncertain while this refresh was in progress.
+                recover_nonterminal_order_intents(
+                    self.ex,
+                    self.BOT_NAME,
+                    log_event=log_event,
+                )
+                health = order_intent_recovery_health(
+                    self.BOT_NAME,
+                    max_retry_seconds=int(getattr(
+                        self, "ENTRY_RECOVERY_RETRY_MAX_SEC", 300
+                    )),
+                )
         except Exception as exc:
-            if lock is None:
-                self._entry_recovery_blocked = True
-            else:
-                with lock:
-                    self._entry_recovery_blocked = True
-            self._log_error(f"{context} order-intent recovery", exc)
-            return False, recovery_generation
-        if unresolved:
-            if lock is None:
-                self._entry_recovery_blocked = True
-            else:
-                with lock:
-                    self._entry_recovery_blocked = True
-            log_event(
-                f"[{self.BOT_NAME}] {len(unresolved)} unresolved order "
-                "intent(s); new entries blocked until reconciliation",
-                "ERROR",
+            try:
+                from core.database import record_order_intent_recovery_evidence
+
+                for row in claimed:
+                    record_order_intent_recovery_evidence(
+                        row["intent_id"],
+                        bot_name=self.BOT_NAME,
+                        evidence_state="attempt_error",
+                        sources={},
+                    )
+            except Exception as evidence_exc:
+                self._log_error(
+                    f"{context} recovery evidence persistence",
+                    evidence_exc,
+                )
+            health = {
+                "ok": False,
+                "component": "entry_recovery",
+                "state": "blocked",
+                "reason": "attempt_error",
+                "error_type": type(exc).__name__,
+                "unresolved_count": max(1, len(claimed)),
+                "next_retry_seconds": float(getattr(
+                    self, "ENTRY_RECOVERY_RETRY_BASE_SEC", 15
+                )),
+                "evidence_counts": {"attempt_error": max(1, len(claimed))},
+            }
+            FuturesReconcileMixin._store_entry_recovery_health(
+                self, health, True
+            )
+            FuturesReconcileMixin._log_entry_recovery_health(
+                self, log_event, health, context=context
             )
             return False, recovery_generation
-        return True, recovery_generation
+        blocked = health.get("ok") is not True
+        barrier_blocked = blocked or bool(
+            getattr(self, "_entry_recovery_blocked", False)
+        )
+        FuturesReconcileMixin._store_entry_recovery_health(
+            self, health, barrier_blocked
+        )
+        FuturesReconcileMixin._log_entry_recovery_health(
+            self, log_event, health, context=context
+        )
+        return not blocked, recovery_generation
 
     def _complete_entry_recovery_barrier(
         self,
@@ -2600,10 +2789,16 @@ class FuturesReconcileMixin:
         )
 
         last_gc = 0.0
+        last_reconciliation = time.monotonic()
         while not self._shutdown_event.is_set():
             wait_timeout = float(self.RECONCILE_INTERVAL_SEC)
             if bool(getattr(self, "_entry_recovery_blocked", False)):
-                wait_timeout = min(wait_timeout, 5.0)
+                wait_timeout = min(
+                    wait_timeout,
+                    FuturesReconcileMixin._entry_recovery_retry_wait_seconds(
+                        self
+                    ),
+                )
             wakeup = getattr(self, "_reconcile_wakeup_event", None)
             if wakeup is None:
                 if self._shutdown_event.wait(timeout=wait_timeout):
@@ -2646,7 +2841,18 @@ class FuturesReconcileMixin:
                         context="periodic",
                     )
                 )
-                reconciliation_ok = self._startup_reconciliation()
+                reconciliation_due = (
+                    time.monotonic() - last_reconciliation
+                    >= float(self.RECONCILE_INTERVAL_SEC)
+                )
+                if recovery_ok or reconciliation_due:
+                    reconciliation_ok = self._startup_reconciliation()
+                    last_reconciliation = time.monotonic()
+                else:
+                    # Keep the entry gate closed. The latest full position
+                    # snapshot remains valid for monitoring/exits, while
+                    # retry-only wakeups perform no extra position request.
+                    reconciliation_ok = False
                 FuturesReconcileMixin._complete_entry_recovery_barrier(
                     self,
                     recovery_generation,

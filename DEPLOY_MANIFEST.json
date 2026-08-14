@@ -1,6 +1,6 @@
 {
-  "build_id": "415ed8aabeb8874d",
-  "created_at": "2026-08-14 13:17:57",
+  "build_id": "fea20185e7555808",
+  "created_at": "2026-08-14 14:41:23",
   "source": "update_deploy_manifest.py",
   "file_count": 188,
   "files": [
@@ -76,8 +76,8 @@
     },
     {
       "path": "bot_utils/futures_order.py",
-      "sha256": "0da94199f3adc2e7bd6535ffa98491ae5c21bc7c7aa187b6b9e56852c525012d",
-      "bytes": 86474
+      "sha256": "97a72b4447ad27566ce96472994af0975e2dfbe1f6c8202b144927d19d5726ee",
+      "bytes": 89441
     },
     {
       "path": "bot_utils/indicators.py",
@@ -246,8 +246,8 @@
     },
     {
       "path": "core/database.py",
-      "sha256": "378ee48e872f8c9fa09bfac8772d5ecc002e16e93ae6c347335173d05dd60e6b",
-      "bytes": 296028
+      "sha256": "a23d1c069f82e34f4d8ba72fb1fd1fb842a5041c32410d3fb0465e2f2c24eb58",
+      "bytes": 311785
     },
     {
       "path": "core/event_bus.py",
@@ -256,8 +256,8 @@
     },
     {
       "path": "core/futures_bot.py",
-      "sha256": "64ea9fb50d70c00532cfe6c399a74d84bb9408ce913494d371cc99a100bf4840",
-      "bytes": 56646
+      "sha256": "b65b88e6a059b409de58565d5cc4f7074f55133fdff45b51ebfa7677c91f18b9",
+      "bytes": 59167
     },
     {
       "path": "core/futures_bot_exits.py",
@@ -266,13 +266,13 @@
     },
     {
       "path": "core/futures_bot_reconcile.py",
-      "sha256": "f8a66e94d4f430914db32fa3b629f603e1d869830f05212482a5721a50930f16",
-      "bytes": 112667
+      "sha256": "cfb65838b8a486d33a22d4fe156512590bf5ec8f2eb97201c071c459461ae69e",
+      "bytes": 121445
     },
     {
       "path": "core/futures_bot_scan.py",
-      "sha256": "88ba8f46f79120fa1aec8b6389b2ddfafb5c45a6c3124f0db196d8c775062aa9",
-      "bytes": 112952
+      "sha256": "8de9b8153da79f1b0057309ef7680c5ddbfb06d0334a5e4f6dbd3ec9c2b48a95",
+      "bytes": 113326
     },
     {
       "path": "core/logger.py",
@@ -736,8 +736,8 @@
     },
     {
       "path": "trading/entry_executor.py",
-      "sha256": "e9a635f2f92fcc6d21ca04fefab47314f6d4724c0db0a1dad990a638b8e3b41b",
-      "bytes": 68111
+      "sha256": "3a5886863eea8b674c474f2d95c53e6ea5262a6f7a941b11e4774be0d828893a",
+      "bytes": 69877
     },
     {
       "path": "trading/entry_lifecycle.py",

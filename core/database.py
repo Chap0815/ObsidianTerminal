@@ -1243,6 +1243,23 @@ def _run_migrations(conn) -> None:
         "WHERE status != 'FINALIZED'"
     )
     c.execute("""
+    CREATE TABLE IF NOT EXISTS order_intent_recovery_state (
+        intent_id          TEXT PRIMARY KEY,
+        bot_name           TEXT NOT NULL,
+        attempt_count      INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at    TEXT,
+        next_attempt_at    TEXT,
+        evidence_state     TEXT NOT NULL DEFAULT 'unattempted',
+        source_status_json TEXT NOT NULL DEFAULT '{}',
+        budget_denied      INTEGER NOT NULL DEFAULT 0,
+        updated_at         TEXT NOT NULL,
+        FOREIGN KEY(intent_id) REFERENCES order_intents(intent_id)
+    )""")
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_order_intent_recovery_due "
+        "ON order_intent_recovery_state(bot_name, next_attempt_at, intent_id)"
+    )
+    c.execute("""
     CREATE TABLE IF NOT EXISTS execution_tca (
         id                 INTEGER PRIMARY KEY AUTOINCREMENT,
         intent_id          TEXT NOT NULL,
@@ -6301,6 +6318,405 @@ def list_nonterminal_order_intents(
         params.append(str(bot_name))
     query += " ORDER BY created_at, intent_id"
     return [dict(row) for row in conn.execute(query, tuple(params)).fetchall()]
+
+
+_ORDER_RECOVERY_EVIDENCE_STATES = frozenset({
+    "unattempted",
+    "attempting",
+    "found",
+    "empty",
+    "unavailable",
+    "conflict",
+    "attempt_error",
+})
+_ORDER_RECOVERY_SOURCE_STATES = frozenset({
+    "found",
+    "empty",
+    "unavailable",
+    "conflict",
+})
+_ORDER_RECOVERY_MAX_ITEMS = 8
+
+
+def _order_recovery_sources_db(value) -> tuple[dict[str, str], str]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError("recovery source status must be an object")
+    normalized: dict[str, str] = {}
+    for raw_name, raw_state in value.items():
+        name = _required_text_db(
+            raw_name, "recovery source name", max_length=32
+        )
+        state = _required_text_db(
+            raw_state, "recovery source state", max_length=16
+        ).lower()
+        if state not in _ORDER_RECOVERY_SOURCE_STATES:
+            raise ValueError("recovery source state is invalid")
+        if name in normalized:
+            raise ValueError("duplicate recovery source status")
+        normalized[name] = state
+    if len(normalized) > 8:
+        raise ValueError("too many recovery source statuses")
+    encoded = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    if len(encoded.encode("utf-8")) > 512:
+        raise ValueError("recovery source status exceeds storage bound")
+    return normalized, encoded
+
+
+def claim_due_order_intent_recoveries(
+    bot_name: str,
+    *,
+    now: str | None = None,
+    base_delay_seconds: int = 15,
+    max_delay_seconds: int = 300,
+    limit: int = 8,
+) -> list[dict]:
+    """Atomically lease due LIVE recovery work and persist its next retry.
+
+    The next deadline is committed before any venue I/O. A crash therefore
+    cannot reset the retry cadence, and competing bot processes cannot claim
+    the same intent in one retry window.
+    """
+    validated_bot = _canonical_bot_name_db(bot_name)
+    if isinstance(base_delay_seconds, bool) or not isinstance(
+        base_delay_seconds, int
+    ):
+        raise ValueError("recovery base delay must be an integer")
+    if isinstance(max_delay_seconds, bool) or not isinstance(
+        max_delay_seconds, int
+    ):
+        raise ValueError("recovery maximum delay must be an integer")
+    if not 5 <= base_delay_seconds <= 300:
+        raise ValueError("recovery base delay must be between 5 and 300")
+    if not base_delay_seconds <= max_delay_seconds <= 3600:
+        raise ValueError("recovery maximum delay is invalid")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 32:
+        raise ValueError("recovery claim limit must be between 1 and 32")
+    if now is None:
+        now_dt = _utcnow()
+        now_text = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        now_text, now_dt = _trade_timestamp_db(now, "recovery now")
+
+    conn = get_connection()
+    claimed: list[dict] = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """SELECT intent.*, recovery.attempt_count,
+                      recovery.last_attempt_at, recovery.next_attempt_at
+                 FROM order_intents AS intent
+            LEFT JOIN order_intent_recovery_state AS recovery
+                   ON recovery.intent_id=intent.intent_id
+                WHERE intent.bot_name=?
+                  AND intent.status!='FINALIZED'
+                  AND UPPER(TRIM(intent.mode))!='SIM'
+             ORDER BY intent.created_at, intent.intent_id""",
+            (validated_bot,),
+        ).fetchall()
+        for raw_row in rows:
+            if len(claimed) >= limit:
+                break
+            row = dict(raw_row)
+            raw_attempts = row.get("attempt_count")
+            attempts = 0 if raw_attempts is None else raw_attempts
+            if (
+                isinstance(attempts, bool)
+                or not isinstance(attempts, int)
+                or attempts < 0
+                or attempts > 1_000_000
+            ):
+                raise ValueError("persisted recovery attempt count is invalid")
+            next_text = row.get("next_attempt_at")
+            due = next_text in (None, "")
+            if not due:
+                next_text, next_dt = _trade_timestamp_db(
+                    next_text, "persisted recovery next attempt"
+                )
+                remaining = (next_dt - now_dt).total_seconds()
+                if remaining <= 0.0:
+                    due = True
+                elif remaining > max_delay_seconds:
+                    # A backward wall-clock correction must not suspend a
+                    # fail-closed recovery barrier indefinitely. Re-anchor the
+                    # deadline without performing venue I/O in this call.
+                    corrected = now_dt + timedelta(seconds=max_delay_seconds)
+                    conn.execute(
+                        """UPDATE order_intent_recovery_state
+                              SET next_attempt_at=?, updated_at=?
+                            WHERE intent_id=? AND bot_name=?""",
+                        (
+                            corrected.strftime("%Y-%m-%d %H:%M:%S"),
+                            now_text,
+                            row["intent_id"],
+                            validated_bot,
+                        ),
+                    )
+            if not due:
+                continue
+            claimed_attempt = attempts + 1
+            exponent = min(attempts, 20)
+            delay = min(
+                max_delay_seconds,
+                base_delay_seconds * (2 ** exponent),
+            )
+            next_attempt = (now_dt + timedelta(seconds=delay)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            conn.execute(
+                """INSERT INTO order_intent_recovery_state
+                       (intent_id, bot_name, attempt_count, last_attempt_at,
+                        next_attempt_at, evidence_state, source_status_json,
+                        budget_denied, updated_at)
+                     VALUES (?, ?, ?, ?, ?, 'attempting', '{}', 0, ?)
+                     ON CONFLICT(intent_id) DO UPDATE SET
+                        bot_name=excluded.bot_name,
+                        attempt_count=excluded.attempt_count,
+                        last_attempt_at=excluded.last_attempt_at,
+                        next_attempt_at=excluded.next_attempt_at,
+                        evidence_state='attempting',
+                        source_status_json='{}',
+                        budget_denied=0,
+                        updated_at=excluded.updated_at""",
+                (
+                    row["intent_id"],
+                    validated_bot,
+                    claimed_attempt,
+                    now_text,
+                    next_attempt,
+                    now_text,
+                ),
+            )
+            row["recovery_attempt_count"] = claimed_attempt
+            row["recovery_next_attempt_at"] = next_attempt
+            claimed.append(row)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return claimed
+
+
+def record_order_intent_recovery_evidence(
+    intent_id: str,
+    *,
+    bot_name: str,
+    evidence_state: str,
+    sources: dict | None = None,
+    budget_denied: bool = False,
+    now: str | None = None,
+) -> bool:
+    """Attach bounded lookup evidence to an already claimed recovery try."""
+    validated_intent = _required_text_db(
+        intent_id, "intent_id", max_length=64
+    )
+    validated_bot = _canonical_bot_name_db(bot_name)
+    state = _required_text_db(
+        evidence_state, "recovery evidence state", max_length=16
+    ).lower()
+    if state not in _ORDER_RECOVERY_EVIDENCE_STATES - {"unattempted", "attempting"}:
+        raise ValueError("recovery evidence state is invalid")
+    if not isinstance(budget_denied, bool):
+        raise ValueError("recovery budget flag must be boolean")
+    _, encoded_sources = _order_recovery_sources_db(sources)
+    now_text = (
+        _utcnow_str()
+        if now is None
+        else _trade_timestamp_db(now, "recovery evidence time")[0]
+    )
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            """UPDATE order_intent_recovery_state
+                  SET evidence_state=?, source_status_json=?,
+                      budget_denied=?, updated_at=?
+                WHERE intent_id=? AND bot_name=?
+                  AND EXISTS (
+                      SELECT 1 FROM order_intents AS intent
+                       WHERE intent.intent_id=order_intent_recovery_state.intent_id
+                         AND intent.status!='FINALIZED'
+                         AND UPPER(TRIM(intent.mode))!='SIM'
+                  )""",
+            (
+                state,
+                encoded_sources,
+                int(budget_denied),
+                now_text,
+                validated_intent,
+                validated_bot,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return cursor.rowcount == 1
+
+
+def order_intent_recovery_health(
+    bot_name: str,
+    *,
+    now: str | None = None,
+    max_retry_seconds: int = 300,
+) -> dict:
+    """Return bounded, restart-reconstructed LIVE recovery diagnostics."""
+    validated_bot = _canonical_bot_name_db(bot_name)
+    if (
+        isinstance(max_retry_seconds, bool)
+        or not isinstance(max_retry_seconds, int)
+        or not 5 <= max_retry_seconds <= 3600
+    ):
+        raise ValueError("recovery health retry bound is invalid")
+    if now is None:
+        now_dt = _utcnow()
+    else:
+        _, now_dt = _trade_timestamp_db(now, "recovery health time")
+    rows = get_connection().execute(
+        """SELECT intent.symbol, intent.status, intent.created_at,
+                  recovery.attempt_count, recovery.next_attempt_at,
+                  recovery.evidence_state, recovery.source_status_json,
+                  recovery.budget_denied
+             FROM order_intents AS intent
+        LEFT JOIN order_intent_recovery_state AS recovery
+               ON recovery.intent_id=intent.intent_id
+            WHERE intent.bot_name=?
+              AND intent.status!='FINALIZED'
+              AND UPPER(TRIM(intent.mode))!='SIM'
+         ORDER BY intent.created_at, intent.intent_id""",
+        (validated_bot,),
+    ).fetchall()
+    if not rows:
+        return {
+            "ok": True,
+            "component": "entry_recovery",
+            "state": "clear",
+            "reason": "",
+            "unresolved_count": 0,
+            "oldest_age_seconds": 0.0,
+            "next_retry_at": None,
+            "next_retry_seconds": None,
+            "max_attempt_count": 0,
+            "budget_denied": False,
+            "evidence_counts": {},
+            "source_counts": {},
+            "items": [],
+        }
+
+    evidence_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    items = []
+    oldest_age = 0.0
+    next_retry_at = None
+    next_retry_seconds = None
+    retry_due_now = False
+    max_attempt_count = 0
+    any_budget_denied = False
+    invalid_time = False
+    for raw_row in rows:
+        row = dict(raw_row)
+        try:
+            _, created_dt = _trade_timestamp_db(
+                row.get("created_at"), "persisted intent creation time"
+            )
+            age = max(0.0, (now_dt - created_dt).total_seconds())
+        except ValueError:
+            age = 0.0
+            invalid_time = True
+        oldest_age = max(oldest_age, age)
+        raw_attempts = row.get("attempt_count")
+        attempts = raw_attempts if isinstance(raw_attempts, int) else 0
+        if isinstance(attempts, bool) or attempts < 0:
+            attempts = 0
+        max_attempt_count = max(max_attempt_count, attempts)
+        evidence = str(row.get("evidence_state") or "unattempted").lower()
+        if evidence not in _ORDER_RECOVERY_EVIDENCE_STATES:
+            evidence = "attempt_error"
+        try:
+            sources = json.loads(row.get("source_status_json") or "{}")
+            sources, _ = _order_recovery_sources_db(sources)
+        except (TypeError, ValueError):
+            sources = {}
+            evidence = "attempt_error"
+            invalid_time = True
+        evidence_counts[evidence] = evidence_counts.get(evidence, 0) + 1
+        for source_state in sources.values():
+            source_counts[source_state] = source_counts.get(source_state, 0) + 1
+        budget_denied = row.get("budget_denied") == 1
+        any_budget_denied = any_budget_denied or budget_denied
+        retry_text = row.get("next_attempt_at")
+        retry_seconds = 0.0
+        if retry_text not in (None, ""):
+            try:
+                retry_text, retry_dt = _trade_timestamp_db(
+                    retry_text, "persisted recovery next attempt"
+                )
+                retry_seconds = max(
+                    0.0,
+                    min(
+                        float(max_retry_seconds),
+                        (retry_dt - now_dt).total_seconds(),
+                    ),
+                )
+                if (
+                    not retry_due_now
+                    and (next_retry_at is None or retry_text < next_retry_at)
+                ):
+                    next_retry_at = retry_text
+                    next_retry_seconds = retry_seconds
+            except ValueError:
+                invalid_time = True
+                retry_due_now = True
+                retry_text = None
+                next_retry_at = None
+                next_retry_seconds = 0.0
+                retry_seconds = 0.0
+        else:
+            retry_due_now = True
+            next_retry_at = None
+            next_retry_seconds = 0.0
+        if len(items) < _ORDER_RECOVERY_MAX_ITEMS:
+            items.append({
+                "symbol": str(row.get("symbol") or "")[:64],
+                "status": str(row.get("status") or "")[:24],
+                "age_seconds": age,
+                "attempt_count": attempts,
+                "next_retry_at": retry_text,
+                "next_retry_seconds": retry_seconds,
+                "evidence_state": evidence,
+                "sources": sources,
+                "budget_denied": budget_denied,
+            })
+    if invalid_time:
+        reason = "recovery_state_invalid"
+    elif evidence_counts.get("conflict", 0):
+        reason = "evidence_conflict"
+    elif evidence_counts.get("unavailable", 0) or evidence_counts.get(
+        "attempt_error", 0
+    ):
+        reason = "source_unavailable"
+    else:
+        reason = "unresolved_intents"
+    return {
+        "ok": False,
+        "component": "entry_recovery",
+        "state": "blocked",
+        "reason": reason,
+        "unresolved_count": len(rows),
+        "oldest_age_seconds": oldest_age,
+        "next_retry_at": next_retry_at,
+        "next_retry_seconds": next_retry_seconds,
+        "max_attempt_count": max_attempt_count,
+        "budget_denied": any_budget_denied,
+        "evidence_counts": evidence_counts,
+        "source_counts": source_counts,
+        "items": items,
+    }
 
 
 def _canonical_finite_json_object_db(raw) -> tuple[dict, str] | None:

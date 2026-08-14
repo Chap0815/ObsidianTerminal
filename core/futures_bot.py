@@ -87,6 +87,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
     MARKOUT_MAX_OVERDUE_SEC: float = 30.0
     MARKOUT_POLL_STALE_SEC: float = 15.0
     VENUE_HEALTH_MIN_STALE_SEC: float = 30.0
+    ENTRY_RECOVERY_RETRY_BASE_SEC: int = 15
+    ENTRY_RECOVERY_RETRY_MAX_SEC: int = 300
+    ENTRY_RECOVERY_BATCH_MAX: int = 8
+    ENTRY_RECOVERY_LOG_REMINDER_SEC: float = 300.0
 
     # Monitor / Scan defaults
     DEFAULT_MONITOR_INTERVAL: int = 20
@@ -174,6 +178,15 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         }
         self._venue_health: dict[str, Any] = {}
         self._entry_recovery_blocked = False
+        self._entry_recovery_health: dict[str, Any] = {
+            "ok": True,
+            "component": "entry_recovery",
+            "state": "clear",
+            "reason": "",
+            "unresolved_count": 0,
+        }
+        self._entry_recovery_last_log_key = None
+        self._entry_recovery_last_log_monotonic = 0.0
 
     # Route through bot_utils.config.get_live_value so that user-edited values
     # in the launcher's settings UI take effect within ~5 s without a bot
@@ -238,6 +251,48 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 "error_type": type(exc).__name__,
             }
 
+    def _entry_recovery_runtime_health(self) -> dict[str, Any]:
+        """Expose a blocked entry journal as degraded runtime health."""
+        lock = getattr(self, "_entry_recovery_lock", None)
+        if lock is None:
+            blocked = bool(getattr(self, "_entry_recovery_blocked", False))
+            health = getattr(self, "_entry_recovery_health", None)
+        else:
+            with lock:
+                blocked = bool(
+                    getattr(self, "_entry_recovery_blocked", False)
+                )
+                health = getattr(self, "_entry_recovery_health", None)
+        if isinstance(health, dict):
+            result = dict(health)
+        else:
+            result = {}
+        if not blocked and (not result or result.get("ok") is True):
+            return {}
+        if blocked and result.get("ok") is not False:
+            try:
+                unresolved_count = max(
+                    1, int(result.get("unresolved_count") or 0)
+                )
+            except (TypeError, ValueError, OverflowError):
+                unresolved_count = 1
+            result = {
+                "ok": False,
+                "component": "entry_recovery",
+                "state": "blocked",
+                "reason": "barrier_blocked",
+                "unresolved_count": unresolved_count,
+            }
+        elif not result:
+            result = {
+                "ok": not blocked,
+                "component": "entry_recovery",
+                "state": "blocked" if blocked else "clear",
+                "reason": "barrier_blocked" if blocked else "",
+                "unresolved_count": 1 if blocked else 0,
+            }
+        return result
+
     def _runtime_status_health(
         self,
         threads: dict[str, bool],
@@ -262,6 +317,11 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         markout_ok = not markout_health or markout_health.get("ok") is True
         venue_health = self._venue_runtime_health()
         venue_ok = not venue_health or venue_health.get("ok") is True
+        entry_recovery_health = self._entry_recovery_runtime_health()
+        entry_recovery_ok = (
+            not entry_recovery_health
+            or entry_recovery_health.get("ok") is True
+        )
         status = (
             "ready"
             if (
@@ -270,6 +330,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 and ticker_ok
                 and markout_ok
                 and venue_ok
+                and entry_recovery_ok
             )
             else "degraded"
         )
@@ -282,6 +343,8 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             extra["markout_health"] = markout_health
         if venue_health:
             extra["venue_health"] = venue_health
+        if entry_recovery_health:
+            extra["entry_recovery_health"] = entry_recovery_health
         return status, extra
 
     def _owns_markout_worker(self) -> bool:

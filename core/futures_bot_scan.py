@@ -265,18 +265,28 @@ class FuturesScanMixin:
         return released
 
     def _mark_futures_entry_recovery_pending(self) -> None:
+        pending_health = {
+            "ok": False,
+            "component": "entry_recovery",
+            "state": "blocked",
+            "reason": "new_uncertain_entry",
+            "unresolved_count": 1,
+            "next_retry_seconds": 0.0,
+        }
         lock = getattr(self, "_entry_recovery_lock", None)
         if lock is None:
             self._entry_recovery_generation = (
                 int(getattr(self, "_entry_recovery_generation", 0)) + 1
             )
             self._entry_recovery_blocked = True
+            self._entry_recovery_health = pending_health
         else:
             with lock:
                 self._entry_recovery_generation = (
                     int(getattr(self, "_entry_recovery_generation", 0)) + 1
                 )
                 self._entry_recovery_blocked = True
+                self._entry_recovery_health = pending_health
         wakeup = getattr(self, "_reconcile_wakeup_event", None)
         setter = getattr(wakeup, "set", None)
         if callable(setter):

@@ -1172,7 +1172,14 @@ def _record_fill_tca(
         return
 
 
-def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -> list[dict]:
+def recover_nonterminal_order_intents(
+    exchange,
+    bot_name: str,
+    log_event=None,
+    *,
+    intent_ids: set[str] | None = None,
+    recovery_report: dict | None = None,
+) -> list[dict]:
     """Reconcile persisted intents without ever submitting a replacement order."""
     from bot_utils.futures_order import _find_order_by_client_id
     from core.database import (
@@ -1183,6 +1190,32 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
     )
 
     unresolved = []
+    selected_ids = None if intent_ids is None else set(intent_ids)
+    if selected_ids is not None and (
+        len(selected_ids) > 32
+        or any(not isinstance(value, str) or not value for value in selected_ids)
+    ):
+        raise ValueError("recovery intent filter is invalid")
+    if recovery_report is not None:
+        if not isinstance(recovery_report, dict):
+            raise ValueError("recovery report must be a dictionary")
+        recovery_report.clear()
+
+    def report_evidence(intent: dict, lookup_status: dict) -> None:
+        if recovery_report is None or len(recovery_report) >= 32:
+            return
+        result = str(lookup_status.get("result") or "unavailable").lower()
+        if result not in {"found", "empty", "unavailable", "conflict"}:
+            result = "unavailable"
+        sources = lookup_status.get("sources")
+        if not isinstance(sources, dict):
+            sources = {}
+        recovery_report[intent["intent_id"]] = {
+            "symbol": str(intent.get("symbol") or "")[:64],
+            "evidence_state": result,
+            "sources": dict(list(sources.items())[:8]),
+            "budget_denied": lookup_status.get("budget_denied") is True,
+        }
 
     def persisted_snapshot(intent_id: str, fallback: dict) -> dict:
         try:
@@ -1205,17 +1238,22 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
 
     for intent in list_nonterminal_order_intents(bot_name):
         intent_id = intent["intent_id"]
+        if selected_ids is not None and intent_id not in selected_ids:
+            continue
         current = intent["status"]
         fallback_client_order_id = intent.get("fallback_client_order_id")
         lookup_client_order_id = (
             fallback_client_order_id or intent["client_order_id"]
         )
+        lookup_status: dict = {}
         order = _find_order_by_client_id(
             exchange,
             intent["symbol"],
             lookup_client_order_id,
             log_event=log_event,
+            lookup_status=lookup_status,
         )
+        report_evidence(intent, lookup_status)
         if order is None:
             if _legacy_budget_denial_proves_not_submitted(intent):
                 try:
@@ -1314,6 +1352,8 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
                         "startup refresh changed order amount"
                     )
         if refresh_identity_error is not None:
+            if recovery_report is not None and intent_id in recovery_report:
+                recovery_report[intent_id]["evidence_state"] = "conflict"
             if current != "RECOVERY_REQUIRED":
                 transition_order_intent(
                     intent_id,
@@ -1769,4 +1809,6 @@ def recover_nonterminal_order_intents(exchange, bot_name: str, log_event=None) -
             unresolved.append(persisted_intent)
             continue
         unresolved.append(intent)
+    if selected_ids is not None:
+        return list_nonterminal_order_intents(bot_name)
     return unresolved
