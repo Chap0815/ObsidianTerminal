@@ -27,36 +27,26 @@ def _persist_sim_tca_capture_failure(
     *,
     entry_id: str,
     bot_name: str,
-    mode: str,
     symbol: str,
+    side: str,
+    reference_price: float,
+    measured_at: str,
     reason: str,
     error_type: str,
 ) -> bool:
     try:
-        from core.database import save_candidate_microstructure
+        from core.database import persist_simulated_entry_tca_unavailable_bundle
 
-        persisted = save_candidate_microstructure(
-            entry_id=entry_id,
+        persist_simulated_entry_tca_unavailable_bundle(
+            entry_id,
             bot_name=bot_name,
-            mode=mode,
             symbol=symbol,
-            stage="arrival_book_unavailable",
-            measured_at=datetime.now(timezone.utc).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-            source="sim_tca_capture",
-            sequence_status="capture_failed",
-            payload={
-                "bot_name": bot_name,
-                "error_type": str(error_type or "UnknownError")[:100],
-                "markouts_scheduled": True,
-                "mode": mode,
-                "reason": str(reason)[:100],
-                "research_simulated": True,
-            },
+            side=side,
+            reference_price=reference_price,
+            measured_at=measured_at,
+            reason=reason,
+            error_type=error_type,
         )
-        if not persisted:
-            raise RuntimeError("SIM TCA capture failure was not persisted")
         return True
     except Exception as exc:
         try:
@@ -80,6 +70,7 @@ def capture_simulated_entry_tca(
     fill_price: float,
     fee_rate: float,
     notional_usdt: float | None = None,
+    filled_at: str | None = None,
     depth_levels: int = 20,
     consume_api=None,
     record_tca=None,
@@ -88,7 +79,6 @@ def capture_simulated_entry_tca(
 ) -> bool:
     """Record SIM arrival/fill/markouts without creating an order intent."""
     default_persistence = False
-    markouts_scheduled = False
     failure_reason = "capture_validation_failed"
     try:
         normalized_mode = str(mode).strip().upper()
@@ -117,6 +107,17 @@ def capture_simulated_entry_tca(
         levels = int(depth_levels)
         if levels < 5 or levels > 100:
             raise ValueError("depth levels must be between 5 and 100")
+        if filled_at is None:
+            measured_at = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        else:
+            measured_at = str(filled_at).strip()
+            parsed_time = datetime.strptime(
+                measured_at, "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+            if parsed_time.strftime("%Y-%m-%d %H:%M:%S") != measured_at:
+                raise ValueError("filled_at must be a canonical UTC timestamp")
 
         default_persistence = (
             record_tca is None
@@ -138,21 +139,22 @@ def capture_simulated_entry_tca(
                 symbol=normalized_symbol,
                 side=normalized_side,
                 reference_price=reference,
+                measured_at=measured_at,
             )
-            markouts_scheduled = True
-
         failure_reason = "api_budget_check_failed"
         if consume_api is None:
             from bot_utils.api_budget import try_consume_api_call as consume
         else:
             consume = consume_api
         if not consume("candidate_microstructure_fetch_order_book"):
-            if default_persistence and markouts_scheduled:
+            if default_persistence:
                 _persist_sim_tca_capture_failure(
                     entry_id=normalized_entry_id,
                     bot_name=normalized_bot,
-                    mode=normalized_mode,
                     symbol=normalized_symbol,
+                    side=normalized_side,
+                    reference_price=reference,
+                    measured_at=measured_at,
                     reason="api_budget_denied",
                     error_type="ApiBudgetDenied",
                 )
@@ -189,7 +191,6 @@ def capture_simulated_entry_tca(
             "mode": normalized_mode,
             "research_simulated": True,
         }
-        measured_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         if default_persistence:
             failure_reason = "bundle_persist_failed"
             from core.database import persist_simulated_entry_tca_bundle
@@ -243,15 +244,18 @@ def capture_simulated_entry_tca(
                 symbol=normalized_symbol,
                 side=normalized_side,
                 reference_price=reference,
+                measured_at=measured_at,
             )
         return True
     except Exception as exc:
-        if default_persistence and markouts_scheduled:
+        if default_persistence:
             _persist_sim_tca_capture_failure(
                 entry_id=normalized_entry_id,
                 bot_name=normalized_bot,
-                mode=normalized_mode,
                 symbol=normalized_symbol,
+                side=normalized_side,
+                reference_price=reference,
+                measured_at=measured_at,
                 reason=failure_reason,
                 error_type=type(exc).__name__,
             )

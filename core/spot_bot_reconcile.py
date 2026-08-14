@@ -1516,10 +1516,13 @@ class ReconcileMixin:
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
         if self.simulation:
-            # SIM: nothing to reconcile against the exchange; stay quiet (no
-            # log line). Lock-gc still runs periodically below.
+            # SIM has no exchange wallet to reconcile. It can still carry a
+            # durable post-state TCA WAL after a crash or transient DB fault.
             while not self._shutdown_event.is_set():
                 self._shutdown_event.wait(timeout=self.GC_LOCKS_INTERVAL_SEC)
+                if self._shutdown_event.is_set():
+                    return
+                self._recover_simulated_entry_tca_pending()
                 try:
                     reaped = self.ex.reap_dead_thread_clones()
                     if reaped:

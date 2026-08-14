@@ -20,6 +20,7 @@ Flow per tick:
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 
 from bot_utils import (
     safe_fetch_balance_usdt,
@@ -898,6 +899,16 @@ class ScanMixin:
             return None  # buy failed  already logged
 
         amount, fill_price, gross_amount, invested_usdt, entry_fee = entry
+        sim_tca_pending = None
+        if self.simulation:
+            sim_tca_pending = self._new_simulated_entry_tca_pending(
+                entry_id=entry_id,
+                symbol=f"{sym}/USDT",
+                amount=amount,
+                fill_price=fill_price,
+                fee_rate=(entry_fee / invested_usdt),
+                notional_usdt=invested_usdt,
+            )
 
         # Persist the final position. _place_buy_order already wrote a
         # PROVISIONAL row (zombie protection) before the slow fee refetches, so
@@ -931,6 +942,8 @@ class ScanMixin:
             "entry_id": entry_id,
             "provisional": False,
         }
+        if sim_tca_pending is not None:
+            position_fields[self._SIM_TCA_PENDING_FIELD] = sim_tca_pending
         if self.state.has(sym):
             # Keep the provisional buy_time (earliest, most accurate entry time).
             state_ok = self.state.update_many(sym, position_fields)
@@ -993,6 +1006,8 @@ class ScanMixin:
                 stage="state_failed", mode=entry_mode,
                 reason="post_fill_state_write")
         else:
+            if sim_tca_pending is not None:
+                self._finalize_simulated_entry_tca(sym, sim_tca_pending)
             if not self.simulation:
                 from core.database import release_portfolio_reservation
 
@@ -1469,35 +1484,6 @@ class ScanMixin:
             except Exception:
                 _TKR = 0.001
             entry_fee = invested_usdt * _TKR
-            if entry_id:
-                try:
-                    from trading.candidate_microstructure import (
-                        capture_simulated_entry_tca,
-                    )
-
-                    tca_recorded = capture_simulated_entry_tca(
-                        exchange=self.ex,
-                        entry_id=entry_id,
-                        bot_name=self.BOT_NAME,
-                        mode="SIM",
-                        symbol=f"{sym}/USDT",
-                        side="buy",
-                        amount=amount,
-                        fill_price=sim_fill_price,
-                        fee_rate=_TKR,
-                        notional_usdt=invested_usdt,
-                        depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
-                    )
-                    if not tca_recorded:
-                        silent_log(
-                            f"{self.BOT_NAME} {sym} SIM TCA entry {entry_id}",
-                            RuntimeError("SIM TCA was not recorded"),
-                        )
-                except Exception as exc:
-                    silent_log(
-                        f"{self.BOT_NAME} {sym} SIM TCA dispatch {entry_id}",
-                        exc,
-                    )
             return amount, sim_fill_price, amount, invested_usdt, entry_fee
 
         # Pre-trade spread gate: refuse a market buy into a blown-out/vacuum
@@ -1999,3 +1985,130 @@ class ScanMixin:
         except Exception as e:
             log_event(f"Buy order {sym} failed: {e}", "WARN")
             return None
+    _SIM_TCA_PENDING_FIELD = "sim_tca_pending_v1"
+
+    def _new_simulated_entry_tca_pending(
+        self,
+        *,
+        entry_id: str,
+        symbol: str,
+        amount: float,
+        fill_price: float,
+        fee_rate: float,
+        notional_usdt: float,
+    ) -> dict:
+        """Build the bounded evidence WAL stored with the final SIM position."""
+        return {
+            "version": 1,
+            "entry_id": str(entry_id),
+            "bot_name": str(self.BOT_NAME).upper(),
+            "symbol": str(symbol),
+            "side": "buy",
+            "amount": float(amount),
+            "fill_price": float(fill_price),
+            "fee_rate": float(fee_rate),
+            "notional_usdt": float(notional_usdt),
+            "filled_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+        }
+
+    def _finalize_simulated_entry_tca(
+        self,
+        sym: str,
+        pending: dict,
+        *,
+        restart_recovery: bool = False,
+    ) -> bool:
+        """Persist post-state SIM evidence; retain the WAL until it is durable."""
+        context = f"{self.BOT_NAME} {sym} SIM TCA durable finalize"
+        try:
+            if not isinstance(pending, dict) or pending.get("version") != 1:
+                raise ValueError("invalid SIM TCA pending schema")
+            row = self.state.get(sym)
+            if (
+                not isinstance(row, dict)
+                or row.get("entry_id") != pending.get("entry_id")
+                or row.get(self._SIM_TCA_PENDING_FIELD) != pending
+                or pending.get("bot_name") != str(self.BOT_NAME).upper()
+                or pending.get("symbol") != f"{sym}/USDT"
+                or pending.get("side") != "buy"
+            ):
+                raise ValueError("SIM TCA pending evidence conflicts with state")
+
+            from core.database import has_durable_simulated_entry_tca
+
+            evidence_durable = has_durable_simulated_entry_tca(
+                pending["entry_id"], pending["bot_name"]
+            )
+            if not evidence_durable and restart_recovery:
+                from core.database import (
+                    persist_simulated_entry_tca_unavailable_bundle,
+                )
+
+                persist_simulated_entry_tca_unavailable_bundle(
+                    pending["entry_id"],
+                    bot_name=pending["bot_name"],
+                    symbol=pending["symbol"],
+                    side=pending["side"],
+                    reference_price=pending["fill_price"],
+                    measured_at=pending["filled_at"],
+                    reason="restart_recovery_without_arrival_book",
+                    error_type="ArrivalBookNotRecoverable",
+                )
+            elif not evidence_durable:
+                from trading.candidate_microstructure import (
+                    capture_simulated_entry_tca,
+                )
+
+                capture_simulated_entry_tca(
+                    exchange=self.ex,
+                    entry_id=pending["entry_id"],
+                    bot_name=pending["bot_name"],
+                    mode="SIM",
+                    symbol=pending["symbol"],
+                    side=pending["side"],
+                    amount=pending["amount"],
+                    fill_price=pending["fill_price"],
+                    fee_rate=pending["fee_rate"],
+                    notional_usdt=pending["notional_usdt"],
+                    filled_at=pending["filled_at"],
+                    depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
+                )
+
+            if not has_durable_simulated_entry_tca(
+                pending["entry_id"], pending["bot_name"]
+            ):
+                raise RuntimeError("SIM TCA evidence is not durable")
+            latest = self.state.get(sym)
+            if (
+                not isinstance(latest, dict)
+                or latest.get("entry_id") != pending["entry_id"]
+                or latest.get(self._SIM_TCA_PENDING_FIELD) != pending
+            ):
+                raise RuntimeError("SIM TCA state changed before WAL clear")
+            if not self.state.update_many(
+                sym, {self._SIM_TCA_PENDING_FIELD: None}
+            ):
+                raise RuntimeError("SIM TCA WAL clear was not durable")
+            return True
+        except Exception as exc:
+            silent_log(context, exc)
+            return False
+
+    def _recover_simulated_entry_tca_pending(self) -> int:
+        """Close restart-surviving SIM evidence WALs without false book data."""
+        if not self.simulation:
+            return 0
+        recovered = 0
+        for sym, row in self.state.get_all().items():
+            pending = (
+                row.get(self._SIM_TCA_PENDING_FIELD)
+                if isinstance(row, dict)
+                else None
+            )
+            if isinstance(pending, dict) and self._finalize_simulated_entry_tca(
+                sym, pending, restart_recovery=True
+            ):
+                recovered += 1
+        return recovered

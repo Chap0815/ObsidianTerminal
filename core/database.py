@@ -7448,7 +7448,7 @@ def persist_simulated_entry_tca_bundle(
     normalized_symbol = _required_text_db(symbol, "symbol", max_length=64)
     normalized_side = str(side).strip().lower()
     reference = _optional_finite_db(reference_price)
-    normalized_time, _ = _trade_timestamp_db(measured_at, "measured_at")
+    normalized_time, fill_time = _trade_timestamp_db(measured_at, "measured_at")
     if normalized_side not in {"buy", "sell"}:
         raise ValueError("SIM markout side must be buy or sell")
     if reference is None or reference <= 0.0:
@@ -7486,7 +7486,6 @@ def persist_simulated_entry_tca_bundle(
         raise ValueError("SIM TCA bundle must contain finite evidence") from exc
     if not raw_horizons:
         raise ValueError("at least one SIM markout horizon is required")
-    now = _utcnow()
     markout_rows = []
     seen: set[int] = set()
     for raw_horizon in raw_horizons:
@@ -7495,7 +7494,7 @@ def persist_simulated_entry_tca_bundle(
             raise ValueError("SIM markout horizons must be unique integers")
         seen.add(horizon)
         try:
-            due_at = (now + timedelta(seconds=horizon)).strftime(
+            due_at = (fill_time + timedelta(seconds=horizon)).strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
         except OverflowError as exc:
@@ -7639,8 +7638,9 @@ def schedule_simulated_execution_markouts(
     side: str,
     reference_price: float,
     horizons: tuple[int, ...] = (1, 10, 60, 300, 900),
+    measured_at: str | None = None,
 ) -> None:
-    """Schedule restart-safe research markouts in the isolated SIM store."""
+    """Schedule restart-safe research markouts from one causal fill anchor."""
     validated_entry_id = _causal_entry_id_db(entry_id, required=True)
     validated_symbol = _order_id_text_db(symbol)
     price = _optional_finite_db(reference_price)
@@ -7657,7 +7657,10 @@ def schedule_simulated_execution_markouts(
         raise ValueError("SIM markout horizons must be iterable") from exc
     if not raw_horizons:
         raise ValueError("at least one SIM markout horizon is required")
-    now = _utcnow()
+    if measured_at is None:
+        fill_time = _utcnow()
+    else:
+        _, fill_time = _trade_timestamp_db(measured_at, "measured_at")
     rows = []
     seen: set[int] = set()
     for raw_horizon in raw_horizons:
@@ -7672,7 +7675,7 @@ def schedule_simulated_execution_markouts(
                 validated_symbol,
                 normalized_side,
                 price,
-                (now + timedelta(seconds=horizon)).strftime(
+                (fill_time + timedelta(seconds=horizon)).strftime(
                     "%Y-%m-%d %H:%M:%S"
                 ),
             )
@@ -7723,6 +7726,214 @@ def schedule_simulated_execution_markouts(
     except Exception:
         conn.rollback()
         raise
+
+
+def persist_simulated_entry_tca_unavailable_bundle(
+    entry_id: str,
+    *,
+    bot_name: str,
+    symbol: str,
+    side: str,
+    reference_price: float,
+    measured_at: str,
+    reason: str,
+    error_type: str,
+    horizons: tuple[int, ...] = (1, 10, 60, 300, 900),
+) -> None:
+    """Atomically persist honest missing-book evidence and causal markouts."""
+    validated_entry_id = _causal_entry_id_db(entry_id, required=True)
+    normalized_bot = _required_text_db(
+        bot_name, "bot_name", max_length=32
+    ).upper()
+    if normalized_bot not in _SIM_TCA_BOTS:
+        raise ValueError("simulated TCA bot is unsupported")
+    normalized_symbol = _required_text_db(symbol, "symbol", max_length=64)
+    normalized_side = str(side).strip().lower()
+    reference = _optional_finite_db(reference_price)
+    normalized_time, fill_time = _trade_timestamp_db(measured_at, "measured_at")
+    normalized_reason = _required_text_db(reason, "reason", max_length=100)
+    normalized_error = _required_text_db(
+        error_type or "UnknownError", "error_type", max_length=100
+    )
+    if normalized_side not in {"buy", "sell"}:
+        raise ValueError("SIM markout side must be buy or sell")
+    if reference is None or reference <= 0.0:
+        raise ValueError("SIM markout reference price must be positive and finite")
+    try:
+        raw_horizons = tuple(horizons)
+        encoded_snapshot = json.dumps(
+            {
+                "bot_name": normalized_bot,
+                "error_type": normalized_error,
+                "markouts_scheduled": True,
+                "mode": "SIM",
+                "reason": normalized_reason,
+                "research_simulated": True,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("SIM unavailable bundle must contain finite evidence") from exc
+    if not raw_horizons:
+        raise ValueError("at least one SIM markout horizon is required")
+    markout_rows = []
+    seen: set[int] = set()
+    for raw_horizon in raw_horizons:
+        horizon = _positive_integer_db(raw_horizon, "SIM markout horizon")
+        if horizon != raw_horizon or horizon in seen:
+            raise ValueError("SIM markout horizons must be unique integers")
+        seen.add(horizon)
+        try:
+            due_at = (fill_time + timedelta(seconds=horizon)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except OverflowError as exc:
+            raise ValueError("SIM markout horizon is out of range") from exc
+        markout_rows.append((horizon, due_at))
+
+    if not _INIT_DB_DONE:
+        init_db()
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        candidate = conn.execute(
+            """SELECT symbol FROM expectancy_candidates
+                WHERE entry_id=? AND bot_name=? AND mode='SIM'""",
+            (validated_entry_id, normalized_bot),
+        ).fetchone()
+        if candidate is None:
+            raise ValueError(
+                "SIM unavailable evidence requires a matching persisted candidate"
+            )
+        if not _candidate_symbol_matches_db(
+            candidate["symbol"], normalized_symbol
+        ):
+            raise ValueError(
+                "SIM unavailable evidence symbol conflicts with candidate"
+            )
+
+        existing_snapshot = conn.execute(
+            """SELECT bot_name, mode, symbol, source, sequence_status,
+                      payload_json
+                 FROM candidate_microstructure
+                WHERE entry_id=? AND stage='arrival_book_unavailable'""",
+            (validated_entry_id,),
+        ).fetchone()
+        expected_snapshot = (
+            normalized_bot,
+            "SIM",
+            normalized_symbol,
+            "sim_tca_capture",
+            "capture_failed",
+            encoded_snapshot,
+        )
+        if existing_snapshot is None:
+            conn.execute(
+                """INSERT INTO candidate_microstructure
+                   (entry_id, stage, bot_name, mode, symbol, measured_at,
+                    source, sequence_status, payload_json)
+                   VALUES (?, 'arrival_book_unavailable', ?, 'SIM', ?, ?,
+                           'sim_tca_capture', 'capture_failed', ?)""",
+                (
+                    validated_entry_id,
+                    normalized_bot,
+                    normalized_symbol,
+                    normalized_time,
+                    encoded_snapshot,
+                ),
+            )
+        elif tuple(existing_snapshot) != expected_snapshot:
+            raise ValueError("conflicting SIM unavailable evidence already exists")
+
+        for horizon, due_at in markout_rows:
+            existing = conn.execute(
+                """SELECT symbol, side, reference_price
+                     FROM sim_execution_markouts
+                    WHERE entry_id=? AND horizon_seconds=?""",
+                (validated_entry_id, horizon),
+            ).fetchone()
+            expected = (normalized_symbol, normalized_side, reference)
+            if existing is None:
+                conn.execute(
+                    """INSERT INTO sim_execution_markouts
+                       (entry_id, horizon_seconds, symbol, side,
+                        reference_price, due_at, status)
+                       VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
+                    (
+                        validated_entry_id,
+                        horizon,
+                        normalized_symbol,
+                        normalized_side,
+                        reference,
+                        due_at,
+                    ),
+                )
+            elif tuple(existing) != expected:
+                raise ValueError("conflicting SIM markout evidence already exists")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def has_durable_simulated_entry_tca(
+    entry_id: str,
+    bot_name: str,
+    horizons: tuple[int, ...] = (1, 10, 60, 300, 900),
+) -> bool:
+    """Return whether capture success/failure and every markout are durable."""
+    try:
+        validated_entry_id = _causal_entry_id_db(entry_id, required=True)
+        normalized_bot = _required_text_db(
+            bot_name, "bot_name", max_length=32
+        ).upper()
+        raw_horizons = tuple(horizons)
+        expected_horizons = {
+            _positive_integer_db(value, "SIM markout horizon")
+            for value in raw_horizons
+        }
+        if (
+            normalized_bot not in _SIM_TCA_BOTS
+            or not expected_horizons
+            or len(expected_horizons) != len(raw_horizons)
+        ):
+            return False
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not _INIT_DB_DONE:
+        init_db()
+    conn = get_connection()
+    candidate = conn.execute(
+        """SELECT 1 FROM expectancy_candidates
+            WHERE entry_id=? AND bot_name=? AND mode='SIM'""",
+        (validated_entry_id, normalized_bot),
+    ).fetchone()
+    if candidate is None:
+        return False
+    stages = {
+        row["stage"]
+        for row in conn.execute(
+            "SELECT stage FROM sim_execution_tca WHERE entry_id=?",
+            (validated_entry_id,),
+        ).fetchall()
+    }
+    unavailable = conn.execute(
+        """SELECT 1 FROM candidate_microstructure
+            WHERE entry_id=? AND bot_name=? AND mode='SIM'
+              AND stage='arrival_book_unavailable'""",
+        (validated_entry_id, normalized_bot),
+    ).fetchone()
+    durable_capture = {"arrival", "fill"}.issubset(stages) or unavailable is not None
+    scheduled = {
+        int(row["horizon_seconds"])
+        for row in conn.execute(
+            "SELECT horizon_seconds FROM sim_execution_markouts WHERE entry_id=?",
+            (validated_entry_id,),
+        ).fetchall()
+    }
+    return durable_capture and expected_horizons.issubset(scheduled)
 
 
 def list_due_simulated_execution_markouts(limit: int = 25) -> list[dict]:

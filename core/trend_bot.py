@@ -501,9 +501,21 @@ class TrendBot(SpotBot):
                         release_portfolio_reservation(entry_id)
                 continue
             amount, fill_price, gross_amount, invested_usdt, entry_fee = entry
+            sim_tca_pending = None
+            if self.simulation:
+                sim_tca_pending = self._new_simulated_entry_tca_pending(
+                    entry_id=entry_id,
+                    symbol=f"{sym}/USDT",
+                    amount=amount,
+                    fill_price=fill_price,
+                    fee_rate=(entry_fee / invested_usdt),
+                    notional_usdt=invested_usdt,
+                )
             state_ok = self._add_trend_state(
                 sym, fill_price, amount, gross_amount, invested_usdt,
-                entry_fee, votes, entry_id)
+                entry_fee, votes, entry_id,
+                sim_tca_pending=sim_tca_pending,
+            )
             if state_ok is False:
                 emit_entry_lifecycle(
                     entry_id,
@@ -576,6 +588,8 @@ class TrendBot(SpotBot):
                 # SIM has no exchange position to roll back. Do not report an
                 # opened position when its state was not persisted.
                 continue
+            if sim_tca_pending is not None:
+                self._finalize_simulated_entry_tca(sym, sim_tca_pending)
             if not self.simulation:
                 from core.database import release_portfolio_reservation
 
@@ -601,7 +615,8 @@ class TrendBot(SpotBot):
                   f"holding {self.state.count()}/{max_trades}", "SCAN")
 
     def _add_trend_state(self, sym, fill_price, amount, gross_amount,
-                         invested_usdt, entry_fee, votes, entry_id):
+                         invested_usdt, entry_fee, votes, entry_id,
+                         *, sim_tca_pending=None):
         # _place_buy_order already wrote a PROVISIONAL row (zombie protection);
         # patch it in place with the corrected NET amount + fees instead of a
         # second full add. Fall back to add() if the provisional didn't land.
@@ -622,6 +637,8 @@ class TrendBot(SpotBot):
             "entry_id": entry_id,
             "provisional": False,
         }
+        if sim_tca_pending is not None:
+            fields[self._SIM_TCA_PENDING_FIELD] = sim_tca_pending
         if self.state.has(sym):
             return self.state.update_many(sym, fields)
         else:

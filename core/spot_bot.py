@@ -555,6 +555,9 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                 "WARN"
             )
 
+        if self.simulation:
+            self._recover_simulated_entry_tca_pending()
+
         #  Startup reconciliation 
         if not self.simulation:
             self._startup_reconciliation()

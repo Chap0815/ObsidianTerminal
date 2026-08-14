@@ -1,6 +1,6 @@
 {
-  "build_id": "fea20185e7555808",
-  "created_at": "2026-08-14 14:41:23",
+  "build_id": "efd3a40fcfa6c4b9",
+  "created_at": "2026-08-14 16:31:25",
   "source": "update_deploy_manifest.py",
   "file_count": 188,
   "files": [
@@ -246,8 +246,8 @@
     },
     {
       "path": "core/database.py",
-      "sha256": "a23d1c069f82e34f4d8ba72fb1fd1fb842a5041c32410d3fb0465e2f2c24eb58",
-      "bytes": 311785
+      "sha256": "4f5c993a9bf543886f8a6668a94ba6854fcccb057fd0a8c6f0804c567b55a579",
+      "bytes": 319885
     },
     {
       "path": "core/event_bus.py",
@@ -306,8 +306,8 @@
     },
     {
       "path": "core/spot_bot.py",
-      "sha256": "f4fc424d5928cf204335b7725933fe273060b9c7024cbe3b49603736c0a17728",
-      "bytes": 37723
+      "sha256": "14c88aafa63e9cbfc4d2eb993986b41124c695f3fa7d6e3a41077f646b52d9d4",
+      "bytes": 37808
     },
     {
       "path": "core/spot_bot_exits.py",
@@ -316,13 +316,13 @@
     },
     {
       "path": "core/spot_bot_reconcile.py",
-      "sha256": "934a99586971ac03acda57a415d5c3859ad9c55e9da1e6768bbb9d121be19cd8",
-      "bytes": 64013
+      "sha256": "0716ebe6f59a647cd61d49809dd6fabac64da644ea899f7a76399187ce4e04cf",
+      "bytes": 64163
     },
     {
       "path": "core/spot_bot_scan.py",
-      "sha256": "f926714485b8a8ca4c0110a034b72999f9a09fd5d7b296d330c3d30b399ce76a",
-      "bytes": 85856
+      "sha256": "f336d3b74dcd7863c060c61ae8a78d092697271d29c7a5d775d1c38512bf0ec6",
+      "bytes": 90291
     },
     {
       "path": "core/state_manager.py",
@@ -336,8 +336,8 @@
     },
     {
       "path": "core/trend_bot.py",
-      "sha256": "c32171777ac89c81550a56dc966dfe7b44f4d2c57b52a5a86644ee1472273bbb",
-      "bytes": 30699
+      "sha256": "fccc42fd18d89facde6ee3144a8f5ec30e9db047514ef0381808c307addc498d",
+      "bytes": 31459
     },
     {
       "path": "core/trend_futures_bot.py",
@@ -711,8 +711,8 @@
     },
     {
       "path": "trading/candidate_microstructure.py",
-      "sha256": "f72b862e1d5c069e3cb43318f25fe61cd5a827717fa084d2bc5b096ff32b3bd4",
-      "bytes": 9276
+      "sha256": "7ec9ccceddf285392cc46b46badcee4ccc5c10992ab8a985c32a07f1bb610604",
+      "bytes": 9423
     },
     {
       "path": "trading/carry_sim.py",
