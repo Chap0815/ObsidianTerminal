@@ -60,6 +60,7 @@ class FuturesExchangeBot(FuturesBot):
         "POSITION_SIZE":     40.0,
         "POSITION_SIZE_MAX": 80.0,
         "MAX_OPEN_TRADES":   3,
+        "NEW_ENTRIES_ENABLED": True,
         "LEVERAGE":          1.0,
         "LIQ_SAFETY_PCT":    15.0,
         "SCAN_INTERVAL":     150,

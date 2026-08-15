@@ -15,7 +15,8 @@ picks up a launcher settings change within ~5s without a restart.
 
 NOTE: structural fields like ``SIMULATION`` are intentionally read at boot only
 flipping SIMLIVE mid-flight is dangerous and stays a restart action.
-Hot-reload covers ONLY numeric trading parameters.
+Hot-reload covers numeric trading parameters and explicitly supported boolean
+controls such as the FUTURES new-entry admission gate.
 """
 from __future__ import annotations
 
@@ -356,6 +357,9 @@ _HOT_RELOAD_BLACKLIST = frozenset((
     "MARGIN_MODE",
 ))
 
+# An invalid live edit of an admission control must never silently enable risk.
+_FAIL_CLOSED_BOOL_FIELDS = frozenset(("NEW_ENTRIES_ENABLED",))
+
 # PRICE-move stops that must stay negative; a positive live edit would stop
 # every position out at entry, so we keep the validated boot value instead.
 _NEGATIVE_ONLY = frozenset((
@@ -447,7 +451,10 @@ def get_live_value(bot_name: str, key: str, default: Any = None,
             return _clamp(key, int(raw))
         fb = fallback_cfg.get(key, default)
         if isinstance(fb, bool):
-            return _coerce_bool(raw, fb)
+            parsed = parse_explicit_bool(raw)
+            if parsed is None and key in _FAIL_CLOSED_BOOL_FIELDS:
+                return False
+            return fb if parsed is None else parsed
         if isinstance(fb, (int, float)):
             if key in {"POSITION_SIZE", "POSITION_SIZE_MAX"}:
                 return _clamp_live_sizing(

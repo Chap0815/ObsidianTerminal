@@ -260,6 +260,7 @@ DEFAULT_CONFIG = {
         "POSITION_SIZE":     40.0,
         "POSITION_SIZE_MAX": 80.0,
         "MAX_OPEN_TRADES":   3,      # less cluster risk
+        "NEW_ENTRIES_ENABLED": True,
         "LEVERAGE":          1.0,
         "LIQ_SAFETY_PCT":    15.0,
         "SCAN_INTERVAL":     150,    # 5min would be too long for futures
@@ -507,6 +508,8 @@ PARAM_DEFS_FUTURES = [
      "Cap for dynamically scaled margin amount."),
     ("MAX_OPEN_TRADES",   "Max Open Trades",      1.0,   1.0,  30.0, ".0f", "",
      "Number of simultaneous futures positions. 3 is safer; more = cluster risk."),
+    ("NEW_ENTRIES_ENABLED", "New Entries (0/1)",   1.0,   0.0,   1.0, ".0f", "",
+     "0 blocks only new FUTURES entries; monitoring, reconciliation and exits continue."),
     ("LEVERAGE",          "Leverage",             1.0,   1.0,  10.0, ".0f", "x",
      "Leverage 1-10x. 3x default = total loss at ~33% price move against."),
     ("LIQ_SAFETY_PCT",    "Liq Safety Buffer",    1.0,   5.0,  50.0, ".0f", "%",

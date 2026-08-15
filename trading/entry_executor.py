@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
@@ -342,6 +342,33 @@ def _finalize_not_submitted_intent(
     )
 
 
+def _finalize_pre_submit_rejection(
+    journal,
+    intent_id: str,
+    blocked: FuturesOrderNotSubmitted,
+) -> None:
+    """Preserve the proven no-submit outcome if journal cleanup fails."""
+    try:
+        _finalize_not_submitted_intent(
+            journal,
+            intent_id,
+            blocked,
+            current_status="PREPARED",
+        )
+    except Exception as cleanup_error:
+        try:
+            blocked.add_note(
+                "pre-submit intent finalization failed: "
+                f"{type(cleanup_error).__name__}"
+            )
+        except Exception:
+            pass
+        try:
+            silent_log("pre-submit intent finalization", cleanup_error)
+        except Exception:
+            pass
+
+
 def _legacy_budget_denial_proves_not_submitted(intent: Mapping) -> bool:
     def explicit_zero(value) -> bool:
         if value is None or isinstance(value, bool):
@@ -580,6 +607,7 @@ def execute_entry_order(
     maker_order_params: Mapping | None = None,
     config: MakerFirstConfig,
     journal=None,
+    pre_submit_guard: Callable[[], bool] | None = None,
 ) -> dict:
     """Execute one entry intent; unknown cancel state never falls back."""
     amount = _positive_finite_float(amount, "entry amount")
@@ -617,6 +645,21 @@ def execute_entry_order(
         target_price=reference_price,
         client_order_id=client_order_id,
     )
+    if pre_submit_guard is not None:
+        try:
+            admission_allowed = pre_submit_guard()
+        except Exception as exc:
+            blocked = FuturesOrderNotSubmitted(
+                "entry admission guard unavailable"
+            )
+            _finalize_pre_submit_rejection(journal, intent_id, blocked)
+            raise blocked from exc
+        if admission_allowed is not True:
+            blocked = FuturesOrderNotSubmitted(
+                "new entries disabled by config"
+            )
+            _finalize_pre_submit_rejection(journal, intent_id, blocked)
+            raise blocked
     journal.transition(intent_id, "SUBMITTING")
 
     arrival = None

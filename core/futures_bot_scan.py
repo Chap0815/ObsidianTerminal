@@ -61,6 +61,58 @@ class FuturesScanMixin:
             return value
         return str(value).strip().lower() in ("1", "true", "yes", "on")
 
+    def _new_entries_enabled(self) -> bool:
+        """Hot-reloaded admission gate; invalid live values fail closed."""
+        return self._bool_cfg_value(
+            self.C("NEW_ENTRIES_ENABLED", True), True
+        )
+
+    def _entry_admission_runtime_fields(self) -> dict[str, object]:
+        if str(getattr(self, "BOT_NAME", "")).upper() != "FUTURES":
+            return {}
+        enabled = self._new_entries_enabled()
+        return {
+            "new_entries_enabled": enabled,
+            "entry_admission_state": (
+                "enabled" if enabled else "disabled_by_config"
+            ),
+        }
+
+    def _entry_admission_disabled_by_config(self) -> bool:
+        """Return True when scans must stop, logging only state transitions."""
+        enabled = self._new_entries_enabled()
+        previous = getattr(self, "_new_entries_enabled_last", None)
+        self._new_entries_enabled_last = enabled
+        transition = (previous is None and not enabled) or (
+            previous is False and enabled
+        )
+        if transition:
+            try:
+                from core.logger import log_event, log_struct
+
+                if enabled:
+                    log_event(
+                        f"[{self.BOT_NAME}] New entries enabled by config",
+                        "OK",
+                    )
+                else:
+                    log_event(
+                        f"[{self.BOT_NAME}] New entries disabled by config; "
+                        "existing positions remain monitored",
+                        "WARN",
+                    )
+                log_struct(
+                    "entry_admission_gate",
+                    bot=self.BOT_NAME,
+                    mode="SIM" if self.simulation else "LIVE",
+                    enabled=enabled,
+                    source="config_hot_reload",
+                    exits_supervised=True,
+                )
+            except Exception:
+                pass
+        return not enabled
+
     @staticmethod
     def _finite_float(value, default: float = 0.0) -> float:
         try:
@@ -345,6 +397,11 @@ class FuturesScanMixin:
         from trading.risk_manager import is_bot_paused, is_bad_hour
         from trading.screener import get_top_momentum_coins
 
+        # Operator admission gate: stop only the entry scan. Monitor,
+        # reconcile, recovery, capture and all exit paths keep running.
+        if self._entry_admission_disabled_by_config():
+            return
+
         # SAFE_MODE: stop opening new entries
         if self.safe_mode.is_active():
             log_event(
@@ -437,6 +494,8 @@ class FuturesScanMixin:
 
         for _, r in cand.iterrows():
             if self._shutdown_event.is_set():
+                return
+            if self._entry_admission_disabled_by_config():
                 return
             if state_exposure_count(self.state) >= max_trades:
                 break
@@ -1322,6 +1381,9 @@ class FuturesScanMixin:
                     reference_price=entry_price,
                     market_order=_submit_market_entry,
                     maker_order_params=_entry_order_params(_cid),
+                    pre_submit_guard=lambda: not (
+                        self._entry_admission_disabled_by_config()
+                    ),
                     config=MakerFirstConfig(
                         mode=maker_mode,
                         ttl_seconds=float(self.C("MAKER_FIRST_TTL_SECONDS", 3.0)),

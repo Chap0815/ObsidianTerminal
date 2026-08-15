@@ -452,6 +452,7 @@ def _check_config(bot_name: str | None,
             ("TREND_EXIT_STALE_LIMIT", 1.0, 50.0),
             ("MAX_NEW_TRADES_PER_TICK", 0.0, 50.0),
             ("ENTRY_QUALITY_FILTER_ENABLED", 0.0, 1.0),
+            ("NEW_ENTRIES_ENABLED", 0.0, 1.0),
             ("ENTRY_QUALITY_MIN_SCORE", 0.0, 100.0),
             ("ENTRY_QUALITY_SHADOW_ENABLED", 0.0, 1.0),
             ("ENTRY_QUALITY_SHADOW_MIN_SCORE", 0.0, 100.0),
@@ -474,6 +475,7 @@ def _check_config(bot_name: str | None,
             try:
                 if key in {
                     "ENTRY_QUALITY_FILTER_ENABLED",
+                    "NEW_ENTRIES_ENABLED",
                     "ENTRY_QUALITY_SHADOW_ENABLED",
                     "SPOT_EXIT_SHADOW_ENABLED",
                 }:

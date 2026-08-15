@@ -1112,6 +1112,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 extra={
                     "open_positions": state_exposure_count(self.state),
                     "safe_mode": bool(self.safe_mode.is_active()),
+                    **self._entry_admission_runtime_fields(),
                     **observability,
                     **strategy_health,
                 },
@@ -1167,6 +1168,13 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             f"Max trades: {self.C('MAX_OPEN_TRADES')}",
             "START"
         )
+        if str(self.BOT_NAME).upper() == "FUTURES":
+            log_event(
+                "New entries: "
+                f"{'enabled' if self._new_entries_enabled() else 'disabled'} "
+                "(monitor/reconcile/exits remain active)",
+                "START",
+            )
         log_event(
             f"Margin/Trade: {self.C('POSITION_SIZE')} USDT  "
             f"Liq buffer: {self.C('LIQ_SAFETY_PCT')}%",
@@ -1238,6 +1246,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "monitor_interval": self.C(
                 "MONITOR_INTERVAL", self.DEFAULT_MONITOR_INTERVAL),
         }
+        started_fields.update(self._entry_admission_runtime_fields())
         started_fields.update(mfe_fallback_fields)
         log_struct("bot_started", **started_fields)
 
@@ -1493,6 +1502,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             threads=threads,
             extra={
                 "open_positions": state_exposure_count(self.state),
+                **self._entry_admission_runtime_fields(),
                 **strategy_health,
             })
 
