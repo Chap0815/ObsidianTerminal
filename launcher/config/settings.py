@@ -12,15 +12,14 @@ from __future__ import annotations
 import json
 import math
 import os
-import sys
 import subprocess
-import threading       # tmp filename uses get_ident()
-import time            # retry sleep between os.replace attempts
+import sys
+import threading  # tmp filename uses get_ident()
+import time  # retry sleep between os.replace attempts
 from contextlib import contextmanager
 from tkinter import font as tkfont
 
 from core.constants import CONFIG_AUDIT_BACKUPS, CONFIG_AUDIT_MAX_BYTES
-
 
 #  Path anchors 
 #
@@ -375,6 +374,7 @@ DEFAULT_CONFIG = {
         "ACTIVATION_PROFIT":     2.25,
         "TRAILING_DISTANCE":     1.5,
         "POST_PARTIAL_TRAILING_DISTANCE": 1.0,
+        "TRAILING_AUDIT_LOG_INTERVAL_SEC": 3600,
         "BREAKEVEN_TRIGGER":     1.8,
         "PARTIAL_SELL_PCT":      0.5,
         "TREND_EXIT_STALE_LIMIT": 3,
@@ -962,7 +962,13 @@ def _append_config_audit(record: dict) -> None:
         pass
 
 
-def _write_config_audit(new_cfg: dict, previous_cfg: dict | None = None) -> None:
+def _write_config_audit(
+    new_cfg: dict,
+    previous_cfg: dict | None = None,
+    *,
+    source: str = "save_config",
+    context: dict | None = None,
+) -> None:
     """Append a compact record of what changed vs the previous on-disk config.
 
     Best-effort and bounded; never raises, never blocks save_config.
@@ -978,8 +984,11 @@ def _write_config_audit(new_cfg: dict, previous_cfg: dict | None = None) -> None
             ts = now_utc().strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-        diff, redaction_failed = _redact_config_audit_fields(diff)
-        record = {"ts": ts, "source": "save_config", "changes": diff}
+        fields = {"changes": diff}
+        if context is not None:
+            fields["context"] = context
+        fields, redaction_failed = _redact_config_audit_fields(fields)
+        record = {**fields, "ts": ts, "source": source}
         if redaction_failed:
             record["redaction_failed"] = True
         _append_config_audit(record)
@@ -1012,6 +1021,88 @@ def audit_event(source: str, **fields) -> None:
 _CONFIG_WRITE_LOCK = threading.RLock()
 _CONFIG_PROCESS_LOCK = CONFIG_FILE + ".lock"
 _CONFIG_PROCESS_LOCK_STATE = threading.local()
+
+
+class ConfigMergeConflict(RuntimeError):
+    """The exact config values captured for a staged merge are no longer current."""
+
+
+def _canonical_config_value(value) -> str:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("config merge expectation contains an invalid value") from exc
+
+
+def _build_config_merge_expectations(cfg: dict, section_updates: dict) -> dict:
+    if type(cfg) is not dict or type(section_updates) is not dict:
+        raise TypeError("config merge expectations require object inputs")
+    result = {}
+    for section, updates in section_updates.items():
+        if not isinstance(section, str) or not section or type(updates) is not dict:
+            raise ValueError("config merge expectations require keyed section updates")
+        current = cfg.get(section)
+        section_result = {}
+        for key in updates:
+            if not isinstance(key, str) or not key:
+                raise ValueError("config merge expectation keys must be non-empty strings")
+            present = type(current) is dict and key in current
+            value = current[key] if present else None
+            section_result[key] = {
+                "present": present,
+                "value": json.loads(_canonical_config_value(value)),
+            }
+        result[section] = section_result
+    return result
+
+
+def capture_config_merge_expectations(section_updates: dict) -> dict:
+    """Capture the effective target values under the same locks used by merge."""
+    with _CONFIG_WRITE_LOCK:
+        with _config_process_lock():
+            return _build_config_merge_expectations(load_config(), section_updates)
+
+
+def _verify_config_merge_expectations(
+    cfg: dict,
+    section_updates: dict,
+    expected_section_values: dict,
+) -> None:
+    if type(expected_section_values) is not dict:
+        raise TypeError("expected config section values must be an object")
+    if set(expected_section_values) != set(section_updates):
+        raise ValueError("config merge expectations do not match update sections")
+    for section, updates in section_updates.items():
+        expected = expected_section_values.get(section)
+        if type(updates) is not dict or type(expected) is not dict:
+            raise ValueError("config merge expectations require section objects")
+        if set(expected) != set(updates):
+            raise ValueError("config merge expectations do not match update keys")
+        current = cfg.get(section)
+        for key, spec in expected.items():
+            if (
+                type(spec) is not dict
+                or set(spec) != {"present", "value"}
+                or type(spec.get("present")) is not bool
+            ):
+                raise ValueError("config merge expectation structure is invalid")
+            actual_present = type(current) is dict and key in current
+            if actual_present != spec["present"]:
+                raise ConfigMergeConflict(
+                    f"{section}.{key} changed since staging"
+                )
+            if actual_present and _canonical_config_value(current[key]) != (
+                _canonical_config_value(spec["value"])
+            ):
+                raise ConfigMergeConflict(
+                    f"{section}.{key} changed since staging"
+                )
 
 
 def _validated_config_lock_timeout(value: float) -> float:
@@ -1121,7 +1212,12 @@ def validate_config_for_save(cfg: dict) -> None:
     except Exception as exc:
         raise ValueError(f"config validation failed: {exc}") from exc
 
-def _save_config_unlocked(cfg: dict) -> None:
+def _save_config_unlocked(
+    cfg: dict,
+    *,
+    audit_source: str = "save_config",
+    audit_context: dict | None = None,
+) -> None:
     previous_cfg = _read_config_for_audit()
     try:
         tmp = f"{CONFIG_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
@@ -1149,7 +1245,12 @@ def _save_config_unlocked(cfg: dict) -> None:
             except OSError:
                 pass
             raise last_err
-        _write_config_audit(cfg, previous_cfg=previous_cfg)
+        _write_config_audit(
+            cfg,
+            previous_cfg=previous_cfg,
+            source=audit_source,
+            context=audit_context,
+        )
     except Exception as e:
         try:
             from bot_utils.silent_log import silent_log
@@ -1165,8 +1266,14 @@ def _save_config_unlocked(cfg: dict) -> None:
         raise
 
 
-def save_config_merge(section_updates: dict | None = None,
-                      section_replacements: dict | None = None) -> dict:
+def save_config_merge(
+    section_updates: dict | None = None,
+    section_replacements: dict | None = None,
+    *,
+    expected_section_values: dict | None = None,
+    audit_source: str = "save_config",
+    audit_context: dict | None = None,
+) -> dict:
     """Merge selected config sections into the latest on-disk config.
 
     Use this from the launcher UI when saving a bot's parameter edits or UI
@@ -1175,9 +1282,25 @@ def save_config_merge(section_updates: dict | None = None,
     """
     section_updates = section_updates or {}
     section_replacements = section_replacements or {}
+    if not isinstance(audit_source, str) or not audit_source or len(audit_source) > 64:
+        raise ValueError("config audit source is invalid")
+    if audit_context is not None:
+        if type(audit_context) is not dict:
+            raise TypeError("config audit context must be an object")
+        _canonical_config_value(audit_context)
     with _CONFIG_WRITE_LOCK:
         with _config_process_lock():
             cfg = load_config()
+            if expected_section_values is not None:
+                if section_replacements:
+                    raise ValueError(
+                        "config merge expectations do not support section replacements"
+                    )
+                _verify_config_merge_expectations(
+                    cfg,
+                    section_updates,
+                    expected_section_values,
+                )
             for section, value in section_replacements.items():
                 cfg[section] = dict(value) if isinstance(value, dict) else value
             for section, values in section_updates.items():
@@ -1190,7 +1313,11 @@ def save_config_merge(section_updates: dict | None = None,
                 else:
                     cfg[section] = values
             validate_config_for_save(cfg)
-            _save_config_unlocked(cfg)
+            _save_config_unlocked(
+                cfg,
+                audit_source=audit_source,
+                audit_context=audit_context,
+            )
             return cfg
 
 

@@ -969,7 +969,15 @@ def _is_fresh_position(state_row, max_age_s: float) -> bool:
             tzinfo=timezone.utc)
     except (ValueError, TypeError):
         return False
-    return (datetime.now(timezone.utc) - opened).total_seconds() < max_age_s
+    try:
+        from core.clock import now_utc
+
+        age_seconds = (now_utc() - opened).total_seconds()
+    except Exception:
+        # Keep the propagation guard closed when the authoritative clock is
+        # temporarily unavailable; the next reconcile can safely retry.
+        return True
+    return age_seconds < max_age_s
 
 
 def _still_held_on_spot_exchange(bot, sym: str, dust_usdt: float = 1.0) -> bool:
@@ -1329,6 +1337,47 @@ def _adopt_spot_orphans(
 # Startup reconciliation (called once from SpotBot.run())
 # 
 
+
+def _emit_spot_position_integrity(
+    bot,
+    bal_data: dict,
+    *,
+    telemetry_phase: str,
+) -> dict:
+    """Audit State/Claim/Balance layers from an already-fetched snapshot."""
+    from core.database import get_open_positions_db, _base_symbol
+    from trading.runtime_observability import emit_startup_integrity
+
+    state_rows = bot.state.get_all()
+    managed = set(state_rows)
+    try:
+        claims = get_open_positions_db(bot.BOT_NAME)
+    except Exception:
+        claims = []
+    for claim in claims:
+        base = _base_symbol(claim.get("symbol", ""))
+        if base:
+            managed.add(base)
+    exchange_layer = {}
+    for base in managed:
+        amount = _spot_effective_balance_or_none(bal_data, base)
+        if amount is None:
+            exchange_layer[base] = {"amount": None, "direction": "SPOT"}
+        elif amount > 1e-8:
+            exchange_layer[base] = {"amount": amount, "direction": "SPOT"}
+    report = emit_startup_integrity(
+        bot_name=bot.BOT_NAME,
+        mode="LIVE",
+        state_rows=state_rows,
+        exchange_rows=exchange_layer,
+        telemetry_phase=telemetry_phase,
+    )
+    record_integrity = getattr(bot, "_record_position_integrity_health", None)
+    if callable(record_integrity):
+        record_integrity(report, telemetry_phase=telemetry_phase)
+    return report
+
+
 def startup_reconciliation(bot) -> None:
     """Boot-time spot reconciliation.
 
@@ -1477,23 +1526,10 @@ def startup_reconciliation(bot) -> None:
     bot._spot_corrupt_ghost_bases = corrupt_ghost_syms
     _adopt_spot_orphans(bot, bal_data, skip_bases=corrupt_ghost_syms)
     try:
-        from core.database import get_open_positions_db, _base_symbol
-        from trading.runtime_observability import emit_startup_integrity
-        managed = set(bot.state.keys())
-        for claim in get_open_positions_db(bot.BOT_NAME):
-            base = _base_symbol(claim.get("symbol", ""))
-            if base:
-                managed.add(base)
-        exchange_layer = {}
-        for base in managed:
-            amount = _spot_effective_balance_or_none(bal_data, base)
-            if amount is None:
-                exchange_layer[base] = {"amount": None, "direction": "SPOT"}
-            elif amount > 1e-8:
-                exchange_layer[base] = {"amount": amount, "direction": "SPOT"}
-        emit_startup_integrity(
-            bot_name=bot.BOT_NAME, mode="LIVE",
-            state_rows=bot.state.get_all(), exchange_rows=exchange_layer,
+        _emit_spot_position_integrity(
+            bot,
+            bal_data,
+            telemetry_phase="startup",
         )
     except Exception:
         pass
@@ -1654,6 +1690,11 @@ class ReconcileMixin:
                     self,
                     bal_data,
                     skip_bases=getattr(self, "_spot_corrupt_ghost_bases", set()),
+                )
+                _emit_spot_position_integrity(
+                    self,
+                    bal_data,
+                    telemetry_phase="reconcile",
                 )
             except Exception as e:
                 # Transient network blips (DNS fail, SSL EOF, timeout) are not

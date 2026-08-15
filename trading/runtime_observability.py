@@ -3,9 +3,70 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Mapping
+
+
+_STRUCTURED_REMINDER_SECONDS = 3_600.0
+_STRUCTURED_STATE_MAX_KEYS = 32
+_structured_state_lock = threading.Lock()
+_structured_states: OrderedDict[
+    tuple[str, str, str], dict[str, Any]
+] = OrderedDict()
+
+
+def _structured_state_decision(
+    *,
+    event: str,
+    bot_name: str,
+    mode: str,
+    fingerprint: tuple[Any, ...],
+    now_monotonic: float | None = None,
+) -> dict[str, Any] | None:
+    """Return bounded emission metadata or suppress an unchanged sample."""
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    if isinstance(now, bool) or not isinstance(now, (int, float)):
+        now = time.monotonic()
+    now = float(now)
+    if not math.isfinite(now):
+        now = time.monotonic()
+    key = (str(event)[:64], str(bot_name)[:32], str(mode)[:16])
+    with _structured_state_lock:
+        previous = _structured_states.get(key)
+        if previous is None:
+            reason = "initial"
+            suppressed = 0
+        else:
+            last_seen = float(previous["last_seen_at"])
+            last_emit = float(previous["last_emit_at"])
+            suppressed = max(0, int(previous["suppressed_count"]))
+            if now < last_seen:
+                reason = "monotonic_reset"
+            elif fingerprint != previous["fingerprint"]:
+                reason = "state_change"
+            elif now - last_emit >= _STRUCTURED_REMINDER_SECONDS:
+                reason = "reminder"
+            else:
+                previous["last_seen_at"] = now
+                previous["suppressed_count"] = suppressed + 1
+                _structured_states.move_to_end(key)
+                return None
+        _structured_states[key] = {
+            "fingerprint": fingerprint,
+            "last_emit_at": now,
+            "last_seen_at": now,
+            "suppressed_count": 0,
+        }
+        _structured_states.move_to_end(key)
+        while len(_structured_states) > _STRUCTURED_STATE_MAX_KEYS:
+            _structured_states.popitem(last=False)
+    return {
+        "emission_reason": reason,
+        "suppressed_sample_count": suppressed,
+    }
 
 
 def _base_symbol(value: Any) -> str:
@@ -525,7 +586,11 @@ def compare_position_layers(
     for symbol in sorted(state_symbols & exchange_symbols):
         state_amount = _positive_float(states[symbol].get("amount"))
         exchange_amount = _positive_float(exchange[symbol].get("amount"))
-        if state_amount is not None and exchange_amount is not None:
+        if state_amount is None:
+            money_issues.append(f"state_amount_invalid:{symbol}")
+        elif exchange_amount is None:
+            money_issues.append(f"exchange_amount_unavailable:{symbol}")
+        else:
             drift = abs(state_amount - exchange_amount) / max(
                 state_amount, exchange_amount)
             if drift > max(0.0, amount_tolerance):
@@ -564,12 +629,44 @@ def compare_position_layers(
     }
 
 
+def _bounded_issue_fingerprint(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    issues: list[str] = []
+    for raw in value[:64]:
+        issue = str(raw)[:192]
+        parts = issue.split(":")
+        if len(parts) >= 3 and parts[0] == "amount_mismatch":
+            issue = ":".join(parts[:2])
+        issues.append(issue)
+    return tuple(sorted(issues))
+
+
+def _position_integrity_fingerprint(
+    report: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    return (
+        report.get("ok") is True,
+        report.get("metadata_complete") is True,
+        int(report.get("state_count") or 0),
+        int(report.get("claim_count") or 0),
+        report.get("claims_available") is True,
+        int(report.get("exchange_count") or 0),
+        int(report.get("account_exchange_count") or 0),
+        int(report.get("ignored_unowned_exchange_count") or 0),
+        _bounded_issue_fingerprint(report.get("money_issues")),
+        _bounded_issue_fingerprint(report.get("metadata_issues")),
+    )
+
+
 def emit_startup_integrity(
     *, bot_name: str, mode: str,
     state_rows: Mapping[str, Mapping[str, Any]],
     exchange_rows: Mapping[str, Mapping[str, Any]],
+    telemetry_phase: str = "startup",
+    now_monotonic: float | None = None,
 ) -> dict[str, Any]:
-    """Read claims, compare all layers and emit one passive startup report."""
+    """Compare all layers and emit bounded startup/reconcile telemetry."""
     claims = None
     try:
         from core.database import get_open_positions_db
@@ -589,19 +686,39 @@ def emit_startup_integrity(
     report["account_exchange_count"] = len(exchange_rows)
     report["ignored_unowned_exchange_count"] = max(
         0, len(exchange_rows) - len(scoped_exchange))
+    phase = "startup" if telemetry_phase == "startup" else "reconcile"
+    event = (
+        "startup_position_integrity"
+        if phase == "startup"
+        else "position_integrity"
+    )
+    decision = _structured_state_decision(
+        event=event,
+        bot_name=bot_name,
+        mode=mode,
+        fingerprint=_position_integrity_fingerprint(report),
+        now_monotonic=now_monotonic,
+    )
     try:
         from core.logger import log_event, log_struct
-        log_struct("startup_position_integrity", bot=bot_name, mode=mode,
-                   **report)
-        if report["money_issues"]:
+        if decision is not None:
+            log_struct(
+                event,
+                bot=bot_name,
+                mode=mode,
+                telemetry_phase=phase,
+                **decision,
+                **report,
+            )
+        if decision is not None and report["money_issues"]:
             log_event(
-                f"[{bot_name}] startup position integrity warning: "
+                f"[{bot_name}] {phase} position integrity warning: "
                 + ", ".join(report["money_issues"][:8]),
                 "WARN",
             )
-        elif report["metadata_issues"]:
+        elif decision is not None and report["metadata_issues"]:
             log_event(
-                f"[{bot_name}] startup metadata incomplete: "
+                f"[{bot_name}] {phase} metadata incomplete: "
                 + ", ".join(report["metadata_issues"][:8]),
                 "WARN",
             )
@@ -651,22 +768,205 @@ def runtime_observability_snapshot(
     return {"entry_lifecycle_health": lifecycle, "ticker_cache": ticker}
 
 
+def _bounded_nonnegative_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return min(max(0, parsed), 2_147_483_647)
+
+
+def _bounded_runtime_issues(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item)[:192] for item in value[:16]]
+
+
+def position_integrity_runtime_report(
+    report: Mapping[str, Any],
+    *,
+    telemetry_phase: str,
+    checked_monotonic: float | None = None,
+    checked_wall_ts: float | None = None,
+) -> dict[str, Any]:
+    """Project one integrity comparison into a bounded runtime-health shape."""
+    source = report if isinstance(report, Mapping) else {}
+    phase = "startup" if telemetry_phase == "startup" else "reconcile"
+    monotonic_value = _strict_nonnegative_float(
+        time.monotonic() if checked_monotonic is None else checked_monotonic
+    )
+    wall_value = _strict_nonnegative_float(
+        time.time() if checked_wall_ts is None else checked_wall_ts
+    )
+    money_ok = source.get("ok") is True
+    claims_available = source.get("claims_available") is True
+    metadata_complete = source.get("metadata_complete") is True
+    runtime_ok = money_ok and claims_available
+    if not claims_available:
+        reason = "claim_registry_unavailable"
+    elif not money_ok:
+        reason = "money_state_mismatch"
+    elif not metadata_complete:
+        reason = "metadata_incomplete"
+    else:
+        reason = ""
+    return {
+        "ok": runtime_ok and metadata_complete,
+        "runtime_ok": runtime_ok,
+        "component": "position_integrity",
+        "state": (
+            "healthy" if runtime_ok and metadata_complete
+            else "warning" if runtime_ok
+            else "degraded"
+        ),
+        "reason": reason,
+        "telemetry_phase": phase,
+        "last_check_monotonic": monotonic_value,
+        "last_check_wall_ts": wall_value,
+        "claims_available": claims_available,
+        "metadata_complete": metadata_complete,
+        "state_count": _bounded_nonnegative_int(source.get("state_count")),
+        "claim_count": _bounded_nonnegative_int(source.get("claim_count")),
+        "exchange_count": _bounded_nonnegative_int(source.get("exchange_count")),
+        "account_exchange_count": _bounded_nonnegative_int(
+            source.get("account_exchange_count")
+        ),
+        "ignored_unowned_exchange_count": _bounded_nonnegative_int(
+            source.get("ignored_unowned_exchange_count")
+        ),
+        "money_issues": _bounded_runtime_issues(source.get("money_issues")),
+        "metadata_issues": _bounded_runtime_issues(
+            source.get("metadata_issues")
+        ),
+    }
+
+
+def position_integrity_runtime_snapshot(
+    health: Mapping[str, Any] | None,
+    *,
+    started_monotonic: float | None,
+    reconcile_interval_seconds: float,
+    now_monotonic: float | None = None,
+) -> dict[str, Any]:
+    """Return freshness-aware health without mutating the stored report."""
+    now = _strict_nonnegative_float(
+        time.monotonic() if now_monotonic is None else now_monotonic
+    )
+    interval = _strict_nonnegative_float(reconcile_interval_seconds)
+    stale_after = max(30.0, 2.0 * (interval or 0.0) + 15.0)
+    snapshot = dict(health) if isinstance(health, Mapping) else {}
+    last_check = _strict_nonnegative_float(snapshot.get("last_check_monotonic"))
+    if not snapshot or last_check is None:
+        started = _strict_nonnegative_float(started_monotonic)
+        if started is None or now is None:
+            return {}
+        startup_age = max(0.0, now - started)
+        return {
+            "ok": False,
+            "runtime_ok": False,
+            "component": "position_integrity",
+            "state": "stalled",
+            "reason": "position_integrity_not_checked",
+            "startup_age_seconds": startup_age,
+            "stale_after_seconds": stale_after,
+        }
+    check_age = 0.0 if now is None else max(0.0, now - last_check)
+    stale = now is None or check_age > stale_after
+    snapshot.update({
+        "check_age_seconds": check_age,
+        "stale_after_seconds": stale_after,
+    })
+    if stale:
+        snapshot.update({
+            "ok": False,
+            "runtime_ok": False,
+            "state": "stalled",
+            "reason": "position_integrity_stale",
+        })
+    return snapshot
+
+
+def _runtime_observability_fingerprint(
+    snapshot: Mapping[str, Any],
+    ticker_cache: Any,
+) -> tuple[Any, ...]:
+    lifecycle = snapshot.get("entry_lifecycle_health")
+    if not isinstance(lifecycle, Mapping):
+        lifecycle = {}
+    anomalies = _bounded_issue_fingerprint(lifecycle.get("anomalies"))
+    ticker = snapshot.get("ticker_cache")
+    if not isinstance(ticker, Mapping):
+        ticker = {}
+    ticker_health: Mapping[str, Any] = {}
+    try:
+        health_method = getattr(ticker_cache, "health", None)
+        if callable(health_method):
+            raw_health = health_method()
+            if isinstance(raw_health, Mapping):
+                ticker_health = raw_health
+    except Exception:
+        ticker_health = {"ok": False, "state": "health_unavailable"}
+    if ticker_health:
+        ticker_state = (
+            ticker_health.get("ok") is True,
+            str(ticker_health.get("state") or "")[:64],
+            str(ticker_health.get("reason") or "")[:96],
+        )
+    else:
+        ticker_state = (
+            bool(ticker),
+            _bounded_nonnegative_int(
+                ticker.get("consecutive_fetch_errors")
+            )
+            > 0,
+            _bounded_nonnegative_int(
+                ticker.get("consecutive_unavailable_requests")
+            )
+            > 0,
+        )
+    return (
+        lifecycle.get("available") is True,
+        anomalies,
+        _bounded_nonnegative_int(lifecycle.get("open_attempts")),
+        _bounded_nonnegative_int(lifecycle.get("pending_candidates")),
+        _bounded_nonnegative_int(lifecycle.get("tracked_entries")),
+        ticker_state,
+    )
+
+
 def log_runtime_observability(
     *, bot_name: str, mode: str,
     state_rows: Mapping[str, Mapping[str, Any]] | None = None,
     ticker_cache: Any = None,
+    now_monotonic: float | None = None,
 ) -> dict[str, Any]:
     """Emit aggregate telemetry and rate-limited lifecycle warnings."""
     global _last_watchdog_fingerprint, _last_watchdog_log_at
     snapshot = runtime_observability_snapshot(
         state_rows=state_rows, ticker_cache=ticker_cache)
     lifecycle = snapshot.get("entry_lifecycle_health") or {}
-    anomalies = tuple(sorted(str(item) for item in lifecycle.get(
-        "anomalies", [])))
+    anomalies = _bounded_issue_fingerprint(lifecycle.get("anomalies"))
+    decision = _structured_state_decision(
+        event="runtime_observability",
+        bot_name=bot_name,
+        mode=mode,
+        fingerprint=_runtime_observability_fingerprint(
+            snapshot, ticker_cache
+        ),
+        now_monotonic=now_monotonic,
+    )
     try:
         from core.logger import log_event, log_struct
-        log_struct("runtime_observability", bot=bot_name, mode=mode,
-                   **snapshot)
+        if decision is not None:
+            log_struct(
+                "runtime_observability",
+                bot=bot_name,
+                mode=mode,
+                **decision,
+                **snapshot,
+            )
         now = time.monotonic()
         if anomalies and (
             anomalies != _last_watchdog_fingerprint

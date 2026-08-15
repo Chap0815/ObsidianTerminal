@@ -28,16 +28,15 @@ from launcher.core.runtime_status_values import (
 )
 from launcher.core.metrics_service import (
     MetricsDbReadError,
-    get_bot_stats,
     get_exchange_status,
     get_futures_state_count,
     get_llm_info,
     get_market_info,
     get_open_trades,
-    get_pnl_sparkline,
+    get_pnl_sparklines,
+    get_trade_metrics_snapshot,
     get_unrealized_pnl_futures,
     get_unrealized_pnl_spot,
-    query_db,
 )
 from launcher.core.system_monitor import get_system_stats
 
@@ -418,10 +417,9 @@ class DataPoller:
                 new_data["mode_is_sim"] = dict(mode_is_sim)
 
                 try:
-                    stats: dict = {}
+                    stats, trades_total = get_trade_metrics_snapshot(mode_is_sim)
                     opens: dict = {}
                     for bot in BOT_ORDER:
-                        stats[bot] = get_bot_stats(bot, mode_is_sim=mode_is_sim[bot])
                         if BOT_META[bot].get("is_futures"):
                             # Futures-type bots (FUTURES, CROSS) use
                             # futures_state as the authoritative source  SCOPED
@@ -432,6 +430,7 @@ class DataPoller:
                                 BOT_META[bot]["log_dir"], bot,
                                 mode_is_sim=mode_is_sim[bot]))
                     new_data["stats"] = stats
+                    new_data["trades_total"] = trades_total
                     new_data["open"]  = opens
                     new_data["futures_positions"] = sum(
                         int(opens.get(bot, 0) or 0)
@@ -447,30 +446,29 @@ class DataPoller:
                     new_data["open"] = self.cache.get("open", {})
                     new_data["futures_positions"] = self.cache.get(
                         "futures_positions", 0)
+                    new_data["trades_total"] = self.cache.get("trades_total", 0)
                     new_data["metrics_error"] = _safe_error_text(exc, 160)
 
                 #  Sparkline (PnL trend, last ~30 closed trades) 
                 # Refresh every 30s  sparklines only change when a trade
                 # closes, so polling faster than that is pure DB load.
                 if now >= self._sparkline_next:
-                    spark = {}
-                    for bot in BOT_ORDER:
-                        try:
-                            spark[bot] = get_pnl_sparkline(
-                                bot, limit=30, mode_is_sim=mode_is_sim[bot])
-                        except MetricsDbReadError as exc:
-                            self._log_diag(
-                                f"sparkline DB read failed: "
-                                f"{_safe_error_text(exc)}"
-                            )
-                            new_data["metrics_error"] = _safe_error_text(
-                                exc, 160
-                            )
-                            spark[bot] = self.cache.get("sparkline", {}).get(bot, [])
-                        except Exception:
-                            # Keep the previous values rather than wiping
-                            # the chart on a transient DB hiccup
-                            spark[bot] = self.cache.get("sparkline", {}).get(bot, [])
+                    try:
+                        spark = get_pnl_sparklines(mode_is_sim, limit=30)
+                    except MetricsDbReadError as exc:
+                        self._log_diag(
+                            f"sparkline DB read failed: {_safe_error_text(exc)}"
+                        )
+                        new_data["metrics_error"] = _safe_error_text(exc, 160)
+                        spark = self.cache.get(
+                            "sparkline", {bot: [] for bot in BOT_ORDER}
+                        )
+                    except Exception:
+                        # Keep the previous values rather than wiping
+                        # the chart on a transient read failure.
+                        spark = self.cache.get(
+                            "sparkline", {bot: [] for bot in BOT_ORDER}
+                        )
                     new_data["sparkline"] = spark
                     self._sparkline_next = now + 30.0
                 else:
@@ -521,16 +519,6 @@ class DataPoller:
                 else:
                     new_data["unrealized"] = self.cache.get(
                         "unrealized", {b: 0.0 for b in BOT_ORDER})
-
-                try:
-                    rows = query_db("SELECT COUNT(*) FROM trades WHERE is_partial=0")
-                    new_data["trades_total"] = rows[0][0] if rows else 0
-                except MetricsDbReadError as exc:
-                    self._log_diag(
-                        f"trade-count DB read failed: {_safe_error_text(exc)}"
-                    )
-                    new_data["trades_total"] = self.cache.get("trades_total", 0)
-                    new_data["metrics_error"] = _safe_error_text(exc, 160)
 
                 # Incremental read via _ErrorLogCounter  O(1) when no new errors.
                 new_data["error_count"] = self._error_counter.count()

@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 _lock = threading.Lock()
 _offset_ms: float = 0.0  # exchange_time  local_time, in milliseconds
 _have_offset: bool = False
+_offset_set_monotonic: float | None = None
 
 
 def set_exchange_offset_ms(offset_ms: float) -> None:
@@ -31,7 +32,7 @@ def set_exchange_offset_ms(offset_ms: float) -> None:
 
     Called by the exchange layer after each (re)sync. Ignores non-numeric input
     so a bad value can never poison the clock."""
-    global _offset_ms, _have_offset
+    global _offset_ms, _have_offset, _offset_set_monotonic
     if isinstance(offset_ms, bool):
         return
     try:
@@ -47,9 +48,16 @@ def set_exchange_offset_ms(offset_ms: float) -> None:
         )
     except (OSError, OverflowError, ValueError):
         return
+    try:
+        observed_monotonic = float(time.monotonic())
+        if not math.isfinite(observed_monotonic):
+            observed_monotonic = None
+    except (TypeError, ValueError, OverflowError):
+        observed_monotonic = None
     with _lock:
         _offset_ms = off
         _have_offset = True
+        _offset_set_monotonic = observed_monotonic
 
 
 def get_offset_ms() -> float:
@@ -62,6 +70,21 @@ def have_offset() -> bool:
     """True once the exchange layer has published an offset."""
     with _lock:
         return _have_offset
+
+
+def get_offset_age_seconds() -> float | None:
+    """Monotonic age of the current exchange offset, or ``None`` if unknown."""
+    with _lock:
+        observed = _offset_set_monotonic if _have_offset else None
+    if observed is None:
+        return None
+    try:
+        age = float(time.monotonic()) - observed
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(age):
+        return None
+    return max(0.0, age)
 
 
 def now_ms() -> float:

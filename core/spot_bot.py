@@ -38,6 +38,7 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from functools import cached_property, partial
 from typing import Optional, Dict, Any
 
@@ -115,6 +116,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         self._shutdown_lock = threading.Lock()
         self._cooldown_lock = threading.Lock()
         self._markout_health_lock = threading.Lock()
+        self._position_integrity_health_lock = threading.Lock()
         # populated in run()
         self.ex = None
         # Spot uses batched ticker fetches instead of FuturesBot's TickerCache.
@@ -132,6 +134,10 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         self._reconcile_thread: Optional[threading.Thread] = None
         self._markout_thread: Optional[threading.Thread] = None
         self._markout_started_monotonic: float | None = None
+        self._sim_evidence_health_cache: dict[str, Any] | None = None
+        self._sim_evidence_health_last_monotonic: float | None = None
+        self._position_integrity_started_monotonic = time.monotonic()
+        self._position_integrity_health: dict[str, Any] = {}
         self._markout_health = {
             "ok": True,
             "last_poll_monotonic": None,
@@ -141,6 +147,8 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             "due_count": 0,
             "oldest_due_at": None,
             "oldest_overdue_seconds": 0.0,
+            "next_runnable_at": None,
+            "next_runnable_seconds": None,
             "timestamps_valid": True,
             "reason": "",
             "scopes": {
@@ -148,6 +156,8 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                     "due_count": 0,
                     "oldest_due_at": None,
                     "oldest_overdue_seconds": 0.0,
+                    "next_runnable_at": None,
+                    "next_runnable_seconds": None,
                     "timestamps_valid": True,
                 }
                 for scope in ("LIVE", "SIM")
@@ -157,8 +167,14 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             "completed_total": 0,
             "polls_total": 0,
             "errors_total": 0,
+            "poll_wait_seconds": self.MARKOUT_POLL_INTERVAL_SEC,
+            "wake_strategy": "starting",
             "last_completed_wall_ts": None,
             "lock_state": "starting",
+            "worker_family": "spot",
+            "producer_bots": ["SPOT", "TREND"],
+            "progress_scope": "worker_market_family",
+            "progress_is_bot_scoped": False,
         }
 
     # Convenience: config access as attribute-style. Routes through
@@ -219,6 +235,15 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                 return 0.0
             return max(0.0, parsed) if math.isfinite(parsed) else 0.0
 
+        def optional_nonnegative_float(value) -> float | None:
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return max(0.0, parsed) if math.isfinite(parsed) else None
+
         raw_scopes = report.get("scopes")
         raw_scopes = raw_scopes if isinstance(raw_scopes, dict) else {}
         scopes = {}
@@ -226,11 +251,18 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             raw = raw_scopes.get(scope)
             raw = raw if isinstance(raw, dict) else {}
             oldest = raw.get("oldest_due_at")
+            next_runnable = raw.get("next_runnable_at")
             scopes[scope] = {
                 "due_count": nonnegative_int(raw.get("due_count")),
                 "oldest_due_at": str(oldest)[:32] if oldest else None,
                 "oldest_overdue_seconds": nonnegative_float(
                     raw.get("oldest_overdue_seconds")
+                ),
+                "next_runnable_at": (
+                    str(next_runnable)[:32] if next_runnable else None
+                ),
+                "next_runnable_seconds": optional_nonnegative_float(
+                    raw.get("next_runnable_seconds")
                 ),
                 "timestamps_valid": raw.get("timestamps_valid", True) is True,
             }
@@ -248,6 +280,13 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             reason = ""
         elif reason not in allowed_reasons or not reason:
             reason = "worker_error"
+        wake_strategy = str(report.get("wake_strategy") or "fixed_interval")
+        if wake_strategy not in {
+            "deadline_or_local_commit",
+            "fixed_interval",
+            "fixed_error_backoff",
+        }:
+            wake_strategy = "fixed_interval"
         with self._markout_health_lock:
             previous_errors = nonnegative_int(
                 self._markout_health.get("consecutive_errors")
@@ -272,6 +311,13 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                 "oldest_overdue_seconds": nonnegative_float(
                     report.get("oldest_overdue_seconds")
                 ),
+                "next_runnable_at": (
+                    str(report.get("next_runnable_at"))[:32]
+                    if report.get("next_runnable_at") else None
+                ),
+                "next_runnable_seconds": optional_nonnegative_float(
+                    report.get("next_runnable_seconds")
+                ),
                 "timestamps_valid": report.get("timestamps_valid", True) is True,
                 "reason": reason,
                 "scopes": scopes,
@@ -284,10 +330,18 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                 ),
                 "polls_total": nonnegative_int(report.get("polls_total")),
                 "errors_total": nonnegative_int(report.get("errors_total")),
+                "poll_wait_seconds": nonnegative_float(
+                    report.get("poll_wait_seconds")
+                ),
+                "wake_strategy": wake_strategy,
                 "last_completed_wall_ts": report.get(
                     "last_completed_wall_ts"
                 ),
                 "lock_state": str(report.get("lock_state") or "unknown")[:32],
+                "worker_family": "spot",
+                "producer_bots": ["SPOT", "TREND"],
+                "progress_scope": "worker_market_family",
+                "progress_is_bot_scoped": False,
             })
 
     def _markout_runtime_health(self) -> dict[str, Any]:
@@ -325,6 +379,246 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             "poll_age_seconds": poll_age,
         })
         return snapshot
+
+    def _record_position_integrity_health(
+        self,
+        report: dict,
+        *,
+        telemetry_phase: str,
+    ) -> None:
+        """Store one bounded State/Claim/Exchange comparison for status."""
+        from trading.runtime_observability import (
+            position_integrity_runtime_report,
+        )
+
+        projected = position_integrity_runtime_report(
+            report,
+            telemetry_phase=telemetry_phase,
+            checked_monotonic=time.monotonic(),
+            checked_wall_ts=time.time(),
+        )
+        with self._position_integrity_health_lock:
+            self._position_integrity_health = projected
+
+    def _position_integrity_runtime_health(self) -> dict[str, Any]:
+        """Return freshness-aware integrity health for LIVE trading only."""
+        if bool(getattr(self, "simulation", True)):
+            return {}
+        lock = getattr(self, "_position_integrity_health_lock", None)
+        if lock is None:
+            return {}
+        with lock:
+            health = dict(
+                getattr(self, "_position_integrity_health", {}) or {}
+            )
+        from trading.runtime_observability import (
+            position_integrity_runtime_snapshot,
+        )
+
+        return position_integrity_runtime_snapshot(
+            health,
+            started_monotonic=getattr(
+                self, "_position_integrity_started_monotonic", None
+            ),
+            reconcile_interval_seconds=self.RECONCILE_INTERVAL_SEC,
+            now_monotonic=time.monotonic(),
+        )
+
+    @staticmethod
+    def _sim_tca_pending_state_health(
+        state_rows: Any,
+        bot_name: str,
+        *,
+        now_wall: float | None = None,
+        grace_seconds: int = 60,
+    ) -> dict[str, int]:
+        """Validate the bounded state-first SIM evidence WAL projection."""
+        result = {
+            "pending_state_count": 0,
+            "pending_state_grace_count": 0,
+            "pending_state_overdue_count": 0,
+            "invalid_pending_state_count": 0,
+        }
+        if not isinstance(state_rows, dict):
+            result["invalid_pending_state_count"] = 1
+            return result
+        if len(state_rows) > 4_096:
+            result["invalid_pending_state_count"] = 1
+            return result
+        wall = time.time() if now_wall is None else now_wall
+        if (
+            isinstance(wall, bool)
+            or not isinstance(wall, (int, float))
+            or not math.isfinite(float(wall))
+        ):
+            result["invalid_pending_state_count"] = 1
+            return result
+        normalized_bot = str(bot_name).strip().upper()
+        for state_symbol, row in state_rows.items():
+            if not isinstance(row, dict):
+                continue
+            pending = row.get("sim_tca_pending_v1")
+            if pending is None:
+                continue
+            result["pending_state_count"] += 1
+            valid = isinstance(pending, dict)
+            if valid:
+                entry_id = pending.get("entry_id")
+                symbol = pending.get("symbol")
+                filled_at = pending.get("filled_at")
+                valid = bool(
+                    type(pending.get("version")) is int
+                    and pending["version"] == 1
+                    and pending.get("bot_name") == normalized_bot
+                    and pending.get("side") == "buy"
+                    and isinstance(entry_id, str)
+                    and 0 < len(entry_id) <= 64
+                    and entry_id == entry_id.strip()
+                    and row.get("entry_id") == entry_id
+                    and isinstance(symbol, str)
+                    and symbol == f"{str(state_symbol).strip().upper()}/USDT"
+                    and isinstance(filled_at, str)
+                )
+            if valid:
+                for field, allow_zero in (
+                    ("amount", False),
+                    ("fill_price", False),
+                    ("fee_rate", True),
+                    ("notional_usdt", False),
+                ):
+                    value = pending.get(field)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        or (float(value) < 0 if allow_zero else float(value) <= 0)
+                    ):
+                        valid = False
+                        break
+                if valid and float(pending["fee_rate"]) >= 1.0:
+                    valid = False
+            filled_epoch = 0.0
+            if valid:
+                try:
+                    parsed = datetime.strptime(
+                        pending["filled_at"], "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=timezone.utc)
+                    if parsed.strftime("%Y-%m-%d %H:%M:%S") != pending["filled_at"]:
+                        raise ValueError("non-canonical timestamp")
+                    filled_epoch = parsed.timestamp()
+                    if filled_epoch > float(wall) + 5.0:
+                        raise ValueError("future timestamp")
+                except (TypeError, ValueError, OverflowError, OSError):
+                    valid = False
+            if not valid:
+                result["invalid_pending_state_count"] += 1
+            elif float(wall) - filled_epoch > float(grace_seconds):
+                result["pending_state_overdue_count"] += 1
+            else:
+                result["pending_state_grace_count"] += 1
+        return result
+
+    def _sim_evidence_runtime_health(
+        self, state_rows: Any | None = None
+    ) -> dict[str, Any]:
+        """Expose origin-bot SIM evidence independently from global workers."""
+        if not bool(getattr(self, "simulation", False)):
+            return {}
+        bot_name = str(getattr(self, "BOT_NAME", "")).strip().upper()
+        if bot_name not in {"SPOT", "TREND"}:
+            return {}
+        now = time.monotonic()
+        cached = getattr(self, "_sim_evidence_health_cache", None)
+        last = getattr(self, "_sim_evidence_health_last_monotonic", None)
+        if (
+            isinstance(cached, dict)
+            and not isinstance(last, bool)
+            and isinstance(last, (int, float))
+            and math.isfinite(float(last))
+        ):
+            age = now - float(last)
+            if 0.0 <= age < 30.0:
+                health = dict(cached)
+            else:
+                cached = None
+        else:
+            cached = None
+        if not isinstance(cached, dict):
+            try:
+                from core.database import simulated_execution_evidence_health
+
+                health = simulated_execution_evidence_health(bot_name)
+                if not isinstance(health, dict):
+                    raise TypeError("invalid simulated evidence health payload")
+            except Exception as exc:
+                health = {
+                    "ok": False,
+                    "component": "sim_execution_evidence",
+                    "state": "degraded",
+                    "reason": "health_query_failed",
+                    "bot_name": bot_name,
+                    "error_type": type(exc).__name__,
+                }
+            self._sim_evidence_health_cache = dict(health)
+            self._sim_evidence_health_last_monotonic = now
+        try:
+            rows = self.state.get_all() if state_rows is None else state_rows
+            pending_health = self._sim_tca_pending_state_health(rows, bot_name)
+        except Exception as exc:
+            pending_health = {
+                "pending_state_count": 0,
+                "pending_state_grace_count": 0,
+                "pending_state_overdue_count": 0,
+                "invalid_pending_state_count": 1,
+            }
+            health = dict(health)
+            health["state_health_error_type"] = type(exc).__name__
+            health.update({
+                "runtime_ok": False,
+                "runtime_state": "degraded",
+                "runtime_reason": "state_health_query_failed",
+                "data_quality_ok": False,
+            })
+            if health.get("ok") is True:
+                health.update({
+                    "ok": False,
+                    "state": "degraded",
+                    "reason": "state_health_query_failed",
+                })
+        else:
+            health = dict(health)
+            if (
+                pending_health["invalid_pending_state_count"]
+            ):
+                health.update({
+                    "runtime_ok": False,
+                    "runtime_state": "degraded",
+                    "runtime_reason": "state_pending_invalid",
+                    "data_quality_ok": False,
+                })
+                if health.get("ok") is True:
+                    health.update({
+                        "ok": False,
+                        "state": "degraded",
+                        "reason": "state_pending_invalid",
+                    })
+            elif (
+                pending_health["pending_state_overdue_count"]
+            ):
+                health.update({
+                    "runtime_ok": False,
+                    "runtime_state": "degraded",
+                    "runtime_reason": "state_capture_pending_overdue",
+                    "data_quality_ok": False,
+                })
+                if health.get("ok") is True:
+                    health.update({
+                        "ok": False,
+                        "state": "degraded",
+                        "reason": "state_capture_pending_overdue",
+                    })
+        health.update(pending_health)
+        return health
 
     def _publish_periodic_runtime_status(
         self,
@@ -365,12 +659,35 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                     ticker_cache=self.ticker_cache,
                 )
             markout_health = self._markout_runtime_health()
+            evidence_health = self._sim_evidence_runtime_health(state_rows)
+            integrity_reader = getattr(
+                self, "_position_integrity_runtime_health", None
+            )
+            position_integrity_health = (
+                integrity_reader() if callable(integrity_reader) else {}
+            )
             status_writer(
                 self.LOG_DIR,
                 self.BOT_NAME,
                 (
                     "ready"
-                    if all(threads.values()) and markout_health.get("ok") is True
+                    if (
+                        all(threads.values())
+                        and markout_health.get("ok") is True
+                        and (
+                            not evidence_health
+                            or evidence_health.get(
+                                "runtime_ok", evidence_health.get("ok")
+                            ) is True
+                        )
+                        and (
+                            not position_integrity_health
+                            or position_integrity_health.get(
+                                "runtime_ok",
+                                position_integrity_health.get("ok"),
+                            ) is True
+                        )
+                    )
                     else "degraded"
                 ),
                 self.simulation,
@@ -379,6 +696,15 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                     "open_positions": self.state.count(),
                     "safe_mode": bool(self.safe_mode.is_active()),
                     "markout_health": markout_health,
+                    "sim_evidence_health": evidence_health,
+                    **(
+                        {
+                            "position_integrity_health": (
+                                position_integrity_health
+                            )
+                        }
+                        if position_integrity_health else {}
+                    ),
                     **observability,
                 },
             )
@@ -595,6 +921,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                 "limit": 25,
                 "max_overdue_seconds": self.MARKOUT_MAX_OVERDUE_SEC,
                 "health_callback": self._record_markout_worker_health,
+                "worker_family": "spot",
             },
             daemon=True,
             name=f"{self.BOT_NAME}Markouts",
@@ -616,11 +943,28 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         )
         threads = self._runtime_threads()
         markout_health = self._markout_runtime_health()
+        evidence_health = self._sim_evidence_runtime_health()
+        position_integrity_health = self._position_integrity_runtime_health()
         write_runtime_status(
             self.LOG_DIR, self.BOT_NAME,
             (
                 "ready"
-                if all(threads.values()) and markout_health.get("ok") is True
+                if (
+                    all(threads.values())
+                    and markout_health.get("ok") is True
+                    and (
+                        not evidence_health
+                        or evidence_health.get(
+                            "runtime_ok", evidence_health.get("ok")
+                        ) is True
+                    )
+                    and (
+                        not position_integrity_health
+                        or position_integrity_health.get(
+                            "runtime_ok", position_integrity_health.get("ok")
+                        ) is True
+                    )
+                )
                 else "degraded"
             ),
             self.simulation,
@@ -628,6 +972,11 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             extra={
                 "open_positions": self.state.count(),
                 "markout_health": markout_health,
+                "sim_evidence_health": evidence_health,
+                **(
+                    {"position_integrity_health": position_integrity_health}
+                    if position_integrity_health else {}
+                ),
             })
 
         #  Main thread: heartbeat + shutdown wait 

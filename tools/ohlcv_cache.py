@@ -14,11 +14,16 @@ So one cache serves both the In-Sample optimizer
 (asof-capped) and the Out-of-Sample red-team (full history). Read-only w.r.t. the
 exchange; never used by live trading.
 """
-import os
+
+import hashlib
+import itertools
 import json
 import math
+import os
 import time as _time
 import uuid
+from contextlib import nullcontext
+from pathlib import Path
 
 import ccxt
 import portalocker
@@ -28,6 +33,8 @@ _CACHE_DIR = os.path.join(
 
 _TF_MS = {"1h": 3_600_000, "1d": 86_400_000}
 _CACHE_JSON_MAX_BYTES = 50_000_000
+_CACHE_SCHEMA = 1
+OHLCV_CACHE_NAMESPACE_LOCK = ".namespace.lock"
 # Bitget's historical-candle endpoint returns at most 200 rows.  Passing a
 # larger limit does not merely clamp the row count: it shifts the returned
 # window forward, which can silently skip candles during forward pagination.
@@ -69,18 +76,136 @@ def _exchange_cache_namespace(exchange) -> str:
     return namespace[:64]
 
 
+def _validated_symbol(symbol: str) -> str:
+    if (
+        not isinstance(symbol, str)
+        or not symbol
+        or symbol != symbol.strip()
+        or len(symbol) > 512
+    ):
+        raise ValueError("cache symbol identity is invalid")
+    return symbol
+
+
+def _validated_namespace(cache_namespace: str | None) -> str | None:
+    if cache_namespace is None:
+        return None
+    if (
+        not isinstance(cache_namespace, str)
+        or not cache_namespace
+        or len(cache_namespace) > 64
+        or any(
+            not (character.isalnum() or character in {"-", "_"})
+            for character in cache_namespace
+        )
+    ):
+        raise ValueError("cache namespace is invalid")
+    return cache_namespace
+
+
+def ohlcv_cache_filename(symbol: str, timeframe: str) -> str:
+    symbol = _validated_symbol(symbol)
+    if timeframe not in _TF_MS:
+        raise ValueError(f"unsupported timeframe {timeframe}")
+    prefix = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "_"
+        for character in symbol
+    )[:32] or "symbol"
+    symbol_key = f"{prefix}--{hashlib.sha256(symbol.encode('utf-8')).hexdigest()}"
+    return f"{symbol_key}__{timeframe}.json"
+
+
 def _path(
     symbol: str,
     timeframe: str,
     cache_namespace: str | None = None,
 ) -> str:
-    safe = symbol.replace("/", "_").replace(":", "-")
+    cache_namespace = _validated_namespace(cache_namespace)
     root = (
         os.path.join(_CACHE_DIR, cache_namespace)
         if cache_namespace is not None
         else _CACHE_DIR
     )
-    return os.path.join(root, f"{safe}__{timeframe}.json")
+    return os.path.join(root, ohlcv_cache_filename(symbol, timeframe))
+
+
+def _is_linklike(path: Path) -> bool:
+    return path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    )
+
+
+def _cache_path_without_links(path: str) -> Path:
+    root = Path(_CACHE_DIR).expanduser().absolute()
+    requested = Path(path).expanduser().absolute()
+    try:
+        requested.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("OHLCV cache path escapes cache root") from exc
+    if any(
+        _is_linklike(component)
+        for component in (root, requested, *requested.parents)
+    ):
+        raise ValueError("OHLCV cache path must be link-free")
+    return requested
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate OHLCV cache JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def decode_ohlcv_cache_payload(raw: bytes) -> dict:
+    if not isinstance(raw, bytes) or len(raw) > _CACHE_JSON_MAX_BYTES:
+        raise ValueError("OHLCV cache JSON exceeds size limit")
+    payload = json.loads(
+        raw.decode("utf-8-sig"),
+        parse_constant=lambda value: (_ for _ in ()).throw(
+            ValueError(f"non-standard OHLCV cache JSON constant: {value}")
+        ),
+        object_pairs_hook=_unique_json_object,
+    )
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema", "exchange", "symbol", "timeframe", "rows"
+    }:
+        raise ValueError("OHLCV cache envelope is invalid")
+    if type(payload["schema"]) is not int or payload["schema"] != _CACHE_SCHEMA:
+        raise ValueError("OHLCV cache schema is invalid")
+    exchange = _validated_namespace(payload["exchange"])
+    symbol = _validated_symbol(payload["symbol"])
+    timeframe = payload["timeframe"]
+    if not isinstance(timeframe, str) or timeframe not in _TF_MS:
+        raise ValueError("OHLCV cache timeframe is invalid")
+    rows = payload["rows"]
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("OHLCV cache rows are invalid")
+    tf_ms = _TF_MS[timeframe]
+    timestamps = []
+    for row in rows:
+        if not isinstance(row, list) or not _valid_ohlcv_row(
+            row, since_ms=0, until_ms=math.inf
+        ):
+            raise ValueError("OHLCV cache row is invalid")
+        timestamp = int(float(row[0]))
+        if timestamp % tf_ms != 0:
+            raise ValueError("OHLCV cache row is off-grid")
+        timestamps.append(timestamp)
+    if any(
+        current - previous != tf_ms
+        for previous, current in itertools.pairwise(timestamps)
+    ):
+        raise ValueError("OHLCV cache rows are not contiguous")
+    return {
+        "schema": _CACHE_SCHEMA,
+        "exchange": exchange,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "rows": rows,
+    }
 
 
 def _valid_ohlcv_row(row, *, since_ms: int, until_ms: int) -> bool:
@@ -88,6 +213,11 @@ def _valid_ohlcv_row(row, *, since_ms: int, until_ms: int) -> bool:
         return False
     timestamp = row[0]
     if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+        return False
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in row[1:6]
+    ):
         return False
     try:
         timestamp_float = float(timestamp)
@@ -114,30 +244,24 @@ def _load(
     tf_ms = _TF_MS.get(timeframe)
     if tf_ms is None:
         return None
-    p = _path(symbol, timeframe, cache_namespace)
-    if not os.path.exists(p):
-        return None
     try:
-        with open(p, "rb") as f:
+        p = _cache_path_without_links(_path(symbol, timeframe, cache_namespace))
+        if not p.is_file():
+            return None
+        with p.open("rb") as f:
             raw = f.read(_CACHE_JSON_MAX_BYTES + 1)
+        _cache_path_without_links(str(p))
         if len(raw) > _CACHE_JSON_MAX_BYTES:
             return None
-        bars = json.loads(raw.decode("utf-8-sig"))
-        if not isinstance(bars, list) or not bars:
+        payload = decode_ohlcv_cache_payload(raw)
+        if (
+            payload["exchange"] != cache_namespace
+            or payload["symbol"] != symbol
+            or payload["timeframe"] != timeframe
+        ):
             return None
-        previous_timestamp = None
-        for bar in bars:
-            if not isinstance(bar, list) or not _valid_ohlcv_row(
-                bar, since_ms=0, until_ms=math.inf
-            ):
-                return None
-            timestamp = int(float(bar[0]))
-            if previous_timestamp is not None:
-                if timestamp - previous_timestamp != tf_ms:
-                    return None
-            previous_timestamp = timestamp
-        return bars
-    except Exception:
+        return payload["rows"]
+    except (OSError, TypeError, ValueError, OverflowError):
         return None
 
 
@@ -149,29 +273,88 @@ def _save(
 ) -> None:
     tmp = None
     try:
-        p = _path(symbol, timeframe, cache_namespace)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with portalocker.Lock(
-            f"{p}.lock",
-            mode="a",
-            timeout=30,
-            check_interval=0.05,
-            fail_when_locked=False,
+        tf_ms = _TF_MS.get(timeframe)
+        if tf_ms is None or not isinstance(bars, list) or not bars:
+            return
+        incoming = {}
+        for bar in bars:
+            if not _valid_ohlcv_row(bar, since_ms=0, until_ms=math.inf):
+                return
+            timestamp = int(float(bar[0]))
+            if timestamp % tf_ms != 0:
+                return
+            incoming[timestamp] = bar
+        p = _cache_path_without_links(_path(symbol, timeframe, cache_namespace))
+        os.makedirs(p.parent, exist_ok=True)
+        p = _cache_path_without_links(str(p))
+        if not p.parent.is_dir():
+            return
+        namespace_lock_path = _cache_path_without_links(
+            os.path.join(_CACHE_DIR, OHLCV_CACHE_NAMESPACE_LOCK)
+        )
+        lock_path = _cache_path_without_links(f"{p}.lock")
+        namespace_guard = (
+            nullcontext()
+            if p.is_file()
+            else portalocker.Lock(
+                str(namespace_lock_path),
+                mode="a",
+                timeout=30,
+                check_interval=0.05,
+                fail_when_locked=False,
+            )
+        )
+        with (
+            namespace_guard,
+            portalocker.Lock(
+                str(lock_path),
+                mode="a",
+                timeout=30,
+                check_interval=0.05,
+                fail_when_locked=False,
+            ),
         ):
             merged = {
-                bar[0]: bar
+                int(float(bar[0])): bar
                 for bar in (_load(symbol, timeframe, cache_namespace) or [])
             }
-            merged.update({bar[0]: bar for bar in bars})
+            merged.update(incoming)
             rows = [merged[timestamp] for timestamp in sorted(merged)]
-            tmp = f"{p}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-            with open(tmp, "x", encoding="utf-8", newline="\n") as f:
-                json.dump(rows, f)
+            timestamps = [int(float(row[0])) for row in rows]
+            if any(
+                current - previous != tf_ms
+                for previous, current in itertools.pairwise(timestamps)
+            ):
+                return
+            payload = {
+                "schema": _CACHE_SCHEMA,
+                "exchange": cache_namespace,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "rows": rows,
+            }
+            encoded = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            if len(encoded) > _CACHE_JSON_MAX_BYTES:
+                return
+            p = _cache_path_without_links(str(p))
+            tmp = _cache_path_without_links(
+                f"{p}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            with tmp.open("xb") as f:
+                f.write(encoded)
                 f.flush()
                 os.fsync(f.fileno())
+            p = _cache_path_without_links(str(p))
+            _cache_path_without_links(str(tmp))
             os.replace(tmp, p)
             tmp = None
-    except Exception:
+    # A cache write is best-effort and must never break an offline research run.
+    except Exception:  # noqa: BLE001, S110
         pass
     finally:
         if tmp is not None:
@@ -251,9 +434,11 @@ def _paginate(exchange, symbol, timeframe, since_ms, until_ms) -> list:
         if not batch:
             break
         timestamps = [int(float(row[0])) for row in batch]
+        if any(timestamp % tf_ms != 0 for timestamp in timestamps):
+            return []
         if timestamps[0] - since >= tf_ms or any(
             current - previous != tf_ms
-            for previous, current in zip(timestamps, timestamps[1:])
+            for previous, current in itertools.pairwise(timestamps)
         ):
             # Missing candles change elapsed-time semantics and must never be
             # cached or passed to a backtest as a continuous market history.
@@ -284,7 +469,7 @@ def get_series(exchange, symbol: str, timeframe: str, since_ms: int) -> list:
     tf_ms = _TF_MS[timeframe]
     try:
         real_now = exchange.milliseconds()
-    except Exception:
+    except Exception:  # noqa: BLE001 - exchange adapters expose venue-specific errors
         real_now = int(_time.time() * 1000)
     try:
         if (
@@ -330,7 +515,7 @@ def get_series(exchange, symbol: str, timeframe: str, since_ms: int) -> list:
     bars = [merged[k] for k in sorted(merged)]
     if any(
         int(float(current[0])) - int(float(previous[0])) != tf_ms
-        for previous, current in zip(bars, bars[1:])
+        for previous, current in itertools.pairwise(bars)
     ):
         return []
     if changed:

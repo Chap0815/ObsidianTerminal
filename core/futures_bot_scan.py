@@ -850,19 +850,6 @@ class FuturesScanMixin:
             symbol=sym,
             direction=direction,
         )
-        if (not self.simulation and self._entry_quality_filter_enabled()
-                and ("score_error" in quality.reasons
-                     or quality.score < self._entry_quality_min_score())):
-            log_event(
-                f"{sym}: {direction} blocked  entry quality "
-                f"{quality.score} < {self._entry_quality_min_score():.0f} "
-                f"({quality.label}; {','.join(quality.reasons) or 'no_reason'})",
-                "WAIT")
-            emit_entry_lifecycle(
-                entry_id, bot=self.BOT_NAME, symbol=sym,
-                stage="blocked", mode=entry_mode, reason="entry_quality")
-            return
-
         expectancy_features = {
             "score": float(quality.score),
             "spread_bps": float(entry_spread_pct or 0.0) * 100.0,
@@ -878,9 +865,33 @@ class FuturesScanMixin:
             entry_id=entry_id,
             symbol=sym,
             mode=entry_mode,
+            direction=direction,
             features=expectancy_features,
             venue_symbol=symbol_full,
+            quality_decision={
+                "score": float(quality.score),
+                "minimum_score": float(self._entry_quality_min_score()),
+                "label": quality.label,
+                "reasons": list(quality.reasons),
+                "would_block": bool(
+                    "score_error" in quality.reasons
+                    or quality.score < self._entry_quality_min_score()
+                ),
+            },
         )
+
+        if (not self.simulation and self._entry_quality_filter_enabled()
+                and ("score_error" in quality.reasons
+                     or quality.score < self._entry_quality_min_score())):
+            log_event(
+                f"{sym}: {direction} blocked  entry quality "
+                f"{quality.score} < {self._entry_quality_min_score():.0f} "
+                f"({quality.label}; {','.join(quality.reasons) or 'no_reason'})",
+                "WAIT")
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="blocked", mode=entry_mode, reason="entry_quality")
+            return
 
         from trading.expectancy_runtime import evaluate_runtime_expectancy
 

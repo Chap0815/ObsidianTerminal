@@ -946,6 +946,7 @@ def _find_order_by_client_id(
     expected_position_side: str = "",
     exchange_id: str = "",
     expected_reduce_only: Optional[bool] = None,
+    lookup_since_ms: Optional[int] = None,
 ):
     """Locate an order by clientOrderId - open orders first, then recent
     history. Used to recover from a lost-response timeout so a retry doesn't
@@ -960,6 +961,9 @@ def _find_order_by_client_id(
     non-reduce-only create outcome is blocked because an instant market fill
     may legitimately be absent from open-order results."""
     source_status: dict[str, str] = {}
+    source_complete: dict[str, bool] = {}
+    if isinstance(lookup_status, dict):
+        lookup_status["complete_negative"] = False
 
     def _set_source(source: str, state: str) -> None:
         source_status[source] = state
@@ -978,6 +982,12 @@ def _find_order_by_client_id(
     if not cid:
         _mark_unavailable()
         return None
+    if (
+        isinstance(lookup_since_ms, bool)
+        or not isinstance(lookup_since_ms, int)
+        or lookup_since_ms <= 0
+    ):
+        lookup_since_ms = None
 
     def _budgeted(endpoint: str, source: str, fn):
         try:
@@ -992,10 +1002,14 @@ def _find_order_by_client_id(
             return None
         return fn()
 
-    def _recovery_rows(raw, source: str):
+    def _recovery_rows(raw, source: str, *, page_limit: int | None = None):
         if not isinstance(raw, list):
             _mark_unavailable(source)
+            source_complete[source] = False
             return ()
+        source_complete[source] = bool(
+            page_limit is None or len(raw) < page_limit
+        )
         rows = []
         for row in raw:
             if not isinstance(row, dict):
@@ -1184,6 +1198,7 @@ def _find_order_by_client_id(
                     and raw.get("data") in (None, [])
                 ):
                     _set_source("mexc_exact", "empty")
+                    source_complete["mexc_exact"] = True
                 elif source_status.get("mexc_exact") != "unavailable":
                     _mark_unavailable("mexc_exact")
             except Exception as e:
@@ -1222,13 +1237,27 @@ def _find_order_by_client_id(
             except Exception:
                 pass
     has = getattr(ex, "has", {}) or {}
+    is_anchored_mexc_lookup = (
+        _exchange_id(ex) == "mexc" and lookup_since_ms is not None
+    )
+    history_limit = 100 if is_anchored_mexc_lookup else 20
+
+    def _fetch_history(method):
+        if is_anchored_mexc_lookup:
+            return method(
+                symbol_full,
+                since=lookup_since_ms,
+                limit=history_limit,
+            )
+        return method(symbol_full, limit=history_limit)
+
     try:
         if has.get("fetchOrders"):
             selected = _select_recovery_batch(_recovery_rows(_budgeted(
                 "order_recovery_fetch_orders",
                 "orders",
-                lambda: ex.fetch_orders(symbol_full, limit=20),
-            ), "orders"))
+                lambda: _fetch_history(ex.fetch_orders),
+            ), "orders", page_limit=history_limit))
             if selected is not None:
                 state = (
                     "conflict"
@@ -1247,17 +1276,16 @@ def _find_order_by_client_id(
             except Exception:
                 pass
     # A just-filled MARKET order is no longer "open", and several supported
-  # venues (bitget  the DEFAULT  okx, bybit, kucoin, gate) don't expose the
-    # unified fetchOrders. Such a fill surfaces in closed orders / my-trades, so
-  # consult those before giving up  otherwise the lost-response retry fires a
-    # SECOND entry in exactly the fill-but-no-ack window this guard exists for.
+    # venues do not expose the unified fetchOrders. Such a fill surfaces in
+    # closed orders / my-trades, so consult those before giving up; otherwise
+    # the lost-response retry can fire a second entry in the fill/no-ack window.
     try:
         if has.get("fetchClosedOrders"):
             selected = _select_recovery_batch(_recovery_rows(_budgeted(
                 "order_recovery_fetch_closed_orders",
                 "closed_orders",
-                lambda: ex.fetch_closed_orders(symbol_full, limit=20),
-            ), "closed_orders"))
+                lambda: _fetch_history(ex.fetch_closed_orders),
+            ), "closed_orders", page_limit=history_limit))
             if selected is not None:
                 state = (
                     "conflict"
@@ -1282,8 +1310,8 @@ def _find_order_by_client_id(
                 for trade in _recovery_rows(_budgeted(
                     "order_recovery_fetch_my_trades",
                     "my_trades",
-                    lambda: ex.fetch_my_trades(symbol_full, limit=20),
-                ), "my_trades")
+                    lambda: _fetch_history(ex.fetch_my_trades),
+                ), "my_trades", page_limit=history_limit)
                 if _order_client_id_matches(trade, cid)
             ]
             if matching_trades:
@@ -1317,6 +1345,28 @@ def _find_order_by_client_id(
     result = "unavailable" if any(
         state == "unavailable" for state in source_status.values()
     ) else "empty"
+    if isinstance(lookup_status, dict):
+        # Automatic absence recovery is intentionally MEXC-only.  A complete
+        # negative quorum requires the venue-native exact lookup, the live
+        # order book, at least one supported order-history endpoint, and the
+        # trade ledger.  Every source that was attempted must be conclusively
+        # empty; unsupported, denied, malformed, conflicting, or positive
+        # evidence can therefore never be mistaken for absence.
+        lookup_status["complete_negative"] = bool(
+            _exchange_id(ex) == "mexc"
+            and source_status.get("mexc_exact") == "empty"
+            and source_status.get("open_orders") == "empty"
+            and source_status.get("my_trades") == "empty"
+            and (
+                source_status.get("orders") == "empty"
+                or source_status.get("closed_orders") == "empty"
+            )
+            and bool(source_status)
+            and all(state == "empty" for state in source_status.values())
+            and lookup_since_ms is not None
+            and all(source_complete.get(source) is True for source in source_status)
+            and lookup_status.get("budget_denied") is not True
+        )
     _set_result(result)
     return None
 

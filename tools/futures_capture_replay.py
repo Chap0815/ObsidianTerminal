@@ -9,6 +9,7 @@ import json
 import math
 import os
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -29,29 +30,136 @@ from trading.futures_capture_replay import (
 
 
 MAX_CONFIG_BYTES = 1024 * 1024
+MAX_REPLAY_REPORT_BYTES = 64 * 1024 * 1024
+
+
+def _is_linklike(path: Path) -> bool:
+    return path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    )
+
+
+def _absolute_without_links(path: Path, *, label: str) -> Path:
+    requested = path.expanduser().absolute()
+    if any(_is_linklike(component) for component in (requested, *requested.parents)):
+        raise ValueError(f"{label} path must not contain links")
+    return requested
+
+
+def _require_finite_json(value) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("replay JSON contains a non-finite number")
+    if isinstance(value, dict):
+        for item in value.values():
+            _require_finite_json(item)
+    elif isinstance(value, list):
+        for item in value:
+            _require_finite_json(item)
 
 
 def _read_config(path: Path | None) -> dict:
     if path is None:
         return {}
+    try:
+        path = _absolute_without_links(path, label="replay config")
+    except ValueError as exc:
+        raise ValueError("replay config must be a real file") from exc
+    if not path.is_file():
+        raise ValueError("replay config must be a real file")
     with path.open("rb") as handle:
         raw = handle.read(MAX_CONFIG_BYTES + 1)
     if len(raw) > MAX_CONFIG_BYTES:
         raise ValueError("replay config is oversized")
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("replay config contains duplicate keys")
+            result[key] = item
+        return result
+
+    def reject_constant(_value):
+        raise ValueError("replay config contains a non-finite constant")
+
     try:
-        value = json.loads(raw.decode("utf-8-sig"))
+        value = json.loads(
+            raw.decode("utf-8-sig"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("replay config is invalid JSON") from exc
     if not isinstance(value, dict):
         raise ValueError("replay config must be a JSON object")
+    _require_finite_json(value)
     return value
+
+
+def _write_immutable_output(path: Path, encoded: bytes) -> Path:
+    if len(encoded) > MAX_REPLAY_REPORT_BYTES:
+        raise ValueError("replay output is oversized")
+    path = _absolute_without_links(path, label="replay output")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path = _absolute_without_links(path, label="replay output")
+
+    def existing_matches() -> bool:
+        if _is_linklike(path) or not path.is_file():
+            return False
+        try:
+            if path.stat().st_size != len(encoded):
+                return False
+            with path.open("rb") as handle:
+                return handle.read(len(encoded) + 1) == encoded
+        except OSError:
+            return False
+
+    if path.exists() or _is_linklike(path):
+        if existing_matches():
+            return path
+        raise FileExistsError("immutable replay output conflict")
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            if existing_matches():
+                return path
+            raise FileExistsError("immutable replay output conflict") from exc
+        try:
+            directory_fd = os.open(str(path.parent), os.O_RDONLY)
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(directory_fd)
+                except OSError:
+                    pass
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return path
 
 
 def _json_safe(value):
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, float):
-        return value if math.isfinite(value) else None
+        if not math.isfinite(value):
+            raise ValueError("replay result contains a non-finite number")
+        return value
     if isinstance(value, datetime):
         return value.isoformat()
     isoformat = getattr(value, "isoformat", None)
@@ -100,7 +208,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = _read_config(args.config)
     report = run_replay(args.dataset, config)
-    args.json_output.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(
         report,
         indent=2,
@@ -108,25 +215,14 @@ def main(argv: list[str] | None = None) -> int:
         ensure_ascii=False,
         allow_nan=False,
     ) + "\n"
-    temporary = args.json_output.with_name(
-        f".{args.json_output.name}.{os.getpid()}.tmp"
+    output_path = _write_immutable_output(
+        args.json_output, encoded.encode("utf-8")
     )
-    try:
-        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, args.json_output)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
     print(json.dumps({
         "dataset_fingerprint": report["dataset"]["dataset_fingerprint"],
         "trades": report["result"]["trades"],
         "net": report["result"]["net"],
-        "output": str(args.json_output.resolve()),
+        "output": str(output_path),
     }, sort_keys=True))
     return 0
 

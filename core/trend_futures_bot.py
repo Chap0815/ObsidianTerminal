@@ -31,7 +31,6 @@ from typing import Dict, List, Optional, Tuple
 from shared_limits import normalize_gate_mode
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.safe_numeric import parse_ohlcv_closes
-from bot_utils.silent_log import silent_log
 from bot_utils.trade_state import state_exposure_count
 from core.futures_bot import FuturesBot
 from core.cross_bot import _is_crypto_base   # shared crypto-only perp filter
@@ -305,10 +304,12 @@ class TrendFuturesBot(FuturesBot):
 
     def _trailing_audit_log_interval_sec(self) -> float:
         try:
-            interval = float(self.C("TRAILING_AUDIT_LOG_INTERVAL_SEC", 300) or 300)
+            interval = float(
+                self.C("TRAILING_AUDIT_LOG_INTERVAL_SEC", 3_600) or 3_600
+            )
         except (TypeError, ValueError, OverflowError):
-            interval = 300.0
-        return max(30.0, interval) if math.isfinite(interval) else 300.0
+            interval = 3_600.0
+        return max(30.0, interval) if math.isfinite(interval) else 3_600.0
 
     def _trailing_audit_signature(self, audit: dict) -> tuple:
         """Fields whose changes should be logged immediately.
@@ -325,18 +326,57 @@ class TrendFuturesBot(FuturesBot):
             round(self._safe_float(audit.get("trailing_base_distance_pct")), 4),
         )
 
-    def _should_log_trailing_audit(self, base: str, audit: dict) -> bool:
+    def _trailing_audit_log_decision(
+        self,
+        base: str,
+        audit: dict,
+    ) -> dict | None:
         cache = getattr(self, "_trailing_audit_log_cache", None)
         if not isinstance(cache, dict):
             cache = {}
             self._trailing_audit_log_cache = cache
         sig = self._trailing_audit_signature(audit)
         now = time.monotonic()
-        last_sig, last_ts = cache.get(base, (None, 0.0))
-        if sig != last_sig or now - last_ts >= self._trailing_audit_log_interval_sec():
-            cache[base] = (sig, now)
-            return True
-        return False
+        key = str(base)[:64]
+        previous = cache.get(key)
+        if not isinstance(previous, dict):
+            reason = "initial"
+            suppressed = 0
+        else:
+            last_seen = self._safe_float(previous.get("last_seen_at"), now)
+            last_emit = self._safe_float(previous.get("last_emit_at"), now)
+            suppressed = max(
+                0, int(self._safe_float(previous.get("suppressed_count"), 0))
+            )
+            if now < last_seen:
+                reason = "monotonic_reset"
+            elif sig != previous.get("signature"):
+                reason = "state_change"
+            elif now - last_emit >= self._trailing_audit_log_interval_sec():
+                reason = "reminder"
+            else:
+                previous["last_seen_at"] = now
+                previous["suppressed_count"] = suppressed + 1
+                cache.pop(key, None)
+                cache[key] = previous
+                return None
+        cache.pop(key, None)
+        cache[key] = {
+            "signature": sig,
+            "last_emit_at": now,
+            "last_seen_at": now,
+            "suppressed_count": 0,
+        }
+        while len(cache) > 64:
+            cache.pop(next(iter(cache)))
+        return {
+            "emission_reason": reason,
+            "suppressed_sample_count": suppressed,
+        }
+
+    def _should_log_trailing_audit(self, base: str, audit: dict) -> bool:
+        """Compatibility wrapper for callers that only need a decision."""
+        return self._trailing_audit_log_decision(base, audit) is not None
 
     #  Universe 
     def _is_in_cooldown(self, base: str) -> bool:
@@ -883,15 +923,6 @@ class TrendFuturesBot(FuturesBot):
             log_struct("futrend_entry_shadow", **shadow)
         except Exception:
             pass
-        if not self.simulation and shadow.get("would_block"):
-            log_event(
-                f"[{self.BOT_NAME}] {base}: entry blocked by live shadow "
-                f"filter ({shadow.get('reasons')})", "WAIT")
-            emit_entry_lifecycle(
-                entry_id, bot=self.BOT_NAME, symbol=base,
-                stage="blocked", mode=entry_mode, reason="entry_quality",
-                direction="LONG")
-            return
         expectancy_features = {
             "score": float(shadow.get("entry_quality_score") or 0.0),
             "spread_bps": float(shadow.get("spread_pct") or 0.0) * 100.0,
@@ -906,9 +937,35 @@ class TrendFuturesBot(FuturesBot):
             entry_id=entry_id,
             symbol=base,
             mode=entry_mode,
+            direction="LONG",
             features=expectancy_features,
             venue_symbol=full,
+            quality_decision={
+                "score": float(shadow.get("entry_quality_score") or 0.0),
+                "minimum_score": float(
+                    shadow.get("entry_quality_min_score") or 0.0
+                ),
+                "label": str(
+                    shadow.get("entry_quality_label") or "UNKNOWN"
+                ),
+                "reasons": [
+                    reason for reason in str(
+                        shadow.get("entry_quality_reasons") or ""
+                    ).split(",") if reason
+                ],
+                "would_block": bool(shadow.get("would_block")),
+            },
         )
+        if not self.simulation and shadow.get("would_block"):
+            log_event(
+                f"[{self.BOT_NAME}] {base}: entry blocked by live shadow "
+                f"filter ({shadow.get('reasons')})", "WAIT")
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=base,
+                stage="blocked", mode=entry_mode, reason="entry_quality",
+                direction="LONG")
+            return
+        sim_tca_pending = None
         if not self.simulation:
             from trading.entry_admission import evaluate_entry_admission
             from trading.portfolio_risk import portfolio_limits_from_config
@@ -1343,34 +1400,15 @@ class TrendFuturesBot(FuturesBot):
             from bot_utils.fee_math import taker_fee_rate
             fee_rate = taker_fee_rate(self.ex, full)
             fees = notional * fee_rate
-            try:
-                from trading.candidate_microstructure import (
-                    capture_simulated_entry_tca,
-                )
-
-                tca_recorded = capture_simulated_entry_tca(
-                    exchange=self.ex,
-                    entry_id=entry_id,
-                    bot_name=self.BOT_NAME,
-                    mode=entry_mode,
-                    symbol=full,
-                    side="buy",
-                    amount=contracts,
-                    fill_price=fill,
-                    fee_rate=fee_rate,
-                    notional_usdt=notional,
-                    depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
-                )
-                if not tca_recorded:
-                    silent_log(
-                        f"{self.BOT_NAME} {base} SIM TCA entry {entry_id}",
-                        RuntimeError("SIM TCA was not recorded"),
-                    )
-            except Exception as exc:
-                silent_log(
-                    f"{self.BOT_NAME} {base} SIM TCA dispatch {entry_id}",
-                    exc,
-                )
+            sim_tca_pending = self._new_simulated_entry_tca_pending(
+                entry_id=entry_id,
+                symbol=full,
+                side="buy",
+                amount=contracts,
+                fill_price=fill,
+                fee_rate=fee_rate,
+                notional_usdt=notional,
+            )
 
         actual_margin, margin_from_fill = filled_margin_usdt(
             amount, cs, fill, eff_lev, margin)
@@ -1390,6 +1428,7 @@ class TrendFuturesBot(FuturesBot):
             base, fill, actual_margin, eff_lev, amount, fees,
             provisional=provisional, lev_cap=lev_cap, mm_rate=mm,
             entry_shadow=shadow, margin_mode=margin_mode,
+            sim_tca_pending=sim_tca_pending,
         )
         if not tracked:
             emit_entry_lifecycle(
@@ -1407,6 +1446,8 @@ class TrendFuturesBot(FuturesBot):
                 entry_id=entry_id,
             )
             return
+        if sim_tca_pending is not None:
+            self._finalize_simulated_entry_tca(base, sim_tca_pending)
         emit_entry_lifecycle(
             entry_id, bot=self.BOT_NAME, symbol=base,
             stage="opened", mode=entry_mode, fill_price=fill,
@@ -1581,7 +1622,8 @@ class TrendFuturesBot(FuturesBot):
                       mm_rate: float = 0.01,
                       entry_shadow: Optional[dict] = None,
                       margin_mode: str = "isolated",
-                      entry_inflight: bool = False) -> bool:
+                      entry_inflight: bool = False,
+                      sim_tca_pending: Optional[dict] = None) -> bool:
         from core.logger import _date as _utc
         from bot_utils import calc_liquidation_price, distance_to_liquidation_pct
         # Liquidation uses the INTEGER leverage the exchange runs (ceil) + real
@@ -1601,6 +1643,8 @@ class TrendFuturesBot(FuturesBot):
         }
         if provisional and entry_inflight:
             row["entry_inflight_until"] = time.time() + 120.0
+        if sim_tca_pending is not None:
+            row[self._SIM_TCA_PENDING_FIELD] = sim_tca_pending
         if entry_shadow:
             row.update({
                 "entry_id": entry_shadow.get("entry_id"),
@@ -2819,12 +2863,16 @@ class TrendFuturesBot(FuturesBot):
                     self.state.update_many(base, trail_audit)
                 except Exception as e:
                     self._log_error(f"trend trailing audit update {base}", e)
-                if self._should_log_trailing_audit(base, trail_audit):
+                audit_decision = self._trailing_audit_log_decision(
+                    base, trail_audit
+                )
+                if audit_decision is not None:
                     try:
                         from core.logger import log_struct
                         log_struct("futrend_trailing_audit",
                                    bot=self.BOT_NAME, symbol=base,
                                    mode="SIM" if self.simulation else "LIVE",
+                                   **audit_decision,
                                    **trail_audit)
                     except Exception:
                         pass

@@ -26,7 +26,9 @@ from launcher.config.settings import (
     COLORS,
     FONT_BODY,
     PROJECT_ROOT,
+    ConfigMergeConflict,
     _get_python_exe,
+    capture_config_merge_expectations,
     load_config,
     save_config_merge,
     subprocess_no_window_kwargs,
@@ -39,7 +41,6 @@ from launcher.tool_processes import (
 from launcher.ui.components.widgets import safe_geometry
 from launcher.ui.logging_panel import classify_severity
 from launcher.ui.theme import force_dark_titlebar
-
 
 # Realistic 8h funding magnitude for leveraged-perp backtests so leveraged EV
 # isn't overstated by modelling zero carry. ~0.01%/8h  0.03%/day. Overridable
@@ -80,6 +81,13 @@ TOOL_OUTPUT_MAX_RAW_LINE_BYTES = 16 * 1024
 TOOL_OUTPUT_DRAIN_BATCH_LINES = 100
 OPTIMIZER_BEST_CONFIG_START = "<<<BEST_CONFIG>>>"
 OPTIMIZER_BEST_CONFIG_END = "<<<END_BEST_CONFIG>>>"
+PROMOTION_APPLY_PROVENANCE_FIELDS = {
+    "artifact_schema",
+    "artifact_kind",
+    "promotion_apply_artifact_sha256",
+    "optimizer_source_sha256",
+    "promotion_bundle_sha256",
+}
 
 
 class _BoundedToolOutputBuffer:
@@ -249,6 +257,104 @@ def optimizer_promotion_reasons(cfg: dict) -> list[str]:
     if not isinstance(cfg, dict):
         return ["payload is not an object"]
     reasons = []
+    for key, expected in (
+        ("research_only", False),
+        ("promotion_eligible", True),
+        ("changes_runtime", False),
+    ):
+        if cfg.get(key) is not expected:
+            reasons.append(f"{key} is not explicitly {str(expected).lower()}")
+    run_id = cfg.get("reproducible_run_id")
+    dataset_fingerprint = cfg.get("dataset_fingerprint")
+    candidate_fingerprint = cfg.get("optimizer_candidate_fingerprint")
+    if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{64}", run_id) is None:
+        reasons.append("reproducible optimizer run id is invalid")
+    if (
+        not isinstance(dataset_fingerprint, str)
+        or re.fullmatch(r"[0-9a-f]{64}", dataset_fingerprint) is None
+    ):
+        reasons.append("optimizer dataset fingerprint is invalid")
+    if (
+        not isinstance(candidate_fingerprint, str)
+        or re.fullmatch(r"[0-9a-f]{64}", candidate_fingerprint) is None
+    ):
+        reasons.append("optimizer candidate fingerprint is invalid")
+    candidate_params = cfg.get("optimizer_candidate_params")
+    if not isinstance(candidate_params, dict):
+        reasons.append("optimizer candidate parameters are invalid")
+    else:
+        try:
+            from tools.simulation_workspace import canonical_evidence_sha256
+
+            actual_candidate_fingerprint = canonical_evidence_sha256(candidate_params)
+        except (TypeError, ValueError, OverflowError):
+            reasons.append("optimizer candidate parameters are invalid")
+        else:
+            if actual_candidate_fingerprint != candidate_fingerprint:
+                reasons.append("optimizer candidate fingerprint does not match")
+        for key in OPTIMIZER_CONFIG_MAPPING:
+            if key not in cfg:
+                continue
+            emitted = _finite_optimizer_number(cfg.get(key))
+            bound = _finite_optimizer_number(candidate_params.get(key))
+            if (
+                emitted is None
+                or bound is None
+                or not math.isclose(emitted, bound, rel_tol=1e-12, abs_tol=1e-12)
+            ):
+                reasons.append(f"{key} does not match optimizer candidate")
+    envelope = cfg.get("promotion_envelope")
+    if not isinstance(envelope, dict):
+        reasons.append("shared promotion envelope is missing")
+    else:
+        evidence = envelope.get("evidence")
+        if not isinstance(evidence, dict):
+            reasons.append("shared promotion evidence is invalid")
+        elif (
+            evidence.get("optimizer_strategy") != cfg.get("strategy")
+            or evidence.get("optimizer_candidate_fingerprint")
+            != candidate_fingerprint
+            or evidence.get("optimizer_run_id") != run_id
+            or evidence.get("dataset_fingerprint") != dataset_fingerprint
+        ):
+            reasons.append("shared promotion provenance does not match optimizer run")
+        else:
+            minimum_samples = envelope.get("minimum_samples")
+            manual_approval = envelope.get("manual_live_approval")
+            if (
+                not isinstance(minimum_samples, int)
+                or isinstance(minimum_samples, bool)
+                or minimum_samples < 1
+                or not isinstance(manual_approval, bool)
+            ):
+                reasons.append("shared promotion controls are invalid")
+            else:
+                try:
+                    from trading.profit_research_runner import check_promotion
+                    from trading.promotion_assembly import verify_promotion_envelope
+
+                    verified_envelope = verify_promotion_envelope(envelope)
+                    verified = check_promotion(
+                        verified_envelope["evidence"],
+                        minimum_samples=minimum_samples,
+                        manual_live_approval=manual_approval,
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    reasons.append("shared promotion envelope is invalid")
+                else:
+                    if verified.get("research_passed") is not True:
+                        reasons.append("shared research promotion gate did not pass")
+                    if verified.get("live_allowed") is not True:
+                        reasons.append("shared live promotion gate did not pass")
+                    if verified.get("deployment_performed") is not False:
+                        reasons.append("shared promotion boundary is invalid")
+                    if (
+                        envelope.get("decision_input_schema")
+                        != verified.get("decision_input_schema")
+                        or envelope.get("decision_input_sha256")
+                        != verified.get("decision_input_sha256")
+                    ):
+                        reasons.append("shared promotion fingerprint does not match")
     for key in (
         "robust",
         "deep_validation_complete",
@@ -302,24 +408,57 @@ def optimizer_promotion_reasons(cfg: dict) -> list[str]:
 def optimizer_config_from_complete_marker(
     line: str, *, expected_strategy: str | None = None
 ) -> dict | None:
-    """Parse only a complete, promotion-eligible single-line marker."""
+    """Keep the legacy stdout marker informational; file evidence is mandatory."""
     if not isinstance(line, str) or OPTIMIZER_BEST_CONFIG_START not in line:
         return None
     payload_with_tail = line.split(OPTIMIZER_BEST_CONFIG_START, 1)[1]
     if OPTIMIZER_BEST_CONFIG_END not in payload_with_tail:
         return None
-    payload = payload_with_tail.split(OPTIMIZER_BEST_CONFIG_END, 1)[0]
-    try:
-        import json as _json
+    _ = expected_strategy
+    return None
 
-        cfg = _json.loads(payload)
-    except Exception:
-        return None
-    if not isinstance(cfg, dict) or optimizer_promotion_reasons(cfg):
-        return None
-    if expected_strategy is not None and cfg.get("strategy") != expected_strategy:
-        return None
-    return cfg
+
+def optimizer_config_from_promotion_artifact(
+    source, *, expected_strategy: str | None = None
+) -> dict:
+    """Load one finalized artifact and revalidate it for manual Launcher apply."""
+    from tools.promotion_bundle import load_promotion_apply_artifact
+
+    result = load_promotion_apply_artifact(source)
+    payload = result.get("apply_payload") if isinstance(result, dict) else None
+    if not isinstance(payload, dict):
+        raise TypeError("promotion apply artifact payload is invalid")
+    if expected_strategy is not None and payload.get("strategy") != expected_strategy:
+        raise ValueError("promotion apply artifact strategy mismatch")
+    reasons = optimizer_promotion_reasons(payload)
+    if reasons:
+        raise ValueError(
+            "promotion apply artifact is not promotable: " + "; ".join(reasons)
+        )
+    optimizer_apply_provenance(payload)
+    return payload
+
+
+def optimizer_apply_provenance(cfg: dict) -> dict:
+    """Return exact apply-artifact identities or fail closed."""
+    provenance = cfg.get("promotion_apply_provenance") if isinstance(cfg, dict) else None
+    if (
+        type(provenance) is not dict
+        or set(provenance) != PROMOTION_APPLY_PROVENANCE_FIELDS
+        or type(provenance.get("artifact_schema")) is not int
+        or provenance.get("artifact_schema") != 1
+        or provenance.get("artifact_kind") != "optimizer_promotion_apply"
+    ):
+        raise ValueError("optimizer promotion apply provenance is invalid")
+    for key in (
+        "promotion_apply_artifact_sha256",
+        "optimizer_source_sha256",
+        "promotion_bundle_sha256",
+    ):
+        value = provenance.get(key)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("optimizer promotion apply provenance is invalid")
+    return dict(provenance)
 
 
 def optimizer_best_config_updates(cfg: dict) -> tuple[dict, list[str]]:
@@ -339,17 +478,42 @@ def optimizer_best_config_updates(cfg: dict) -> tuple[dict, list[str]]:
     return updates, applied
 
 
-def apply_optimizer_best_config_to_app(app, strategy: str, cfg: dict) -> list[str]:
+def apply_optimizer_best_config_to_app(
+    app,
+    strategy: str,
+    cfg: dict,
+    *,
+    expected_section_values: dict | None = None,
+) -> list[str]:
     """Apply optimizer-emitted keys to UI memory and persist only those keys."""
     if not isinstance(cfg, dict) or cfg.get("strategy") != strategy:
         raise ValueError("optimizer strategy mismatch")
     updates, applied = optimizer_best_config_updates(cfg)
-    if not updates:
-        return applied
     reasons = optimizer_promotion_reasons(cfg)
     if reasons:
         raise ValueError("optimizer result is not promotable: " + "; ".join(reasons))
-    persisted_config = save_config_merge({strategy: dict(updates)})
+    provenance = optimizer_apply_provenance(cfg)
+    if not updates:
+        return applied
+    if type(expected_section_values) is not dict:
+        raise ValueError("optimizer config staging expectation is missing")
+    from tools.simulation_workspace import canonical_evidence_sha256
+
+    audit_context = {
+        **provenance,
+        "strategy": strategy,
+        "config_update_sha256": canonical_evidence_sha256({
+            "strategy": strategy,
+            "updates": updates,
+        }),
+        "updated_keys": sorted(updates),
+    }
+    persisted_config = save_config_merge(
+        {strategy: dict(updates)},
+        expected_section_values=expected_section_values,
+        audit_source="optimizer_promotion_apply",
+        audit_context=audit_context,
+    )
     app.config = persisted_config
     for cfg_key, val in updates.items():
         try:
@@ -397,6 +561,7 @@ def reset_optimizer_apply_run_state(parse_state: dict, apply_btn_ref: dict) -> b
         "run_generation": generation,
         "output_complete": False,
         "expected_strategy": None,
+        "apply_expectations": None,
     })
     return True
 
@@ -414,6 +579,7 @@ def finalize_optimizer_apply_run(
     if (
         not clean_exit
         or parse_state.get("output_complete") is not True
+        or not isinstance(parse_state.get("apply_expectations"), dict)
         or not isinstance(cfg, dict)
         or (
             expected_strategy is not None
@@ -491,7 +657,7 @@ def open_selftest_dialog(app) -> None:
 def open_heatmap_dialog(app) -> None:
     """Win/loss heatmap by hour-of-day  day-of-week."""
     try:
-        from core.database import get_winloss_heatmap   # type: ignore
+        from core.database import get_winloss_heatmap  # type: ignore
     except Exception as e:
         from tkinter import messagebox
         messagebox.showerror("Heatmap", f"Database module error: {e}")
@@ -1000,6 +1166,8 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         "trophy_lines_seen": 0,
         "run_generation": 0,
         "output_complete": False,
+        "expected_strategy": None,
+        "apply_expectations": None,
     }
 
     def _append_line(line: str) -> None:
@@ -1054,6 +1222,12 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             return
         if optimizer_promotion_reasons(cfg):
             return
+        try:
+            optimizer_apply_provenance(cfg)
+        except ValueError:
+            return
+        if not isinstance(parse_state.get("apply_expectations"), dict):
+            return
 
         apply_btn = ctk.CTkButton(
             btns,
@@ -1085,8 +1259,14 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             return
 
         try:
-            applied = apply_optimizer_best_config_to_app(app, strategy, cfg)
+            applied = apply_optimizer_best_config_to_app(
+                app,
+                strategy,
+                cfg,
+                expected_section_values=parse_state.get("apply_expectations"),
+            )
         except Exception as exc:
+            stale_conflict = isinstance(exc, ConfigMergeConflict)
             try:
                 app.config = load_config()
                 rows = app.param_rows.get(strategy, {})
@@ -1098,6 +1278,8 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
                 app._mark_dirty(strategy, False)
             except Exception:
                 pass
+            if stale_conflict:
+                reset_optimizer_apply_run_state(parse_state, apply_btn_ref)
             status_var.set(f" Config rejected for {strategy}: {exc}")
             status_lbl.configure(text_color=COLORS["danger"])
             _append_line("")
@@ -1126,6 +1308,69 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
                                               text=" Applied")
         except Exception:
             pass
+
+    def _import_promotion_artifact() -> None:
+        """Stage a verified file; config still changes only on the Apply click."""
+        if tool_name != "optimizer":
+            return
+        if _process_is_alive(proc_state.get("proc")):
+            status_var.set(" Stop the running optimizer before importing evidence")
+            status_lbl.configure(text_color=COLORS["danger"])
+            return
+        from tkinter import filedialog
+
+        selected = filedialog.askopenfilename(
+            parent=dlg,
+            title="Load promotion artifact",
+            filetypes=(("Promotion JSON", "*.json"), ("All files", "*.*")),
+        )
+        if not selected:
+            return
+        if not reset_optimizer_apply_run_state(parse_state, apply_btn_ref):
+            status_var.set(" Cannot invalidate the previous optimizer result")
+            status_lbl.configure(text_color=COLORS["danger"])
+            return
+        expected_strategy = bot_var.get()
+        try:
+            cfg = optimizer_config_from_promotion_artifact(
+                selected, expected_strategy=expected_strategy
+            )
+            updates, _applied = optimizer_best_config_updates(cfg)
+            if not updates:
+                raise ValueError("promotion artifact contains no applicable parameters")
+            expectations = capture_config_merge_expectations({
+                cfg["strategy"]: updates
+            })
+        except (OSError, TypeError, ValueError, OverflowError) as exc:
+            status_var.set(f" Promotion artifact rejected: {exc}")
+            status_lbl.configure(text_color=COLORS["danger"])
+            return
+        parse_state["best_config"] = cfg
+        parse_state["expected_strategy"] = cfg["strategy"]
+        parse_state["output_complete"] = True
+        parse_state["apply_expectations"] = expectations
+        _show_apply_button(parse_state["run_generation"])
+        status_var.set(
+            f" Promotion verified for {cfg['strategy']}; review and Apply manually"
+        )
+        status_lbl.configure(text_color=COLORS["success"])
+
+    if tool_name == "optimizer":
+        import_promotion_btn = ctk.CTkButton(
+            btns,
+            text="Load promotion artifact",
+            height=36,
+            corner_radius=8,
+            width=190,
+            font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+            fg_color="transparent",
+            hover_color=COLORS["panel_hover"],
+            text_color=COLORS["text"],
+            border_width=1,
+            border_color=COLORS["border"],
+            command=_import_promotion_artifact,
+        )
+        import_promotion_btn.pack(side="left", padx=(0, 8))
 
     #  Subprocess output reader thread 
     def _read_stdout(proc, run_generation):

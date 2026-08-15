@@ -17,6 +17,7 @@ import math
 import os
 import statistics
 import sys
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -40,6 +41,81 @@ from trading.xsec_signal import (
 
 DEFAULT_DAYS = 180
 MAX_DAYS = 3650
+MAX_XSEC_REPORT_BYTES = 64 * 1024 * 1024
+
+
+def _is_linklike(path: Path) -> bool:
+    return path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    )
+
+
+def _absolute_without_links(path: Path, *, label: str) -> Path:
+    requested = path.expanduser().absolute()
+    if any(_is_linklike(component) for component in (requested, *requested.parents)):
+        raise ValueError(f"{label} path must not contain links")
+    return requested
+
+
+def _write_immutable_report(path: Path, encoded: bytes) -> Path:
+    if not isinstance(encoded, bytes) or len(encoded) > MAX_XSEC_REPORT_BYTES:
+        raise ValueError("CROSS replay output is oversized")
+    path = _absolute_without_links(path, label="CROSS replay output")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path = _absolute_without_links(path, label="CROSS replay output")
+
+    def existing_matches() -> bool:
+        if _is_linklike(path) or not path.is_file():
+            return False
+        try:
+            if path.stat().st_size != len(encoded):
+                return False
+            with path.open("rb") as handle:
+                return handle.read(len(encoded) + 1) == encoded
+        except OSError:
+            return False
+
+    if path.exists() or _is_linklike(path):
+        if existing_matches():
+            return path
+        raise FileExistsError("immutable CROSS replay output conflict")
+
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            if existing_matches():
+                return path
+            raise FileExistsError(
+                "immutable CROSS replay output conflict"
+            ) from exc
+        try:
+            directory_fd = os.open(str(path.parent), os.O_RDONLY)
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(directory_fd)
+                except OSError:
+                    pass
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return path
 
 
 def _parse_xsec_days(args=None) -> int:
@@ -335,11 +411,7 @@ def _offline_replay(argv: list[str]) -> dict:
     }
     raw = json.dumps(report, allow_nan=False, separators=(",", ":"), sort_keys=True)
     if args.output:
-        output = Path(args.output).expanduser().resolve()
-        output.parent.mkdir(parents=True, exist_ok=True)
-        temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
-        temporary.write_text(raw, encoding="utf-8")
-        os.replace(temporary, output)
+        _write_immutable_report(Path(args.output), raw.encode("utf-8"))
     return report
 
 

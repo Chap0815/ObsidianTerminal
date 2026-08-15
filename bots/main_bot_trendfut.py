@@ -82,6 +82,7 @@ class TrendFuturesLauncher(TrendFuturesBot):
         "ACTIVATION_PROFIT":    2.25,    # raw price move that arms partial/trailing
         "TRAILING_DISTANCE":    1.5,     # retrace from high-water mark
         "POST_PARTIAL_TRAILING_DISTANCE": 1.0,
+        "TRAILING_AUDIT_LOG_INTERVAL_SEC": 3600,
         "BREAKEVEN_TRIGGER":    1.8,     # move stop to fee-buffered breakeven
         "PARTIAL_SELL_PCT":     0.5,
         "TREND_EXIT_STALE_LIMIT": 3,

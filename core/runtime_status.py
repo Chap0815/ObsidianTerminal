@@ -7,6 +7,7 @@ import math
 import os
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
@@ -22,6 +23,8 @@ _STATUS_JSON_MAX_BYTES = 2 * 1024 * 1024
 _STATUS_MAX_STRING_CHARS = 4096
 _STATUS_MAX_CONTAINER_ITEMS = 256
 _STATUS_MAX_KEY_CHARS = 256
+_STATUS_LOCK_TIMEOUT_SEC = 1.0
+_STATUS_LOCK_CHECK_SEC = 0.01
 
 
 def _log_status_write_failure(context: str, exc: Exception) -> None:
@@ -32,8 +35,88 @@ def _log_status_write_failure(context: str, exc: Exception) -> None:
         pass
 
 
+@contextmanager
+def _runtime_status_path_lock(path: Path):
+    """Serialize a primary+fallback snapshot with its atomic publisher."""
+    lock = None
+    try:
+        import portalocker
+
+        lock_path = path.with_name(f"{path.name}.publish.lock")
+        lock = portalocker.Lock(
+            str(lock_path),
+            mode="a+b",
+            timeout=_STATUS_LOCK_TIMEOUT_SEC,
+            check_interval=_STATUS_LOCK_CHECK_SEC,
+            flags=portalocker.LOCK_EX | portalocker.LOCK_NB,
+        )
+        lock.acquire()
+    except Exception:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:
+                pass
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _clock_health() -> dict[str, Any]:
+    """Return bounded, non-throwing provenance for the process wall clock."""
+    try:
+        from core.clock import (
+            get_offset_age_seconds,
+            get_offset_ms,
+            have_offset,
+        )
+
+        anchored = have_offset()
+        offset_ms = get_offset_ms()
+        offset_age_seconds = get_offset_age_seconds()
+        if (
+            not isinstance(anchored, bool)
+            or isinstance(offset_ms, bool)
+            or not isinstance(offset_ms, (int, float))
+            or not math.isfinite(float(offset_ms))
+            or (
+                anchored
+                and (
+                    isinstance(offset_age_seconds, bool)
+                    or not isinstance(offset_age_seconds, (int, float))
+                    or not math.isfinite(float(offset_age_seconds))
+                    or float(offset_age_seconds) < 0.0
+                )
+            )
+        ):
+            raise ValueError("invalid exchange clock state")
+        return {
+            "component": "exchange_clock",
+            "exchange_anchored": anchored,
+            "offset_ms": float(offset_ms) if anchored else 0.0,
+            "offset_age_seconds": (
+                round(float(offset_age_seconds), 3) if anchored else None
+            ),
+            "source": "exchange_offset" if anchored else "local_fallback",
+        }
+    except Exception:
+        return {
+            "component": "exchange_clock",
+            "exchange_anchored": False,
+            "offset_ms": None,
+            "offset_age_seconds": None,
+            "source": "clock_state_unavailable",
+        }
 
 
 def _read_json(path: Path) -> dict:
@@ -289,6 +372,7 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
             "build_source": build.get("source", "fallback"),
             "build_created_at": build.get("created_at", ""),
             "threads": _strict_json_value(threads or {}),
+            "clock_health": _clock_health(),
         }
         if extra:
             normalized_extra = _strict_json_value(extra)
@@ -300,45 +384,57 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
                 if isinstance(key, str) and key not in payload:
                     payload[key] = value
 
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2, sort_keys=True, allow_nan=False)
-                fh.flush()
-                try:
-                    os.fsync(fh.fileno())
-                except Exception as exc:
-                    _log_status_write_failure(f"write_runtime_status fsync({path})", exc)
-            last_err = None
-            for attempt in range(_STATUS_REPLACE_RETRIES):
-                try:
-                    os.replace(tmp_name, path)
-                    last_err = None
+        with _runtime_status_path_lock(path) as acquired:
+            if not acquired:
+                _log_status_write_failure(
+                    f"write_runtime_status lock({path})",
+                    TimeoutError("runtime status publish lock unavailable"),
+                )
+                return
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh, indent=2, sort_keys=True, allow_nan=False)
+                    fh.flush()
                     try:
-                        path.with_name("runtime_status.fallback.json").unlink()
-                    except FileNotFoundError:
-                        pass
+                        os.fsync(fh.fileno())
                     except Exception as exc:
                         _log_status_write_failure(
-                            f"write_runtime_status cleanup_fallback({path})", exc)
-                    break
-                except OSError as exc:
-                    last_err = exc
-                    time.sleep(
-                        _STATUS_REPLACE_SLEEP_SEC
-                        * (1.0 + (attempt % 3) * 0.25)
+                            f"write_runtime_status fsync({path})", exc
+                        )
+                last_err = None
+                for attempt in range(_STATUS_REPLACE_RETRIES):
+                    try:
+                        os.replace(tmp_name, path)
+                        last_err = None
+                        try:
+                            path.with_name("runtime_status.fallback.json").unlink()
+                        except FileNotFoundError:
+                            pass
+                        except Exception as exc:
+                            _log_status_write_failure(
+                                f"write_runtime_status cleanup_fallback({path})",
+                                exc,
+                            )
+                        break
+                    except OSError as exc:
+                        last_err = exc
+                        time.sleep(
+                            _STATUS_REPLACE_SLEEP_SEC
+                            * (1.0 + (attempt % 3) * 0.25)
+                        )
+                if last_err is not None:
+                    _write_fallback_status(path, payload)
+                    _log_status_write_failure(
+                        f"write_runtime_status({path})", last_err
                     )
-            if last_err is not None:
-                _write_fallback_status(path, payload)
-                _log_status_write_failure(f"write_runtime_status({path})",
-                                          last_err)
-        finally:
-            try:
-                if os.path.exists(tmp_name):
-                    os.remove(tmp_name)
-            except OSError:
-                pass
+            finally:
+                try:
+                    if os.path.exists(tmp_name):
+                        os.remove(tmp_name)
+                except OSError:
+                    pass
     except Exception as exc:
         _log_status_write_failure(f"write_runtime_status({log_dir})", exc)
 
@@ -353,12 +449,15 @@ def read_runtime_status_with_path(
 ) -> tuple[dict, Path | None]:
     primary_path = runtime_status_path(log_dir)
     fallback_path = runtime_status_fallback_path(log_dir)
-    primary = _read_json(primary_path)
-    fallback = _read_json(fallback_path)
-    if not fallback:
-        return primary, primary_path if primary else None
-    if not primary:
-        return fallback, fallback_path
-    if _status_freshness(fallback) > _status_freshness(primary):
-        return fallback, fallback_path
-    return primary, primary_path
+    with _runtime_status_path_lock(primary_path) as acquired:
+        if not acquired:
+            return {}, None
+        primary = _read_json(primary_path)
+        fallback = _read_json(fallback_path)
+        if not fallback:
+            return primary, primary_path if primary else None
+        if not primary:
+            return fallback, fallback_path
+        if _status_freshness(fallback) > _status_freshness(primary):
+            return fallback, fallback_path
+        return primary, primary_path

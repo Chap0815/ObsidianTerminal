@@ -5,6 +5,7 @@ import math
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.futures_order import (
@@ -1215,6 +1216,11 @@ def recover_nonterminal_order_intents(
             "evidence_state": result,
             "sources": dict(list(sources.items())[:8]),
             "budget_denied": lookup_status.get("budget_denied") is True,
+            "complete_negative": (
+                result == "empty"
+                and lookup_status.get("complete_negative") is True
+                and lookup_status.get("budget_denied") is not True
+            ),
         }
 
     def persisted_snapshot(intent_id: str, fallback: dict) -> dict:
@@ -1236,6 +1242,16 @@ def recover_nonterminal_order_intents(
             return row
         return dict(fallback)
 
+    def lookup_since_ms(intent: dict) -> int | None:
+        try:
+            created = datetime.strptime(
+                str(intent["created_at"]), "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+            # Include a bounded pre-submit margin for exchange timestamp skew.
+            return max(1, int(created.timestamp() * 1000) - 60_000)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
     for intent in list_nonterminal_order_intents(bot_name):
         intent_id = intent["intent_id"]
         if selected_ids is not None and intent_id not in selected_ids:
@@ -1252,6 +1268,7 @@ def recover_nonterminal_order_intents(
             lookup_client_order_id,
             log_event=log_event,
             lookup_status=lookup_status,
+            lookup_since_ms=lookup_since_ms(intent),
         )
         report_evidence(intent, lookup_status)
         if order is None:

@@ -188,3 +188,107 @@ def read_simulation_flag(bot_name: str,
 
     # Step 3: default
     return default
+
+
+def read_simulation_flags(
+    bot_names,
+    *,
+    raise_on_corrupt: bool = True,
+    default: bool = True,
+) -> dict[str, bool] | None:
+    """Read several bot modes from one all-or-none config snapshot.
+
+    ``None`` is returned only when ``raise_on_corrupt`` is false and the
+    authoritative config cannot be read or validated.  Callers can therefore
+    retain their last-known modes instead of silently replacing LIVE with the
+    safe default during a transient file, memory or decoder failure.
+    """
+    if isinstance(bot_names, (str, bytes)):
+        raise ValueError("bot_names must be a bounded collection")
+    try:
+        names = tuple(bot_names)
+    except TypeError as exc:
+        raise ValueError("bot_names must be a bounded collection") from exc
+    if not names or len(names) > 64:
+        raise ValueError("bot_names must contain between 1 and 64 names")
+    if any(
+        not isinstance(name, str)
+        or not name.strip()
+        or len(name.strip()) > 32
+        for name in names
+    ):
+        raise ValueError("bot_names contains an invalid name")
+    normalized_names = tuple(name.strip() for name in names)
+    if len(set(normalized_names)) != len(normalized_names):
+        raise ValueError("bot_names contains duplicates")
+
+    try:
+        from core.paths import BOT_CONFIG
+
+        cfg = _read_config_json(str(BOT_CONFIG))
+        if not isinstance(cfg, dict):
+            raise ValueError("bot_config.json root must be an object")
+        for name in normalized_names:
+            if name in cfg and not isinstance(cfg[name], dict):
+                raise ValueError(f"{name} config section must be an object")
+    except FileNotFoundError:
+        cfg = None
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError, MemoryError) as exc:
+        message = (
+            "bot_config.json corrupt, unreadable or unavailable: "
+            f"{type(exc).__name__}: {exc}. Refusing a partial/default mode snapshot."
+        )
+        if raise_on_corrupt:
+            try:
+                from core.logger import log_event
+
+                log_event(f"[sim_flag] {message}", "CRITICAL")
+            except Exception:
+                pass
+        try:
+            from bot_utils.silent_log import silent_log
+
+            silent_log("sim_flag.snapshot", exc)
+        except Exception:
+            pass
+        if raise_on_corrupt:
+            raise CorruptConfigError(message) from exc
+        return None
+    except Exception as exc:
+        try:
+            from bot_utils.silent_log import silent_log
+
+            silent_log("sim_flag.snapshot", exc)
+        except Exception:
+            pass
+        if raise_on_corrupt:
+            raise CorruptConfigError(
+                f"Unexpected error reading bot_config.json: {exc}"
+            ) from exc
+        return None
+
+    env_raw = os.environ.get("SIMULATION")
+    env_value = _to_bool(env_raw)
+    fallback = env_value if env_value is not None else bool(default)
+    result: dict[str, bool] = {}
+    for name in normalized_names:
+        section = cfg.get(name, {}) if cfg is not None else {}
+        raw_value = _find_simulation_value(section)
+        value = _to_bool(raw_value)
+        if raw_value is not None and value is None:
+            message = (
+                f"{name}.SIMULATION has unrecognized value {raw_value!r}; "
+                "refusing a partial/default mode snapshot"
+            )
+            if raise_on_corrupt:
+                try:
+                    from core.logger import log_event
+
+                    log_event(f"[sim_flag] {message}", "CRITICAL")
+                except Exception:
+                    pass
+            if raise_on_corrupt:
+                raise CorruptConfigError(message)
+            return None
+        result[name] = fallback if value is None else value
+    return result

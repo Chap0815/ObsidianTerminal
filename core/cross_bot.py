@@ -2401,21 +2401,6 @@ class CrossBot(FuturesBot):
         quality = self._score_cross_entry_quality(
             base, full, side, quality_context, spread_pct, max_spread,
             entry_id)
-        if (quality_context is not None
-                and not self.simulation and self._entry_quality_filter_enabled()
-                and ("score_error" in quality.reasons
-                     or quality.score < self._entry_quality_min_score())):
-            log_event(
-                f"[{self.BOT_NAME}] {base}: {side} blocked  entry quality "
-                f"{quality.score} < {self._entry_quality_min_score():.0f} "
-                f"({quality.label}; {','.join(quality.reasons) or 'no_reason'})",
-                "WAIT")
-            emit_entry_lifecycle(
-                entry_id, bot=self.BOT_NAME, symbol=base,
-                stage="blocked", mode=entry_mode, reason="entry_quality",
-                direction=side)
-            return
-
         expectancy_features = {
             "score": float(quality.score),
             "spread_bps": float(spread_pct or 0.0) * 100.0,
@@ -2444,10 +2429,37 @@ class CrossBot(FuturesBot):
             entry_id=entry_id,
             symbol=base,
             mode=entry_mode,
+            direction=side,
             features=expectancy_features,
             venue_symbol=full,
+            quality_decision={
+                "score": float(quality.score),
+                "minimum_score": float(self._entry_quality_min_score()),
+                "label": quality.label,
+                "reasons": list(quality.reasons),
+                "would_block": bool(
+                    "score_error" in quality.reasons
+                    or quality.score < self._entry_quality_min_score()
+                ),
+            },
         )
 
+        if (quality_context is not None
+                and not self.simulation and self._entry_quality_filter_enabled()
+                and ("score_error" in quality.reasons
+                     or quality.score < self._entry_quality_min_score())):
+            log_event(
+                f"[{self.BOT_NAME}] {base}: {side} blocked  entry quality "
+                f"{quality.score} < {self._entry_quality_min_score():.0f} "
+                f"({quality.label}; {','.join(quality.reasons) or 'no_reason'})",
+                "WAIT")
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=base,
+                stage="blocked", mode=entry_mode, reason="entry_quality",
+                direction=side)
+            return
+
+        sim_tca_pending = None
         if self.simulation:
             fill = exec_price
             # SIM `amount` is in COINS (not exchange CONTRACTS - there is no real
@@ -2465,34 +2477,36 @@ class CrossBot(FuturesBot):
             fees = amount * fill * fee_rate
             try:
                 from bot_utils import futures_contract_size
-                from trading.candidate_microstructure import (
-                    capture_simulated_entry_tca,
-                )
 
                 contract_size = futures_contract_size(self.ex, full)
+                if not math.isfinite(contract_size) or contract_size <= 0:
+                    raise ValueError("invalid contract size")
                 tca_amount = notional / (fill * contract_size)
-                tca_recorded = capture_simulated_entry_tca(
-                    exchange=self.ex,
+                sim_tca_pending = self._new_simulated_entry_tca_pending(
                     entry_id=entry_id,
-                    bot_name=self.BOT_NAME,
-                    mode=entry_mode,
                     symbol=full,
                     side="buy" if side == "LONG" else "sell",
                     amount=tca_amount,
                     fill_price=fill,
                     fee_rate=fee_rate,
                     notional_usdt=notional,
-                    depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
                 )
-                if not tca_recorded:
-                    silent_log(
-                        f"{self.BOT_NAME} {base} SIM TCA entry {entry_id}",
-                        RuntimeError("SIM TCA was not recorded"),
-                    )
             except Exception as exc:
                 silent_log(
-                    f"{self.BOT_NAME} {base} SIM TCA dispatch {entry_id}",
+                    f"{self.BOT_NAME} {base} SIM TCA contract size {entry_id}",
                     exc,
+                )
+                sim_tca_pending = self._new_simulated_entry_tca_pending(
+                    entry_id=entry_id,
+                    symbol=full,
+                    side="buy" if side == "LONG" else "sell",
+                    amount=amount,
+                    fill_price=fill,
+                    fee_rate=fee_rate,
+                    notional_usdt=notional,
+                )
+                sim_tca_pending["arrival_unavailable_reason"] = (
+                    "capture_contract_size_unavailable"
                 )
         else:
             #  LIVE: cross-margin market order 
@@ -2933,7 +2947,7 @@ class CrossBot(FuturesBot):
         except Exception:
             stored_notional = notional
 
-        tracked = self.state.add(base, {
+        state_row = {
             "position_type": side,
             "buy": fill,
             "highest": fill,
@@ -2952,7 +2966,10 @@ class CrossBot(FuturesBot):
             "entry_quality_reasons": ",".join(quality.reasons),
             "entry_id": entry_id,
             "provisional": provisional,
-        })
+        }
+        if sim_tca_pending is not None:
+            state_row[self._SIM_TCA_PENDING_FIELD] = sim_tca_pending
+        tracked = self.state.add(base, state_row)
         if tracked is False:
             emit_entry_lifecycle(
                 entry_id, bot=self.BOT_NAME, symbol=base,
@@ -2973,6 +2990,8 @@ class CrossBot(FuturesBot):
                 self._cleanup_untracked_entry_state(
                     base, "sim state write failed after entry")
             return
+        if sim_tca_pending is not None:
+            self._finalize_simulated_entry_tca(base, sim_tca_pending)
         emit_entry_lifecycle(
             entry_id, bot=self.BOT_NAME, symbol=base,
             stage="opened", mode=entry_mode, fill_price=fill,

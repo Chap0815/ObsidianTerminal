@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import itertools
 import json
 import math
 import os
@@ -19,14 +20,18 @@ import stat
 import sys
 import threading
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 DATASET_SCHEMA_VERSION = 1
-RUN_SCHEMA_VERSION = 3
+RUN_SCHEMA_VERSION = 4
 MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+RUN_FINGERPRINT_MAX_FILES = 256
+RUN_FINGERPRINT_FILE_MAX_BYTES = 32 * 1024 * 1024
+RUN_FINGERPRINT_TOTAL_MAX_BYTES = 256 * 1024 * 1024
 _HOUR_MS = 3_600_000
 _HISTORY_COLUMNS = (
     "ts",
@@ -79,12 +84,113 @@ def _sha256_bytes(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
+def canonical_evidence_sha256(value: Any) -> str:
+    """Hash one finite JSON-compatible evidence value canonically."""
+    return _sha256_bytes(_canonical_bytes(value))
+
+
+def _is_linklike(path: Path) -> bool:
+    return path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    )
+
+
+def _absolute_without_links(path: str | os.PathLike, *, label: str) -> Path:
+    requested = Path(path).expanduser().absolute()
+    if any(_is_linklike(component) for component in (requested, *requested.parents)):
+        raise ValueError(f"{label} must not contain links")
+    return requested
+
+
+def _sha256_file(path: Path, *, maximum_bytes: int | None = None) -> str:
     digest = hashlib.sha256()
+    total = 0
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            total += len(chunk)
+            if maximum_bytes is not None and total > maximum_bytes:
+                raise ValueError(f"fingerprint file exceeds {maximum_bytes} bytes")
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(value.st_mode),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+        int(value.st_dev),
+        int(value.st_ino),
+    )
+
+
+def _same_file_object(left: tuple[int, ...], right: tuple[int, ...]) -> bool:
+    # Windows may expose a slightly different ctime through fstat() and stat()
+    # for the same open file. Size, mtime and native file identity remain stable.
+    return all(left[index] == right[index] for index in (0, 1, 2, 4, 5))
+
+
+def _stable_file_fingerprint(
+    path: Path,
+    *,
+    public_path: str,
+    label: str,
+) -> tuple[dict, dict]:
+    """Hash one regular, link-free file and reject concurrent replacement/write."""
+    try:
+        verified_path = _absolute_without_links(path, label=label)
+        with verified_path.open("rb") as identity_handle:
+            before = os.fstat(identity_handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError(f"{label} must be a regular file")
+            if before.st_size > RUN_FINGERPRINT_FILE_MAX_BYTES:
+                raise ValueError(
+                    f"{label} exceeds {RUN_FINGERPRINT_FILE_MAX_BYTES} bytes"
+                )
+            digest = _sha256_file(
+                verified_path, maximum_bytes=RUN_FINGERPRINT_FILE_MAX_BYTES
+            )
+            identity_handle.seek(0)
+            confirmed_digest = hashlib.sha256()
+            confirmed_bytes = 0
+            for chunk in iter(lambda: identity_handle.read(1024 * 1024), b""):
+                confirmed_bytes += len(chunk)
+                if confirmed_bytes > RUN_FINGERPRINT_FILE_MAX_BYTES:
+                    raise ValueError(
+                        f"{label} exceeds {RUN_FINGERPRINT_FILE_MAX_BYTES} bytes"
+                    )
+                confirmed_digest.update(chunk)
+            after = os.fstat(identity_handle.fileno())
+        current_path = _absolute_without_links(verified_path, label=label)
+        current = current_path.stat()
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, ValueError) and "exceeds" in str(exc):
+            raise
+        raise ValueError(f"{label} changed during fingerprint") from exc
+    before_identity = _stat_identity(before)
+    after_identity = _stat_identity(after)
+    current_identity = _stat_identity(current)
+    if (
+        before_identity != after_identity
+        or not _same_file_object(after_identity, current_identity)
+        or not stat.S_ISREG(current.st_mode)
+        or confirmed_bytes != before.st_size
+        or confirmed_digest.hexdigest() != digest
+    ):
+        raise ValueError(f"{label} changed during fingerprint")
+    public = {
+        "path": public_path,
+        "bytes": int(before.st_size),
+        "sha256": digest,
+    }
+    observation = {
+        "path": verified_path,
+        "identity": current_identity,
+        "expected": public,
+        "label": label,
+    }
+    return public, observation
 
 
 def _environment_fingerprint() -> dict:
@@ -107,28 +213,98 @@ def _environment_fingerprint() -> dict:
 
 
 def _read_json(path: Path) -> dict:
+    try:
+        path = _absolute_without_links(path, label="JSON manifest")
+    except ValueError as exc:
+        raise ValueError("JSON manifest must be a real file") from exc
+    if not path.is_file():
+        raise ValueError("JSON manifest must be a real file")
     with path.open("rb") as handle:
         raw = handle.read(MANIFEST_MAX_BYTES + 1)
     if len(raw) > MANIFEST_MAX_BYTES:
         raise ValueError(f"manifest exceeds {MANIFEST_MAX_BYTES} bytes")
+
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("reproducible JSON contains duplicate keys")
+            result[key] = item
+        return result
+
+    def reject_constant(_value):
+        raise ValueError("reproducible JSON contains a non-finite constant")
+
     try:
-        value = json.loads(raw.decode("utf-8-sig"))
+        value = json.loads(
+            raw.decode("utf-8-sig"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid JSON manifest: {path}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"manifest must be a JSON object: {path}")
+    try:
+        _jsonable(value)
+    except ValueError as exc:
+        raise ValueError("reproducible JSON contains a non-finite number") from exc
     return value
 
 
+def _fsync_directory(path: Path) -> None:
+    try:
+        directory_fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(directory_fd)
+        except OSError:
+            pass
+
+
 def _atomic_write(path: Path, raw: bytes) -> None:
+    if len(raw) > MANIFEST_MAX_BYTES:
+        raise ValueError(f"manifest exceeds {MANIFEST_MAX_BYTES} bytes")
+    path = _absolute_without_links(path, label="immutable evidence path")
     path.parent.mkdir(parents=True, exist_ok=True)
+    path = _absolute_without_links(path, label="immutable evidence path")
+    if _is_linklike(path):
+        raise ValueError("immutable evidence conflict")
+
+    def existing_matches() -> bool:
+        if path.is_symlink() or not path.is_file():
+            return False
+        try:
+            if path.stat().st_size != len(raw):
+                return False
+            with path.open("rb") as handle:
+                return handle.read(len(raw) + 1) == raw
+        except OSError:
+            return False
+
+    if path.exists():
+        if existing_matches():
+            return
+        raise ValueError("immutable evidence conflict")
     temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         with temp.open("xb") as handle:
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp, path)
+        try:
+            os.link(temp, path)
+        except FileExistsError as exc:
+            if existing_matches():
+                return
+            raise ValueError("immutable evidence conflict") from exc
+        _fsync_directory(path.parent)
     finally:
         try:
             temp.unlink()
@@ -240,9 +416,15 @@ def freeze_history_dataset(
         raise ValueError("history must be a non-empty symbol mapping")
     cutoff = _utc_cutoff(cutoff_utc)
     cutoff_ms = int(cutoff.timestamp() * 1000)
-    workspace = Path(workspace_root).expanduser().resolve()
+    try:
+        workspace = _absolute_without_links(
+            workspace_root, label="dataset workspace"
+        )
+    except ValueError as exc:
+        raise ValueError("dataset workspace must be a real path") from exc
     datasets = workspace / "datasets"
     datasets.mkdir(parents=True, exist_ok=True)
+    datasets = _absolute_without_links(datasets, label="dataset workspace")
     staging = datasets / f".staging-{os.getpid()}-{uuid.uuid4().hex}"
     staging.mkdir()
     try:
@@ -283,8 +465,6 @@ def freeze_history_dataset(
         manifest = {
             "dataset_fingerprint": fingerprint,
             "fingerprint_payload": payload,
-            "created_at_utc": datetime.now(timezone.utc).isoformat(),
-            "provenance": _jsonable(provenance or {}),
         }
         _atomic_write(staging / "dataset_manifest.json", _canonical_bytes(manifest))
         final = datasets / fingerprint
@@ -292,7 +472,7 @@ def freeze_history_dataset(
             verify_history_dataset(final)
             return final
         try:
-            os.replace(staging, final)
+            os.rename(staging, final)
         except OSError:
             # Another local worker may have published the identical immutable
             # dataset between the existence check and the atomic rename.
@@ -300,6 +480,7 @@ def freeze_history_dataset(
                 verify_history_dataset(final)
                 return final
             raise
+        _fsync_directory(datasets)
         for path in final.rglob("*"):
             if path.is_file():
                 try:
@@ -313,8 +494,11 @@ def freeze_history_dataset(
 
 
 def verify_history_dataset(dataset_root: str | os.PathLike) -> dict:
-    root = Path(dataset_root).expanduser().resolve()
-    if not root.is_dir() or root.is_symlink():
+    try:
+        root = _absolute_without_links(dataset_root, label="dataset root")
+    except ValueError as exc:
+        raise ValueError("dataset root must be a real directory") from exc
+    if not root.is_dir():
         raise ValueError("dataset root must be a real directory")
     manifest = _read_json(root / "dataset_manifest.json")
     payload = manifest.get("fingerprint_payload")
@@ -336,12 +520,22 @@ def verify_history_dataset(dataset_root: str | os.PathLike) -> dict:
         relative = item.get("path")
         if not isinstance(relative, str):
             raise ValueError("dataset series path is invalid")
-        path = (root / relative).resolve()
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError("dataset series path escapes root")
+        try:
+            path = _absolute_without_links(
+                root / relative_path, label="dataset series"
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"dataset series is missing or linked: {relative}"
+            ) from exc
         try:
             path.relative_to(root)
         except ValueError as exc:
             raise ValueError("dataset series path escapes root") from exc
-        if path.is_symlink() or not path.is_file():
+        if not path.is_file():
             raise ValueError(f"dataset series is missing or linked: {relative}")
         if path.stat().st_size != item.get("bytes") or _sha256_file(path) != item.get("sha256"):
             raise ValueError(f"dataset series fingerprint mismatch: {relative}")
@@ -355,9 +549,12 @@ def verify_history_dataset(dataset_root: str | os.PathLike) -> dict:
         ):
             raise ValueError(f"dataset series metadata mismatch: {relative}")
         expected.add(relative.replace("\\", "/"))
+    discovered = list(root.rglob("*"))
+    if any(_is_linklike(path) for path in discovered):
+        raise ValueError("dataset contains linked paths")
     actual = {
         path.relative_to(root).as_posix()
-        for path in root.rglob("*")
+        for path in discovered
         if path.is_file()
     }
     if actual != expected:
@@ -367,7 +564,7 @@ def verify_history_dataset(dataset_root: str | os.PathLike) -> dict:
 
 def load_history_dataset(dataset_root: str | os.PathLike) -> tuple[dict, dict]:
     manifest = verify_history_dataset(dataset_root)
-    root = Path(dataset_root).expanduser().resolve()
+    root = _absolute_without_links(dataset_root, label="dataset root")
     try:
         import pandas as pd
     except ImportError as exc:
@@ -432,6 +629,7 @@ class ReproducibleRun:
         seed: int,
         workers: int,
         code_files: Iterable[str | os.PathLike],
+        dependency_lock_file: str | os.PathLike | None = None,
         resume: bool = False,
         dataset_verifier=None,
     ) -> None:
@@ -442,23 +640,66 @@ class ReproducibleRun:
         verifier = dataset_verifier or verify_history_dataset
         if not callable(verifier):
             raise ValueError("dataset_verifier must be callable")
-        dataset = verifier(dataset_root)
+        try:
+            verified_dataset_root = _absolute_without_links(
+                dataset_root, label="dataset root"
+            )
+        except ValueError as exc:
+            raise ValueError("dataset root must be a real directory") from exc
+        if not verified_dataset_root.is_dir():
+            raise ValueError("dataset root must be a real directory")
+        dataset = verifier(verified_dataset_root)
         if (
             not isinstance(dataset, dict)
             or not isinstance(dataset.get("dataset_fingerprint"), str)
             or not dataset["dataset_fingerprint"]
         ):
             raise ValueError("dataset verifier returned an invalid manifest")
+        if isinstance(code_files, (str, bytes, os.PathLike)):
+            raise ValueError("code fingerprint files must be an iterable of paths")
+        try:
+            raw_code_files = list(itertools.islice(
+                iter(code_files), RUN_FINGERPRINT_MAX_FILES + 1
+            ))
+        except TypeError as exc:
+            raise ValueError(
+                "code fingerprint files must be an iterable of paths"
+            ) from exc
+        if len(raw_code_files) > RUN_FINGERPRINT_MAX_FILES:
+            raise ValueError("run fingerprint file limit exceeded")
         resolved_code_files = []
-        for raw_path in code_files:
-            path = Path(raw_path).expanduser().resolve()
-            if path.is_symlink() or not path.is_file():
+        for raw_path in raw_code_files:
+            try:
+                path = _absolute_without_links(
+                    raw_path, label="code fingerprint file"
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"code fingerprint file is missing: {raw_path}"
+                ) from exc
+            if not path.is_file():
                 raise ValueError(f"code fingerprint file is missing: {path}")
             resolved_code_files.append(path)
         if not resolved_code_files:
             raise ValueError("code fingerprint files must not be empty")
         if len(set(resolved_code_files)) != len(resolved_code_files):
             raise ValueError("code fingerprint files must be unique")
+        resolved_dependency_lock = None
+        if dependency_lock_file is not None:
+            try:
+                resolved_dependency_lock = _absolute_without_links(
+                    dependency_lock_file, label="dependency lock file"
+                )
+            except ValueError as exc:
+                raise ValueError("dependency lock file is missing") from exc
+            if not resolved_dependency_lock.is_file():
+                raise ValueError(
+                    f"dependency lock file is missing: {resolved_dependency_lock}"
+                )
+            if resolved_dependency_lock in resolved_code_files:
+                raise ValueError("dependency lock file must be separate from code files")
+            if len(resolved_code_files) + 1 > RUN_FINGERPRINT_MAX_FILES:
+                raise ValueError("run fingerprint file limit exceeded")
         try:
             code_root = Path(os.path.commonpath(
                 [str(path.parent) for path in resolved_code_files]
@@ -468,22 +709,47 @@ class ReproducibleRun:
                 "code fingerprint files must share a stable root"
             ) from exc
         code = []
+        source_observations = []
+        total_fingerprint_bytes = 0
         for path in resolved_code_files:
             relative = path.relative_to(code_root).as_posix()
-            code.append(
-                {
-                    "path": relative,
-                    "bytes": path.stat().st_size,
-                    "sha256": _sha256_file(path),
-                }
+            public, observation = _stable_file_fingerprint(
+                path,
+                public_path=relative,
+                label="code fingerprint file",
             )
+            code.append(public)
+            observation["kind"] = "code"
+            source_observations.append(observation)
+            total_fingerprint_bytes += int(public["bytes"])
+            if total_fingerprint_bytes > RUN_FINGERPRINT_TOTAL_MAX_BYTES:
+                raise ValueError(
+                    "run fingerprint files exceed "
+                    f"{RUN_FINGERPRINT_TOTAL_MAX_BYTES} bytes"
+                )
         if len({item["path"] for item in code}) != len(code):
             raise ValueError("code fingerprint identities must be unique")
         code.sort(key=lambda item: (item["path"], item["sha256"]))
+        dependency_lock = None
+        if resolved_dependency_lock is not None:
+            dependency_lock, observation = _stable_file_fingerprint(
+                resolved_dependency_lock,
+                public_path=resolved_dependency_lock.name,
+                label="dependency lock file",
+            )
+            observation["kind"] = "dependency lock"
+            source_observations.append(observation)
+            total_fingerprint_bytes += int(dependency_lock["bytes"])
+            if total_fingerprint_bytes > RUN_FINGERPRINT_TOTAL_MAX_BYTES:
+                raise ValueError(
+                    "run fingerprint files exceed "
+                    f"{RUN_FINGERPRINT_TOTAL_MAX_BYTES} bytes"
+                )
         spec = {
             "schema_version": RUN_SCHEMA_VERSION,
             "dataset_fingerprint": dataset["dataset_fingerprint"],
             "code": code,
+            "dependency_lock": dependency_lock,
             "environment": _environment_fingerprint(),
             "config": _jsonable(run_config),
             "splits": _jsonable(splits),
@@ -491,20 +757,34 @@ class ReproducibleRun:
             "workers": workers,
         }
         run_id = _sha256_bytes(_canonical_bytes(spec))
-        runs_root = Path(workspace_root).expanduser().resolve() / "runs"
+        try:
+            workspace = _absolute_without_links(
+                workspace_root, label="reproducible workspace"
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "reproducible workspace must be a real path"
+            ) from exc
+        runs_root = workspace / "runs"
         self.root = runs_root / run_id
         self.run_id = run_id
         self.spec = spec
         self._lock = threading.Lock()
+        self._source_lock = threading.Lock()
+        self._source_observations = source_observations
+        self._revalidate_sources()
         manifest_path = self.root / "run_manifest.json"
         manifest = {
             "run_id": run_id,
             "run_spec": spec,
-            "created_at_utc": datetime.now(timezone.utc).isoformat(),
         }
         if self.root.exists():
             existing = _read_json(manifest_path)
-            if existing.get("run_id") != run_id or existing.get("run_spec") != spec:
+            if (
+                existing.get("run_id") != run_id
+                or _canonical_bytes(existing.get("run_spec"))
+                != _canonical_bytes(spec)
+            ):
                 raise ValueError("existing run manifest conflicts with requested run")
             if not resume:
                 raise FileExistsError("run already exists; pass resume=True to continue")
@@ -519,7 +799,24 @@ class ReproducibleRun:
                     staging / "run_manifest.json", _canonical_bytes(manifest)
                 )
                 (staging / "checkpoints").mkdir()
-                os.replace(staging, self.root)
+                try:
+                    os.rename(staging, self.root)
+                except OSError as exc:
+                    if self.root.is_dir():
+                        existing = _read_json(manifest_path)
+                        if (
+                            existing.get("run_id") != run_id
+                            or _canonical_bytes(existing.get("run_spec"))
+                            != _canonical_bytes(spec)
+                        ):
+                            raise ValueError(
+                                "existing run manifest conflicts with requested run"
+                            ) from exc
+                        raise FileExistsError(
+                            "run already exists; pass resume=True to continue"
+                        ) from exc
+                    raise
+                _fsync_directory(runs_root)
             finally:
                 if staging.exists():
                     shutil.rmtree(staging, ignore_errors=True)
@@ -527,7 +824,33 @@ class ReproducibleRun:
 
     @staticmethod
     def _params_hash(params: dict) -> str:
-        return _sha256_bytes(_canonical_bytes(params))
+        return canonical_evidence_sha256(params)
+
+    def _revalidate_sources(self) -> None:
+        with self._source_lock:
+            for observation in self._source_observations:
+                kind = observation["kind"]
+                path = observation["path"]
+                try:
+                    verified_path = _absolute_without_links(
+                        path, label=observation["label"]
+                    )
+                    current = verified_path.stat()
+                    if (
+                        stat.S_ISREG(current.st_mode)
+                        and _stat_identity(current) == observation["identity"]
+                    ):
+                        continue
+                    public, refreshed = _stable_file_fingerprint(
+                        verified_path,
+                        public_path=observation["expected"]["path"],
+                        label=observation["label"],
+                    )
+                except (OSError, ValueError) as exc:
+                    raise ValueError(f"{kind} fingerprint changed") from exc
+                if public != observation["expected"]:
+                    raise ValueError(f"{kind} fingerprint changed")
+                observation["identity"] = refreshed["identity"]
 
     @staticmethod
     def _seal_evidence(value: dict) -> dict:
@@ -545,6 +868,7 @@ class ReproducibleRun:
         return body
 
     def baseline(self, expected_params: dict | None = None) -> dict | None:
+        self._revalidate_sources()
         path = self.root / "baseline.json"
         if not path.exists():
             return None
@@ -577,9 +901,10 @@ class ReproducibleRun:
         })
         path = self.root / "baseline.json"
         with self._lock:
+            self._revalidate_sources()
             if path.exists():
                 existing = _read_json(path)
-                if existing != value:
+                if _canonical_bytes(existing) != _canonical_bytes(value):
                     raise ValueError("baseline evidence conflicts with existing run")
                 return existing
             _atomic_write(path, _canonical_bytes(value))
@@ -588,6 +913,7 @@ class ReproducibleRun:
     def checkpoint(self, index: int, params: dict) -> dict | None:
         if not isinstance(params, dict):
             raise ValueError("checkpoint params must be an object")
+        self._revalidate_sources()
         path = self._checkpoint_path(index)
         if not path.exists():
             return None
@@ -618,9 +944,10 @@ class ReproducibleRun:
         })
         path = self._checkpoint_path(index)
         with self._lock:
+            self._revalidate_sources()
             if path.exists():
                 existing = _read_json(path)
-                if existing != value:
+                if _canonical_bytes(existing) != _canonical_bytes(value):
                     raise ValueError(f"checkpoint {index} already contains other evidence")
                 return
             _atomic_write(path, _canonical_bytes(value))

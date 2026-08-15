@@ -739,7 +739,15 @@ def _is_fresh_position(state_row: dict, max_age_s: float) -> bool:
             tzinfo=timezone.utc)
     except (TypeError, ValueError):
         return False
-    return (datetime.now(timezone.utc) - opened).total_seconds() < max_age_s
+    try:
+        from core.clock import now_utc
+
+        age_seconds = (now_utc() - opened).total_seconds()
+    except Exception:
+        # A transient clock failure must not authorize a destructive drift
+        # adjustment against a possibly not-yet-propagated venue position.
+        return True
+    return age_seconds < max_age_s
 
 
 def _fetch_futures_contracts(
@@ -1220,6 +1228,7 @@ class FuturesReconcileMixin:
                         "evidence_state": "attempt_error",
                         "sources": {},
                         "budget_denied": False,
+                        "complete_negative": False,
                     }
                     record_order_intent_recovery_evidence(
                         row["intent_id"],
@@ -1227,6 +1236,9 @@ class FuturesReconcileMixin:
                         evidence_state=item["evidence_state"],
                         sources=item.get("sources"),
                         budget_denied=item.get("budget_denied") is True,
+                        complete_negative=(
+                            item.get("complete_negative") is True
+                        ),
                     )
             health = order_intent_recovery_health(
                 self.BOT_NAME,
@@ -1295,6 +1307,124 @@ class FuturesReconcileMixin:
             self, log_event, health, context=context
         )
         return not blocked, recovery_generation
+
+    def _finalize_qualified_zero_fill_recoveries(
+        self,
+        log_event,
+        *,
+        reconciliation_ok: bool,
+    ) -> bool:
+        """Resolve qualified absence only against this reconcile cycle's snapshot."""
+        if bool(getattr(self, "simulation", True)) or not reconciliation_ok:
+            return False
+        snapshot = getattr(self, "_entry_recovery_position_snapshot", None)
+        if not isinstance(snapshot, dict) or snapshot.get("complete") is not True:
+            return False
+        open_bases = snapshot.get("open_bases")
+        ambiguous_bases = snapshot.get("ambiguous_bases")
+        if not isinstance(open_bases, frozenset) or not isinstance(
+            ambiguous_bases, frozenset
+        ):
+            return False
+        try:
+            from core.database import (
+                _base_symbol,
+                finalize_qualified_zero_fill_order_intent,
+                list_qualified_zero_fill_order_intents,
+                order_intent_recovery_health,
+            )
+
+            local_bases = {
+                _base_symbol(symbol)
+                for symbol in self.state.get_all()
+                if _base_symbol(symbol)
+            }
+            finalized = 0
+            for item in list_qualified_zero_fill_order_intents(self.BOT_NAME):
+                base = _base_symbol(item.get("symbol"))
+                if (
+                    not base
+                    or base in open_bases
+                    or base in ambiguous_bases
+                    or base in local_bases
+                ):
+                    continue
+                if finalize_qualified_zero_fill_order_intent(
+                    item["intent_id"], bot_name=self.BOT_NAME
+                ):
+                    finalized += 1
+            health = order_intent_recovery_health(
+                self.BOT_NAME,
+                max_retry_seconds=int(getattr(
+                    self, "ENTRY_RECOVERY_RETRY_MAX_SEC", 300
+                )),
+            )
+            if finalized:
+                log_event(
+                    f"[FUTURES] Automatically resolved {finalized} proven "
+                    "zero-fill order intent(s) after complete exchange and "
+                    "position reconciliation",
+                    "OK",
+                )
+            FuturesReconcileMixin._store_entry_recovery_health(
+                self, health, health.get("ok") is not True
+            )
+            return health.get("ok") is True
+        except Exception as exc:
+            self._log_error("zero-fill recovery finalization", exc)
+            return False
+
+    def _finalize_interrupted_candidates(
+        self,
+        log_event,
+        *,
+        reconciliation_ok: bool,
+        startup_cutoff: str,
+    ) -> bool:
+        """Classify prior-process Candidates using the completed startup snapshot."""
+        if bool(getattr(self, "simulation", True)) or not reconciliation_ok:
+            return False
+        snapshot = getattr(self, "_entry_recovery_position_snapshot", None)
+        if not isinstance(snapshot, dict) or snapshot.get("complete") is not True:
+            return False
+        open_bases = snapshot.get("open_bases")
+        ambiguous_bases = snapshot.get("ambiguous_bases")
+        if not isinstance(open_bases, frozenset) or not isinstance(
+            ambiguous_bases, frozenset
+        ):
+            return False
+        try:
+            from core.database import (
+                _base_symbol,
+                finalize_interrupted_futures_candidates,
+            )
+
+            local_bases = frozenset(
+                base
+                for symbol in self.state.get_all()
+                if (base := _base_symbol(symbol))
+            )
+            finalized = finalize_interrupted_futures_candidates(
+                bot_name=self.BOT_NAME,
+                startup_cutoff=startup_cutoff,
+                local_bases=local_bases,
+                exchange_open_bases=open_bases,
+                exchange_ambiguous_bases=ambiguous_bases,
+                exchange_snapshot_complete=True,
+            )
+            if finalized is None:
+                return False
+            if finalized:
+                log_event(
+                    f"[FUTURES] Classified {len(finalized)} pre-order "
+                    "candidate interruption(s) from the previous process after "
+                    "complete negative reconciliation",
+                    "OK",
+                )
+            return True
+        except Exception as exc:
+            self._log_error("interrupted candidate finalization", exc)
+            return False
 
     def _complete_entry_recovery_barrier(
         self,
@@ -1414,20 +1544,26 @@ class FuturesReconcileMixin:
                 )
         return not self._entry_recovery_blocked
 
-    def _startup_reconciliation(self) -> bool:
-        """Boot-time reconciliation  compares state vs exchange.
+    def _startup_reconciliation(
+        self,
+        *,
+        telemetry_phase: str = "startup",
+    ) -> bool:
+        """Full reconciliation compares local, claim and exchange state.
 
         Defensive against ``safe_fetch_positions`` returning an EMPTY list
         (could be a real exchange state, or an auth/network glitch). If we have
         local positions but the exchange returns nothing, refuse to wipe state
         log a loud warning and skip removal. Only proceed with removal when
         the exchange shows at least *some* positions OR local state was empty to
-        begin with.
+        begin with. ``telemetry_phase`` only labels/throttles passive audit
+        output; it never changes reconciliation or order behavior.
         """
         from core.logger import log_event, send_telegram
         from config.exchange_config import safe_fetch_positions
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
+        self._entry_recovery_position_snapshot = None
         try:
             local_state = self.state.get_all()
             if not try_consume_api_call(
@@ -2312,15 +2448,24 @@ class FuturesReconcileMixin:
                         "amount": _position_contracts_or_none(position),
                         "direction": side,
                     }
-                emit_startup_integrity(
+                integrity_report = emit_startup_integrity(
                     bot_name=self.BOT_NAME, mode="LIVE",
                     state_rows=self.state.get_all(),
                     exchange_rows=exchange_layer,
+                    telemetry_phase=telemetry_phase,
                 )
+                record_integrity = getattr(
+                    self, "_record_position_integrity_health", None
+                )
+                if callable(record_integrity):
+                    record_integrity(
+                        integrity_report,
+                        telemetry_phase=telemetry_phase,
+                    )
             except Exception:
                 pass
             managed_symbols = set(self.state.get_all())
-            return (
+            reconciliation_ok = (
                 exchange_snapshot_complete
                 and not ambiguous_exchange_bases
                 and not unadoptable
@@ -2329,6 +2474,13 @@ class FuturesReconcileMixin:
                     managed_symbols | foreign_claimed_bases
                 )
             )
+            if reconciliation_ok:
+                self._entry_recovery_position_snapshot = {
+                    "complete": True,
+                    "open_bases": frozenset(exchange_open),
+                    "ambiguous_bases": frozenset(ambiguous_exchange_bases),
+                }
+            return reconciliation_ok
         except Exception as e:
             self._log_error("reconciliation", e)
             return False
@@ -2846,8 +2998,16 @@ class FuturesReconcileMixin:
                     >= float(self.RECONCILE_INTERVAL_SEC)
                 )
                 if recovery_ok or reconciliation_due:
-                    reconciliation_ok = self._startup_reconciliation()
+                    reconciliation_ok = self._startup_reconciliation(
+                        telemetry_phase="reconcile"
+                    )
                     last_reconciliation = time.monotonic()
+                    if reconciliation_ok:
+                        recovery_ok = FuturesReconcileMixin._finalize_qualified_zero_fill_recoveries(
+                            self,
+                            log_event,
+                            reconciliation_ok=reconciliation_ok,
+                        )
                 else:
                     # Keep the entry gate closed. The latest full position
                     # snapshot remains valid for monitoring/exits, while

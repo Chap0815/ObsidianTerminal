@@ -2079,7 +2079,32 @@ class FuturesExitsMixin:
                 ),
                 mode=str(self.C("TIME_DECAY_MODE", "shadow") or "shadow").lower(),
             )
-            if decay.shadow_should_exit:
+            shadow_identity = str(
+                d.get("entry_id")
+                or d.get("buy_time")
+                or d.get("buy")
+                or "unknown"
+            )[:192]
+            shadow_key = f"{str(sym)[:64]}:{shadow_identity}"
+            shadow_cache = getattr(
+                self, "_time_decay_shadow_log_cache", None
+            )
+            if not isinstance(shadow_cache, dict):
+                shadow_cache = {}
+                self._time_decay_shadow_log_cache = shadow_cache
+            shadow_seen = bool(
+                d.get("time_decay_shadow_seen")
+                or shadow_key in shadow_cache
+            )
+            should_log_decay = bool(
+                decay.shadow_should_exit
+                and (
+                    decay.should_exit
+                    or not shadow_seen
+                )
+            )
+            shadow_logged = False
+            if should_log_decay:
                 try:
                     from core.logger import log_struct
 
@@ -2091,9 +2116,27 @@ class FuturesExitsMixin:
                         age_minutes=age_minutes,
                         mfe_pct=d.get("max_profit_pct"),
                         enforced=decay.should_exit,
+                        emission_reason=(
+                            "enforced"
+                            if decay.should_exit
+                            else "first_shadow_candidate"
+                        ),
                     )
+                    shadow_logged = True
                 except Exception:
                     pass
+            if shadow_logged and not decay.should_exit:
+                shadow_cache.pop(shadow_key, None)
+                shadow_cache[shadow_key] = True
+                while len(shadow_cache) > 128:
+                    shadow_cache.pop(next(iter(shadow_cache)))
+                d["time_decay_shadow_seen"] = True
+                try:
+                    self.state.update(
+                        sym, "time_decay_shadow_seen", True
+                    )
+                except Exception:  # noqa: BLE001 -- telemetry must not block exits
+                    self._time_decay_shadow_persist_failed = True
             if decay.should_exit:
                 return True, "Time Decay"
 

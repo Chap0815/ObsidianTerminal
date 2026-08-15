@@ -3696,9 +3696,10 @@ class ObsidianApp(ctk.CTk):
             return
         self._sim_sync_ts = now
         try:
-            from bot_utils.sim_flag import read_simulation_flag
+            from bot_utils.sim_flag import read_simulation_flags
         except Exception:
             return
+        disk_bots = []
         for bot in BOT_ORDER:
             runtime_sim = self._runtime_sim_for_running_bot(bot)
             if runtime_sim is not None:
@@ -3715,12 +3716,21 @@ class ObsidianApp(ctk.CTk):
                     self.config.setdefault(bot, {})["SIMULATION"] = external_sim
                     self._apply_sim_badge(bot, external_sim)
                 continue
-            try:
-                # raise_on_corrupt=False: a transiently locked/half-written config
-                # must not crash the UI loop  keep the last known badge instead.
-                disk_sim = bool(read_simulation_flag(bot, raise_on_corrupt=False))
-            except Exception:
-                continue
+            disk_bots.append(bot)
+        if not disk_bots:
+            return
+        try:
+            # A transient lock, low-memory condition or half-written config must
+            # not crash the UI loop or replace LIVE with a default SIM badge.
+            disk_modes = read_simulation_flags(
+                tuple(disk_bots), raise_on_corrupt=False
+            )
+        except Exception:
+            return
+        if disk_modes is None:
+            return
+        for bot in disk_bots:
+            disk_sim = disk_modes[bot]
             if bool(self.config.get(bot, {}).get("SIMULATION", True)) != disk_sim:
                 self.config.setdefault(bot, {})["SIMULATION"] = disk_sim
                 self._apply_sim_badge(bot, disk_sim)

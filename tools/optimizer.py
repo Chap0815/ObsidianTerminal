@@ -42,6 +42,7 @@ import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 _TOOL_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _TOOL_PROJECT_ROOT not in sys.path:
@@ -74,10 +75,12 @@ from tools.backtester import (
 )
 from tools.simulation_workspace import (
     ReproducibleRun,
+    canonical_evidence_sha256,
     freeze_history_dataset,
     load_history_dataset,
     split_boundaries,
 )
+from trading.promotion_assembly import seal_promotion_fragment
 from core.logger import log_separator
 
 #  Deterministic optimizer runs (fixed seed)
@@ -1069,6 +1072,7 @@ def outlier_dependency_test(
 
     r1 = results.get("remove_top_1", {})
     outlier_fragile = r1.get("still_positive") is False if "skipped" not in r1 else None
+    stressed = _stressed_position_outlier_evidence(s_full)
 
     return {
         "full_net": full_net,
@@ -1079,6 +1083,7 @@ def outlier_dependency_test(
         "evidence_valid": True,
         "scenarios": results,
         "outlier_fragile": outlier_fragile,
+        **stressed,
         "symbol_nets": symbol_nets,
         "symbol_count": len(symbol_nets),
         "symbol_net_consistent": True,
@@ -1106,6 +1111,11 @@ def _invalid_outlier_result(
         "evidence_valid": False,
         "scenarios": {},
         "outlier_fragile": None,
+        "stressed_evidence_valid": False,
+        "stressed_position_count": 0,
+        "stressed_scenario": {},
+        "stressed_outlier_fragile": None,
+        "stressed_reason": "normal_outlier_evidence_invalid",
         "symbol_nets": {},
         "symbol_count": 0,
         "symbol_net_consistent": False,
@@ -1874,6 +1884,89 @@ def _holdout_cost_stress_pass(stats: dict) -> bool:
     return math.isfinite(stressed_net) and stressed_net > 0.0
 
 
+def _stressed_position_outlier_evidence(stats: dict) -> dict:
+    """Remove the best stressed outcome from the exact normal position scope."""
+    invalid = {
+        "stressed_evidence_valid": False,
+        "stressed_position_count": 0,
+        "stressed_scenario": {},
+        "stressed_outlier_fragile": None,
+    }
+    aggregate_names = ("gross", "costs", "net", "total_fees", "total_funding")
+    if any(
+        isinstance(stats.get(name), bool)
+        or not isinstance(stats.get(name), (int, float))
+        or not math.isfinite(float(stats[name]))
+        for name in aggregate_names
+    ):
+        return {**invalid, "stressed_reason": "invalid_trade_accounting"}
+    totals = _holdout_trade_totals(stats)
+    if totals is None or not _holdout_aggregates_consistent(stats, totals):
+        return {**invalid, "stressed_reason": "invalid_trade_accounting"}
+    normal_outcomes = _holdout_position_outcomes(stats)
+    if normal_outcomes is None:
+        return {**invalid, "stressed_reason": "invalid_position_accounting"}
+    normal_nets = normal_outcomes[1]
+    trades = stats.get("closed_trades")
+    groups: dict[int, list[dict]] = {}
+    for trade in trades:
+        position_id = trade["position_id"]
+        groups.setdefault(position_id, []).append(trade)
+    stressed_rows = []
+    for position_id, fragments in groups.items():
+        terminal = fragments[-1]
+        if any(
+            isinstance(trade.get(name), bool)
+            or not isinstance(trade.get(name), (int, float))
+            or not math.isfinite(float(trade[name]))
+            for trade in fragments
+            for name in ("gross", "fees", "funding")
+        ):
+            return {**invalid, "stressed_reason": "invalid_stressed_costs"}
+        try:
+            stressed_net = math.fsum(
+                float(trade["gross"])
+                - (2.0 * float(trade["fees"]))
+                - (2.0 * max(float(trade["funding"]), 0.0))
+                for trade in fragments
+            )
+        except (ArithmeticError, TypeError, ValueError):
+            return {**invalid, "stressed_reason": "invalid_stressed_costs"}
+        exit_time = _optimizer_time_number(terminal.get("exit_time"))
+        if exit_time is None or not math.isfinite(stressed_net):
+            return {**invalid, "stressed_reason": "invalid_stressed_costs"}
+        stressed_rows.append((exit_time, position_id, stressed_net))
+    stressed_rows.sort(key=lambda row: (row[0], row[1]))
+    stressed_nets = [row[2] for row in stressed_rows]
+    position_count = len(normal_nets)
+    if position_count < 6 or len(stressed_nets) != position_count:
+        return {**invalid, "stressed_reason": "insufficient_position_scope"}
+    try:
+        stressed_full_net = math.fsum(stressed_nets)
+        removed_net = max(stressed_nets)
+        adjusted_net = stressed_full_net - removed_net
+    except (ArithmeticError, ValueError):
+        return {**invalid, "stressed_reason": "invalid_stressed_summary"}
+    if not all(
+        math.isfinite(value)
+        for value in (stressed_full_net, removed_net, adjusted_net)
+    ):
+        return {**invalid, "stressed_reason": "invalid_stressed_summary"}
+    still_positive = adjusted_net > 0.0
+    return {
+        "stressed_evidence_valid": True,
+        "stressed_position_count": position_count,
+        "stressed_scenario": {
+            "full_net": stressed_full_net,
+            "removed_net": removed_net,
+            "adjusted_net": adjusted_net,
+            "still_positive": still_positive,
+        },
+        "stressed_outlier_fragile": not still_positive,
+        "stressed_reason": None,
+    }
+
+
 def freeze_and_evaluate_final_holdout(
     candidates: list[dict], evaluator, *, min_trades: int = FINAL_HOLDOUT_MIN_TRADES
 ) -> dict:
@@ -2215,6 +2308,248 @@ def sensitivity_check(
         "rating": rating,
         "robust": evidence_complete and avg_change < 15,
     }
+
+
+def _promotion_number(value, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be a finite number")
+    return number
+
+
+def _promotion_count(value, name: str, *, positive: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    if value < (1 if positive else 0):
+        raise ValueError(f"{name} is outside its valid range")
+    return value
+
+
+def build_optimizer_promotion_fragment(
+    *,
+    strategy: str,
+    run_id: str,
+    dataset_fingerprint: str,
+    candidate_fingerprint: str,
+    dsr: dict,
+    pbo: dict,
+    outlier: dict,
+    monte_carlo: dict,
+    sensitivity: dict,
+) -> dict:
+    """Seal structurally complete optimizer evidence without inventing defaults."""
+    sources = {
+        "dsr": dsr,
+        "pbo": pbo,
+        "outlier": outlier,
+        "monte_carlo": monte_carlo,
+        "sensitivity": sensitivity,
+    }
+    if any(not isinstance(value, dict) for value in sources.values()):
+        raise ValueError("optimizer promotion evidence must contain objects")
+    if dsr.get("evidence_valid") is not True or pbo.get("evidence_valid") is not True:
+        raise ValueError("multiple-testing evidence is incomplete")
+    dsr_value = _promotion_number(dsr.get("dsr"), "dsr")
+    pbo_value = _promotion_number(pbo.get("pbo"), "pbo")
+    trials = _promotion_count(dsr.get("n_trials"), "n_trials", positive=True)
+    valid_trials = _promotion_count(dsr.get("valid_trial_count"), "valid_trial_count")
+    invalid_trials = _promotion_count(
+        dsr.get("invalid_trial_count"), "invalid_trial_count"
+    )
+    if valid_trials != trials or invalid_trials != 0:
+        raise ValueError("DSR trial scope is incomplete")
+    observations = _promotion_count(dsr.get("n_obs"), "DSR observations", positive=True)
+    if dsr.get("best_consistent") is not True or observations < 2:
+        raise ValueError("DSR observation evidence is incomplete")
+    partitions = _promotion_count(
+        pbo.get("n_partitions"), "PBO partitions", positive=True
+    )
+    expected_partitions = _promotion_count(
+        pbo.get("expected_partitions"), "expected PBO partitions", positive=True
+    )
+    config_count = _promotion_count(
+        pbo.get("config_count"), "PBO config count", positive=True
+    )
+    fold_count = _promotion_count(
+        pbo.get("fold_count"), "PBO fold count", positive=True
+    )
+    if (
+        config_count < 2
+        or fold_count < 2
+        or fold_count % 2
+        or fold_count > MAX_PBO_CSCV_FOLDS
+        or expected_partitions != math.comb(fold_count, fold_count // 2)
+        or partitions != expected_partitions
+    ):
+        raise ValueError("PBO partition evidence is incomplete")
+
+    if monte_carlo.get("evidence_valid") is not True:
+        raise ValueError("Monte Carlo evidence is incomplete")
+    runs = _promotion_count(monte_carlo.get("runs"), "monte_carlo runs", positive=True)
+    requested_runs = _promotion_count(
+        monte_carlo.get("requested_runs"), "requested Monte Carlo runs", positive=True
+    )
+    positive_runs = _promotion_count(
+        monte_carlo.get("positive_run_count"), "positive Monte Carlo runs"
+    )
+    positive_share = _promotion_number(
+        monte_carlo.get("positive_share"), "Monte Carlo positive share"
+    )
+    if (
+        requested_runs != runs
+        or positive_runs > runs
+        or not math.isclose(positive_share, positive_runs / runs, abs_tol=1e-12)
+        or not isinstance(monte_carlo.get("robust"), bool)
+        or monte_carlo["robust"] != (positive_share >= 0.90)
+    ):
+        raise ValueError("Monte Carlo summary is inconsistent")
+    mc_trade_count = _promotion_count(
+        monte_carlo.get("trade_count"), "Monte Carlo trade count", positive=True
+    )
+    mc_valid_trades = _promotion_count(
+        monte_carlo.get("valid_trade_count"), "valid Monte Carlo trade count"
+    )
+    mc_invalid_trades = _promotion_count(
+        monte_carlo.get("invalid_trade_count"), "invalid Monte Carlo trade count"
+    )
+    if mc_valid_trades != mc_trade_count or mc_invalid_trades != 0:
+        raise ValueError("Monte Carlo trade scope is incomplete")
+
+    perturbations = sensitivity.get("perturbations")
+    perturbation_count = _promotion_count(
+        sensitivity.get("valid_perturbation_count"), "valid perturbation count",
+        positive=True,
+    )
+    invalid_perturbations = _promotion_count(
+        sensitivity.get("invalid_perturbation_count"), "invalid perturbation count"
+    )
+    avg_change = _promotion_number(sensitivity.get("avg_change"), "average sensitivity")
+    max_change = _promotion_number(sensitivity.get("max_change"), "maximum sensitivity")
+    perturbation_changes = (
+        [
+            abs(_promotion_number(row.get("change_pct"), "perturbation change"))
+            for row in perturbations
+        ]
+        if isinstance(perturbations, list)
+        and all(isinstance(row, dict) for row in perturbations)
+        else []
+    )
+    if (
+        sensitivity.get("base_net_valid") is not True
+        or not isinstance(perturbations, list)
+        or len(perturbations) != perturbation_count
+        or invalid_perturbations != 0
+        or any(
+            not isinstance(row, dict) or row.get("evidence_valid") is not True
+            for row in perturbations
+        )
+        or not perturbation_changes
+        or not math.isclose(
+            avg_change, statistics.mean(perturbation_changes), abs_tol=1e-12
+        )
+        or not math.isclose(max_change, max(perturbation_changes), abs_tol=1e-12)
+        or avg_change < 0.0
+        or max_change < avg_change
+        or not isinstance(sensitivity.get("robust"), bool)
+        or sensitivity["robust"] != (avg_change < 15.0)
+    ):
+        raise ValueError("parameter sensitivity evidence is incomplete")
+
+    normal = outlier.get("scenarios", {}).get("remove_top_1")
+    stressed = outlier.get("stressed_scenario")
+    position_count = _promotion_count(
+        outlier.get("trade_count"), "outlier position count", positive=True
+    )
+    stressed_count = _promotion_count(
+        outlier.get("stressed_position_count"),
+        "stressed outlier position count",
+        positive=True,
+    )
+    if (
+        outlier.get("evidence_valid") is not True
+        or outlier.get("stressed_evidence_valid") is not True
+        or position_count != stressed_count
+        or not isinstance(normal, dict)
+        or not isinstance(stressed, dict)
+        or not isinstance(normal.get("still_positive"), bool)
+        or not isinstance(stressed.get("still_positive"), bool)
+        or not isinstance(outlier.get("outlier_fragile"), bool)
+        or outlier["outlier_fragile"] != (not normal["still_positive"])
+        or not isinstance(outlier.get("stressed_outlier_fragile"), bool)
+        or outlier["stressed_outlier_fragile"] != (
+            not stressed["still_positive"]
+        )
+    ):
+        raise ValueError("outlier evidence is incomplete or scope-mismatched")
+    normal_adjusted = _promotion_number(
+        normal.get("adjusted_net"), "normal outlier-adjusted net"
+    )
+    stressed_adjusted = _promotion_number(
+        stressed.get("adjusted_net"), "stressed outlier-adjusted net"
+    )
+    valid_outlier_count = _promotion_count(
+        outlier.get("valid_trade_count"), "valid outlier position count"
+    )
+    invalid_outlier_count = _promotion_count(
+        outlier.get("invalid_trade_count"), "invalid outlier position count"
+    )
+    if (
+        valid_outlier_count != position_count
+        or invalid_outlier_count != 0
+        or normal["still_positive"] != (normal_adjusted > 0.0)
+        or stressed["still_positive"] != (stressed_adjusted > 0.0)
+    ):
+        raise ValueError("outlier summary is inconsistent")
+
+    fields = {
+        "dsr": dsr_value,
+        "pbo": pbo_value,
+        "tail_risk_passed": bool(
+            normal["still_positive"] and stressed["still_positive"]
+        ),
+        "parameter_stability_passed": sensitivity["robust"],
+        "multiple_testing_adjusted": True,
+        "experiment_trials": trials,
+        "monte_carlo_passed": monte_carlo["robust"],
+        "monte_carlo_runs": runs,
+        "monte_carlo_positive_share": positive_share,
+        "parameter_perturbation_count": perturbation_count,
+        "parameter_sensitivity_avg_change_pct": avg_change,
+        "parameter_sensitivity_max_change_pct": max_change,
+        "oos_outlier_position_count": position_count,
+        "oos_net_after_best_position_removed": normal_adjusted,
+        "stressed_oos_net_after_best_position_removed": stressed_adjusted,
+    }
+    return seal_promotion_fragment(
+        source_type="optimizer",
+        strategy=strategy,
+        candidate_fingerprint=candidate_fingerprint,
+        source_run_id=run_id,
+        dataset_fingerprint=dataset_fingerprint,
+        fields=fields,
+    )
+
+
+def persist_optimizer_promotion_artifact(
+    payload: dict, run_root: str | os.PathLike | None
+) -> tuple[str | None, str | None]:
+    """Persist a complete optimizer source only inside its reproducible run."""
+    if run_root is None:
+        return None, "reproducible_run_required"
+    if not isinstance(payload, dict) or payload.get(
+        "optimizer_promotion_fragment"
+    ) is None:
+        return None, "optimizer_promotion_fragment_unavailable"
+    destination = Path(run_root) / "optimizer_promotion_artifact.json"
+    try:
+        from tools.promotion_bundle import write_optimizer_promotion_artifact
+
+        write_optimizer_promotion_artifact(payload, destination)
+    except (OSError, TypeError, ValueError, OverflowError) as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:160]}"
+    return str(destination), None
 
 
 #  Robustness Score
@@ -2791,24 +3126,72 @@ def _cmd(p, strategy, days, use_maker):
 #  CSV-Export
 
 
-@contextmanager
-def _atomic_csv_writer(filename: str):
-    temp_filename = f"{filename}.{uuid.uuid4().hex}.tmp"
-    temp_created = False
+def _is_linklike(path: Path) -> bool:
+    return path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    )
+
+
+def _absolute_without_links(path: str | os.PathLike, *, label: str) -> Path:
+    requested = Path(path).expanduser().absolute()
+    if any(_is_linklike(component) for component in (requested, *requested.parents)):
+        raise ValueError(f"{label} must be a real path without links")
+    return requested
+
+
+def _sync_directory(path: Path) -> None:
     try:
-        with open(temp_filename, "x", newline="", encoding="utf-8") as handle:
+        directory_fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(directory_fd)
+        except OSError:
+            pass
+
+
+@contextmanager
+def _atomic_csv_writer(filename: str | os.PathLike):
+    target = _absolute_without_links(filename, label="optimizer report path")
+    if target.exists() or _is_linklike(target):
+        raise FileExistsError("immutable optimizer report conflict")
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    temp_created = False
+    published = False
+    try:
+        _absolute_without_links(temporary, label="optimizer report path")
+        with temporary.open("x", newline="", encoding="utf-8") as handle:
             temp_created = True
             yield handle
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_filename, filename)
-        temp_created = False
+        target = _absolute_without_links(target, label="optimizer report path")
+        try:
+            os.link(temporary, target)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                "immutable optimizer report conflict"
+            ) from exc
+        published = True
+        try:
+            temporary.unlink()
+            temp_created = False
+        except OSError:
+            pass
     finally:
         if temp_created:
             try:
-                os.remove(temp_filename)
+                temporary.unlink()
+                temp_created = False
             except OSError:
                 pass
+        if published:
+            _sync_directory(target.parent)
 
 
 def export_csv(results, strategy, days, k_folds):
@@ -2818,18 +3201,25 @@ def export_csv(results, strategy, days, k_folds):
     try:
         from core.paths import OPT_RESULTS
 
-        results_dir = str(OPT_RESULTS)
+        results_dir = Path(OPT_RESULTS)
     except Exception:
-        results_dir = os.path.join(
+        results_dir = Path(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "optimizer_results",
         )
+    results_dir = _absolute_without_links(
+        results_dir, label="optimizer results directory"
+    )
     os.makedirs(results_dir, exist_ok=True)
+    results_dir = _absolute_without_links(
+        results_dir, label="optimizer results directory"
+    )
+    if not results_dir.is_dir():
+        raise ValueError("optimizer results directory must be a real directory")
 
-    filename = os.path.join(
-        results_dir,
+    filename = results_dir / (
         f"optimizer_{strategy.lower()}_{days}d_{ts}_p{os.getpid()}_"
-        f"{uuid.uuid4().hex[:12]}.csv",
+        f"{uuid.uuid4().hex[:12]}.csv"
     )
     fields = [
         "rank",
@@ -2963,28 +3353,41 @@ def export_csv(results, strategy, days, k_folds):
             )
 
     # Only prune old results after the new CSV is durably published.
+    results_dir = _absolute_without_links(
+        results_dir, label="optimizer results directory"
+    )
     try:
         prefix = f"optimizer_{strategy.lower()}_"
-        current_name = os.path.basename(filename)
+        current_name = filename.name
         previous = sorted(
             [
-                name
-                for name in os.listdir(results_dir)
-                if name.startswith(prefix) and name.endswith(".csv")
-                and name != current_name
+                path
+                for path in results_dir.iterdir()
+                if path.name.startswith(prefix)
+                and path.name.endswith(".csv")
+                and path.name != current_name
+                and not _is_linklike(path)
+                and path.is_file()
             ],
+            key=lambda path: path.name,
             reverse=True,
         )
         for old in previous[19:]:
+            results_dir = _absolute_without_links(
+                results_dir, label="optimizer results directory"
+            )
+            old = _absolute_without_links(old, label="optimizer retention path")
+            if old.parent != results_dir or not old.is_file():
+                continue
             try:
-                os.remove(os.path.join(results_dir, old))
+                os.remove(old)
             except OSError:
                 pass
     except OSError:
         pass
     rel_filename = os.path.relpath(filename)
     print(f"  Ergebnisse gespeichert: {rel_filename}")
-    return filename
+    return str(filename)
 
 
 #  Fortschrittsbalken
@@ -3360,12 +3763,19 @@ def _reproducible_code_files() -> list[str]:
     return [
         os.path.join(root, "tools", "optimizer.py"),
         os.path.join(root, "tools", "backtester.py"),
+        os.path.join(root, "tools", "promotion_bundle.py"),
         os.path.join(root, "tools", "simulation_workspace.py"),
         os.path.join(root, "bot_utils", "indicators.py"),
         os.path.join(root, "bot_utils", "futures_funding.py"),
         os.path.join(root, "core", "constants.py"),
+        os.path.join(root, "trading", "promotion_assembly.py"),
         os.path.join(root, "trading", "simulation.py"),
     ]
+
+
+def _reproducible_dependency_lock_file() -> str:
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "requirements.lock.txt")
 
 
 _GRID_WORKER_CONTEXT = None
@@ -3768,6 +4178,7 @@ def run_optimizer(
             seed=run_seed,
             workers=workers,
             code_files=_reproducible_code_files(),
+            dependency_lock_file=_reproducible_dependency_lock_file(),
             resume=resume,
         )
         print(f"  Reproduzierbarer Run: {reproducible_run.run_id}")
@@ -4241,8 +4652,61 @@ def run_optimizer(
     if not (-100.0 < _stop_out < 0.0):
         _grid = sorted(g for g in space.get("stop_loss", []) if g < 0)
         _stop_out = _grid[len(_grid) // 2] if _grid else -2.0
+    optimizer_candidate_params = dict(best.get("params") or {})
+    optimizer_candidate_fingerprint = canonical_evidence_sha256(
+        optimizer_candidate_params
+    )
+    best_sensitivity = (
+        sensitivity_check(
+            indexed, tune_times, optimizer_candidate_params, strategy, use_maker, space
+        )
+        if do_sensitivity
+        else None
+    )
+    optimizer_promotion_fragment = None
+    optimizer_promotion_fragment_error = None
+    optimizer_promotion_inputs = {
+        "dsr": dsr,
+        "pbo": pbo,
+        "outlier": ot,
+        "monte_carlo": mc,
+        "sensitivity": best_sensitivity,
+    }
+    try:
+        optimizer_promotion_fragment = build_optimizer_promotion_fragment(
+            strategy=strategy,
+            run_id=(
+                reproducible_run.run_id if reproducible_run is not None else None
+            ),
+            dataset_fingerprint=(
+                dataset_manifest.get("dataset_fingerprint")
+                if isinstance(dataset_manifest, dict)
+                else None
+            ),
+            candidate_fingerprint=optimizer_candidate_fingerprint,
+            **optimizer_promotion_inputs,
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        optimizer_promotion_fragment_error = f"{type(exc).__name__}: {str(exc)[:160]}"
     best_payload = {
+        "optimizer_artifact_schema": 1,
         "strategy": strategy,
+        "research_only": True,
+        "promotion_eligible": False,
+        "changes_runtime": False,
+        "reproducible_run_id": (
+            reproducible_run.run_id if reproducible_run is not None else None
+        ),
+        "dataset_fingerprint": (
+            dataset_manifest.get("dataset_fingerprint")
+            if isinstance(dataset_manifest, dict)
+            else None
+        ),
+        "optimizer_candidate_params": optimizer_candidate_params,
+        "optimizer_candidate_fingerprint": optimizer_candidate_fingerprint,
+        "optimizer_promotion_inputs": optimizer_promotion_inputs,
+        "optimizer_promotion_fragment": optimizer_promotion_fragment,
+        "optimizer_promotion_fragment_error": optimizer_promotion_fragment_error,
         "min_pump": float(bp.get("min_pump", 0)),
         "activation_profit": float(bp.get("activation_profit", 0)),
         "trailing_distance": float(bp.get("trailing_distance", 0)),
@@ -4299,6 +4763,14 @@ def run_optimizer(
         "pbo": (float(pbo_val) if pbo_val is not None else None),
         "deployment_trustworthy": bool(deployment_trustworthy),
     }
+    optimizer_artifact_path, optimizer_artifact_error = (
+        persist_optimizer_promotion_artifact(
+            best_payload,
+            reproducible_run.root if reproducible_run is not None else None,
+        )
+    )
+    best_payload["optimizer_promotion_artifact_path"] = optimizer_artifact_path
+    best_payload["optimizer_promotion_artifact_error"] = optimizer_artifact_error
     print(f"\n<<<BEST_CONFIG>>>{_json.dumps(best_payload)}<<<END_BEST_CONFIG>>>\n")
 
     # Sensitivitts-Analyse fr Top 3
@@ -4306,8 +4778,12 @@ def run_optimizer(
         print("\n  SENSITIVITTS-ANALYSE (Top 3 Configs):\n")
         for rank in range(min(3, len(sorted_results))):
             cfg = sorted_results[rank]
-            sens = sensitivity_check(
-                indexed, tune_times, cfg["params"], strategy, use_maker, space
+            sens = (
+                best_sensitivity
+                if rank == 0
+                else sensitivity_check(
+                    indexed, tune_times, cfg["params"], strategy, use_maker, space
+                )
             )
             print(f"  Rang {rank + 1}: {_label(cfg['params'], strategy)}")
             print(f"    Bewertung:        {sens['rating']}")

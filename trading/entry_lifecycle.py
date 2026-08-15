@@ -180,8 +180,30 @@ def emit_entry_lifecycle(
     **fields: Any,
 ) -> None:
     """Write lifecycle telemetry without affecting the trading path."""
+    normalized_entry_id = str(entry_id or "")[:64]
+    normalized_bot = str(bot or "")[:32]
+    normalized_symbol = str(symbol or "")[:64]
+    normalized_stage = str(stage or "")[:48]
+    normalized_mode = str(mode or "")[:8]
+    normalized_reason = str(reason or "")[:256]
+    durable = False
     try:
-        _record_stage(str(entry_id or "")[:64], str(stage or "")[:48], {
+        from core.clock import utc_now_str
+        from core.database import save_entry_lifecycle_stage
+
+        durable = save_entry_lifecycle_stage(
+            entry_id=normalized_entry_id,
+            bot_name=normalized_bot,
+            symbol=normalized_symbol,
+            stage=normalized_stage,
+            mode=normalized_mode,
+            reason=normalized_reason,
+            observed_at=utc_now_str(),
+        )
+    except Exception:
+        durable = False
+    try:
+        _record_stage(normalized_entry_id, normalized_stage, {
             "bot": bot, "symbol": symbol, **fields,
         })
     except Exception:
@@ -191,12 +213,13 @@ def emit_entry_lifecycle(
 
         log_struct(
             "entry_lifecycle",
-            entry_id=str(entry_id or "")[:64],
-            bot=str(bot or "")[:32],
-            symbol=str(symbol or "")[:64],
-            stage=str(stage or "")[:48],
-            mode=str(mode or "")[:8],
-            reason=str(reason or "")[:256],
+            entry_id=normalized_entry_id,
+            bot=normalized_bot,
+            symbol=normalized_symbol,
+            stage=normalized_stage,
+            mode=normalized_mode,
+            reason=normalized_reason,
+            durable=durable,
             **fields,
         )
     except Exception:

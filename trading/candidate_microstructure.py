@@ -10,6 +10,8 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 
+from core.constants import SIM_CAPTURE_CONTRACT_SCHEMA
+
 
 _SUPPORTED_SIM_TCA_BOTS = frozenset({"CROSS", "FUTREND", "SPOT", "TREND"})
 
@@ -108,9 +110,9 @@ def capture_simulated_entry_tca(
         if levels < 5 or levels > 100:
             raise ValueError("depth levels must be between 5 and 100")
         if filled_at is None:
-            measured_at = datetime.now(timezone.utc).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+            from core.clock import utc_now_str
+
+            measured_at = utc_now_str()
         else:
             measured_at = str(filled_at).strip()
             parsed_time = datetime.strptime(
@@ -131,16 +133,6 @@ def capture_simulated_entry_tca(
                 normalized_entry_id, normalized_bot
             ):
                 return False
-            failure_reason = "markout_schedule_failed"
-            from core.database import schedule_simulated_execution_markouts
-
-            schedule_simulated_execution_markouts(
-                normalized_entry_id,
-                symbol=normalized_symbol,
-                side=normalized_side,
-                reference_price=reference,
-                measured_at=measured_at,
-            )
         failure_reason = "api_budget_check_failed"
         if consume_api is None:
             from bot_utils.api_budget import try_consume_api_call as consume
@@ -177,6 +169,8 @@ def capture_simulated_entry_tca(
         )
         arrival_payload = {
             **asdict(arrival),
+            "capture_anchor_utc": measured_at,
+            "capture_contract_schema": SIM_CAPTURE_CONTRACT_SCHEMA,
             "bot_name": normalized_bot,
             "mode": normalized_mode,
             "research_simulated": True,
@@ -187,6 +181,8 @@ def capture_simulated_entry_tca(
         }
         fill_payload = {
             **asdict(fill),
+            "capture_anchor_utc": measured_at,
+            "capture_contract_schema": SIM_CAPTURE_CONTRACT_SCHEMA,
             "bot_name": normalized_bot,
             "mode": normalized_mode,
             "research_simulated": True,

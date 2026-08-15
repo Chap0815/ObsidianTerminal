@@ -5,7 +5,6 @@ import math
 import os
 import threading
 import time
-from datetime import datetime, timezone
 
 
 EXPECTANCY_FEATURES: dict[str, tuple[str, ...]] = {
@@ -151,21 +150,68 @@ def _finite(value) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _quality_decision(value: dict | None) -> dict | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return None
+    score = _finite(value.get("score"))
+    minimum_score = _finite(value.get("minimum_score"))
+    label = str(value.get("label") or "").strip().upper()
+    reasons = value.get("reasons")
+    would_block = value.get("would_block")
+    if (
+        score is None
+        or minimum_score is None
+        or not 0.0 <= minimum_score <= 100.0
+        or not label
+        or len(label) > 32
+        or not isinstance(reasons, (list, tuple))
+        or len(reasons) > 32
+        or not isinstance(would_block, bool)
+    ):
+        return None
+    normalized_reasons = []
+    for reason in reasons:
+        if not isinstance(reason, str):
+            return None
+        normalized_reason = reason.strip()
+        if not normalized_reason or len(normalized_reason) > 64:
+            return None
+        if normalized_reason not in normalized_reasons:
+            normalized_reasons.append(normalized_reason)
+    return {
+        "score": score,
+        "minimum_score": minimum_score,
+        "label": label,
+        "reasons": normalized_reasons,
+        "would_block": would_block,
+    }
+
+
 def emit_expectancy_candidate(
     *,
     bot: str,
     entry_id: str,
     symbol: str,
     mode: str,
+    direction: str,
     features: dict,
+    quality_decision: dict | None = None,
     log_struct=None,
     persist_candidate=None,
     venue_symbol: str | None = None,
 ) -> bool:
     """Persist the exact causal feature vector later joined to a closed trade."""
     normalized_bot = str(bot).strip().upper()
+    normalized_direction = str(direction).strip().upper()
     schemas = EXPECTANCY_FEATURE_SCHEMAS.get(normalized_bot)
-    if not schemas or not str(entry_id).strip() or not str(symbol).strip():
+    if (
+        not schemas
+        or not str(entry_id).strip()
+        or not str(symbol).strip()
+        or normalized_direction not in {"LONG", "SHORT"}
+    ):
         return False
     schema_version = None
     normalized_features = None
@@ -182,9 +228,25 @@ def emit_expectancy_candidate(
             break
     if schema_version is None or normalized_features is None:
         return False
-    candidate_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    normalized_decision = _quality_decision(quality_decision)
+    if quality_decision is not None and normalized_decision is None:
+        return False
+    if (
+        normalized_decision is not None
+        and normalized_decision["score"] != normalized_features.get("score")
+    ):
+        return False
+    if normalized_bot == "CROSS":
+        side_sign = normalized_features.get("side_sign")
+        expected_sign = 1.0 if normalized_direction == "LONG" else -1.0
+        if side_sign is None or side_sign == 0.0 or side_sign * expected_sign <= 0.0:
+            return False
+    from core.clock import utc_now_str
+
+    candidate_time = utc_now_str()
     snapshot_payload = {
         **normalized_features,
+        "direction": normalized_direction,
         "sequence_valid": False,
         "sequence_status": "not_applicable_strategy_features",
         "queue_position_claimed": False,
@@ -205,9 +267,12 @@ def emit_expectancy_candidate(
             candidate_time=candidate_time,
             schema_version=schema_version,
             features=normalized_features,
+            direction=normalized_direction,
         )
         if default_persistence:
             persistence_fields["feature_snapshot"] = snapshot_payload
+        if normalized_decision is not None:
+            persistence_fields["quality_decision"] = normalized_decision
         persisted = bool(persister(**persistence_fields))
     except Exception as exc:
         persistence_error = exc
@@ -222,7 +287,13 @@ def emit_expectancy_candidate(
         try:
             from core.database import request_venue_capture_priority
 
-            if normalized_bot in {"FUTURES", "CROSS", "FUTREND"}:
+            if (
+                normalized_bot in {"FUTURES", "CROSS", "FUTREND"}
+                and not (
+                    normalized_decision is not None
+                    and normalized_decision["would_block"]
+                )
+            ):
                 priority_persisted = request_venue_capture_priority(
                     symbol=str(venue_symbol or symbol),
                     bot_name=normalized_bot,
@@ -244,17 +315,20 @@ def emit_expectancy_candidate(
             from core.logger import log_struct as writer
         else:
             writer = log_struct
-        writer(
-            "expectancy_candidate",
+        log_fields = dict(
             schema_version=schema_version,
             bot=normalized_bot,
             entry_id=str(entry_id),
             symbol=str(symbol),
             mode=str(mode).strip().upper(),
+            direction=normalized_direction,
             candidate_time=candidate_time,
             durable=persisted,
             features=normalized_features,
         )
+        if normalized_decision is not None:
+            log_fields["quality_decision"] = normalized_decision
+        writer("expectancy_candidate", **log_fields)
     except Exception:
         pass
     return persisted

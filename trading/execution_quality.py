@@ -16,6 +16,11 @@ from bot_utils.silent_log import silent_log
 
 
 _MARKOUT_LOCK_TTL_SECONDS = 120
+_MARKOUT_IDLE_POLL_MAX_SECONDS = 5.0
+_MARKOUT_WORKER_FAMILIES = {
+    "futures": ("CROSS", "FUTREND", "FUTURES"),
+    "spot": ("SPOT", "TREND"),
+}
 _BOOK_CLOCK_FUTURE_TOLERANCE_MS = 30_000
 _MEXC_FEE_TRUTH_LOCK = threading.Lock()
 _MEXC_FEE_TRUTHS: weakref.WeakKeyDictionary[
@@ -29,7 +34,12 @@ _MEXC_FEE_TRUTH_PER_EXCHANGE_MAX = 512
 
 
 def _markout_now_utc() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
+    try:
+        from core.clock import now_utc
+
+        return now_utc().astimezone(timezone.utc).replace(microsecond=0)
+    except Exception:
+        return datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def _finite_or_none(value) -> float | None:
@@ -45,6 +55,59 @@ def _finite_or_none(value) -> float | None:
 def _positive_finite_or_none(value) -> float | None:
     parsed = _finite_or_none(value)
     return parsed if parsed is not None and parsed > 0.0 else None
+
+
+def _markout_worker_scope(
+    worker_family,
+) -> tuple[str | None, tuple[str, ...] | None]:
+    if worker_family is None:
+        return None, None
+    if not isinstance(worker_family, str) or not worker_family.strip():
+        raise ValueError("markout worker family is invalid")
+    family = worker_family.strip().lower()
+    producer_bots = _MARKOUT_WORKER_FAMILIES.get(family)
+    if producer_bots is None:
+        raise ValueError("markout worker family is unsupported")
+    return family, producer_bots
+
+
+def _wait_for_markout_wakeup(
+    shutdown_event,
+    queue_wakeup_event,
+    *,
+    timeout_seconds: float,
+    check_interval_seconds: float,
+) -> str:
+    """Wait for shutdown, local committed work, or the fallback deadline.
+
+    ``shutdown_event`` remains the blocking primitive so shutdown stays prompt.
+    The process-local queue edge is inspected at most one configured poll
+    interval later, matching the previous new-work latency without another DB
+    read on every check.
+    """
+    timeout = max(0.0, float(timeout_seconds))
+    check_interval = max(0.001, float(check_interval_seconds))
+    last_now = time.monotonic()
+    deadline = last_now + timeout
+    while True:
+        if shutdown_event.is_set():
+            return "shutdown"
+        if queue_wakeup_event.is_set():
+            return "notified"
+        observed_now = time.monotonic()
+        # A monotonic source should never roll back, but clamping keeps the
+        # deadline bounded under faulty clocks and deterministic test doubles.
+        last_now = max(last_now, observed_now)
+        remaining = deadline - last_now
+        if remaining <= 0.0:
+            return "timeout"
+        wait_slice = min(check_interval, remaining)
+        if shutdown_event.wait(wait_slice):
+            return "shutdown"
+        # Event.wait(False) means the full slice elapsed.  Advance by that
+        # proven duration as a fallback even if a faulty monotonic source
+        # reports a rollback or stalls.
+        last_now += wait_slice
 
 
 def _first_positive_finite(*values) -> float | None:
@@ -464,6 +527,7 @@ def process_due_tca_markouts(
     *,
     limit: int = 25,
     lock_state_callback: Callable[[str], None] | None = None,
+    worker_family: str | None = None,
 ) -> int:
     """Measure persisted post-fill markouts; failed reads remain retryable."""
     from core.database import (
@@ -480,9 +544,14 @@ def process_due_tca_markouts(
 
     completed = 0
     row_limit = max(1, min(250, int(limit)))
+    family, producer_bots = _markout_worker_scope(worker_family)
     holder_id = (
         f"markout:{threading.get_native_id()}:{time.monotonic_ns()}"
     )
+    # Keep the legacy global lease during rolling upgrades: an older process
+    # knows only this lock name.  Family-scoped selection prevents the wrong
+    # exchange client from touching a row without opening a mixed-version
+    # double-processing window.
     lock_name = "execution_markout_worker"
     # Trading REST calls are bounded at 10s and SQLite waits at 20s. Renewals
     # bracket every row/persistence step; 120s keeps ample contention headroom
@@ -533,7 +602,10 @@ def process_due_tca_markouts(
 
     try:
         try:
-            due_rows = list(list_due_execution_markouts(limit=row_limit))
+            list_kwargs = {"limit": row_limit}
+            if producer_bots is not None:
+                list_kwargs["producer_bots"] = producer_bots
+            due_rows = list(list_due_execution_markouts(**list_kwargs))
         except Exception as exc:
             silent_log("read due TCA markouts", exc)
             return 0
@@ -691,6 +763,15 @@ def process_due_tca_markouts(
                     ticker_marks[symbol_key] = ticker_observation
                 else:
                     mark, observed_at_utc = ticker_observation
+                # Queue due-times use the exchange-anchored project clock.
+                # A clock-offset rollback between selection and observation
+                # must leave the row pending, not turn valid evidence into a
+                # permanent persistence failure.
+                if (
+                    due_at_utc is not None
+                    and observed_at_utc < due_at_utc
+                ):
+                    continue
                 observed_at = observed_at_utc.strftime("%Y-%m-%d %H:%M:%S")
                 sign = 1.0 if normalized_side == "buy" else -1.0
                 markout_bps = (
@@ -710,10 +791,9 @@ def process_due_tca_markouts(
                     payload.update({
                         "due_at": due_at_text,
                         "observed_at": observed_at,
-                        "measurement_lag_seconds": max(
-                            0.0,
-                            (observed_at_utc - due_at_utc).total_seconds(),
-                        ),
+                        "measurement_lag_seconds": (
+                            observed_at_utc - due_at_utc
+                        ).total_seconds(),
                     })
                 if previous_error_type:
                     payload["previous_error_type"] = previous_error_type
@@ -796,6 +876,7 @@ def run_tca_markout_worker(
     limit: int = 25,
     max_overdue_seconds: float = 30.0,
     health_callback: Callable[[dict], None] | None = None,
+    worker_family: str | None = None,
 ) -> None:
     """Poll restart-safe LIVE/SIM markouts near their due timestamps.
 
@@ -814,6 +895,7 @@ def run_tca_markout_worker(
             "markout overdue limit must be between 5 and 3600 seconds"
         )
     row_limit = max(1, min(250, int(limit)))
+    family, producer_bots = _markout_worker_scope(worker_family)
     if not callable(getattr(shutdown_event, "is_set", None)) or not callable(
         getattr(shutdown_event, "wait", None)
     ):
@@ -822,7 +904,10 @@ def run_tca_markout_worker(
     from core.database import (
         close_thread_local_conn,
         execution_markout_due_summary,
+        get_markout_queue_wakeup_event,
     )
+
+    queue_wakeup_event = get_markout_queue_wakeup_event()
 
     def _report_health(payload: dict) -> None:
         if health_callback is None:
@@ -849,6 +934,13 @@ def run_tca_markout_worker(
                 "due_count": due,
                 "oldest_due_at": str(oldest)[:32] if oldest else None,
                 "oldest_overdue_seconds": max(0.0, overdue or 0.0),
+                "next_runnable_at": (
+                    str(raw.get("next_runnable_at"))[:32]
+                    if raw.get("next_runnable_at") else None
+                ),
+                "next_runnable_seconds": _finite_or_none(
+                    raw.get("next_runnable_seconds")
+                ),
                 "timestamps_valid": raw.get("timestamps_valid", True) is True,
             }
         return result
@@ -858,12 +950,22 @@ def run_tca_markout_worker(
     errors_total = 0
     last_completed_wall_ts = None
 
+    def _due_summary() -> dict:
+        if producer_bots is None:
+            return execution_markout_due_summary()
+        return execution_markout_due_summary(producer_bots=producer_bots)
+
     try:
         while not shutdown_event.is_set():
+            # Clear-before-read is lost-wake safe: an earlier edge is already
+            # represented in SQLite, while a commit racing after this clear
+            # leaves the edge set for the wait below.
+            queue_wakeup_event.clear()
             wait_interval = interval
+            adaptive_wait = False
             polls_total += 1
             try:
-                summary = execution_markout_due_summary()
+                summary = _due_summary()
                 due_count = max(0, int(summary.get("due_count") or 0))
                 oldest_overdue = _finite_or_none(
                     summary.get("oldest_overdue_seconds")
@@ -880,10 +982,14 @@ def run_tca_markout_worker(
                         nonlocal batch_lock_state
                         batch_lock_state = state
 
+                    process_kwargs = {
+                        "limit": row_limit,
+                        "lock_state_callback": _receive_lock_state,
+                    }
+                    if family is not None:
+                        process_kwargs["worker_family"] = family
                     completed_batch = process_due_tca_markouts(
-                        exchange,
-                        limit=row_limit,
-                        lock_state_callback=_receive_lock_state,
+                        exchange, **process_kwargs
                     )
                     if completed_batch > 0:
                         completed_total += completed_batch
@@ -892,7 +998,7 @@ def run_tca_markout_worker(
                     # Processing may complete rows or schedule retries without
                     # increasing the completion count. Re-read the runnable
                     # queue so health/backoff describe the post-attempt state.
-                    summary = execution_markout_due_summary()
+                    summary = _due_summary()
                     due_count = max(0, int(summary.get("due_count") or 0))
                     oldest_overdue = _finite_or_none(
                         summary.get("oldest_overdue_seconds")
@@ -907,6 +1013,16 @@ def run_tca_markout_worker(
                         # failures all leave runnable rows behind. Avoid a
                         # cross-process write/budget hot loop in those cases.
                         wait_interval = max(interval, 5.0)
+                adaptive_wait = "next_runnable_seconds" in summary
+                next_runnable_seconds = _finite_or_none(
+                    summary.get("next_runnable_seconds")
+                )
+                if due_count == 0 and adaptive_wait:
+                    wait_interval = _MARKOUT_IDLE_POLL_MAX_SECONDS
+                    if next_runnable_seconds is not None:
+                        wait_interval = min(
+                            wait_interval, max(0.0, next_runnable_seconds)
+                        )
                 overdue_queue = (
                     due_count > 0
                     and batch_lock_state != "contended"
@@ -937,6 +1053,8 @@ def run_tca_markout_worker(
                     "due_count": due_count,
                     "oldest_due_at": summary.get("oldest_due_at"),
                     "oldest_overdue_seconds": oldest_overdue,
+                    "next_runnable_at": summary.get("next_runnable_at"),
+                    "next_runnable_seconds": next_runnable_seconds,
                     "timestamps_valid": timestamps_valid,
                     "scopes": scopes,
                     "completed": completed_batch,
@@ -948,6 +1066,13 @@ def run_tca_markout_worker(
                     "last_poll_monotonic": time.monotonic(),
                     "last_poll_wall_ts": time.time(),
                     "lock_state": batch_lock_state,
+                    "worker_family": family or "global",
+                    "producer_bots": list(producer_bots or ()),
+                    "poll_wait_seconds": wait_interval,
+                    "wake_strategy": (
+                        "deadline_or_local_commit" if adaptive_wait
+                        else "fixed_interval"
+                    ),
                 })
             except Exception as exc:
                 errors_total += 1
@@ -960,6 +1085,8 @@ def run_tca_markout_worker(
                     "due_count": 0,
                     "oldest_due_at": None,
                     "oldest_overdue_seconds": 0.0,
+                    "next_runnable_at": None,
+                    "next_runnable_seconds": None,
                     "timestamps_valid": False,
                     "scopes": _scope_health({}),
                     "completed": 0,
@@ -971,8 +1098,21 @@ def run_tca_markout_worker(
                     "last_poll_monotonic": time.monotonic(),
                     "last_poll_wall_ts": time.time(),
                     "lock_state": "error",
+                    "worker_family": family or "global",
+                    "producer_bots": list(producer_bots or ()),
+                    "poll_wait_seconds": wait_interval,
+                    "wake_strategy": "fixed_error_backoff",
                 })
-            if shutdown_event.wait(wait_interval):
+            if adaptive_wait:
+                wake_reason = _wait_for_markout_wakeup(
+                    shutdown_event,
+                    queue_wakeup_event,
+                    timeout_seconds=wait_interval,
+                    check_interval_seconds=interval,
+                )
+                if wake_reason == "shutdown":
+                    break
+            elif shutdown_event.wait(wait_interval):
                 break
     finally:
         try:

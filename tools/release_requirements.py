@@ -120,6 +120,7 @@ RELEASE_TOOL_FILES = {
     "tools/futures_capture_phase2.py",
     "tools/ohlcv_cache.py",
     "tools/optimizer.py",
+    "tools/promotion_bundle.py",
     "tools/profit_research.py",
     "tools/release_check.py",
     "tools/release_requirements.py",

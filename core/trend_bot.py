@@ -263,6 +263,7 @@ class TrendBot(SpotBot):
 
         opened = 0
         parts = []                                        # per-coin vote summary
+        regime_refresh_attempted = False
         for sym in self._trend_universe():
             if self._shutdown_event.is_set():
                 return
@@ -341,6 +342,19 @@ class TrendBot(SpotBot):
                     else 1.0
                 ),
             }
+            if not regime_refresh_attempted:
+                regime_refresh_attempted = True
+                try:
+                    # TREND scans only about twice per day and otherwise never
+                    # calls the shared regime reader.  Refresh once immediately
+                    # before the first Candidate so the atomic Candidate bundle
+                    # can bind fresh evidence.  The result is telemetry only:
+                    # it must not alter this strategy's signal or entry outcome.
+                    from trading.market_filters import get_market_regime
+
+                    get_market_regime(self.ex)
+                except Exception as exc:
+                    self._log_error("trend candidate regime refresh", exc)
             from trading.expectancy_telemetry import emit_expectancy_candidate
 
             emit_expectancy_candidate(
@@ -348,6 +362,7 @@ class TrendBot(SpotBot):
                 entry_id=entry_id,
                 symbol=sym,
                 mode=entry_mode,
+                direction="LONG",
                 features=expectancy_features,
             )
             if not self.simulation:

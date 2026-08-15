@@ -17,7 +17,9 @@ import sqlite3
 import math
 import html
 import sys as _sys
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 _DASHBOARD_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_DASHBOARD_DIR)  # tools/  project root
@@ -728,42 +730,69 @@ def _ticker_price_or_none(ticker: dict | None) -> float | None:
 
 
 def _ro_connect():
-    """Read-only-ish SQLite connection with a busy_timeout.
+    """Open the authoritative dashboard database strictly read-only.
 
     With multiple bots writing to the WAL DB, a heavy write burst can raise
-    ``database is locked``, which the loaders' ``except`` would swallow by
-    returning an EMPTY DataFrame (the dashboard then flashes to "no trades yet"
-    / zeros for a cache cycle). A 20s busy_timeout (matching metrics_service and
-    core.database) makes the read wait out the write instead of failing.
+    ``database is locked``. A 20s busy_timeout (matching metrics_service and
+    core.database) makes the read wait out the write. URI ``mode=ro`` prevents
+    this observer from creating or mutating the database; ``query_only`` is a
+    second connection-local guard against accidental future write statements.
     """
-    conn = sqlite3.connect(DB_PATH, timeout=20.0)
+    uri = Path(DB_PATH).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=20.0)
     try:
         conn.execute("PRAGMA busy_timeout=20000")
+        conn.execute("PRAGMA query_only=ON")
     except Exception:
-        pass
+        conn.close()
+        raise
     return conn
+
+
+def _trade_snapshot_frame(
+    status: str,
+    *,
+    frame: pd.DataFrame | None = None,
+    error: Exception | None = None,
+) -> pd.DataFrame:
+    """Attach bounded provenance so load failures cannot resemble zero trades."""
+    result = frame if frame is not None else pd.DataFrame()
+    result.attrs.update({
+        "snapshot_status": status,
+        "snapshot_rows": int(len(result)),
+        "snapshot_loaded_at": datetime.now(timezone.utc).isoformat(),
+        "snapshot_error_type": type(error).__name__ if error is not None else "",
+    })
+    return result
 
 
 @st.cache_data(ttl=5, show_spinner=False)
 def load_all_trades() -> pd.DataFrame:
     if not os.path.exists(DB_PATH):
-        return pd.DataFrame()
+        return _trade_snapshot_frame("missing")
     try:
-        conn = _ro_connect()
-        df = pd.read_sql_query(
-            # is_partial=1 trades are partial-close events (Futures TP at 50%).
-            # They represent REAL realized P&L and are included in the total.
-            # Win-rate uses is_partial=0 separately (see _compute_stats) to
-            # avoid double-counting wins on the same position.
-            "SELECT * FROM trades ORDER BY sell_time DESC",
-            conn,
-        )
-        conn.close()
+        with closing(_ro_connect()) as conn:
+            df = pd.read_sql_query(
+                # is_partial=1 trades are partial-close events (Futures TP at 50%).
+                # They represent REAL realized P&L and are included in the total.
+                # Win-rate uses is_partial=0 separately (see _compute_stats) to
+                # avoid double-counting wins on the same position.
+                "SELECT * FROM trades ORDER BY sell_time DESC",
+                conn,
+            )
+        required = {
+            "bot_name", "buy_time", "sell_time", "profit_usdt", "is_partial",
+        }
+        missing = sorted(required - set(df.columns))
+        if missing:
+            raise ValueError("trades schema is missing required columns")
         if df.empty:
-            return df
+            return _trade_snapshot_frame("ok", frame=df)
         df["buy_time"] = pd.to_datetime(df["buy_time"], errors="coerce", utc=True)
         df["sell_time"] = pd.to_datetime(df["sell_time"], errors="coerce", utc=True)
-        df["is_futures"] = df.get("is_futures", 0).fillna(0).astype(int)
+        if "is_futures" not in df.columns:
+            df["is_futures"] = 0
+        df["is_futures"] = df["is_futures"].fillna(0).astype(int)
         df["base_bot"] = df["bot_name"].map(_base_bot_name)
         # Tag closed trades by row evidence, not current bot_config. Historical
         # raw bot names cannot be safely relabelled after SIM/LIVE mode changes.
@@ -775,10 +804,9 @@ def load_all_trades() -> pd.DataFrame:
             df["mode"] = row_modes.where(row_modes.notna(), fallback_modes)
         else:
             df["mode"] = df.apply(_mode_for_historical_row, axis=1)
-        return df
+        return _trade_snapshot_frame("ok", frame=df)
     except Exception as exc:
-        st.warning(f"Trades konnten nicht geladen werden: {type(exc).__name__}: {exc}")
-        return pd.DataFrame()
+        return _trade_snapshot_frame("error", error=exc)
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -861,9 +889,8 @@ def load_futures_live() -> pd.DataFrame:
         db_error = None
     else:
         try:
-            conn = _ro_connect()
-            df = pd.read_sql_query("SELECT * FROM futures_state", conn)
-            conn.close()
+            with closing(_ro_connect()) as conn:
+                df = pd.read_sql_query("SELECT * FROM futures_state", conn)
             if not df.empty and "bot_name" in df.columns:
                 df["base_bot"] = df["bot_name"].map(_base_bot_name)
                 df["mode"] = df["bot_name"].map(_mode_for_current_row)
@@ -1043,13 +1070,12 @@ def load_bot_params() -> pd.DataFrame:
     if not os.path.exists(DB_PATH):
         return pd.DataFrame()
     try:
-        conn = _ro_connect()
-        df = pd.read_sql_query(
-            "SELECT bot_name, param_name, param_value, updated_at, reason "
-            "FROM bot_params ORDER BY updated_at DESC",
-            conn,
-        )
-        conn.close()
+        with closing(_ro_connect()) as conn:
+            df = pd.read_sql_query(
+                "SELECT bot_name, param_name, param_value, updated_at, reason "
+                "FROM bot_params ORDER BY updated_at DESC",
+                conn,
+            )
         return df
     except Exception:
         return pd.DataFrame()
@@ -1060,11 +1086,10 @@ def load_learning_log() -> pd.DataFrame:
     if not os.path.exists(DB_PATH):
         return pd.DataFrame()
     try:
-        conn = _ro_connect()
-        df = pd.read_sql_query(
-            "SELECT * FROM learning_log ORDER BY timestamp DESC LIMIT 200", conn
-        )
-        conn.close()
+        with closing(_ro_connect()) as conn:
+            df = pd.read_sql_query(
+                "SELECT * FROM learning_log ORDER BY timestamp DESC LIMIT 200", conn
+            )
         return df
     except Exception:
         return pd.DataFrame()
@@ -1075,11 +1100,10 @@ def load_market_regime() -> pd.DataFrame:
     if not os.path.exists(DB_PATH):
         return pd.DataFrame()
     try:
-        conn = _ro_connect()
-        df = pd.read_sql_query(
-            "SELECT * FROM market_regime ORDER BY timestamp DESC LIMIT 500", conn
-        )
-        conn.close()
+        with closing(_ro_connect()) as conn:
+            df = pd.read_sql_query(
+                "SELECT * FROM market_regime ORDER BY timestamp DESC LIMIT 500", conn
+            )
         if not df.empty:
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
         return df
@@ -1097,7 +1121,9 @@ def aggregate_positions(trades_df: pd.DataFrame) -> pd.DataFrame:
     a partial TP as an additional independent winning trade.
     """
     if trades_df is None or trades_df.empty:
-        return pd.DataFrame(columns=["profit_usdt", "sell_time"])
+        return pd.DataFrame(columns=[
+            "entry_id", "profit_usdt", "sell_time", "terminal_events"
+        ])
     df = trades_df.copy()
     defaults = {
         "bot_name": "",
@@ -1106,34 +1132,68 @@ def aggregate_positions(trades_df: pd.DataFrame) -> pd.DataFrame:
         "sell_time": "",
         "profit_usdt": 0.0,
         "is_partial": 0,
+        "entry_id": "",
+        "mode": "",
+        "is_futures": 0,
+        "position_type": "",
     }
     for col, default in defaults.items():
         if col not in df.columns:
             df[col] = default
-    df["_position_key"] = (
-        df["bot_name"].astype(str)
-        + "|"
-        + df["symbol"].astype(str)
-        + "|"
-        + df["buy_time"].astype(str)
+    entry_ids = df["entry_id"].fillna("").astype(str).str.strip()
+    legacy_keys = (
+        "legacy|" + df["bot_name"].astype(str) + "|"
+        + df["symbol"].astype(str) + "|" + df["buy_time"].astype(str)
     )
+    df["_position_key"] = np.where(
+        entry_ids != "",
+        "entry_id|" + df["bot_name"].astype(str) + "|"
+        + df["mode"].astype(str) + "|" + entry_ids,
+        legacy_keys,
+    )
+    scope_columns = (
+        "bot_name", "mode", "symbol", "buy_time", "is_futures", "position_type"
+    )
+    df["_scope_token"] = df[list(scope_columns)].fillna("").astype(str).agg(
+        "|".join, axis=1
+    )
+    partial_values = pd.to_numeric(df["is_partial"], errors="coerce")
+    df["_partial_valid"] = partial_values.isin([0, 1])
+    df["_is_terminal"] = partial_values == 0
+    df["_sell_sort"] = pd.to_datetime(df["sell_time"], errors="coerce", utc=True)
+    df["_terminal_sell_sort"] = df["_sell_sort"].where(df["_is_terminal"])
+    df["_terminal_sell_text"] = df["sell_time"].where(df["_is_terminal"])
     grouped = (
-        df.groupby("_position_key", dropna=False)
+        df.groupby("_position_key", dropna=False, sort=False)
         .agg(
+            entry_id=("entry_id", "first"),
             bot_name=("bot_name", "first"),
             symbol=("symbol", "first"),
             buy_time=("buy_time", "first"),
-            sell_time=("sell_time", "max"),
+            sell_time=("_terminal_sell_text", "first"),
             profit_usdt=("profit_usdt", "sum"),
             fills=("profit_usdt", "size"),
             partial_events=(
                 "is_partial",
                 lambda s: int(pd.to_numeric(s, errors="coerce").fillna(0).sum()),
             ),
+            terminal_events=("_is_terminal", "sum"),
+            invalid_partial_flags=("_partial_valid", lambda s: int((~s).sum())),
+            invalid_sell_times=("_sell_sort", lambda s: int(s.isna().sum())),
+            scope_variants=("_scope_token", "nunique"),
+            latest_sell=("_sell_sort", "max"),
+            terminal_sell=("_terminal_sell_sort", "max"),
         )
         .reset_index(drop=True)
     )
-    return grouped
+    return grouped[
+        (grouped["terminal_events"] == 1)
+        & (grouped["invalid_partial_flags"] == 0)
+        & (grouped["invalid_sell_times"] == 0)
+        & (grouped["scope_variants"] == 1)
+        & grouped["latest_sell"].notna()
+        & (grouped["latest_sell"] == grouped["terminal_sell"])
+    ].reset_index(drop=True)
 
 
 def build_pnl_snapshot(
@@ -1315,7 +1375,10 @@ def compute_metrics(trades_df: pd.DataFrame) -> dict:
 
     pnl = trades_df["profit_usdt"].astype(float)
     pos_df = aggregate_positions(trades_df)
-    pos_pnl = pos_df["profit_usdt"].astype(float) if not pos_df.empty else pnl
+    pos_pnl = (
+        pos_df["profit_usdt"].astype(float)
+        if not pos_df.empty else pd.Series(dtype=float)
+    )
 
     wins = pos_pnl[pos_pnl > 0]
     losses = pos_pnl[pos_pnl < 0]
@@ -1364,8 +1427,8 @@ def compute_metrics(trades_df: pd.DataFrame) -> dict:
         sharpe = sortino = 0.0
 
     # Max Drawdown  auf der kumulativen Equity-Curve
-    sorted_df = trades_df.sort_values("sell_time")
-    equity = sorted_df["profit_usdt"].cumsum().values
+    sorted_positions = pos_df.sort_values("sell_time")
+    equity = sorted_positions["profit_usdt"].cumsum().values
     if len(equity) > 0:
         peak = np.maximum.accumulate(equity)
         drawdown = peak - equity  # in USDT
@@ -1374,8 +1437,8 @@ def compute_metrics(trades_df: pd.DataFrame) -> dict:
         max_dd = 0.0
 
     # Best & Worst
-    best = pos_pnl.max()
-    worst = pos_pnl.min()
+    best = pos_pnl.max() if n_positions else 0.0
+    worst = pos_pnl.min() if n_positions else 0.0
 
     # Streaks
     is_win_arr = (pos_pnl > 0).astype(int).values
@@ -1450,7 +1513,7 @@ with st.sidebar:
     st.markdown(
         '<div style="margin-top:24px; padding:14px; background:rgba(15,20,29,0.6); '
         'border-radius:10px; border:1px solid rgba(255,255,255,0.05); font-size:0.75rem;">'
-        f'<div style="color:#64748b;">Last update</div>'
+        f'<div style="color:#64748b;">UI refresh</div>'
         f'<div style="color:#cbd5e1; font-family:JetBrains Mono; font-weight:600; margin-top:4px;">'
         f"{datetime.now().strftime('%H:%M:%S')}</div></div>",
         unsafe_allow_html=True,
@@ -1460,6 +1523,18 @@ with st.sidebar:
 #  Filter anwenden
 
 trades_raw = load_all_trades()
+trade_snapshot_status = str(trades_raw.attrs.get("snapshot_status") or "error")
+trade_snapshot_loaded_at = str(trades_raw.attrs.get("snapshot_loaded_at") or "")
+if trade_snapshot_status != "ok":
+    error_type = str(trades_raw.attrs.get("snapshot_error_type") or "unavailable")
+    st.error(
+        "Trade database snapshot unavailable "
+        f"({trade_snapshot_status}: {error_type}). "
+        "Realized PnL and performance KPIs are withheld until a valid read succeeds."
+    )
+    st.stop()
+with st.sidebar:
+    st.caption(f"DB snapshot: {trade_snapshot_loaded_at}")
 trades = trades_raw.copy()
 
 if not trades.empty:

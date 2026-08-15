@@ -16,7 +16,12 @@ import requests
 from collections import OrderedDict
 from typing import Optional
 from dotenv import load_dotenv
-from core.constants import NONCRYPTO_BASES, STOCK_TOKEN_BASES
+from core.constants import (
+    MARKET_FILTER_CACHE_TTL_SECONDS,
+    MARKET_FILTER_STALE_GRACE_MAX_SECONDS,
+    NONCRYPTO_BASES,
+    STOCK_TOKEN_BASES,
+)
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.circuit_breaker import extract_valid_top_of_book
 from bot_utils.safe_numeric import safe_positive_float
@@ -92,7 +97,7 @@ def _filter_log(msg: str, level: str = "INFO") -> None:
 
 #  Bounded LRU Cache
 _CACHE_MAXSIZE = 32
-CACHE_TTL = 300
+CACHE_TTL = MARKET_FILTER_CACHE_TTL_SECONDS
 
 
 class _LRUCache:
@@ -162,7 +167,7 @@ def check_tradability(exchange, symbol_full: str) -> tuple[bool, str]:
 _STALE_BACKOFF: dict = {}
 _STALE_BACKOFF_LOCK = threading.Lock()
 _STALE_GRACE_BASE = 60  # initial grace seconds
-_STALE_GRACE_MAX = 300  # cap
+_STALE_GRACE_MAX = MARKET_FILTER_STALE_GRACE_MAX_SECONDS
 _CACHE_KEY_LOCKS: dict[str, threading.RLock] = {}
 _CACHE_KEY_LOCKS_GUARD = threading.Lock()
 

@@ -23,6 +23,7 @@ import math
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import requests as _req
 
@@ -75,16 +76,6 @@ def _finite_float_or_none(value) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return parsed if math.isfinite(parsed) else None
-
-
-def _nonnegative_int(value, default: int = 0) -> int:
-    if isinstance(value, bool):
-        return default
-    try:
-        parsed = int(float(value))
-    except (TypeError, ValueError, OverflowError):
-        return default
-    return parsed if parsed >= 0 else default
 
 
 def query_db(sql: str, params: tuple = ()) -> list:
@@ -151,98 +142,79 @@ def _metrics_bot_keys(bot: str, mode_is_sim: bool | None = None) -> tuple[str, .
     )
 
 
-def _get_today_pnl_for_metrics_key(bot_key: str) -> dict:
-    """Read today's PnL for an already SIM/LIVE-namespaced bot key.
+def _empty_bot_stats() -> dict:
+    return {
+        "pnl": 0.0,
+        "total": 0,
+        "wr": 0.0,
+        "today_pnl": 0.0,
+        "today_cnt": 0,
+        "avg_win": 0.0,
+        "avg_loss": 0.0,
+        "payoff": 0.0,
+    }
 
-    ``core.database.get_today_pnl()`` intentionally resolves a raw bot name
-    through the current config. The launcher can know a bot's effective runtime
-    mode from ``runtime_status.json``; remapping that key again would mix LIVE
-    and SIM daily rows when config and runtime briefly disagree.
-    """
+
+def _open_metrics_snapshot() -> sqlite3.Connection | None:
+    """Open one explicit, read-only SQLite snapshot for launcher metrics."""
+    if not os.path.exists(DB_PATH):
+        return None
+    conn = None
     try:
-        from core.database import get_local_today_str
+        uri_path = Path(DB_PATH).resolve().as_posix()
+        conn = sqlite3.connect(
+            f"file:{uri_path}?mode=ro",
+            uri=True,
+            timeout=20.0,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=20000")
+        conn.execute("BEGIN")
+        return conn
+    except Exception as exc:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+        raise MetricsDbReadError(str(exc)) from exc
+
+
+def _metrics_day_bounds() -> tuple[str, str, str]:
+    try:
+        from core.database import get_local_today_str, local_day_utc_bounds
+
         today = get_local_today_str()
-    except Exception:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    rows = query_db(
-        "SELECT total_profit, trade_count, is_paused "
-        "FROM daily_pnl WHERE bot_name=? AND trade_date=?",
-        (bot_key, today),
-    )
-    if rows:
-        total_profit, trade_count, is_paused = rows[0]
-        return {
-            "total_profit": _finite_float(total_profit),
-            "trade_count": _nonnegative_int(trade_count),
-            "is_paused": _nonnegative_int(is_paused),
-        }
-    return {"total_profit": 0.0, "trade_count": 0, "is_paused": 0}
-
-
-def get_bot_stats(bot: str, mode_is_sim: bool | None = None) -> dict:
-    """PnL, total trade count, win rate, and today's slice for one bot.
-
-    Realized PnL **must** include partial-TP rows  otherwise the top
-    counter never moves when partials fire, even though those profits are
-    actually realized (capital booked, no longer at risk).
-
-    The query is split: ``pnl`` aggregates all trades incl. partials;
-    ``total`` / ``wins`` aggregate only fully-closed trades (a partial isn't
-    a "completed trade" for win-rate purposes  the remainder is still
-    open).
-    """
-    bot = _metrics_bot_key(bot, mode_is_sim)
-    rows_pnl = query_db(
-        "SELECT COALESCE(SUM(profit_usdt),0) FROM trades WHERE bot_name=?",
-        (bot,)
-    )
-    rows = query_db(
-        "SELECT COUNT(*), "
-        "       COALESCE(SUM(CASE WHEN is_win=1 THEN 1 ELSE 0 END),0) "
-        "FROM trades WHERE bot_name=? AND is_partial=0",
-        (bot,)
-    )
-    try:
-        from core.database import local_day_utc_bounds
-        today_info = _get_today_pnl_for_metrics_key(bot)
         start_utc, end_utc = local_day_utc_bounds()
-    except MetricsDbReadError:
-        raise
+        return today, start_utc, end_utc
     except Exception:
-        today_info = {"total_profit": 0.0, "trade_count": 0}
         today_dt = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0)
-        start_utc = today_dt.strftime("%Y-%m-%d %H:%M:%S")
-        end_utc = (today_dt + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
-    rows_today_cnt = query_db(
-        "SELECT COALESCE(SUM(CASE WHEN is_partial=0 THEN 1 ELSE 0 END),0) "
-        "FROM trades WHERE bot_name=? AND sell_time>=? AND sell_time<?",
-        (bot, start_utc, end_utc)
-    )
-    # Payoff over final closed trades: avg_win / abs(avg_loss).
-    rows_payoff = query_db(
-        "SELECT "
-        "  COALESCE(AVG(CASE WHEN profit_usdt > 0 THEN profit_usdt END), 0), "
-        "  COALESCE(AVG(CASE WHEN profit_usdt < 0 THEN profit_usdt END), 0) "
-        "FROM trades WHERE bot_name=? AND is_partial=0",
-        (bot,)
-    )
-    pnl = _finite_float(rows_pnl[0][0]) if rows_pnl else 0.0
-    if rows:
-        total = _nonnegative_int(rows[0][0])
-        wins = min(_nonnegative_int(rows[0][1]), total)
-        wr = (wins / total * 100) if total > 0 else 0.0
-    else:
-        total, wr = 0, 0.0
-    today_pnl = _finite_float(today_info.get("total_profit", 0.0))
-    today_cnt = (
-        _nonnegative_int(rows_today_cnt[0][0])
-        if rows_today_cnt
-        else _nonnegative_int(today_info.get("trade_count", 0))
-    )
-    # Payoff metrics
-    avg_win  = _finite_float(rows_payoff[0][0]) if rows_payoff else 0.0
-    avg_loss = _finite_float(rows_payoff[0][1]) if rows_payoff else 0.0
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return (
+            today_dt.strftime("%Y-%m-%d"),
+            today_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            (today_dt + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+
+def _stats_from_positions(
+    *,
+    pnl: float,
+    positions: list[dict],
+    daily_row,
+    start_utc: str,
+    end_utc: str,
+) -> dict:
+    total = len(positions)
+    wins = sum(int(row["is_win"]) for row in positions)
+    wins = min(max(0, wins), total)
+    wr = wins / total * 100.0 if total else 0.0
+    profits = [float(row["profit_usdt"]) for row in positions]
+    positive = [value for value in profits if value > 0.0]
+    negative = [value for value in profits if value < 0.0]
+    avg_win = math.fsum(positive) / len(positive) if positive else 0.0
+    avg_loss = math.fsum(negative) / len(negative) if negative else 0.0
     payoff = 0.0
     if avg_loss:
         try:
@@ -251,43 +223,191 @@ def get_bot_stats(bot: str, mode_is_sim: bool | None = None) -> dict:
             payoff = 0.0
         if not math.isfinite(payoff):
             payoff = 0.0
-    return {"pnl": pnl, "total": total, "wr": wr,
-            "today_pnl": today_pnl, "today_cnt": today_cnt,
-            "avg_win": avg_win, "avg_loss": avg_loss, "payoff": payoff}
+    today_cnt = sum(
+        start_utc <= str(row["sell_time"]) < end_utc for row in positions
+    )
+    today_pnl = 0.0
+    if daily_row:
+        parsed_today_pnl = _finite_float_or_none(daily_row[0])
+        if parsed_today_pnl is None:
+            raise ValueError("daily total_profit must be finite")
+        today_pnl = parsed_today_pnl
+    return {
+        "pnl": pnl,
+        "total": total,
+        "wr": wr,
+        "today_pnl": today_pnl,
+        "today_cnt": today_cnt,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "payoff": payoff,
+    }
+
+
+def _read_trade_metrics(
+    bot_modes: dict[str, bool | None],
+    *,
+    include_global_total: bool,
+) -> tuple[dict[str, dict], int]:
+    """Read position-correct launcher trade metrics from one snapshot.
+
+    Realized PnL includes every booked partial cashflow.  Count, win rate and
+    payoff use complete independent positions, including all partials plus
+    exactly one terminal fragment.  Corrupt or ambiguous position evidence
+    fails closed.  When requested, the global count validates every historical
+    bot namespace in the same transaction as the cards.
+    """
+    if not bot_modes:
+        return {}, 0
+    resolved = {
+        bot: _metrics_bot_key(bot, mode_is_sim)
+        for bot, mode_is_sim in bot_modes.items()
+    }
+    conn = _open_metrics_snapshot()
+    if conn is None:
+        return {bot: _empty_bot_stats() for bot in resolved}, 0
+    try:
+        from core.database import _complete_trade_positions_from_snapshot
+
+        today, start_utc, end_utc = _metrics_day_bounds()
+        result = {}
+        positions_by_bot_key: dict[str, list[dict]] = {}
+
+        def positions_for(bot_key: str) -> list[dict]:
+            positions = positions_by_bot_key.get(bot_key)
+            if positions is None:
+                positions = _complete_trade_positions_from_snapshot(
+                    conn, bot_key, strict=True
+                )
+                positions_by_bot_key[bot_key] = positions
+            return positions
+
+        for bot, bot_key in resolved.items():
+            cashflow_rows = conn.execute(
+                "SELECT profit_usdt FROM trades WHERE bot_name=? ORDER BY id",
+                (bot_key,),
+            ).fetchall()
+            cashflows = []
+            for row in cashflow_rows:
+                value = _finite_float_or_none(row[0])
+                if value is None:
+                    raise ValueError("trade profit_usdt must be finite")
+                cashflows.append(value)
+            pnl = math.fsum(cashflows)
+            positions = positions_for(bot_key)
+            daily_row = conn.execute(
+                "SELECT total_profit, trade_count, is_paused "
+                "FROM daily_pnl WHERE bot_name=? AND trade_date=?",
+                (bot_key, today),
+            ).fetchone()
+            result[bot] = _stats_from_positions(
+                pnl=pnl,
+                positions=positions,
+                daily_row=daily_row,
+                start_utc=start_utc,
+                end_utc=end_utc,
+            )
+        trades_total = 0
+        if include_global_total:
+            bot_name_rows = conn.execute(
+                "SELECT DISTINCT bot_name FROM trades ORDER BY bot_name"
+            ).fetchall()
+            bot_keys = []
+            for row in bot_name_rows:
+                raw_bot_key = row[0]
+                if not isinstance(raw_bot_key, str) or not raw_bot_key.strip():
+                    raise ValueError("trade bot_name must be non-empty text")
+                if raw_bot_key != raw_bot_key.strip():
+                    raise ValueError("trade bot_name must be canonical text")
+                bot_keys.append(raw_bot_key)
+            trades_total = sum(len(positions_for(key)) for key in bot_keys)
+        return result, trades_total
+    except Exception as exc:
+        if isinstance(exc, MetricsDbReadError):
+            raise
+        raise MetricsDbReadError(str(exc)) from exc
+    finally:
+        conn.close()
+
+
+def get_trade_metrics_snapshot(
+    bot_modes: dict[str, bool | None],
+) -> tuple[dict[str, dict], int]:
+    """Return launcher cards and the strict global position count atomically."""
+    return _read_trade_metrics(bot_modes, include_global_total=True)
+
+
+def get_bot_stats_batch(
+    bot_modes: dict[str, bool | None],
+) -> dict[str, dict]:
+    """Compatibility reader for position-correct per-bot cards."""
+    stats, _ = _read_trade_metrics(bot_modes, include_global_total=False)
+    return stats
+
+
+def get_bot_stats(bot: str, mode_is_sim: bool | None = None) -> dict:
+    """Compatibility wrapper for one position-correct launcher card."""
+    return get_bot_stats_batch({bot: mode_is_sim})[bot]
+
+
+def get_pnl_sparklines(
+    bot_modes: dict[str, bool | None], limit: int = 30
+) -> dict[str, list]:
+    """Read position-correct cumulative PnL lines in one DB snapshot.
+
+    Each point is one complete independent position.  The terminal limit is
+    applied before fragment expansion, so partial exits cannot create extra
+    points or disappear from a selected position.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError("limit must be a nonnegative integer")
+    if not bot_modes:
+        return {}
+    if limit == 0:
+        return {bot: [] for bot in bot_modes}
+    resolved = {
+        bot: _metrics_bot_key(bot, mode_is_sim)
+        for bot, mode_is_sim in bot_modes.items()
+    }
+    conn = _open_metrics_snapshot()
+    if conn is None:
+        return {bot: [] for bot in resolved}
+    try:
+        from core.database import _complete_trade_positions_from_snapshot
+
+        result = {}
+        for bot, bot_key in resolved.items():
+            positions = _complete_trade_positions_from_snapshot(
+                conn,
+                bot_key,
+                strict=True,
+                terminal_limit=limit,
+            )
+            profits = [
+                float(row["profit_usdt"]) for row in reversed(positions)
+            ]
+            cumulative = []
+            running = 0.0
+            for profit in profits:
+                running_next = running + profit
+                if not math.isfinite(running_next):
+                    raise ValueError("sparkline cumulative PnL is not finite")
+                running = running_next
+                cumulative.append(running)
+            result[bot] = cumulative
+        return result
+    except Exception as exc:
+        if isinstance(exc, MetricsDbReadError):
+            raise
+        raise MetricsDbReadError(str(exc)) from exc
+    finally:
+        conn.close()
 
 
 def get_pnl_sparkline(bot: str, limit: int = 30,
                       mode_is_sim: bool | None = None) -> list:
-    """Cumulative realized PnL over the last ``limit`` closed bot trades.
-
-    Returns floats in chronological order. Uses final closes only
-    (``is_partial=0``), so the card sparkline shows realized performance
-    without partial-TP noise. Read-only and throttled by the poller.
-    """
-    bot = _metrics_bot_key(bot, mode_is_sim)
-    rows = query_db(
-        "SELECT profit_usdt FROM trades "
-        "WHERE bot_name=? AND is_partial=0 AND sell_time IS NOT NULL "
-        "ORDER BY sell_time DESC LIMIT ?",
-        (bot, limit)
-    )
-    if not rows:
-        return []
-    # Rows are DESC; reverse for chronological sparkline.
-    profits = []
-    for r in reversed(rows):
-        value = _finite_float_or_none(r[0])
-        if value is not None:
-            profits.append(value)
-    cumulative = []
-    running = 0.0
-    for p in profits:
-        running_next = running + p
-        if not math.isfinite(running_next):
-            break
-        running = running_next
-        cumulative.append(running)
-    return cumulative
+    """Compatibility wrapper for one position-correct card sparkline."""
+    return get_pnl_sparklines({bot: mode_is_sim}, limit=limit)[bot]
 
 
 def _spot_state_file(log_dir: str, bot_name: str = None,

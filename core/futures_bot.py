@@ -40,6 +40,7 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from functools import cached_property, partial
 from typing import Optional, Dict, Any
 
@@ -56,6 +57,7 @@ from bot_utils.runtime_threads import (finalize_runtime_shutdown,
                                        start_threads_or_shutdown)
 from bot_utils.silent_log import silent_log
 from bot_utils.trade_state import state_exposure_count
+from core.clock import now_utc
 
 from core.futures_bot_exits import FuturesExitsMixin
 from core.futures_bot_scan import FuturesScanMixin
@@ -64,6 +66,7 @@ from core.futures_bot_reconcile import FuturesReconcileMixin
 
 class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                   FuturesReconcileMixin, ABC):
+    _SIM_TCA_PENDING_FIELD = "sim_tca_pending_v1"
     #  Subclass-overridable class attributes 
     BOT_NAME: str = "FUTURES"
     BOT_COLOR: str = "\033[95m"
@@ -129,6 +132,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         self._cooldown_lock = threading.Lock()
         self._markout_health_lock = threading.Lock()
         self._venue_health_lock = threading.Lock()
+        self._position_integrity_health_lock = threading.Lock()
         # populated in run()
         self.ex = None
         self.state: Optional[TradeState] = None
@@ -146,7 +150,11 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         self._markout_thread: Optional[threading.Thread] = None
         self._venue_recorder_thread: Optional[threading.Thread] = None
         self._markout_started_monotonic: float | None = None
+        self._sim_evidence_health_cache: dict[str, Any] | None = None
+        self._sim_evidence_health_last_monotonic: float | None = None
         self._venue_started_monotonic: float | None = None
+        self._position_integrity_started_monotonic = time.monotonic()
+        self._position_integrity_health: dict[str, Any] = {}
         self._venue_health_stale_sec = self.VENUE_HEALTH_MIN_STALE_SEC
         self._markout_health = {
             "ok": True,
@@ -157,6 +165,8 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "due_count": 0,
             "oldest_due_at": None,
             "oldest_overdue_seconds": 0.0,
+            "next_runnable_at": None,
+            "next_runnable_seconds": None,
             "timestamps_valid": True,
             "reason": "",
             "scopes": {
@@ -164,6 +174,8 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     "due_count": 0,
                     "oldest_due_at": None,
                     "oldest_overdue_seconds": 0.0,
+                    "next_runnable_at": None,
+                    "next_runnable_seconds": None,
                     "timestamps_valid": True,
                 }
                 for scope in ("LIVE", "SIM")
@@ -173,8 +185,14 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "completed_total": 0,
             "polls_total": 0,
             "errors_total": 0,
+            "poll_wait_seconds": self.MARKOUT_POLL_INTERVAL_SEC,
+            "wake_strategy": "starting",
             "last_completed_wall_ts": None,
             "lock_state": "starting",
+            "worker_family": "futures",
+            "producer_bots": ["CROSS", "FUTREND", "FUTURES"],
+            "progress_scope": "worker_market_family",
+            "progress_is_bot_scoped": False,
         }
         self._venue_health: dict[str, Any] = {}
         self._entry_recovery_blocked = False
@@ -187,6 +205,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         }
         self._entry_recovery_last_log_key = None
         self._entry_recovery_last_log_monotonic = 0.0
+        self._entry_recovery_position_snapshot = None
 
     # Route through bot_utils.config.get_live_value so that user-edited values
     # in the launcher's settings UI take effect within ~5 s without a bot
@@ -199,6 +218,142 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                                    fallback_cfg=self.cfg)
         except Exception:
             return self.cfg.get(key, default)
+
+    def _new_simulated_entry_tca_pending(
+        self,
+        *,
+        entry_id: str,
+        symbol: str,
+        side: str,
+        amount: float,
+        fill_price: float,
+        fee_rate: float,
+        notional_usdt: float,
+    ) -> dict[str, Any]:
+        """Build the bounded SIM-evidence WAL committed with position state."""
+        from core.logger import _date as _utc_now_str
+
+        return {
+            "version": 1,
+            "entry_id": str(entry_id),
+            "bot_name": str(self.BOT_NAME).upper(),
+            "symbol": str(symbol),
+            "side": str(side).lower(),
+            "amount": float(amount),
+            "fill_price": float(fill_price),
+            "fee_rate": float(fee_rate),
+            "notional_usdt": float(notional_usdt),
+            "filled_at": _utc_now_str(),
+        }
+
+    def _finalize_simulated_entry_tca(
+        self,
+        base: str,
+        pending: dict,
+        *,
+        restart_recovery: bool = False,
+    ) -> bool:
+        """Persist post-state SIM evidence; retain WAL until it is durable."""
+        context = f"{self.BOT_NAME} {base} SIM TCA durable finalize"
+        try:
+            if not isinstance(pending, dict) or pending.get("version") != 1:
+                raise ValueError("invalid SIM TCA pending schema")
+            row = self.state.get(base)
+            if (
+                not isinstance(row, dict)
+                or row.get("entry_id") != pending.get("entry_id")
+                or row.get(self._SIM_TCA_PENDING_FIELD) != pending
+                or pending.get("bot_name") != str(self.BOT_NAME).upper()
+                or pending.get("side") not in {"buy", "sell"}
+            ):
+                raise ValueError("SIM TCA pending evidence conflicts with state")
+
+            from core.database import has_durable_simulated_entry_tca
+
+            evidence_durable = has_durable_simulated_entry_tca(
+                pending["entry_id"], pending["bot_name"]
+            )
+            unavailable_reason = str(
+                pending.get("arrival_unavailable_reason") or ""
+            )[:64]
+            if not evidence_durable and (restart_recovery or unavailable_reason):
+                from core.database import (
+                    persist_simulated_entry_tca_unavailable_bundle,
+                )
+
+                persist_simulated_entry_tca_unavailable_bundle(
+                    pending["entry_id"],
+                    bot_name=pending["bot_name"],
+                    symbol=pending["symbol"],
+                    side=pending["side"],
+                    reference_price=pending["fill_price"],
+                    measured_at=pending["filled_at"],
+                    reason=(
+                        unavailable_reason
+                        or "restart_recovery_without_arrival_book"
+                    ),
+                    error_type=(
+                        "ContractSizeUnavailable"
+                        if unavailable_reason
+                        else "ArrivalBookNotRecoverable"
+                    ),
+                )
+            elif not evidence_durable:
+                from trading.candidate_microstructure import (
+                    capture_simulated_entry_tca,
+                )
+
+                capture_simulated_entry_tca(
+                    exchange=self.ex,
+                    entry_id=pending["entry_id"],
+                    bot_name=pending["bot_name"],
+                    mode="SIM",
+                    symbol=pending["symbol"],
+                    side=pending["side"],
+                    amount=pending["amount"],
+                    fill_price=pending["fill_price"],
+                    fee_rate=pending["fee_rate"],
+                    notional_usdt=pending["notional_usdt"],
+                    filled_at=pending["filled_at"],
+                    depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
+                )
+
+            if not has_durable_simulated_entry_tca(
+                pending["entry_id"], pending["bot_name"]
+            ):
+                raise RuntimeError("SIM TCA evidence is not durable")
+            latest = self.state.get(base)
+            if (
+                not isinstance(latest, dict)
+                or latest.get("entry_id") != pending["entry_id"]
+                or latest.get(self._SIM_TCA_PENDING_FIELD) != pending
+            ):
+                raise RuntimeError("SIM TCA state changed before WAL clear")
+            if not self.state.update_many(
+                base, {self._SIM_TCA_PENDING_FIELD: None}
+            ):
+                raise RuntimeError("SIM TCA WAL clear was not durable")
+            return True
+        except Exception as exc:
+            silent_log(context, exc)
+            return False
+
+    def _recover_simulated_entry_tca_pending(self) -> int:
+        """Close restart-surviving SIM evidence WALs without false book data."""
+        if not self.simulation:
+            return 0
+        recovered = 0
+        for base, row in self.state.get_all().items():
+            pending = (
+                row.get(self._SIM_TCA_PENDING_FIELD)
+                if isinstance(row, dict)
+                else None
+            )
+            if isinstance(pending, dict) and self._finalize_simulated_entry_tca(
+                base, pending, restart_recovery=True
+            ):
+                recovered += 1
+        return recovered
 
     @cached_property
     def _news(self):
@@ -293,6 +448,50 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             }
         return result
 
+    def _record_position_integrity_health(
+        self,
+        report: dict,
+        *,
+        telemetry_phase: str,
+    ) -> None:
+        """Store one bounded State/Claim/Exchange comparison for status."""
+        from trading.runtime_observability import (
+            position_integrity_runtime_report,
+        )
+
+        projected = position_integrity_runtime_report(
+            report,
+            telemetry_phase=telemetry_phase,
+            checked_monotonic=time.monotonic(),
+            checked_wall_ts=time.time(),
+        )
+        with self._position_integrity_health_lock:
+            self._position_integrity_health = projected
+
+    def _position_integrity_runtime_health(self) -> dict[str, Any]:
+        """Return freshness-aware integrity health for LIVE trading only."""
+        if bool(getattr(self, "simulation", True)):
+            return {}
+        lock = getattr(self, "_position_integrity_health_lock", None)
+        if lock is None:
+            return {}
+        with lock:
+            health = dict(
+                getattr(self, "_position_integrity_health", {}) or {}
+            )
+        from trading.runtime_observability import (
+            position_integrity_runtime_snapshot,
+        )
+
+        return position_integrity_runtime_snapshot(
+            health,
+            started_monotonic=getattr(
+                self, "_position_integrity_started_monotonic", None
+            ),
+            reconcile_interval_seconds=self.RECONCILE_INTERVAL_SEC,
+            now_monotonic=time.monotonic(),
+        )
+
     def _runtime_status_health(
         self,
         threads: dict[str, bool],
@@ -315,12 +514,26 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         ticker_ok = not ticker_health or ticker_health.get("ok") is True
         markout_health = self._markout_runtime_health()
         markout_ok = not markout_health or markout_health.get("ok") is True
+        sim_evidence_health = self._sim_evidence_runtime_health()
+        sim_evidence_ok = (
+            not sim_evidence_health
+            or sim_evidence_health.get(
+                "runtime_ok", sim_evidence_health.get("ok")
+            ) is True
+        )
         venue_health = self._venue_runtime_health()
         venue_ok = not venue_health or venue_health.get("ok") is True
         entry_recovery_health = self._entry_recovery_runtime_health()
         entry_recovery_ok = (
             not entry_recovery_health
             or entry_recovery_health.get("ok") is True
+        )
+        position_integrity_health = self._position_integrity_runtime_health()
+        position_integrity_ok = (
+            not position_integrity_health
+            or position_integrity_health.get(
+                "runtime_ok", position_integrity_health.get("ok")
+            ) is True
         )
         status = (
             "ready"
@@ -329,8 +542,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 and strategy_ok
                 and ticker_ok
                 and markout_ok
+                and sim_evidence_ok
                 and venue_ok
                 and entry_recovery_ok
+                and position_integrity_ok
             )
             else "degraded"
         )
@@ -341,10 +556,14 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             extra["ticker_health"] = ticker_health
         if markout_health:
             extra["markout_health"] = markout_health
+        if sim_evidence_health:
+            extra["sim_evidence_health"] = sim_evidence_health
         if venue_health:
             extra["venue_health"] = venue_health
         if entry_recovery_health:
             extra["entry_recovery_health"] = entry_recovery_health
+        if position_integrity_health:
+            extra["position_integrity_health"] = position_integrity_health
         return status, extra
 
     def _owns_markout_worker(self) -> bool:
@@ -374,6 +593,15 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 return 0.0
             return max(0.0, parsed) if math.isfinite(parsed) else 0.0
 
+        def optional_nonnegative_float(value) -> float | None:
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return max(0.0, parsed) if math.isfinite(parsed) else None
+
         raw_scopes = report.get("scopes")
         raw_scopes = raw_scopes if isinstance(raw_scopes, dict) else {}
         scopes = {}
@@ -383,10 +611,17 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             due_count = nonnegative_int(raw.get("due_count"))
             overdue = nonnegative_float(raw.get("oldest_overdue_seconds"))
             oldest = raw.get("oldest_due_at")
+            next_runnable = raw.get("next_runnable_at")
             scopes[scope] = {
                 "due_count": due_count,
                 "oldest_due_at": str(oldest)[:32] if oldest else None,
                 "oldest_overdue_seconds": overdue,
+                "next_runnable_at": (
+                    str(next_runnable)[:32] if next_runnable else None
+                ),
+                "next_runnable_seconds": optional_nonnegative_float(
+                    raw.get("next_runnable_seconds")
+                ),
                 "timestamps_valid": raw.get("timestamps_valid", True) is True,
             }
         allowed_reasons = {
@@ -402,6 +637,13 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             reason = ""
         elif reason not in allowed_reasons or not reason:
             reason = "worker_error"
+        wake_strategy = str(report.get("wake_strategy") or "fixed_interval")
+        if wake_strategy not in {
+            "deadline_or_local_commit",
+            "fixed_interval",
+            "fixed_error_backoff",
+        }:
+            wake_strategy = "fixed_interval"
         with self._markout_health_lock:
             previous_errors = int(
                 self._markout_health.get("consecutive_errors") or 0
@@ -430,6 +672,13 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 "oldest_overdue_seconds": nonnegative_float(
                     report.get("oldest_overdue_seconds")
                 ),
+                "next_runnable_at": (
+                    str(report.get("next_runnable_at"))[:32]
+                    if report.get("next_runnable_at") else None
+                ),
+                "next_runnable_seconds": optional_nonnegative_float(
+                    report.get("next_runnable_seconds")
+                ),
                 "timestamps_valid": report.get("timestamps_valid", True) is True,
                 "reason": reason,
                 "scopes": scopes,
@@ -442,10 +691,18 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 ),
                 "polls_total": nonnegative_int(report.get("polls_total")),
                 "errors_total": nonnegative_int(report.get("errors_total")),
+                "poll_wait_seconds": nonnegative_float(
+                    report.get("poll_wait_seconds")
+                ),
+                "wake_strategy": wake_strategy,
                 "last_completed_wall_ts": report.get(
                     "last_completed_wall_ts"
                 ),
                 "lock_state": str(report.get("lock_state") or "unknown")[:32],
+                "worker_family": "futures",
+                "producer_bots": ["CROSS", "FUTREND", "FUTURES"],
+                "progress_scope": "worker_market_family",
+                "progress_is_bot_scoped": False,
             })
 
     def _markout_runtime_health(self) -> dict[str, Any]:
@@ -489,6 +746,185 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "poll_age_seconds": poll_age,
         })
         return snapshot
+
+    @staticmethod
+    def _sim_tca_pending_state_health(
+        state_rows: Any,
+        bot_name: str,
+        *,
+        now_wall: float | None = None,
+        grace_seconds: int = 60,
+    ) -> dict[str, int]:
+        """Validate the bounded futures SIM-evidence WAL projection."""
+        result = {
+            "pending_state_count": 0,
+            "pending_state_grace_count": 0,
+            "pending_state_overdue_count": 0,
+            "invalid_pending_state_count": 0,
+        }
+        if not isinstance(state_rows, dict) or len(state_rows) > 4_096:
+            result["invalid_pending_state_count"] = 1
+            return result
+        wall = time.time() if now_wall is None else now_wall
+        if (
+            isinstance(wall, bool)
+            or not isinstance(wall, (int, float))
+            or not math.isfinite(float(wall))
+        ):
+            result["invalid_pending_state_count"] = 1
+            return result
+        normalized_bot = str(bot_name).strip().upper()
+        for state_symbol, row in state_rows.items():
+            if not isinstance(row, dict):
+                continue
+            pending = row.get("sim_tca_pending_v1")
+            if pending is None:
+                continue
+            result["pending_state_count"] += 1
+            valid = isinstance(pending, dict)
+            if valid:
+                entry_id = pending.get("entry_id")
+                symbol = pending.get("symbol")
+                filled_at = pending.get("filled_at")
+                valid = bool(
+                    type(pending.get("version")) is int
+                    and pending["version"] == 1
+                    and pending.get("bot_name") == normalized_bot
+                    and pending.get("side") in {"buy", "sell"}
+                    and isinstance(entry_id, str)
+                    and 0 < len(entry_id) <= 64
+                    and entry_id == entry_id.strip()
+                    and row.get("entry_id") == entry_id
+                    and isinstance(symbol, str)
+                    and symbol
+                    == f"{str(state_symbol).strip().upper()}/USDT:USDT"
+                    and isinstance(filled_at, str)
+                )
+            if valid:
+                for field, allow_zero in (
+                    ("amount", False),
+                    ("fill_price", False),
+                    ("fee_rate", True),
+                    ("notional_usdt", False),
+                ):
+                    value = pending.get(field)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        or (float(value) < 0 if allow_zero else float(value) <= 0)
+                    ):
+                        valid = False
+                        break
+                if valid and float(pending["fee_rate"]) >= 1.0:
+                    valid = False
+                unavailable = pending.get("arrival_unavailable_reason")
+                if unavailable is not None and unavailable != (
+                    "capture_contract_size_unavailable"
+                ):
+                    valid = False
+            filled_epoch = 0.0
+            if valid:
+                try:
+                    parsed = datetime.strptime(
+                        pending["filled_at"], "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=timezone.utc)
+                    if parsed.strftime("%Y-%m-%d %H:%M:%S") != pending[
+                        "filled_at"
+                    ]:
+                        raise ValueError("non-canonical timestamp")
+                    filled_epoch = parsed.timestamp()
+                    if filled_epoch > float(wall) + 5.0:
+                        raise ValueError("future timestamp")
+                except (TypeError, ValueError, OverflowError, OSError):
+                    valid = False
+            if not valid:
+                result["invalid_pending_state_count"] += 1
+            elif float(wall) - filled_epoch > float(grace_seconds):
+                result["pending_state_overdue_count"] += 1
+            else:
+                result["pending_state_grace_count"] += 1
+        return result
+
+    def _sim_evidence_runtime_health(
+        self, state_rows: Any | None = None
+    ) -> dict[str, Any]:
+        """Expose origin-bot SIM evidence independently from global workers."""
+        if not bool(getattr(self, "simulation", False)):
+            return {}
+        bot_name = str(getattr(self, "BOT_NAME", "")).strip().upper()
+        if bot_name not in {"CROSS", "FUTREND"}:
+            return {}
+        now = time.monotonic()
+        cached = getattr(self, "_sim_evidence_health_cache", None)
+        last = getattr(self, "_sim_evidence_health_last_monotonic", None)
+        if (
+            isinstance(cached, dict)
+            and not isinstance(last, bool)
+            and isinstance(last, (int, float))
+            and math.isfinite(float(last))
+        ):
+            age = now - float(last)
+            if 0.0 <= age < 30.0:
+                health = dict(cached)
+            else:
+                cached = None
+        else:
+            cached = None
+        if not isinstance(cached, dict):
+            try:
+                from core.database import simulated_execution_evidence_health
+
+                health = simulated_execution_evidence_health(bot_name)
+                if not isinstance(health, dict):
+                    raise TypeError("invalid simulated evidence health payload")
+            except Exception as exc:
+                health = {
+                    "ok": False,
+                    "component": "sim_execution_evidence",
+                    "state": "degraded",
+                    "reason": "health_query_failed",
+                    "bot_name": bot_name,
+                    "error_type": type(exc).__name__,
+                }
+            self._sim_evidence_health_cache = dict(health)
+            self._sim_evidence_health_last_monotonic = now
+        try:
+            rows = self.state.get_all() if state_rows is None else state_rows
+            pending_health = self._sim_tca_pending_state_health(rows, bot_name)
+        except Exception as exc:
+            pending_health = {
+                "pending_state_count": 0,
+                "pending_state_grace_count": 0,
+                "pending_state_overdue_count": 0,
+                "invalid_pending_state_count": 1,
+            }
+            health = dict(health)
+            health["state_health_error_type"] = type(exc).__name__
+            health.update({
+                "runtime_ok": False,
+                "runtime_state": "degraded",
+                "runtime_reason": "state_health_query_failed",
+                "data_quality_ok": False,
+            })
+        else:
+            health = dict(health)
+            if pending_health["invalid_pending_state_count"]:
+                health.update({
+                    "runtime_ok": False,
+                    "runtime_state": "degraded",
+                    "runtime_reason": "state_pending_invalid",
+                    "data_quality_ok": False,
+                })
+            elif pending_health["pending_state_overdue_count"]:
+                health.update({
+                    "runtime_ok": False,
+                    "runtime_state": "degraded",
+                    "runtime_reason": "state_capture_pending_overdue",
+                    "data_quality_ok": False,
+                })
+        health.update(pending_health)
+        return health
 
     def _record_venue_recorder_health(self, report: dict) -> None:
         """Receive one bounded health report from the venue recorder."""
@@ -895,6 +1331,9 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 "WARN"
             )
 
+        if self.simulation:
+            self._recover_simulated_entry_tca_pending()
+
         #  Stale-state cleanup 
         # SCOPED to THIS bot: futures_state is shared with the CROSS bot, so an
         # unscoped read here made the FUTURES startup delete the CROSS bot's
@@ -914,11 +1353,22 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
 
         #  Startup reconciliation (in mixin) 
         if not self.simulation:
+            startup_recovery_cutoff = now_utc().strftime("%Y-%m-%d %H:%M:%S")
             recovery_ok, recovery_generation = self._refresh_entry_recovery_barrier(
                 log_event,
                 context="startup",
             )
             reconciliation_ok = self._startup_reconciliation()
+            if reconciliation_ok:
+                recovery_ok = self._finalize_qualified_zero_fill_recoveries(
+                    log_event,
+                    reconciliation_ok=reconciliation_ok,
+                )
+                self._finalize_interrupted_candidates(
+                    log_event,
+                    reconciliation_ok=reconciliation_ok,
+                    startup_cutoff=startup_recovery_cutoff,
+                )
             self._complete_entry_recovery_barrier(
                 recovery_generation,
                 recovery_ok=recovery_ok,
@@ -959,6 +1409,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     "limit": 25,
                     "max_overdue_seconds": self.MARKOUT_MAX_OVERDUE_SEC,
                     "health_callback": self._record_markout_worker_health,
+                    "worker_family": "futures",
                 },
                 daemon=True,
                 name=f"{self.BOT_NAME}Markouts",

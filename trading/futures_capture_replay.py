@@ -38,7 +38,7 @@ from trading.historical_futures_evidence import (
 )
 
 
-REPLAY_DATASET_SCHEMA = 2
+REPLAY_DATASET_SCHEMA = 3
 REPLAY_SCAN_SECONDS = 150
 REPLAY_MAX_SNAPSHOT_AGE_SECONDS = 120
 REPLAY_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
@@ -68,6 +68,19 @@ def _sha256_bytes(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _is_linklike(path: Path) -> bool:
+    return path.is_symlink() or (
+        hasattr(path, "is_junction") and path.is_junction()
+    )
+
+
+def _absolute_without_links(path: str | Path, *, label: str) -> Path:
+    requested = Path(path).expanduser().absolute()
+    if any(_is_linklike(component) for component in (requested, *requested.parents)):
+        raise ValueError(f"{label} must not contain links")
+    return requested
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -88,6 +101,22 @@ def _atomic_write(path: Path, raw: bytes) -> None:
         try:
             temporary.unlink()
         except FileNotFoundError:
+            pass
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        directory_fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(directory_fd)
+        except OSError:
             pass
 
 
@@ -176,12 +205,31 @@ def freeze_replay_dataset(
     normalized_venue = "".join(char for char in venue.lower() if char.isalnum())
     if normalized_venue != "mexc":
         raise ValueError("FUTURES capture replay currently requires venue=mexc")
-    overview = sorted(Path(path).expanduser().resolve() for path in overview_partitions)
+    if source is not None and not isinstance(source, dict):
+        raise ValueError("replay source provenance must be an object")
+    overview = []
+    for raw_path in overview_partitions:
+        try:
+            path = _absolute_without_links(raw_path, label="overview partition")
+        except ValueError as exc:
+            raise ValueError(
+                f"overview partition is missing or linked: {raw_path}"
+            ) from exc
+        if not path.is_file():
+            raise ValueError(f"overview partition is missing or linked: {path}")
+        overview.append(path)
+    overview.sort(key=lambda path: str(path).casefold())
     if not overview:
         raise ValueError("overview_partitions must not be empty")
-    workspace = Path(workspace_root).expanduser().resolve()
+    try:
+        workspace = _absolute_without_links(
+            workspace_root, label="replay workspace"
+        )
+    except ValueError as exc:
+        raise ValueError("replay workspace must be a real path") from exc
     datasets = workspace / "datasets"
     datasets.mkdir(parents=True, exist_ok=True)
+    datasets = _absolute_without_links(datasets, label="replay workspace")
     staging = datasets / f".replay-{os.getpid()}-{uuid.uuid4().hex}"
     staging.mkdir()
     try:
@@ -189,8 +237,6 @@ def freeze_replay_dataset(
         overview_dir = staging / "overview"
         overview_dir.mkdir()
         for index, path in enumerate(overview):
-            if path.is_symlink() or not path.is_file():
-                raise ValueError(f"overview partition is missing or linked: {path}")
             target = overview_dir / f"{index:04d}-{path.name}"
             source_connection = destination_connection = None
             try:
@@ -301,20 +347,26 @@ def freeze_replay_dataset(
             "overview": overview_manifest,
             "series": series_manifest,
             "funding": funding_manifest,
+            "source": source or {},
         }
         fingerprint = _sha256_bytes(_canonical_bytes(payload))
         manifest = {
             "dataset_fingerprint": fingerprint,
             "fingerprint_payload": payload,
-            "created_at_utc": datetime.now(timezone.utc).isoformat(),
-            "source": source or {},
         }
         _atomic_write(staging / "dataset_manifest.json", _canonical_bytes(manifest))
         final = datasets / fingerprint
         if final.exists():
             verify_replay_dataset(final)
             return final
-        os.replace(staging, final)
+        try:
+            os.rename(staging, final)
+        except OSError:
+            if final.is_dir():
+                verify_replay_dataset(final)
+                return final
+            raise
+        _fsync_directory(datasets)
         for path in final.rglob("*"):
             if path.is_file():
                 try:
@@ -328,24 +380,62 @@ def freeze_replay_dataset(
 
 
 def _read_manifest(path: Path) -> dict:
+    try:
+        path = _absolute_without_links(path, label="replay manifest")
+    except ValueError as exc:
+        raise ValueError("replay manifest must be a real file") from exc
+    if not path.is_file():
+        raise ValueError("replay manifest must be a real file")
     with path.open("rb") as handle:
         raw = handle.read(REPLAY_MANIFEST_MAX_BYTES + 1)
     if len(raw) > REPLAY_MANIFEST_MAX_BYTES:
         raise ValueError("replay manifest is oversized")
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("replay manifest contains duplicate keys")
+            result[key] = item
+        return result
+
+    def reject_constant(_value):
+        raise ValueError("replay manifest contains a non-finite constant")
+
     try:
-        value = json.loads(raw.decode("utf-8-sig"))
+        value = json.loads(
+            raw.decode("utf-8-sig"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("replay manifest is invalid JSON") from exc
     if not isinstance(value, dict):
         raise ValueError("replay manifest must be an object")
+
+    def require_finite(item):
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("replay manifest contains a non-finite number")
+        if isinstance(item, dict):
+            for nested in item.values():
+                require_finite(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                require_finite(nested)
+
+    require_finite(value)
     return value
 
 
 def verify_replay_dataset(dataset_root: str | Path) -> dict:
-    root = Path(dataset_root).expanduser().resolve()
-    if root.is_symlink() or not root.is_dir():
+    try:
+        root = _absolute_without_links(dataset_root, label="replay dataset root")
+    except ValueError as exc:
+        raise ValueError("replay dataset root must be a real directory") from exc
+    if not root.is_dir():
         raise ValueError("replay dataset root must be a real directory")
     manifest = _read_manifest(root / "dataset_manifest.json")
+    if set(manifest) != {"dataset_fingerprint", "fingerprint_payload"}:
+        raise ValueError("replay manifest structure is invalid")
     payload = manifest.get("fingerprint_payload")
     fingerprint = manifest.get("dataset_fingerprint")
     if (
@@ -354,6 +444,7 @@ def verify_replay_dataset(dataset_root: str | Path) -> dict:
         or payload.get("kind") != "mexc_futures_capture_replay"
         or payload.get("venue") != "mexc"
         or payload.get("scan_interval_seconds") != REPLAY_SCAN_SECONDS
+        or not isinstance(payload.get("source"), dict)
     ):
         raise ValueError("unsupported replay dataset contract")
     if fingerprint != _sha256_bytes(_canonical_bytes(payload)) or root.name != fingerprint:
@@ -371,6 +462,9 @@ def verify_replay_dataset(dataset_root: str | Path) -> dict:
             if not isinstance(item, dict) or not isinstance(item.get("path"), str):
                 raise ValueError(f"invalid replay {group} manifest entry")
             relative = item["path"]
+            relative_path = Path(relative)
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                raise ValueError("replay dataset path escapes root")
             if relative in manifest_paths:
                 raise ValueError("replay dataset manifest paths must be unique")
             manifest_paths.add(relative)
@@ -405,10 +499,13 @@ def verify_replay_dataset(dataset_root: str | Path) -> dict:
                     raise ValueError("replay funding path conflicts with identity")
             elif not relative.startswith("overview/"):
                 raise ValueError("replay overview path conflicts with group")
-            candidate = root / relative
-            if candidate.is_symlink() or candidate.parent.is_symlink():
+            try:
+                path = _absolute_without_links(
+                    root / relative_path, label="replay dataset file"
+                )
+            except ValueError:
                 raise ValueError(f"replay dataset file missing or linked: {relative}")
-            path = candidate.resolve()
+
             try:
                 path.relative_to(root)
             except ValueError as exc:
@@ -426,9 +523,12 @@ def verify_replay_dataset(dataset_root: str | Path) -> dict:
         raise ValueError("replay dataset timeframe coverage is incomplete")
     if funding_symbols != set(series_timeframes):
         raise ValueError("replay funding symbols must match OHLCV symbols")
+    discovered = list(root.rglob("*"))
+    if any(_is_linklike(path) for path in discovered):
+        raise ValueError("replay dataset contains linked paths")
     actual = {
         path.relative_to(root).as_posix()
-        for path in root.rglob("*")
+        for path in discovered
         if path.is_file()
     }
     if actual != expected:
@@ -438,7 +538,7 @@ def verify_replay_dataset(dataset_root: str | Path) -> dict:
 
 def load_replay_dataset(dataset_root: str | Path) -> ReplayDataset:
     manifest = verify_replay_dataset(dataset_root)
-    root = Path(dataset_root).expanduser().resolve()
+    root = _absolute_without_links(dataset_root, label="replay dataset root")
     payload = manifest["fingerprint_payload"]
     overview_paths = [root / item["path"] for item in payload["overview"]]
     snapshots = tuple(load_overview_snapshots(overview_paths))

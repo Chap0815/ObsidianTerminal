@@ -20,7 +20,6 @@ Flow per tick:
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
 
 from bot_utils import (
     safe_fetch_balance_usdt,
@@ -701,19 +700,6 @@ class ScanMixin:
             bot=self.BOT_NAME, symbol=sym, mode=entry_mode, direction="BUY")
         quality = self._score_spot_entry_quality(
             sym, r, regime, confidence, entry_id)
-        if (not self.simulation and self._entry_quality_filter_enabled()
-                and ("score_error" in quality.reasons
-                     or quality.score < self._entry_quality_min_score())):
-            log_event(
-                f"{sym}: BUY blocked  entry quality "
-                f"{quality.score} < {self._entry_quality_min_score():.0f} "
-                f"({quality.label}; {','.join(quality.reasons) or 'no_reason'})",
-                "WAIT")
-            emit_entry_lifecycle(
-                entry_id, bot=self.BOT_NAME, symbol=sym,
-                stage="blocked", mode=entry_mode, reason="entry_quality")
-            return None
-
         expectancy_features = {
             "score": float(quality.score),
             "confidence": {
@@ -731,8 +717,32 @@ class ScanMixin:
             entry_id=entry_id,
             symbol=sym,
             mode=entry_mode,
+            direction="LONG",
             features=expectancy_features,
+            quality_decision={
+                "score": float(quality.score),
+                "minimum_score": float(self._entry_quality_min_score()),
+                "label": quality.label,
+                "reasons": list(quality.reasons),
+                "would_block": bool(
+                    "score_error" in quality.reasons
+                    or quality.score < self._entry_quality_min_score()
+                ),
+            },
         )
+
+        if (not self.simulation and self._entry_quality_filter_enabled()
+                and ("score_error" in quality.reasons
+                     or quality.score < self._entry_quality_min_score())):
+            log_event(
+                f"{sym}: BUY blocked  entry quality "
+                f"{quality.score} < {self._entry_quality_min_score():.0f} "
+                f"({quality.label}; {','.join(quality.reasons) or 'no_reason'})",
+                "WAIT")
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym,
+                stage="blocked", mode=entry_mode, reason="entry_quality")
+            return None
 
         # Bull/Bear devil's-advocate veto is handled inside
         # news_brain.analyze_sentiment() when direction=="BUY" (it has full
@@ -1998,6 +2008,8 @@ class ScanMixin:
         notional_usdt: float,
     ) -> dict:
         """Build the bounded evidence WAL stored with the final SIM position."""
+        from core.clock import utc_now_str
+
         return {
             "version": 1,
             "entry_id": str(entry_id),
@@ -2008,9 +2020,7 @@ class ScanMixin:
             "fill_price": float(fill_price),
             "fee_rate": float(fee_rate),
             "notional_usdt": float(notional_usdt),
-            "filled_at": datetime.now(timezone.utc).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
+            "filled_at": utc_now_str(),
         }
 
     def _finalize_simulated_entry_tca(
