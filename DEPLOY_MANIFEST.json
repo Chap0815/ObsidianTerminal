@@ -1,6 +1,6 @@
 {
-  "build_id": "476d1a5bd8cd3828",
-  "created_at": "2026-08-15 20:46:57",
+  "build_id": "015a871ade58677e",
+  "created_at": "2026-08-16 15:22:51",
   "source": "update_deploy_manifest.py",
   "file_count": 193,
   "files": [
@@ -231,8 +231,8 @@
     },
     {
       "path": "core/clock.py",
-      "sha256": "eb06d22db297c9b62ca4833ed0d759c3603d11e26afff53b87a459611d64c81a",
-      "bytes": 4297
+      "sha256": "7155cb91fb5adc1de9eb59ee2ff3950abf719556adffad3c642e72d4f332baa6",
+      "bytes": 5143
     },
     {
       "path": "core/constants.py",
@@ -431,7 +431,7 @@
     },
     {
       "path": "launcher/state/poller.py",
-      "sha256": "080caa159c1b6c8790c1eff47f783e0c140b7e9e0dab2bf7c452c8dc7ef92dc1",
+      "sha256": "2b024733b64b42939e9115c42158c3e2a32e10edd513df906df6c361f6066edc",
       "bytes": 38935
     },
     {
@@ -691,8 +691,8 @@
     },
     {
       "path": "tools/update_deploy_manifest.py",
-      "sha256": "fe87b74bc8c737e8c44bc3bedddea383751227fd64b09f8289ee2927342f20b0",
-      "bytes": 10945
+      "sha256": "fc68e58e3bd0397043122d8ab6ac78ef3ab234e0cb68f4c2f7b1da6346752ba0",
+      "bytes": 10997
     },
     {
       "path": "tools/update_from_git.py",

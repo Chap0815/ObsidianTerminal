@@ -25,6 +25,8 @@ _lock = threading.Lock()
 _offset_ms: float = 0.0  # exchange_time  local_time, in milliseconds
 _have_offset: bool = False
 _offset_set_monotonic: float | None = None
+_anchor_epoch_ms: float | None = None
+_anchor_monotonic: float | None = None
 
 
 def set_exchange_offset_ms(offset_ms: float) -> None:
@@ -33,6 +35,7 @@ def set_exchange_offset_ms(offset_ms: float) -> None:
     Called by the exchange layer after each (re)sync. Ignores non-numeric input
     so a bad value can never poison the clock."""
     global _offset_ms, _have_offset, _offset_set_monotonic
+    global _anchor_epoch_ms, _anchor_monotonic
     if isinstance(offset_ms, bool):
         return
     try:
@@ -42,8 +45,9 @@ def set_exchange_offset_ms(offset_ms: float) -> None:
     if not math.isfinite(off):
         return
     try:
+        anchor_epoch_ms = time.time() * 1000.0 + off
         datetime.fromtimestamp(
-            (time.time() * 1000.0 + off) / 1000.0,
+            anchor_epoch_ms / 1000.0,
             tz=timezone.utc,
         )
     except (OSError, OverflowError, ValueError):
@@ -58,6 +62,8 @@ def set_exchange_offset_ms(offset_ms: float) -> None:
         _offset_ms = off
         _have_offset = True
         _offset_set_monotonic = observed_monotonic
+        _anchor_epoch_ms = anchor_epoch_ms
+        _anchor_monotonic = observed_monotonic
 
 
 def get_offset_ms() -> float:
@@ -88,8 +94,25 @@ def get_offset_age_seconds() -> float | None:
 
 
 def now_ms() -> float:
-    """Exchange-anchored epoch milliseconds (local + published offset)."""
-    return time.time() * 1000.0 + get_offset_ms()
+    """Exchange-anchored epoch milliseconds immune to later wall-clock jumps."""
+    with _lock:
+        anchored = _have_offset
+        offset_ms = _offset_ms if anchored else 0.0
+        anchor_epoch_ms = _anchor_epoch_ms
+        anchor_monotonic = _anchor_monotonic
+    if (
+        anchored
+        and anchor_epoch_ms is not None
+        and anchor_monotonic is not None
+    ):
+        try:
+            elapsed = float(time.monotonic()) - anchor_monotonic
+            value = anchor_epoch_ms + elapsed * 1000.0
+            if elapsed >= 0.0 and math.isfinite(value):
+                return value
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return time.time() * 1000.0 + offset_ms
 
 
 def now_utc() -> datetime:

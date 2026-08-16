@@ -87,15 +87,15 @@ def _runtime_status_is_fresh(rs: dict, *, now: float | None = None) -> bool:
     status = str(rs.get("status") or "").lower()
     if status not in {"starting", "started", "ready", "running", "degraded"}:
         return False
+    mono = finite_float_or_none(rs.get("monotonic_ts")) or 0.0
+    if mono > 0.0:
+        age = (time.monotonic() if now is None else now) - mono
+        return -5.0 <= age <= _RUNTIME_MODE_MAX_AGE_SEC
     wall_ts = finite_float_or_none(rs.get("wall_ts"))
     if wall_ts is None or wall_ts <= 0.0:
         wall_ts = finite_float_or_none(rs.get("epoch_ts")) or 0.0
     if wall_ts > 0.0:
         age = time.time() - wall_ts
-        return -5.0 <= age <= _RUNTIME_MODE_MAX_AGE_SEC
-    mono = finite_float_or_none(rs.get("monotonic_ts")) or 0.0
-    if mono > 0.0:
-        age = (time.monotonic() if now is None else now) - mono
         return -5.0 <= age <= _RUNTIME_MODE_MAX_AGE_SEC
     return False
 
