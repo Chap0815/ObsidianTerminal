@@ -193,6 +193,13 @@ class L2ShadowCollector:
             sample_health_window,
             self.stale_after_ms / 1000.0 * 2.0,
         )
+        # Initial MEXC subscriptions are serialized internally and can take
+        # materially longer than an already-live stream's stale threshold.
+        # Do not create a reconnect loop before the first sample can arrive.
+        self._health_startup_grace_seconds = max(
+            60.0,
+            self._health_stale_after_seconds * 3.0,
+        )
         self._health_error_type: str | None = None
         self._health_reconnect_attempts = 0
         self._health_ok_logged = False
@@ -761,10 +768,18 @@ class L2ShadowCollector:
                     symbol
                     for kind, symbol in tasks
                     if kind == "l2"
-                    and now - l2_last.get(
-                        symbol,
-                        task_started.get((kind, symbol), now),
-                    ) > self._health_stale_after_seconds
+                    and (
+                        (
+                            symbol in l2_last
+                            and now - l2_last[symbol]
+                            > self._health_stale_after_seconds
+                        )
+                        or (
+                            symbol not in l2_last
+                            and now - task_started.get((kind, symbol), now)
+                            > self._health_startup_grace_seconds
+                        )
+                    )
                 ]
                 if stale:
                     raise TimeoutError(
