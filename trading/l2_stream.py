@@ -36,19 +36,20 @@ class TradeValidationError(ValueError):
     """Raised when a public trade update is unsafe to persist."""
 
 
-def build_public_async_config(exchange) -> dict:
+def build_public_async_config(exchange, *, new_updates: bool = False) -> dict:
     """Copy public-market and network settings without copying credentials."""
-    config: dict = {"enableRateLimit": True, "newUpdates": True}
+    config: dict = {"enableRateLimit": True, "newUpdates": bool(new_updates)}
     timeout = getattr(exchange, "timeout", None)
     if timeout is not None:
         config["timeout"] = timeout
     options = getattr(exchange, "options", None)
     if options:
         config["options"] = copy.deepcopy(dict(options))
-    config.setdefault("options", {})["tradesLimit"] = max(
-        10_000,
-        int(config.get("options", {}).get("tradesLimit") or 0),
-    )
+    if new_updates:
+        config.setdefault("options", {})["tradesLimit"] = max(
+            10_000,
+            int(config.get("options", {}).get("tradesLimit") or 0),
+        )
     for key in (
         "proxies",
         "proxyUrl",
@@ -676,8 +677,11 @@ class L2ShadowCollector:
             self._health_last_trade_monotonic.pop(symbol, None)
             self._health_error_type = str(error_type or "InvalidTradeSample")[:100]
 
-    def _make_async_exchange(self):
-        config = build_public_async_config(self.exchange)
+    def _make_async_exchange(self, *, new_updates: bool = False):
+        config = build_public_async_config(
+            self.exchange,
+            new_updates=new_updates,
+        )
         if self._async_exchange_factory is not None:
             return self._async_exchange_factory(config)
         import ccxt.pro as ccxt_pro
@@ -706,7 +710,12 @@ class L2ShadowCollector:
                 return
             self.record_trades(symbol, trades)
 
-    async def _watch_session(self, async_exchange) -> None:
+    async def _watch_session(self, l2_exchange, trade_exchange=None) -> None:
+        # MEXC's CCXT-Pro adapter can starve order-book subscriptions when
+        # public trades share the same transport. Keep the two evidence
+        # streams isolated; a fault in either still restarts the whole epoch.
+        if trade_exchange is None:
+            trade_exchange = l2_exchange
         tasks: dict[tuple[str, str], asyncio.Task] = {}
         task_started: dict[tuple[str, str], float] = {}
         try:
@@ -727,13 +736,13 @@ class L2ShadowCollector:
                     trade_key = ("trades", symbol)
                     if l2_key not in tasks:
                         tasks[l2_key] = asyncio.create_task(
-                            self._watch_symbol(async_exchange, symbol),
+                            self._watch_symbol(l2_exchange, symbol),
                             name=f"l2-{self.exchange_id}-{symbol}",
                         )
                         task_started[l2_key] = time.monotonic()
                     if trade_key not in tasks:
                         tasks[trade_key] = asyncio.create_task(
-                            self._watch_trade_symbol(async_exchange, symbol),
+                            self._watch_trade_symbol(trade_exchange, symbol),
                             name=f"trades-{self.exchange_id}-{symbol}",
                         )
                         task_started[trade_key] = time.monotonic()
@@ -815,22 +824,32 @@ class L2ShadowCollector:
         reconnect_attempts = 0
         last_warning_at = 0.0
         while not self._should_stop():
-            async_exchange = None
+            l2_exchange = None
+            trade_exchange = None
             try:
-                try:
-                    markets_allowed = bool(try_consume_api_call(
-                        "l2_stream_load_markets"
-                    ))
-                except Exception as budget_exc:
-                    raise RuntimeError(
-                        "L2 load_markets API budget gate unavailable"
-                    ) from budget_exc
-                if not markets_allowed:
-                    raise RuntimeError(
-                        "L2 load_markets API budget exhausted"
+                for stream_name in ("l2", "trades"):
+                    try:
+                        markets_allowed = bool(
+                            try_consume_api_call(
+                                f"{stream_name}_stream_load_markets"
+                            )
+                        )
+                    except Exception as budget_exc:
+                        raise RuntimeError(
+                            f"{stream_name} load_markets API budget gate unavailable"
+                        ) from budget_exc
+                    if not markets_allowed:
+                        raise RuntimeError(
+                            f"{stream_name} load_markets API budget exhausted"
+                        )
+                    exchange = self._make_async_exchange(
+                        new_updates=stream_name == "trades"
                     )
-                async_exchange = self._make_async_exchange()
-                await async_exchange.load_markets()
+                    if stream_name == "l2":
+                        l2_exchange = exchange
+                    else:
+                        trade_exchange = exchange
+                    await exchange.load_markets()
                 self._begin_connection_epoch(
                     error_type=last_error_type,
                     reconnect_attempts=reconnect_attempts,
@@ -846,7 +865,7 @@ class L2ShadowCollector:
                         f"validating L2 research data "
                         f"(epoch {self._connection_epoch})",
                     )
-                await self._watch_session(async_exchange)
+                await self._watch_session(l2_exchange, trade_exchange)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -890,9 +909,15 @@ class L2ShadowCollector:
                     last_warning_at = now
                 last_error_type = error_type
             finally:
-                if async_exchange is not None:
+                exchanges = []
+                for exchange in (trade_exchange, l2_exchange):
+                    if exchange is not None and all(
+                        exchange is not existing for existing in exchanges
+                    ):
+                        exchanges.append(exchange)
+                for exchange in exchanges:
                     try:
-                        await async_exchange.close()
+                        await exchange.close()
                     except Exception:
                         pass
             if self._should_stop():
