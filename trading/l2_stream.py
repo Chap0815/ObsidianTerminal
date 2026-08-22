@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable
 
 from bot_utils.api_budget import try_consume_api_call
+from bot_utils.order_utils import order_id_text_or_none
 from trading.venue_recorder import (
     MAX_PARTITION_CLOCK_AGE_MS,
     SQLitePartitionWriter,
@@ -31,15 +32,23 @@ class OrderBookValidationError(ValueError):
     """Raised when a unified order-book snapshot is unsafe to persist."""
 
 
+class TradeValidationError(ValueError):
+    """Raised when a public trade update is unsafe to persist."""
+
+
 def build_public_async_config(exchange) -> dict:
     """Copy public-market and network settings without copying credentials."""
-    config: dict = {"enableRateLimit": True}
+    config: dict = {"enableRateLimit": True, "newUpdates": True}
     timeout = getattr(exchange, "timeout", None)
     if timeout is not None:
         config["timeout"] = timeout
     options = getattr(exchange, "options", None)
     if options:
         config["options"] = copy.deepcopy(dict(options))
+    config.setdefault("options", {})["tradesLimit"] = max(
+        10_000,
+        int(config.get("options", {}).get("tradesLimit") or 0),
+    )
     for key in (
         "proxies",
         "proxyUrl",
@@ -173,6 +182,8 @@ class L2ShadowCollector:
         self._health_lock = threading.Lock()
         self._health_seen_symbols: set[str] = set()
         self._health_last_persist_monotonic: dict[str, float] = {}
+        self._health_trade_seen_symbols: set[str] = set()
+        self._health_last_trade_monotonic: dict[str, float] = {}
         sample_health_window = self.sample_interval * 3.0
         if not math.isfinite(sample_health_window):
             sample_health_window = 10.0
@@ -212,6 +223,47 @@ class L2ShadowCollector:
                 and fresh
             )
 
+    @property
+    def trades_healthy(self) -> bool:
+        desired = set(self._symbol_snapshot())
+        now = time.monotonic()
+        with self._health_lock:
+            return bool(
+                desired
+                and desired.issubset(self._health_trade_seen_symbols)
+                and all(
+                    symbol in self._health_last_trade_monotonic
+                    and 0.0
+                    <= now - self._health_last_trade_monotonic[symbol]
+                    <= 300.0
+                    for symbol in desired
+                )
+            )
+
+    def health_snapshot(self) -> dict:
+        desired = tuple(self._symbol_snapshot())
+        now = time.monotonic()
+        with self._health_lock:
+            return {
+                "connection_epoch": self._connection_epoch,
+                "l2_missing_or_stale": sorted(
+                    symbol
+                    for symbol in desired
+                    if symbol not in self._health_last_persist_monotonic
+                    or not 0.0
+                    <= now - self._health_last_persist_monotonic[symbol]
+                    <= self._health_stale_after_seconds
+                ),
+                "trade_missing_or_stale": sorted(
+                    symbol
+                    for symbol in desired
+                    if symbol not in self._health_last_trade_monotonic
+                    or not 0.0
+                    <= now - self._health_last_trade_monotonic[symbol]
+                    <= 300.0
+                ),
+            }
+
     def _log(self, message: str, level: str = "INFO") -> None:
         if not self.log_event:
             return
@@ -239,8 +291,11 @@ class L2ShadowCollector:
                     state.pop(symbol, None)
         with self._health_lock:
             self._health_seen_symbols.intersection_update(active)
+            self._health_trade_seen_symbols.intersection_update(active)
             for symbol in set(self._health_last_persist_monotonic) - active:
                 self._health_last_persist_monotonic.pop(symbol, None)
+            for symbol in set(self._health_last_trade_monotonic) - active:
+                self._health_last_trade_monotonic.pop(symbol, None)
             if active - previous:
                 # A newly selected stream belongs to a new validation
                 # generation; do not inherit the prior universe's healthy
@@ -398,6 +453,98 @@ class L2ShadowCollector:
             )
         return True
 
+    def record_trades(self, symbol: str, trades) -> bool:
+        """Persist one bounded CCXT-Pro public-trade update."""
+        if not isinstance(trades, (list, tuple)) or not trades:
+            self._mark_trade_unhealthy(symbol, "EmptyTradeUpdate")
+            return False
+        received_ms = int(time.time() * 1000)
+        normalized = []
+        seen: dict[str, tuple] = {}
+        try:
+            for index, trade in enumerate(trades):
+                if not isinstance(trade, dict):
+                    raise TradeValidationError(f"trade[{index}] is malformed")
+                trade_id = order_id_text_or_none(trade.get("id"))
+                timestamp = _finite_positive(
+                    trade.get("timestamp"), f"trade[{index}].timestamp"
+                )
+                price = _finite_positive(trade.get("price"), f"trade[{index}].price")
+                amount = _finite_positive(
+                    trade.get("amount"), f"trade[{index}].amount"
+                )
+                if not timestamp.is_integer() or timestamp > received_ms + 30_000:
+                    raise TradeValidationError(f"trade[{index}].timestamp is invalid")
+                side = str(trade.get("side") or "").strip().lower()
+                if trade_id is None or side not in {"buy", "sell"}:
+                    raise TradeValidationError(f"trade[{index}] identity is invalid")
+                evidence = (int(timestamp), price, amount, side)
+                previous = seen.get(trade_id)
+                if previous == evidence:
+                    continue
+                if previous is not None:
+                    raise TradeValidationError(
+                        f"trade[{index}] id conflicts within update"
+                    )
+                seen[trade_id] = evidence
+                normalized.append({
+                    "id": trade_id,
+                    "timestamp": int(timestamp),
+                    "price": price,
+                    "amount": amount,
+                    "side": side,
+                })
+        except (OrderBookValidationError, TradeValidationError) as exc:
+            self._mark_trade_unhealthy(symbol, type(exc).__name__)
+            self._log(f"invalid trade update for {symbol}: {exc}", "WARN")
+            return False
+        normalized.sort(key=lambda row: (row["timestamp"], row["id"]))
+        received_time = self._iso8601(received_ms)
+        # A websocket update can straddle UTC midnight. Split it before the
+        # partition writer sees it so every embedded trade belongs to the
+        # partition selected by the event exchange time.
+        groups: dict[str, list[dict]] = {}
+        for trade in normalized:
+            trade_day = self._iso8601(trade["timestamp"])[:10]
+            groups.setdefault(trade_day, []).append(trade)
+        try:
+            for trade_day, day_trades in sorted(groups.items()):
+                payload = {
+                    "venue": self.exchange_id,
+                    "symbol": symbol,
+                    "trades": day_trades,
+                    "stream_source": "ccxt_pro",
+                    "connection_epoch": self._connection_epoch,
+                    "continuity_status": "websocket_observed_id_deduplicated",
+                }
+                digest = hashlib.blake2s(
+                    json.dumps(
+                        payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8"),
+                    digest_size=8,
+                ).hexdigest()
+                latest_ms = max(row["timestamp"] for row in day_trades)
+                event = VenueEvent(
+                    event_id=(
+                        f"trades:{self.exchange_id}:{self._market_id(symbol)}:"
+                        f"{trade_day}:{latest_ms}:{received_ms}:{digest}"
+                    ),
+                    kind="trades",
+                    market_id=self._market_id(symbol),
+                    exchange_time=self._iso8601(latest_ms),
+                    received_time=received_time,
+                    payload=payload,
+                )
+                self.writer.write(event)
+        except Exception as exc:
+            self._mark_trade_unhealthy(symbol, type(exc).__name__)
+            self._log(f"trade storage error for {symbol}: {type(exc).__name__}", "WARN")
+            return False
+        self._mark_trade_healthy(symbol, observed_at_monotonic=time.monotonic())
+        return True
+
     def _log_invalid_snapshot(
         self,
         symbol: str,
@@ -437,6 +584,8 @@ class L2ShadowCollector:
         with self._health_lock:
             self._health_seen_symbols.clear()
             self._health_last_persist_monotonic.clear()
+            self._health_trade_seen_symbols.clear()
+            self._health_last_trade_monotonic.clear()
             self._health_error_type = error_type
             self._health_reconnect_attempts = reconnect_attempts
             self._health_ok_logged = False
@@ -450,11 +599,13 @@ class L2ShadowCollector:
         # A transport reconnect leaves an unobserved sequence gap. Start a
         # fresh sampling generation so the first new snapshot is immediate and
         # never compares its nonce with evidence from the previous connection.
+        next_epoch = getattr(self.writer, "next_connection_epoch", None)
+        epoch = next_epoch() if callable(next_epoch) else self._connection_epoch + 1
         with self._state_lock:
             self._last_persist.clear()
             self._last_nonce.clear()
             self._updates_since_sample.clear()
-            self._connection_epoch += 1
+            self._connection_epoch = int(epoch)
         self._begin_health_check(
             error_type=error_type,
             reconnect_attempts=reconnect_attempts,
@@ -503,6 +654,28 @@ class L2ShadowCollector:
             self._health_ok_logged = False
             self._health_error_type = str(error_type or "InvalidL2Sample")[:100]
 
+    def _mark_trade_healthy(
+        self,
+        symbol: str,
+        *,
+        observed_at_monotonic: float,
+    ) -> None:
+        desired = set(self._symbol_snapshot())
+        if symbol not in desired:
+            return
+        with self._health_lock:
+            self._health_trade_seen_symbols.add(symbol)
+            self._health_last_trade_monotonic[symbol] = observed_at_monotonic
+
+    def _mark_trade_unhealthy(self, symbol: str, error_type: str) -> None:
+        desired = set(self._symbol_snapshot())
+        if symbol not in desired:
+            return
+        with self._health_lock:
+            self._health_trade_seen_symbols.discard(symbol)
+            self._health_last_trade_monotonic.pop(symbol, None)
+            self._health_error_type = str(error_type or "InvalidTradeSample")[:100]
+
     def _make_async_exchange(self):
         config = build_public_async_config(self.exchange)
         if self._async_exchange_factory is not None:
@@ -517,25 +690,53 @@ class L2ShadowCollector:
     async def _watch_symbol(self, async_exchange, symbol: str) -> None:
         while not self._should_stop() and symbol in self._symbol_snapshot():
             book = await async_exchange.watch_order_book(symbol, self.depth_levels)
+            if self._should_stop() or symbol not in self._symbol_snapshot():
+                return
             self.record_order_book(symbol, book)
 
+    async def _watch_trade_symbol(self, async_exchange, symbol: str) -> None:
+        watcher = getattr(async_exchange, "watch_trades", None)
+        if not callable(watcher):
+            while not self._should_stop() and symbol in self._symbol_snapshot():
+                await asyncio.sleep(0.25)
+            return
+        while not self._should_stop() and symbol in self._symbol_snapshot():
+            trades = await watcher(symbol)
+            if self._should_stop() or symbol not in self._symbol_snapshot():
+                return
+            self.record_trades(symbol, trades)
+
     async def _watch_session(self, async_exchange) -> None:
-        tasks: dict[str, asyncio.Task] = {}
+        tasks: dict[tuple[str, str], asyncio.Task] = {}
+        task_started: dict[tuple[str, str], float] = {}
         try:
             while not self._should_stop():
                 desired = set(self._symbol_snapshot())
                 retired = []
-                for symbol in set(tasks) - desired:
-                    task = tasks.pop(symbol)
+                for key in set(tasks):
+                    if key[1] in desired:
+                        continue
+                    task = tasks.pop(key)
+                    task_started.pop(key, None)
                     task.cancel()
                     retired.append(task)
                 if retired:
                     await asyncio.gather(*retired, return_exceptions=True)
-                for symbol in desired - set(tasks):
-                    tasks[symbol] = asyncio.create_task(
-                        self._watch_symbol(async_exchange, symbol),
-                        name=f"l2-{self.exchange_id}-{symbol}",
-                    )
+                for symbol in desired:
+                    l2_key = ("l2", symbol)
+                    trade_key = ("trades", symbol)
+                    if l2_key not in tasks:
+                        tasks[l2_key] = asyncio.create_task(
+                            self._watch_symbol(async_exchange, symbol),
+                            name=f"l2-{self.exchange_id}-{symbol}",
+                        )
+                        task_started[l2_key] = time.monotonic()
+                    if trade_key not in tasks:
+                        tasks[trade_key] = asyncio.create_task(
+                            self._watch_trade_symbol(async_exchange, symbol),
+                            name=f"trades-{self.exchange_id}-{symbol}",
+                        )
+                        task_started[trade_key] = time.monotonic()
                 if not tasks:
                     await asyncio.sleep(0.1)
                     continue
@@ -544,9 +745,27 @@ class L2ShadowCollector:
                     timeout=0.25,
                     return_when=asyncio.FIRST_EXCEPTION,
                 )
+                now = time.monotonic()
+                with self._health_lock:
+                    l2_last = dict(self._health_last_persist_monotonic)
+                stale = [
+                    symbol
+                    for kind, symbol in tasks
+                    if kind == "l2"
+                    and now - l2_last.get(
+                        symbol,
+                        task_started.get((kind, symbol), now),
+                    ) > self._health_stale_after_seconds
+                ]
+                if stale:
+                    raise TimeoutError(
+                        "L2 watcher stale for " + ",".join(sorted(stale))
+                    )
                 for task in done:
-                    symbol = next(key for key, value in tasks.items() if value is task)
-                    tasks.pop(symbol, None)
+                    key = next(key for key, value in tasks.items() if value is task)
+                    kind, symbol = key
+                    tasks.pop(key, None)
+                    task_started.pop(key, None)
                     if task.cancelled():
                         continue
                     exception = task.exception()
@@ -556,7 +775,9 @@ class L2ShadowCollector:
                         symbol in set(self._symbol_snapshot())
                         and not self._should_stop()
                     ):
-                        raise RuntimeError(f"L2 watcher ended unexpectedly for {symbol}")
+                        raise RuntimeError(
+                            f"{kind} watcher ended unexpectedly for {symbol}"
+                        )
         finally:
             for task in tasks.values():
                 task.cancel()
@@ -700,15 +921,17 @@ class L2ShadowCollector:
         )
         self._thread.start()
 
-    def stop(self, *, timeout: float = 5.0) -> None:
+    def stop(self, *, timeout: float = 5.0) -> bool:
         self._stop_event.set()
         thread = self._thread
         if thread and thread is not threading.current_thread():
             thread.join(max(0.0, timeout))
         if self.is_alive:
             self._log("shutdown timeout; daemon thread remains isolated", "WARN")
+            return False
         else:
             self.close()
+            return True
 
     def close(self) -> None:
         if self._owns_writer:

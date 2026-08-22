@@ -937,6 +937,37 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             except (TypeError, ValueError, OverflowError):
                 return 0
 
+        def bounded_strings(value, *, limit: int = 32) -> list[str]:
+            if not isinstance(value, (list, tuple)):
+                return []
+            return [str(item)[:100] for item in value[:limit]]
+
+        raw_rest = report.get("rest_data_health")
+        raw_rest = raw_rest if isinstance(raw_rest, dict) else {}
+        raw_stream = report.get("stream_health")
+        raw_stream = raw_stream if isinstance(raw_stream, dict) else {}
+        raw_integrity = report.get("integrity_health")
+        raw_integrity = raw_integrity if isinstance(raw_integrity, dict) else {}
+        raw_storage = report.get("storage_health")
+        raw_storage = raw_storage if isinstance(raw_storage, dict) else {}
+
+        def bounded_nonnegative(value) -> int | None:
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        def bounded_float(value) -> float | None:
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return parsed if math.isfinite(parsed) else None
+
         with self._venue_health_lock:
             self._venue_health = {
                 "ok": report.get("ok") is True,
@@ -949,6 +980,78 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 "l2_data_healthy": report.get(
                     "l2_data_healthy", True
                 ) is True,
+                "trade_stream_healthy": report.get(
+                    "trade_stream_healthy", True
+                ) is True,
+                "rest_data_health": {
+                    "ok": raw_rest.get("ok") is True,
+                    "stale_after_seconds": bounded_float(
+                        raw_rest.get("stale_after_seconds")
+                    ),
+                    "missing_or_invalid": bounded_strings(
+                        raw_rest.get("missing_or_invalid")
+                    ),
+                    "trade_audit_warnings": bounded_strings(
+                        raw_rest.get("trade_audit_warnings")
+                    ),
+                },
+                "stream_health": {
+                    "connection_epoch": bounded_nonnegative(
+                        raw_stream.get("connection_epoch")
+                    ),
+                    "l2_missing_or_stale": bounded_strings(
+                        raw_stream.get("l2_missing_or_stale")
+                    ),
+                    "trade_missing_or_stale": bounded_strings(
+                        raw_stream.get("trade_missing_or_stale")
+                    ),
+                },
+                "integrity_health": {
+                    "ok": raw_integrity.get("ok") is True,
+                    "sealed_days": bounded_nonnegative(
+                        raw_integrity.get("sealed_days")
+                    ) or 0,
+                    "valid_days": bounded_nonnegative(
+                        raw_integrity.get("valid_days")
+                    ) or 0,
+                    "invalid_days": bounded_strings(
+                        raw_integrity.get("invalid_days")
+                    ),
+                    "latest_day": str(
+                        raw_integrity.get("latest_day") or ""
+                    )[:16],
+                },
+                "integrity_errors_total": nonnegative_int(
+                    "integrity_errors_total"
+                ),
+                "last_integrity_error": str(
+                    report.get("last_integrity_error") or ""
+                )[:200],
+                "storage_health": {
+                    "capacity_ok": (
+                        raw_storage.get("capacity_ok")
+                        if isinstance(raw_storage.get("capacity_ok"), bool)
+                        else None
+                    ),
+                    "total_bytes": bounded_nonnegative(
+                        raw_storage.get("total_bytes")
+                    ),
+                    "max_storage_bytes": bounded_nonnegative(
+                        raw_storage.get("max_storage_bytes")
+                    ),
+                    "closed_days_observed": bounded_nonnegative(
+                        raw_storage.get("closed_days_observed")
+                    ),
+                    "peak_closed_day_bytes": bounded_nonnegative(
+                        raw_storage.get("peak_closed_day_bytes")
+                    ),
+                    "projected_required_bytes": bounded_nonnegative(
+                        raw_storage.get("projected_required_bytes")
+                    ),
+                    "headroom_ratio": bounded_float(
+                        raw_storage.get("headroom_ratio")
+                    ),
+                },
                 "consecutive_capture_errors": nonnegative_int(
                     "consecutive_capture_errors"
                 ),
@@ -1445,7 +1548,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     self.C("VENUE_RECORDER_RETENTION_DAYS", 30)
                 ),
                 max_storage_gib=float(
-                    self.C("VENUE_RECORDER_MAX_STORAGE_GIB", 20.0)
+                    self.C("VENUE_RECORDER_MAX_STORAGE_GIB", 150.0)
                 ),
                 log_event=log_event,
                 l2_mode=str(self.C("VENUE_L2_MODE", "shadow")),

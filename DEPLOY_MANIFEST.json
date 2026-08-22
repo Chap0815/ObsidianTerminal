@@ -1,13 +1,13 @@
 {
-  "build_id": "57282772270396d9",
-  "created_at": "2026-08-22 10:19:56",
+  "build_id": "1ed64088bef71f41",
+  "created_at": "2026-08-22 14:25:47",
   "source": "update_deploy_manifest.py",
-  "file_count": 193,
+  "file_count": 194,
   "files": [
     {
       "path": "bot_config.default.json",
-      "sha256": "9085fad7828cd122379f31b09c0c8174d77465b6a4e290d8a9fc749b83bc6bbc",
-      "bytes": 12142
+      "sha256": "d6a0f692e3f0cc49a1d0491af9094bd7809db5bb06df986b795302e651c705a4",
+      "bytes": 12143
     },
     {
       "path": "bot_utils/__init__.py",
@@ -186,8 +186,8 @@
     },
     {
       "path": "bots/main_bot_futures.py",
-      "sha256": "f6ef7fdec5bfffaad79163b93955a89411749d33a677a949165fbb88d873ab1c",
-      "bytes": 4686
+      "sha256": "3d705135cf563a3b41848164d6c687a091d672cd144857d7f644d06e29ded386",
+      "bytes": 4687
     },
     {
       "path": "bots/main_bot_trendfut.py",
@@ -256,8 +256,8 @@
     },
     {
       "path": "core/futures_bot.py",
-      "sha256": "20a444a81cae766f3ff6cd83e4c89b1f39bbc3ba70301a77a491605dace56f0f",
-      "bytes": 78201
+      "sha256": "78fd57dc7cc7c0fa927c6931f8751872092fa8f1269ea8d0f0aa5433793c6f2b",
+      "bytes": 82771
     },
     {
       "path": "core/futures_bot_exits.py",
@@ -381,8 +381,8 @@
     },
     {
       "path": "launcher/config/settings.py",
-      "sha256": "8c3818d97695d67e33d47698530d5a647259aae503051349436aa40a290b7539",
-      "bytes": 59452
+      "sha256": "2aae154fec8d0f834c281695ca2f4fad255cbc8736ce2bfe868d58d75e49dee7",
+      "bytes": 59453
     },
     {
       "path": "launcher/core/__init__.py",
@@ -725,6 +725,11 @@
       "bytes": 9286
     },
     {
+      "path": "trading/capture_integrity.py",
+      "sha256": "8743b02971fd7a82462c0de50efa3185b5e1311d877c94c072641e6eb06b3361",
+      "bytes": 22458
+    },
+    {
       "path": "trading/capture_replay_validation.py",
       "sha256": "84e1513ba4195cb728b0680a4e503ec7b0f3a3c745a3c328f4921ebb69862e74",
       "bytes": 53481
@@ -841,8 +846,8 @@
     },
     {
       "path": "trading/l2_stream.py",
-      "sha256": "5b531d2ff517686f99556f0eb0a66347323a26db5a4714ef67384371022d5c6b",
-      "bytes": 28326
+      "sha256": "04e6e9f1c55419116fc82c16ae246cc5bfad7807d3be3868404098333705a15d",
+      "bytes": 38341
     },
     {
       "path": "trading/market_filters.py",
@@ -936,8 +941,8 @@
     },
     {
       "path": "trading/venue_recorder.py",
-      "sha256": "a9a1680c0d9636acf783c9102a8e394d56320b6a7bb7e19cf8be18859444879f",
-      "bytes": 46701
+      "sha256": "f52958760f20105822d22a24234ba9d5301304adede55ad2576b0f47beaf979d",
+      "bytes": 62775
     },
     {
       "path": "trading/vol_target.py",

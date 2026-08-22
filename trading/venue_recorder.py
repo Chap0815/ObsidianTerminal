@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import sqlite3
 import threading
 import time
@@ -39,13 +40,71 @@ class SQLitePartitionWriter:
         root: str | Path,
         *,
         retention_days: int = 30,
-        max_storage_gib: float = 20.0,
+        max_storage_gib: float = 150.0,
     ) -> None:
         self.root = Path(root)
         self.retention_days = max(1, int(retention_days))
         self.max_storage_bytes = max(0, int(float(max_storage_gib) * 1024**3))
         self._connections: dict[Path, sqlite3.Connection] = {}
         self._lock = threading.Lock()
+        self._control_path = self.root / "capture_state.json"
+
+    def _load_control_state_locked(self) -> dict:
+        try:
+            raw = self._control_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {"schema_version": 1, "connection_epoch": 0}
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise RuntimeError("capture control state is invalid") from exc
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            raise RuntimeError("capture control state schema is invalid")
+        epoch = value.get("connection_epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            raise RuntimeError("capture connection epoch is invalid")
+        return dict(value)
+
+    def _write_control_state_locked(self, state: dict) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(
+            state,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        temporary = self.root / (
+            f".{self._control_path.name}.{os.getpid()}."
+            f"{threading.get_ident()}.tmp"
+        )
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self._control_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        try:
+            directory_fd = os.open(self.root, os.O_RDONLY)
+        except (AttributeError, OSError):
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def next_connection_epoch(self) -> int:
+        """Return a process-independent monotonic transport epoch."""
+        with self._lock:
+            state = self._load_control_state_locked()
+            epoch = int(state["connection_epoch"]) + 1
+            state["connection_epoch"] = epoch
+            state["updated_at"] = datetime.now(timezone.utc).isoformat().replace(
+                "+00:00", "Z"
+            )
+            self._write_control_state_locked(state)
+            return epoch
 
     @staticmethod
     def _parse_event_time(value) -> datetime | None:
@@ -102,7 +161,11 @@ class SQLitePartitionWriter:
         # workers legitimately share this connection across two threads.
         connection = sqlite3.connect(path, timeout=15.0, check_same_thread=False)
         connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=NORMAL")
+        # Capture evidence favours durability over peak insert throughput.  In
+        # WAL mode FULL syncs the WAL before a commit is acknowledged, so an
+        # abrupt host/power loss cannot silently discard an already reported
+        # successful sample.
+        connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA busy_timeout=15000")
         connection.execute(
             """CREATE TABLE IF NOT EXISTS venue_events (
@@ -225,6 +288,71 @@ class SQLitePartitionWriter:
         if first_error is not None:
             raise first_error
 
+    def _stage_delete_day(self, day, paths: list[Path]) -> None:
+        """Remove one expired UTC dataset without leaving active fragments."""
+        staging = self.root / f".retention_trash-{day.isoformat()}"
+        if staging.exists():
+            first_error = None
+            for item in sorted(staging.iterdir()):
+                try:
+                    item.unlink()
+                except OSError as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+            staging.rmdir()
+        staging.mkdir(parents=False, exist_ok=False)
+        moved: list[tuple[Path, Path]] = []
+        try:
+            for path in paths:
+                for source in (
+                    path,
+                    Path(f"{path}-wal"),
+                    Path(f"{path}-shm"),
+                ):
+                    if not source.exists():
+                        continue
+                    target = staging / f"{path.parent.name}__{source.name}"
+                    source.replace(target)
+                    moved.append((source, target))
+        except OSError:
+            rollback_error = None
+            for source, target in reversed(moved):
+                try:
+                    target.replace(source)
+                except OSError as exc:
+                    if rollback_error is None:
+                        rollback_error = exc
+            try:
+                staging.rmdir()
+            except OSError as exc:
+                if rollback_error is None:
+                    rollback_error = exc
+            if rollback_error is not None:
+                raise RuntimeError(
+                    "expired capture day staging rollback failed"
+                ) from rollback_error
+            raise
+
+        first_error = None
+        for _source, target in moved:
+            try:
+                target.unlink()
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        try:
+            staging.rmdir()
+        except OSError as exc:
+            if first_error is None:
+                first_error = exc
+        if first_error is not None:
+            # The active capture tree is still coherent: every stream of the
+            # expired day has moved out together. A later retention pass cleans
+            # the private staging directory before doing more work.
+            raise first_error
+
     def enforce_retention(self, *, now: datetime | None = None) -> None:
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         cutoff = (current - timedelta(days=self.retention_days)).date()
@@ -274,27 +402,28 @@ class SQLitePartitionWriter:
                         first_cleanup_error = exc
 
             partitions = sorted(self.root.glob("*/*.sqlite3"))
+            expired_by_day: dict[object, list[Path]] = {}
             for path in partitions:
                 partition_date = self._partition_date(path)
-                if (
-                    path not in failed_cleanup_paths
-                    and partition_date is not None
-                    and partition_date.date() < cutoff
-                ):
-                    try:
-                        self._delete_partition(path)
-                    except (OSError, sqlite3.Error) as exc:
-                        failed_cleanup_paths.add(path)
-                        if first_cleanup_error is None:
-                            first_cleanup_error = exc
+                if partition_date is not None and partition_date.date() < cutoff:
+                    expired_by_day.setdefault(partition_date.date(), []).append(path)
+            # Retention is a dataset operation, not a file operation.  Remove
+            # every available stream of an expired UTC day together; never
+            # trim one stream from a still-required day merely to meet quota.
+            for day in sorted(expired_by_day):
+                paths = sorted(expired_by_day[day])
+                if any(path in failed_cleanup_paths for path in paths):
+                    continue
+                try:
+                    self._stage_delete_day(day, paths)
+                except (OSError, sqlite3.Error, RuntimeError) as exc:
+                    failed_cleanup_paths.update(paths)
+                    if first_cleanup_error is None:
+                        first_cleanup_error = exc
             if self.max_storage_bytes <= 0:
                 if first_cleanup_error is not None:
                     raise first_cleanup_error
                 return
-            partitions = sorted(
-                self.root.glob("*/*.sqlite3"),
-                key=lambda path: (self._partition_date(path) or current, str(path)),
-            )
             def _storage_bytes() -> int:
                 total = 0
                 for item in self.root.glob("*/*"):
@@ -305,22 +434,61 @@ class SQLitePartitionWriter:
                             pass
                 return total
             total = _storage_bytes()
-            for path in partitions:
-                partition_date = self._partition_date(path)
-                if total <= self.max_storage_bytes:
-                    break
-                if path in failed_cleanup_paths:
-                    continue
-                if partition_date is None or partition_date.date() >= current.date():
-                    continue
-                try:
-                    self._delete_partition(path)
-                except (OSError, sqlite3.Error) as exc:
-                    if first_cleanup_error is None:
-                        first_cleanup_error = exc
-                total = _storage_bytes()
+            if total > self.max_storage_bytes and first_cleanup_error is None:
+                raise RuntimeError(
+                    "venue capture storage cap cannot be met without deleting "
+                    "the required retention window"
+                )
             if first_cleanup_error is not None:
                 raise first_cleanup_error
+
+    def storage_health(self, *, now: datetime | None = None) -> dict:
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        daily_bytes: dict[str, int] = {}
+        total = 0
+        for item in self.root.glob("*/*"):
+            if not item.is_file():
+                continue
+            try:
+                size = item.stat().st_size
+            except OSError:
+                continue
+            total += size
+            name = item.name.split(".sqlite3", 1)[0]
+            try:
+                datetime.strptime(name, "%Y-%m-%d")
+            except ValueError:
+                continue
+            daily_bytes[name] = daily_bytes.get(name, 0) + size
+        closed = [
+            size
+            for day, size in daily_bytes.items()
+            if day < current.date().isoformat()
+        ]
+        peak = max(closed, default=None)
+        projected = (
+            int(peak * (self.retention_days + 1) * 1.2)
+            if peak is not None and len(closed) >= 3
+            else None
+        )
+        capacity_ok = (
+            None
+            if projected is None or self.max_storage_bytes <= 0
+            else self.max_storage_bytes >= projected
+        )
+        return {
+            "total_bytes": total,
+            "max_storage_bytes": self.max_storage_bytes,
+            "closed_days_observed": len(closed),
+            "peak_closed_day_bytes": peak,
+            "projected_required_bytes": projected,
+            "capacity_ok": capacity_ok,
+            "headroom_ratio": (
+                None
+                if not projected or self.max_storage_bytes <= 0
+                else self.max_storage_bytes / projected
+            ),
+        }
 
     def close(self) -> bool:
         with self._lock:
@@ -353,7 +521,7 @@ class VenueRecorder:
         micro_interval_seconds: float = 6.0,
         overview_interval_seconds: float = 60.0,
         retention_days: int = 30,
-        max_storage_gib: float = 20.0,
+        max_storage_gib: float = 150.0,
         log_event=None,
         writer=None,
         l2_mode: str = "disabled",
@@ -380,6 +548,19 @@ class VenueRecorder:
         self._universe: list[str] = []
         self._cursor = 0
         self._next_retention_check = 0.0
+        self._rest_health_lock = threading.Lock()
+        self._rest_health: dict[tuple[str, str], dict] = {}
+        self._integrity_lock = threading.Lock()
+        self._integrity_thread: threading.Thread | None = None
+        self._integrity_health = {
+            "ok": True,
+            "sealed_days": 0,
+            "valid_days": 0,
+            "invalid_days": [],
+            "latest_day": None,
+        }
+        self._integrity_errors_total = 0
+        self._last_integrity_error = ""
         self.l2_mode = str(l2_mode).strip().lower()
         self._l2_collector = None
         if self.l2_mode == "shadow":
@@ -503,6 +684,8 @@ class VenueRecorder:
         market_id: str | None = None,
     ) -> Path:
         market_id = market_id or self._market_id(self.exchange, symbol)
+        if ended_ms < started_ms and "wallclock_non_monotonic" not in flags:
+            flags = (*flags, "wallclock_non_monotonic")
         raw_event_clock = exchange_ms if exchange_ms is not None else ended_ms
         invalid_exchange_clock = False
         stale_exchange_clock = False
@@ -765,6 +948,7 @@ class VenueRecorder:
             ended_ms=ended_book,
             flags=tuple(flags),
         )
+        self._record_rest_observation(symbol, "depth", flags)
         self._require_api_budget("venue_recorder_fetch_trades")
         started_trades = int(time.time() * 1000)
         trades = self.exchange.fetch_trades(symbol, limit=100)
@@ -852,6 +1036,11 @@ class VenueRecorder:
             trade_flags.append("conflicting_trade_id")
         if truncated_trade_payload:
             trade_flags.append("truncated_trade_payload")
+        # The MEXC swap endpoint is a latest-N window.  A full page cannot
+        # prove that no older trade was displaced between polls, even though
+        # CCXT correctly returns no more than the requested limit.
+        if isinstance(trades, (list, tuple)) and len(trades) >= 100:
+            trade_flags.append("saturated_trade_payload")
         trades_path = self._write_event(
             "trades",
             symbol,
@@ -861,7 +1050,128 @@ class VenueRecorder:
             ended_ms=ended_trades,
             flags=tuple(trade_flags),
         )
+        self._record_rest_observation(symbol, "trades", trade_flags)
         return book_path, trades_path
+
+    def _record_rest_observation(
+        self,
+        symbol: str,
+        stream: str,
+        flags,
+    ) -> None:
+        now = time.monotonic()
+        normalized_flags = tuple(sorted({str(flag) for flag in flags if flag}))
+        with self._rest_health_lock:
+            self._rest_health[(str(symbol), str(stream))] = {
+                "last_attempt_monotonic": now,
+                "last_valid_monotonic": None if normalized_flags else now,
+                "flags": normalized_flags,
+            }
+
+    def _rest_data_health(self) -> dict:
+        desired = tuple(self._universe)
+        now = time.monotonic()
+        stale_after = max(
+            30.0,
+            self.micro_interval * max(1, self.max_symbols) * 2.5,
+        )
+        markets = {}
+        with self._rest_health_lock:
+            observations_available = bool(self._rest_health)
+            for symbol in desired:
+                streams = {}
+                for stream in ("depth", "trades"):
+                    item = self._rest_health.get((symbol, stream))
+                    valid_at = item.get("last_valid_monotonic") if item else None
+                    age = None if valid_at is None else max(0.0, now - valid_at)
+                    streams[stream] = {
+                        "valid": age is not None and age <= stale_after,
+                        "age_seconds": age,
+                        "flags": list((item or {}).get("flags") or ()),
+                    }
+                markets[symbol] = streams
+        # REST order-book freshness is part of the core snapshot contract.
+        # REST trades are an independent reconciliation/audit window now that
+        # the lossless-path candidate is the public WebSocket trade stream.
+        missing = sorted(
+            f"{symbol}:depth"
+            for symbol, streams in markets.items()
+            if streams["depth"]["valid"] is not True
+        )
+        trade_audit_warnings = sorted(
+            f"{symbol}:trades"
+            for symbol, streams in markets.items()
+            if streams["trades"]["valid"] is not True
+        )
+        return {
+            "ok": not missing if observations_available else True,
+            "stale_after_seconds": stale_after,
+            "missing_or_invalid": missing,
+            "trade_audit_warnings": trade_audit_warnings,
+            "markets": markets,
+        }
+
+    def _run_integrity_check(self, writer_root: Path) -> None:
+        try:
+            from trading.capture_integrity import seal_closed_capture_days
+
+            health = seal_closed_capture_days(
+                writer_root,
+                max_symbols=self.max_symbols,
+                micro_interval_seconds=self.micro_interval,
+                l2_sample_interval_seconds=(
+                    self._l2_collector.sample_interval
+                    if self._l2_collector is not None
+                    else 1.0
+                ),
+            )
+        except Exception as exc:
+            with self._integrity_lock:
+                self._integrity_errors_total += 1
+                self._last_integrity_error = (
+                    f"{type(exc).__name__}: {str(exc)[:160]}"
+                )
+                self._integrity_health = {
+                    **self._integrity_health,
+                    "ok": False,
+                }
+            self._log_gap("capture integrity gap", exc)
+            return
+        with self._integrity_lock:
+            self._integrity_health = dict(health)
+            if health.get("ok") is True:
+                self._last_integrity_error = ""
+            else:
+                self._integrity_errors_total += 1
+                self._last_integrity_error = (
+                    "invalid sealed days: "
+                    + ",".join(health.get("invalid_days") or [])
+                )[:160]
+
+    def _schedule_integrity_check(self, writer_root) -> None:
+        with self._integrity_lock:
+            if self._integrity_thread and self._integrity_thread.is_alive():
+                return
+            thread = threading.Thread(
+                target=self._run_integrity_check,
+                args=(Path(writer_root),),
+                daemon=True,
+                name="VenueCaptureIntegrity",
+            )
+            self._integrity_thread = thread
+        thread.start()
+
+    def _integrity_status(self) -> tuple[dict, int, str]:
+        with self._integrity_lock:
+            health = dict(self._integrity_health)
+            thread = self._integrity_thread
+            if thread is not None and thread.is_alive():
+                health["worker_running"] = True
+            return (
+                health,
+                self._integrity_errors_total,
+                self._last_integrity_error,
+            )
 
     def run(self, shutdown_event: threading.Event) -> None:
         next_overview = 0.0
@@ -881,6 +1191,10 @@ class VenueRecorder:
         retention_ok = True
         retention_errors_total = 0
         last_retention_error = ""
+        storage_health = {
+            "capacity_ok": None,
+            "closed_days_observed": 0,
+        }
         l2_errors_consecutive = 0
         l2_errors_total = 0
         last_l2_error = ""
@@ -969,8 +1283,16 @@ class VenueRecorder:
                         enforce = getattr(self.writer, "enforce_retention", None)
                         if callable(enforce):
                             enforce()
+                        storage_marker = getattr(
+                            self.writer, "storage_health", None
+                        )
+                        if callable(storage_marker):
+                            storage_health = dict(storage_marker())
                         retention_ok = True
                         last_retention_error = ""
+                        writer_root = getattr(self.writer, "root", None)
+                        if writer_root is not None:
+                            self._schedule_integrity_check(writer_root)
                     except Exception as exc:
                         retry_seconds = 300.0
                         retention_ok = False
@@ -1044,12 +1366,21 @@ class VenueRecorder:
                     captures_total += 1
                     last_capture_success_wall_ts = time.time()
                     last_capture_error = ""
+                rest_data_health = self._rest_data_health()
+                (
+                    integrity_health,
+                    integrity_errors_total,
+                    last_integrity_error,
+                ) = self._integrity_status()
                 rest_ok = (
                     capture_errors_consecutive
                     < self.CAPTURE_FAILURE_THRESHOLD
+                    and rest_data_health["ok"] is True
                 )
                 l2_enabled = self._l2_collector is not None
                 l2_data_healthy = not l2_enabled
+                trade_stream_healthy = not l2_enabled
+                stream_health = {}
                 if l2_enabled:
                     healthy_marker = getattr(
                         self._l2_collector, "is_healthy", None
@@ -1067,6 +1398,28 @@ class VenueRecorder:
                             l2_data_healthy = False
                             note_l2_failure(exc)
                             self._log_gap("L2 health read gap", exc)
+                    trade_marker = getattr(
+                        self._l2_collector, "trades_healthy", False
+                    )
+                    try:
+                        trade_stream_healthy = bool(
+                            trade_marker()
+                            if callable(trade_marker)
+                            else trade_marker
+                        )
+                    except Exception as exc:
+                        trade_stream_healthy = False
+                        note_l2_failure(exc)
+                        self._log_gap("trade stream health read gap", exc)
+                    snapshot_marker = getattr(
+                        self._l2_collector, "health_snapshot", None
+                    )
+                    if callable(snapshot_marker):
+                        try:
+                            stream_health = dict(snapshot_marker())
+                        except Exception as exc:
+                            note_l2_failure(exc)
+                            self._log_gap("stream health snapshot gap", exc)
                 l2_ok = not l2_enabled or (
                     l2_started
                     and l2_errors_consecutive == 0
@@ -1074,20 +1427,38 @@ class VenueRecorder:
                 )
                 reason = (
                     "capture_error"
+                    if capture_errors_consecutive >= self.CAPTURE_FAILURE_THRESHOLD
+                    else "rest_market_gap"
                     if not rest_ok
                     else "l2_unavailable"
                     if not l2_ok
+                    else "trade_stream_unavailable"
+                    if not trade_stream_healthy
                     else "retention_error"
                     if not retention_ok
+                    else "capture_integrity_error"
+                    if integrity_health.get("ok") is not True
+                    else "capture_capacity_insufficient"
+                    if storage_health.get("capacity_ok") is False
                     else ""
                 )
                 self._report_health({
-                    "ok": rest_ok and l2_ok and retention_ok,
+                    "ok": (
+                        rest_ok
+                        and l2_ok
+                        and trade_stream_healthy
+                        and retention_ok
+                        and integrity_health.get("ok") is True
+                        and storage_health.get("capacity_ok") is not False
+                    ),
                     "reason": reason,
                     "rest_ok": rest_ok,
+                    "rest_data_health": rest_data_health,
                     "l2_enabled": l2_enabled,
                     "l2_ok": l2_ok,
                     "l2_data_healthy": l2_data_healthy,
+                    "trade_stream_healthy": trade_stream_healthy,
+                    "stream_health": stream_health,
                     "consecutive_capture_errors": capture_errors_consecutive,
                     "capture_errors_total": capture_errors_total,
                     "captures_total": captures_total,
@@ -1108,6 +1479,10 @@ class VenueRecorder:
                     "retention_ok": retention_ok,
                     "retention_errors_total": retention_errors_total,
                     "last_retention_error": last_retention_error,
+                    "integrity_health": dict(integrity_health),
+                    "integrity_errors_total": integrity_errors_total,
+                    "last_integrity_error": last_integrity_error,
+                    "storage_health": dict(storage_health),
                     "l2_consecutive_errors": l2_errors_consecutive,
                     "l2_errors_total": l2_errors_total,
                     "last_l2_error": last_l2_error,
@@ -1116,13 +1491,20 @@ class VenueRecorder:
                 })
                 shutdown_event.wait(self.micro_interval)
         finally:
+            producers_quiescent = True
             if self._l2_collector is not None:
                 try:
-                    self._l2_collector.stop(timeout=5.0)
+                    stopped = self._l2_collector.stop(timeout=15.0)
+                    producers_quiescent = stopped is not False
+                    if not producers_quiescent:
+                        raise RuntimeError(
+                            "capture producer remains alive after shutdown timeout"
+                        )
                 except Exception as exc:
+                    producers_quiescent = False
                     self._log_gap("L2 stop gap", exc)
             close = getattr(self.writer, "close", None)
-            if callable(close):
+            if producers_quiescent and callable(close):
                 try:
                     closed = close()
                     if closed is False:
