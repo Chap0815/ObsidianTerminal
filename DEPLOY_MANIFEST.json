@@ -1,6 +1,6 @@
 {
-  "build_id": "015a871ade58677e",
-  "created_at": "2026-08-16 15:22:51",
+  "build_id": "57282772270396d9",
+  "created_at": "2026-08-22 10:19:56",
   "source": "update_deploy_manifest.py",
   "file_count": 193,
   "files": [
@@ -241,8 +241,8 @@
     },
     {
       "path": "core/cross_bot.py",
-      "sha256": "fc4bb2e2a996d250d73f0911accfcdb00fc03ac87c6da6cff3c4723495987ba3",
-      "bytes": 199974
+      "sha256": "460b117b008566b801454e3ce38e746401a89ccb6335ccb41197e83de40c19ea",
+      "bytes": 201908
     },
     {
       "path": "core/database.py",
@@ -951,8 +951,8 @@
     },
     {
       "path": "trading/xsec_signal.py",
-      "sha256": "47a590555082c05aa8ea63412d51e438b64b73322873f2e6c62ac8852f84c473",
-      "bytes": 10466
+      "sha256": "63a6772fc7f60af0e5e032e755d710f2945cffad53e59c1d9e54388b4cda689a",
+      "bytes": 10704
     },
     {
       "path": "update.bat",

@@ -1492,6 +1492,45 @@ class CrossBot(FuturesBot):
         state_load_error = str(
             getattr(self, "_rebalance_state_load_error", "") or ""
         )
+        crash_flat = bool(getattr(self, "_cross_crash_flat", False))
+        raw_last_slot = getattr(self, "_last_rebalance_slot", None)
+        last_slot = (
+            raw_last_slot
+            if isinstance(raw_last_slot, int)
+            and not isinstance(raw_last_slot, bool)
+            and raw_last_slot >= 0
+            else None
+        )
+        current_slot = None
+        next_rebalance_wall_ts = None
+        seconds_to_next_rebalance = None
+        try:
+            interval = self._rebalance_interval_sec()
+            now = float(time.time())
+            if (
+                isinstance(interval, bool)
+                or not isinstance(interval, int)
+                or interval <= 0
+                or not math.isfinite(now)
+            ):
+                raise ValueError("invalid rebalance schedule")
+            current_slot = int(now) // interval
+            if last_slot is not None:
+                next_rebalance_wall_ts = float((last_slot + 1) * interval)
+                seconds_to_next_rebalance = max(
+                    0.0,
+                    next_rebalance_wall_ts - now,
+                )
+        except Exception:
+            current_slot = None
+            next_rebalance_wall_ts = None
+            seconds_to_next_rebalance = None
+        crash_reentry_ready = bool(
+            crash_flat
+            and last_slot is not None
+            and current_slot is not None
+            and current_slot != last_slot
+        )
         return {
             "ok": (
                 errors == 0
@@ -1504,6 +1543,12 @@ class CrossBot(FuturesBot):
             "rebalance_slot_persist_pending": slot_persist_pending,
             "rebalance_state_persist_pending": state_persist_pending,
             "rebalance_state_load_error": state_load_error,
+            "crash_flat": crash_flat,
+            "last_rebalance_slot": last_slot,
+            "current_rebalance_slot": current_slot,
+            "next_rebalance_wall_ts": next_rebalance_wall_ts,
+            "seconds_to_next_rebalance": seconds_to_next_rebalance,
+            "crash_reentry_ready": crash_reentry_ready,
             "last_operation": str(getattr(
                 self, "_cross_scan_last_operation", "") or ""),
             "last_error": str(getattr(
@@ -1687,12 +1732,14 @@ class CrossBot(FuturesBot):
         if last_slot is not None:
             current_slot = int(time.time()) // CrossBot._rebalance_interval_sec(self)
             slot_advanced = current_slot != last_slot
+        was_crash_flat = bool(getattr(self, "_cross_crash_flat", False))
         staged_returns = advance_crash_history(
             list(self._recent_rebalance_returns),
             realized,
-            was_crash_flat=bool(getattr(self, "_cross_crash_flat", False)),
+            was_crash_flat=was_crash_flat,
             slot_advanced=slot_advanced,
         )
+        crash_reentry = bool(was_crash_flat and slot_advanced)
 
         # 2. target book from the pure signal module
         book = compute_target_book(prices, staged_returns, params)
@@ -1707,6 +1754,7 @@ class CrossBot(FuturesBot):
             f"long {book.longs} | short {book.shorts}", "SCAN")
         log_struct("cross_rebalance", longs=book.longs, shorts=book.shorts,
                    exposure_mult=book.exposure_mult,
+                   crash_reentry=crash_reentry,
                    recent_returns=staged_returns[-params.crash_window:],
                    strategy_shadow_version="xsec_regime_v2",
                    **self._cross_regime_snapshot)

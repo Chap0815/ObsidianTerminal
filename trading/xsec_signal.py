@@ -97,8 +97,10 @@ def crash_exposure(recent_rebalance_returns: List[float],
     """Own-momentum crash filter  exposure multiplier in {0.0, 1.0}.
 
     Go FLAT (0.0) when the strategy's own last ``crash_window`` rebalance
-    returns are net-negative; otherwise full exposure. Uses only PAST realized
-    returns (no look-ahead). During warmup (too few rebalances)  full exposure.
+    returns are net-negative; otherwise full exposure. A trailing neutral
+    sample is the persisted marker for one completed crash-flat slot and permits
+    the next anchored-slot re-entry without erasing the loss history. Uses only
+    PAST realized returns (no look-ahead). During warmup  full exposure.
     """
     if not params.crash_filter:
         return 1.0
@@ -119,6 +121,8 @@ def crash_exposure(recent_rebalance_returns: List[float],
         if not math.isfinite(value):
             return 0.0
         window.append(value)
+    if window[-1] == 0.0:
+        return 1.0
     return 0.0 if statistics.mean(window) < 0.0 else 1.0
 
 
@@ -132,10 +136,11 @@ def advance_crash_history(
 ) -> List[float]:
     """Return the next bounded own-momentum history.
 
-    A crash-flat book has no realized price move.  Recording one neutral sample
-    per *new anchored rebalance slot* lets the bounded filter cool down without
-    inventing profit and without allowing repeated polls/manual retries to age
-    the history.  This also makes the live transition reproducible in replay.
+    A crash-flat book has no realized price move. Recording one neutral marker
+    at the *next anchored rebalance slot* proves that one full slot elapsed and
+    permits re-entry without inventing profit or deleting the negative history.
+    Repeated polls/manual retries cannot age the history. This also makes the
+    live transition reproducible in replay.
     """
     if not isinstance(recent_rebalance_returns, list):
         raise ValueError("recent rebalance returns must be a list")
