@@ -948,6 +948,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         raw_stream = raw_stream if isinstance(raw_stream, dict) else {}
         raw_integrity = report.get("integrity_health")
         raw_integrity = raw_integrity if isinstance(raw_integrity, dict) else {}
+        raw_continuity = raw_integrity.get("continuity")
+        raw_continuity = (
+            raw_continuity if isinstance(raw_continuity, dict) else {}
+        )
         raw_storage = report.get("storage_health")
         raw_storage = raw_storage if isinstance(raw_storage, dict) else {}
 
@@ -1014,12 +1018,50 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     "valid_days": bounded_nonnegative(
                         raw_integrity.get("valid_days")
                     ) or 0,
+                    "usable_days": bounded_nonnegative(
+                        raw_integrity.get("usable_days")
+                    ) or 0,
+                    "degraded_days": bounded_strings(
+                        raw_integrity.get("degraded_days")
+                    ),
                     "invalid_days": bounded_strings(
                         raw_integrity.get("invalid_days")
                     ),
                     "latest_day": str(
                         raw_integrity.get("latest_day") or ""
                     )[:16],
+                    "continuity": {
+                        "window_days": bounded_nonnegative(
+                            raw_continuity.get("window_days")
+                        ),
+                        "observed_days": bounded_nonnegative(
+                            raw_continuity.get("observed_days")
+                        ),
+                        "maximum_degraded_days": bounded_nonnegative(
+                            raw_continuity.get("maximum_degraded_days")
+                        ),
+                        "degraded_days": bounded_nonnegative(
+                            raw_continuity.get("degraded_days")
+                        ),
+                        "invalid_days": bounded_nonnegative(
+                            raw_continuity.get("invalid_days")
+                        ),
+                        "ready": raw_continuity.get("ready") is True,
+                        "ok": (
+                            raw_continuity.get("ok")
+                            if isinstance(raw_continuity.get("ok"), bool)
+                            else None
+                        ),
+                        "reason": str(
+                            raw_continuity.get("reason") or ""
+                        )[:64],
+                        "start_day": str(
+                            raw_continuity.get("start_day") or ""
+                        )[:16],
+                        "end_day": str(
+                            raw_continuity.get("end_day") or ""
+                        )[:16],
+                    },
                 },
                 "integrity_errors_total": nonnegative_int(
                     "integrity_errors_total"

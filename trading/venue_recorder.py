@@ -556,8 +556,17 @@ class VenueRecorder:
             "ok": True,
             "sealed_days": 0,
             "valid_days": 0,
+            "usable_days": 0,
+            "degraded_days": [],
             "invalid_days": [],
             "latest_day": None,
+            "continuity": {
+                "window_days": 30,
+                "observed_days": 0,
+                "ready": False,
+                "ok": None,
+                "reason": "collecting_closed_days",
+            },
         }
         self._integrity_errors_total = 0
         self._last_integrity_error = ""

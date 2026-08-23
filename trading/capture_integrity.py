@@ -31,6 +31,12 @@ EVENT_SCHEMA = (
     ("payload_json", "TEXT", 1, 0),
 )
 SEAL_GRACE = timedelta(hours=1)
+GAP_EXCLUSION_BUFFER = timedelta(minutes=2)
+DAY_MAX_SINGLE_OUTAGE = timedelta(minutes=45)
+DAY_MAX_TOTAL_OUTAGE = timedelta(hours=1)
+DAY_MAX_OUTAGE_EPISODES = 6
+CONTINUITY_WINDOW_DAYS = 30
+CONTINUITY_MAX_DEGRADED_RATIO = 0.20
 
 
 def _reject_constant(value: str):
@@ -86,6 +92,179 @@ def _linklike(path: Path) -> bool:
 def _day_bounds(day: date) -> tuple[datetime, datetime]:
     start = datetime.combine(day, datetime_time.min, tzinfo=timezone.utc)
     return start, start + timedelta(days=1)
+
+
+def _iso_z(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _gap_record(
+    stream: str,
+    market: str,
+    reason: str,
+    started: datetime,
+    ended: datetime,
+) -> dict:
+    return {
+        "stream": stream,
+        "market": market,
+        "reason": reason,
+        "start": started,
+        "end": ended,
+    }
+
+
+def _merge_gap_windows(
+    gaps: list[dict],
+    day: date,
+    *,
+    buffer: timedelta,
+) -> list[dict]:
+    day_start, day_end = _day_bounds(day)
+    windows = []
+    for gap in gaps:
+        started = max(day_start, gap["start"] - buffer)
+        ended = min(day_end, gap["end"] + buffer)
+        if ended <= started:
+            continue
+        windows.append({
+            "start": started,
+            "end": ended,
+            "streams": {gap["stream"]},
+            "markets": {gap["market"]},
+            "reasons": {gap["reason"]},
+        })
+    windows.sort(key=lambda item: (item["start"], item["end"]))
+    merged = []
+    for window in windows:
+        if merged and window["start"] <= merged[-1]["end"]:
+            current = merged[-1]
+            current["end"] = max(current["end"], window["end"])
+            current["streams"].update(window["streams"])
+            current["markets"].update(window["markets"])
+            current["reasons"].update(window["reasons"])
+            continue
+        merged.append(window)
+    return merged
+
+
+def _availability_summary(
+    gaps: list[dict],
+    day: date,
+    *,
+    connection_epochs: list[int],
+) -> dict:
+    raw_windows = _merge_gap_windows(gaps, day, buffer=timedelta(0))
+    exclusions = _merge_gap_windows(
+        gaps,
+        day,
+        buffer=GAP_EXCLUSION_BUFFER,
+    )
+    maximum_gap_seconds = max(
+        (
+            max(0.0, (gap["end"] - gap["start"]).total_seconds())
+            for gap in gaps
+        ),
+        default=0.0,
+    )
+    total_gap_seconds = sum(
+        (window["end"] - window["start"]).total_seconds()
+        for window in raw_windows
+    )
+    within_daily_budget = (
+        maximum_gap_seconds <= DAY_MAX_SINGLE_OUTAGE.total_seconds()
+        and total_gap_seconds <= DAY_MAX_TOTAL_OUTAGE.total_seconds()
+        and len(raw_windows) <= DAY_MAX_OUTAGE_EPISODES
+    )
+    transport_changed = len(connection_epochs) > 1
+    serialized_exclusions = [
+        {
+            "start": _iso_z(window["start"]),
+            "end": _iso_z(window["end"]),
+            "duration_seconds": round(
+                (window["end"] - window["start"]).total_seconds(), 6
+            ),
+            "streams": sorted(window["streams"]),
+            "markets": sorted(window["markets"]),
+            "reasons": sorted(window["reasons"]),
+        }
+        for window in exclusions
+    ]
+    warnings = []
+    if transport_changed:
+        warnings.append("transport_connection_epoch_changed")
+    if gaps:
+        warnings.append("bounded_capture_outage_excluded")
+    return {
+        "contract": "bounded_outage_exclusion_v1",
+        "state": (
+            "degraded" if gaps or transport_changed else "complete"
+        ),
+        "within_daily_budget": within_daily_budget,
+        "maximum_single_outage_seconds": (
+            DAY_MAX_SINGLE_OUTAGE.total_seconds()
+        ),
+        "maximum_total_outage_seconds": DAY_MAX_TOTAL_OUTAGE.total_seconds(),
+        "maximum_outage_episodes": DAY_MAX_OUTAGE_EPISODES,
+        "outage_episodes": len(raw_windows),
+        "maximum_gap_seconds": round(maximum_gap_seconds, 6),
+        "total_gap_seconds": round(total_gap_seconds, 6),
+        "exclusion_buffer_seconds": GAP_EXCLUSION_BUFFER.total_seconds(),
+        "excluded_seconds": round(sum(
+            (window["end"] - window["start"]).total_seconds()
+            for window in exclusions
+        ), 6),
+        "transport_connection_epochs": connection_epochs,
+        "warnings": warnings,
+        "exclusion_intervals": serialized_exclusions,
+    }
+
+
+def capture_continuity_health(reports: list[dict]) -> dict:
+    """Grade the latest consecutive 30-day window without hiding gap days."""
+    normalized = []
+    for report in reports:
+        try:
+            parsed_day = date.fromisoformat(str(report.get("day") or ""))
+        except (TypeError, ValueError):
+            continue
+        normalized.append((parsed_day, str(report.get("status") or "")))
+    normalized.sort(key=lambda item: item[0])
+    window = normalized[-CONTINUITY_WINDOW_DAYS:]
+    maximum_degraded = math.floor(
+        CONTINUITY_WINDOW_DAYS * CONTINUITY_MAX_DEGRADED_RATIO
+    )
+    result = {
+        "window_days": CONTINUITY_WINDOW_DAYS,
+        "observed_days": len(window),
+        "maximum_degraded_days": maximum_degraded,
+        "ready": len(window) == CONTINUITY_WINDOW_DAYS,
+        "ok": None,
+        "reason": "collecting_closed_days",
+        "degraded_days": sum(
+            status == "usable_with_gaps" for _, status in window
+        ),
+        "invalid_days": sum(status == "invalid" for _, status in window),
+        "start_day": window[0][0].isoformat() if window else None,
+        "end_day": window[-1][0].isoformat() if window else None,
+    }
+    if not result["ready"]:
+        return result
+    expected = [
+        window[0][0] + timedelta(days=index)
+        for index in range(CONTINUITY_WINDOW_DAYS)
+    ]
+    if [day for day, _ in window] != expected:
+        result.update(ok=False, reason="closed_day_calendar_gap")
+        return result
+    if any(status not in {"valid", "usable_with_gaps"} for _, status in window):
+        result.update(ok=False, reason="invalid_closed_day")
+        return result
+    if result["degraded_days"] > maximum_degraded:
+        result.update(ok=False, reason="degraded_day_budget_exceeded")
+        return result
+    result.update(ok=True, reason="")
+    return result
 
 
 def _positive_number(value, label: str) -> float:
@@ -145,9 +324,10 @@ def _partition_rows(path: Path, stream: str, day: date) -> tuple[dict, dict]:
     connection.row_factory = sqlite3.Row
     samples: dict[str, list[datetime]] = defaultdict(list)
     overview_rows = []
-    websocket_trade_samples: dict[str, list[datetime]] = defaultdict(list)
     connection_epochs = set()
     warnings = set()
+    event_count = 0
+    websocket_trade_events = 0
     future_limit = datetime.now(timezone.utc) + timedelta(minutes=1)
     try:
         quick = connection.execute("PRAGMA quick_check").fetchall()
@@ -168,6 +348,7 @@ def _partition_rows(path: Path, stream: str, day: date) -> tuple[dict, dict]:
             "schema_version,quality_flags_json,payload_json "
             "FROM venue_events ORDER BY exchange_time,event_id"
         ):
+            event_count += 1
             if row["schema_version"] != 1:
                 raise ValueError(f"{stream} schema_version mismatch")
             exchange_time = _utc(row["exchange_time"])
@@ -200,7 +381,8 @@ def _partition_rows(path: Path, stream: str, day: date) -> tuple[dict, dict]:
                     raise ValueError("l2 quality contract is incomplete")
                 _validate_l2_payload(payload)
             market_id = str(row["market_id"])
-            samples[market_id].append(received_time)
+            if stream in {"depth", "l2_stream"}:
+                samples[market_id].append(received_time)
             if stream == "overview":
                 overview_rows.append({
                     "received_time": received_time,
@@ -210,6 +392,7 @@ def _partition_rows(path: Path, stream: str, day: date) -> tuple[dict, dict]:
                 stream == "trades"
                 and payload.get("stream_source") == "ccxt_pro"
             ):
+                websocket_trade_events += 1
                 trades = payload.get("trades")
                 if (
                     payload.get("continuity_status")
@@ -247,7 +430,6 @@ def _partition_rows(path: Path, stream: str, day: date) -> tuple[dict, dict]:
                     _positive_number(trade.get("amount"), "trade amount")
                     if trade.get("side") not in {"buy", "sell"}:
                         raise ValueError("trade side is invalid")
-                websocket_trade_samples[market_id].append(received_time)
             if stream in {"trades", "l2_stream"}:
                 epoch = payload.get("connection_epoch")
                 epoch_required = stream == "l2_stream" or (
@@ -264,7 +446,6 @@ def _partition_rows(path: Path, stream: str, day: date) -> tuple[dict, dict]:
                     connection_epochs.add(epoch)
     finally:
         connection.close()
-    event_count = sum(len(values) for values in samples.values())
     if not event_count:
         raise ValueError(f"{stream} partition is empty")
     return {
@@ -276,26 +457,48 @@ def _partition_rows(path: Path, stream: str, day: date) -> tuple[dict, dict]:
     }, {
         "samples": dict(samples),
         "overview": overview_rows,
-        "websocket_trade_samples": dict(websocket_trade_samples),
+        "websocket_trade_events": websocket_trade_events,
         "connection_epochs": sorted(connection_epochs),
     }
 
 
-def _membership_intervals(overview: list[dict], day: date) -> tuple[dict, list[str]]:
+def _membership_intervals(
+    overview: list[dict],
+    day: date,
+) -> tuple[dict, list[str], list[dict]]:
     day_start, day_end = _day_bounds(day)
     issues = []
+    gaps = []
     overview = sorted(overview, key=lambda row: row["received_time"])
     if overview[0]["received_time"] > day_start + timedelta(minutes=3):
-        issues.append("overview_start_boundary_gap")
+        gaps.append(_gap_record(
+            "overview",
+            "ALL_USDT_SWAPS",
+            "start_gap",
+            day_start,
+            overview[0]["received_time"],
+        ))
     if overview[-1]["received_time"] < day_end - timedelta(minutes=3):
-        issues.append("overview_end_boundary_gap")
+        gaps.append(_gap_record(
+            "overview",
+            "ALL_USDT_SWAPS",
+            "end_gap",
+            overview[-1]["received_time"],
+            day_end,
+        ))
     intervals: dict[str, list[tuple[datetime, datetime]]] = defaultdict(list)
     active: dict[str, datetime] = {}
     previous_time = None
     for row in overview:
         current = row["received_time"]
         if previous_time is not None and current - previous_time > timedelta(minutes=3):
-            issues.append("overview_cadence_gap")
+            gaps.append(_gap_record(
+                "overview",
+                "ALL_USDT_SWAPS",
+                "cadence_gap",
+                previous_time,
+                current,
+            ))
         previous_time = current
         payload = row["payload"]
         markets = payload.get("markets")
@@ -325,17 +528,17 @@ def _membership_intervals(overview: list[dict], day: date) -> tuple[dict, list[s
             active[market] = current
     for market, started in active.items():
         intervals[market].append((started, day_end))
-    return dict(intervals), sorted(set(issues))
+    return dict(intervals), sorted(set(issues)), gaps
 
 
-def _coverage_issues(
+def _coverage_gaps(
     by_market: dict[str, list[datetime]],
     intervals: dict[str, list[tuple[datetime, datetime]]],
     *,
     stream: str,
     maximum_gap: timedelta,
-) -> list[str]:
-    issues = []
+) -> list[dict]:
+    gaps = []
     for market, expected in intervals.items():
         samples = by_market.get(market, [])
         for started, ended in expected:
@@ -343,18 +546,24 @@ def _coverage_issues(
                 continue
             selected = [value for value in samples if started <= value <= ended]
             if not selected:
-                issues.append(f"{stream}:{market}:missing_interval")
+                gaps.append(_gap_record(
+                    stream, market, "missing_interval", started, ended
+                ))
                 continue
             if selected[0] - started > maximum_gap:
-                issues.append(f"{stream}:{market}:start_gap")
+                gaps.append(_gap_record(
+                    stream, market, "start_gap", started, selected[0]
+                ))
             if ended - selected[-1] > maximum_gap:
-                issues.append(f"{stream}:{market}:end_gap")
-            if any(
-                right - left > maximum_gap
-                for left, right in zip(selected, selected[1:])
-            ):
-                issues.append(f"{stream}:{market}:cadence_gap")
-    return issues
+                gaps.append(_gap_record(
+                    stream, market, "end_gap", selected[-1], ended
+                ))
+            for left, right in zip(selected, selected[1:]):
+                if right - left > maximum_gap:
+                    gaps.append(_gap_record(
+                        stream, market, "cadence_gap", left, right
+                    ))
+    return gaps
 
 
 def validate_capture_day(
@@ -373,6 +582,7 @@ def validate_capture_day(
     if day >= datetime.now(timezone.utc).date():
         raise ValueError("capture day is not closed")
     issues = []
+    availability_gaps = []
     manifest = []
     stream_data = {}
     for stream in CORE_STREAMS:
@@ -397,10 +607,11 @@ def validate_capture_day(
         manifest.append(entry)
         stream_data[stream] = data
     if "overview" in stream_data:
-        intervals, overview_issues = _membership_intervals(
+        intervals, overview_issues, overview_gaps = _membership_intervals(
             stream_data["overview"]["overview"], day
         )
         issues.extend(overview_issues)
+        availability_gaps.extend(overview_gaps)
     else:
         intervals = {}
     rest_gap = timedelta(
@@ -414,8 +625,8 @@ def validate_capture_day(
     )
     if intervals:
         if "depth" in stream_data:
-            issues.extend(
-                _coverage_issues(
+            availability_gaps.extend(
+                _coverage_gaps(
                     stream_data["depth"]["samples"],
                     intervals,
                     stream="depth",
@@ -427,33 +638,46 @@ def validate_capture_day(
         for stream in ("trades", "l2_stream")
         for epoch in stream_data.get(stream, {}).get("connection_epochs", [])
     }
-    if len(observed_epochs) != 1:
-        issues.append("transport_connection_epoch_not_stable")
+    if (
+        "trades" in stream_data
+        and not stream_data["trades"].get("websocket_trade_events")
+    ):
+        issues.append("trades_ws_primary_stream_missing")
     if intervals:
         if "l2_stream" in stream_data:
-            issues.extend(
-                _coverage_issues(
+            availability_gaps.extend(
+                _coverage_gaps(
                     stream_data["l2_stream"]["samples"],
                     intervals,
                     stream="l2_stream",
                     maximum_gap=l2_gap,
                 )
             )
-        if "trades" in stream_data:
-            issues.extend(
-                _coverage_issues(
-                    stream_data["trades"]["websocket_trade_samples"],
-                    intervals,
-                    stream="trades_ws",
-                    maximum_gap=timedelta(minutes=5),
-                )
-            )
+        # Public trades are event-driven.  Silence is not proof of transport
+        # loss, so it must never invent an outage for a low-activity market.
+        # Shared connection epochs remain visible in the availability report;
+        # actual outage windows are established by periodic overview/depth and
+        # the sampled L2 stream.
+    availability = _availability_summary(
+        availability_gaps,
+        day,
+        connection_epochs=sorted(observed_epochs),
+    )
+    if not availability["within_daily_budget"]:
+        issues.append("availability_daily_budget_exceeded")
     issues = sorted(set(issues))
+    if issues:
+        status = "invalid"
+    elif availability["state"] == "degraded":
+        status = "usable_with_gaps"
+    else:
+        status = "valid"
     result = {
         "schema_version": 1,
         "day": day.isoformat(),
-        "status": "valid" if not issues else "invalid",
+        "status": status,
         "issues": issues,
+        "availability": availability,
         "universe_contract": "persisted_point_in_time_dynamic",
         "sequence_contract": "l2_sequence_unverified_snapshot_only",
         "manifest": sorted(manifest, key=lambda item: item["path"]),
@@ -502,6 +726,18 @@ def _atomic_create(path: Path, payload: dict) -> None:
 def _verify_sealed_report(root: Path, report: dict) -> None:
     if not isinstance(report, dict) or report.get("schema_version") != 1:
         raise RuntimeError("sealed capture report schema is invalid")
+    status = report.get("status")
+    if status not in {"valid", "usable_with_gaps", "invalid"}:
+        raise RuntimeError("sealed capture report status is invalid")
+    if status == "usable_with_gaps":
+        availability = report.get("availability")
+        if (
+            not isinstance(availability, dict)
+            or availability.get("contract") != "bounded_outage_exclusion_v1"
+            or availability.get("within_daily_budget") is not True
+            or not isinstance(availability.get("exclusion_intervals"), list)
+        ):
+            raise RuntimeError("sealed capture availability is invalid")
     reported_hash = report.get("report_sha256")
     body = dict(report)
     body.pop("report_sha256", None)
@@ -574,17 +810,32 @@ def seal_closed_capture_days(
                 micro_interval_seconds=micro_interval_seconds,
                 l2_sample_interval_seconds=l2_sample_interval_seconds,
             )
-            if report.get("status") == "valid":
+            if report.get("status") in {"valid", "usable_with_gaps"}:
                 _remove_empty_sidecars(root, report)
             _atomic_create(report_path, report)
         reports.append(report)
-    invalid = [report["day"] for report in reports if report.get("status") != "valid"]
+    invalid = [
+        report["day"]
+        for report in reports
+        if report.get("status") not in {"valid", "usable_with_gaps"}
+    ]
+    degraded = [
+        report["day"]
+        for report in reports
+        if report.get("status") == "usable_with_gaps"
+    ]
+    strict_valid = [
+        report["day"] for report in reports if report.get("status") == "valid"
+    ]
     return {
         "ok": not invalid,
         "sealed_days": len(reports),
-        "valid_days": len(reports) - len(invalid),
+        "valid_days": len(strict_valid),
+        "usable_days": len(strict_valid) + len(degraded),
+        "degraded_days": degraded,
         "invalid_days": invalid,
         "latest_day": reports[-1]["day"] if reports else None,
+        "continuity": capture_continuity_health(reports),
     }
 
 

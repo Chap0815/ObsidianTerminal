@@ -1,6 +1,6 @@
 {
-  "build_id": "b838a9035defea42",
-  "created_at": "2026-08-22 15:26:27",
+  "build_id": "2cc66d831134a869",
+  "created_at": "2026-08-23 09:19:29",
   "source": "update_deploy_manifest.py",
   "file_count": 194,
   "files": [
@@ -256,8 +256,8 @@
     },
     {
       "path": "core/futures_bot.py",
-      "sha256": "78fd57dc7cc7c0fa927c6931f8751872092fa8f1269ea8d0f0aa5433793c6f2b",
-      "bytes": 82771
+      "sha256": "bf1eee70f0dba700cac4d4c12289f5c8c196e2a27a30a04610c1649b7976c353",
+      "bytes": 84751
     },
     {
       "path": "core/futures_bot_exits.py",
@@ -726,8 +726,8 @@
     },
     {
       "path": "trading/capture_integrity.py",
-      "sha256": "8743b02971fd7a82462c0de50efa3185b5e1311d877c94c072641e6eb06b3361",
-      "bytes": 22458
+      "sha256": "49890159810779309ecb8f184ebfd5a9e03b2930b4640e2bdd0da3fd8cc5aabe",
+      "bytes": 30833
     },
     {
       "path": "trading/capture_replay_validation.py",
@@ -941,8 +941,8 @@
     },
     {
       "path": "trading/venue_recorder.py",
-      "sha256": "f52958760f20105822d22a24234ba9d5301304adede55ad2576b0f47beaf979d",
-      "bytes": 62775
+      "sha256": "8b114842bc8323687b2e85e49d3d4dc3e215869be591c7abc38a135cd3d92c21",
+      "bytes": 63064
     },
     {
       "path": "trading/vol_target.py",
