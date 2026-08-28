@@ -734,7 +734,11 @@ class CrossBot(FuturesBot):
             expected_position_side,
         )
         if pos:
-            contracts = abs(self._safe_float(pos.get("contracts") or pos.get("size"), 0.0))
+            from bot_utils.futures_order import _position_contracts_abs
+
+            contracts = _position_contracts_abs(pos)
+            if contracts is None:
+                return 0.0, fill, True, "position_quantity_unverified"
             for key in ("entryPrice", "entry_price"):
                 fv = self._safe_float(pos.get(key), 0.0)
                 if fv > 0:
@@ -899,7 +903,9 @@ class CrossBot(FuturesBot):
                 )
                 return False
 
-        contracts = abs(self._safe_float(pos.get("contracts") or pos.get("size"), 0.0))
+        from bot_utils.futures_order import _position_contracts_abs
+
+        contracts = _position_contracts_abs(pos)
         entry = 0.0
         for key in ("entryPrice", "entry_price"):
             entry = self._safe_float(pos.get(key), 0.0)
@@ -907,7 +913,7 @@ class CrossBot(FuturesBot):
                 break
         if entry <= 0:
             entry = self._safe_float(d.get("buy"), 0.0)
-        if contracts <= 0 or entry <= 0:
+        if contracts is None or contracts <= 0 or entry <= 0:
             return False
         try:
             from bot_utils import futures_contract_size
@@ -1251,6 +1257,8 @@ class CrossBot(FuturesBot):
         """True when we hold a partial book (some legs, but UNDER target K/side)
         and the per-slot budget isn't spent. Independent of whether a rebalance
         ran THIS session - so a restart that adopted a partial book also fills."""
+        if not CrossBot._load_rebalance_state(self):
+            return False
         if self.safe_mode is not None and self.safe_mode.is_active():
             return False
         try:
@@ -2449,12 +2457,17 @@ class CrossBot(FuturesBot):
         quality = self._score_cross_entry_quality(
             base, full, side, quality_context, spread_pct, max_spread,
             entry_id)
+        from trading.expectancy_telemetry import (
+            expectancy_feature_bps,
+            expectancy_feature_value,
+        )
+
         expectancy_features = {
             "score": float(quality.score),
-            "spread_bps": float(spread_pct or 0.0) * 100.0,
+            "spread_bps": expectancy_feature_bps(spread_pct),
             "side_sign": 1.0 if side == "LONG" else -1.0,
-            "target_side_count": float(
-                (quality_context or {}).get("target_side_count") or 0.0
+            "target_side_count": expectancy_feature_value(
+                (quality_context or {}).get("target_side_count")
             ),
         }
         for feature_name in (
@@ -2627,12 +2640,11 @@ class CrossBot(FuturesBot):
             from trading.entry_admission import evaluate_entry_admission
             from trading.portfolio_risk import portfolio_limits_from_config
 
-            cfg = getattr(self, "cfg", {}) or {}
             portfolio_mode = normalize_gate_mode(
-                cfg.get("PORTFOLIO_RISK_MODE", "shadow")
+                self.C("PORTFOLIO_RISK_MODE", "shadow")
             )
             expectancy_mode = normalize_gate_mode(
-                cfg.get("NET_EXPECTANCY_MODE", "shadow")
+                self.C("NET_EXPECTANCY_MODE", "shadow")
             )
             admission = evaluate_entry_admission(
                 exchange=self.ex,
@@ -2676,27 +2688,15 @@ class CrossBot(FuturesBot):
                 )
                 return
             lev_int = max(1, int(__import__("math").ceil(lev)))
-            # CROSS margin + leverage. HARD fail -> skip the leg; NEVER open at
-            # the account-default leverage (could be 20x -> instant liquidation).
-            try:
-                must_set_leverage(self.ex, lev_int, full, direction=side,
-                                  margin_mode="cross")
-            except LeverageNotSetError as e:
-                log_event(f"[{self.BOT_NAME}] {base}: set_leverage failed "
-                          f"({e}) - skipping leg", "WARN")
-                emit_entry_lifecycle(
-                    entry_id, bot=self.BOT_NAME, symbol=base,
-                    stage="aborted", mode=entry_mode,
-                    reason="set_leverage_failed", direction=side)
-                return
-            safe_set_margin_mode(self.ex, "cross", full, leverage=lev_int,
-                                 direction=side.upper())
             order_side = "buy" if side == "LONG" else "sell"
             from trading.execution_quality import make_client_order_id
             _cid = make_client_order_id(entry_id, "entry", self.BUY_PREFIX)
             params = entry_params(
                 position_side="long" if side == "LONG" else "short",
-                margin_mode="cross", leverage=lev_int, client_order_id=_cid)
+                margin_mode="cross",
+                leverage=lev_int,
+                client_order_id=_cid,
+            )
             if not claim_symbol_for_entry(
                 self.BOT_NAME,
                 full,
@@ -2716,6 +2716,34 @@ class CrossBot(FuturesBot):
                     stage="blocked", mode=entry_mode,
                     reason="claim_conflict", direction=side)
                 return
+            # CROSS margin + leverage. HARD fail -> skip the leg; NEVER open at
+            # the account-default leverage (could be 20x -> instant liquidation).
+            try:
+                must_set_leverage(self.ex, lev_int, full, direction=side,
+                                  margin_mode="cross")
+            except LeverageNotSetError as e:
+                log_event(f"[{self.BOT_NAME}] {base}: set_leverage failed "
+                          f"({e}) - skipping leg", "WARN")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="aborted", mode=entry_mode,
+                    reason="set_leverage_failed", direction=side)
+                cleaned = self._cleanup_untracked_entry_state(
+                    base, "set leverage failed before entry"
+                )
+                if cleaned:
+                    try:
+                        from core.database import release_portfolio_reservation
+
+                        release_portfolio_reservation(entry_id)
+                    except Exception as cleanup_exc:
+                        self._log_error(
+                            f"release leverage-failed reservation {base}",
+                            cleanup_exc,
+                        )
+                return
+            safe_set_margin_mode(self.ex, "cross", full, leverage=lev_int,
+                                 direction=side.upper())
             provisional_added = self.state.add(base, {
                 "position_type": side,
                 "buy": exec_price,
@@ -4243,7 +4271,11 @@ class CrossBot(FuturesBot):
                         try:
                             from bot_utils import get_exchange_liq_price
                             liq_price = CrossBot._safe_positive_price(
-                                get_exchange_liq_price(self.ex, full))
+                                get_exchange_liq_price(
+                                    self.ex,
+                                    full,
+                                    expected_position_side=pos_type,
+                                ))
                         except Exception:
                             liq_price = 0.0
                         upd = {"liq_next_check_at": now_ts + float(

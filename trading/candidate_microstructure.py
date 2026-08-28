@@ -6,10 +6,10 @@ alter an entry.  Unified order books remain snapshot/sequence-unverified.
 from __future__ import annotations
 
 import math
-import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 
+from core import clock as exchange_clock
 from core.constants import SIM_CAPTURE_CONTRACT_SCHEMA
 
 
@@ -160,7 +160,7 @@ def capture_simulated_entry_tca(
             book,
             side=normalized_side,
             amount=requested_amount,
-            local_time_ms=int(time.time() * 1000),
+            local_time_ms=int(exchange_clock.now_ms()),
         )
         fill = compute_fill_tca(
             arrival,

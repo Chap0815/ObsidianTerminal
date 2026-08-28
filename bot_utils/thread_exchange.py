@@ -96,13 +96,21 @@ def _shallow_auth_cfg(exchange) -> dict:
             cfg["headers"] = dict(headers)
         except TypeError:
             pass
+    # Preserve the deployment's transport route.  The base performs startup
+    # probes through this proxy; dropping it from clones would make all later
+    # worker-thread requests bypass that route.
+    proxies = getattr(exchange, "proxies", None) or {}
+    if proxies:
+        try:
+            cfg["proxies"] = copy.deepcopy(dict(proxies))
+        except (TypeError, copy.Error) as exc:
+            raise ValueError("exchange proxy configuration is invalid") from exc
     return cfg
 
 
 def _build_clone(src) -> Any:
     """Construct a fresh CCXT instance of the same class as ``src``,
-    with deep-copied auth + markets, then re-apply SSL workaround if
-    available."""
+    with deep-copied auth + markets and the canonical connection hardening."""
     cls = type(src)
     cfg = _shallow_auth_cfg(src)
     clone = cls(cfg)
@@ -140,12 +148,19 @@ def _build_clone(src) -> Any:
                     clone.markets_by_id = copy.deepcopy(src_by_id)
                 except (TypeError, copy.Error):
                     clone.markets_by_id = dict(src_by_id)
-    # Re-apply SSL workaround if the project has one (Bitget cert chain)
-    try:
-        from config.exchange_config import _apply_ssl_workaround  # type: ignore
-        clone = _apply_ssl_workaround(clone)
-    except Exception:
-        pass
+    # Clone construction bypasses exchange_config._finalize_connection().  The
+    # initial server-time difference is already present in the copied options,
+    # so do not add another startup network request, but do install the same
+    # signed-request self-heal and periodic refresh boundary as the base.
+    from config.exchange_config import (  # type: ignore
+        _apply_ssl_workaround,
+        _install_nonce_selfheal,
+    )
+
+    clone = _apply_ssl_workaround(clone)
+    clone._clock_periodic_refresh_enabled = False
+    clone = _install_nonce_selfheal(clone)
+    clone._clock_periodic_refresh_enabled = True
     return clone
 
 
@@ -173,6 +188,10 @@ class ThreadLocalExchange:
     _CLONE_PREFIXES = (
         "fetch_", "create_", "cancel_", "edit_", "load_", "watch_",
         "set_", "transfer", "withdraw", "deposit",
+        # MEXC implicit private REST methods used by exact order recovery and
+        # account-tier fee lookup.  They mutate the same CCXT request/signing
+        # state as unified fetch_/create_ methods and must never hit _base.
+        "contractPrivate",
     )
 
     def __init__(self, base_exchange):
@@ -346,14 +365,22 @@ class ThreadLocalExchange:
                 # async ccxt close() returns a coroutine; run it to completion.
                 if inspect.iscoroutine(result):
                     try:
-                        asyncio.run(result)
+                        completed = asyncio.run(result)
                     except Exception as exc:
                         close_error = exc
                         result.close()
                     else:
-                        return True
+                        if completed is not False:
+                            return True
+                        close_error = RuntimeError(
+                            "exchange close reported incomplete"
+                        )
                 else:
-                    return True
+                    if result is not False:
+                        return True
+                    close_error = RuntimeError(
+                        "exchange close reported incomplete"
+                    )
             except Exception as exc:
                 close_error = exc
         try:
@@ -366,10 +393,18 @@ class ThreadLocalExchange:
                 result = sess.close()
                 if inspect.iscoroutine(result):
                     try:
-                        asyncio.run(result)
+                        completed = asyncio.run(result)
                     except Exception:
                         result.close()
                         raise
+                    if completed is False:
+                        raise RuntimeError(
+                            "exchange session close reported incomplete"
+                        )
+                elif result is False:
+                    raise RuntimeError(
+                        "exchange session close reported incomplete"
+                    )
                 return True
             except Exception as exc:
                 close_error = exc

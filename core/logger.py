@@ -1184,12 +1184,30 @@ class _LoggerStateTooLarge(ValueError):
     pass
 
 
+class _LoggerStateDuplicateKey(ValueError):
+    pass
+
+
+def _logger_state_object_without_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _LoggerStateDuplicateKey(
+                f"duplicate state JSON key {key}"
+            )
+        result[key] = value
+    return result
+
+
 def _read_logger_state_json(path: str):
     with open(path, "rb") as stream:
         raw = stream.read(_LOGGER_STATE_JSON_MAX_BYTES + 1)
     if len(raw) > _LOGGER_STATE_JSON_MAX_BYTES:
         raise _LoggerStateTooLarge("logger state JSON exceeds size limit")
-    return json.loads(raw.decode("utf-8-sig"))
+    return json.loads(
+        raw.decode("utf-8-sig"),
+        object_pairs_hook=_logger_state_object_without_duplicate_keys,
+    )
 
 def _preserve_corrupt_json(path: str, max_backups: int = 3) -> None:
     """Copy one corrupt state file aside with a bounded forensic history."""
@@ -1232,7 +1250,11 @@ def load_j(f, default=None, *, preserve_corrupt: bool = False):
                 f"Read error ({_safe_log_text(f)}): {_safe_log_text(e)}",
                 "WARN",
             )
-        except (json.JSONDecodeError, UnicodeError) as e:
+        except (
+            json.JSONDecodeError,
+            UnicodeError,
+            _LoggerStateDuplicateKey,
+        ) as e:
             if preserve_corrupt:
                 _preserve_corrupt_json(f)
             log_event(

@@ -16,6 +16,7 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from typing import Dict, List, Optional, Set
 
+from bot_utils.api_budget import try_consume_api_call
 from bot_utils.safe_numeric import safe_positive_float
 from bot_utils.silent_log import silent_log
 from core.constants import TICKER_STALE_MAX_SEC
@@ -44,20 +45,37 @@ def _ws_session_is_stable(
     return elapsed >= _WS_STABLE_RESET_SEC
 
 
+async def _close_async_exchange(exchange) -> None:
+    """Finish one async client close even if shutdown is requested again."""
+    close_task = asyncio.create_task(exchange.close())
+    cancellation_requested = False
+    while not close_task.done():
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            cancellation_requested = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        except Exception:
+            break
+    try:
+        close_task.result()
+    except asyncio.CancelledError:
+        cancellation_requested = True
+    except Exception:
+        pass
+    if cancellation_requested:
+        raise asyncio.CancelledError
+
+
 def _clone_exchange(exchange):
-    """Deepcopy markets so nested dicts aren't shared between threads."""
+    """Build one credential-free public client with independent state."""
+    clone = None
     try:
         cls  = type(exchange)
-        cfg  = {
-            "apiKey":          getattr(exchange, "apiKey",  None),
-            "secret":          getattr(exchange, "secret",  None),
-            "enableRateLimit": True,
-        }
-        if getattr(exchange, "password", None):
-            cfg["password"] = exchange.password
-        options = getattr(exchange, "options", {})
-        if options:
-            cfg["options"] = copy.deepcopy(dict(options))
+        cfg = build_public_async_config(exchange)
+        cfg.pop("newUpdates", None)
         clone = cls(cfg)
         clone.timeout = getattr(exchange, "timeout", 10_000)
         src_markets = getattr(exchange, "markets", None)
@@ -69,9 +87,20 @@ def _clone_exchange(exchange):
                     clone.markets = dict(src_markets)
                 except TypeError:
                     clone.markets = src_markets
+        if clone is exchange:
+            raise RuntimeError("exchange constructor returned shared client")
         return clone
-    except Exception:
-        return exchange
+    except Exception as exc:
+        if clone is not None and clone is not exchange:
+            close = getattr(clone, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        raise RuntimeError(
+            "independent REST exchange clone unavailable"
+        ) from exc
 
 
 class WebSocketFeed:
@@ -96,6 +125,8 @@ class WebSocketFeed:
         self._rest_poller_lock   = threading.Lock()
         self._threads: List[weakref.ref] = []
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ws_main_task: Optional[asyncio.Task] = None
+        self._ws_main_task_lock = threading.Lock()
         self._rest_clones: List = []
         self._rest_clones_lock = threading.Lock()
         self._async_ex = None
@@ -141,22 +172,14 @@ class WebSocketFeed:
         self._running = False
         loop = self._loop
         if loop and loop.is_running():
-            # Close the ccxt.pro async exchange on its own loop so its
-            # aiohttp session is released, then stop the loop.
+            # The owned main coroutine closes the active ccxt.pro client in its
+            # ``finally`` block.  Cancel that task instead of launching a
+            # detached second close and force-stopping its loop mid-cleanup.
             def _shutdown() -> None:
-                with self._async_ex_lock:
-                    ex = self._async_ex
-                if ex is not None:
-                    async def _do_close():
-                        try:
-                            await ex.close()
-                        except Exception:
-                            pass
-                    try:
-                        asyncio.ensure_future(_do_close())
-                    except Exception:
-                        pass
-                loop.call_later(1.0, loop.stop)
+                with self._ws_main_task_lock:
+                    task = self._ws_main_task
+                if task is not None and not task.done():
+                    task.cancel()
             try:
                 loop.call_soon_threadsafe(_shutdown)
             except Exception:
@@ -269,8 +292,15 @@ class WebSocketFeed:
             asyncio.set_event_loop(self._loop)
             previous_handler = self._loop.get_exception_handler()
             self._loop.set_exception_handler(self._handle_loop_exception)
+            main_task = self._loop.create_task(self._ws_main(symbols))
+            with self._ws_main_task_lock:
+                self._ws_main_task = main_task
             try:
-                self._loop.run_until_complete(self._ws_main(symbols))
+                self._loop.run_until_complete(main_task)
+                completed_normally = True
+            except asyncio.CancelledError:
+                # stop() requested cancellation; _ws_main's per-client finally
+                # has already awaited the client close before this propagates.
                 completed_normally = True
             except Exception as e:
                 try:
@@ -295,6 +325,9 @@ class WebSocketFeed:
                 except Exception as fallback_exc:
                     silent_log("start WebSocket REST fallback", fallback_exc)
             finally:
+                with self._ws_main_task_lock:
+                    if self._ws_main_task is main_task:
+                        self._ws_main_task = None
                 try:
                     self._loop.set_exception_handler(previous_handler)
                 except Exception:
@@ -455,7 +488,7 @@ class WebSocketFeed:
                     if self._async_ex is async_ex:
                         self._async_ex = None
                 try:
-                    await async_ex.close()
+                    await _close_async_exchange(async_ex)
                 except Exception:
                     pass
 
@@ -523,8 +556,18 @@ class WebSocketFeed:
                 self._rest_thread_started = False
 
     def _rest_pool_session(self) -> None:
-        clones = [_clone_exchange(self._exchange)
-                  for _ in range(_MAX_REST_WORKERS)]
+        clones = []
+        try:
+            for _ in range(_MAX_REST_WORKERS):
+                clones.append(_clone_exchange(self._exchange))
+        except Exception:
+            # A later constructor can fail after earlier CCXT clients already
+            # opened their own HTTP sessions. Register the partial generation
+            # before cleanup so failed close attempts remain retryable.
+            with self._rest_clones_lock:
+                self._rest_clones.extend(clones)
+            self._close_rest_clones()
+            raise
         with self._rest_clones_lock:
             # Keep unresolved clients from an earlier generation retryable.
             self._rest_clones.extend(clones)
@@ -545,6 +588,14 @@ class WebSocketFeed:
             return clones[idx]
 
         def _fetch(sym: str) -> dict:
+            try:
+                allowed = try_consume_api_call(
+                    "ws_feed_rest_fetch_ticker"
+                )
+            except Exception:
+                allowed = False
+            if not allowed:
+                return {}
             return _my_clone().fetch_ticker(sym)
 
         with ThreadPoolExecutor(

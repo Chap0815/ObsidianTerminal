@@ -242,6 +242,11 @@ def _relaunch_windowless() -> bool:
                 creationflags=subprocess.CREATE_NO_WINDOW, close_fds=True,
                 env=dict(os.environ, OBSIDIAN_NO_REEXEC="1"))
         return True
+    except UpdateInProgressError:
+        # The updater can claim its lifecycle lock after the module-level
+        # check.  Continuing the console parent here would bypass that late
+        # barrier and start a launcher while product files are changing.
+        raise
     except Exception:
         # If Popen succeeded but releasing the lifecycle lock failed, the
         # console parent must still exit. Continuing would leave two launchers.

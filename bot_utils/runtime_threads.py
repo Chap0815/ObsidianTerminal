@@ -295,7 +295,7 @@ def finalize_runtime_shutdown(
         status_written = state.last_status_signature == status_signature
         if not status_written:
             try:
-                status_writer(
+                write_result = status_writer(
                     owner.LOG_DIR,
                     owner.BOT_NAME,
                     status,
@@ -303,6 +303,10 @@ def finalize_runtime_shutdown(
                     threads=threads,
                     extra={"shutdown": shutdown_payload},
                 )
+                if write_result is False:
+                    raise RuntimeError(
+                        "runtime status writer reported publish failure"
+                    )
             except Exception as exc:
                 if not _quiet:
                     _report_shutdown_error(owner, "Runtime shutdown status", exc)

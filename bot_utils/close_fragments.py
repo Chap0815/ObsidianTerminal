@@ -10,6 +10,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from bot_utils.order_utils import order_id_text_or_none
+
 
 def _f(value: Any, default: float = 0.0) -> float:
     if isinstance(value, bool):
@@ -22,13 +24,7 @@ def _f(value: Any, default: float = 0.0) -> float:
 
 
 def _order_id_text_or_none(value: Any) -> str | None:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        text = str(value).strip()
-    except Exception:
-        return None
-    return text or None
+    return order_id_text_or_none(value)
 
 
 def pending_close_values(state: dict) -> tuple[float, float, float, str | None]:

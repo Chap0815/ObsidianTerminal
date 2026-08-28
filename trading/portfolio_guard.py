@@ -6,7 +6,13 @@ import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
+from bot_utils.futures_order import _position_contracts_abs, position_row_side
+from core.constants import STABLECOIN_EQUIVALENTS
 from shared_limits import normalize_gate_mode
 from trading.portfolio_risk import (
     PortfolioDecision,
@@ -17,9 +23,22 @@ from trading.portfolio_risk import (
 )
 
 
-def _require_api_budget(endpoint: str) -> None:
-    if not try_consume_api_call(endpoint):
+def _budgeted_api_call(endpoint: str, operation):
+    reservation = try_consume_api_call(
+        endpoint,
+        return_reservation=True,
+    )
+    if not reservation:
         raise RuntimeError(f"API budget exhausted before {endpoint}")
+    try:
+        return operation()
+    except Exception:
+        # Production returns ApiCallReservation here.  The isinstance guard
+        # keeps narrow test doubles/backwards-compatible callers harmless
+        # without ever double-counting a call as a new error row.
+        if isinstance(reservation, ApiCallReservation):
+            record_api_error(endpoint, reservation)
+        raise
 
 
 def _finite(value) -> float | None:
@@ -40,27 +59,10 @@ def _safe_lower_text(value) -> str:
 
 
 def _position_side(raw: dict) -> str | None:
-    info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
-    candidates = (
-        raw.get("side"),
-        raw.get("positionSide"),
-        info.get("side"),
-        info.get("positionSide"),
-        info.get("posSide"),
-        info.get("holdSide"),
-    )
-    saw_unknown = False
-    for candidate in candidates:
-        normalized = _safe_lower_text(candidate)
-        if normalized in {"long", "buy"}:
-            return "LONG"
-        if normalized in {"short", "sell"}:
-            return "SHORT"
-        saw_unknown = saw_unknown or bool(normalized)
-    if saw_unknown:
+    side, contradictory = position_row_side(raw)
+    if contradictory or not side:
         return None
-    signed_contracts = _finite(raw.get("contracts"))
-    return "SHORT" if signed_contracts is not None and signed_contracts < 0 else None
+    return side.upper()
 
 
 def _symbol_cluster(symbol: str) -> str:
@@ -246,10 +248,12 @@ def _futures_balance_values(
 def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
     now = datetime.now(timezone.utc)
     try:
-        _require_api_budget("portfolio_guard_fetch_balance")
-        balance = exchange.fetch_balance()
-        _require_api_budget("portfolio_guard_fetch_positions")
-        positions_raw = exchange.fetch_positions()
+        balance = _budgeted_api_call(
+            "portfolio_guard_fetch_balance", exchange.fetch_balance
+        )
+        positions_raw = _budgeted_api_call(
+            "portfolio_guard_fetch_positions", exchange.fetch_positions
+        )
         if not isinstance(balance, dict) or not isinstance(positions_raw, list):
             raise ValueError("malformed account snapshot")
         free, equity = _futures_balance_values(balance)
@@ -269,23 +273,59 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
             if not isinstance(raw, dict):
                 raise ValueError("malformed position row")
             raw_contracts = raw.get("contracts")
+            raw_size = raw.get("size")
             raw_notional = raw.get("notional")
-            if raw_contracts is None and raw_notional is None:
+            if raw_contracts is None and raw_size is None and raw_notional is None:
                 raise ValueError("position quantity unavailable")
-            parsed_contracts = _finite(raw_contracts)
+            parsed_contracts = _position_contracts_abs(raw)
             parsed_notional = _finite(raw_notional)
-            if raw_contracts is not None and parsed_contracts is None:
+            if (
+                (raw_contracts is not None or raw_size is not None)
+                and parsed_contracts is None
+            ):
                 raise ValueError("position contracts unavailable")
             if raw_notional is not None and parsed_notional is None:
                 raise ValueError("position notional unavailable")
-            contracts = abs(parsed_contracts or 0.0)
+            contracts = parsed_contracts or 0.0
             notional = abs(parsed_notional or 0.0)
             symbol = str(raw.get("symbol") or "UNKNOWN")
             if contracts <= 0.0 and notional <= 0.0:
                 continue
+            market = markets.get(symbol) if isinstance(markets, dict) else {}
+            market = market if isinstance(market, dict) else {}
+            info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+            if contracts > 0.0 and notional > 0.0:
+                direct_contract_size = abs(
+                    _finite(raw.get("contractSize"))
+                    or _finite(market.get("contractSize"))
+                    or 0.0
+                )
+                direct_price = 0.0
+                for raw_price in (
+                    raw.get("markPrice"),
+                    raw.get("last"),
+                    info.get("fairPrice"),
+                    info.get("fair_price"),
+                ):
+                    candidate = abs(_finite(raw_price) or 0.0)
+                    if candidate > 0.0:
+                        direct_price = candidate
+                        break
+                if direct_contract_size > 0.0 and direct_price > 0.0:
+                    physical_notional = (
+                        contracts * direct_contract_size * direct_price
+                    )
+                    if not math.isfinite(physical_notional):
+                        raise ValueError(
+                            f"position notional conflicts for {symbol}"
+                        )
+                    smaller = min(notional, physical_notional)
+                    larger = max(notional, physical_notional)
+                    if smaller <= 0.0 or larger >= smaller * 2.0:
+                        raise ValueError(
+                            f"position notional conflicts for {symbol}"
+                        )
             if notional <= 0.0:
-                market = markets.get(symbol) if isinstance(markets, dict) else {}
-                market = market if isinstance(market, dict) else {}
                 contract_size = abs(
                     _finite(raw.get("contractSize"))
                     or _finite(market.get("contractSize"))
@@ -293,11 +333,12 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
                 )
                 if contract_size <= 0.0:
                     raise ValueError(f"contract size unavailable for {symbol}")
-                info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
                 if tickers is None:
-                    _require_api_budget("portfolio_guard_fetch_tickers")
                     try:
-                        fetched_tickers = exchange.fetch_tickers()
+                        fetched_tickers = _budgeted_api_call(
+                            "portfolio_guard_fetch_tickers",
+                            exchange.fetch_tickers,
+                        )
                     except Exception:
                         fetched_tickers = {}
                     tickers = (
@@ -372,15 +413,15 @@ def collect_spot_snapshot(exchange) -> PortfolioSnapshot:
     """Value the complete spot account from exchange truth, fail-closed on gaps."""
     now = datetime.now(timezone.utc)
     try:
-        _require_api_budget("portfolio_guard_fetch_balance")
-        balance = exchange.fetch_balance()
+        balance = _budgeted_api_call(
+            "portfolio_guard_fetch_balance", exchange.fetch_balance
+        )
         if not isinstance(balance, dict):
             raise ValueError("malformed account snapshot")
         totals = balance.get("total")
         free_balances = balance.get("free")
         if not isinstance(totals, dict) or not isinstance(free_balances, dict):
             raise ValueError("spot totals unavailable")
-        stable_assets = {"USDT", "USDC", "USD", "FDUSD"}
         free = _finite(free_balances.get("USDT"))
         if free is None or free < 0.0:
             raise ValueError("spot USDT free balance unavailable")
@@ -394,14 +435,16 @@ def collect_spot_snapshot(exchange) -> PortfolioSnapshot:
         equity = 0.0
         positions = []
         for normalized_asset, amount in normalized_totals:
-            if normalized_asset in stable_assets:
+            if normalized_asset == "USDT":
                 equity += amount
                 if not math.isfinite(equity):
                     raise ValueError("spot equity overflow")
                 continue
             symbol = f"{normalized_asset}/USDT"
-            _require_api_budget("portfolio_guard_fetch_ticker")
-            ticker = exchange.fetch_ticker(symbol)
+            ticker = _budgeted_api_call(
+                "portfolio_guard_fetch_ticker",
+                lambda: exchange.fetch_ticker(symbol),
+            )
             price = _finite(
                 (ticker or {}).get("last") or (ticker or {}).get("close")
             )
@@ -413,6 +456,8 @@ def collect_spot_snapshot(exchange) -> PortfolioSnapshot:
             equity += notional
             if not math.isfinite(equity):
                 raise ValueError("spot equity overflow")
+            if normalized_asset in STABLECOIN_EQUIVALENTS:
+                continue
             positions.append(
                 PortfolioPosition(
                     symbol=symbol,

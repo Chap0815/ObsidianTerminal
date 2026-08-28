@@ -15,7 +15,12 @@ import time
 from datetime import datetime, timezone
 
 from bot_utils.api_budget import try_consume_api_call
-from bot_utils.futures_order import FUTURES_DEFAULT_TAKER_FEE, position_row_side
+from bot_utils.futures_order import (
+    FUTURES_DEFAULT_TAKER_FEE,
+    _position_contracts_abs,
+    position_row_side,
+)
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from core.clock import now_utc
 
 _OFFLINE_ACCOUNTING_RETRY_BASE_SEC = 30.0
@@ -48,17 +53,18 @@ def _positive_abs_float_or_none(value) -> float | None:
 def _position_signed_contracts_or_none(position: dict | None) -> float | None:
     if not isinstance(position, dict):
         return None
-    size_evidence_seen = False
+    contracts = _position_contracts_abs(position)
+    if contracts is None or contracts == 0.0:
+        return contracts
     for key in ("contracts", "size"):
         if key not in position or position.get(key) is None:
             continue
-        size_evidence_seen = True
         parsed = _finite_float_or_none(position.get(key))
         if parsed is None:
             return None
         if parsed != 0:
-            return parsed
-    return 0.0 if size_evidence_seen else None
+            return -contracts if parsed < 0.0 else contracts
+    return 0.0
 
 
 def _position_contracts_or_none(position: dict | None) -> float | None:
@@ -413,7 +419,23 @@ def _trade_side(t: dict) -> str:
         return ""
     raw_info = t.get("info")
     info = raw_info if isinstance(raw_info, dict) else {}
-    return str(t.get("side") or info.get("side") or "").strip().lower()
+    sides = []
+    for source in (t, info):
+        raw = source.get("side")
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            continue
+        if not isinstance(raw, str):
+            return ""
+        normalized = raw.strip().lower()
+        if normalized in {"buy", "long"}:
+            sides.append("buy")
+        elif normalized in {"sell", "short"}:
+            sides.append("sell")
+        else:
+            return ""
+    if not sides or any(side != sides[0] for side in sides[1:]):
+        return ""
+    return sides[0]
 
 
 def _is_close_trade_for_position(
@@ -444,7 +466,6 @@ def _trade_amount(t: dict) -> float:
     amount = _finite_float_or_none(t.get("amount"))
     if amount is None:
         return 0.0
-    amount = abs(amount)
     return amount if amount > 0 else 0.0
 
 
@@ -555,6 +576,19 @@ def _trade_timestamp_ms_or_none(trade: dict) -> float | None:
     return timestamp_ms
 
 
+def _offline_trade_future_ceiling_ms() -> int | None:
+    try:
+        current = now_utc()
+        if current.tzinfo is None:
+            return None
+        milliseconds = int(
+            current.astimezone(timezone.utc).timestamp() * 1000
+        )
+    except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+        return None
+    return milliseconds + 60_000 if milliseconds > 0 else None
+
+
 def _aggregate_futures_reduce_trades(bot, symbol_full: str,
                                      target_contracts: float,
                                      pos_type: str | None,
@@ -566,9 +600,11 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
     if target >= float("inf"):
         target = 0.0
     boundary_ms = _entry_trade_boundary_ms(buy_time)
+    future_ceiling_ms = _offline_trade_future_ceiling_ms()
     if (
         target <= 0
         or boundary_ms is None
+        or future_ceiling_ms is None
         or not hasattr(bot.ex, "fetch_my_trades")
     ):
         return 0.0, 0.0, "unavailable"
@@ -588,7 +624,11 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
     for trade in trades:
         if not isinstance(trade, dict):
             continue
+        if not explicit_trade_symbol_matches(trade, symbol_full):
+            continue
         timestamp_ms = _trade_timestamp_ms_or_none(trade)
+        if timestamp_ms is not None and timestamp_ms > future_ceiling_ms:
+            return 0.0, 0.0, "unavailable"
         if timestamp_ms is None or timestamp_ms < boundary_ms:
             continue
         eligible_trades.append((timestamp_ms, trade))
@@ -1560,7 +1600,10 @@ class FuturesReconcileMixin:
         output; it never changes reconciliation or order behavior.
         """
         from core.logger import log_event, send_telegram
-        from config.exchange_config import safe_fetch_positions
+        from config.exchange_config import (
+            is_authentication_error,
+            safe_fetch_positions,
+        )
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
         self._entry_recovery_position_snapshot = None
@@ -1575,13 +1618,45 @@ class FuturesReconcileMixin:
                     "WARN",
                 )
                 return False
-            exchange_positions = safe_fetch_positions(self.ex)
+            try:
+                exchange_positions = safe_fetch_positions(self.ex)
+            except Exception as exc:
+                if not is_authentication_error(exc):
+                    raise
+                record_private_api = getattr(
+                    self, "_record_private_api_health", None
+                )
+                changed = bool(
+                    record_private_api(
+                        ok=False,
+                        reason="authentication_failed",
+                        error_type=type(exc).__name__,
+                    )
+                ) if callable(record_private_api) else False
+                if changed:
+                    log_event(
+                        f"[{self.BOT_NAME}] private API authentication failed; "
+                        "new entries remain blocked while reconciliation and "
+                        "exit supervision keep retrying",
+                        "WARN",
+                    )
+                return False
             if exchange_positions is None:
                 log_event(
                     "Reconciliation: fetch_positions unavailable on this "
                     "exchange  skipping. Local state used as-is.", "WARN"
                 )
                 return False
+            record_private_api = getattr(
+                self, "_record_private_api_health", None
+            )
+            if callable(record_private_api):
+                changed = bool(record_private_api(ok=True))
+                if changed:
+                    log_event(
+                        f"[{self.BOT_NAME}] private API authentication healthy",
+                        "INFO",
+                    )
 
             # Build set of symbols with non-zero contracts on exchange
             exchange_open: dict = {}
@@ -2528,8 +2603,9 @@ class FuturesReconcileMixin:
         Sources for the close price (priority order):
           1. fetch_order_history for this symbol  find the most recent
              reduceOnly fill (the actual close price)
-          2. Current market price (worst case  slightly stale, but
-             better than no record at all)
+
+        A later current ticker is not evidence of the historical execution.
+        Missing fill history therefore keeps state for a later retry.
 
         Sign: matches the bot's normal close logic. The fee is estimated
         from the standard taker rate since we have no order dict.
@@ -2665,6 +2741,7 @@ class FuturesReconcileMixin:
                         self,
                         symbol_full,
                         amount,
+                        allow_ticker=False,
                         pos_type=pos_type,
                         buy_time=buy_time,
                     )

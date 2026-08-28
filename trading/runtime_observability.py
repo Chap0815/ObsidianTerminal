@@ -121,7 +121,7 @@ def _safe_entry_id(value: Any, *, max_length: int = 64) -> str | None:
     if (
         not text
         or len(text) > max_length
-        or any(ord(char) < 32 for char in text)
+        or any(ord(char) < 32 or ord(char) == 127 for char in text)
     ):
         return None
     return text
@@ -561,9 +561,21 @@ def compare_position_layers(
     states = {_base_symbol(key): dict(value)
               for key, value in state_rows.items() if _base_symbol(key)}
     claims = None
+    claim_count = 0
+    duplicate_claim_symbols: set[str] = set()
     if claim_rows is not None:
-        claims = {_base_symbol(row.get("symbol")): dict(row)
-                  for row in claim_rows if _base_symbol(row.get("symbol"))}
+        claim_count = len(claim_rows)
+        claim_groups: dict[str, list[Mapping[str, Any]]] = {}
+        for row in claim_rows:
+            base = _base_symbol(row.get("symbol"))
+            if base:
+                claim_groups.setdefault(base, []).append(row)
+        duplicate_claim_symbols = {
+            base for base, rows in claim_groups.items() if len(rows) > 1
+        }
+        claims = {
+            base: dict(rows[0]) for base, rows in claim_groups.items()
+        }
     exchange = {_base_symbol(key): dict(value)
                 for key, value in exchange_rows.items() if _base_symbol(key)}
 
@@ -574,6 +586,8 @@ def compare_position_layers(
     metadata_issues: list[str] = []
 
     if claims is not None:
+        for symbol in sorted(duplicate_claim_symbols):
+            money_issues.append(f"duplicate_claim_identity:{symbol}")
         for symbol in sorted(state_symbols - claim_symbols):
             money_issues.append(f"state_without_claim:{symbol}")
         for symbol in sorted(claim_symbols - state_symbols):
@@ -597,31 +611,92 @@ def compare_position_layers(
                 money_issues.append(f"amount_mismatch:{symbol}:{drift:.3f}")
         state_direction = _direction(states[symbol].get("position_type"))
         exchange_direction = _direction(exchange[symbol].get("direction"))
-        if (state_direction and exchange_direction
+        if state_direction and not exchange_direction:
+            money_issues.append(
+                f"exchange_direction_unavailable:{symbol}"
+            )
+        elif (state_direction and exchange_direction
                 and state_direction != exchange_direction
                 and state_direction != "SPOT"):
             money_issues.append(
                 f"direction_mismatch:{symbol}:{state_direction}:"
                 f"{exchange_direction}")
 
+    if claims is not None:
+        for symbol in sorted(state_symbols & claim_symbols):
+            # Narrow synthetic/legacy callers may omit the projection entirely;
+            # a present SQL amount column must always be valid evidence.
+            if "amount" not in claims[symbol]:
+                continue
+            raw_claim_amount = claims[symbol].get("amount")
+            state_amount = _positive_float(states[symbol].get("amount"))
+            claim_amount = _positive_float(raw_claim_amount)
+            if claim_amount is None:
+                money_issues.append(f"claim_amount_invalid:{symbol}")
+            elif state_amount is not None:
+                drift = abs(state_amount - claim_amount) / max(
+                    state_amount, claim_amount
+                )
+                if drift > max(0.0, amount_tolerance):
+                    money_issues.append(
+                        f"claim_amount_mismatch:{symbol}:{drift:.3f}"
+                    )
+
+    state_entry_ids: dict[str, str] = {}
     for symbol, row in sorted(states.items()):
-        if not str(row.get("entry_id") or "").strip():
-            metadata_issues.append(f"state_missing_entry_id:{symbol}")
+        raw_entry_id = row.get("entry_id")
+        entry_id = _safe_entry_id(raw_entry_id)
+        if entry_id is None:
+            issue = (
+                "missing"
+                if raw_entry_id is None
+                or (isinstance(raw_entry_id, str) and not raw_entry_id.strip())
+                else "invalid"
+            )
+            metadata_issues.append(f"state_{issue}_entry_id:{symbol}")
+        else:
+            state_entry_ids[symbol] = entry_id
         if row.get("entry_quality_score") is None:
             metadata_issues.append(f"state_missing_quality:{symbol}")
     if claims is not None:
+        claim_entry_ids: dict[str, str] = {}
         for symbol, row in sorted(claims.items()):
             extra = _claim_extra(row)
-            if not str(extra.get("entry_id") or "").strip():
-                metadata_issues.append(f"claim_missing_entry_id:{symbol}")
+            raw_entry_id = extra.get("entry_id")
+            entry_id = _safe_entry_id(raw_entry_id)
+            if entry_id is None:
+                issue = (
+                    "missing"
+                    if raw_entry_id is None
+                    or (
+                        isinstance(raw_entry_id, str)
+                        and not raw_entry_id.strip()
+                    )
+                    else "invalid"
+                )
+                metadata_issues.append(f"claim_{issue}_entry_id:{symbol}")
+            else:
+                claim_entry_ids[symbol] = entry_id
             if extra.get("entry_quality_score") is None:
                 metadata_issues.append(f"claim_missing_quality:{symbol}")
+        for symbol in sorted(state_symbols & claim_symbols):
+            state_entry_id = state_entry_ids.get(symbol)
+            claim_entry_id = claim_entry_ids.get(symbol)
+            if (
+                state_entry_id is not None
+                and claim_entry_id is not None
+                and state_entry_id != claim_entry_id
+            ):
+                metadata_issues.append(
+                    f"entry_id_mismatch:{symbol}:{state_entry_id}:"
+                    f"{claim_entry_id}"
+                )
 
     return {
         "ok": not money_issues,
         "metadata_complete": not metadata_issues,
         "state_count": len(states),
-        "claim_count": len(claims or {}),
+        "claim_count": claim_count,
         "claims_available": claims is not None,
         "exchange_count": len(exchange),
         "money_issues": money_issues,
@@ -636,7 +711,9 @@ def _bounded_issue_fingerprint(value: Any) -> tuple[str, ...]:
     for raw in value[:64]:
         issue = str(raw)[:192]
         parts = issue.split(":")
-        if len(parts) >= 3 and parts[0] == "amount_mismatch":
+        if len(parts) >= 3 and parts[0] in {
+            "amount_mismatch", "claim_amount_mismatch",
+        }:
             issue = ":".join(parts[:2])
         issues.append(issue)
     return tuple(sorted(issues))

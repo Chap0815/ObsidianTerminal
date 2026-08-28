@@ -1042,10 +1042,7 @@ class ExitsMixin:
         attempt would hit InsufficientBalance.
         """
         from core.logger import log_event
-        try:
-            from core.symbol_locks import close_lock
-        except ImportError:
-            close_lock = None
+        from core.symbol_locks import close_lock
 
         amount = _positive_finite(d.get("amount"))
         invested = _positive_finite(d.get("invested_usdt"))
@@ -1158,12 +1155,6 @@ class ExitsMixin:
                 return True
 
         # Acquire close_lock before any sell-side state change.
-        if close_lock is None:
-            # No lock module available  fall through (best-effort).
-            return self._execute_partial_tp_unlocked(
-                sym, d, curr, partial_pct, sld_test
-            )
-
         with close_lock(sym, timeout=2.0, bot_name=self.BOT_NAME) as got:
             if not got:
                 # Another path (probably emergency-close) holds the lock.
@@ -1551,15 +1542,7 @@ class ExitsMixin:
         ``with`` statement so the lock is always released, even on early raises.
         """
         from core.logger import log_event
-        try:
-            from core.symbol_locks import close_lock
-        except ImportError:
-            close_lock = None
-
-        if close_lock is None:
-            # No lock module available  do the work directly (best-effort).
-            self._execute_full_exit_inner(sym, d, curr, reason)
-            return
+        from core.symbol_locks import close_lock
 
         with close_lock(sym, timeout=5.0, bot_name=self.BOT_NAME) as got:
             if not got:

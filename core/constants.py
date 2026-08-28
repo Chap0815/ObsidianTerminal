@@ -223,10 +223,11 @@ BTC_DUMP_THRESHOLD            = -2.0
 #  F&G Cache Max Staleness 
 FG_MAX_STALE_AGE_SEC          = 3600
 
-#  Stablecoin Equivalents 
+#  Spot cash / non-position assets
 STABLECOIN_EQUIVALENTS = frozenset({
-    "USDT", "USD", "USDC", "FDUSD", "TUSD", "DAI",
+    "USDT", "USD", "USDC", "FDUSD", "BUSD", "TUSD", "DAI", "USD1", "USDE",
 })
+SPOT_NON_POSITION_ASSETS = STABLECOIN_EQUIVALENTS | frozenset({"MX"})
 
 #  Screener Tunables 
 SCREENER_MAX_PARALLEL_WORKERS = min(8, max(2, (_mp.cpu_count() or 2) * 2))

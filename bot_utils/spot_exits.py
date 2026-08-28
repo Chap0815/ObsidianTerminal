@@ -107,13 +107,12 @@ def spot_sell_requires_terminal_recovery(
     raw_status = order.get("status")
     if raw_status not in (None, ""):
         if not isinstance(raw_status, str):
-            # The submit/recovery validators reject malformed explicit status
-            # values before any production caller reaches this helper.
-            return False
+            return True
         normalized_status = normalize_spot_order_status(raw_status)
+        if normalized_status not in _SPOT_KNOWN_ORDER_STATUSES:
+            return True
         return (
-            normalized_status in _SPOT_KNOWN_ORDER_STATUSES
-            and normalized_status not in _SPOT_TERMINAL_ORDER_STATUSES
+            normalized_status not in _SPOT_TERMINAL_ORDER_STATUSES
         )
 
     requested = _positive_finite(expected_amount)
@@ -1707,9 +1706,50 @@ def emergency_close_all_spot(*,
                         if spot_sell_requires_terminal_recovery(
                             order, amount
                         ):
+                            barrier_updates = {
+                                "emergency_exit_outcome_uncertain": True,
+                            }
+                            explicit_unknown_status = (
+                                raw_status not in (None, "")
+                                and (
+                                    not isinstance(raw_status, str)
+                                    or normalized_status
+                                    not in _SPOT_KNOWN_ORDER_STATUSES
+                                )
+                            )
+                            observed_residual = (
+                                _emergency_residual_amount(
+                                    ex,
+                                    symbol_pair,
+                                    amount,
+                                    _sold,
+                                    curr,
+                                    order=order,
+                                )
+                                if explicit_unknown_status
+                                else amount
+                            )
+                            if observed_residual < amount:
+                                barrier_updates.update(
+                                    _emergency_residual_updates(
+                                        amount,
+                                        observed_residual,
+                                        margin,
+                                        initial_entry_fee,
+                                        original_amount,
+                                        None,
+                                        reason,
+                                    )
+                                )
+                                barrier_updates.pop(
+                                    "emergency_exit_client_order_id", None
+                                )
+                                barrier_updates[
+                                    "emergency_exit_outcome_uncertain"
+                                ] = True
                             persisted = _persist_spot_exit_fields(
                                 state, sym, d,
-                                {"emergency_exit_outcome_uncertain": True},
+                                barrier_updates,
                             )
                             if not persisted:
                                 log_event(

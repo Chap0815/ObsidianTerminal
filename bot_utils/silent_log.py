@@ -19,6 +19,7 @@ Usage::
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 import time
@@ -47,6 +48,36 @@ def _safe_text(value, max_chars: int) -> str:
     except Exception:
         rendered = f"[UNRENDERABLE:{type(value).__name__}]"
     return rendered[:max_chars]
+
+
+def _fallback_redact(text: str) -> str:
+    """Scrub common credential shapes without importing the main logger."""
+    try:
+        out = str(text)
+        out = re.sub(
+            r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b",
+            "[REDACTED_TELEGRAM]",
+            out,
+        )
+        out = re.sub(
+            r"(?i)\b(api[_-]?key|secret|passphrase|password|token)"
+            r"([\"'\s:=]+)([^\"'\s,;}]{6,})",
+            r"\1\2[REDACTED]",
+            out,
+        )
+        out = re.sub(
+            r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}",
+            r"\1[REDACTED]",
+            out,
+        )
+        out = re.sub(
+            r"(://[^:/\s]+:)([^@/\s]{3,})(@)",
+            r"\1[REDACTED]\3",
+            out,
+        )
+        return out
+    except Exception:
+        return "[REDACTION_FAILED]"
 
 
 def silent_log(ctx: str, exc: Exception,
@@ -94,7 +125,7 @@ def silent_log(ctx: str, exc: Exception,
         from core.logger import redact
         msg = redact(msg)
     except Exception:
-        pass
+        msg = _fallback_redact(msg)
     if write is None:
         # ``sys.stderr`` is ``None`` under ``pythonw.exe``.
         stderr = sys.stderr

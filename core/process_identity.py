@@ -7,6 +7,7 @@ also references this project and the bot's module or script path.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 
@@ -38,31 +39,89 @@ def pid_cmdline(pid: int) -> str:
         return ""
 
 
+def pid_cwd(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    try:
+        import psutil  # type: ignore
+        return str(psutil.Process(pid).cwd() or "")
+    except Exception:
+        return ""
+
+
 def _norm(text: str) -> str:
     return str(text or "").replace("\\", "/").lower()
 
 
-def cmdline_matches_bot(bot_name: str, cmdline: str) -> bool:
-    if not cmdline:
+def _module_token_seen(cmdline: str, module: str) -> bool:
+    if not module:
         return False
+    escaped = re.escape(module)
+    return bool(
+        re.search(
+            rf"(?:^|\s)-m\s+(?:\"{escaped}\"|'{escaped}'|{escaped})(?=\s|$)",
+            cmdline,
+        )
+    )
+
+
+def _script_token_seen(cmdline: str, script: str) -> bool:
+    if not script:
+        return False
+    return bool(
+        re.search(
+            rf"(?:^|[/\s\"']){re.escape(script)}(?=$|[\s\"'])",
+            cmdline,
+        )
+    )
+
+
+def cmdline_bot_match_kind(bot_name: str, cmdline: str) -> str:
+    """Return the exact bot invocation kind: ``module``, ``script`` or empty."""
+    if not cmdline:
+        return ""
     try:
         from launcher.config.settings import BOT_META, PROJECT_ROOT
         meta = BOT_META.get(str(bot_name or "").upper()) or {}
     except Exception:
-        return False
+        return ""
     low = _norm(cmdline)
     module = _norm(meta.get("module") or "")
     script = _norm(meta.get("script") or "")
     script_name = _norm(Path(script).name) if script else ""
-    if module and module in low:
-        return True
+    if _module_token_seen(low, module):
+        return "module"
     root = _norm(str(PROJECT_ROOT))
     root_seen = bool(root and root in low)
-    return bool(
-        (script and script in low)
-        or (script_name and script_name in low and (root_seen or "/bots/" in low))
+    script_seen = bool(
+        _script_token_seen(low, script)
+        or (
+            _script_token_seen(low, script_name)
+            and (root_seen or "/bots/" in low)
+        )
     )
+    return "script" if script_seen else ""
+
+
+def cmdline_matches_bot(bot_name: str, cmdline: str) -> bool:
+    return bool(cmdline_bot_match_kind(bot_name, cmdline))
 
 
 def pid_matches_bot(pid: int, bot_name: str) -> bool:
-    return pid_alive(pid) and cmdline_matches_bot(bot_name, pid_cmdline(pid))
+    if not pid_alive(pid):
+        return False
+    cmdline = pid_cmdline(pid)
+    match_kind = cmdline_bot_match_kind(bot_name, cmdline)
+    if not match_kind:
+        return False
+    try:
+        from launcher.config.settings import PROJECT_ROOT
+
+        raw_process_root = pid_cwd(pid)
+        if not raw_process_root:
+            return False
+        process_root = _norm(os.path.abspath(raw_process_root)).rstrip("/")
+        expected_root = _norm(os.path.abspath(PROJECT_ROOT)).rstrip("/")
+        return bool(process_root and process_root == expected_root)
+    except Exception:
+        return False

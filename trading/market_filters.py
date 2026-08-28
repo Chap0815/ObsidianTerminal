@@ -467,17 +467,12 @@ def _fetch_fg_from_cmc() -> Optional[int]:
         for entry in candidates:
             if not isinstance(entry, dict):
                 continue
-            score = (
-                entry.get("score")
-                or entry.get("value")
-                or entry.get("fgi")
-                or entry.get("index")
-            )
-            if score is None:
-                continue
-            value = _normalized_fear_greed(score)
-            if value is not None:
-                return value
+            for key in ("score", "value", "fgi", "index"):
+                if key not in entry or entry[key] is None:
+                    continue
+                value = _normalized_fear_greed(entry[key])
+                if value is not None:
+                    return value
     except Exception as e:
         _filter_log(f"[Filter] CMC data-api failed: {type(e).__name__}: {e}", "WARN")
     return None
@@ -620,10 +615,12 @@ def _closed_daily_bars(bars: list) -> list:
         return []
     out = list(bars)
     try:
+        from core.clock import now_ms
+
         last_ts = int(float(out[-1][0]))
-        now_ms = int(time.time() * 1000)
+        current_ms = int(now_ms())
         day_ms = 24 * 60 * 60 * 1000
-        today_start_ms = (now_ms // day_ms) * day_ms
+        today_start_ms = (current_ms // day_ms) * day_ms
         if last_ts >= today_start_ms:
             out = out[:-1]
     except Exception:
@@ -641,11 +638,27 @@ def get_market_regime(exchange) -> dict:
                 raise RuntimeError("API budget exhausted before market-regime ticker")
             ticker_24h = exchange.fetch_ticker(symbol)
             btc_24h = float(ticker_24h.get("percentage", 0) or 0)
+            if not math.isfinite(btc_24h):
+                btc_24h = 0.0
 
             if not try_consume_api_call("market_regime_fetch_ohlcv"):
                 raise RuntimeError("API budget exhausted before market-regime OHLCV")
             bars = exchange.fetch_ohlcv(symbol, "1d", limit=9)
             closed_bars = _closed_daily_bars(bars)
+            if len(closed_bars) < 8:
+                raise RuntimeError(
+                    "market-regime daily candle history is incomplete"
+                )
+            closed_prices = [float(row[4]) for row in closed_bars[-8:]]
+            if any(
+                isinstance(row[4], bool)
+                or not math.isfinite(price)
+                or price <= 0.0
+                for row, price in zip(closed_bars[-8:], closed_prices)
+            ):
+                raise RuntimeError(
+                    "market-regime daily candle prices are invalid"
+                )
 
             # Nicht jede Exchange fllt das ccxt-Ticker-Feld "percentage"
             # (KuCoin z.B. nicht; Bitget/MEXC schon). Fallback: 24h-nderung
@@ -653,9 +666,9 @@ def get_market_regime(exchange) -> dict:
             # exchange-unabhngig.
             if not btc_24h:
                 try:
-                    if closed_bars and len(closed_bars) >= 2:
-                        prev_close = closed_bars[-2][4]
-                        last_close = closed_bars[-1][4]
+                    if len(closed_prices) >= 2:
+                        prev_close = closed_prices[-2]
+                        last_close = closed_prices[-1]
                         if prev_close:
                             btc_24h = ((last_close - prev_close) / prev_close) * 100
                 except Exception:
@@ -663,7 +676,7 @@ def get_market_regime(exchange) -> dict:
 
             if len(closed_bars) >= 8:
                 btc_7d = (
-                    (closed_bars[-1][4] - closed_bars[-8][4]) / closed_bars[-8][4]
+                    (closed_prices[-1] - closed_prices[-8]) / closed_prices[-8]
                 ) * 100
             else:
                 btc_7d = 0.0
@@ -719,7 +732,7 @@ def get_market_regime(exchange) -> dict:
         except Exception as e:
             _filter_log(f"[Filter] Market phase analysis failed: {e}", "WARN")
             return {
-                "regime": "NEUTRAL",
+                "regime": "UNKNOWN",
                 "btc_24h": 0.0,
                 "btc_7d": 0.0,
                 "fear_greed": 50,
@@ -962,7 +975,13 @@ def can_buy_now(
             return False, reason
 
     regime_data = get_market_regime(exchange)
-    if regime_data.get("regime") == "BEAR":
+    regime = regime_data.get("regime")
+    if regime not in {"BULL", "BEAR", "NEUTRAL"}:
+        return (
+            False,
+            "Market regime unavailable  fail-closed (pausing new entries)",
+        )
+    if regime == "BEAR":
         if allow_shorts:
             # BEAR is a valid SHORT context  don't block, fall through
             pass

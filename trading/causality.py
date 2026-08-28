@@ -83,13 +83,14 @@ def scan_prefix_invariance(
     absolute_tolerance = _absolute_tolerance(absolute_tolerance)
     if len(rows) <= min_compare:
         return CausalityReport(False, 0, None, 0.0, "insufficient coverage")
-    full = list(feature_fn(rows))
+    source_rows = deepcopy(rows)
+    full = list(feature_fn(deepcopy(source_rows)))
     if len(full) != len(rows):
         return CausalityReport(False, 0, None, 0.0, "feature length mismatch")
     compared = 0
     max_error = 0.0
     for end in range(min_compare, len(rows)):
-        prefix = list(feature_fn(rows[:end]))
+        prefix = list(feature_fn(deepcopy(source_rows[:end])))
         if len(prefix) != end:
             return CausalityReport(False, compared, end - 1, max_error, "prefix length mismatch")
         error, invalid_numeric = _comparison_error(
@@ -124,12 +125,13 @@ def scan_future_tail_perturbation(
     absolute_tolerance = _absolute_tolerance(absolute_tolerance)
     if cutoff <= 0 or cutoff >= len(rows):
         return CausalityReport(False, 0, None, 0.0, "invalid perturbation cutoff")
-    changed_rows = list(rows[:cutoff]) + [
-        perturb(deepcopy(row)) for row in rows[cutoff:]
+    source_rows = deepcopy(rows)
+    changed_rows = deepcopy(source_rows[:cutoff]) + [
+        perturb(deepcopy(row)) for row in source_rows[cutoff:]
     ]
     intervention_effective = False
     for original, changed_row in zip(
-        rows[cutoff:], changed_rows[cutoff:], strict=True
+        source_rows[cutoff:], changed_rows[cutoff:], strict=True
     ):
         error, invalid_numeric = _comparison_error(original, changed_row)
         if not invalid_numeric and error > 0.0:
@@ -143,8 +145,8 @@ def scan_future_tail_perturbation(
             0.0,
             "future-tail perturbation had no effect",
         )
-    baseline = list(feature_fn(rows))
-    changed = list(feature_fn(changed_rows))
+    baseline = list(feature_fn(deepcopy(source_rows)))
+    changed = list(feature_fn(deepcopy(changed_rows)))
     if len(baseline) != len(rows) or len(changed) != len(rows):
         return CausalityReport(False, 0, None, 0.0, "feature length mismatch")
     max_error = 0.0

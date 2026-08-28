@@ -29,7 +29,7 @@ class EntryQuality:
 
 def _finite_float(value: Any) -> float | None:
     try:
-        if value is None or value == "":
+        if value is None or isinstance(value, bool) or value == "":
             return None
         out = float(value)
     except (TypeError, ValueError, OverflowError):

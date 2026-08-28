@@ -81,9 +81,9 @@ class TrendBot(SpotBot):
             return ent[1]
         try:
             if not try_consume_api_call("trend_fetch_ohlcv"):
-                return ent[1] if ent else []
+                return []
         except Exception:
-            return ent[1] if ent else []
+            return []
         try:
             bars = self.ex.fetch_ohlcv(f"{sym}/USDT", "1d", limit=need + 6)
             # Drop the still-FORMING current-day candle so the signal is based
@@ -104,7 +104,7 @@ class TrendBot(SpotBot):
                 raise ValueError("invalid OHLCV close snapshot")
         except Exception as e:
             self._log_error(f"trend fetch_ohlcv {sym}", e)
-            return ent[1] if ent else []
+            return []
         cache[sym] = (cache_now, closes)
         return closes
 
@@ -260,6 +260,13 @@ class TrendBot(SpotBot):
                 free = safe_fetch_balance_usdt(self.ex)
             except Exception:
                 free = None
+            if free is None:
+                log_event(
+                    "Trend live balance unavailable - blocking buy-side "
+                    "fail-closed",
+                    "WAIT",
+                )
+                return
 
         opened = 0
         parts = []                                        # per-coin vote summary
@@ -310,7 +317,10 @@ class TrendBot(SpotBot):
                 continue
             try:
                 paused, why = is_bot_paused(
-                    self.BOT_NAME, simulation=self.simulation)
+                    self.BOT_NAME,
+                    exchange=self.ex,
+                    simulation=self.simulation,
+                )
             except Exception as e:
                 log_event(f"Trend pause recheck failed ({type(e).__name__}) - "
                           f"blocking new entries", "WARN")
@@ -333,9 +343,11 @@ class TrendBot(SpotBot):
                 mode=entry_mode,
                 direction="BUY",
             )
+            from trading.expectancy_telemetry import expectancy_feature_value
+
             expectancy_features = {
-                "trend_votes": float(votes),
-                "realized_vol": float(vols.get(sym) or 0.0),
+                "trend_votes": expectancy_feature_value(votes),
+                "realized_vol": expectancy_feature_value(vols.get(sym)),
                 "size_multiplier": float(
                     vol_target_multiplier(vols.get(sym), med)
                     if vt_on

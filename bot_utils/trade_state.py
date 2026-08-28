@@ -19,11 +19,15 @@ import math
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 from bot_utils.state_persist import (atomic_save_json,
+                                       _is_canonical_position_symbol,
+                                       _valid_pending_accounting_items,
                                        validate_spot_state,
                                        validate_futures_state)
+from bot_utils.order_utils import order_id_text_or_none
 
 # Fields that, when changed via update()/update_many(), must be mirrored to the
 # shared bot_open_positions claim row. Deliberately EXCLUDES the high-frequency
@@ -57,6 +61,44 @@ _CLAIM_EXTRA_FIELDS = frozenset((
     "oversize_intended_notional", "oversize_real_notional",
 ))
 
+# Every recovery-defining claim field must publish its new generation when it
+# changes.  Only the two deliberately high-frequency price observations stay
+# piggy-backed on the next recovery/position update instead of hammering the
+# registry on every monitor tick.
+_CLAIM_UPDATE_FIELDS = (
+    _CLAIM_FIELDS | (_CLAIM_EXTRA_FIELDS - {"highest", "last_price"})
+)
+
+
+def _row_is_proven_flat_pending_accounting(row: dict) -> bool:
+    if row.get("accounting_pending") is not True:
+        return False
+    if order_id_text_or_none(
+        row.get("accounting_pending_exchange_order_id")
+    ) is not None:
+        return True
+    sell_price = _finite_float_or_none(
+        row.get("accounting_pending_sell_price")
+    )
+    raw_sell_time = row.get("accounting_pending_sell_time")
+    try:
+        parsed_sell_time = datetime.strptime(
+            raw_sell_time, "%Y-%m-%d %H:%M:%S"
+        )
+        canonical_sell_time = (
+            parsed_sell_time.strftime("%Y-%m-%d %H:%M:%S")
+            == raw_sell_time
+        )
+    except (TypeError, ValueError, OverflowError):
+        canonical_sell_time = False
+    return bool(
+        sell_price is not None
+        and sell_price > 0.0
+        and canonical_sell_time
+        and isinstance(row.get("accounting_pending_reason"), str)
+        and row["accounting_pending_reason"].strip()
+    )
+
 
 def _rows_exposure_count(rows) -> int:
     if not isinstance(rows, dict):
@@ -66,7 +108,7 @@ def _rows_exposure_count(rows) -> int:
         for row in rows.values()
         if not (
             isinstance(row, dict)
-            and row.get("accounting_pending") is True
+            and _row_is_proven_flat_pending_accounting(row)
         )
     )
 
@@ -206,7 +248,12 @@ def _normalize_position_row(
     if "buy" in normalized:
         normalized["buy"] = buy_val
 
-    leverage = _finite_float_or_none(normalized.get("leverage"))
+    raw_leverage = normalized.get("leverage")
+    leverage = _finite_float_or_none(raw_leverage)
+    if is_futures and "leverage" in normalized and (
+        leverage is None or leverage <= 0
+    ):
+        return None, f"invalid leverage={raw_leverage!r}"
     if leverage is None or leverage <= 0:
         leverage = 1.0
     normalized["leverage"] = leverage
@@ -223,6 +270,11 @@ def _reject_update_reason(fields: dict) -> Optional[str]:
     if nonfinite_path is not None:
         return f"non-finite {nonfinite_path}"
     for key, value in fields.items():
+        if key in (
+            "accounting_pending_partials",
+            "unpriced_external_partials",
+        ) and not _valid_pending_accounting_items(value):
+            return f"invalid {key} structure"
         reason = _validate_numeric_field(key, value)
         if reason is not None:
             return reason
@@ -231,13 +283,13 @@ def _reject_update_reason(fields: dict) -> Optional[str]:
 
 def normalize_pending_accounting_items(value) -> List[Dict[str, Any]]:
     """Return valid pending accounting items from legacy/corrupt state shapes."""
-    if not value:
+    if value is None:
         return []
     if isinstance(value, dict):
         return [dict(value)]
-    if not isinstance(value, list):
-        return []
-    return [dict(item) for item in value if isinstance(item, dict)]
+    if not _valid_pending_accounting_items(value):
+        raise ValueError("pending accounting items have invalid structure")
+    return [dict(item) for item in value]
 
 
 def remove_with_restore_fields(state, sym: str, fields: Dict[str, Any]) -> bool:
@@ -811,10 +863,13 @@ class TradeState:
         buggy screener producing amount=0 consistently is visible to the
         dashboard / Telegram instead of just silently yielding no trades.
         """
-        normalized, rejection_reason = _normalize_position_row(
-            data,
-            is_futures=self._is_futures,
-        )
+        if _is_canonical_position_symbol(sym):
+            normalized, rejection_reason = _normalize_position_row(
+                data,
+                is_futures=self._is_futures,
+            )
+        else:
+            normalized, rejection_reason = None, "symbol"
         if normalized is not None:
             data = normalized
             rejection_reason = None
@@ -888,7 +943,7 @@ class TradeState:
             return False
         with self._lock:
             if sym in self._trades:
-                if key in _CLAIM_FIELDS:
+                if key in _CLAIM_UPDATE_FIELDS:
                     candidate = copy.deepcopy(self._trades[sym])
                     candidate[key] = safe_value
                     normalized, reason = _normalize_position_row(
@@ -955,7 +1010,7 @@ class TradeState:
             return False
         with self._lock:
             if sym in self._trades:
-                if _CLAIM_FIELDS.intersection(safe_fields):
+                if _CLAIM_UPDATE_FIELDS.intersection(safe_fields):
                     candidate = copy.deepcopy(self._trades[sym])
                     candidate.update(safe_fields)
                     normalized, reason = _normalize_position_row(

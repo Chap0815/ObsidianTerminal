@@ -20,6 +20,9 @@ from datetime import datetime, timezone
 
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.balance_resolver import effective_balance
+from bot_utils.order_utils import explicit_trade_symbol_matches
+from core.clock import now_utc
+from core.constants import SPOT_NON_POSITION_ASSETS
 
 _SPOT_ORPHAN_MAX_USDT = 1_000_000_000.0
 
@@ -74,7 +77,9 @@ def _spot_effective_balance(bal_data: dict | None, sym: str) -> float:
 def _spot_effective_balance_or_none(bal_data: dict | None, sym: str) -> float | None:
     if not isinstance(bal_data, dict):
         return None
-    info = bal_data.get(sym) or {}
+    info = bal_data.get(sym) if sym in bal_data else {}
+    if not isinstance(info, dict):
+        return None
     if _spot_balance_payload_unclear(info):
         return None
     return effective_balance(info)
@@ -95,7 +100,6 @@ def _trade_amount(t: dict) -> float:
     amount = _finite_float_or_none(t.get("amount"))
     if amount is None:
         return 0.0
-    amount = abs(amount)
     return amount if amount > 0 else 0.0
 
 
@@ -225,6 +229,19 @@ def _trade_timestamp_ms_or_none(trade: dict) -> float | None:
     return timestamp_ms
 
 
+def _offline_trade_future_ceiling_ms() -> int | None:
+    try:
+        current = now_utc()
+        if current.tzinfo is None:
+            return None
+        milliseconds = int(
+            current.astimezone(timezone.utc).timestamp() * 1000
+        )
+    except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+        return None
+    return milliseconds + 60_000 if milliseconds > 0 else None
+
+
 def _aggregate_spot_sell_trades(
     bot,
     pair: str,
@@ -238,9 +255,11 @@ def _aggregate_spot_sell_trades(
     if not math.isfinite(target):
         target = 0.0
     boundary_ms = _entry_trade_boundary_ms(buy_time)
+    future_ceiling_ms = _offline_trade_future_ceiling_ms()
     if (
         target <= 0
         or boundary_ms is None
+        or future_ceiling_ms is None
         or not hasattr(bot.ex, "fetch_my_trades")
     ):
         return 0.0, 0.0, "unavailable"
@@ -257,7 +276,11 @@ def _aggregate_spot_sell_trades(
     for trade in trades:
         if not isinstance(trade, dict):
             continue
+        if not explicit_trade_symbol_matches(trade, pair):
+            continue
         timestamp_ms = _trade_timestamp_ms_or_none(trade)
+        if timestamp_ms is not None and timestamp_ms > future_ceiling_ms:
+            return 0.0, 0.0, "unavailable"
         if timestamp_ms is None or timestamp_ms < boundary_ms:
             continue
         eligible_trades.append((timestamp_ms, trade))
@@ -315,8 +338,9 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
     some other external action).
 
     Writes a trade record to the DB so the realized PnL shows up in
-    dashboards. Uses ``fetch_my_trades`` to find the actual sell price,
-    falls back to current ticker if needed.
+    dashboards. Uses ``fetch_my_trades`` to find the actual sell price.
+    A later ticker is not execution evidence, so missing fill history keeps
+    the state pending for a later retry.
 
     Returns True only after DB accounting succeeded or was already present.
     Reconcile must keep state on False so the next cycle can retry.
@@ -364,7 +388,11 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
         if close_price <= 0:
             close_price, close_fee_actual, close_source = (
                 _find_spot_external_close_price(
-                    bot, sym, amount, buy_time=buy_time
+                    bot,
+                    sym,
+                    amount,
+                    allow_ticker=False,
+                    buy_time=buy_time,
                 )
             )
 
@@ -1206,7 +1234,7 @@ def _adopt_spot_orphans(
         for coin, coin_bal in bal_data.items():
             if not isinstance(coin_bal, dict):
                 continue
-            if coin in ("USDT", "USD", "BUSD", "USDC", "FDUSD"):
+            if str(coin).strip().upper() in SPOT_NON_POSITION_ASSETS:
                 continue
             base = _base_symbol(coin)
             if not base or base in current_syms:

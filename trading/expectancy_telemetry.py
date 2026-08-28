@@ -141,13 +141,30 @@ def _schedule_retention_cleanup(now: float | None = None) -> None:
 
 
 def _finite(value) -> float | None:
-    if value is None or isinstance(value, bool):
+    if (
+        value is None
+        or isinstance(value, bool)
+        or not isinstance(value, (int, float))
+    ):
         return None
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def expectancy_feature_value(value, *, missing_default: float = 0.0):
+    """Default only absent evidence without erasing an invalid source type."""
+    return missing_default if value is None or value == "" else value
+
+
+def expectancy_feature_bps(value):
+    """Scale numeric percentages while preserving invalid source evidence."""
+    normalized = expectancy_feature_value(value)
+    if isinstance(normalized, bool) or not isinstance(normalized, (int, float)):
+        return normalized
+    return normalized * 100.0
 
 
 def _quality_decision(value: dict | None) -> dict | None:

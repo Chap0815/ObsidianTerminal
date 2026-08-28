@@ -276,8 +276,13 @@ class EventBus:
 
     def emit_sync(self, event_type: str, payload: dict = None,
                   emitted_by: str = "") -> None:
-        if self._stopped:
-            return
+        # Serialize admission with shutdown just like emit(). During a bounded
+        # shutdown an older async publisher may still be finishing while
+        # ``_accepting`` is already false and ``_stopped`` is not set yet.
+        # Synchronous critical events must not bypass that closed boundary.
+        with self._publish_condition:
+            if not self._accepting or self._stopped:
+                return
         safe_payload = _coerce_payload(payload)
         event = Event(event_type, safe_payload, emitted_by)
 

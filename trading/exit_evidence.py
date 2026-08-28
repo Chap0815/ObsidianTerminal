@@ -3,7 +3,9 @@ from __future__ import annotations
 
 
 def classify_exit_reason(reason: str) -> str:
-    normalized = str(reason or "").strip().lower()
+    if not isinstance(reason, str) or not reason.strip():
+        return "unclassified"
+    normalized = reason.strip().lower()
     if "application quit" in normalized or "manual" in normalized:
         return "manual_shutdown"
     if any(

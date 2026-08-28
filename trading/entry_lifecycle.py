@@ -88,8 +88,12 @@ def lifecycle_health_snapshot(
     state_ids = set(state_entry_ids or set())
     anomalies: list[str] = []
     with _lock:
-        expired = [entry_id for entry_id, row in _entries.items()
-                   if now - float(row.get("last_at") or now) > retention_sec]
+        expired = [
+            entry_id
+            for entry_id, row in _entries.items()
+            if row.get("terminal_at") is not None
+            and now - float(row.get("last_at") or now) > retention_sec
+        ]
         for entry_id in expired:
             _entries.pop(entry_id, None)
         rows = {

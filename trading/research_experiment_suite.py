@@ -409,9 +409,30 @@ def evaluate_momentum_panel(
     dispersion_exposures = []
     liquidity_pool_sizes = []
     market_hedge_benchmarks = []
+    skipped_invested_windows = 0
+    last_rebalance_timestamp = None
     for timestamp in timestamps:
         if (timestamp - origin) % holding_ms:
             continue
+        invested = any((
+            previous_cross_weights,
+            previous_hysteresis_weights,
+            previous_long_only_weights,
+            previous_market_hedged_weights,
+            previous_liquid_short_weights,
+            previous_dispersion_weights,
+            previous_time_weights,
+            previous_guarded_weights,
+        ))
+        if (
+            invested
+            and last_rebalance_timestamp is not None
+            and timestamp - last_rebalance_timestamp > holding_ms
+        ):
+            skipped_invested_windows += (
+                timestamp - last_rebalance_timestamp
+            ) // holding_ms - 1
+        last_rebalance_timestamp = timestamp
         previous = timestamp - lookback_ms
         tsmom_previous = timestamp - tsmom_lookback_ms
         entry_timestamp = timestamp + hour_ms
@@ -455,6 +476,8 @@ def evaluate_momentum_panel(
         ranked.sort(key=lambda row: row[1], reverse=True)
         eligible = ranked[:universe_limit]
         if len(eligible) < 2 * basket + 2:
+            if invested:
+                skipped_invested_windows += 1
             continue
         by_momentum = sorted(eligible, key=lambda row: row[2])
         shorts = by_momentum[:basket]
@@ -702,6 +725,7 @@ def evaluate_momentum_panel(
         len(series) >= 20
         and cross_metrics["samples"] >= max(1, int(minimum_windows))
         and time_metrics["samples"] >= max(1, int(minimum_windows))
+        and skipped_invested_windows == 0
     )
     ready = bool(data_sufficient and universe_proven)
     return {
@@ -717,6 +741,8 @@ def evaluate_momentum_panel(
         ),
         "cost_model": "weight_turnover_plus_final_liquidation",
         "minimum_windows": max(1, int(minimum_windows)),
+        "skipped_invested_windows": skipped_invested_windows,
+        "position_continuity_valid": skipped_invested_windows == 0,
         "cross_sectional": cross_metrics,
         "cross_sectional_hysteresis": {
             **hysteresis_metrics,
@@ -1565,7 +1591,95 @@ def _projected_funding_periods_24h(median_interval_hours: float | None) -> float
     return min(3.0, 24.0 / interval)
 
 
-def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
+def _verified_carry_capture_scope(venue_root: Path) -> dict | None:
+    """Bind production carry evidence to immutable closed-day capture seals."""
+    integrity_root = venue_root / "integrity"
+    if not integrity_root.is_dir():
+        return None
+    from trading.capture_integrity import (
+        _verify_sealed_report,
+        capture_continuity_health,
+    )
+
+    eligible: dict[str, tuple[tuple[datetime, datetime], ...]] = {}
+    verified_reports = []
+    invalid_days = 0
+    seal_errors = 0
+    for report_path in sorted(integrity_root.glob("*.json")):
+        try:
+            if report_path.stat().st_size > RESEARCH_VENUE_PAYLOAD_MAX_BYTES:
+                raise ValueError("capture seal is oversized")
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            _verify_sealed_report(
+                venue_root, report, expected_day=report_path.stem
+            )
+            day = str(report.get("day") or "")
+            if day != report_path.stem:
+                raise ValueError("capture seal day does not match its path")
+            status = report.get("status")
+            if status == "invalid":
+                invalid_days += 1
+                verified_reports.append(report)
+                continue
+            if status not in {"valid", "usable_with_gaps"}:
+                raise ValueError("capture seal status is unsupported")
+            expected_partition = f"overview/{day}.sqlite3"
+            manifest_paths = {
+                item.get("path")
+                for item in report.get("manifest") or ()
+                if isinstance(item, dict)
+            }
+            if expected_partition not in manifest_paths:
+                raise ValueError("capture seal does not bind overview partition")
+            availability = report.get("availability")
+            if (
+                not isinstance(availability, dict)
+                or availability.get("contract")
+                != "bounded_outage_exclusion_v1"
+                or availability.get("within_daily_budget") is not True
+                or not isinstance(
+                    availability.get("exclusion_intervals"), list
+                )
+            ):
+                raise ValueError("capture seal availability is invalid")
+            exclusions = []
+            for interval in availability["exclusion_intervals"]:
+                if not isinstance(interval, dict):
+                    raise ValueError("capture exclusion interval is invalid")
+                started = _utc_datetime(interval.get("start"))
+                ended = _utc_datetime(interval.get("end"))
+                if started is None or ended is None or ended <= started:
+                    raise ValueError("capture exclusion interval is invalid")
+                exclusions.append((started, ended))
+            if status == "valid" and exclusions:
+                raise ValueError("valid capture seal contains exclusions")
+            eligible[day] = tuple(sorted(exclusions))
+            verified_reports.append(report)
+        except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+            seal_errors += 1
+    continuity = capture_continuity_health(verified_reports)
+    if continuity.get("ok") is True:
+        start_day = str(continuity.get("start_day") or "")
+        end_day = str(continuity.get("end_day") or "")
+        eligible = {
+            day: intervals
+            for day, intervals in eligible.items()
+            if start_day <= day <= end_day
+        }
+    return {
+        "eligible": eligible,
+        "invalid_days": invalid_days,
+        "seal_errors": seal_errors,
+        "continuity": continuity,
+    }
+
+
+def _carry_history_report(
+    root: Path,
+    *,
+    minimum_samples: int = 90,
+    require_verified_seals: bool = True,
+) -> dict:
     from trading.carry_sim import CarryEngine, CarryState, CarryTerms
 
     grouped: dict[str, dict[str, dict]] = {}
@@ -1575,8 +1689,35 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
     unsettled_funding_periods: set[tuple[str, str]] = set()
     analysis_time = datetime.now(timezone.utc)
     folder = root / "data" / "venue_native" / "overview"
+    capture_scope = _verified_carry_capture_scope(folder.parent)
+    capture_contract = (
+        "verified_closed_day_seals"
+        if capture_scope is not None
+        else "verified_closed_day_seals_missing"
+        if require_verified_seals
+        else "legacy_unsealed_test_fixture"
+    )
+    capture_window_ready = bool(
+        not require_verified_seals
+        or (
+            capture_scope is not None
+            and capture_scope["continuity"].get("ok") is True
+        )
+    )
     total_events = 0
+    excluded_overview_events = 0
+    skipped_unusable_partitions = 0
     for path in folder.glob("*.sqlite3"):
+        exclusions: tuple[tuple[datetime, datetime], ...] = ()
+        if capture_scope is None and require_verified_seals:
+            skipped_unusable_partitions += 1
+            continue
+        if capture_scope is not None:
+            scoped = capture_scope["eligible"].get(path.stem)
+            if scoped is None:
+                skipped_unusable_partitions += 1
+                continue
+            exclusions = scoped
         conn = None
         try:
             conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
@@ -1588,6 +1729,15 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
                 (RESEARCH_VENUE_PAYLOAD_MAX_BYTES,),
             )
             for event_id, exchange_time, received_time, encoded in rows:
+                snapshot_received_time = _utc_datetime(received_time)
+                if snapshot_received_time is None:
+                    continue
+                if any(
+                    started <= snapshot_received_time <= ended
+                    for started, ended in exclusions
+                ):
+                    excluded_overview_events += 1
+                    continue
                 total_events += 1
                 try:
                     payload = json.loads(encoded)
@@ -1643,10 +1793,8 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
                         else None
                     )
                     snapshot_time = _utc_datetime(exchange_time)
-                    snapshot_received_time = _utc_datetime(received_time)
                     if (
                         snapshot_time is None
-                        or snapshot_received_time is None
                         or snapshot_time > settlement_time
                         or snapshot_received_time > settlement_time
                     ):
@@ -1766,7 +1914,8 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
             and len(volumes) >= math.ceil(len(values) * 0.80)
         )
         ready = (
-            len(periods) >= required
+            capture_window_ready
+            and len(periods) >= required
             and verified == len(values)
             and positive_fraction >= 0.80
             and sign_flip_rate <= 0.20
@@ -1816,6 +1965,21 @@ def _carry_history_report(root: Path, *, minimum_samples: int = 90) -> dict:
     )
     qualified.sort()
     return {
+        "capture_evidence_contract": capture_contract,
+        "eligible_sealed_days": (
+            None if capture_scope is None else len(capture_scope["eligible"])
+        ),
+        "invalid_sealed_days": (
+            None if capture_scope is None else capture_scope["invalid_days"]
+        ),
+        "seal_validation_errors": (
+            None if capture_scope is None else capture_scope["seal_errors"]
+        ),
+        "capture_continuity": (
+            None if capture_scope is None else capture_scope["continuity"]
+        ),
+        "skipped_unusable_partitions": skipped_unusable_partitions,
+        "excluded_overview_events": excluded_overview_events,
         "overview_events": total_events,
         "minimum_market_samples": required,
         "minimum_independent_funding_periods": required,
@@ -1856,6 +2020,7 @@ def run_research_experiments(
         build_carry_preview,
         build_execution_cost_report,
         build_execution_policy_report,
+        build_observation_readiness,
         build_ofi_report,
         select_expectancy_schema,
     )
@@ -1893,9 +2058,18 @@ def run_research_experiments(
         },
         "minimum_rows": max(30, int(minimum_expectancy_rows)),
     }
+    observation_readiness = build_observation_readiness(
+        project,
+        bot=normalized_bot,
+        mode=normalized_mode,
+    )
+    expectancy_evidence["observation_readiness"] = observation_readiness
     abstention = None
     expectancy_ready = False
-    if len(labels) >= max(30, int(minimum_expectancy_rows)):
+    if (
+        observation_readiness["ready"] is True
+        and len(labels) >= max(30, int(minimum_expectancy_rows))
+    ):
         try:
             min_train = max(
                 100,
@@ -1992,7 +2166,11 @@ def run_research_experiments(
             expectancy_evidence,
             "purged walk-forward evidence available"
             if expectancy_ready
-            else "insufficient closed causal labels",
+            else (
+                "observation window is not ready"
+                if observation_readiness["ready"] is not True
+                else "insufficient closed causal labels"
+            ),
         ),
         "entry_selectivity": _result(
             selectivity_ready,

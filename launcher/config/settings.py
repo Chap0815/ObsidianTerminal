@@ -752,6 +752,15 @@ def _safe_display_font() -> str:
 _LAUNCHER_CONFIG_JSON_MAX_BYTES = 2 * 1024 * 1024
 
 
+def _config_object_without_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate config JSON key {key}")
+        result[key] = value
+    return result
+
+
 def _read_launcher_config_json(path: str):
     with open(path, "rb") as stream:
         raw = stream.read(_LAUNCHER_CONFIG_JSON_MAX_BYTES + 1)
@@ -760,6 +769,7 @@ def _read_launcher_config_json(path: str):
     return json.loads(
         raw.decode("utf-8-sig"),
         parse_constant=_reject_json_constant,
+        object_pairs_hook=_config_object_without_duplicate_keys,
     )
 
 
@@ -808,6 +818,15 @@ def load_config() -> dict:
         ) from e
     if not isinstance(cfg, dict):
         raise RuntimeError("bot_config.json root must be an object")
+    for section, defaults in defaults_cfg.items():
+        if (
+            isinstance(defaults, dict)
+            and section in cfg
+            and not isinstance(cfg[section], dict)
+        ):
+            raise RuntimeError(
+                f"{section} config section must be an object"
+            )
     existing_ui = cfg.get("UI")
     legacy_dashboard_binding = not (
         isinstance(existing_ui, dict)

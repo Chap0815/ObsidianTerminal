@@ -137,12 +137,15 @@ def _record_slippage_into(
         recent_abnormal = sum(1 for _, p in observations if p > MAX_SLIPPAGE_PCT)
 
     if abnormal and log_event:
-        log_event(
-            f" Slippage {slippage_pct:.3f}% on {symbol} {side} "
-            f"({recent_abnormal}/{SLIPPAGE_TRIP_COUNT} in last "
-            f"{SLIPPAGE_WINDOW_SEC}s)",
-            "WARN",
-        )
+        try:
+            log_event(
+                f" Slippage {slippage_pct:.3f}% on {symbol} {side} "
+                f"({recent_abnormal}/{SLIPPAGE_TRIP_COUNT} in last "
+                f"{SLIPPAGE_WINDOW_SEC}s)",
+                "WARN",
+            )
+        except Exception as exc:
+            _log_safe_mode_error("slippage circuit-breaker warning", exc)
 
     if recent_abnormal >= SLIPPAGE_TRIP_COUNT and trigger_safe_mode:
         trigger_safe_mode(
@@ -314,6 +317,7 @@ class SafeMode:
         self._event = threading.Event()
         self._reason = "normal"
         self._alert_sent = False
+        self._alert_inflight = False
         self._lock = threading.Lock()
         self._alert_persist_pending = False
         self._alert_persist_timer: Optional[threading.Timer] = None
@@ -511,18 +515,25 @@ class SafeMode:
                 persist_retry_pending = False
                 self._event.set()
                 self._reason = reason
-        if already_active:
+            send_alert = bool(
+                not self._alert_sent
+                and not self._alert_inflight
+                and self._telegram_send
+            )
+            if send_alert:
+                self._alert_inflight = True
+        if already_active and not send_alert:
             if persist_retry_pending:
                 self._schedule_alert_state_retry()
             return
-        if self._log_struct:
+        if not already_active and self._log_struct:
             try:
                 self._log_struct(
                     "safe_mode_triggered", reason=reason, bot=self.bot_name
                 )
             except Exception:
                 pass
-        if self._log_event:
+        if not already_active and self._log_event:
             try:
                 self._log_event(
                     f" SAFE_MODE activated: {reason}. New entries "
@@ -531,7 +542,7 @@ class SafeMode:
                 )
             except Exception:
                 pass
-        if not self._alert_sent and self._telegram_send:
+        if send_alert:
             try:
                 accepted = self._telegram_send(
                     self._telegram_token,
@@ -548,6 +559,10 @@ class SafeMode:
             except Exception as exc:
                 _log_safe_mode_error("safe-mode Telegram alert", exc)
             else:
-                self._alert_sent = True
+                with self._lock:
+                    self._alert_sent = True
                 if not self._save_alert_state():
                     self._schedule_alert_state_retry()
+            finally:
+                with self._lock:
+                    self._alert_inflight = False

@@ -113,7 +113,7 @@ class TrendFuturesBot(FuturesBot):
             return None
         return out if math.isfinite(out) else None
 
-    def _entry_contract_size(self, full: str, fallback_reader) -> float:
+    def _entry_contract_size(self, full: str, _fallback_reader) -> float:
         markets = getattr(self.ex, "markets", None) or {}
         market = markets.get(full) or {}
         info = market.get("info") if isinstance(market, dict) else {}
@@ -134,9 +134,10 @@ class TrendFuturesBot(FuturesBot):
             cs = self._safe_float(value, 0.0)
             if cs > 0.0:
                 return cs
-        if explicit:
-            return 0.0
-        return self._safe_float(fallback_reader(self.ex, full), 0.0)
+        # Entry sizing needs venue evidence.  The generic helper's historical
+        # 1.0 fallback is suitable only for non-authorizing display/accounting
+        # paths; using it here can submit the wrong number of contracts.
+        return 0.0
 
     def _bool_cfg(self, key: str, default: bool = False) -> bool:
         value = self.C(key, default)
@@ -382,9 +383,9 @@ class TrendFuturesBot(FuturesBot):
     def _is_in_cooldown(self, base: str) -> bool:
         try:
             from trading.cooldown_utils import check_in_cooldown
-            return check_in_cooldown(getattr(self, "cool", {}) or {}, base)
+            return check_in_cooldown(getattr(self, "cool", None), base)
         except Exception:
-            return False
+            return True
 
     def _set_stop_cooldown(self, base: str, reason: str, profit_usdt: float,
                            log_event=None) -> None:
@@ -900,7 +901,7 @@ class TrendFuturesBot(FuturesBot):
 
         # Entry price from the ticker (cross-the-ask realism left to the live fill)
         try:
-            tk = self.ticker_cache.get(self.ex, full, timeout=5.0)
+            tk = self._entry_ticker(full, timeout=5.0)
             price = self._safe_float(tk.get("last"), 0.0)
             if price <= 0:
                 price = self._safe_float(tk.get("close"), 0.0)
@@ -923,12 +924,26 @@ class TrendFuturesBot(FuturesBot):
             log_struct("futrend_entry_shadow", **shadow)
         except Exception:
             pass
+        from trading.expectancy_telemetry import (
+            expectancy_feature_bps,
+            expectancy_feature_value,
+        )
+
+        raw_spread_pct = shadow.get("spread_pct")
         expectancy_features = {
-            "score": float(shadow.get("entry_quality_score") or 0.0),
-            "spread_bps": float(shadow.get("spread_pct") or 0.0) * 100.0,
-            "funding_rate_pct": float(shadow.get("funding_rate_pct") or 0.0),
-            "trend_votes": float(shadow.get("trend_votes") or 0.0),
-            "realized_vol": float(shadow.get("realized_vol") or 0.0),
+            "score": expectancy_feature_value(
+                shadow.get("entry_quality_score")
+            ),
+            "spread_bps": expectancy_feature_bps(raw_spread_pct),
+            "funding_rate_pct": expectancy_feature_value(
+                shadow.get("funding_rate_pct")
+            ),
+            "trend_votes": expectancy_feature_value(
+                shadow.get("trend_votes")
+            ),
+            "realized_vol": expectancy_feature_value(
+                shadow.get("realized_vol")
+            ),
         }
         from trading.expectancy_telemetry import emit_expectancy_candidate
 
@@ -1122,29 +1137,23 @@ class TrendFuturesBot(FuturesBot):
                     stage="blocked", mode=entry_mode,
                     reason="precision_below_min_amount", direction="LONG")
                 return
-            try:
-                must_set_leverage(self.ex, lev_cap, full, direction="LONG",
-                                  margin_mode=margin_mode)
-            except LeverageNotSetError as e:
-                log_event(f"[{self.BOT_NAME}] {base}: set_leverage failed ({e}) "
-                          f" skip", "WARN")
-                emit_entry_lifecycle(
-                    entry_id, bot=self.BOT_NAME, symbol=base,
-                    stage="aborted", mode=entry_mode,
-                    reason="set_leverage_failed", direction="LONG")
-                return
-            safe_set_margin_mode(self.ex, margin_mode, full, leverage=lev_cap,
-                                 direction="LONG")
             from trading.execution_quality import make_client_order_id
             _cid = make_client_order_id(entry_id, "entry", self.BUY_PREFIX)
-            params = entry_params(position_side="long", margin_mode=margin_mode,
-                                  leverage=lev_cap, client_order_id=_cid)
+            params = entry_params(
+                position_side="long",
+                margin_mode=margin_mode,
+                leverage=lev_cap,
+                client_order_id=_cid,
+            )
             if not claim_symbol_for_entry(
                 self.BOT_NAME,
                 full,
                 "LONG",
                 intent_id=entry_id,
-                notional_usdt=float(margin) * float(lev_cap),
+                # Reserve the same physical notional admitted above.  The
+                # integer exchange leverage cap configures the venue, while
+                # ``eff_lev`` determines the contracts actually requested.
+                notional_usdt=notional,
                 mode=entry_mode,
                 reservation_ceiling_usdt=(
                     admission.portfolio.reservation_ceiling_usdt
@@ -1158,6 +1167,32 @@ class TrendFuturesBot(FuturesBot):
                     stage="blocked", mode=entry_mode,
                     reason="claim_conflict", direction="LONG")
                 return
+            try:
+                must_set_leverage(self.ex, lev_cap, full, direction="LONG",
+                                  margin_mode=margin_mode)
+            except LeverageNotSetError as e:
+                log_event(f"[{self.BOT_NAME}] {base}: set_leverage failed ({e}) "
+                          f" skip", "WARN")
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="aborted", mode=entry_mode,
+                    reason="set_leverage_failed", direction="LONG")
+                cleaned = self._cleanup_untracked_entry_state(
+                    base, "set leverage failed before entry"
+                )
+                if cleaned:
+                    try:
+                        from core.database import release_portfolio_reservation
+
+                        release_portfolio_reservation(entry_id)
+                    except Exception as cleanup_exc:
+                        self._log_error(
+                            f"release leverage-failed reservation {base}",
+                            cleanup_exc,
+                        )
+                return
+            safe_set_margin_mode(self.ex, margin_mode, full, leverage=lev_cap,
+                                 direction="LONG")
             if not self._record_open(
                 base, fill, margin, eff_lev, contracts, 0.0,
                 provisional=True, lev_cap=lev_cap, mm_rate=mm,
@@ -1553,8 +1588,11 @@ class TrendFuturesBot(FuturesBot):
 
         pos, unavailable = self._fetch_exchange_position(full, "LONG")
         if pos:
-            contracts = self._safe_float(pos.get("contracts") or pos.get("size"), 0.0)
-            contracts = abs(contracts)
+            from bot_utils.futures_order import _position_contracts_abs
+
+            contracts = _position_contracts_abs(pos)
+            if contracts is None:
+                return 0.0, fill, True, "position_quantity_unverified"
             for key in ("entryPrice", "entry_price"):
                 fv = self._safe_float(pos.get(key), 0.0)
                 if fv > 0:
@@ -2516,7 +2554,9 @@ class TrendFuturesBot(FuturesBot):
                 pass
             return False
 
-        contracts = abs(self._safe_float(pos.get("contracts") or pos.get("size"), 0.0))
+        from bot_utils.futures_order import _position_contracts_abs
+
+        contracts = _position_contracts_abs(pos)
         entry = 0.0
         for key in ("entryPrice", "entry_price"):
             entry = self._safe_float(pos.get(key), 0.0)
@@ -2524,7 +2564,7 @@ class TrendFuturesBot(FuturesBot):
                 break
         if entry <= 0:
             entry = self._safe_float(d.get("buy"), 0.0)
-        if contracts <= 0 or entry <= 0:
+        if contracts is None or contracts <= 0 or entry <= 0:
             return False
 
         lev = self._safe_float(d.get("leverage"), 1.0) or 1.0
@@ -2762,7 +2802,11 @@ class TrendFuturesBot(FuturesBot):
                     getattr(self, "LIQ_REFRESH_INTERVAL_SEC", 90.0), 90.0)
                 upd = {"liq_next_check_at": now_ts + interval}
                 try:
-                    exch_liq = get_exchange_liq_price(self.ex, full)
+                    exch_liq = get_exchange_liq_price(
+                        self.ex,
+                        full,
+                        expected_position_side=pos_type,
+                    )
                 except Exception:
                     exch_liq = 0.0
                 if exch_liq > 0:

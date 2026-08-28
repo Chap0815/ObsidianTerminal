@@ -1987,7 +1987,7 @@ def build_exit_evidence_report(root: str | Path) -> dict:
     try:
         conn = _read_connection(path)
     except FileNotFoundError:
-        return _empty_exit_evidence_report()
+        return _empty_exit_evidence_report(schema_ready=False)
     try:
         if not _table_exists(conn, "trades"):
             return _empty_exit_evidence_report(schema_ready=False)
@@ -2104,6 +2104,9 @@ def build_research_status(
                 minimum_rows=required_expectancy_rows,
                 rejection_counts=label_rejections,
             )
+            observation_readiness = build_observation_readiness(
+                project, bot=bot, mode=mode
+            )
             expectancy[bot][mode] = {
                 "candidate_events": len(events),
                 "closed_labels": len(labels),
@@ -2111,10 +2114,11 @@ def build_research_status(
                 "closed_labels_by_schema": schema_counts,
                 "label_rejections": dict(sorted(label_rejections.items())),
                 "minimum_rows": required_expectancy_rows,
-                "ready": len(labels) >= required_expectancy_rows,
-                "observation_readiness": build_observation_readiness(
-                    project, bot=bot, mode=mode
+                "ready": bool(
+                    len(labels) >= required_expectancy_rows
+                    and observation_readiness["ready"] is True
                 ),
+                "observation_readiness": observation_readiness,
             }
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),

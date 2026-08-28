@@ -122,6 +122,11 @@ def parse_ohlcv_closes(
                 return None
             closes.append(close)
         previous_timestamp = timestamp
+    if (
+        previous_timestamp is not None
+        and previous_timestamp < current_bucket_start - expected_interval
+    ):
+        return None
     return closes
 
 

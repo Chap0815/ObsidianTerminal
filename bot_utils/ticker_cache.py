@@ -309,7 +309,7 @@ class TickerCache:
             if (
                 superseded_after is not None
                 and current is not None
-                and current[0] > superseded_after
+                and current[0] >= superseded_after
             ):
                 return False
             if symbol_full in self._cache:
@@ -356,7 +356,8 @@ class TickerCache:
                     or "too many requests" in s or "rate limit" in s)
 
     def get(self, ex, symbol_full: str, timeout: float = 5.0,
-            critical: bool = False) -> dict:
+            critical: bool = False,
+            allow_extended_rate_limit_stale: bool = True) -> dict:
         """Fetch ticker with caching, timeout, and backpressure.
 
         ``critical=True`` marks an exit-critical fetch (price for an
@@ -370,7 +371,15 @@ class TickerCache:
         """
         self._note("requests")
         try:
-            ticker = self._get(ex, symbol_full, timeout=timeout, critical=critical)
+            ticker = self._get(
+                ex,
+                symbol_full,
+                timeout=timeout,
+                critical=critical,
+                allow_extended_rate_limit_stale=(
+                    allow_extended_rate_limit_stale
+                ),
+            )
         except Exception:
             self._note_request_result(ok=False)
             raise
@@ -378,7 +387,12 @@ class TickerCache:
         return ticker
 
     def _get(self, ex, symbol_full: str, timeout: float = 5.0,
-             critical: bool = False) -> dict:
+             critical: bool = False,
+             allow_extended_rate_limit_stale: bool = True) -> dict:
+        if not isinstance(allow_extended_rate_limit_stale, bool):
+            raise ValueError(
+                "allow_extended_rate_limit_stale must be boolean"
+            )
         pre_now = time.monotonic()
 
         # Fast path: fresh cache hit. Touch LRU position on read.
@@ -392,7 +406,11 @@ class TickerCache:
                 return cached[1]
 
         if pre_now < self._rate_limited_until:
-            max_age = self.stale_max if critical else self.rate_limit_stale_max
+            max_age = (
+                self.rate_limit_stale_max
+                if not critical and allow_extended_rate_limit_stale
+                else self.stale_max
+            )
             stale = self._stale(symbol_full, time.monotonic(), max_age)
             if stale is not None:
                 self._note_stale_hit()
@@ -496,7 +514,11 @@ class TickerCache:
                     self._rate_limited_until = (
                         time.monotonic() + self.rate_limit_backoff
                     )
-                    max_age = self.stale_max if critical else self.rate_limit_stale_max
+                    max_age = (
+                        self.rate_limit_stale_max
+                        if not critical and allow_extended_rate_limit_stale
+                        else self.stale_max
+                    )
                     stale = self._stale(
                         symbol_full, time.monotonic(), max_age
                     )
@@ -518,7 +540,12 @@ class TickerCache:
                     return stale
                 raise ValueError(f"invalid ticker price for {symbol_full}")
             self._note_fetch_result(fetch_started_at, ok=True)
-            self._store(symbol_full, ticker, post_now)
+            self._store(
+                symbol_full,
+                ticker,
+                post_now,
+                superseded_after=fetch_started_at,
+            )
             return ticker
         finally:
             if permit_owned_by_caller:

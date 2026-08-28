@@ -113,7 +113,15 @@ def mfe_fallback_hit(
     opened = _utc_datetime(buy_time)
     move = _finite(move_pct)
     mfe = _finite(mfe_pct)
-    current = now or datetime.now(timezone.utc)
+    if now is None:
+        try:
+            from core.clock import now_utc
+
+            current = now_utc()
+        except Exception:
+            return False
+    else:
+        current = now
     if opened is None or move is None or mfe is None:
         return False
     if current.tzinfo is None:

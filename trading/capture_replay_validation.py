@@ -1288,7 +1288,7 @@ def analyze_independent_positions(
         except ValueError:
             return {"evidence_valid": False, "reason": "position_chronology_invalid"}
         if (
-            any(exit_number < entry_number for exit_number in exit_numbers)
+            any(exit_number <= entry_number for exit_number in exit_numbers)
             or any(
                 current <= previous
                 for previous, current in zip(exit_numbers, exit_numbers[1:])

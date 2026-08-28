@@ -195,6 +195,11 @@ def _normalize_update_rel(rel: Any) -> str | None:
     return "/".join(parts)
 
 
+def _windows_manifest_target_key(rel: str) -> str:
+    """Canonical identity for paths installed on the Windows runtime."""
+    return rel.replace("\\", "/").casefold()
+
+
 def _redact_text(value: Any) -> str:
     try:
         from core.logger import redact
@@ -648,16 +653,7 @@ def _running_bot_processes() -> list[str]:
     current = os.getpid()
     root_text = str(ROOT).replace("\\", "/").lower()
     from launcher.config.settings import BOT_META
-    module_markers = []
-    script_markers = []
-    for meta in BOT_META.values():
-        module = str(meta.get("module") or "").lower()
-        script = str(meta.get("script") or "").replace("\\", "/").lower()
-        if module:
-            module_markers.append(module)
-        if script:
-            script_markers.append(script)
-            script_markers.append(Path(script).name.lower())
+    from core.process_identity import cmdline_bot_match_kind
     out: list[str] = []
     scan_incomplete = False
     saw_current_pid = False
@@ -706,16 +702,21 @@ def _running_bot_processes() -> list[str]:
                 continue
             norm = cmdline.lower().replace("\\", "/")
             cwd_norm = proc_cwd.lower().replace("\\", "/")
-            module_match = any(marker in norm for marker in module_markers)
+            match_kinds = {
+                cmdline_bot_match_kind(bot_name, cmdline)
+                for bot_name in BOT_META
+            }
+            module_match = "module" in match_kinds
+            script_match = "script" in match_kinds
             scoped_script_match = (
                 (root_text in norm or cwd_norm == root_text)
-                and any(marker in norm for marker in script_markers)
+                and script_match
             )
             if (
                 python_like
                 and raw_cwd is None
                 and root_text not in norm
-                and any(marker in norm for marker in script_markers)
+                and script_match
             ):
                 scan_incomplete = True
                 continue
@@ -746,10 +747,14 @@ def _running_bot_processes_via_cim() -> list[str]:
     escaped_modules = [marker.replace("'", "''") for marker in module_markers]
     escaped_scripts = [marker.replace("'", "''") for marker in script_markers]
     module_checks = " -or ".join(
-        f"$norm.Contains('{marker}')" for marker in escaped_modules
+        "$norm -match "
+        f"'(?:^|\\s)-m\\s+\"?{re.escape(marker)}\"?(?=\\s|$)'"
+        for marker in escaped_modules
     ) or "$false"
     script_checks = " -or ".join(
-        f"$norm.Contains('{marker}')" for marker in escaped_scripts
+        "$norm -match "
+        f"'(?:^|[/\\s\"]){re.escape(marker)}(?=$|[\\s\"])'"
+        for marker in escaped_scripts
     ) or "$false"
     script = (
         "$ErrorActionPreference='Stop'; "
@@ -2065,6 +2070,7 @@ def _verify_deploy_manifest_hashes() -> None:
         raise RuntimeError("Update-Manifest ist leer oder ungueltig")
 
     problems: list[str] = []
+    manifest_targets: dict[str, str] = {}
     for item in files:
         if not isinstance(item, dict):
             problems.append("<invalid item>")
@@ -2073,6 +2079,14 @@ def _verify_deploy_manifest_hashes() -> None:
         if rel is None or _is_forbidden_update_file(rel):
             problems.append(str(item.get("path") or "<empty>"))
             continue
+        target_key = _windows_manifest_target_key(rel)
+        previous = manifest_targets.get(target_key)
+        if previous is not None:
+            problems.append(
+                f"{rel}: duplicate manifest target path ({previous})"
+            )
+            continue
+        manifest_targets[target_key] = rel
         expected_hash = str(item.get("sha256") or "").strip().lower()
         expected_bytes = item.get("bytes")
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
@@ -2109,6 +2123,25 @@ def _verify_deploy_manifest_hashes() -> None:
         raise RuntimeError(
             "Update-Manifest-Pruefung fehlgeschlagen: "
             + "; ".join(problems[:20])
+        )
+    file_count = manifest.get("file_count")
+    if (
+        isinstance(file_count, bool)
+        or not isinstance(file_count, int)
+        or file_count != len(files)
+    ):
+        raise RuntimeError(
+            "Update-Manifest-Pruefung fehlgeschlagen: file_count stimmt nicht"
+        )
+    build = hashlib.sha256()
+    for item in files:
+        rel = _normalize_update_rel(item.get("path"))
+        build.update(rel.encode("utf-8"))
+        build.update(str(item.get("sha256")).strip().lower().encode("ascii"))
+    expected_build_id = build.hexdigest()[:16]
+    if manifest.get("build_id") != expected_build_id:
+        raise RuntimeError(
+            "Update-Manifest-Pruefung fehlgeschlagen: build_id stimmt nicht"
         )
 
 
@@ -2152,6 +2185,7 @@ def _manifest_paths_from_items(
         raise RuntimeError("Update-Manifest ist leer oder ungueltig")
     paths = {"DEPLOY_MANIFEST.json"}
     bad: list[str] = []
+    manifest_targets = {_windows_manifest_target_key("DEPLOY_MANIFEST.json")}
     for item in files:
         if not isinstance(item, dict):
             continue
@@ -2163,6 +2197,11 @@ def _manifest_paths_from_items(
         if _is_forbidden_update_file(rel):
             bad.append(rel)
             continue
+        target_key = _windows_manifest_target_key(rel)
+        if target_key in manifest_targets:
+            bad.append(f"duplicate manifest target path: {rel}")
+            continue
+        manifest_targets.add(target_key)
         if not exists(rel):
             raise RuntimeError(f"{missing_label}: {rel}")
         paths.add(rel)
@@ -2218,16 +2257,15 @@ def _verify_ref_has_no_runtime_files(git: str, ref: str) -> None:
 def _tracked_protected_files() -> list[str]:
     r = _run([_git(), "ls-files", "-z", "--", *PROTECTED_FILES], check=False)
     if r.returncode != 0:
-        return []
+        raise RuntimeError(
+            "Lokale Git-User-Dateien konnten nicht sicher ermittelt werden."
+        )
     return _split_git_paths(r.stdout or "")
 
 
 def _tracked_blocked_runtime_files() -> list[str]:
     bad = []
-    try:
-        tracked = _tracked_files(ROOT)
-    except Exception:
-        return []
+    tracked = _tracked_files(ROOT)
     for line in tracked:
         rel = line.strip().replace("\\", "/")
         if rel.startswith(BLOCKED_TRACKED_PREFIXES):

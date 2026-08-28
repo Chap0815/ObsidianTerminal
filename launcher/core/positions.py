@@ -2225,13 +2225,7 @@ def _direct_close_remaining_spot(
         return {"closed": 0, "failed": [], "total_pnl": 0.0}
 
     ex = None
-    if not sim_only:
-        try:
-            from config.exchange_config import get_spot_exchange_connection  # type: ignore
-            ex = get_spot_exchange_connection()
-            _owned_exchanges.append(ex)
-        except Exception as e:
-            log("warn", f"Exchange unreachable - using stored values: {e}")
+    exchange_attempted = False
 
     closed = 0
     total_pnl = 0.0
@@ -2397,6 +2391,20 @@ def _direct_close_remaining_spot(
                     f"({pending_kwargs['profit_pct']:+.2f}%)")
                 continue
 
+            if not sim_only and ex is None and not exchange_attempted:
+                exchange_attempted = True
+                try:
+                    from config.exchange_config import (  # type: ignore
+                        get_spot_exchange_connection,
+                    )
+
+                    ex = get_spot_exchange_connection()
+                    _owned_exchanges.append(ex)
+                except Exception as e:
+                    log(
+                        "warn",
+                        f"Exchange unreachable - using stored values: {e}",
+                    )
             if not sim_only and ex is None:
                 log("error",
                     f"{sym}: LIVE sell skipped - exchange unavailable. "

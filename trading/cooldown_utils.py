@@ -35,7 +35,15 @@ except ImportError:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        from core.clock import now_utc
+
+        current = now_utc()
+        if current.tzinfo is not None:
+            current = current.astimezone(timezone.utc)
+        return current.replace(tzinfo=None)
+    except Exception:
+        return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # Stop-type exit reasons emitted by the spot/futures exit evaluators. A LOSING
@@ -72,12 +80,54 @@ _cooldown_retry_timers: dict[str, threading.Timer] = {}
 _cooldown_retry_data: dict[str, dict] = {}
 
 
+class CooldownState(dict):
+    """Cooldown mapping carrying whether its persisted source was trustworthy."""
+
+    def __init__(self, *args, source_valid: bool = True, source_error: str = ""):
+        super().__init__(*args)
+        self.source_valid = source_valid
+        self.source_error = source_error
+
+
 def _read_cooldown_json(path: str):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate cooldown JSON key: {key}")
+            result[key] = value
+        return result
+
     with open(path, "rb") as stream:
         raw = stream.read(_COOLDOWN_JSON_MAX_BYTES + 1)
     if len(raw) > _COOLDOWN_JSON_MAX_BYTES:
         raise ValueError("cooldown JSON exceeds size limit")
-    return json.loads(raw.decode("utf-8-sig"))
+    return json.loads(
+        raw.decode("utf-8-sig"),
+        object_pairs_hook=unique_object,
+    )
+
+
+def load_cooldown_state(path: str) -> CooldownState:
+    """Load persisted cooldowns without turning corruption into no cooldowns.
+
+    A missing file is a valid empty initial state.  Any existing unreadable or
+    malformed source returns an invalid state whose hot-path checks block all
+    entries; exits and position management remain available.
+    """
+    try:
+        data = _read_cooldown_json(path)
+        now = _utcnow()
+        # Validate the entire source, including expired rows.  Expiry cleanup
+        # is a separate operation and must never disguise malformed evidence.
+        _active_cooldowns(data, now, include_expired=True)
+        return CooldownState(data)
+    except FileNotFoundError:
+        return CooldownState()
+    except Exception as exc:
+        detail = str(exc).strip()
+        error = type(exc).__name__ + (f": {detail[:200]}" if detail else "")
+        return CooldownState(source_valid=False, source_error=error)
 
 
 def _normalize_cooldown_minutes(value) -> Optional[int]:
@@ -304,12 +354,18 @@ def set_cooldown(cool: dict, symbol: str, minutes: int,
     expiry_iso = (_utcnow() + timedelta(minutes=minutes)).isoformat()
     with _COOLDOWN_LOCK:
         cool[symbol] = expiry_iso
+        if isinstance(cool, CooldownState) and not cool.source_valid:
+            return False
         return _persist_with_retry_locked(cooldown_file, cool)
 
 
 def check_in_cooldown(cool: dict, symbol: str) -> bool:
     """READ-ONLY cooldown check. Mutiert nicht, schreibt nicht.
     Hot-Path-Aufrufe (Buy-Loop) sollten DIES verwenden, nicht is_in_cooldown."""
+    if not isinstance(cool, dict):
+        return True
+    if isinstance(cool, CooldownState) and not cool.source_valid:
+        return True
     raw = cool.get(symbol)
     if raw is None:
         return False
@@ -318,13 +374,17 @@ def check_in_cooldown(cool: dict, symbol: str) -> bool:
         if expiry.tzinfo is not None:
             expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
         return _utcnow() < expiry
-    except (TypeError, ValueError):
-        return False
+    except (TypeError, ValueError, OverflowError):
+        return True
 
 
 def is_in_cooldown(cool: dict, symbol: str, cooldown_file: str) -> bool:
     """Legacy: read AND auto-purge expired entries. Schreibt die Datei
     on expired hits; do not use in hot paths."""
+    if not isinstance(cool, dict):
+        return True
+    if isinstance(cool, CooldownState) and not cool.source_valid:
+        return True
     with _COOLDOWN_LOCK:
         raw = cool.get(symbol)
         if raw is None:
@@ -336,14 +396,18 @@ def is_in_cooldown(cool: dict, symbol: str, cooldown_file: str) -> bool:
             if _utcnow() < expiry:
                 return True
             cool.pop(symbol, None)
-        except (TypeError, ValueError):
-            cool.pop(symbol, None)
+        except (TypeError, ValueError, OverflowError):
+            return True
         _persist_with_retry_locked(cooldown_file, cool)
     return False
 
 
 def purge_expired(cool: dict, cooldown_file: str) -> int:
     """Explizit alle expired entries entfernen. Returns # removed."""
+    if not isinstance(cool, dict):
+        return 0
+    if isinstance(cool, CooldownState) and not cool.source_valid:
+        return 0
     now = _utcnow()
     removed = 0
     with _COOLDOWN_LOCK:
@@ -356,9 +420,10 @@ def purge_expired(cool: dict, cooldown_file: str) -> int:
                 if now >= expiry:
                     cool.pop(sym, None)
                     removed += 1
-            except (TypeError, ValueError):
-                cool.pop(sym, None)
-                removed += 1
+            except (TypeError, ValueError, OverflowError):
+                # Unknown expiry evidence is protective.  Preserve it and let
+                # check_in_cooldown block that symbol instead of failing open.
+                continue
         if removed > 0:
             _persist_with_retry_locked(cooldown_file, cool)
     return removed
@@ -366,20 +431,32 @@ def purge_expired(cool: dict, cooldown_file: str) -> int:
 
 #  Persistence 
 
-def _active_cooldowns(data, now: datetime) -> dict[str, datetime]:
+def _active_cooldowns(
+    data,
+    now: datetime,
+    *,
+    include_expired: bool = False,
+) -> dict[str, datetime]:
     if not isinstance(data, dict):
-        return {}
+        raise ValueError("cooldown JSON root must be an object")
     active: dict[str, datetime] = {}
     for symbol, raw_expiry in data.items():
-        if not isinstance(symbol, str) or not symbol:
-            continue
+        if (
+            not isinstance(symbol, str)
+            or not symbol.strip()
+            or len(symbol) > 64
+            or any(ord(char) < 32 or ord(char) == 127 for char in symbol)
+        ):
+            raise ValueError("cooldown symbol is invalid")
         try:
             expiry = datetime.fromisoformat(raw_expiry)
-        except (TypeError, ValueError):
-            continue
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"cooldown expiry is invalid for {symbol}"
+            ) from exc
         if expiry.tzinfo is not None:
             expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
-        if expiry > now:
+        if include_expired or expiry > now:
             active[symbol] = expiry
     return active
 
@@ -387,19 +464,18 @@ def _active_cooldowns(data, now: datetime) -> dict[str, datetime]:
 def _persist(path: str, data: dict) -> bool:
     if not path or not isinstance(data, dict):
         return False
+    if isinstance(data, CooldownState) and not data.source_valid:
+        return False
     try:
         with _file_lock(path):
             now = _utcnow()
             merged = _active_cooldowns(data, now)
-            try:
-                if os.path.exists(path):
-                    disk = _active_cooldowns(_read_cooldown_json(path), now)
-                    for symbol, expiry in disk.items():
-                        current = merged.get(symbol)
-                        if current is None or expiry > current:
-                            merged[symbol] = expiry
-            except Exception:
-                pass
+            if os.path.exists(path):
+                disk = _active_cooldowns(_read_cooldown_json(path), now)
+                for symbol, expiry in disk.items():
+                    current = merged.get(symbol)
+                    if current is None or expiry > current:
+                        merged[symbol] = expiry
 
             snapshot = {
                 symbol: expiry.isoformat()

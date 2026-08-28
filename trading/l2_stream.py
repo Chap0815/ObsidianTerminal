@@ -15,6 +15,7 @@ import math
 import random
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -26,6 +27,13 @@ from trading.venue_recorder import (
     SQLitePartitionWriter,
     VenueEvent,
 )
+
+
+def _capture_now_ms() -> int:
+    """Exchange-anchored capture receipt time in epoch milliseconds."""
+    from core.clock import now_ms
+
+    return int(now_ms())
 
 
 class OrderBookValidationError(ValueError):
@@ -144,6 +152,7 @@ class L2ShadowCollector:
     """Consume every update, persist bounded snapshots, and remain fail-closed."""
 
     INVALID_WARNING_INTERVAL_SECONDS = 60.0
+    TRADE_DEDUP_MAX_IDS_PER_SYMBOL = 20_000
 
     def __init__(
         self,
@@ -179,12 +188,21 @@ class L2ShadowCollector:
         self._last_nonce: dict[str, object] = {}
         self._updates_since_sample: dict[str, int] = {}
         self._invalid_warning_state: dict[str, tuple[float, int]] = {}
+        self._recent_trade_evidence: dict[
+            str, OrderedDict[str, tuple[int, float, float, str]]
+        ] = {}
         self._connection_epoch = 0
         self._health_lock = threading.Lock()
         self._health_seen_symbols: set[str] = set()
         self._health_last_persist_monotonic: dict[str, float] = {}
-        self._health_trade_seen_symbols: set[str] = set()
+        self._health_trade_watcher_symbols: set[str] = set()
+        self._health_trade_invalid_symbols: set[str] = set()
         self._health_last_trade_monotonic: dict[str, float] = {}
+        self._health_trade_duplicates_suppressed = 0
+        self._health_transport_errors_total = 0
+        self._health_transport_errors_consecutive = 0
+        self._health_last_transport_error = ""
+        self._health_last_interruption_wall_ts: float | None = None
         sample_health_window = self.sample_interval * 3.0
         if not math.isfinite(sample_health_window):
             sample_health_window = 10.0
@@ -234,17 +252,12 @@ class L2ShadowCollector:
     @property
     def trades_healthy(self) -> bool:
         desired = set(self._symbol_snapshot())
-        now = time.monotonic()
         with self._health_lock:
             return bool(
                 desired
-                and desired.issubset(self._health_trade_seen_symbols)
-                and all(
-                    symbol in self._health_last_trade_monotonic
-                    and 0.0
-                    <= now - self._health_last_trade_monotonic[symbol]
-                    <= 300.0
-                    for symbol in desired
+                and desired.issubset(self._health_trade_watcher_symbols)
+                and not desired.intersection(
+                    self._health_trade_invalid_symbols
                 )
             )
 
@@ -265,10 +278,19 @@ class L2ShadowCollector:
                 "trade_missing_or_stale": sorted(
                     symbol
                     for symbol in desired
-                    if symbol not in self._health_last_trade_monotonic
-                    or not 0.0
-                    <= now - self._health_last_trade_monotonic[symbol]
-                    <= 300.0
+                    if symbol not in self._health_trade_watcher_symbols
+                    or symbol in self._health_trade_invalid_symbols
+                ),
+                "trade_duplicates_suppressed": (
+                    self._health_trade_duplicates_suppressed
+                ),
+                "transport_errors_total": self._health_transport_errors_total,
+                "transport_errors_consecutive": (
+                    self._health_transport_errors_consecutive
+                ),
+                "last_transport_error": self._health_last_transport_error,
+                "last_interruption_wall_ts": (
+                    self._health_last_interruption_wall_ts
                 ),
             }
 
@@ -294,12 +316,14 @@ class L2ShadowCollector:
                 self._last_nonce,
                 self._updates_since_sample,
                 self._invalid_warning_state,
+                self._recent_trade_evidence,
             ):
                 for symbol in set(state) - active:
                     state.pop(symbol, None)
         with self._health_lock:
             self._health_seen_symbols.intersection_update(active)
-            self._health_trade_seen_symbols.intersection_update(active)
+            self._health_trade_watcher_symbols.intersection_update(active)
+            self._health_trade_invalid_symbols.intersection_update(active)
             for symbol in set(self._health_last_persist_monotonic) - active:
                 self._health_last_persist_monotonic.pop(symbol, None)
             for symbol in set(self._health_last_trade_monotonic) - active:
@@ -348,7 +372,7 @@ class L2ShadowCollector:
             return False
 
         now_monotonic = time.monotonic()
-        received_ms = int(time.time() * 1000)
+        received_ms = _capture_now_ms()
         with self._state_lock:
             previous_nonce = self._last_nonce.get(symbol)
             current_nonce = normalized["nonce"]
@@ -401,6 +425,7 @@ class L2ShadowCollector:
         payload = {
             "venue": self.exchange_id,
             "symbol": symbol,
+            "universe": list(self._symbol_snapshot()),
             "bids": normalized["bids"],
             "asks": normalized["asks"],
             "nonce": normalized["nonce"],
@@ -466,7 +491,7 @@ class L2ShadowCollector:
         if not isinstance(trades, (list, tuple)) or not trades:
             self._mark_trade_unhealthy(symbol, "EmptyTradeUpdate")
             return False
-        received_ms = int(time.time() * 1000)
+        received_ms = _capture_now_ms()
         normalized = []
         seen: dict[str, tuple] = {}
         try:
@@ -507,6 +532,42 @@ class L2ShadowCollector:
             self._log(f"invalid trade update for {symbol}: {exc}", "WARN")
             return False
         normalized.sort(key=lambda row: (row["timestamp"], row["id"]))
+        duplicate_count = 0
+        filtered = []
+        conflict = None
+        with self._state_lock:
+            recent = self._recent_trade_evidence.get(symbol)
+            for trade in normalized:
+                evidence = (
+                    trade["timestamp"],
+                    trade["price"],
+                    trade["amount"],
+                    trade["side"],
+                )
+                previous = recent.get(trade["id"]) if recent is not None else None
+                if previous is None:
+                    filtered.append(trade)
+                elif previous == evidence:
+                    duplicate_count += 1
+                else:
+                    conflict = trade["id"]
+                    break
+        if conflict is not None:
+            self._mark_trade_unhealthy(symbol, "ConflictingTradeIdentity")
+            self._log(
+                f"trade identity conflict for {symbol}: {conflict[:100]}",
+                "WARN",
+            )
+            return False
+        normalized = filtered
+        if not normalized:
+            with self._health_lock:
+                self._health_trade_duplicates_suppressed += duplicate_count
+            self._mark_trade_healthy(
+                symbol,
+                observed_at_monotonic=time.monotonic(),
+            )
+            return True
         received_time = self._iso8601(received_ms)
         # A websocket update can straddle UTC midnight. Split it before the
         # partition writer sees it so every embedded trade belongs to the
@@ -520,6 +581,7 @@ class L2ShadowCollector:
                 payload = {
                     "venue": self.exchange_id,
                     "symbol": symbol,
+                    "universe": list(self._symbol_snapshot()),
                     "trades": day_trades,
                     "stream_source": "ccxt_pro",
                     "connection_epoch": self._connection_epoch,
@@ -546,10 +608,31 @@ class L2ShadowCollector:
                     payload=payload,
                 )
                 self.writer.write(event)
+                # Commit identity knowledge only after this partition write
+                # succeeds. If a midnight-split update fails on its later
+                # partition, retrying can suppress the already-durable group
+                # while still persisting the missing group.
+                with self._state_lock:
+                    recent = self._recent_trade_evidence.setdefault(
+                        symbol, OrderedDict()
+                    )
+                    for trade in day_trades:
+                        recent[trade["id"]] = (
+                            trade["timestamp"],
+                            trade["price"],
+                            trade["amount"],
+                            trade["side"],
+                        )
+                        recent.move_to_end(trade["id"])
+                    while len(recent) > self.TRADE_DEDUP_MAX_IDS_PER_SYMBOL:
+                        recent.popitem(last=False)
         except Exception as exc:
             self._mark_trade_unhealthy(symbol, type(exc).__name__)
             self._log(f"trade storage error for {symbol}: {type(exc).__name__}", "WARN")
             return False
+        if duplicate_count:
+            with self._health_lock:
+                self._health_trade_duplicates_suppressed += duplicate_count
         self._mark_trade_healthy(symbol, observed_at_monotonic=time.monotonic())
         return True
 
@@ -592,7 +675,8 @@ class L2ShadowCollector:
         with self._health_lock:
             self._health_seen_symbols.clear()
             self._health_last_persist_monotonic.clear()
-            self._health_trade_seen_symbols.clear()
+            self._health_trade_watcher_symbols.clear()
+            self._health_trade_invalid_symbols.clear()
             self._health_last_trade_monotonic.clear()
             self._health_error_type = error_type
             self._health_reconnect_attempts = reconnect_attempts
@@ -640,6 +724,7 @@ class L2ShadowCollector:
             error_type = self._health_error_type
             attempts = self._health_reconnect_attempts
             self._health_ok_logged = True
+            self._health_transport_errors_consecutive = 0
         if error_type is None:
             self._log(
                 f"L2 research data healthy ({len(desired)}/{len(desired)} symbols)",
@@ -672,7 +757,10 @@ class L2ShadowCollector:
         if symbol not in desired:
             return
         with self._health_lock:
-            self._health_trade_seen_symbols.add(symbol)
+            # A valid callback is also direct evidence that the watcher is
+            # active. This keeps record_trades useful in isolated diagnostics.
+            self._health_trade_watcher_symbols.add(symbol)
+            self._health_trade_invalid_symbols.discard(symbol)
             self._health_last_trade_monotonic[symbol] = observed_at_monotonic
 
     def _mark_trade_unhealthy(self, symbol: str, error_type: str) -> None:
@@ -680,9 +768,18 @@ class L2ShadowCollector:
         if symbol not in desired:
             return
         with self._health_lock:
-            self._health_trade_seen_symbols.discard(symbol)
-            self._health_last_trade_monotonic.pop(symbol, None)
+            self._health_trade_invalid_symbols.add(symbol)
             self._health_error_type = str(error_type or "InvalidTradeSample")[:100]
+
+    def _mark_trade_watcher_active(self, symbol: str) -> None:
+        if symbol not in set(self._symbol_snapshot()):
+            return
+        with self._health_lock:
+            self._health_trade_watcher_symbols.add(symbol)
+
+    def _mark_trade_watcher_inactive(self, symbol: str) -> None:
+        with self._health_lock:
+            self._health_trade_watcher_symbols.discard(symbol)
 
     def _make_async_exchange(self, *, new_updates: bool = False):
         config = build_public_async_config(
@@ -711,11 +808,15 @@ class L2ShadowCollector:
             while not self._should_stop() and symbol in self._symbol_snapshot():
                 await asyncio.sleep(0.25)
             return
-        while not self._should_stop() and symbol in self._symbol_snapshot():
-            trades = await watcher(symbol)
-            if self._should_stop() or symbol not in self._symbol_snapshot():
-                return
-            self.record_trades(symbol, trades)
+        self._mark_trade_watcher_active(symbol)
+        try:
+            while not self._should_stop() and symbol in self._symbol_snapshot():
+                trades = await watcher(symbol)
+                if self._should_stop() or symbol not in self._symbol_snapshot():
+                    return
+                self.record_trades(symbol, trades)
+        finally:
+            self._mark_trade_watcher_inactive(symbol)
 
     async def _watch_session(self, l2_exchange, trade_exchange=None) -> None:
         # MEXC's CCXT-Pro adapter can starve order-book subscriptions when
@@ -885,9 +986,20 @@ class L2ShadowCollector:
                 break
             except Exception as exc:
                 error_type = type(exc).__name__
+                interruption_wall_ts = _capture_now_ms() / 1000.0
                 with self._health_lock:
                     was_healthy = self._health_ok_logged
                     self._health_ok_logged = False
+                    if was_healthy:
+                        self._health_transport_errors_consecutive = 0
+                    self._health_transport_errors_total += 1
+                    self._health_transport_errors_consecutive += 1
+                    self._health_last_transport_error = (
+                        f"{error_type}: {str(exc)[:160]}"
+                    )
+                    self._health_last_interruption_wall_ts = (
+                        interruption_wall_ts
+                    )
                 if was_healthy:
                     reconnect_attempts = 0
                     last_error_type = None

@@ -19,7 +19,7 @@ from core.constants import MarketRegime
 from core.database import (
     get_recent_trades, get_param, get_param_text, set_param,
     is_blacklisted, add_to_blacklist, log_learning,
-    get_today_pnl, pause_bot_today,
+    get_today_pnl, metrics_bot_name_for_mode, pause_bot_today,
 )
 from core.logger import log_event
 
@@ -110,6 +110,10 @@ RECENT_TRADES_DAYS  = C.RECENT_TRADES_DAYS
 RECENT_TRADES_LIMIT = C.RECENT_TRADES_LIMIT
 
 
+class _UnavailableBotConfig(dict):
+    """Empty mapping that preserves a failed/missing config read."""
+
+
 _CONFIG_CACHE: dict       = {}
 _CONFIG_CACHE_TTL         = 60.0
 _CONFIG_LOCK              = threading.RLock()
@@ -143,7 +147,7 @@ def _load_bot_config(bot_name: str) -> dict:
         cached = _CONFIG_CACHE.get(bot_name)
         if cached and (now - cached[1]) < _CONFIG_CACHE_TTL:
             return cached[0]
-    result = {}
+    result: dict = _UnavailableBotConfig()
     # Use the absolute path from core.paths so the file is found regardless of
     # which cwd the bot was started from.
     try:
@@ -168,6 +172,36 @@ def _load_bot_config(bot_name: str) -> dict:
     except Exception as exc:
         log_event(f"[{bot_name}] bot_config.json read error ({config_path}): {exc}", "WARN")
     with _CONFIG_LOCK:
+        current = _CONFIG_CACHE.get(bot_name)
+        if current and current[1] > now:
+            return current[0]
+        if isinstance(result, _UnavailableBotConfig) and current:
+            last_good = current[0]
+            if not isinstance(last_good, _UnavailableBotConfig):
+                _CONFIG_CACHE[bot_name] = (last_good, now)
+                return last_good
+        if not isinstance(result, _UnavailableBotConfig) and current:
+            previous = current[0]
+            previous_limit = (
+                _finite_float_or_none(previous.get("MAX_DAILY_LOSS"))
+                if isinstance(previous, dict)
+                else None
+            )
+            current_limit = _finite_float_or_none(
+                result.get("MAX_DAILY_LOSS")
+            )
+            if (
+                previous_limit is not None
+                and previous_limit != 0.0
+                and abs(previous_limit) <= 1000.0
+                and (
+                    current_limit is None
+                    or current_limit == 0.0
+                    or abs(current_limit) > 1000.0
+                )
+            ):
+                result = dict(result)
+                result["MAX_DAILY_LOSS"] = previous_limit
         _CONFIG_CACHE[bot_name] = (result, now)
     return result
 
@@ -204,7 +238,7 @@ def validate_config_or_die(bot_name: str) -> dict:
         _fatal_exit(1)
     try:
         mdl = _require_finite_float(cfg["MAX_DAILY_LOSS"], "MAX_DAILY_LOSS")
-        if mdl > 0 or mdl < -1000:
+        if mdl >= 0 or mdl < -1000:
             log_event(f"[{bot_name}] FATAL: MAX_DAILY_LOSS={mdl} out of safe range", "WARN")
             _fatal_exit(1)
         ps = _require_finite_float(cfg["POSITION_SIZE"], "POSITION_SIZE")
@@ -535,13 +569,19 @@ def is_bad_hour(bot_name: str) -> bool:
     if not raw:
         return False
     try:
-        bad_hours = [int(h.strip()) for h in raw.split(",") if h.strip()]
+        tokens = [token.strip() for token in raw.split(",")]
+        if not tokens or any(not token for token in tokens):
+            return True
+        bad_hours = [int(token) for token in tokens]
+        if any(hour < 0 or hour > 23 for hour in bad_hours):
+            return True
         return _get_local_hour() in bad_hours
-    except Exception:
-        return False
+    except (TypeError, ValueError, OverflowError):
+        # Corrupt adaptive-risk evidence must not silently re-enable entries.
+        return True
 
 
-def own_momentum_blocked(bot_name: str) -> tuple:
+def own_momentum_blocked(bot_name: str, mode_is_sim=None) -> tuple:
     """Own-momentum crash overlay (OPT-IN)  block NEW entries when the bot's
     own recent realized PnL is net-negative over a window.
 
@@ -569,7 +609,12 @@ def own_momentum_blocked(bot_name: str) -> tuple:
             window = 8
         window = max(3, min(50, window))
         # get_recent_trades already returns only fully-closed (is_partial=0) rows.
-        trades = get_recent_trades(bot_name, limit=window, days=RECENT_TRADES_DAYS)
+        trades = get_recent_trades(
+            bot_name,
+            limit=window,
+            days=RECENT_TRADES_DAYS,
+            mode_is_sim=mode_is_sim,
+        )
         if len(trades) < window:
             return False, ""  # warmup  not enough history, stay open
         net = 0.0
@@ -601,7 +646,11 @@ def own_momentum_blocked(bot_name: str) -> tuple:
                           f" pausing new entries until recovery")
         return False, ""
     except Exception:
-        return False, ""   # never block on an error
+        # Once this optional protection is enabled, unavailable history must
+        # not silently disable it and authorize a new entry. Existing
+        # positions remain managed; only the entry gate pauses until the
+        # evidence can be read again.
+        return True, "Own-momentum history unavailable - pausing new entries"
 
 
 def is_bot_paused(bot_name: str, exchange=None, simulation: bool = True) -> tuple:
@@ -617,13 +666,17 @@ def is_bot_paused(bot_name: str, exchange=None, simulation: bool = True) -> tupl
             "Kill-switch evaluation unavailable",
         )
 
-    pnl = get_today_pnl(bot_name)
+    pnl = get_today_pnl(bot_name, mode_is_sim=simulation)
     if pnl["is_paused"]:
         return True, f"Bot paused today (P&L: {pnl['total_profit']:.2f} USDT)"
 
     max_loss = get_max_daily_loss(bot_name)
     if pnl["total_profit"] <= max_loss:
-        pause_bot_today(bot_name, f"Daily loss {pnl['total_profit']:.2f} USDT reached")
+        pause_bot_today(
+            bot_name,
+            f"Daily loss {pnl['total_profit']:.2f} USDT reached",
+            mode_is_sim=simulation,
+        )
         _reason = (f"Daily drawdown limit reached: {pnl['total_profit']:.2f} "
                    f"USDT (limit {max_loss} USDT)")
         log_event(f"[{bot_name}] BOT PAUSED  {_reason}", "WARN")
@@ -634,7 +687,9 @@ def is_bot_paused(bot_name: str, exchange=None, simulation: bool = True) -> tupl
             bot_name, f"STOP: {_reason}", telegram_enabled=not simulation)
         return True, f"Drawdown limit reached ({pnl['total_profit']:.2f} USDT)"
 
-    blocked, om_reason = own_momentum_blocked(bot_name)
+    blocked, om_reason = own_momentum_blocked(
+        bot_name, mode_is_sim=simulation
+    )
     if blocked:
         return True, om_reason
 
@@ -743,13 +798,21 @@ def _analyze_and_adapt_once(bot_name: str) -> None:
     # MIN_TRADES_FOR_LEARNING, "blacklist BTC/ETH" and adjust params it never
     # reads. Transparent to bots that don't set LEARNING_DISABLED.
     try:
-        if _load_bot_config(bot_name).get("LEARNING_DISABLED"):
+        bot_config = _load_bot_config(bot_name)
+        if isinstance(bot_config, _UnavailableBotConfig):
+            return
+        if bot_config.get("LEARNING_DISABLED"):
             return
     except Exception:
-        pass
+        return
 
-    trades = get_recent_trades(
-        bot_name, limit=RECENT_TRADES_LIMIT, days=RECENT_TRADES_DAYS)
+    trades = [
+        trade
+        for trade in get_recent_trades(
+            bot_name, limit=RECENT_TRADES_LIMIT, days=RECENT_TRADES_DAYS
+        )
+        if not _is_manual_close(trade)
+    ]
     n = len(trades)
     if n < MIN_TRADES_FOR_LEARNING:
         log_event(
@@ -1270,7 +1333,7 @@ def check_kill_switches(bot_name: str, exchange=None,
         # Stop-Losses means the run is a mixed run, not 2-in-a-row losses.
         # (get_recent_trades' public default filters is_partial=0, which would
         # hide a partial-TP between two SLs, so we query the raw events here.)
-        from core.database import get_connection, _metric_bot
+        from core.database import get_connection
         conn = get_connection()
         try:
             from core.clock import now_utc as _now_utc
@@ -1281,16 +1344,19 @@ def check_kill_switches(bot_name: str, exchange=None,
         # Pull ALL recent trade events (including partials) ordered newest first.
         # The four-hour wall-clock window makes the pause self-expiring: once
         # the triggering run ages out it cannot immediately pause the bot again.
-        # Use a 50-event cap, well above the streak threshold. SIM/LIVE is
-        # namespaced like every other read.
+        # Exclude manual closes before applying the bounded event cap.  If the
+        # cap were applied first, a burst of manual closes could hide an older
+        # but still-current five-loss streak from the entry kill-switch.
+        # SIM/LIVE is namespaced like every other read.
         sql_rows = conn.execute("""
             SELECT reason, is_win, profit_usdt, sell_time
             FROM trades
             WHERE bot_name = ? AND sell_time >= ? AND sell_time <= ?
-            ORDER BY sell_time DESC
+              AND LOWER(COALESCE(reason, '')) NOT LIKE '%manual%'
+            ORDER BY sell_time DESC, id DESC
             LIMIT 50
         """, (
-            _metric_bot(bot_name),
+            metrics_bot_name_for_mode(bot_name, simulation),
             streak_cutoff.strftime("%Y-%m-%d %H:%M:%S"),
             streak_now.strftime("%Y-%m-%d %H:%M:%S"),
         )).fetchall()
@@ -1419,7 +1485,11 @@ def check_kill_switches(bot_name: str, exchange=None,
                     bot_name, reason, telegram_enabled=not simulation)
                 return True, reason
         except Exception:
-            pass
+            return _cache_entry_telemetry_pause(
+                bot_name,
+                now,
+                "STOP: Kill-Switch: BTC risk telemetry unavailable",
+            )
 
     return False, "OK"
 

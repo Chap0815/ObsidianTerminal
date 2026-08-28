@@ -14,7 +14,7 @@ import math
 import time
 
 from bot_utils.api_budget import try_consume_api_call
-from bot_utils.order_utils import extract_base_fee_amount
+from bot_utils.order_utils import extract_base_fee_amount, order_id_text_or_none
 
 
 # Conservative default taker fee  Bitget/Binance spot is 0.1%.
@@ -25,13 +25,7 @@ SPOT_DEFAULT_TAKER_FEE = 0.001
 
 def _order_id_text(value) -> str:
     """Return a fetch_order-safe order id string, or empty for bogus ids."""
-    if value is None or isinstance(value, bool):
-        return ""
-    try:
-        text = str(value).strip()
-    except Exception:
-        return ""
-    return text
+    return order_id_text_or_none(value) or ""
 
 
 def _order_id_for_refetch(order: dict) -> str:

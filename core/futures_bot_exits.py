@@ -17,6 +17,7 @@ from core.logger import _date as _utc_now_str
 
 import math
 import time
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 
 from bot_utils import (
@@ -45,11 +46,60 @@ _PARTIAL_EXIT_AMOUNT = "partial_exit_requested_amount"
 _PARTIAL_EXIT_SIDE = "partial_exit_position_side"
 _PARTIAL_EXIT_MODE = "partial_exit_mode"
 _PARTIAL_EXIT_OBSERVED_FILLED = "partial_exit_observed_filled"
+_PARTIAL_EXIT_CREATED_AT = "partial_exit_created_at"
 _FULL_EXIT_CLIENT_ID = "full_exit_client_order_id"
 _FULL_EXIT_AMOUNT = "full_exit_requested_amount"
 _FULL_EXIT_SIDE = "full_exit_position_side"
 _FULL_EXIT_MODE = "full_exit_mode"
 _FULL_EXIT_BASE_FILLED = "full_exit_base_filled_amount"
+_FULL_EXIT_CREATED_AT = "full_exit_created_at"
+
+
+def _futures_order_lookup_since_ms(value) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            seconds = float(value)
+            if seconds > 100_000_000_000:
+                seconds /= 1000.0
+        else:
+            text = str(value).strip().replace("Z", "+00:00")
+            if not text:
+                return None
+            try:
+                parsed = datetime.fromisoformat(text)
+            except ValueError:
+                parsed = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            seconds = parsed.timestamp()
+        if not math.isfinite(seconds) or seconds <= 0:
+            return None
+        milliseconds = int(seconds * 1000)
+        if milliseconds > int(time.time() * 1000) + 60_000:
+            return None
+        return milliseconds
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _futures_partial_exit_lookup_since_ms(row: dict) -> int | None:
+    if not isinstance(row, dict):
+        return None
+    return (
+        _futures_order_lookup_since_ms(row.get(_PARTIAL_EXIT_CREATED_AT))
+        or _futures_order_lookup_since_ms(row.get("buy_time"))
+    )
+
+
+def _futures_full_exit_lookup_since_ms(row: dict) -> int | None:
+    if not isinstance(row, dict):
+        return None
+    return (
+        _futures_order_lookup_since_ms(row.get(_FULL_EXIT_CREATED_AT))
+        or _futures_order_lookup_since_ms(row.get("buy_time"))
+    )
 
 
 def _has_futures_partial_exit_intent(row: dict) -> bool:
@@ -61,6 +111,7 @@ def _has_futures_partial_exit_intent(row: dict) -> bool:
             _PARTIAL_EXIT_SIDE,
             _PARTIAL_EXIT_MODE,
             _PARTIAL_EXIT_OBSERVED_FILLED,
+            _PARTIAL_EXIT_CREATED_AT,
         )
     )
 
@@ -75,7 +126,14 @@ def _futures_partial_exit_order_is_terminal(
         return False
     raw_status = order.get("status")
     status = raw_status.strip().lower() if isinstance(raw_status, str) else ""
-    if status in {"closed", "filled", "canceled", "cancelled", "expired"}:
+    if status in {
+        "closed",
+        "filled",
+        "canceled",
+        "cancelled",
+        "expired",
+        "rejected",
+    }:
         return True
     tolerance = max(1e-12, requested_amount * 1e-9)
     return filled_amount >= requested_amount - tolerance
@@ -96,6 +154,7 @@ def _ensure_futures_partial_exit_intent(
     raw_side = row.get(_PARTIAL_EXIT_SIDE)
     raw_mode = row.get(_PARTIAL_EXIT_MODE)
     raw_observed_filled = row.get(_PARTIAL_EXIT_OBSERVED_FILLED)
+    raw_created_at = row.get(_PARTIAL_EXIT_CREATED_AT)
     if existing:
         if not existing.isascii() or len(existing) > 32:
             raise RuntimeError(f"invalid pending partial-exit client id for {sym}")
@@ -114,6 +173,13 @@ def _ensure_futures_partial_exit_intent(
             raise RuntimeError(f"invalid pending partial-exit side for {sym}")
         if raw_mode != "LIVE":
             raise RuntimeError(f"invalid pending partial-exit mode for {sym}")
+        if (
+            raw_created_at not in (None, "")
+            and _futures_order_lookup_since_ms(raw_created_at) is None
+        ):
+            raise RuntimeError(
+                f"invalid pending partial-exit creation time for {sym}"
+            )
         if isinstance(raw_observed_filled, bool):
             raise RuntimeError(
                 f"invalid pending partial-exit observed fill for {sym}"
@@ -143,6 +209,7 @@ def _ensure_futures_partial_exit_intent(
             raw_side,
             raw_mode,
             raw_observed_filled,
+            raw_created_at,
         )
     ):
         raise RuntimeError(f"incomplete pending partial-exit intent for {sym}")
@@ -169,6 +236,7 @@ def _ensure_futures_partial_exit_intent(
         _PARTIAL_EXIT_SIDE: position_side,
         _PARTIAL_EXIT_MODE: "LIVE",
         _PARTIAL_EXIT_OBSERVED_FILLED: 0.0,
+        _PARTIAL_EXIT_CREATED_AT: _utc_now_str(),
     }
     persisted = state.update_many(sym, updates)
     if persisted is False:
@@ -186,6 +254,7 @@ def _clear_futures_partial_exit_intent(state, sym: str, row: dict) -> bool:
         _PARTIAL_EXIT_SIDE: None,
         _PARTIAL_EXIT_MODE: None,
         _PARTIAL_EXIT_OBSERVED_FILLED: None,
+        _PARTIAL_EXIT_CREATED_AT: None,
     }
     persisted = state.update_many(sym, updates)
     if persisted is False:
@@ -209,6 +278,7 @@ def _ensure_futures_full_exit_intent(
     raw_side = row.get(_FULL_EXIT_SIDE)
     raw_mode = row.get(_FULL_EXIT_MODE)
     raw_base_filled = row.get(_FULL_EXIT_BASE_FILLED)
+    raw_created_at = row.get(_FULL_EXIT_CREATED_AT)
     if existing:
         if not existing.isascii() or len(existing) > 32:
             raise RuntimeError(f"invalid pending full-exit client id for {sym}")
@@ -227,6 +297,13 @@ def _ensure_futures_full_exit_intent(
             raise RuntimeError(f"invalid pending full-exit side for {sym}")
         if raw_mode != "LIVE":
             raise RuntimeError(f"invalid pending full-exit mode for {sym}")
+        if (
+            raw_created_at not in (None, "")
+            and _futures_order_lookup_since_ms(raw_created_at) is None
+        ):
+            raise RuntimeError(
+                f"invalid pending full-exit creation time for {sym}"
+            )
         if isinstance(raw_base_filled, bool):
             raise RuntimeError(
                 f"invalid pending full-exit fill baseline for {sym}"
@@ -261,6 +338,8 @@ def _ensure_futures_full_exit_intent(
             _FULL_EXIT_MODE: "LIVE",
             _FULL_EXIT_BASE_FILLED: base_filled,
         }
+        if raw_created_at not in (None, ""):
+            durable_fields[_FULL_EXIT_CREATED_AT] = raw_created_at
         try:
             persisted = state.update_many(sym, durable_fields)
         except Exception as exc:
@@ -282,6 +361,7 @@ def _ensure_futures_full_exit_intent(
             raw_side,
             raw_mode,
             raw_base_filled,
+            raw_created_at,
         )
     ):
         raise RuntimeError(f"incomplete pending full-exit intent for {sym}")
@@ -316,6 +396,7 @@ def _ensure_futures_full_exit_intent(
         _FULL_EXIT_SIDE: position_side,
         _FULL_EXIT_MODE: "LIVE",
         _FULL_EXIT_BASE_FILLED: base_filled,
+        _FULL_EXIT_CREATED_AT: _utc_now_str(),
     }
     persisted = state.update_many(sym, updates)
     if persisted is False:
@@ -333,6 +414,7 @@ def _futures_full_exit_clear_fields() -> dict:
         _FULL_EXIT_SIDE: None,
         _FULL_EXIT_MODE: None,
         _FULL_EXIT_BASE_FILLED: None,
+        _FULL_EXIT_CREATED_AT: None,
     }
 
 
@@ -344,6 +426,7 @@ def _clear_futures_full_exit_intent(state, sym: str, row: dict) -> bool:
         _FULL_EXIT_SIDE: row.get(_FULL_EXIT_SIDE),
         _FULL_EXIT_MODE: row.get(_FULL_EXIT_MODE),
         _FULL_EXIT_BASE_FILLED: row.get(_FULL_EXIT_BASE_FILLED),
+        _FULL_EXIT_CREATED_AT: row.get(_FULL_EXIT_CREATED_AT),
     }
     try:
         persisted = state.update_many(sym, updates)
@@ -421,6 +504,7 @@ def _recover_or_submit_futures_full_exit(
             expected_position_side=requested_position_side,
             exchange_id=_exchange_id(bot.ex),
             expected_reduce_only=True,
+            lookup_since_ms=_futures_full_exit_lookup_since_ms(row),
         )
         recovery_conflict = (
             isinstance(order, dict)
@@ -431,6 +515,25 @@ def _recover_or_submit_futures_full_exit(
                 f"{action_label}: pending full-close recovery unavailable "
                 "or conflicting - additional submit remains blocked",
                 "ERROR" if recovery_conflict else "WARN",
+            )
+            return None, close_amount, False
+        if order is None:
+            lookup_since_ms = _futures_full_exit_lookup_since_ms(row)
+            if (
+                lookup_since_ms is not None
+                and lookup_status.get("complete_negative") is True
+            ):
+                if not _clear_futures_full_exit_intent(bot.state, sym, row):
+                    log_event(
+                        f"{action_label}: complete-negative intent could not "
+                        "be cleared durably",
+                        "ERROR",
+                    )
+                return None, close_amount, False
+            log_event(
+                f"{action_label}: pending full-close order is not proven "
+                "absent - additional submit remains blocked",
+                "WARN",
             )
             return None, close_amount, False
         if _order_confirmed_terminal_zero_fill(order):
@@ -1601,7 +1704,11 @@ class FuturesExitsMixin:
             # cached liquidation_price (or a local estimate if none stored yet).
             if now_ts >= FuturesExitsMixin._safe_finite_float(
                     d.get("liq_next_check_at"), 0.0):
-                exch_liq = get_exchange_liq_price(self.ex, symbol_full)
+                exch_liq = get_exchange_liq_price(
+                    self.ex,
+                    symbol_full,
+                    expected_position_side=pos_type,
+                )
                 interval = FuturesExitsMixin._safe_positive_float(
                     getattr(self, "LIQ_REFRESH_INTERVAL_SEC", 90.0), 90.0)
                 upd = {"liq_next_check_at": now_ts + interval}
@@ -2349,6 +2456,7 @@ class FuturesExitsMixin:
                 order = None
                 if not created_intent:
                     lookup_status = {}
+                    lookup_since_ms = _futures_partial_exit_lookup_since_ms(d)
                     order = _find_order_by_client_id(
                         self.ex,
                         symbol_full,
@@ -2360,6 +2468,7 @@ class FuturesExitsMixin:
                         expected_position_side=requested_position_side,
                         exchange_id=_exchange_id(self.ex),
                         expected_reduce_only=True,
+                        lookup_since_ms=lookup_since_ms,
                     )
                     recovery_conflict = (
                         isinstance(order, dict)
@@ -2371,6 +2480,34 @@ class FuturesExitsMixin:
                             "unavailable or conflicting - retry remains blocked",
                             "ERROR" if recovery_conflict else "WARN",
                         )
+                        return False
+                    if (
+                        order is None
+                        and lookup_since_ms is not None
+                        and lookup_status.get("complete_negative") is True
+                    ):
+                        if observed_filled > 0:
+                            log_event(
+                                f"Partial-TP {sym}: complete negative order "
+                                "evidence contradicts a durable earlier "
+                                "partial fill - retry remains blocked",
+                                "ERROR",
+                            )
+                            return False
+                        if not _clear_futures_partial_exit_intent(
+                            self.state, sym, d
+                        ):
+                            log_event(
+                                f"Partial-TP {sym}: complete negative intent "
+                                "could not be cleared durably",
+                                "ERROR",
+                            )
+                        else:
+                            log_event(
+                                f"Partial-TP {sym}: complete negative MEXC "
+                                "order evidence cleared stale intent",
+                                "WARN",
+                            )
                         return False
                     if _order_confirmed_terminal_zero_fill(order):
                         if observed_filled > 0:
@@ -2540,8 +2677,15 @@ class FuturesExitsMixin:
                             expected_position_side=pos_type,
                         )
                         if pos is not None:
-                            remaining_live = abs(float(pos.get("contracts")
-                                                       or pos.get("size") or 0.0))
+                            from bot_utils.futures_order import (
+                                _position_contracts_abs,
+                            )
+
+                            remaining_live = _position_contracts_abs(pos)
+                            if remaining_live is None:
+                                raise ValueError(
+                                    "position quantity aliases conflict"
+                                )
                             actual_filled = max(0.0, old_amount - remaining_live)
                         elif unavailable:
                             actual_filled = 0.0
@@ -3161,6 +3305,51 @@ class FuturesExitsMixin:
                 from bot_utils.close_fragments import (
                     add_close_fragment_update, pending_close_values)
                 prev_amount, _px, _fee, _oid = pending_close_values(d)
+                intent_base_filled = FuturesExitsMixin._safe_nonnegative_amount(
+                    d.get(_FULL_EXIT_BASE_FILLED)
+                )
+                evidenced_amount = max(
+                    prev_amount,
+                    intent_base_filled + min(order_filled, close_amount),
+                )
+                evidence_tolerance = max(1e-12, raw_amount * 1e-9)
+                if evidenced_amount + evidence_tolerance < raw_amount:
+                    known_delta = max(0.0, evidenced_amount - prev_amount)
+                    flat_pending = {
+                        "verified_flat_pending_accounting": True,
+                        "verified_flat_reason": reason,
+                        "verified_flat_at": _utc_now_str(),
+                        "verified_flat_sell_price": fill_price,
+                        "verified_flat_exchange_order_id": exch_oid,
+                    }
+                    if known_delta > 0.0 and fill_price > 0.0:
+                        known_fee = extract_or_estimate_futures_fee(
+                            self.ex,
+                            order or {},
+                            symbol_full,
+                            fill_price,
+                            amount=known_delta,
+                            contract_size=contract_size,
+                        )
+                        flat_pending.update(add_close_fragment_update(
+                            d,
+                            amount=known_delta,
+                            price=fill_price,
+                            fee=known_fee,
+                            order_id=exch_oid,
+                        ))
+                    flat_pending.update(_futures_full_exit_clear_fields())
+                    if not FuturesExitsMixin._persist_close_fragment(
+                        self, sym, flat_pending, log_event
+                    ):
+                        return
+                    log_event(
+                        f"{sym}: position verified flat but only "
+                        f"{evidenced_amount:.12g}/{raw_amount:.12g} contracts "
+                        "have causal fill evidence; accounting deferred",
+                        "ERROR",
+                    )
+                    return
                 if order is None and prev_amount <= 0 and _px > 0:
                     fill_price = _px
                     close_fee = _fee

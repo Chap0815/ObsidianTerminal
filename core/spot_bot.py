@@ -848,13 +848,17 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
 
         #  Load and validate state 
         trades_raw = load_j(self.DB_FILE, preserve_corrupt=True)
-        self.cool = load_j(self.COOLDOWN_FILE) or {}
-        if not isinstance(self.cool, dict):
-            self.cool = {}
+        from trading.cooldown_utils import load_cooldown_state
+        self.cool = load_cooldown_state(self.COOLDOWN_FILE)
+        if not self.cool.source_valid:
+            log_event(
+                f"Cooldown reload failed closed; new entries remain blocked: "
+                f"{self.cool.source_error}",
+                "ERROR",
+            )
 
-        # After restart, purge expired cooldowns and drop malformed timestamp
-        # entries  otherwise a stale entry could keep a coin blocked forever or
-        # crash the cooldown check. Best-effort; never blocks startup.
+        # After restart, purge only expired cooldowns. Malformed evidence is
+        # retained and keeps entries blocked until an operator repairs it.
         try:
             try:
                 from trading.cooldown_utils import purge_expired
@@ -863,7 +867,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             removed = purge_expired(self.cool, self.COOLDOWN_FILE)
             if removed > 0:
                 log_event(
-                    f"Cooldown reload: purged {removed} expired/malformed "
+                    f"Cooldown reload: purged {removed} expired "
                     f"entry/entries from {self.COOLDOWN_FILE}", "INFO")
         except Exception as cd_err:
             log_event(
@@ -888,14 +892,13 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         if not self.simulation:
             self._startup_reconciliation()
 
-        #  Register shutdown handlers 
-        try:
-            signal.signal(signal.SIGINT, self._shutdown_handler)
-            signal.signal(signal.SIGTERM, self._shutdown_handler)
-            if hasattr(signal, "SIGBREAK"):
-                signal.signal(signal.SIGBREAK, self._shutdown_handler)
-        except Exception:
-            pass
+        # Register every shutdown handler before worker threads start.  The
+        # Windows launcher uses CTRL_BREAK_EVENT, so silently missing SIGBREAK
+        # would turn a requested graceful close into an unhandled termination.
+        signal.signal(signal.SIGINT, self._shutdown_handler)
+        signal.signal(signal.SIGTERM, self._shutdown_handler)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, self._shutdown_handler)
         atexit.register(self._shutdown_handler)
 
         #  Start threads 
@@ -985,7 +988,11 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             last_runtime_status = 0.0
             self._last_hourly_status = 0.0
             while not self._shutdown_event.is_set():
-                now = time.time()
+                # Scheduling must be immune to wall-clock corrections.  The
+                # launcher treats a missing runtime-status refresh as a stalled
+                # process, so a backwards OS-clock jump must not pause this
+                # cadence for the duration of the jump.
+                now = time.monotonic()
                 if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_SEC:
                     tc = self.state.count()
                     log_event(
@@ -1044,6 +1051,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         instance is not thread-safe and caused sporadic ``invalid signature``
         errors under load.
         """
+        from config.exchange_config import is_authentication_error
         from core.logger import log_event
         try:
             raw_ex = self.EXCHANGE_FACTORY()
@@ -1092,15 +1100,21 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                     f"unavailable ({type(budget_exc).__name__})",
                     "WARN",
                 )
+            if not auth_probe_allowed and not bool(
+                getattr(self, "simulation", True)
+            ):
+                log_event(
+                    "Spot LIVE startup blocked - authentication could not be "
+                    "verified within the API budget.",
+                    "WARN",
+                )
+                return False
             if auth_probe_allowed:
                 try:
                     _bal = raw_ex.fetch_balance()
                     _ = (_bal or {}).get("USDT", {})
                 except Exception as se:
-                    err_lc = str(se).lower()
-                    if any(m in err_lc for m in (
-                            "auth", "signature", "permission", "forbidden",
-                            "401", "403", "ip", "passphrase")):
+                    if is_authentication_error(se):
                         log_event(
                             f"Spot auth smoke-test FAILED ({type(se).__name__}: "
                             f"{str(se)[:120]})  check API credentials.",
@@ -1117,14 +1131,21 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                 from bot_utils.thread_exchange import ThreadLocalExchange
                 self.ex = ThreadLocalExchange(raw_ex)
             except Exception as wrap_err:
-                # Fall back to raw exchange  losing thread isolation
-                # but the bot still works. We log the WARN so it's
-                # visible in the activity log.
+                # A shared CCXT instance is not safe across the scan, monitor
+                # and reconcile threads.  Refuse startup instead of reviving
+                # the invalid-signature race that this wrapper prevents.
+                self.ex = None
                 log_event(
-                    f"ThreadLocalExchange unavailable ({wrap_err})  "
-                    f"falling back to shared exchange instance (less "
-                    f"thread-safe but functional)", "WARN")
-                self.ex = raw_ex
+                    f"ThreadLocalExchange initialization failed "
+                    f"({type(wrap_err).__name__}: {str(wrap_err)[:120]})  "
+                    f"refusing unsafe shared exchange startup",
+                    "WARN",
+                )
+                try:
+                    raw_ex.close()
+                except Exception as close_err:
+                    self._log_error("exchange cleanup after wrapper failure", close_err)
+                return False
             _exname = getattr(self.ex, "name", None) or "Exchange"
             log_event(f"{_exname} API connection established", "INFO")
             return True
@@ -1239,11 +1260,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         from core.logger import log_event, log_sell, send_telegram, save_trade
         from core.database import save_trade_db
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-        try:
-            from core.symbol_locks import close_lock, release_lock
-        except ImportError:
-            close_lock = None
-            release_lock = None
+        from core.symbol_locks import close_lock, release_lock
         return emergency_close_all_spot(
             ex=self.ex,
             state=self.state,

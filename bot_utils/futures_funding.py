@@ -70,6 +70,13 @@ def _funding_symbol_key(value) -> str:
     return "".join(char for char in primary.upper() if char.isalnum())
 
 
+def _funding_position_type(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    return normalized if normalized in {"LONG", "SHORT"} else None
+
+
 def _funding_row_matches_symbol(ex, symbol_full: str, row: dict) -> bool:
     expected = {_funding_symbol_key(symbol_full)}
     try:
@@ -148,6 +155,16 @@ def fetch_or_estimate_funding(ex,
       SHORT +rate  shorts receive  negative return ( -raw)
       SHORT -rate  shorts pay  positive return ( -raw)
     """
+    normalized_position_type = _funding_position_type(pos_type)
+    if normalized_position_type is None:
+        return None
+    since_ms = _utc_ms_or_none(since_time_str)
+    if since_ms is None:
+        return None
+    if until_time_str is not None:
+        until_ms = _utc_ms_or_none(until_time_str)
+        if until_ms is None or until_ms < since_ms:
+            return None
     realized = fetch_realized_funding(
         ex,
         symbol_full,
@@ -163,7 +180,7 @@ def fetch_or_estimate_funding(ex,
             symbol_full,
             since_time_str,
             notional_usdt,
-            pos_type,
+            normalized_position_type,
             fallback_state_value,
             until_time_str=until_time_str,
         )
@@ -184,7 +201,7 @@ def fetch_or_estimate_funding(ex,
         symbol_full,
         since_time_str,
         notional_usdt,
-        pos_type,
+        normalized_position_type,
         fallback_state_value=0.0,
         until_time_str=until_time_str,
     )
@@ -235,6 +252,7 @@ def fetch_realized_funding(ex,
     next_since = since_ms
     seen_keys = set()
     unverifiable_row = False
+    pagination_complete = False
     for _page in range(max_pages):
         # Atomic budget gate. If exhausted, return None and let the caller fall
         # back to state/estimates instead of returning a partial sum.
@@ -247,12 +265,16 @@ def fetch_realized_funding(ex,
         if not isinstance(page, list):
             return None
         if not page:
+            pagination_complete = True
             break
 
         added = 0
         max_ts = next_since
         for h in page:
             if not isinstance(h, dict):
+                unverifiable_row = True
+                continue
+            if not _funding_row_matches_symbol(ex, symbol_full, h):
                 continue
             amt = _finite_float_or_none(h.get("amount"))
             ts = h.get("timestamp")
@@ -260,15 +282,11 @@ def fetch_realized_funding(ex,
                 ts_i = int(ts) if ts is not None and not isinstance(ts, bool) else None
             except (TypeError, ValueError):
                 ts_i = None
-            if amt is not None and ts_i is None:
+            if amt is None or ts_i is None:
                 unverifiable_row = True
-                continue
-            if ts_i is None:
                 continue
             max_ts = max(max_ts, ts_i)
             if ts_i < since_ms or (until_ms is not None and ts_i > until_ms):
-                continue
-            if not _funding_row_matches_symbol(ex, symbol_full, h):
                 continue
             info = h.get("info") if isinstance(h.get("info"), dict) else {}
             key = h.get("id") or info.get("id")
@@ -283,11 +301,14 @@ def fetch_realized_funding(ex,
             history.append(h)
             added += 1
 
-        if added == 0 or len(page) < 50 or max_ts <= next_since:
+        if len(page) < 50:
+            pagination_complete = True
+            break
+        if added == 0 or max_ts <= next_since:
             break
         next_since = max_ts + 1
 
-    if unverifiable_row:
+    if unverifiable_row or not pagination_complete:
         return None
     total = 0.0
     for h in history:
@@ -329,13 +350,16 @@ def estimate_funding_paid(ex,
                             notional_usdt: float,
                             pos_type: str = "LONG",
                             fallback_state_value: float = 0.0,
-                            until_time_str: str | None = None) -> float:
+                            until_time_str: str | None = None) -> Optional[float]:
     """Estimate funding when history API returns empty.
 
     Funding settles at 00:00 / 08:00 / 16:00 UTC on most exchanges.
     Position held within one settlement window: returns 0.0 (correct).
     Position that crossed N settlements:  notional  rate  N.
     """
+    normalized_position_type = _funding_position_type(pos_type)
+    if normalized_position_type is None:
+        return None
     if notional_usdt <= 0 or not since_time_str:
         return 0.0
     try:
@@ -344,7 +368,7 @@ def estimate_funding_paid(ex,
         if until_time_str is not None:
             until_ms = _utc_ms_or_none(until_time_str)
             if until_ms is None:
-                return 0.0
+                return None
             ts_close = until_ms / 1000.0
         else:
             from core.clock import now_ms
@@ -352,18 +376,23 @@ def estimate_funding_paid(ex,
     except ImportError:
         ts_close = datetime.now(timezone.utc).timestamp()
     except (ValueError, TypeError):
-        return 0.0
-    if ts_close <= ts_open:
+        return None
+    if ts_close < ts_open:
+        return None
+    if ts_close == ts_open:
         return 0.0
 
     n_settlements = count_funding_settlements(ts_open, ts_close)
     if n_settlements == 0:
         return 0.0
 
-    funding_rate_dec = 0.0
+    fallback = _finite_float_or_none(fallback_state_value)
+    known_fallback = (
+        fallback if fallback is not None and fallback != 0.0 else None
+    )
     if not _budget_ok("estimate_funding_rate"):
-        fallback = _finite_float_or_none(fallback_state_value)
-        return fallback if fallback is not None else 0.0
+        return known_fallback
+    funding_rate_dec = None
     try:
         from config.exchange_config import safe_fetch_funding_rate
         fr = safe_fetch_funding_rate(ex, symbol_full)
@@ -372,14 +401,16 @@ def estimate_funding_paid(ex,
             if parsed_rate is not None:
                 funding_rate_dec = parsed_rate
     except Exception:
-        funding_rate_dec = 0.0
+        pass
+    if funding_rate_dec is None:
+        return known_fallback
     # Epsilon comparison  exchanges occasionally return microscopic rates
     # like 1e-13; below 1e-9 is effectively zero.
     if abs(funding_rate_dec) < 1e-9:
         return 0.0
 
     raw = notional_usdt * funding_rate_dec * n_settlements
-    if pos_type.upper() == "LONG":
+    if normalized_position_type == "LONG":
         return raw
     return -raw
 
@@ -417,7 +448,10 @@ def get_funding_info(
             from config.exchange_config import safe_fetch_open_interest
             oi = safe_fetch_open_interest(ex, symbol_full)
             if oi is not None:
-                for k in ("openInterestAmount", "openInterestValue", "openInterest"):
+                # CCXT can expose both the base/contracts quantity and its
+                # quote value.  This function promises USDT millions, so the
+                # explicit quote value is authoritative when both are present.
+                for k in ("openInterestValue", "openInterestAmount", "openInterest"):
                     v = oi.get(k)
                     if v is None and isinstance(oi.get("info"), dict):
                         v = oi["info"].get(k)

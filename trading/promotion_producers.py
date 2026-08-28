@@ -70,6 +70,7 @@ def _normalize_validation_periods(periods: Any) -> dict[str, list[dict]]:
     if not isinstance(periods, list) or not periods:
         raise ValueError("validation periods must be a non-empty list")
     by_profile = {"normal": [], "stressed": []}
+    position_ids_by_profile = {"normal": set(), "stressed": set()}
     for row in periods:
         if not isinstance(row, dict) or set(row) != _PERIOD_KEYS:
             raise ValueError("validation period structure is invalid")
@@ -111,6 +112,11 @@ def _normalize_validation_periods(periods: Any) -> dict[str, list[dict]]:
             ):
                 raise ValueError("validation position identity is invalid")
             seen.add(position_id)
+            if position_id in position_ids_by_profile[profile]:
+                raise ValueError(
+                    "position identity repeats across validation periods"
+                )
+            position_ids_by_profile[profile].add(position_id)
             normalized_positions.append({**position, "net": _number(position["net"], "position net")})
         by_profile[profile].append(
             {
@@ -131,6 +137,10 @@ def _normalize_validation_periods(periods: Any) -> dict[str, list[dict]]:
             raise ValueError(f"{profile} validation periods overlap")
         if sum(row["scope"] == "final_holdout" for row in rows) != 1:
             raise ValueError(f"{profile} final holdout scope is invalid")
+        if ordered[-1]["scope"] != "final_holdout":
+            raise ValueError(
+                f"{profile} final holdout must follow all walk-forward periods"
+            )
         fold_indices = sorted(
             row["fold_index"] for row in rows if row["scope"] == "walk_forward"
         )
@@ -140,6 +150,23 @@ def _normalize_validation_periods(periods: Any) -> dict[str, list[dict]]:
         _period_identity(row) for row in by_profile["stressed"]
     }:
         raise ValueError("normal and stressed validation periods do not match")
+    stressed_by_period = {
+        _period_identity(row): row for row in by_profile["stressed"]
+    }
+    for normal in by_profile["normal"]:
+        stressed = stressed_by_period[_period_identity(normal)]
+        normal_population = {
+            position["position_id"]: (position["symbol"], position["regime"])
+            for position in normal["positions"]
+        }
+        stressed_population = {
+            position["position_id"]: (position["symbol"], position["regime"])
+            for position in stressed["positions"]
+        }
+        if normal_population != stressed_population:
+            raise ValueError(
+                "normal and stressed position populations do not match"
+            )
     return by_profile
 
 
@@ -186,7 +213,28 @@ def build_validation_promotion_fragment(
     if gross_loss <= 0.0:
         raise ValueError("validation profit factor requires realized losses")
     mean = statistics.mean(nets)
-    lower = mean - (1.645 * statistics.stdev(nets) / math.sqrt(len(nets)))
+    # Positions inside one disjoint OOS period share regime, liquidity and
+    # market shocks and are not independent draws.  Use the intercept-only
+    # cluster-robust standard error across periods instead of shrinking the
+    # uncertainty as if every position were independent.
+    populated_periods = [row for row in normal_rows if row["positions"]]
+    if len(populated_periods) < 2:
+        raise ValueError(
+            "clustered validation confidence requires two populated OOS periods"
+        )
+    cluster_scores = [
+        math.fsum(position["net"] - mean for position in row["positions"])
+        for row in populated_periods
+    ]
+    cluster_count = len(cluster_scores)
+    clustered_variance = (
+        cluster_count
+        / (cluster_count - 1)
+        * math.fsum(score * score for score in cluster_scores)
+        / (len(nets) * len(nets))
+    )
+    clustered_standard_error = math.sqrt(max(0.0, clustered_variance))
+    lower = mean - (1.645 * clustered_standard_error)
     normal_folds = [row for row in normal_rows if row["scope"] == "walk_forward"]
     stressed_folds = [row for row in stressed_rows if row["scope"] == "walk_forward"]
     normal_holdout = next(row for row in normal_rows if row["scope"] == "final_holdout")
@@ -197,6 +245,9 @@ def build_validation_promotion_fragment(
     normal_positive = sum(period_net(row) > 0.0 for row in normal_folds)
     stressed_positive = sum(period_net(row) > 0.0 for row in stressed_folds)
     observed_regimes = {row["regime"] for row in normal_positions if row["regime"] != "UNKNOWN"}
+    regime_labels_complete = all(
+        row["regime"] != "UNKNOWN" for row in normal_positions
+    )
     symbol_share = _positive_profit_share(normal_positions, "symbol")
     regime_share = _positive_profit_share(normal_positions, "regime")
     stressed_net = math.fsum(period_net(row) for row in stressed_rows)
@@ -209,7 +260,11 @@ def build_validation_promotion_fragment(
         "max_symbol_profit_share": symbol_share,
         "cost_stress_passed": stressed_net > 0.0,
         "sample_count": len(nets),
-        "regime_stability_passed": len(observed_regimes) >= 2 and regime_share <= 0.80,
+        "regime_stability_passed": (
+            regime_labels_complete
+            and len(observed_regimes) >= 2
+            and regime_share <= 0.80
+        ),
         "walk_forward_passed": normal_positive * 2 > len(normal_folds) and stressed_positive * 2 > len(stressed_folds),
         "walk_forward_positive_folds": normal_positive,
         "stressed_walk_forward_positive_folds": stressed_positive,
@@ -251,6 +306,7 @@ def build_forward_shadow_promotion_fragment(
         raise ValueError("forward positions must be a non-empty list")
     normalized_positions = []
     position_ids = set()
+    observed_utc_days = set()
     for row in positions:
         if not isinstance(row, dict) or set(row) != _SHADOW_POSITION_KEYS:
             raise ValueError("forward position structure is invalid")
@@ -258,6 +314,10 @@ def build_forward_shadow_promotion_fragment(
         closed_at = _number(row["closed_at"], "forward close time")
         probability = _number(row["predicted_probability"], "predicted probability")
         outcome = row["outcome"]
+        normal_net = _number(row["net_after_cost"], "forward net")
+        stressed_net = _number(
+            row["stressed_net_after_cost"], "stressed forward net"
+        )
         if (
             identity in position_ids or not isinstance(identity, (str, int))
             or isinstance(identity, bool) or not str(identity).strip()
@@ -265,11 +325,22 @@ def build_forward_shadow_promotion_fragment(
             or type(outcome) is not int or outcome not in {0, 1}
         ):
             raise ValueError("forward position identity, time or outcome is invalid")
+        if outcome != int(normal_net > 0.0):
+            raise ValueError(
+                "forward outcome does not match realized net"
+            )
+        if stressed_net > normal_net and not math.isclose(
+            stressed_net, normal_net, rel_tol=1e-12, abs_tol=1e-12
+        ):
+            raise ValueError(
+                "stressed forward net exceeds normal net"
+            )
         position_ids.add(identity)
+        observed_utc_days.add(math.floor(closed_at / 86_400.0))
         normalized_positions.append({
             **row,
-            "net_after_cost": _number(row["net_after_cost"], "forward net"),
-            "stressed_net_after_cost": _number(row["stressed_net_after_cost"], "stressed forward net"),
+            "net_after_cost": normal_net,
+            "stressed_net_after_cost": stressed_net,
             "predicted_probability": probability,
         })
     probabilities = [row["predicted_probability"] for row in normalized_positions]
@@ -306,10 +377,14 @@ def build_forward_shadow_promotion_fragment(
         ):
             raise ValueError("capacity sample identity, time or value is invalid")
         sample_ids.add(identity)
+        observed_utc_days.add(math.floor(measured_at / 86_400.0))
         participations.append(participation)
         capacity_passed = capacity_passed and row["capacity_allowed"]
     fields = {
-        "forward_shadow_days": math.floor((end - start) / 86_400.0),
+        "forward_shadow_days": min(
+            len(observed_utc_days),
+            math.floor((end - start) / 86_400.0),
+        ),
         "calibration_brier": brier,
         "calibration_ece": ece,
         "calibration_slope": slope,

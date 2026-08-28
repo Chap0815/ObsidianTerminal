@@ -132,6 +132,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         self._cooldown_lock = threading.Lock()
         self._markout_health_lock = threading.Lock()
         self._venue_health_lock = threading.Lock()
+        self._private_api_health_lock = threading.Lock()
         self._position_integrity_health_lock = threading.Lock()
         # populated in run()
         self.ex = None
@@ -195,6 +196,13 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "progress_is_bot_scoped": False,
         }
         self._venue_health: dict[str, Any] = {}
+        self._private_api_health: dict[str, Any] = {
+            "ok": None,
+            "component": "private_api",
+            "state": "unverified",
+            "reason": "private_api_unverified",
+            "error_type": "",
+        }
         self._entry_recovery_blocked = False
         self._entry_recovery_health: dict[str, Any] = {
             "ok": True,
@@ -448,6 +456,55 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             }
         return result
 
+    def _exit_recovery_runtime_health(self) -> dict[str, Any]:
+        """Expose durable LIVE exit-order intents as degraded health."""
+        if bool(getattr(self, "simulation", True)):
+            return {}
+        state = getattr(self, "state", None)
+        get_all = getattr(state, "get_all", None)
+        if not callable(get_all):
+            return {}
+        try:
+            rows = get_all()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "component": "exit_recovery",
+                "state": "unavailable",
+                "reason": "exit_state_unavailable",
+                "error_type": type(exc).__name__,
+            }
+        if not isinstance(rows, dict):
+            return {
+                "ok": False,
+                "component": "exit_recovery",
+                "state": "unavailable",
+                "reason": "invalid_exit_state_payload",
+            }
+        partial_symbols = []
+        full_symbols = []
+        for symbol, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            safe_symbol = str(symbol)[:32]
+            if row.get("partial_exit_client_order_id") not in (None, ""):
+                partial_symbols.append(safe_symbol)
+            if row.get("full_exit_client_order_id") not in (None, ""):
+                full_symbols.append(safe_symbol)
+        unresolved_count = len(partial_symbols) + len(full_symbols)
+        if unresolved_count == 0:
+            return {}
+        return {
+            "ok": False,
+            "component": "exit_recovery",
+            "state": "blocked",
+            "reason": "unresolved_exit_order_intent",
+            "unresolved_count": unresolved_count,
+            "partial_count": len(partial_symbols),
+            "full_count": len(full_symbols),
+            "symbols": sorted(set(partial_symbols + full_symbols))[:16],
+        }
+
     def _record_position_integrity_health(
         self,
         report: dict,
@@ -492,6 +549,50 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             now_monotonic=time.monotonic(),
         )
 
+    def _record_private_api_health(
+        self,
+        *,
+        ok: bool,
+        reason: str = "",
+        error_type: str = "",
+    ) -> bool:
+        """Store authentication health and report whether its state changed."""
+        snapshot = {
+            "ok": bool(ok),
+            "component": "private_api",
+            "state": "authenticated" if ok else "authentication_failed",
+            "reason": "" if ok else str(reason or "authentication_failed")[:80],
+            "error_type": "" if ok else str(error_type or "unknown")[:80],
+            "checked_wall_ts": time.time(),
+        }
+        lock = getattr(self, "_private_api_health_lock", None)
+        if lock is None:
+            previous = dict(getattr(self, "_private_api_health", {}) or {})
+            self._private_api_health = snapshot
+        else:
+            with lock:
+                previous = dict(getattr(self, "_private_api_health", {}) or {})
+                self._private_api_health = snapshot
+        return (
+            previous.get("ok"),
+            previous.get("reason"),
+            previous.get("error_type"),
+        ) != (
+            snapshot["ok"],
+            snapshot["reason"],
+            snapshot["error_type"],
+        )
+
+    def _private_api_runtime_health(self) -> dict[str, Any]:
+        """Expose explicit private-API authentication state for LIVE bots."""
+        if bool(getattr(self, "simulation", True)):
+            return {}
+        lock = getattr(self, "_private_api_health_lock", None)
+        if lock is None:
+            return {}
+        with lock:
+            return dict(getattr(self, "_private_api_health", {}) or {})
+
     def _runtime_status_health(
         self,
         threads: dict[str, bool],
@@ -523,10 +624,20 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         )
         venue_health = self._venue_runtime_health()
         venue_ok = not venue_health or venue_health.get("ok") is True
+        private_api_health = self._private_api_runtime_health()
+        private_api_ok = (
+            not private_api_health
+            or private_api_health.get("ok") is True
+        )
         entry_recovery_health = self._entry_recovery_runtime_health()
         entry_recovery_ok = (
             not entry_recovery_health
             or entry_recovery_health.get("ok") is True
+        )
+        exit_recovery_health = self._exit_recovery_runtime_health()
+        exit_recovery_ok = (
+            not exit_recovery_health
+            or exit_recovery_health.get("ok") is True
         )
         position_integrity_health = self._position_integrity_runtime_health()
         position_integrity_ok = (
@@ -544,7 +655,9 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 and markout_ok
                 and sim_evidence_ok
                 and venue_ok
+                and private_api_ok
                 and entry_recovery_ok
+                and exit_recovery_ok
                 and position_integrity_ok
             )
             else "degraded"
@@ -560,8 +673,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             extra["sim_evidence_health"] = sim_evidence_health
         if venue_health:
             extra["venue_health"] = venue_health
+        if private_api_health:
+            extra["private_api_health"] = private_api_health
         if entry_recovery_health:
             extra["entry_recovery_health"] = entry_recovery_health
+        if exit_recovery_health:
+            extra["exit_recovery_health"] = exit_recovery_health
         if position_integrity_health:
             extra["position_integrity_health"] = position_integrity_health
         return status, extra
@@ -1009,6 +1126,21 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     "trade_missing_or_stale": bounded_strings(
                         raw_stream.get("trade_missing_or_stale")
                     ),
+                    "trade_duplicates_suppressed": bounded_nonnegative(
+                        raw_stream.get("trade_duplicates_suppressed")
+                    ) or 0,
+                    "transport_errors_total": bounded_nonnegative(
+                        raw_stream.get("transport_errors_total")
+                    ) or 0,
+                    "transport_errors_consecutive": bounded_nonnegative(
+                        raw_stream.get("transport_errors_consecutive")
+                    ) or 0,
+                    "last_transport_error": str(
+                        raw_stream.get("last_transport_error") or ""
+                    )[:200],
+                    "last_interruption_wall_ts": bounded_float(
+                        raw_stream.get("last_interruption_wall_ts")
+                    ),
                 },
                 "integrity_health": {
                     "ok": raw_integrity.get("ok") is True,
@@ -1089,6 +1221,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     ),
                     "projected_required_bytes": bounded_nonnegative(
                         raw_storage.get("projected_required_bytes")
+                    ),
+                    "filesystem_free_bytes": bounded_nonnegative(
+                        raw_storage.get("filesystem_free_bytes")
+                    ),
+                    "filesystem_capacity_bytes": bounded_nonnegative(
+                        raw_storage.get("filesystem_capacity_bytes")
                     ),
                     "headroom_ratio": bounded_float(
                         raw_storage.get("headroom_ratio")
@@ -1450,13 +1588,17 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
 
         #  Load state 
         trades_raw = load_j(self.DB_FILE, preserve_corrupt=True)
-        self.cool = load_j(self.COOLDOWN_FILE) or {}
-        if not isinstance(self.cool, dict):
-            self.cool = {}
+        from trading.cooldown_utils import load_cooldown_state
+        self.cool = load_cooldown_state(self.COOLDOWN_FILE)
+        if not self.cool.source_valid:
+            log_event(
+                f"Cooldown reload failed closed; new entries remain blocked: "
+                f"{self.cool.source_error}",
+                "ERROR",
+            )
 
-        # M-7 fix: purge expired/malformed cooldown entries on startup so
-        # an old entry from a previous format/run can't block a coin
-        # indefinitely. See spot_bot.py for the same change.
+        # Purge only expired cooldowns. Malformed evidence is retained and
+        # keeps entries blocked until an operator repairs it.
         try:
             try:
                 from trading.cooldown_utils import purge_expired
@@ -1465,7 +1607,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             removed = purge_expired(self.cool, self.COOLDOWN_FILE)
             if removed > 0:
                 log_event(
-                    f"Cooldown reload: purged {removed} expired/malformed "
+                    f"Cooldown reload: purged {removed} expired "
                     f"entry/entries from {self.COOLDOWN_FILE}", "INFO")
         except Exception as cd_err:
             log_event(
@@ -1529,14 +1671,13 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 reconciliation_ok=reconciliation_ok,
             )
 
-        #  Register shutdown handlers 
-        try:
-            signal.signal(signal.SIGINT, self._shutdown_handler)
-            signal.signal(signal.SIGTERM, self._shutdown_handler)
-            if hasattr(signal, "SIGBREAK"):
-                signal.signal(signal.SIGBREAK, self._shutdown_handler)
-        except Exception:
-            pass
+        # Register every shutdown handler before worker threads start.  The
+        # Windows launcher uses CTRL_BREAK_EVENT, so silently missing SIGBREAK
+        # would turn a requested graceful close into an unhandled termination.
+        signal.signal(signal.SIGINT, self._shutdown_handler)
+        signal.signal(signal.SIGTERM, self._shutdown_handler)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, self._shutdown_handler)
         atexit.register(self._shutdown_handler)
 
         #  Start threads 
@@ -1657,7 +1798,11 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             last_runtime_status = 0.0
             self._last_hourly_status = 0.0
             while not self._shutdown_event.is_set():
-                now = time.time()
+                # Scheduling must be immune to wall-clock corrections.  The
+                # launcher treats a missing runtime-status refresh as a stalled
+                # process, so a backwards OS-clock jump must not pause this
+                # cadence for the duration of the jump.
+                now = time.monotonic()
                 if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_SEC:
                     tc = state_exposure_count(self.state)
                     sm_marker = "  SAFE_MODE" if self.safe_mode.is_active() else ""
@@ -1729,6 +1874,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         (``fetch_balance``) so an expired API key or wrong passphrase fails
         fast at startup instead of on the first trade attempt.
         """
+        from config.exchange_config import is_authentication_error
         from core.logger import log_event
 
         def _startup_probe_allowed(endpoint: str) -> bool:
@@ -1778,19 +1924,26 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
 
             # Auth smoke-test BEFORE going threaded, so a dead key surfaces
             # here instead of on the first close-order.
-            if _startup_probe_allowed("futures_startup_auth_fetch_balance"):
+            auth_probe_allowed = _startup_probe_allowed(
+                "futures_startup_auth_fetch_balance"
+            )
+            if not auth_probe_allowed and not self.C("SIMULATION", True):
+                log_event(
+                    "Futures LIVE startup blocked - authentication could not "
+                    "be verified within the API budget.",
+                    "WARN",
+                )
+                return False
+            if auth_probe_allowed:
                 try:
                     _bal = raw_ex.fetch_balance()
                     # We only care that the call succeeded; ignore content.
                     _ = (_bal or {}).get("USDT", {})
                 except Exception as se:
                     # Don't fail the connect on a transient network blip:
-                    # log and continue. If the error is a real 401/403 the
-                    # next fetch_balance will surface it too.
-                    err_lc = str(se).lower()
-                    if any(m in err_lc for m in (
-                            "auth", "signature", "permission", "forbidden",
-                            "401", "403", "ip", "passphrase")):
+                    # log and continue. Credential failures fail closed before
+                    # worker threads start or a connected status is emitted.
+                    if is_authentication_error(se):
                         log_event(
                             f"Futures auth smoke-test FAILED ({type(se).__name__}: "
                             f"{str(se)[:120]})  bot will not be able to "
@@ -1809,10 +1962,21 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 from bot_utils.thread_exchange import ThreadLocalExchange
                 self.ex = ThreadLocalExchange(raw_ex)
             except Exception as wrap_err:
+                # A shared CCXT instance is not safe across the scan, monitor
+                # and reconcile threads.  Refuse startup instead of reviving
+                # the invalid-signature race that this wrapper prevents.
+                self.ex = None
                 log_event(
-                    f"ThreadLocalExchange unavailable ({wrap_err})  "
-                    f"falling back to shared exchange instance", "WARN")
-                self.ex = raw_ex
+                    f"ThreadLocalExchange initialization failed "
+                    f"({type(wrap_err).__name__}: {str(wrap_err)[:120]})  "
+                    f"refusing unsafe shared exchange startup",
+                    "WARN",
+                )
+                try:
+                    raw_ex.close()
+                except Exception as close_err:
+                    self._log_error("exchange cleanup after wrapper failure", close_err)
+                return False
 
             # Smoke test of the futures API surface.
             # In SIMULATION mode fetch_balance is not critical  skip to
@@ -1825,15 +1989,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 try:
                     self.ex.fetch_balance()
                 except Exception as bal_err:
-                    err_str = str(bal_err).lower()
-                    is_auth = any(x in err_str for x in
-                                  ("401", "403", "invalid api",
-                                   "apikey", "unauthorized", "forbidden"))
-                    if is_auth:
+                    if is_authentication_error(bal_err):
                         log_event(
                             f"H-6 smoke test: fetch_balance  AUTH FAILURE "
                             f"({type(bal_err).__name__}: {str(bal_err)[:80]}) "
                             f" check API key permissions", "WARN")
+                        return False
                     else:
                         # NetworkError / timeout  transient, not actionable
                         log_event(
@@ -1846,6 +2007,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     # only need to know the call path WORKS, not the data.
                     self.ex.fetch_positions(["BTC/USDT:USDT"])
                 except Exception as pos_err:
+                    if is_authentication_error(pos_err):
+                        log_event(
+                            f"H-6 smoke test: fetch_positions AUTH FAILURE "
+                            f"({type(pos_err).__name__}: {str(pos_err)[:80]}) "
+                            f" check API key permissions", "WARN")
+                        return False
                     log_event(
                         f"H-6 smoke test note: fetch_positions raised "
                         f"{type(pos_err).__name__} (non-fatal; reconcile "

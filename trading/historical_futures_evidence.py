@@ -183,6 +183,7 @@ class HistoricalFundingTimeline:
     ) -> "HistoricalFundingTimeline":
         periods = []
         observations = {}
+        settled_rates: dict[tuple[str, datetime], float] = {}
         for symbol, rows in history.items():
             canonical = _canonical_symbol(symbol)
             if not canonical:
@@ -193,6 +194,14 @@ class HistoricalFundingTimeline:
                 rate = _finite(raw_rate)
                 if rate is None:
                     raise ValueError("settled funding rate must be finite")
+                key = (canonical, settlement)
+                previous_rate = settled_rates.get(key)
+                if previous_rate is not None and previous_rate != rate:
+                    raise ValueError(
+                        "conflicting settled funding rates for "
+                        f"{canonical} at {settlement.isoformat()}"
+                    )
+                settled_rates[key] = rate
                 stamps.append(settlement)
                 periods.append(FundingPeriod(
                     symbol=canonical,
@@ -422,8 +431,10 @@ def load_overview_snapshots(
                 try:
                     flags_value = json.loads(flags_raw)
                     payload = json.loads(payload_raw)
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    continue
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        f"invalid overview event JSON in {path}: {event_id}"
+                    ) from exc
                 if not isinstance(flags_value, list) or not all(
                     isinstance(flag, str) for flag in flags_value
                 ):

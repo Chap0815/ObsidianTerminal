@@ -288,6 +288,7 @@ class StateManager:
         self._persist_lock = threading.Lock()
         self._persist_rev = 0
         self._positions: Dict[str, Position] = {}
+        self._sqlite_load_available = True
         # Ensure schema BEFORE any load() / save() can be called
         try:
             from core.database import init_db
@@ -306,6 +307,11 @@ class StateManager:
 
     def load(self) -> Dict[str, Position]:
         db_pos   = self._load_from_sqlite()
+        if not self._sqlite_load_available:
+            raise RuntimeError(
+                f"[{self.bot_name}] SQLite state unavailable; refusing "
+                "JSON migration"
+            )
         json_pos = self._load_from_json()
 
         merged: Dict[str, Position] = {}
@@ -379,6 +385,10 @@ class StateManager:
             return
         if not persisted:
             with self.lock:
+                if self._persist_rev != rev:
+                    # A newer mutation owns the next durable write. Never let
+                    # this older failed generation roll it back in memory.
+                    return
                 current = self._positions.get(position.symbol)
                 if current is position:
                     if previous is None:
@@ -391,7 +401,8 @@ class StateManager:
     def update(self, symbol: str, **kwargs) -> Optional[Position]:
         """Capture snapshot under lock, write outside."""
         _alias = {"buy": "buy_price", "highest": "highest_price"}
-        snapshot_pos = None
+        live_pos = None
+        persisted_pos = None
         snapshot = None
         old_pos = None
         with self.lock:
@@ -403,23 +414,31 @@ class StateManager:
                 attr = _alias.get(k, k)
                 if hasattr(pos, attr):
                     setattr(pos, attr, v)
-            snapshot_pos = pos
+            live_pos = pos
+            # Freeze this exact revision. A concurrent later update mutates the
+            # live Position object before it can acquire _persist_lock; passing
+            # that shared object into SQLite would let the newer generation
+            # bleed into this older durable write.
+            persisted_pos = Position.from_dict(pos.to_dict())
             snapshot     = {s: p.to_dict() for s, p in self._positions.items()}
             rev = self._persist_rev = self._persist_rev + 1
         # Disk I/O OUTSIDE lock
         persisted = True
         with self._persist_lock:
             if self._is_current_revision(rev):
-                persisted = self._write_sqlite_single(snapshot_pos)
+                persisted = self._write_sqlite_single(persisted_pos)
                 if persisted and self.write_json and self._json_writer:
                     self._json_writer.submit(snapshot)
         if not persisted:
             with self.lock:
-                if symbol in self._positions:
+                if (
+                    self._persist_rev == rev
+                    and self._positions.get(symbol) is live_pos
+                ):
                     self._positions[symbol] = old_pos
                     self._persist_rev += 1
             return None
-        return snapshot_pos
+        return live_pos
 
     def remove(self, symbol: str) -> Optional[Position]:
         with self.lock:
@@ -427,26 +446,37 @@ class StateManager:
             snapshot = {s: p.to_dict() for s, p in self._positions.items()}
             rev = self._persist_rev = self._persist_rev + 1
         persisted = True
+        sqlite_deleted = False
         with self._persist_lock:
             if self._is_current_revision(rev):
                 deleted = self._delete_sqlite(symbol)
                 # Backwards-compatible for tests/legacy monkeypatches from
                 # the old void-return helper; real _delete_sqlite now returns
                 # False only on confirmed persistence failure.
-                persisted = True if deleted is None else bool(deleted)
+                sqlite_deleted = True if deleted is None else bool(deleted)
+                persisted = sqlite_deleted
                 if persisted and self.write_json and self._json_writer:
                     if hasattr(self._json_writer, "write_now"):
                         persisted = self._json_writer.write_now(snapshot)
                     else:
                         self._json_writer.submit(snapshot)
-        if not persisted and pos is not None:
-            with self.lock:
-                self._positions[symbol] = pos
-                self._persist_rev += 1
-            try:
-                self._write_sqlite_single(pos)
-            except Exception:
-                pass
+                if not persisted and pos is not None:
+                    restored = False
+                    with self.lock:
+                        if self._persist_rev == rev:
+                            self._positions[symbol] = pos
+                            self._persist_rev += 1
+                            restored = True
+                    # A JSON failure follows a committed SQLite delete. Restore
+                    # that row while still holding the persistence lock, so a
+                    # newer generation can only write durable state afterwards.
+                    if restored and sqlite_deleted:
+                        self._write_sqlite_single(pos)
+        if not persisted:
+            # If a newer generation superseded this remove, it owns both the
+            # current in-memory value and the next serialized durable write.
+            if pos is not None:
+                return None
             return None
         if pos:
             self._emit("POSITION_CLOSED", pos)
@@ -520,6 +550,7 @@ class StateManager:
 
     def _load_from_sqlite(self) -> Dict[str, Position]:
         result = {}
+        self._sqlite_load_available = False
         try:
             conn = self._get_conn()
             try:
@@ -542,16 +573,28 @@ class StateManager:
                 else:
                     raise
             conn.close()
+            from core.database import _strict_claim_extra_object
+
             for row in rows:
                 d   = dict(row)
                 sym = d.get("symbol", "")
                 if not sym:
                     continue
-                try:
-                    extra = json.loads(d.pop("extra_json") or "{}")
-                except Exception:
-                    extra = {}
-                d.update(extra)
+                extra = _strict_claim_extra_object(d.pop("extra_json", None))
+                if extra is None:
+                    raise ValueError(
+                        f"malformed SQLite recovery metadata for {sym}"
+                    )
+                protected = self._BASE_COLS | {
+                    "buy",
+                    "highest",
+                    "opened_at",
+                }
+                d.update(
+                    key_value
+                    for key_value in extra.items()
+                    if key_value[0] not in protected
+                )
                 try:
                     pos = Position.from_dict({**d, "bot_name": self.bot_name})
                     money_error = self._normalize_required_money(pos)
@@ -564,6 +607,7 @@ class StateManager:
                     result[sym] = pos
                 except Exception as e:
                     self._warn(f"Skip malformed SQLite position {sym}: {e}")
+            self._sqlite_load_available = True
         except Exception as e:
             self._warn(f"SQLite load error: {e}")
         return result

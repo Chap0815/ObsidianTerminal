@@ -22,7 +22,7 @@ from typing import Tuple, Optional
 
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.network_retry import RetryForbiddenError
-from bot_utils.order_utils import strict_order_snapshot_equal
+from bot_utils.order_utils import order_id_text_or_none, strict_order_snapshot_equal
 
 
 def _utc_now_str() -> str:
@@ -295,13 +295,7 @@ _CLIENT_ID_INFO_KEYS = (
 
 
 def _order_id_text(value) -> str:
-    if value is None or isinstance(value, bool):
-        return ""
-    try:
-        text = str(value).strip()
-    except Exception:
-        return ""
-    return text
+    return order_id_text_or_none(value) or ""
 
 
 class FuturesOrderOutcomeUnknown(RetryForbiddenError):
@@ -1115,6 +1109,7 @@ def _find_order_by_client_id(
                         "2": "open",
                         "3": "closed",
                         "4": "canceled",
+                        "5": "rejected",
                     }.get(raw_state)
                     filled = _finite_order_telemetry_value(
                         data.get("dealVol")
@@ -1715,33 +1710,31 @@ def _position_contracts_abs(pos: dict) -> Optional[float]:
     """Parse exchange position size; malformed payload means untrusted state."""
     if not isinstance(pos, dict):
         return None
-    raw_contracts = pos.get("contracts")
-    raw_size = pos.get("size")
-    raw = raw_contracts
-    if raw_contracts not in (None, ""):
-        if isinstance(raw_contracts, bool):
+    observed: list[float] = []
+    for key in ("contracts", "size"):
+        raw = pos.get(key)
+        if raw in (None, ""):
+            continue
+        if isinstance(raw, bool):
             return None
         try:
-            parsed_contracts = float(raw_contracts)
+            parsed = float(raw)
         except (TypeError, ValueError, OverflowError):
             return None
-        if not math.isfinite(parsed_contracts):
+        if not math.isfinite(parsed):
             return None
-        if parsed_contracts == 0.0 and raw_size not in (None, ""):
-            raw = raw_size
-        else:
-            return abs(parsed_contracts)
-    else:
-        raw = raw_size
-    if raw in (None, ""):
+        observed.append(parsed)
+    if not observed:
         return None
-    if isinstance(raw, bool):
-        return None
-    try:
-        contracts = abs(float(raw))
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return contracts if math.isfinite(contracts) else None
+    nonzero = [abs(value) for value in observed if value != 0.0]
+    if not nonzero:
+        return 0.0
+    contracts = nonzero[0]
+    for alias_value in nonzero[1:]:
+        tolerance = max(1e-12, max(contracts, alias_value) * 1e-9)
+        if abs(alias_value - contracts) > tolerance:
+            return None
+    return contracts
 
 
 def _upper_currency_text(value) -> str:
@@ -1908,9 +1901,11 @@ def _extract_order_fee_futures_known(order) -> tuple[float, bool]:
         for fee_dict in fees_list:
             if not isinstance(fee_dict, dict):
                 saw_fee = True
+                saw_unknown = True
                 continue
             if "cost" not in fee_dict or fee_dict.get("cost") is None:
                 saw_fee = True
+                saw_unknown = True
                 continue
             saw_fee = True
             fee, known = _convert_fee_to_usdt_futures_known(
@@ -1921,14 +1916,15 @@ def _extract_order_fee_futures_known(order) -> tuple[float, bool]:
             if known:
                 saw_known = True
                 total += fee
-            elif (
-                _finite_fee_cost(fee_dict.get("cost")) is not None
-                and _upper_currency_text(fee_dict.get("currency"))
-                in _FUTURES_DISCOUNT_TOKENS
-            ):
+            else:
                 saw_unknown = True
         if saw_fee:
             if saw_unknown:
+                singular_fee, singular_known = _convert_fee_to_usdt_futures_known(
+                    order.get("fee") or {}, order
+                )
+                if singular_known:
+                    return singular_fee, True
                 # A notional fallback describes the whole order, not one fee
                 # row. Apply it once and never add it per discount-token item.
                 estimate = _estimate_futures_order_fee_from_payload(order)
@@ -2108,6 +2104,7 @@ def extract_or_estimate_futures_fee(ex,
     real, fee_known = _extract_order_fee_futures_known(order_payload)
     if fee_known:
         return real
+    estimate_payload = order_payload
 
     order_id = _order_id_for_fee_refetch(ex, symbol_full, order)
     if (
@@ -2140,6 +2137,11 @@ def extract_or_estimate_futures_fee(ex,
                         symbol_full=symbol_full,
                         contract_size=contract_size,
                     )
+                    if _first_positive_float(
+                        refreshed_payload.get("filled"),
+                        refreshed_payload.get("amount"),
+                    ) > 0:
+                        estimate_payload = refreshed_payload
                     real, fee_known = _extract_order_fee_futures_known(
                         refreshed_payload
                     )
@@ -2152,7 +2154,10 @@ def extract_or_estimate_futures_fee(ex,
     # Prefer the order's own fill; fall back to what the CALLER actually traded
     # when the response carries no fill yet. Notional ALWAYS includes contractSize.
     filled = 0.0
-    for candidate in (order_payload.get("filled"), order_payload.get("amount")):
+    for candidate in (
+        estimate_payload.get("filled"),
+        estimate_payload.get("amount"),
+    ):
         if isinstance(candidate, bool):
             continue
         try:
@@ -2404,6 +2409,12 @@ def verify_position_closed(
   ``(False, -1.0)``  same pessimistic signal as an exception.
     """
     deadline = time.monotonic() + max(0.0, timeout)
+    def reserve_api_call(stage: str) -> bool:
+        return try_consume_api_call(
+            f"fetch_positions:{stage}",
+            critical=True,
+        )
+
     # Do at most 2 attempts within the window, with a small gap. If both
     # exceed the deadline, report "not verified" so the caller keeps state.
     last_remaining = -1.0
@@ -2413,6 +2424,7 @@ def verify_position_closed(
                 ex,
                 symbol_full,
                 expected_position_side=expected_position_side,
+                _reserve_api_call=reserve_api_call,
             )
             if unavailable:
                 pass
@@ -2445,32 +2457,66 @@ def get_maintenance_margin_rate(ex, symbol_full: str,
     try:
         markets = getattr(ex, "markets", None) or {}
         m = markets.get(symbol_full) or {}
+        info = m.get("info") if isinstance(m, dict) else None
+        info = info if isinstance(info, dict) else {}
         for key in ("maintenanceMarginRate", "maintMarginRate",
                      "maintenance_margin", "mm"):
-            v = m.get(key) or m.get("info", {}).get(key)
-            if v is not None:
-                fv = float(v)
-                if 0 < fv < 0.5:
+            for source in (m, info):
+                v = source.get(key)
+                if v is None or isinstance(v, bool):
+                    continue
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(fv) and 0 < fv < 0.5:
                     return fv
         return default
     except Exception:
         return default
 
 
-def get_exchange_liq_price(ex, symbol_full: str) -> float:
-    """Fetch exchange-reported liquidation price."""
+def get_exchange_liq_price(
+    ex,
+    symbol_full: str,
+    *,
+    expected_position_side: Optional[str] = None,
+) -> float:
+    """Fetch the liquidation price of one unambiguous open position leg."""
     try:
         from config.exchange_config import safe_fetch_positions
+        expected_side = ""
+        if expected_position_side not in (None, ""):
+            expected_side = _normalize_order_position_side(
+                expected_position_side
+            )
+            if not expected_side:
+                return 0.0
         if not try_consume_api_call(
             "futures_liquidation_fetch_positions", critical=True
         ):
             return 0.0
         positions = safe_fetch_positions(ex)
+        positions = _validated_position_rows(positions)
         if positions is None:
             return 0.0
+        candidates = []
         for p in positions:
-            if (p.get("symbol") or "") != symbol_full:
+            if p["symbol"] != symbol_full:
                 continue
+            quantity_present = any(
+                p.get(key) not in (None, "") for key in ("contracts", "size")
+            )
+            if quantity_present:
+                contracts = _position_contracts_abs(p)
+                if contracts is None:
+                    return 0.0
+                if contracts <= 1e-8:
+                    continue
+            observed_side, contradictory = position_row_side(p)
+            if contradictory:
+                return 0.0
+            liq_price = 0.0
             for k in ("liquidationPrice", "liquidation_price"):
                 v = p.get(k)
                 if v is None and isinstance(p.get("info"), dict):
@@ -2481,9 +2527,25 @@ def get_exchange_liq_price(ex, symbol_full: str) -> float:
                     try:
                         fv = float(v)
                         if math.isfinite(fv) and fv > 0:
-                            return fv
+                            liq_price = fv
+                            break
                     except (TypeError, ValueError, OverflowError):
                         continue
-        return 0.0
+            candidates.append((observed_side, liq_price))
+        if expected_side:
+            matching = [
+                price
+                for side, price in candidates
+                if side == expected_side
+            ]
+            unknown = [price for side, price in candidates if not side]
+            if len(matching) == 1 and not unknown:
+                return matching[0]
+            # One-way venues commonly omit an explicit position side.  Such a
+            # row is safe only when it is the sole open symbol candidate.
+            if not matching and len(candidates) == 1 and len(unknown) == 1:
+                return unknown[0]
+            return 0.0
+        return candidates[0][1] if len(candidates) == 1 else 0.0
     except Exception:
         return 0.0

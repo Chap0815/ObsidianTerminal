@@ -35,6 +35,60 @@ class LeverageNotSetError(Exception):
         self.cause = cause
 
 
+def is_authentication_error(exc: BaseException) -> bool:
+    """Classify private-API credential failures without venue-specific gaps."""
+    non_authentication_types = tuple(
+        exception_type
+        for exception_type in (
+            getattr(ccxt, "RateLimitExceeded", None),
+        )
+        if isinstance(exception_type, type)
+    )
+    if non_authentication_types and isinstance(exc, non_authentication_types):
+        return False
+    authentication_types = tuple(
+        exception_type
+        for exception_type in (
+            getattr(ccxt, "AuthenticationError", None),
+            getattr(ccxt, "PermissionDenied", None),
+            getattr(ccxt, "AccountSuspended", None),
+        )
+        if isinstance(exception_type, type)
+    )
+    if authentication_types and isinstance(exc, authentication_types):
+        return True
+    message = str(exc).lower()
+    return any(marker in message for marker in (
+        "api key",
+        "api-key",
+        "apikey",
+        "authentication",
+        "invalid api",
+        "invalid signature",
+        "permission denied",
+        "unauthorized",
+        "forbidden",
+        "passphrase",
+        "status code 401",
+        "status code 403",
+        "http 401",
+        "http 403",
+    ))
+
+
+def _admin_setting_already_applied(exc: BaseException) -> bool:
+    """Recognize only explicit idempotent admin-setting responses."""
+    message = str(exc).lower()
+    return any(marker in message for marker in (
+        "already set",
+        "already configured",
+        "already in effect",
+        "not modified",
+        "same leverage",
+        "same margin mode",
+    ))
+
+
 # defer-import of silent_log because it lives in bot_utils
 def _silent(ctx: str, exc: BaseException) -> None:
     try:
@@ -296,6 +350,8 @@ _LAST_TIME_RESYNC = {
     "offset_ms": None,
 }
 _TIME_RESYNC_MIN_INTERVAL = 2.0   # don't refetch server time more than every 2s
+_CLOCK_OFFSET_MAX_AGE_SECONDS = 6.0 * 60.0 * 60.0
+_CLOCK_REFRESH_RETRY_SECONDS = 5.0 * 60.0
 
 
 def _time_resync_exchange_key(ex) -> str:
@@ -405,6 +461,43 @@ def resync_time_difference(ex) -> bool:
                 pass
 
 
+def _maybe_refresh_exchange_clock(ex) -> None:
+    """Refresh a stale process clock anchor without blocking regular traffic."""
+    if (
+        not getattr(ex, "_clock_periodic_refresh_enabled", False)
+        or getattr(ex, "_in_time_resync", False)
+    ):
+        return
+    try:
+        from core.clock import get_offset_age_seconds
+
+        age_seconds = get_offset_age_seconds()
+        if age_seconds is not None:
+            age_seconds = float(age_seconds)
+            if (
+                math.isfinite(age_seconds)
+                and 0.0 <= age_seconds <= _CLOCK_OFFSET_MAX_AGE_SECONDS
+            ):
+                return
+        now = time.monotonic()
+        last_attempt = float(
+            getattr(ex, "_last_clock_refresh_attempt_mono", 0.0) or 0.0
+        )
+        if (
+            last_attempt > 0.0
+            and now - last_attempt < _CLOCK_REFRESH_RETRY_SECONDS
+        ):
+            return
+        ex._last_clock_refresh_attempt_mono = now
+    except Exception as exc:
+        _silent("periodic_clock_refresh_check", exc)
+        return
+    try:
+        resync_time_difference(ex)
+    except Exception as exc:
+        _silent("resync_time_difference", exc)
+
+
 def _install_nonce_selfheal(ex):
     """Wrap ex.fetch2  the single path every signed request goes through  so a
     clock-skew rejection auto-resyncs and retries ONCE. Idempotent."""
@@ -415,6 +508,7 @@ def _install_nonce_selfheal(ex):
         return ex
 
     def _fetch2_selfheal(*args, **kwargs):
+        _maybe_refresh_exchange_clock(ex)
         try:
             return orig_fetch2(*args, **kwargs)
         except Exception as e:
@@ -466,8 +560,13 @@ def _finalize_connection(ex):
     """Single place that applies the SSL workaround + clock-skew self-heal to
     every exchange instance (spot + futures), and anchors the bot's wall clock
     to the exchange server time."""
-    ex = _install_nonce_selfheal(_apply_ssl_workaround(ex))
-    _publish_clock_offset(ex)
+    ex = _apply_ssl_workaround(ex)
+    ex._clock_periodic_refresh_enabled = False
+    ex = _install_nonce_selfheal(ex)
+    try:
+        _publish_clock_offset(ex)
+    finally:
+        ex._clock_periodic_refresh_enabled = True
     return ex
 
 
@@ -743,6 +842,7 @@ def try_set_leverage(ex, leverage, symbol=None, direction=None,
         {},
     ]
     import time as _time
+    authentication_failed = False
     for params in attempts:
         # MEXC code 510 rate-limits bursty set_leverage during a multi-leg
         # rebalance  wait out the limit and retry the SAME (correct) param
@@ -768,12 +868,17 @@ def try_set_leverage(ex, leverage, symbol=None, direction=None,
             except Exception as e:
                 last_err = e
                 es = str(e).lower()
-                if "already" in es:
+                if is_authentication_error(e):
+                    authentication_failed = True
+                    break
+                if _admin_setting_already_applied(e):
                     return True, None
                 if _is_rate_limited(es) and _retry < 3:
                     _time.sleep(1.0 * (2 ** _retry))
                     continue
                 break
+        if authentication_failed:
+            break
 
     # Loud diagnostics  return last_err so the caller can include it in
     # their thrown exception's message.
@@ -851,7 +956,10 @@ def safe_set_margin_mode(ex, mode: str = "isolated", symbol=None,
     except Exception as e:
         msg = str(e).lower()
         # "already set" / "not modified"  effectively fine.
-        if "already" in msg or "not modified" in msg or "same" in msg:
+        if (
+            not is_authentication_error(e)
+            and _admin_setting_already_applied(e)
+        ):
             return True
         # MEXC 510 rate-limit here is expected under concurrent multi-leg opens
         # and harmless  the order carries marginMode+leverage itself, so the
@@ -900,6 +1008,11 @@ def safe_fetch_positions(ex, symbols=None):
             return ex.fetch_positions(symbols)
         return ex.fetch_positions()
     except Exception as e:
+        # Authentication loss is operational state, not a transient missing
+        # snapshot. Let guarded callers fail closed and publish explicit health
+        # instead of persisting the same swallowed error every minute.
+        if is_authentication_error(e):
+            raise
         _silent(f"safe_fetch_positions({symbols})", e)
         return None
 

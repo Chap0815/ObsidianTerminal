@@ -53,6 +53,21 @@ from trading.entry_quality import EntryQuality, score_futures_entry
 
 class FuturesScanMixin:
 
+    def _entry_ticker(
+        self,
+        symbol_full: str,
+        *,
+        timeout: float,
+    ) -> dict:
+        """Fetch an entry quote without the extended rate-limit stale window."""
+        return self.ticker_cache.get(
+            self.ex,
+            symbol_full,
+            timeout=timeout,
+            critical=False,
+            allow_extended_rate_limit_stale=False,
+        )
+
     @staticmethod
     def _bool_cfg_value(value, default: bool = False) -> bool:
         if value is None:
@@ -115,9 +130,11 @@ class FuturesScanMixin:
 
     @staticmethod
     def _finite_float(value, default: float = 0.0) -> float:
+        if isinstance(value, bool):
+            return float(default)
         try:
             parsed = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return float(default)
         if not math.isfinite(parsed):
             return float(default)
@@ -802,7 +819,10 @@ class FuturesScanMixin:
         entry_spread_pct = None
         if not self.simulation:
             try:
-                entry_ticker = self.ticker_cache.get(self.ex, symbol_full, timeout=4.0)
+                entry_ticker = self._entry_ticker(
+                    symbol_full,
+                    timeout=4.0,
+                )
                 if not has_valid_spread_quotes(entry_ticker):
                     if not try_consume_api_call(
                         "futures_entry_fetch_spread_book"
@@ -909,13 +929,18 @@ class FuturesScanMixin:
             symbol=sym,
             direction=direction,
         )
+        from trading.expectancy_telemetry import (
+            expectancy_feature_bps,
+            expectancy_feature_value,
+        )
+
         expectancy_features = {
             "score": float(quality.score),
-            "spread_bps": float(entry_spread_pct or 0.0) * 100.0,
-            "funding_rate_pct": float(funding_rate or 0.0),
-            "oi_change_pct": float(oi_change or 0.0),
-            "change_pct": float(r.get("change_percent") or 0.0),
-            "btc_change_pct": float(btc_chg or 0.0),
+            "spread_bps": expectancy_feature_bps(entry_spread_pct),
+            "funding_rate_pct": expectancy_feature_value(funding_rate),
+            "oi_change_pct": expectancy_feature_value(oi_change),
+            "change_pct": expectancy_feature_value(r.get("change_percent")),
+            "btc_change_pct": expectancy_feature_value(btc_chg),
         }
         from trading.expectancy_telemetry import emit_expectancy_candidate
 
@@ -1275,39 +1300,14 @@ class FuturesScanMixin:
                     )
                     return
 
-                # must_set_leverage raises on failure  ABORT trade. Do this
-                # only after all local sizing/precision gates passed, so a
-                # malformed amount cannot create exchange-side config changes.
-                try:
-                    must_set_leverage(self.ex, leverage, symbol_full,
-                                      direction=direction, margin_mode=margin_mode)
-                except LeverageNotSetError as lev_e:
-                    log_event(
-                        f"set_leverage failed for {sym} at {leverage}x  "
-                        f"ABORTING trade ({lev_e})", "WARN"
-                    )
-                    log_struct("futures_open_aborted",
-                                symbol=sym, leverage=leverage,
-                                reason="set_leverage_failed")
-                    emit_entry_lifecycle(
-                        entry_id, bot=self.BOT_NAME, symbol=sym,
-                        stage="aborted", mode=entry_mode,
-                        reason="set_leverage_failed")
-                    return
-                safe_set_margin_mode(self.ex, margin_mode, symbol_full,
-                                     leverage=leverage, direction=direction)
-
                 side = "buy" if direction == "LONG" else "sell"
-                # MEXC requires `leverage` in params for isolated-margin swap
-                # orders (else: "createSwapOrder() requires a leverage
-                # parameter"). Include it alongside marginMode/positionSide.
                 try:
                     _lev_int = int(leverage)
                 except (ValueError, TypeError):
                     _lev_int = leverage
-                # Stable across process restarts and within MEXC's 32-char cap.
                 from trading.execution_quality import make_client_order_id
                 _cid = make_client_order_id(entry_id, "entry", self.BUY_PREFIX)
+
                 def _entry_order_params(order_client_id):
                     return entry_params(
                         position_side=(
@@ -1317,6 +1317,8 @@ class FuturesScanMixin:
                         leverage=_lev_int,
                         client_order_id=order_client_id,
                     )
+
+                maker_order_params = _entry_order_params(_cid)
 
                 def _submit_market_entry(
                     order_amount=amount_contracts,
@@ -1333,6 +1335,27 @@ class FuturesScanMixin:
                         log_event=log_event,
                         log_struct=log_struct,
                     )
+
+                from trading.entry_executor import (
+                    MakerFirstConfig,
+                    execute_entry_order,
+                )
+                maker_config = MakerFirstConfig(
+                    mode=str(
+                        self.C("MAKER_FIRST_MODE", "disabled") or "disabled"
+                    ).strip().lower(),
+                    ttl_seconds=float(
+                        self.C("MAKER_FIRST_TTL_SECONDS", 3.0)
+                    ),
+                    market_fallback=self._bool_cfg_value(
+                        self.C("MAKER_FIRST_MARKET_FALLBACK", False), False
+                    ),
+                    depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
+                )
+
+                # Claim before changing exchange-side leverage/margin state.
+                # The initial coexistence read is not atomic; another bot can
+                # win the symbol between that read and this commit boundary.
                 entry_notional_ceiling = self._oversize_notional_ceiling(
                     leverage
                 )
@@ -1358,17 +1381,45 @@ class FuturesScanMixin:
                         stage="blocked", mode=entry_mode,
                         reason="claim_conflict")
                     return
+
+                # must_set_leverage raises on failure  ABORT trade. Do this
+                # only after all local sizing/precision gates and the atomic
+                # ownership claim have passed.
+                try:
+                    must_set_leverage(self.ex, leverage, symbol_full,
+                                      direction=direction, margin_mode=margin_mode)
+                except LeverageNotSetError as lev_e:
+                    log_event(
+                        f"set_leverage failed for {sym} at {leverage}x  "
+                        f"ABORTING trade ({lev_e})", "WARN"
+                    )
+                    log_struct("futures_open_aborted",
+                                symbol=sym, leverage=leverage,
+                                reason="set_leverage_failed")
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=sym,
+                        stage="aborted", mode=entry_mode,
+                        reason="set_leverage_failed")
+                    released = self._release_untracked_futures_entry_claim(
+                        sym, "set leverage failure"
+                    )
+                    if released:
+                        try:
+                            from core.database import release_portfolio_reservation
+
+                            release_portfolio_reservation(entry_id)
+                        except Exception as cleanup_exc:
+                            self._log_error(
+                                f"release leverage-failed reservation {sym}",
+                                cleanup_exc,
+                            )
+                    return
+                safe_set_margin_mode(self.ex, margin_mode, symbol_full,
+                                     leverage=leverage, direction=direction)
                 emit_entry_lifecycle(
                     entry_id, bot=self.BOT_NAME, symbol=sym,
                     stage="order_attempt", mode=entry_mode,
                     direction=direction)
-                from trading.entry_executor import (
-                    MakerFirstConfig,
-                    execute_entry_order,
-                )
-                maker_mode = str(
-                    self.C("MAKER_FIRST_MODE", "disabled") or "disabled"
-                ).strip().lower()
                 order = execute_entry_order(
                     exchange=self.ex,
                     symbol=symbol_full,
@@ -1380,18 +1431,11 @@ class FuturesScanMixin:
                     mode=entry_mode,
                     reference_price=entry_price,
                     market_order=_submit_market_entry,
-                    maker_order_params=_entry_order_params(_cid),
+                    maker_order_params=maker_order_params,
                     pre_submit_guard=lambda: not (
                         self._entry_admission_disabled_by_config()
                     ),
-                    config=MakerFirstConfig(
-                        mode=maker_mode,
-                        ttl_seconds=float(self.C("MAKER_FIRST_TTL_SECONDS", 3.0)),
-                        market_fallback=self._bool_cfg_value(
-                            self.C("MAKER_FIRST_MARKET_FALLBACK", False), False
-                        ),
-                        depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
-                    ),
+                    config=maker_config,
                 )
                 # Prefer the ACTUAL filled amount. Bitget often returns
                 # filled=0/None on the initial market-order response (the fill
@@ -1410,12 +1454,16 @@ class FuturesScanMixin:
                         _order_request_conflicts,
                         _requested_position_side,
                     )
+                    from bot_utils.order_utils import order_id_text_or_none
 
                     original_order_ids = _explicit_order_ids(order)
                     expected_position_side = _requested_position_side(
                         _entry_order_params(_cid)
                     )
-                    oid = order.get("id") or order.get("orderId")
+                    oid = (
+                        order_id_text_or_none(order.get("id"))
+                        or order_id_text_or_none(order.get("orderId"))
+                    )
                     if oid:
                         import time as _t
                         for _att in range(2):
@@ -1498,9 +1546,14 @@ class FuturesScanMixin:
                             expected_position_side=direction,
                         )
                         if pos is not None:
-                            real_amt = abs(self._finite_float(
-                                pos.get("contracts") or pos.get("size")))
-                            if real_amt > 0:
+                            from bot_utils.futures_order import (
+                                _position_contracts_abs,
+                            )
+
+                            real_amt = _position_contracts_abs(pos)
+                            if real_amt is None:
+                                positions_unavailable = True
+                            elif real_amt > 0:
                                 amount = real_amt
                                 positions_verified = True
                                 for _k in ("entryPrice", "entry_price"):

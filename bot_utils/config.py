@@ -208,11 +208,16 @@ def _live_position_cap(bot_name: str,
     hard_limit = _position_limit(bot_name)
     fallback_cap = fallback_cfg.get("POSITION_SIZE_MAX", hard_limit)
     raw_cap = section.get("POSITION_SIZE_MAX", fallback_cap)
-    cap = _clamp("POSITION_SIZE_MAX", raw_cap)
     try:
-        cap = float(cap)
+        if isinstance(raw_cap, bool):
+            raise ValueError("boolean is not a numeric config value")
+        parsed_cap = float(raw_cap)
+        if not math.isfinite(parsed_cap):
+            raise ValueError("non-finite numeric config value")
+        cap = _clamp("POSITION_SIZE_MAX", parsed_cap)
     except (TypeError, ValueError, OverflowError):
-        cap = float(fallback_cap or hard_limit)
+        cap = _clamp("POSITION_SIZE_MAX", fallback_cap)
+    cap = float(cap)
     return max(0.01, min(hard_limit, cap))
 
 
@@ -232,6 +237,31 @@ def _clamp_live_sizing(bot_name: str,
     if key == "POSITION_SIZE":
         val = min(val, _live_position_cap(bot_name, section, fallback_cfg, default))
     return val
+
+
+def _effective_live_numeric(section: Dict[str, Any],
+                            fallback_cfg: Dict[str, Any],
+                            key: str,
+                            default: Any) -> float:
+    """Resolve one related numeric value from the same live snapshot."""
+    raw = section.get(key, fallback_cfg.get(key, default))
+    try:
+        if isinstance(raw, bool):
+            raise ValueError("boolean is not a numeric config value")
+        parsed = float(raw)
+        if not math.isfinite(parsed):
+            raise ValueError("non-finite numeric config value")
+    except (TypeError, ValueError, OverflowError):
+        fallback = fallback_cfg.get(key, default)
+        if isinstance(fallback, bool):
+            fallback = _CLAMP_DEFAULTS.get(key, default)
+        try:
+            parsed = float(fallback)
+            if not math.isfinite(parsed):
+                raise ValueError("non-finite fallback config value")
+        except (TypeError, ValueError, OverflowError):
+            parsed = float(_CLAMP_DEFAULTS.get(key, 0.0))
+    return float(_clamp(key, parsed))
 
 
 def _enforce_invariants(cfg: Dict[str, Any]) -> None:
@@ -261,12 +291,24 @@ def _resolve_config_path() -> str:
 _CONFIG_JSON_MAX_BYTES = 2 * 1024 * 1024
 
 
+def _config_object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate config JSON key {key}")
+        result[key] = value
+    return result
+
+
 def _read_config_json(path: str) -> dict:
     with open(path, "rb") as fh:
         raw = fh.read(_CONFIG_JSON_MAX_BYTES + 1)
     if len(raw) > _CONFIG_JSON_MAX_BYTES:
         raise ValueError("config JSON exceeds size limit")
-    return json.loads(raw.decode("utf-8-sig"))
+    return json.loads(
+        raw.decode("utf-8-sig"),
+        object_pairs_hook=_config_object_without_duplicate_keys,
+    )
 
 
 def merge_runtime_config(
@@ -369,6 +411,14 @@ _NEGATIVE_ONLY = frozenset((
 ))
 
 
+class _ConfigSection(dict):
+    """Config values plus the health of the current on-disk source."""
+
+    def __init__(self, values: dict, *, source_healthy: bool) -> None:
+        super().__init__(values)
+        self.source_healthy = source_healthy
+
+
 class _ConfigCache:
     """Process-local cache. Shared across all callers in the same
     Python process, refreshed lazily via mtime."""
@@ -378,8 +428,10 @@ class _ConfigCache:
         self._path: str = _resolve_config_path()
         self._raw: dict = {}
         self._mtime: float = 0.0
+        self._file_signature: tuple[int, int, int, int, int] | None = None
         self._last_check_mono: float = 0.0
         self._last_err_log_mono: float = 0.0
+        self._source_healthy = False
 
     def _maybe_reload(self) -> None:
         """Refresh _raw if TTL expired and mtime changed."""
@@ -388,10 +440,27 @@ class _ConfigCache:
             return
         self._last_check_mono = now_mono
         try:
-            st_mtime = os.path.getmtime(self._path)
+            stat_result = os.stat(self._path)
         except OSError:
+            self._source_healthy = False
             return
-        if st_mtime == self._mtime and self._raw:
+        st_mtime = stat_result.st_mtime
+        signature = (
+            int(getattr(stat_result, "st_mtime_ns", st_mtime * 1_000_000_000)),
+            int(stat_result.st_size),
+            int(getattr(
+                stat_result,
+                "st_ctime_ns",
+                stat_result.st_ctime * 1_000_000_000,
+            )),
+            int(getattr(stat_result, "st_dev", 0)),
+            int(getattr(stat_result, "st_ino", 0)),
+        )
+        if (
+            signature == self._file_signature
+            and self._raw
+            and self._source_healthy
+        ):
             return
         try:
             candidate = _read_config_json(self._path)
@@ -399,7 +468,10 @@ class _ConfigCache:
                 raise ValueError("bot_config.json root must be an object")
             self._raw = candidate
             self._mtime = st_mtime
+            self._file_signature = signature
+            self._source_healthy = True
         except Exception as e:
+            self._source_healthy = False
             if (now_mono - self._last_err_log_mono) > 60.0:
                 self._last_err_log_mono = now_mono
                 try:
@@ -414,7 +486,11 @@ class _ConfigCache:
         with self._lock:
             self._maybe_reload()
             section = self._raw.get(bot_name)
-            return dict(section) if isinstance(section, dict) else {}
+            values = dict(section) if isinstance(section, dict) else {}
+            return _ConfigSection(
+                values,
+                source_healthy=self._source_healthy,
+            )
 
 
 _CACHE = _ConfigCache()
@@ -437,17 +513,31 @@ def get_live_value(bot_name: str, key: str, default: Any = None,
         return fallback_cfg.get(key, default)
 
     section = _CACHE.get_section(bot_name)
+    if (
+        key in _FAIL_CLOSED_BOOL_FIELDS
+        and (
+            getattr(section, "source_healthy", True) is not True
+            or key not in section
+        )
+    ):
+        return False
     if key not in section:
         return fallback_cfg.get(key, default)
 
     raw = section[key]
     try:
         if key in _NEGATIVE_ONLY:
+            if isinstance(raw, bool):
+                raise ValueError("boolean is not a numeric config value")
             fv = float(raw)
+            if not math.isfinite(fv):
+                raise ValueError("non-finite numeric config value")
             if fv >= 0.0:
                 return fallback_cfg.get(key, default)
             return _clamp(key, fv)
         if key in _INT_FIELDS:
+            if isinstance(raw, bool):
+                raise ValueError("boolean is not a numeric config value")
             return _clamp(key, int(raw))
         fb = fallback_cfg.get(key, default)
         if isinstance(fb, bool):
@@ -456,20 +546,30 @@ def get_live_value(bot_name: str, key: str, default: Any = None,
                 return False
             return fb if parsed is None else parsed
         if isinstance(fb, (int, float)):
+            if isinstance(raw, bool):
+                raise ValueError("boolean is not a numeric config value")
+            parsed_numeric = float(raw)
+            if not math.isfinite(parsed_numeric):
+                raise ValueError("non-finite numeric config value")
             if key in {"POSITION_SIZE", "POSITION_SIZE_MAX"}:
                 return _clamp_live_sizing(
-                    bot_name, key, raw, section, fallback_cfg, default
+                    bot_name,
+                    key,
+                    parsed_numeric,
+                    section,
+                    fallback_cfg,
+                    default,
                 )
-            val = _clamp(key, float(raw))
+            val = _clamp(key, parsed_numeric)
             if key in {"TRAILING_DISTANCE", "POST_PARTIAL_TRAILING_DISTANCE"}:
-                try:
-                    activation = float(section.get(
-                        "ACTIVATION_PROFIT",
-                        fallback_cfg.get("ACTIVATION_PROFIT", 0.0)) or 0.0)
-                    if activation > 0 and float(val) >= activation:
-                        return max(0.25, activation * 0.5)
-                except (TypeError, ValueError, OverflowError):
-                    pass
+                activation = _effective_live_numeric(
+                    section,
+                    fallback_cfg,
+                    "ACTIVATION_PROFIT",
+                    0.0,
+                )
+                if activation > 0 and float(val) >= activation:
+                    return max(0.25, activation * 0.5)
             return val
         return _clamp(key, raw)
     except (TypeError, ValueError, OverflowError):

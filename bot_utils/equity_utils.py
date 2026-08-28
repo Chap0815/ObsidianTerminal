@@ -166,10 +166,10 @@ def _sum_position_margin_and_upnl(positions: list) -> tuple[float, float, int, l
         if not isinstance(p, dict):
             continue
         # Skip closed/zero positions
-        contracts = _safe_float(p.get("contracts"))
-        if contracts == 0.0:
-            contracts = _safe_float(p.get("size"))
-        if not (abs(contracts) > 0):
+        from bot_utils.futures_order import _position_contracts_abs
+
+        contracts = _position_contracts_abs(p)
+        if contracts is None or contracts <= 0.0:
             continue
         count += 1
 
@@ -288,6 +288,8 @@ def compute_futures_equity(ex) -> Optional[dict]:
     except Exception:
         # Without positions we don't know what's bound. Return what we
         # know but flag that the unrealized side is incomplete.
+        return _futures_free_only(free)
+    if not isinstance(positions, list):
         return _futures_free_only(free)
 
     margin_sum, upnl_sum, count, details = _sum_position_margin_and_upnl(positions)

@@ -16,6 +16,7 @@ import math
 import os
 import threading
 import time
+from datetime import datetime
 from typing import Tuple, List, Optional, Callable
 
 
@@ -43,6 +44,62 @@ def _read_persist_retry_sleep(default: float = 0.05) -> float:
 
 _PERSIST_RETRIES     = _read_persist_retries()
 _PERSIST_RETRY_SLEEP = _read_persist_retry_sleep()
+
+
+# These flags directly steer position ownership, entry/exit recovery,
+# accounting, or protective exits.  Truthiness is not a schema: for example,
+# the JSON string ``"false"`` is true in Python and can therefore skip a
+# partial exit or misclassify a recovery barrier.  Missing fields retain their
+# existing backwards-compatible defaults, but present fields must be genuine
+# JSON booleans.
+_POSITION_BOOLEAN_FIELDS = frozenset((
+    "partial_sold",
+    "break_even",
+    "be_active",
+    "accounting_pending",
+    "accounting_already_booked",
+    "provisional",
+    "claim_release_pending",
+    "entry_sizing_recovery_pending",
+    "entry_sizing_recovery_unverified",
+    "entry_funding_window_unverified",
+    "accounting_pending_funding_unverified",
+    "oversize_rollback_pending",
+    "verified_flat_pending_accounting",
+    "full_exit_outcome_uncertain",
+    "partial_exit_outcome_uncertain",
+))
+
+_POSITION_SYMBOL_MAX_LENGTH = 64
+_POSITION_SYMBOL_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+_PENDING_ACCOUNTING_FIELDS = frozenset((
+    "accounting_pending_partials",
+    "unpriced_external_partials",
+))
+
+
+def _valid_pending_accounting_items(value) -> bool:
+    if isinstance(value, dict):
+        return True
+    return isinstance(value, list) and all(
+        isinstance(item, dict) for item in value
+    )
+
+
+def _is_canonical_position_symbol(value) -> bool:
+    """Return whether a state key is one canonical exchange base code."""
+    if not isinstance(value, str):
+        return False
+    if not (1 <= len(value) <= _POSITION_SYMBOL_MAX_LENGTH):
+        return False
+    if value != value.strip() or value != value.upper():
+        return False
+    return (
+        all(char in _POSITION_SYMBOL_CHARS for char in value)
+        and any(char.isascii() and char.isalnum() for char in value)
+    )
 
 
 #  Atomic write 
@@ -155,6 +212,16 @@ def _finite_float_or_none(value):
     return parsed if math.isfinite(parsed) else None
 
 
+def _valid_buy_time(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return parsed.strftime("%Y-%m-%d %H:%M:%S") == value
+
+
 def _replace_nonfinite_values(value):
     """Heal JSON-parsed NaN/Inf telemetry without dropping the position."""
     if isinstance(value, float):
@@ -206,6 +273,9 @@ def _validate_state(trades: dict,
         return clean, rejected
 
     for sym, d in trades.items():
+        if not _is_canonical_position_symbol(sym):
+            rejected.append(f"{sym}(symbol)")
+            continue
         if not isinstance(d, dict):
             rejected.append(f"{sym}(not-dict)")
             continue
@@ -228,6 +298,8 @@ def _validate_state(trades: dict,
             continue
         if "buy_price" in d:
             d["buy_price"] = buy
+        if "buy" in d:
+            d["buy"] = buy
 
         raw_amount = d.get("amount", 0)
         amt = _finite_float_or_none(raw_amount)
@@ -242,15 +314,42 @@ def _validate_state(trades: dict,
             rejected.append(f"{sym}(position_type)")
             continue
 
-        if not isinstance(d.get("buy_time"), str):
+        if not _valid_buy_time(d.get("buy_time")):
             rejected.append(f"{sym}(buy_time)")
+            continue
+
+        invalid_boolean = next(
+            (
+                field
+                for field in _POSITION_BOOLEAN_FIELDS
+                if field in d and not isinstance(d[field], bool)
+            ),
+            None,
+        )
+        if invalid_boolean is not None:
+            rejected.append(f"{sym}({invalid_boolean}-boolean)")
+            continue
+
+        invalid_pending = next(
+            (
+                field
+                for field in _PENDING_ACCOUNTING_FIELDS
+                if field in d and not _valid_pending_accounting_items(d[field])
+            ),
+            None,
+        )
+        if invalid_pending is not None:
+            rejected.append(f"{sym}({invalid_pending})")
             continue
 
         leverage = 1.0
         raw_leverage = d.get("leverage")
         if raw_leverage is not None:
             parsed_leverage = _finite_float_or_none(raw_leverage)
-            leverage = parsed_leverage if parsed_leverage is not None and parsed_leverage > 0 else 1.0
+            if parsed_leverage is None or parsed_leverage <= 0:
+                rejected.append(f"{sym}(leverage)")
+                continue
+            leverage = parsed_leverage
             d["leverage"] = leverage
 
         raw_invested = d.get("invested_usdt")

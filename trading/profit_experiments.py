@@ -14,7 +14,7 @@ def _mode(value: str) -> str:
 
 
 def _finite_number(value) -> float | None:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
         number = float(value)
@@ -126,9 +126,12 @@ def decide_net_expectancy(
         )
 
     try:
-        values = [float(features[name]) for name in model.feature_order]
-        if not all(math.isfinite(value) for value in values):
+        parsed_values = [
+            _finite_number(features[name]) for name in model.feature_order
+        ]
+        if any(value is None for value in parsed_values):
             raise ValueError("non-finite feature")
+        values = [value for value in parsed_values if value is not None]
     except (KeyError, TypeError, ValueError, OverflowError):
         return _invalid("feature coverage incomplete")
     if model.feature_means and model.feature_scales:

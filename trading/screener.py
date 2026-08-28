@@ -492,13 +492,19 @@ def _compute_indicators(bars) -> dict:
         h = float(df["high"].iloc[-2])
         low = float(df["low"].iloc[-2])
         c = float(df["close"].iloc[-2])
+        if (
+            not all(math.isfinite(value) for value in (o, h, low, c))
+            or h <= low
+            or h < max(o, c)
+            or low > min(o, c)
+        ):
+            return {}
         candle_range = h - low
         body = abs(c - o)
-        body_ratio = (body / candle_range) if candle_range > 0 else 1.0
+        body_ratio = body / candle_range
         candle_dir = -1.0 if c < o else (1.0 if c > o else 0.0)
     except Exception:
-        body_ratio = 1.0
-        candle_dir = 0.0
+        return {}
 
     return {
         "rsi": rsi,
@@ -672,18 +678,13 @@ def _clone_exchange(exchange):
     except Exception:
         pass
 
+    clone = None
     try:
         cls = type(src)
-        cfg = {
-            "apiKey": getattr(src, "apiKey", None),
-            "secret": getattr(src, "secret", None),
-            "enableRateLimit": True,
-        }
-        if getattr(src, "password", None):
-            cfg["password"] = src.password
-        options = getattr(src, "options", {})
-        if options:
-            cfg["options"] = copy.deepcopy(dict(options))
+        from trading.l2_stream import build_public_async_config
+
+        cfg = build_public_async_config(src)
+        cfg.pop("newUpdates", None)
         clone = cls(cfg)
         clone.timeout = getattr(src, "timeout", 10_000)
         src_markets = getattr(src, "markets", None)
@@ -696,8 +697,12 @@ def _clone_exchange(exchange):
                 except TypeError:
                     clone.markets = src_markets
         return clone
-    except Exception:
-        return src
+    except Exception as exc:
+        if clone is not None and clone is not src:
+            _close_clone(clone)
+        raise RuntimeError(
+            "independent screener exchange clone unavailable"
+        ) from exc
 
 
 def _close_clone(clone) -> None:
@@ -800,17 +805,39 @@ def _get_clone_pool(exchange, n_workers: int) -> list:
     (e.g. user reconnected), we drop the old pool and rebuild.
     """
     old = []
+    abandoned = []
+    build_error = None
+    selected = []
     with _CLONE_POOL_LOCK:
         if _CLONE_POOL_KEY["source"] is not exchange:
-            # Source exchange changed (or first call). Close the old
-            # pool so the sockets don't linger, then rebuild.
-            old = list(_CLONE_POOL)
-            _CLONE_POOL.clear()
-            _CLONE_POOL_KEY["source"] = exchange
-        need = max(0, n_workers - len(_CLONE_POOL))
-        for _ in range(need):
-            _CLONE_POOL.append(_clone_exchange(exchange))
-        selected = list(_CLONE_POOL[:n_workers])
+            # Build a replacement generation transactionally. If construction
+            # fails, keep the prior healthy pool indexed and close only the
+            # unused partial replacement batch.
+            replacement = []
+            try:
+                for _ in range(max(0, n_workers)):
+                    replacement.append(_clone_exchange(exchange))
+            except Exception as exc:
+                abandoned = replacement
+                build_error = exc
+            else:
+                old = list(_CLONE_POOL)
+                _CLONE_POOL[:] = replacement
+                _CLONE_POOL_KEY["source"] = exchange
+                selected = list(_CLONE_POOL[:n_workers])
+        else:
+            need = max(0, n_workers - len(_CLONE_POOL))
+            try:
+                for _ in range(need):
+                    _CLONE_POOL.append(_clone_exchange(exchange))
+            except Exception as exc:
+                build_error = exc
+            else:
+                selected = list(_CLONE_POOL[:n_workers])
+    for clone in abandoned:
+        _close_clone(clone)
+    if build_error is not None:
+        raise build_error
     # Close old sessions after releasing the pool lock.
     for clone in old:
         _close_clone(clone)
@@ -841,6 +868,28 @@ def _apply_quality_filters(
     dumping  relative surges are smaller. Without this adjustment, spot
     bots can scan for 8+ hours with 0 trades.
     """
+    def _valid_rsi(payload) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        value = payload.get("rsi")
+        if isinstance(value, bool):
+            return False
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return math.isfinite(parsed) and 0.0 <= parsed <= 100.0
+
+    complete_symbols = {
+        sym
+        for sym in candidates["symbol"]
+        if all(
+            _valid_rsi(results.get((sym, timeframe)))
+            for timeframe in ("15m", "1h", "4h")
+        )
+    }
+    candidates = candidates[candidates["symbol"].isin(complete_symbols)].copy()
+
     rsi_15, rsi_1h, rsi_4h = [], [], []
     macd_1h, atr_1h, ema_1h, vsurge_1h, body_1h, cdir_1h = [], [], [], [], [], []
     for sym in candidates["symbol"]:

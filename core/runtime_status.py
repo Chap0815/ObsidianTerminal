@@ -25,6 +25,10 @@ _STATUS_MAX_CONTAINER_ITEMS = 256
 _STATUS_MAX_KEY_CHARS = 256
 _STATUS_LOCK_TIMEOUT_SEC = 1.0
 _STATUS_LOCK_CHECK_SEC = 0.01
+_CLOCK_OFFSET_MAX_AGE_SECONDS = 6.0 * 60.0 * 60.0
+_BUILD_ID_CHARS = 16
+_BUILD_CREATED_AT_MAX_CHARS = 128
+_BUILD_SOURCE_MAX_CHARS = 64
 
 
 def _log_status_write_failure(context: str, exc: Exception) -> None:
@@ -51,12 +55,15 @@ def _runtime_status_path_lock(path: Path):
             flags=portalocker.LOCK_EX | portalocker.LOCK_NB,
         )
         lock.acquire()
-    except Exception:
+    except Exception as exc:
         if lock is not None:
             try:
                 lock.release()
             except Exception:
                 pass
+        _log_status_write_failure(
+            f"runtime status lock acquire({path})", exc
+        )
         yield False
         return
     try:
@@ -100,12 +107,25 @@ def _clock_health() -> dict[str, Any]:
             )
         ):
             raise ValueError("invalid exchange clock state")
+        clock_ok = bool(
+            anchored
+            and float(offset_age_seconds) <= _CLOCK_OFFSET_MAX_AGE_SECONDS
+        )
         return {
             "component": "exchange_clock",
             "exchange_anchored": anchored,
             "offset_ms": float(offset_ms) if anchored else 0.0,
             "offset_age_seconds": (
                 round(float(offset_age_seconds), 3) if anchored else None
+            ),
+            "maximum_offset_age_seconds": _CLOCK_OFFSET_MAX_AGE_SECONDS,
+            "ok": clock_ok,
+            "reason": (
+                ""
+                if clock_ok
+                else "exchange_offset_stale"
+                if anchored
+                else "exchange_offset_unavailable"
             ),
             "source": "exchange_offset" if anchored else "local_fallback",
         }
@@ -115,6 +135,9 @@ def _clock_health() -> dict[str, Any]:
             "exchange_anchored": False,
             "offset_ms": None,
             "offset_age_seconds": None,
+            "maximum_offset_age_seconds": _CLOCK_OFFSET_MAX_AGE_SECONDS,
+            "ok": False,
+            "reason": "clock_state_unavailable",
             "source": "clock_state_unavailable",
         }
 
@@ -131,6 +154,26 @@ def _read_json(path: Path) -> dict:
         return {}
 
 
+def _validated_build_id(value: Any) -> str | None:
+    if not isinstance(value, str) or len(value) != _BUILD_ID_CHARS:
+        return None
+    if any(char not in "0123456789abcdefABCDEF" for char in value):
+        return None
+    return value
+
+
+def _bounded_build_created_at(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > _BUILD_CREATED_AT_MAX_CHARS:
+        return ""
+    return value
+
+
+def _bounded_build_source(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > _BUILD_SOURCE_MAX_CHARS:
+        return "fallback"
+    return value
+
+
 def get_build_info() -> dict:
     """Return deploy metadata without raising.
 
@@ -138,11 +181,13 @@ def get_build_info() -> dict:
     by manual remote syncs and only has file hashes, so we derive a build id.
     """
     deploy = _read_json(PROJECT_ROOT / "DEPLOY_MANIFEST.json")
-    if deploy:
+    deploy_build_id = _validated_build_id(deploy.get("build_id"))
+    if deploy_build_id is not None:
         return {
-            "build_id": str(deploy.get("build_id") or "unknown"),
-            "created_at": str(deploy.get("created_at")
-                              or deploy.get("created_at_utc") or ""),
+            "build_id": deploy_build_id,
+            "created_at": _bounded_build_created_at(
+                deploy.get("created_at") or deploy.get("created_at_utc") or ""
+            ),
             "source": "DEPLOY_MANIFEST.json",
         }
 
@@ -162,7 +207,7 @@ def get_build_info() -> dict:
             h.update(str(row.get("sha256", "")).encode("ascii", errors="ignore"))
         return {
             "build_id": h.hexdigest()[:16],
-            "created_at": str(sync.get("created_at") or ""),
+            "created_at": _bounded_build_created_at(sync.get("created_at") or ""),
             "source": "SYNC_MANIFEST.json",
         }
 
@@ -288,9 +333,10 @@ def _strict_json_value(value: Any, *, depth: int = 0) -> Any:
     return None
 
 
-def _write_fallback_status(path: Path, payload: Mapping[str, Any]) -> None:
+def _write_fallback_status(path: Path, payload: Mapping[str, Any]) -> bool:
     fallback = path.with_name("runtime_status.fallback.json")
     tmp_name = ""
+    published = False
     try:
         fd, tmp_name = tempfile.mkstemp(
             prefix=fallback.name + ".", suffix=".tmp", dir=str(fallback.parent))
@@ -305,12 +351,14 @@ def _write_fallback_status(path: Path, payload: Mapping[str, Any]) -> None:
         try:
             os.replace(tmp_name, fallback)
             tmp_name = ""
+            published = True
         except OSError as replace_exc:
             # Never truncate a last-good fallback in place. A hard link makes
             # the already-flushed temp visible atomically when no fallback
             # exists; otherwise retain the older valid status for the reader.
             try:
                 os.link(tmp_name, fallback)
+                published = True
             except FileExistsError:
                 pass
             except (AttributeError, OSError) as link_exc:
@@ -327,6 +375,7 @@ def _write_fallback_status(path: Path, payload: Mapping[str, Any]) -> None:
                     os.remove(tmp_name)
             except OSError:
                 pass
+    return published
 
 
 def write_runtime_status(log_dir: str | os.PathLike[str],
@@ -338,13 +387,20 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
                          extra: Mapping[str, Any] | None = None,
                          build_info: Mapping[str, Any] | None = None,
                          process_pid: int | None = None,
-                         process_run_id: str | None = None) -> None:
+                         process_run_id: str | None = None) -> bool:
     try:
         path = runtime_status_path(log_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         # Long-running bots pass the snapshot captured during startup so an
         # on-disk sync cannot make already-loaded code advertise a newer build.
         build = dict(build_info) if isinstance(build_info, Mapping) else get_build_info()
+        status_build_id = _validated_build_id(build.get("build_id")) or "unknown"
+        status_build_created_at = _bounded_build_created_at(
+            build.get("created_at") or ""
+        )
+        status_build_source = _bounded_build_source(
+            build.get("source") or "fallback"
+        )
         if process_pid is None:
             status_pid = os.getpid()
         elif isinstance(process_pid, bool):
@@ -368,9 +424,9 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
             "updated_at": _utc_now(),
             "wall_ts": time.time(),
             "monotonic_ts": time.monotonic(),
-            "build_id": build.get("build_id", "unknown"),
-            "build_source": build.get("source", "fallback"),
-            "build_created_at": build.get("created_at", ""),
+            "build_id": status_build_id,
+            "build_source": status_build_source,
+            "build_created_at": status_build_created_at,
             "threads": _strict_json_value(threads or {}),
             "clock_health": _clock_health(),
         }
@@ -386,13 +442,10 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
 
         with _runtime_status_path_lock(path) as acquired:
             if not acquired:
-                _log_status_write_failure(
-                    f"write_runtime_status lock({path})",
-                    TimeoutError("runtime status publish lock unavailable"),
-                )
-                return
+                return False
             fd, tmp_name = tempfile.mkstemp(
                 prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+            published = False
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     json.dump(payload, fh, indent=2, sort_keys=True, allow_nan=False)
@@ -417,6 +470,7 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
                                 f"write_runtime_status cleanup_fallback({path})",
                                 exc,
                             )
+                        published = True
                         break
                     except OSError as exc:
                         last_err = exc
@@ -425,7 +479,7 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
                             * (1.0 + (attempt % 3) * 0.25)
                         )
                 if last_err is not None:
-                    _write_fallback_status(path, payload)
+                    published = _write_fallback_status(path, payload)
                     _log_status_write_failure(
                         f"write_runtime_status({path})", last_err
                     )
@@ -435,8 +489,10 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
                         os.remove(tmp_name)
                 except OSError:
                     pass
+            return published
     except Exception as exc:
         _log_status_write_failure(f"write_runtime_status({log_dir})", exc)
+        return False
 
 
 def read_runtime_status(log_dir: str | os.PathLike[str]) -> dict:

@@ -27,8 +27,6 @@ _have_offset: bool = False
 _offset_set_monotonic: float | None = None
 _anchor_epoch_ms: float | None = None
 _anchor_monotonic: float | None = None
-
-
 def set_exchange_offset_ms(offset_ms: float) -> None:
     """Publish the localexchange offset (exchange  local, in ms).
 
@@ -46,6 +44,11 @@ def set_exchange_offset_ms(offset_ms: float) -> None:
         return
     try:
         anchor_epoch_ms = time.time() * 1000.0 + off
+        # ``datetime.fromtimestamp(0)`` is representable, but an exchange-time
+        # sentinel at/before the Unix epoch must never replace a last-good
+        # live clock anchor.  Keep synthetic positive epochs valid for tests.
+        if anchor_epoch_ms <= 0.0:
+            return
         datetime.fromtimestamp(
             anchor_epoch_ms / 1000.0,
             tz=timezone.utc,

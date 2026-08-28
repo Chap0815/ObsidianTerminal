@@ -5,19 +5,41 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import sqlite3
+import stat
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from bot_utils.api_budget import try_consume_api_call
+import portalocker
+
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.order_utils import order_id_text_or_none
 from core.constants import NONCRYPTO_BASES
 
 
 MAX_PARTITION_CLOCK_AGE_MS = 86_400_000
+
+
+def _capture_now_ms() -> int:
+    """Exchange-anchored absolute time for immutable capture provenance."""
+    from core.clock import now_ms
+
+    return int(now_ms())
+
+
+def _capture_now_utc() -> datetime:
+    from core.clock import now_utc
+
+    return now_utc()
 
 
 @dataclass(frozen=True)
@@ -47,7 +69,63 @@ class SQLitePartitionWriter:
         self.max_storage_bytes = max(0, int(float(max_storage_gib) * 1024**3))
         self._connections: dict[Path, sqlite3.Connection] = {}
         self._lock = threading.Lock()
+        self._partition_locks: dict[str, threading.RLock] = {}
         self._control_path = self.root / "capture_state.json"
+
+    @contextmanager
+    def partition_guard(self, day) -> object:
+        """Serialize a UTC day's final seal with every in-process write."""
+        day_text = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        with self._lock:
+            guard = self._partition_locks.setdefault(
+                day_text, threading.RLock()
+            )
+        with guard:
+            yield
+
+    def _assert_partition_writable(self, path: Path) -> None:
+        seal = self.root / "integrity" / f"{path.stem}.json"
+        self._assert_scoped_path(seal)
+        if seal.exists():
+            raise RuntimeError(
+                f"sealed capture partition is immutable: {path.stem}"
+            )
+
+    @staticmethod
+    def _linklike(path: Path) -> bool:
+        try:
+            value = path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise RuntimeError("capture path cannot be inspected") from exc
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        return bool(
+            stat.S_ISLNK(value.st_mode)
+            or (
+                reparse_flag
+                and getattr(value, "st_file_attributes", 0) & reparse_flag
+            )
+        )
+
+    def _assert_scoped_path(self, path: Path) -> None:
+        root_absolute = self.root.absolute()
+        path_absolute = path.absolute()
+        try:
+            relative = path_absolute.relative_to(root_absolute)
+        except ValueError as exc:
+            raise RuntimeError("capture path escaped root") from exc
+        if self._linklike(self.root):
+            raise RuntimeError("capture root is linked")
+        if self._linklike(path.parent) or self._linklike(path):
+            raise RuntimeError("capture path is linked")
+        try:
+            resolved_root = self.root.resolve()
+            resolved_path = path.resolve(strict=False)
+        except OSError as exc:
+            raise RuntimeError("capture path cannot be resolved") from exc
+        if resolved_path != resolved_root / relative:
+            raise RuntimeError("capture path escaped root through a link")
 
     def _load_control_state_locked(self) -> dict:
         try:
@@ -67,6 +145,7 @@ class SQLitePartitionWriter:
 
     def _write_control_state_locked(self, state: dict) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+        self._assert_scoped_path(self._control_path)
         encoded = json.dumps(
             state,
             sort_keys=True,
@@ -77,6 +156,7 @@ class SQLitePartitionWriter:
             f".{self._control_path.name}.{os.getpid()}."
             f"{threading.get_ident()}.tmp"
         )
+        self._assert_scoped_path(temporary)
         try:
             with temporary.open("xb") as handle:
                 handle.write(encoded)
@@ -96,15 +176,26 @@ class SQLitePartitionWriter:
 
     def next_connection_epoch(self) -> int:
         """Return a process-independent monotonic transport epoch."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock_path = self.root / ".capture_state.lock"
+        self._assert_scoped_path(self._control_path)
+        self._assert_scoped_path(lock_path)
         with self._lock:
-            state = self._load_control_state_locked()
-            epoch = int(state["connection_epoch"]) + 1
-            state["connection_epoch"] = epoch
-            state["updated_at"] = datetime.now(timezone.utc).isoformat().replace(
-                "+00:00", "Z"
-            )
-            self._write_control_state_locked(state)
-            return epoch
+            with portalocker.Lock(
+                str(lock_path),
+                mode="a",
+                timeout=15.0,
+                check_interval=0.05,
+                fail_when_locked=False,
+            ):
+                state = self._load_control_state_locked()
+                epoch = int(state["connection_epoch"]) + 1
+                state["connection_epoch"] = epoch
+                state["updated_at"] = (
+                    _capture_now_utc().isoformat().replace("+00:00", "Z")
+                )
+                self._write_control_state_locked(state)
+                return epoch
 
     @staticmethod
     def _parse_event_time(value) -> datetime | None:
@@ -152,11 +243,64 @@ class SQLitePartitionWriter:
     def _path(self, event: VenueEvent) -> Path:
         return self.root / event.kind / f"{self._day(event)}.sqlite3"
 
+    @staticmethod
+    def _valid_text(value, *, max_chars: int) -> bool:
+        return bool(
+            isinstance(value, str)
+            and value
+            and value == value.strip()
+            and len(value) <= max_chars
+            and all(ord(char) >= 32 and ord(char) != 127 for char in value)
+        )
+
+    @classmethod
+    def _validate_event(cls, event: VenueEvent) -> None:
+        """Reject malformed capture evidence before selecting a path."""
+        if not isinstance(event, VenueEvent):
+            raise ValueError("venue event type is invalid")
+        if not cls._valid_text(event.event_id, max_chars=2048):
+            raise ValueError("venue event id is invalid")
+        if (
+            not cls._valid_text(event.kind, max_chars=32)
+            or event.kind[0] not in "abcdefghijklmnopqrstuvwxyz"
+            or any(
+                char not in "abcdefghijklmnopqrstuvwxyz0123456789_"
+                for char in event.kind
+            )
+        ):
+            raise ValueError("venue event kind is invalid")
+        if not cls._valid_text(event.market_id, max_chars=256):
+            raise ValueError("venue event market id is invalid")
+        # Unusable clocks are retained in the explicit unknown-date quarantine
+        # (or exchange_time falls back to a usable receiving clock). They still
+        # have to be bounded text so serialization and paths remain safe.
+        if not cls._valid_text(event.exchange_time, max_chars=64):
+            raise ValueError("venue event exchange_time is invalid")
+        if not cls._valid_text(event.received_time, max_chars=64):
+            raise ValueError("venue event received_time is invalid")
+        if type(event.schema_version) is not int or event.schema_version != 1:
+            raise ValueError("venue event schema version is invalid")
+        if not isinstance(event.payload, dict):
+            raise ValueError("venue event payload is invalid")
+        if not isinstance(event.quality_flags, tuple):
+            raise ValueError("venue event quality flags are invalid")
+        if len(event.quality_flags) > 64:
+            raise ValueError("venue event quality flags are invalid")
+        if len(set(event.quality_flags)) != len(event.quality_flags):
+            raise ValueError("venue event quality flags are invalid")
+        if any(
+            not cls._valid_text(flag, max_chars=128)
+            for flag in event.quality_flags
+        ):
+            raise ValueError("venue event quality flags are invalid")
+
     def _connection(self, path: Path) -> sqlite3.Connection:
+        self._assert_scoped_path(path)
         connection = self._connections.get(path)
         if connection is not None:
             return connection
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._assert_scoped_path(path)
         # Writes are serialized by ``_lock`` but the recorder's REST and L2
         # workers legitimately share this connection across two threads.
         connection = sqlite3.connect(path, timeout=15.0, check_same_thread=False)
@@ -201,7 +345,9 @@ class SQLitePartitionWriter:
         )
 
     def write(self, event: VenueEvent) -> Path:
+        self._validate_event(event)
         path = self._path(event)
+        self._assert_scoped_path(path)
         exchange_time, clock_fallback = self._storage_exchange_time(event)
         payload = json.dumps(
             event.payload, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -222,34 +368,37 @@ class SQLitePartitionWriter:
             flags,
             payload,
         )
-        with self._lock:
-            connection = self._connection(path)
-            try:
-                cursor = connection.execute(
-                    """INSERT OR IGNORE INTO venue_events
-                       (event_id, market_id, exchange_time, received_time,
-                        schema_version, quality_flags_json, payload_json)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    values,
-                )
-                if cursor.rowcount == 0:
-                    existing = connection.execute(
-                        """SELECT event_id, market_id, exchange_time,
-                                  received_time, schema_version,
-                                  quality_flags_json, payload_json
-                             FROM venue_events WHERE event_id=?""",
-                        (event.event_id,),
-                    ).fetchone()
-                    if existing is None or not self._persisted_values_match(
-                        tuple(existing), values
-                    ):
-                        raise ValueError(
-                            "venue event id conflicts with persisted evidence"
-                        )
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
+        with self.partition_guard(path.stem):
+            with self._lock:
+                self._assert_partition_writable(path)
+                connection = self._connection(path)
+                try:
+                    cursor = connection.execute(
+                        """INSERT OR IGNORE INTO venue_events
+                           (event_id, market_id, exchange_time, received_time,
+                            schema_version, quality_flags_json, payload_json)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        values,
+                    )
+                    if cursor.rowcount == 0:
+                        existing = connection.execute(
+                            """SELECT event_id, market_id, exchange_time,
+                                      received_time, schema_version,
+                                      quality_flags_json, payload_json
+                                 FROM venue_events WHERE event_id=?""",
+                            (event.event_id,),
+                        ).fetchone()
+                        if existing is None or not self._persisted_values_match(
+                            tuple(existing), values
+                        ):
+                            raise ValueError(
+                                "venue event id conflicts with persisted evidence"
+                            )
+                    self._assert_partition_writable(path)
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
         return path
 
     def _close_path(self, path: Path) -> None:
@@ -291,6 +440,9 @@ class SQLitePartitionWriter:
     def _stage_delete_day(self, day, paths: list[Path]) -> None:
         """Remove one expired UTC dataset without leaving active fragments."""
         staging = self.root / f".retention_trash-{day.isoformat()}"
+        self._assert_scoped_path(staging)
+        for path in paths:
+            self._assert_scoped_path(path)
         if staging.exists():
             first_error = None
             for item in sorted(staging.iterdir()):
@@ -311,6 +463,7 @@ class SQLitePartitionWriter:
                     Path(f"{path}-wal"),
                     Path(f"{path}-shm"),
                 ):
+                    self._assert_scoped_path(source)
                     if not source.exists():
                         continue
                     target = staging / f"{path.parent.name}__{source.name}"
@@ -354,8 +507,9 @@ class SQLitePartitionWriter:
             raise first_error
 
     def enforce_retention(self, *, now: datetime | None = None) -> None:
-        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        current = (now or _capture_now_utc()).astimezone(timezone.utc)
         cutoff = (current - timedelta(days=self.retention_days)).date()
+        self._assert_scoped_path(self._control_path)
         with self._lock:
             first_cleanup_error: OSError | sqlite3.Error | None = None
             failed_cleanup_paths: set[Path] = set()
@@ -390,6 +544,7 @@ class SQLitePartitionWriter:
                 | set(self.root.glob("*/*.sqlite3-shm"))
             )
             for sidecar in orphan_sidecars:
+                self._assert_scoped_path(sidecar)
                 base_path = Path(str(sidecar)[:-4])
                 if base_path.exists():
                     continue
@@ -402,8 +557,9 @@ class SQLitePartitionWriter:
                         first_cleanup_error = exc
 
             partitions = sorted(self.root.glob("*/*.sqlite3"))
+            sealed_reports = sorted((self.root / "integrity").glob("*.json"))
             expired_by_day: dict[object, list[Path]] = {}
-            for path in partitions:
+            for path in (*partitions, *sealed_reports):
                 partition_date = self._partition_date(path)
                 if partition_date is not None and partition_date.date() < cutoff:
                     expired_by_day.setdefault(partition_date.date(), []).append(path)
@@ -443,16 +599,19 @@ class SQLitePartitionWriter:
                 raise first_cleanup_error
 
     def storage_health(self, *, now: datetime | None = None) -> dict:
-        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        current = (now or _capture_now_utc()).astimezone(timezone.utc)
         daily_bytes: dict[str, int] = {}
         total = 0
+        measurement_errors = 0
         for item in self.root.glob("*/*"):
-            if not item.is_file():
-                continue
             try:
-                size = item.stat().st_size
+                item_stat = item.stat()
             except OSError:
+                measurement_errors += 1
                 continue
+            if not stat.S_ISREG(item_stat.st_mode):
+                continue
+            size = item_stat.st_size
             total += size
             name = item.name.split(".sqlite3", 1)[0]
             try:
@@ -471,22 +630,51 @@ class SQLitePartitionWriter:
             if peak is not None and len(closed) >= 3
             else None
         )
+        try:
+            filesystem_free = max(0, int(shutil.disk_usage(self.root).free))
+        except (OSError, TypeError, ValueError, OverflowError):
+            filesystem_free = None
+        filesystem_capacity = (
+            total + filesystem_free
+            if filesystem_free is not None
+            else None
+        )
+        effective_capacity = (
+            min(self.max_storage_bytes, filesystem_capacity)
+            if self.max_storage_bytes > 0 and filesystem_capacity is not None
+            else None
+        )
         capacity_ok = (
-            None
+            False
+            if measurement_errors
+            else None
             if projected is None or self.max_storage_bytes <= 0
-            else self.max_storage_bytes >= projected
+            else (
+                total <= self.max_storage_bytes
+                and self.max_storage_bytes >= projected
+                and filesystem_capacity is not None
+                and filesystem_capacity >= projected
+            )
         )
         return {
             "total_bytes": total,
+            "measurement_complete": measurement_errors == 0,
+            "measurement_errors": measurement_errors,
             "max_storage_bytes": self.max_storage_bytes,
             "closed_days_observed": len(closed),
             "peak_closed_day_bytes": peak,
             "projected_required_bytes": projected,
+            "filesystem_free_bytes": filesystem_free,
+            "filesystem_capacity_bytes": filesystem_capacity,
             "capacity_ok": capacity_ok,
             "headroom_ratio": (
                 None
-                if not projected or self.max_storage_bytes <= 0
-                else self.max_storage_bytes / projected
+                if (
+                    measurement_errors
+                    or not projected
+                    or effective_capacity is None
+                )
+                else effective_capacity / projected
             ),
         }
 
@@ -570,6 +758,7 @@ class VenueRecorder:
         }
         self._integrity_errors_total = 0
         self._last_integrity_error = ""
+        self._integrity_incident_key = None
         self.l2_mode = str(l2_mode).strip().lower()
         self._l2_collector = None
         if self.l2_mode == "shadow":
@@ -590,7 +779,7 @@ class VenueRecorder:
 
     @staticmethod
     def _iso_now() -> str:
-        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return _capture_now_utc().isoformat().replace("+00:00", "Z")
 
     @staticmethod
     def _market_id(exchange, symbol: str) -> str:
@@ -676,9 +865,22 @@ class VenueRecorder:
             self._log_gap("health callback gap", exc)
 
     @staticmethod
-    def _require_api_budget(endpoint: str) -> None:
-        if not try_consume_api_call(endpoint):
+    def _require_api_budget(endpoint: str):
+        reservation = try_consume_api_call(
+            endpoint,
+            return_reservation=True,
+        )
+        if not reservation:
             raise RuntimeError(f"API budget denied: {endpoint}")
+        return reservation
+
+    def _record_api_failure(self, endpoint: str, reservation) -> None:
+        if not isinstance(reservation, ApiCallReservation):
+            return
+        try:
+            record_api_error(endpoint, reservation)
+        except Exception as exc:
+            self._log_gap("API error-ledger gap", exc)
 
     def _write_event(
         self,
@@ -756,10 +958,15 @@ class VenueRecorder:
         )
 
     def capture_overview(self) -> int:
-        self._require_api_budget("venue_recorder_fetch_tickers")
-        started = int(time.time() * 1000)
-        tickers = self.exchange.fetch_tickers()
-        ended = int(time.time() * 1000)
+        endpoint = "venue_recorder_fetch_tickers"
+        reservation = self._require_api_budget(endpoint)
+        started = _capture_now_ms()
+        try:
+            tickers = self.exchange.fetch_tickers()
+        except Exception:
+            self._record_api_failure(endpoint, reservation)
+            raise
+        ended = _capture_now_ms()
         candidates = []
         invalid_numeric_payload = False
         invalid_tickers_payload = not isinstance(tickers, dict)
@@ -886,6 +1093,11 @@ class VenueRecorder:
             flags=tuple(overview_flags),
             market_id="ALL_USDT_SWAPS",
         )
+        self._record_rest_observation(
+            "ALL_USDT_SWAPS",
+            "overview",
+            overview_flags,
+        )
         return len(candidates)
 
     @classmethod
@@ -908,10 +1120,18 @@ class VenueRecorder:
         return max(timestamps, default=int(fallback)), invalid_timestamp
 
     def capture_microstructure(self, symbol: str) -> tuple[Path, Path]:
-        self._require_api_budget("venue_recorder_fetch_order_book")
-        started_book = int(time.time() * 1000)
-        book = self.exchange.fetch_order_book(symbol, limit=self.depth_levels)
-        ended_book = int(time.time() * 1000)
+        book_endpoint = "venue_recorder_fetch_order_book"
+        book_reservation = self._require_api_budget(book_endpoint)
+        started_book = _capture_now_ms()
+        try:
+            book = self.exchange.fetch_order_book(
+                symbol,
+                limit=self.depth_levels,
+            )
+        except Exception:
+            self._record_api_failure(book_endpoint, book_reservation)
+            raise
+        ended_book = _capture_now_ms()
         flags = []
         try:
             from trading.l2_stream import normalize_order_book
@@ -958,10 +1178,15 @@ class VenueRecorder:
             flags=tuple(flags),
         )
         self._record_rest_observation(symbol, "depth", flags)
-        self._require_api_budget("venue_recorder_fetch_trades")
-        started_trades = int(time.time() * 1000)
-        trades = self.exchange.fetch_trades(symbol, limit=100)
-        ended_trades = int(time.time() * 1000)
+        trades_endpoint = "venue_recorder_fetch_trades"
+        trades_reservation = self._require_api_budget(trades_endpoint)
+        started_trades = _capture_now_ms()
+        try:
+            trades = self.exchange.fetch_trades(symbol, limit=100)
+        except Exception:
+            self._record_api_failure(trades_endpoint, trades_reservation)
+            raise
+        ended_trades = _capture_now_ms()
         normalized = []
         seen: dict[tuple, tuple] = {}
         out_of_order = False
@@ -1084,9 +1309,31 @@ class VenueRecorder:
             30.0,
             self.micro_interval * max(1, self.max_symbols) * 2.5,
         )
+        overview_stale_after = max(30.0, self.overview_interval * 2.5)
         markets = {}
         with self._rest_health_lock:
             observations_available = bool(self._rest_health)
+            overview_item = self._rest_health.get(
+                ("ALL_USDT_SWAPS", "overview")
+            )
+            overview_valid_at = (
+                overview_item.get("last_valid_monotonic")
+                if overview_item
+                else None
+            )
+            overview_age = (
+                None
+                if overview_valid_at is None
+                else max(0.0, now - overview_valid_at)
+            )
+            overview = {
+                "valid": (
+                    overview_age is not None
+                    and overview_age <= overview_stale_after
+                ),
+                "age_seconds": overview_age,
+                "flags": list((overview_item or {}).get("flags") or ()),
+            }
             for symbol in desired:
                 streams = {}
                 for stream in ("depth", "trades"):
@@ -1107,6 +1354,9 @@ class VenueRecorder:
             for symbol, streams in markets.items()
             if streams["depth"]["valid"] is not True
         )
+        if overview["valid"] is not True:
+            missing.append("ALL_USDT_SWAPS:overview")
+            missing.sort()
         trade_audit_warnings = sorted(
             f"{symbol}:trades"
             for symbol, streams in markets.items()
@@ -1115,8 +1365,10 @@ class VenueRecorder:
         return {
             "ok": not missing if observations_available else True,
             "stale_after_seconds": stale_after,
+            "overview_stale_after_seconds": overview_stale_after,
             "missing_or_invalid": missing,
             "trade_audit_warnings": trade_audit_warnings,
+            "overview": overview,
             "markets": markets,
         }
 
@@ -1133,10 +1385,20 @@ class VenueRecorder:
                     if self._l2_collector is not None
                     else 1.0
                 ),
+                partition_guard=getattr(
+                    self.writer, "partition_guard", None
+                ),
             )
         except Exception as exc:
+            incident_key = (
+                "exception",
+                type(exc).__name__,
+                str(exc)[:160],
+            )
             with self._integrity_lock:
-                self._integrity_errors_total += 1
+                if incident_key != self._integrity_incident_key:
+                    self._integrity_errors_total += 1
+                    self._integrity_incident_key = incident_key
                 self._last_integrity_error = (
                     f"{type(exc).__name__}: {str(exc)[:160]}"
                 )
@@ -1150,11 +1412,22 @@ class VenueRecorder:
             self._integrity_health = dict(health)
             if health.get("ok") is True:
                 self._last_integrity_error = ""
+                self._integrity_incident_key = None
             else:
-                self._integrity_errors_total += 1
+                invalid_days = tuple(
+                    str(day) for day in (health.get("invalid_days") or [])
+                )
+                incident_key = (
+                    "invalid_days",
+                    invalid_days,
+                    str(health.get("latest_day") or ""),
+                )
+                if incident_key != self._integrity_incident_key:
+                    self._integrity_errors_total += 1
+                    self._integrity_incident_key = incident_key
                 self._last_integrity_error = (
                     "invalid sealed days: "
-                    + ",".join(health.get("invalid_days") or [])
+                    + ",".join(invalid_days)
                 )[:160]
 
     def _schedule_integrity_check(self, writer_root) -> None:
@@ -1390,6 +1663,9 @@ class VenueRecorder:
                 l2_data_healthy = not l2_enabled
                 trade_stream_healthy = not l2_enabled
                 stream_health = {}
+                collector_l2_errors_total = 0
+                collector_l2_errors_consecutive = 0
+                collector_last_l2_error = ""
                 if l2_enabled:
                     healthy_marker = getattr(
                         self._l2_collector, "is_healthy", None
@@ -1426,12 +1702,47 @@ class VenueRecorder:
                     if callable(snapshot_marker):
                         try:
                             stream_health = dict(snapshot_marker())
+                            total_marker = stream_health.get(
+                                "transport_errors_total", 0
+                            )
+                            consecutive_marker = stream_health.get(
+                                "transport_errors_consecutive", 0
+                            )
+                            if (
+                                isinstance(total_marker, int)
+                                and not isinstance(total_marker, bool)
+                                and total_marker >= 0
+                            ):
+                                collector_l2_errors_total = total_marker
+                            if (
+                                isinstance(consecutive_marker, int)
+                                and not isinstance(consecutive_marker, bool)
+                                and consecutive_marker >= 0
+                            ):
+                                collector_l2_errors_consecutive = (
+                                    consecutive_marker
+                                )
+                            last_marker = stream_health.get(
+                                "last_transport_error", ""
+                            )
+                            if isinstance(last_marker, str):
+                                collector_last_l2_error = last_marker[:256]
                         except Exception as exc:
                             note_l2_failure(exc)
                             self._log_gap("stream health snapshot gap", exc)
+                effective_l2_errors_consecutive = max(
+                    l2_errors_consecutive,
+                    collector_l2_errors_consecutive,
+                )
+                effective_l2_errors_total = (
+                    l2_errors_total + collector_l2_errors_total
+                )
+                effective_last_l2_error = (
+                    last_l2_error or collector_last_l2_error
+                )
                 l2_ok = not l2_enabled or (
                     l2_started
-                    and l2_errors_consecutive == 0
+                    and effective_l2_errors_consecutive == 0
                     and l2_data_healthy
                 )
                 reason = (
@@ -1492,9 +1803,9 @@ class VenueRecorder:
                     "integrity_errors_total": integrity_errors_total,
                     "last_integrity_error": last_integrity_error,
                     "storage_health": dict(storage_health),
-                    "l2_consecutive_errors": l2_errors_consecutive,
-                    "l2_errors_total": l2_errors_total,
-                    "last_l2_error": last_l2_error,
+                    "l2_consecutive_errors": effective_l2_errors_consecutive,
+                    "l2_errors_total": effective_l2_errors_total,
+                    "last_l2_error": effective_last_l2_error,
                     "last_poll_monotonic": time.monotonic(),
                     "last_poll_wall_ts": time.time(),
                 })

@@ -54,16 +54,14 @@ def effective_balance(info: dict, dust_threshold: float = 1e-8) -> float:
     free  = _safe_float("free")
     used  = _safe_float("used")
 
-    # Prefer total when it exists and is sane
-    if total is not None and total > 0:
-        result = total
-    elif (free or 0.0) > 0 or (used or 0.0) > 0:
-        # Fallback: sum free + used. Some exchanges miss the total field.
-        result = (free or 0.0) + (used or 0.0)
-        if not math.isfinite(result):
-            result = max(free or 0.0, used or 0.0)
-    else:
-        result = 0.0
+    # ``total`` and ``free + used`` are independent exchange evidence.  A
+    # stale positive ``total`` must not hide a larger actually available or
+    # locked balance, because reconciliation could otherwise delete a live
+    # position.  The larger sane view is conservative for ownership checks.
+    component_total = (free or 0.0) + (used or 0.0)
+    if not math.isfinite(component_total):
+        component_total = max(free or 0.0, used or 0.0)
+    result = max(total or 0.0, component_total)
 
     return result if result > threshold else 0.0
 

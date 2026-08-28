@@ -19,6 +19,7 @@ from bot_utils.futures_order import (
     _requested_position_side,
 )
 from bot_utils.silent_log import silent_log
+from core import clock as exchange_clock
 from core.constants import DEFAULT_TAKER_FEE
 
 
@@ -227,6 +228,21 @@ def _order_status(order: dict, target_amount: float) -> str:
     return "OPEN"
 
 
+def _require_positive_partial_fill(order: dict, context: str) -> None:
+    raw_status = (
+        _external_text(order.get("status", ""))
+        if isinstance(order, dict)
+        else ""
+    )
+    if (
+        raw_status in {"partially_filled", "partiallyfilled"}
+        and _number(order.get("filled")) <= 0.0
+    ):
+        raise _OrderSnapshotConflict(
+            f"{context} partial status without positive fill evidence"
+        )
+
+
 _TERMINAL_NO_FILL_STATUSES = frozenset({
     "rejected", "canceled", "cancelled", "expired",
 })
@@ -346,6 +362,8 @@ def _finalize_pre_submit_rejection(
     journal,
     intent_id: str,
     blocked: FuturesOrderNotSubmitted,
+    *,
+    current_status: str = "PREPARED",
 ) -> None:
     """Preserve the proven no-submit outcome if journal cleanup fails."""
     try:
@@ -353,7 +371,7 @@ def _finalize_pre_submit_rejection(
             journal,
             intent_id,
             blocked,
-            current_status="PREPARED",
+            current_status=current_status,
         )
     except Exception as cleanup_error:
         try:
@@ -497,6 +515,7 @@ def _reconcile_market_response(
 
 
 def _transition_from_order(journal, intent_id: str, order: dict, amount: float) -> str:
+    _require_positive_partial_fill(order, "entry order")
     status = _order_status(order, amount)
     filled = _number(order.get("filled"))
     cost = _number(order.get("cost"))
@@ -667,26 +686,46 @@ def execute_entry_order(
     book_budget_denied = False
     if config.tca_enabled or config.mode == "enforce":
         try:
-            from trading.execution_quality import build_arrival_tca
-
             if not try_consume_api_call("entry_executor_fetch_order_book"):
                 book_budget_denied = True
             else:
                 book = exchange.fetch_order_book(
                     symbol, limit=config.depth_levels
                 )
+        except Exception as exc:
+            silent_log("entry arrival TCA", exc)
+            book = None
+        if book is not None:
+            try:
+                from trading.execution_quality import build_arrival_tca
+
                 arrival = build_arrival_tca(
                     book,
                     side=side,
                     amount=amount,
-                    local_time_ms=int(time.time() * 1000),
+                    local_time_ms=int(exchange_clock.now_ms()),
                 )
+            except Exception as exc:
+                silent_log("entry arrival TCA", exc)
+                arrival = None
+                if config.mode == "enforce":
+                    blocked = FuturesOrderNotSubmitted(
+                        "maker-first order book validation failed"
+                    )
+                    _finalize_pre_submit_rejection(
+                        journal,
+                        intent_id,
+                        blocked,
+                        current_status="SUBMITTING",
+                    )
+                    raise blocked from exc
+            else:
                 recorder = getattr(journal, "record_tca", None)
                 if callable(recorder):
-                    recorder(intent_id, "arrival", asdict(arrival))
-        except Exception as exc:
-            silent_log("entry arrival TCA", exc)
-            arrival = None
+                    try:
+                        recorder(intent_id, "arrival", asdict(arrival))
+                    except Exception as exc:
+                        silent_log("entry arrival TCA persistence", exc)
 
     if config.mode != "enforce":
         try:
@@ -791,6 +830,25 @@ def execute_entry_order(
             book = exchange.fetch_order_book(
                 symbol, limit=config.depth_levels
             )
+            try:
+                from trading.execution_quality import build_arrival_tca
+
+                arrival = build_arrival_tca(
+                    book,
+                    side=side,
+                    amount=amount,
+                    local_time_ms=int(exchange_clock.now_ms()),
+                )
+            except Exception as exc:
+                raise FuturesOrderNotSubmitted(
+                    "maker-first order book validation failed"
+                ) from exc
+            recorder = getattr(journal, "record_tca", None)
+            if callable(recorder):
+                try:
+                    recorder(intent_id, "arrival", asdict(arrival))
+                except Exception as exc:
+                    silent_log("entry arrival TCA persistence", exc)
         levels = book.get("bids") if str(side).lower() == "buy" else book.get("asks")
         if not levels:
             raise RuntimeError("maker-first top of book unavailable")
@@ -940,6 +998,7 @@ def execute_entry_order(
             expected_amount=amount,
         ):
             raise RuntimeError("maker status refresh changed symbol or side")
+        _require_positive_partial_fill(latest, "maker status refresh")
         latest_status = _order_status(latest, amount)
         if (
             latest_status in {"FILLED", "PARTIAL"}
@@ -999,7 +1058,7 @@ def execute_entry_order(
         _require_api_budget("entry_executor_fetch_order", critical=True)
         canceled = exchange.fetch_order(order_id, symbol)
         canceled_order_ids = _explicit_order_ids(canceled)
-        if canceled_order_ids and canceled_order_ids != {order_id}:
+        if canceled_order_ids != {order_id}:
             raise RuntimeError("maker cancel verification changed order id")
         if _order_client_id_conflicts(canceled, client_order_id):
             raise RuntimeError(
@@ -1065,7 +1124,11 @@ def execute_entry_order(
         )
         residual = max(0.0, amount - filled)
         if residual <= amount * 1e-9 or not config.market_fallback:
-            journal.transition(intent_id, "FINALIZED")
+            journal.transition(
+                intent_id,
+                "FINALIZED",
+                release_terminal_zero_claim=(filled == 0.0),
+            )
             if filled > 0.0:
                 _record_fill_tca(
                     journal,
@@ -1088,6 +1151,7 @@ def execute_entry_order(
         fallback = market_order(residual, fallback_client_order_id)
         if not isinstance(fallback, dict):
             raise RuntimeError("market fallback returned no order object")
+        _require_positive_partial_fill(fallback, "market fallback")
         fallback_status = _order_status(fallback, residual)
         fallback_order_ids = _explicit_order_ids(fallback)
         if len(fallback_order_ids) > 1 or (
@@ -1300,6 +1364,33 @@ def recover_nonterminal_order_intents(
         if selected_ids is not None and intent_id not in selected_ids:
             continue
         current = intent["status"]
+        raw_direction = intent.get("direction")
+        direction = (
+            raw_direction.strip().upper()
+            if isinstance(raw_direction, str)
+            else ""
+        )
+        if direction not in {"LONG", "SHORT"}:
+            error = "persisted order intent direction is invalid"
+            try:
+                if current != "RECOVERY_REQUIRED":
+                    transition_order_intent(
+                        intent_id,
+                        "RECOVERY_REQUIRED",
+                        error=error,
+                    )
+            except (TypeError, ValueError):
+                pass
+            if log_event:
+                try:
+                    log_event(
+                        f"Entry recovery blocked for {intent_id}: {error}",
+                        "ERROR",
+                    )
+                except Exception:
+                    pass
+            unresolved.append(persisted_snapshot(intent_id, intent))
+            continue
         fallback_client_order_id = intent.get("fallback_client_order_id")
         lookup_client_order_id = (
             fallback_client_order_id or intent["client_order_id"]
@@ -1377,7 +1468,6 @@ def recover_nonterminal_order_intents(
         ):
             refresh_identity_error = "startup refresh changed client order id"
         else:
-            direction = str(intent["direction"]).strip().upper()
             expected_side = "buy" if direction == "LONG" else "sell"
             if _order_request_conflicts(
                 refreshed_order,

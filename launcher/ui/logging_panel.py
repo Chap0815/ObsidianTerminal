@@ -96,6 +96,12 @@ _DISPLAY_IMPORTANT_STATE_RE = re.compile(
     r"recovered|connection established)\b",
     re.IGNORECASE,
 )
+_DISPLAY_DUPLICATE_SUMMARY_RE = re.compile(
+    r"^\s*(?:(?:INFO|WARN|WARNING)\s+)?\[Log\]\s+"
+    r"Previous message repeated\s+\d+\s+"
+    r"(?:time|times);\s+duplicates? condensed\.\s*$",
+    re.IGNORECASE,
+)
 
 
 class LiveLogDisplayFilter:
@@ -120,6 +126,10 @@ class LiveLogDisplayFilter:
     }
     _NEVER_FILTER = frozenset({
         "error", "critical", "buy", "sell", "win", "loss", "ok",
+    })
+    _SILENT_SINGLETON_CATEGORIES = frozenset({
+        "analysis", "skipped", "monitor", "scan", "wait", "heartbeat",
+        "formatting",
     })
 
     def __init__(
@@ -189,6 +199,7 @@ class LiveLogDisplayFilter:
         ordered = sorted(
             self._pending.items(), key=lambda item: (-item[1], item[0])
         )
+        singleton_category = ordered[0][0] if total == 1 else None
         details = ", ".join(
             f"{self._CATEGORY_LABELS.get(category, category)}: {count}"
             for category, count in ordered
@@ -198,6 +209,8 @@ class LiveLogDisplayFilter:
         self._pending.clear()
         self._pending_first_at = None
         self._pending_last_at = None
+        if singleton_category in self._SILENT_SINGLETON_CATEGORIES:
+            return None
         noun = "message" if total == 1 else "messages"
         duration = 0.0
         if first_at is not None and last_at is not None:
@@ -295,6 +308,11 @@ class LiveLogDisplayFilter:
             return ((summary,) if summary else ()) + (text,)
 
         normalized_severity = str(severity or "info").lower()
+        if (
+            normalized_severity in {"info", "warn", "warning"}
+            and _DISPLAY_DUPLICATE_SUMMARY_RE.fullmatch(text)
+        ):
+            return ()
         if (
             normalized_severity not in self._NEVER_FILTER | {"warn"}
             and _DISPLAY_IMPORTANT_STATE_RE.search(text)

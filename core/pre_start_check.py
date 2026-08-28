@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import math
 import os
@@ -21,8 +22,32 @@ from core.runtime_status import (
 )
 
 
+_MANIFEST_MAX_BYTES = 4 * 1024 * 1024
+_MANIFEST_MAX_FILES = 4096
+_MANIFEST_MAX_FILE_BYTES = 64 * 1024 * 1024
+_MANIFEST_MAX_TOTAL_BYTES = 512 * 1024 * 1024
+
+
 def _reject_json_constant(value: str):
     raise ValueError(f"non-standard JSON constant rejected: {value}")
+
+
+def _config_object_without_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate config JSON key {key}")
+        result[key] = value
+    return result
+
+
+def _state_object_without_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate state JSON key {key}")
+        result[key] = value
+    return result
 
 
 POSITION_LIMIT_BY_BOT = {
@@ -60,12 +85,18 @@ def _read_json_bounded(
     label: str,
     *,
     reject_constants: bool = False,
+    reject_duplicates: bool = False,
+    duplicate_hook=None,
 ):
     with open(path, "rb") as stream:
         raw = stream.read(max_bytes + 1)
     if len(raw) > max_bytes:
         raise ValueError(f"{label} JSON exceeds size limit")
     kwargs = {"parse_constant": _reject_json_constant} if reject_constants else {}
+    if reject_duplicates:
+        kwargs["object_pairs_hook"] = (
+            duplicate_hook or _config_object_without_duplicate_keys
+        )
     return json.loads(raw.decode("utf-8-sig"), **kwargs)
 
 
@@ -76,6 +107,7 @@ def _read_config() -> tuple[dict, list[CheckIssue]]:
             _PRE_START_CONFIG_JSON_MAX_BYTES,
             "bot_config",
             reject_constants=True,
+            reject_duplicates=True,
         )
         if not isinstance(cfg, dict):
             return {}, [_issue("error", "config_type",
@@ -142,6 +174,8 @@ def _load_state(path: Path) -> tuple[dict, str | None]:
             path,
             _PRE_START_STATE_JSON_MAX_BYTES,
             "state file",
+            reject_duplicates=True,
+            duplicate_hook=_state_object_without_duplicate_keys,
         )
         if data is None:
             return {}, None
@@ -174,7 +208,8 @@ def _validate_state(bot_name: str, raw: dict, is_futures: bool) -> list[CheckIss
 def _db_rows(table: str, where: str = "", params: Iterable = ()) -> tuple[list[dict], str | None]:
     con = None
     try:
-        con = sqlite3.connect(DB_PATH)
+        database_uri = f"{Path(DB_PATH).resolve().as_uri()}?mode=ro"
+        con = sqlite3.connect(database_uri, uri=True)
         con.row_factory = sqlite3.Row
         sql = f"SELECT * FROM {table}"
         if where:
@@ -191,6 +226,41 @@ def _db_rows(table: str, where: str = "", params: Iterable = ()) -> tuple[list[d
                 pass
 
 
+def _check_database_integrity() -> list[CheckIssue]:
+    connection = None
+    try:
+        database_uri = f"{Path(DB_PATH).resolve().as_uri()}?mode=ro"
+        connection = sqlite3.connect(database_uri, uri=True)
+        quick = connection.execute("PRAGMA quick_check(1)").fetchone()
+        if quick is None or str(quick[0]).lower() != "ok":
+            detail = "no result" if quick is None else str(quick[0])
+            return [_issue(
+                "error",
+                "db_quick_check",
+                f"database quick_check failed: {detail}",
+            )]
+        foreign_key = connection.execute("PRAGMA foreign_key_check").fetchone()
+        if foreign_key is not None:
+            return [_issue(
+                "error",
+                "db_foreign_key_integrity",
+                "database contains a foreign-key violation",
+            )]
+        return []
+    except Exception as exc:
+        return [_issue(
+            "error",
+            "db_integrity_read",
+            f"database integrity checks failed: {exc}",
+        )]
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
 def _check_manifest() -> list[CheckIssue]:
     issues: list[CheckIssue] = []
     manifest = PROJECT_ROOT / "DEPLOY_MANIFEST.json"
@@ -201,6 +271,127 @@ def _check_manifest() -> list[CheckIssue]:
     if build.get("build_id") in ("", "unknown", None):
         issues.append(_issue("error", "manifest_unreadable",
                              "DEPLOY_MANIFEST.json exists but build_id is unknown"))
+    try:
+        with manifest.open("rb") as handle:
+            raw = handle.read(_MANIFEST_MAX_BYTES + 1)
+        if len(raw) > _MANIFEST_MAX_BYTES:
+            raise ValueError("manifest exceeds size limit")
+        payload = json.loads(
+            raw.decode("utf-8-sig"),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_config_object_without_duplicate_keys,
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("manifest root must be an object")
+        files = payload.get("files")
+        if (
+            not isinstance(files, list)
+            or not files
+            or len(files) > _MANIFEST_MAX_FILES
+        ):
+            raise ValueError("manifest file list is invalid")
+        file_count = payload.get("file_count")
+        if (
+            isinstance(file_count, bool)
+            or not isinstance(file_count, int)
+            or file_count != len(files)
+        ):
+            raise ValueError("manifest file count is inconsistent")
+        build_id = payload.get("build_id")
+        if (
+            not isinstance(build_id, str)
+            or len(build_id) != 16
+            or any(char not in "0123456789abcdef" for char in build_id)
+        ):
+            raise ValueError("manifest build id is invalid")
+
+        resolved_root = PROJECT_ROOT.resolve(strict=True)
+        seen_targets: set[str] = set()
+        total_bytes = 0
+        build_digest = hashlib.sha256()
+        for item in files:
+            if not isinstance(item, dict):
+                raise ValueError("manifest file entry must be an object")
+            relative = item.get("path")
+            if (
+                not isinstance(relative, str)
+                or not relative
+                or len(relative) > 512
+                or relative != relative.strip()
+                or "\\" in relative
+                or "\x00" in relative
+                or ":" in relative
+                or relative.startswith("/")
+            ):
+                raise ValueError("manifest contains an unsafe path")
+            parts = relative.split("/")
+            if any(
+                not part
+                or part in {".", ".."}
+                or part.endswith((" ", "."))
+                for part in parts
+            ):
+                raise ValueError("manifest contains an unsafe path")
+            target_key = relative.casefold()
+            if target_key in seen_targets:
+                raise ValueError("manifest contains a duplicate target")
+            seen_targets.add(target_key)
+
+            expected_size = item.get("bytes")
+            expected_hash = item.get("sha256")
+            if (
+                isinstance(expected_size, bool)
+                or not isinstance(expected_size, int)
+                or not 0 <= expected_size <= _MANIFEST_MAX_FILE_BYTES
+            ):
+                raise ValueError("manifest file size is invalid")
+            if (
+                not isinstance(expected_hash, str)
+                or len(expected_hash) != 64
+                or any(char not in "0123456789abcdef" for char in expected_hash)
+            ):
+                raise ValueError("manifest file hash is invalid")
+            total_bytes += expected_size
+            if total_bytes > _MANIFEST_MAX_TOTAL_BYTES:
+                raise ValueError("manifest total size exceeds limit")
+
+            target = PROJECT_ROOT.joinpath(*parts)
+            try:
+                resolved_target = target.resolve(strict=True)
+                resolved_target.relative_to(resolved_root)
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    f"manifest file is missing or escaped root: {relative}"
+                ) from exc
+            if resolved_target != resolved_root.joinpath(*parts):
+                raise ValueError(f"manifest path traverses a link: {relative}")
+            if not resolved_target.is_file():
+                raise ValueError(f"manifest target is not a file: {relative}")
+
+            digest = hashlib.sha256()
+            actual_size = 0
+            with resolved_target.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    actual_size += len(chunk)
+                    if actual_size > _MANIFEST_MAX_FILE_BYTES:
+                        raise ValueError(
+                            f"manifest target exceeds size limit: {relative}"
+                        )
+                    digest.update(chunk)
+            if actual_size != expected_size:
+                raise ValueError(f"manifest byte mismatch: {relative}")
+            if digest.hexdigest() != expected_hash:
+                raise ValueError(f"manifest hash mismatch: {relative}")
+            build_digest.update(relative.encode("utf-8"))
+            build_digest.update(expected_hash.encode("ascii"))
+        if build_digest.hexdigest()[:16] != build_id:
+            raise ValueError("manifest build id does not match its file list")
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        issues.append(_issue(
+            "error",
+            "manifest_integrity",
+            f"DEPLOY_MANIFEST.json integrity check failed: {exc}",
+        ))
     for folder in ("bots", "core", "launcher", "config", "data", "logs"):
         if not (PROJECT_ROOT / folder).exists():
             issues.append(_issue("error", "root_incomplete",
@@ -212,7 +403,19 @@ def _check_runtime(bot_name: str, meta: dict, *, cleanup: bool = False) -> list[
     status, status_path = read_runtime_status_with_path(meta.get("log_dir", ""))
     if not status:
         return []
-    pid = int(status.get("pid") or 0)
+    raw_pid = status.get("pid")
+    if (
+        isinstance(raw_pid, bool)
+        or not isinstance(raw_pid, int)
+        or raw_pid < 0
+        or raw_pid > 0xFFFFFFFF
+    ):
+        return [_issue(
+            "error",
+            "runtime_status_invalid",
+            f"{bot_name}: runtime_status pid is not a valid process id",
+        )]
+    pid = raw_pid
     state = str(status.get("status") or "").lower()
     cmdline = _pid_cmdline(pid) if pid > 0 else ""
     expected_module = str(meta.get("module") or "")
@@ -270,8 +473,9 @@ def _check_runtime(bot_name: str, meta: dict, *, cleanup: bool = False) -> list[
             age_sec = 0.0
         if age_sec >= 300:
             if cleanup:
+                published = False
                 try:
-                    write_runtime_status(
+                    published = write_runtime_status(
                         meta.get("log_dir", ""),
                         bot_name,
                         "stopped",
@@ -286,7 +490,11 @@ def _check_runtime(bot_name: str, meta: dict, *, cleanup: bool = False) -> list[
                     )
                 except Exception:
                     pass
-                msg = "marked stopped"
+                msg = (
+                    "marked stopped"
+                    if published is not False
+                    else "status publish failed; left unchanged"
+                )
             else:
                 msg = "left unchanged"
             return [_issue(
@@ -622,6 +830,7 @@ def run_pre_start_checks(bot_name: str | None = None,
     cfg, cfg_issues = _read_config()
     issues.extend(cfg_issues)
     issues.extend(_check_manifest())
+    issues.extend(_check_database_integrity())
     if bot_name and bot_name not in BOT_META:
         issues.append(_issue("error", "unknown_bot", f"unknown bot: {bot_name}"))
         return issues

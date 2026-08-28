@@ -120,6 +120,8 @@ def maybe_send_hourly_status(*, bot_name: str, is_futures: bool,
 
         snapshot = state.get_all() if state is not None else {}
         lines, unreal = _positions_summary(snapshot, is_futures)
+        open_count = len(snapshot)
+        unpriced_count = max(0, open_count - len(lines))
 
         realized = None
         try:
@@ -130,20 +132,29 @@ def maybe_send_hourly_status(*, bot_name: str, is_futures: bool,
         except Exception as exc:
             _log_status_report_error("3h status realized PnL", exc)
 
-        mode = "SIM" if simulation else "LIVE"
+        mode = "LIVE" if not simulation else "SIM"
         sm = "  SAFE_MODE" if safe_mode_active else ""
         realized_text = (
             f"{realized:+.2f} USDT" if realized is not None else "unknown"
         )
+        if unpriced_count:
+            unrealized_text = (
+                f"{unreal:+.2f} USDT (priced subset)" if lines else "unknown"
+            )
+        else:
+            unrealized_text = f"{unreal:+.2f} USDT"
         header = (f" [{bot_name}] status 3h ({mode}){sm}\n"
-                  f"Open: {len(lines)}  Realized today: {realized_text}\n"
-                  f"Unrealized: {unreal:+.2f} USDT")
+                  f"Open: {open_count}  Realized today: {realized_text}\n"
+                  f"Unrealized: {unrealized_text}")
         # Cap the position list so a big book can't blow past Telegram's
         # message limit; the total still reflects ALL positions.
         MAX_LINES = 20
         body = "\n".join(lines[:MAX_LINES])
         if len(lines) > MAX_LINES:
             body += f"\n (+{len(lines) - MAX_LINES} more)"
+        if unpriced_count:
+            suffix = f"(open positions awaiting valid price: {unpriced_count})"
+            body = f"{body}\n{suffix}" if body else suffix
         msg = header + ("\n" + body if body else "\n(no open positions)")
 
         accepted = send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)

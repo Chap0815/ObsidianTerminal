@@ -557,7 +557,7 @@ class BotProcess:
                     "returncode": returncode,
                     "shutdown": shutdown,
                 }
-                write_runtime_status(
+                published = write_runtime_status(
                     log_dir,
                     self.bot_name,
                     status,
@@ -571,6 +571,10 @@ class BotProcess:
                     process_run_id=expected_run_id or last_run_id,
                     extra=extra,
                 )
+                if published is False:
+                    raise RuntimeError(
+                        "runtime status writer reported publish failure"
+                    )
         except Exception as e:
             stderr = sys.stderr
             if stderr is not None:

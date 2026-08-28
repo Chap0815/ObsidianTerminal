@@ -434,6 +434,36 @@ class ScanMixin:
         from trading.risk_manager import is_bot_paused, is_bad_hour
         from trading.screener import get_top_momentum_coins
 
+        # A LIVE buy-side scan is unsafe until State/Claim/Exchange recovery
+        # has produced a complete, fresh money-integrity snapshot.  Startup
+        # balance failures and stalled periodic reconciliation must therefore
+        # block new entries while the monitor remains free to manage exits.
+        if not self.simulation:
+            integrity_reader = getattr(
+                self, "_position_integrity_runtime_health", None
+            )
+            try:
+                integrity = (
+                    integrity_reader() if callable(integrity_reader) else {}
+                )
+            except Exception:
+                integrity = {}
+            if (
+                not isinstance(integrity, dict)
+                or integrity.get("runtime_ok") is not True
+            ):
+                reason = (
+                    str(integrity.get("reason") or "unavailable")[:96]
+                    if isinstance(integrity, dict)
+                    else "unavailable"
+                )
+                log_event(
+                    "Position integrity is not runtime-safe "
+                    f"({reason}) - skipping LIVE buy-side this cycle",
+                    "WAIT",
+                )
+                return
+
         # API budget check  shared rate guard across all 3 bots so one bot
         # can't burn the quota and earn a 429 IP-ban for all.
         if budget_exhausted():
@@ -700,15 +730,17 @@ class ScanMixin:
             bot=self.BOT_NAME, symbol=sym, mode=entry_mode, direction="BUY")
         quality = self._score_spot_entry_quality(
             sym, r, regime, confidence, entry_id)
+        from trading.expectancy_telemetry import expectancy_feature_value
+
         expectancy_features = {
             "score": float(quality.score),
             "confidence": {
                 "LOW": 0.0, "MEDIUM": 0.5, "HIGH": 1.0,
             }.get(str(confidence).strip().upper(), 0.0),
-            "change_pct": float(r.get("change_percent") or 0.0),
-            "rsi_15m": float(r.get("rsi_15m") or 0.0),
-            "rsi_1h": float(r.get("rsi_1h") or 0.0),
-            "rsi_4h": float(r.get("rsi_4h") or 0.0),
+            "change_pct": expectancy_feature_value(r.get("change_percent")),
+            "rsi_15m": expectancy_feature_value(r.get("rsi_15m")),
+            "rsi_1h": expectancy_feature_value(r.get("rsi_1h")),
+            "rsi_4h": expectancy_feature_value(r.get("rsi_4h")),
         }
         from trading.expectancy_telemetry import emit_expectancy_candidate
 
@@ -1371,7 +1403,7 @@ class ScanMixin:
             )
         except Exception as e:
             self._log_error("exec-quality import", e)
-            return True
+            return bool(self.simulation)
         if not try_consume_api_call("spot_entry_fetch_ticker"):
             log_event(
                 f"{sym}: spread gate blocked - API budget exhausted",

@@ -809,14 +809,46 @@ _MARKOUT_TIME_INVALID_SQL = """(
 )"""
 
 
+def _strict_claim_extra_object(raw) -> dict | None:
+    """Parse bounded claim metadata without ambiguous JSON semantics."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, str) or len(raw) > 64 * 1024:
+        return None
+
+    def without_duplicates(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate claim metadata key: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError(f"invalid claim metadata constant: {value}")
+
+    try:
+        parsed = json.loads(
+            raw,
+            object_pairs_hook=without_duplicates,
+            parse_constant=reject_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _purge_junk_claims(conn) -> None:
     """One-shot startup cleanup of the claims registry:
-      market-shaped bot_name ("X/USDT:USDT") = swapped-arg junk  delete
-      old empty CLAIMING/ADOPTING placeholders = leaked transients
-        (a real open upgrades to state='OPEN' within seconds)."""
+      old, exactly empty CLAIMING/ADOPTING placeholders = leaked transients
+        (a real open upgrades to state='OPEN' within seconds).
+
+    Malformed ownership or money evidence is never cleanup fodder.  In
+    particular, market-shaped bot names, negative values, invalid timestamps
+    and unreadable metadata remain visible for fail-closed reconciliation.
+    """
     try:
-        conn.execute("DELETE FROM bot_open_positions "
-                     "WHERE bot_name LIKE '%/%' OR bot_name LIKE '%:%'")
+        conn.execute("BEGIN IMMEDIATE")
         cutoff = (
             _utcnow() - timedelta(minutes=_AUTO_TRANSIENT_CLAIM_TTL_MINUTES)
         ).strftime("%Y-%m-%d %H:%M:%S")
@@ -824,21 +856,29 @@ def _purge_junk_claims(conn) -> None:
             "SELECT bot_name, symbol, extra_json "
             "FROM bot_open_positions "
             "WHERE state IN ('CLAIMING','ADOPTING') "
-            "AND COALESCE(amount, 0) <= 0 "
-            "AND COALESCE(invested_usdt, 0) <= 0 "
+            "AND amount = 0 "
+            "AND invested_usdt = 0 "
+            "AND buy_price = 0 "
+            "AND buy_time = '' "
+            "AND leverage = 1 "
+            "AND position_type IN ('SPOT','FUTURES','LONG','SHORT') "
+            "AND strftime('%Y-%m-%d %H:%M:%S', julianday(opened_at)) "
+            "    = opened_at "
             "AND opened_at < ?",
             (cutoff,),
         ).fetchall()
         for bot_name, symbol, extra_json in stale_rows:
-            try:
-                extra = json.loads(extra_json or "{}")
-                entry_id = (
-                    _causal_entry_id_db(extra.get("entry_id"), required=True)
-                    if isinstance(extra, dict) and "entry_id" in extra
-                    else None
-                )
-            except (TypeError, ValueError, json.JSONDecodeError):
-                entry_id = None
+            extra = _strict_claim_extra_object(extra_json)
+            if extra is None:
+                continue
+            entry_id = None
+            if "entry_id" in extra:
+                try:
+                    entry_id = _causal_entry_id_db(
+                        extra.get("entry_id"), required=True
+                    )
+                except (TypeError, ValueError):
+                    continue
             if entry_id is not None:
                 intent_row = conn.execute(
                     "SELECT bot_name, mode, symbol FROM order_intents "
@@ -858,8 +898,14 @@ def _purge_junk_claims(conn) -> None:
                 "DELETE FROM bot_open_positions "
                 "WHERE bot_name=? AND symbol=? "
                 "AND state IN ('CLAIMING','ADOPTING') "
-                "AND COALESCE(amount, 0) <= 0 "
-                "AND COALESCE(invested_usdt, 0) <= 0 "
+                "AND amount = 0 "
+                "AND invested_usdt = 0 "
+                "AND buy_price = 0 "
+                "AND buy_time = '' "
+                "AND leverage = 1 "
+                "AND position_type IN ('SPOT','FUTURES','LONG','SHORT') "
+                "AND strftime('%Y-%m-%d %H:%M:%S', julianday(opened_at)) "
+                "    = opened_at "
                 "AND opened_at < ?",
                 (bot_name, symbol, cutoff),
             )
@@ -1047,7 +1093,8 @@ def _run_migrations(conn) -> None:
     c.execute("""
     CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_dedup
     ON trades(bot_name, symbol, buy_time, sell_time, is_partial,
-              COALESCE(is_futures, 0), COALESCE(exchange_order_id, ''))""")
+              COALESCE(is_futures, 0), COALESCE(exchange_order_id, ''),
+              COALESCE(entry_id, ''))""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_trades_bot_partial ON trades(bot_name, is_partial, sell_time)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_trades_futures ON trades(is_futures, sell_time)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_trades_mode ON trades(is_sim, sell_time)")
@@ -2239,6 +2286,39 @@ def save_trade_db(
             pass
         return False
 
+    close_move_pct = None
+    if position_type in {"SPOT", "LONG"} or (
+        position_type is None and not is_futures
+    ):
+        close_move_pct = (sell_price - buy_price) / buy_price * 100.0
+    elif position_type == "SHORT":
+        close_move_pct = (buy_price - sell_price) / buy_price * 100.0
+    if close_move_pct is not None and math.isfinite(close_move_pct):
+        excursion_tolerance = max(1e-6, abs(close_move_pct) * 1e-6)
+        excursion_error = None
+        if (
+            mfe_pct is not None
+            and close_move_pct > mfe_pct + excursion_tolerance
+        ):
+            excursion_error = "close move exceeds MFE"
+        elif (
+            mae_pct is not None
+            and close_move_pct < mae_pct - excursion_tolerance
+        ):
+            excursion_error = "close move is below MAE"
+        if excursion_error is not None:
+            try:
+                from core.logger import log_event
+
+                log_event(
+                    f"[DB] Refusing to save trade {symbol}: "
+                    f"{excursion_error}",
+                    "WARN",
+                )
+            except Exception:
+                pass
+            return False
+
     sanity_reason = trade_pnl_sanity_reason(
         profit_pct=profit_pct, profit_usdt=profit_usdt,
         invested_usdt=invested_usdt, is_futures=is_futures,
@@ -2336,6 +2416,21 @@ def save_trade_db(
                     is_futures_db,
                     str(exchange_order_id),
                 )).fetchone()
+            elif entry_id is not None:
+                existing_final = conn.execute(f"""
+                SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS} FROM trades
+                 WHERE bot_name = ?
+                   AND symbol = ?
+                   AND COALESCE(is_partial, 0) = 0
+                   AND COALESCE(is_futures, 0) = ?
+                   AND COALESCE(exchange_order_id, '') = ''
+                   AND entry_id = ?
+                 LIMIT 1
+                """, (
+                    bot_name, symbol,
+                    is_futures_db,
+                    entry_id,
+                )).fetchone()
             else:
                 existing_final = conn.execute(f"""
                 SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS} FROM trades
@@ -2414,12 +2509,14 @@ def save_trade_db(
                AND COALESCE(is_partial, 0) = ?
                AND COALESCE(is_futures, 0) = ?
                AND COALESCE(exchange_order_id, '') = COALESCE(?, '')
+               AND COALESCE(entry_id, '') = COALESCE(?, '')
              LIMIT 1
             """, (
                 bot_name, symbol, buy_time, sell_time,
                 is_partial_db,
                 is_futures_db,
                 str(exchange_order_id) if exchange_order_id is not None else None,
+                entry_id,
             )).fetchone()
             matches = _trade_dedup_payload_matches(existing, dedup_payload)
             if not matches:
@@ -4096,8 +4193,9 @@ def _complete_trade_positions(
 
 
 def get_recent_trades(bot_name: str, limit: int = 60,
-                      days: Optional[int] = None) -> list:
-    bot_name = _metric_bot(bot_name)
+                      days: Optional[int] = None,
+                      mode_is_sim=None) -> list:
+    bot_name = _validated_metrics_bot_for_mode_db(bot_name, mode_is_sim)
     conn = get_connection()
     cutoff = (
         None
@@ -4329,12 +4427,13 @@ def get_today_pnl(bot_name: str, mode_is_sim=None) -> dict:
     }
 
 
-def pause_bot_today(bot_name: str, reason: str = "") -> None:
-    validated_bot = _canonical_bot_name_db(bot_name)
+def pause_bot_today(bot_name: str, reason: str = "", mode_is_sim=None) -> None:
+    namespaced_bot = _validated_metrics_bot_for_mode_db(
+        bot_name, mode_is_sim
+    )
     validated_reason = _bounded_text_db(
         reason, "reason", max_length=500, allow_empty=True
     )
-    namespaced_bot = _metric_bot(validated_bot)
     today = _local_today_str()   # lokal-konsistent mit Bad-Hours
     conn = get_connection()
     try:
@@ -5790,33 +5889,49 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
         now_str = claim_opened_at or _utcnow_str()
         if validated_reservation_ceiling is not None:
             active_rows = conn.execute(
-                """SELECT reservation.notional_usdt,
-                          reservation.mode, claim.position_type
+                """SELECT reservation.intent_id, reservation.notional_usdt,
+                          reservation.mode, reservation.status,
+                          claim.position_type, claim.extra_json
                      FROM portfolio_reservations AS reservation
                      LEFT JOIN bot_open_positions AS claim
                        ON claim.bot_name=reservation.bot_name
                       AND claim.symbol=reservation.symbol
-                    WHERE reservation.status='ACTIVE'"""
+                    WHERE reservation.status='ACTIVE'
+                       OR (reservation.status='CONSUMED'
+                           AND claim.bot_name IS NOT NULL)"""
             ).fetchall()
             active_notionals = []
             target_is_futures = _is_futures_ptype(normalized_position_type)
             reservation_evidence_valid = True
             for active_row in active_rows:
                 row = dict(active_row)
-                active_mode = str(row.get("mode") or "").strip().upper()
                 active_position_type = str(
                     row.get("position_type") or ""
                 ).strip().upper()
-                if (
-                    active_mode != "LIVE"
-                    or active_position_type
-                    not in {"SPOT", "FUTURES", "LONG", "SHORT"}
-                ):
+                if active_position_type not in {
+                    "SPOT", "FUTURES", "LONG", "SHORT"
+                }:
                     reservation_evidence_valid = False
                     break
                 active_is_futures = _is_futures_ptype(active_position_type)
                 if active_is_futures != target_is_futures:
                     continue
+                active_mode = str(row.get("mode") or "").strip().upper()
+                if active_mode != "LIVE":
+                    reservation_evidence_valid = False
+                    break
+                if str(row.get("status") or "").strip().upper() == "CONSUMED":
+                    claim_extra = _strict_claim_extra_object(row.get("extra_json"))
+                    claim_entry_id = (
+                        claim_extra.get("entry_id")
+                        if claim_extra is not None
+                        else None
+                    )
+                    if not isinstance(claim_entry_id, str):
+                        reservation_evidence_valid = False
+                        break
+                    if claim_entry_id.strip() != str(row.get("intent_id") or "").strip():
+                        continue
                 active_value = _optional_finite_db(row.get("notional_usdt"))
                 if active_value is None or active_value <= 0.0:
                     reservation_evidence_valid = False
@@ -5956,27 +6071,37 @@ def active_portfolio_reservations(account_type: str) -> tuple[dict, ...]:
     rows = conn.execute(
         """SELECT reservation.intent_id, reservation.symbol,
                   reservation.notional_usdt, reservation.mode,
-                  claim.position_type
+                  reservation.status, claim.position_type, claim.extra_json
              FROM portfolio_reservations AS reservation
              LEFT JOIN bot_open_positions AS claim
                ON claim.bot_name=reservation.bot_name
               AND claim.symbol=reservation.symbol
             WHERE reservation.status='ACTIVE'
+               OR (reservation.status='CONSUMED'
+                   AND claim.bot_name IS NOT NULL)
             ORDER BY reservation.created_at, reservation.reservation_id"""
     ).fetchall()
     result = []
     for raw_row in rows:
         row = dict(raw_row)
-        mode = str(row.get("mode") or "").strip().upper()
         position_type = str(row.get("position_type") or "").strip().upper()
-        if (
-            mode != "LIVE"
-            or position_type not in {"SPOT", "FUTURES", "LONG", "SHORT"}
-        ):
+        if position_type not in {"SPOT", "FUTURES", "LONG", "SHORT"}:
             raise ValueError("active portfolio reservation is malformed")
         is_futures = _is_futures_ptype(position_type)
         if is_futures != (normalized_account == "futures"):
             continue
+        mode = str(row.get("mode") or "").strip().upper()
+        if mode != "LIVE":
+            raise ValueError("active portfolio reservation is malformed")
+        if str(row.get("status") or "").strip().upper() == "CONSUMED":
+            claim_extra = _strict_claim_extra_object(row.get("extra_json"))
+            claim_entry_id = (
+                claim_extra.get("entry_id") if claim_extra is not None else None
+            )
+            if not isinstance(claim_entry_id, str):
+                raise ValueError("active portfolio reservation is malformed")
+            if claim_entry_id.strip() != str(row.get("intent_id") or "").strip():
+                continue
         notional = _optional_finite_db(row.get("notional_usdt"))
         symbol = str(row.get("symbol") or "").strip()
         intent = str(row.get("intent_id") or "").strip()
@@ -7068,10 +7193,9 @@ def record_order_intent_fallback_evidence(
 
 
 def _order_id_text_db(value) -> str | None:
-    if value is None or isinstance(value, bool):
-        return None
-    text = str(value).strip()
-    return text or None
+    from bot_utils.order_utils import order_id_text_or_none
+
+    return order_id_text_or_none(value)
 
 
 def _optional_finite_db(value) -> float | None:

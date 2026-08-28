@@ -36,7 +36,7 @@ _INFO_KEYS = (
     "free", "available", "withdrawable",
 )
 
-_STABLECOINS = {"USDT", "USD", "BUSD", "USDC", "FDUSD", "TUSD"}
+_USDT_IDENTITIES = {"USDT"}
 
 
 def _finite_nonnegative_float(value) -> Optional[float]:
@@ -73,7 +73,8 @@ def safe_fetch_balance_usdt(ex,
     Last-resort returns None (not 0.0) so a transient API schema glitch doesn't
     make the bot think the wallet is empty (which would stop trading without a
     retry). If the raw "info" dict indicates a non-stablecoin currency, the raw
-    fallback is refused (could be e.g. a BTC balance misread as USDT).
+    fallback is refused (could be e.g. a BTC or USDC balance misread as
+    spendable USDT).
     """
     def _log(ctx, exc):
         if error_logger:
@@ -131,11 +132,13 @@ def safe_fetch_balance_usdt(ex,
         )
         raw_currency = raw_currency_value.upper() if isinstance(
             raw_currency_value, str) else "__INVALID__"
-        if raw_currency not in _STABLECOINS:
-            # non-stablecoin balance  refuse raw fallback.
+        if raw_currency not in _USDT_IDENTITIES:
+            # This reader funds USDT orders.  A different stablecoin is still
+            # portfolio value, but it is not spendable USDT.
             _log("fetch_balance",
-                  Exception(f"info dict currency={raw_currency!r} is not USDT "
-                             f" refusing raw fallback (returning None for retry)"))
+                  Exception(f"info dict currency={raw_currency!r} is not "
+                            f"USDT  refusing raw fallback (returning None "
+                            f"for retry)"))
             return None
         for k in _INFO_KEYS:
             v = info.get(k)

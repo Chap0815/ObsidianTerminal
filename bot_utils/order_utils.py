@@ -61,13 +61,41 @@ def _upper_text(value) -> str:
 
 
 def order_id_text_or_none(value) -> str | None:
-    if value is None or isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
         return None
     try:
         text = str(value).strip()
     except Exception:
         return None
-    return text or None
+    if (
+        not text
+        or len(text) > 256
+        or any(ord(character) < 32 or ord(character) == 127 for character in text)
+    ):
+        return None
+    return text
+
+
+def explicit_trade_symbol_matches(trade: dict, expected_symbol: str) -> bool:
+    """Match an explicit CCXT trade symbol to the queried market.
+
+    Older supported payloads may omit ``symbol``.  A supplied identity must
+    match, while a futures row may omit only the settlement suffix.
+    """
+    if not isinstance(trade, dict) or not isinstance(expected_symbol, str):
+        return False
+    if "symbol" not in trade or trade.get("symbol") is None:
+        return True
+    raw_symbol = trade.get("symbol")
+    if not isinstance(raw_symbol, str):
+        return False
+    observed = raw_symbol.strip().upper()
+    expected = expected_symbol.strip().upper()
+    if not observed or not expected:
+        return False
+    if observed == expected:
+        return True
+    return ":" not in observed and observed == expected.split(":", 1)[0]
 
 
 def strict_order_snapshot_equal(left, right) -> bool:
@@ -320,18 +348,18 @@ def extract_order_fee(order: dict) -> float:
         valid = [f for f in fees_list
                   if isinstance(f, dict) and f.get("cost") is not None]
         if valid:
-            saw_known = False
+            all_known = True
             plural_total = 0.0
             for fee_dict in valid:
                 fee, known = _convert_fee_to_usdt_known(fee_dict, order)
-                if known:
-                    saw_known = True
-                    plural_total += fee
-            if saw_known:
+                all_known = all_known and known
+                plural_total += fee
+            if all_known:
                 return plural_total if math.isfinite(plural_total) else 0.0
             singular_fee = order.get("fee")
             if isinstance(singular_fee, dict) and singular_fee.get("cost") is not None:
-                return convert_fee_to_usdt(singular_fee, order)
+                fee, known = _convert_fee_to_usdt_known(singular_fee, order)
+                return fee if known else 0.0
             return 0.0
 
     return convert_fee_to_usdt(order.get("fee") or {}, order)

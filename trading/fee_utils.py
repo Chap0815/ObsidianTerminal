@@ -91,7 +91,11 @@ def _fee_to_usdt_known(fee_dict: dict, order_dict: dict,
     if cost < 0:
         return 0.0, False
     fallback = _discount_fallback(order_dict)
-    return fallback, fallback > 0
+    # A notional-rate fallback is conservative, but it is not exchange proof
+    # of the discount-token fee.  Keep ``known`` false so callers may refetch
+    # final fee truth and never combine a proved subtotal with an inferred
+    # second full-order fee as though the plural list were complete.
+    return fallback, False
 
 
 def extract_fee_usdt(order: dict, base_override: str = "") -> float:
@@ -119,15 +123,22 @@ def extract_fee_usdt_known(
         ]
         if valid_entries:
             total = 0.0
-            saw_known = False
+            all_known = True
             for fee_dict in valid_entries:
                 fee, known = _fee_to_usdt_known(
                     fee_dict, order, base_override)
-                if known:
-                    saw_known = True
-                    total += fee
-            if saw_known:
-                return (total, True) if math.isfinite(total) else (0.0, False)
+                all_known = all_known and known
+                total += fee
+            if math.isfinite(total):
+                if all_known:
+                    return total, True
+                singular_fee, singular_known = _fee_to_usdt_known(
+                    order.get("fee"), order, base_override
+                )
+                if singular_known:
+                    return singular_fee, True
+                return total, False
+            return 0.0, False
 
     return _fee_to_usdt_known(order.get("fee"), order, base_override)
 
@@ -213,6 +224,8 @@ def extract_or_estimate_with_refetch(ex, order: dict, symbol_full: str,
     if _has_negative_fee_evidence(order):
         return real if known else 0.0
 
+    estimate_filled = _first_positive_order_value(order, "filled", "amount")
+
     # Re-fetch once the exchange has had time to attach fee details.
     order_id = (
         order_id_text_or_none(order.get("id"))
@@ -232,6 +245,11 @@ def extract_or_estimate_with_refetch(ex, order: dict, symbol_full: str,
             try:
                 refreshed = ex.fetch_order(order_id, symbol_full)
                 if refreshed:
+                    refreshed_filled = _first_positive_order_value(
+                        refreshed, "filled", "amount"
+                    )
+                    if refreshed_filled > 0:
+                        estimate_filled = refreshed_filled
                     real, known = extract_fee_usdt_known(
                         refreshed, base_override
                     )
@@ -243,10 +261,9 @@ def extract_or_estimate_with_refetch(ex, order: dict, symbol_full: str,
                 continue
 
     # Letzter Resort: estimate
-    filled = _first_positive_order_value(order, "filled", "amount")
     if taker_rate is None:
         taker_rate = DEFAULT_TAKER_FEE
-    return estimate_fee_usdt(filled, fill_price, taker_rate)
+    return estimate_fee_usdt(estimate_filled, fill_price, taker_rate)
 
 
 def base_currency_fee_amount(order: dict, base_currency: str) -> float:

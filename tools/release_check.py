@@ -46,6 +46,7 @@ FORBIDDEN_DIRS = {
     "docs",
     "BOT ADDITIONAL",
 }
+IGNORED_WORKTREE_METADATA_DIRS = {".synologyworkingdirectory"}
 FORBIDDEN_SUFFIXES = {
     ".db",
     ".db-shm",
@@ -148,6 +149,16 @@ def _resolved_within_root(path: Path, root: Path) -> Path | None:
     return resolved
 
 
+def _is_ignored_worktree_metadata(path: Path, root: Path) -> bool:
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return False
+    return any(
+        part.lower() in IGNORED_WORKTREE_METADATA_DIRS for part in rel.parts
+    )
+
+
 def _requirements_hash_errors(path: Path) -> list[str]:
     """Return lock-file errors that would weaken pip ``--require-hashes``."""
     errors: list[str] = []
@@ -160,6 +171,7 @@ def _requirements_hash_errors(path: Path) -> list[str]:
     except (OSError, UnicodeError, ValueError) as exc:
         return [f"requirements.lock.txt unreadable: {exc}"]
     pins = 0
+    seen_dependencies: set[str] = set()
     for number, raw in enumerate(lines, 1):
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -170,6 +182,14 @@ def _requirements_hash_errors(path: Path) -> list[str]:
             )
             continue
         pins += 1
+        dependency = re.sub(r"[-_.]+", "-", line.split("==", 1)[0]).lower()
+        if dependency in seen_dependencies:
+            errors.append(
+                f"requirements.lock.txt line {number} duplicates dependency "
+                f"{dependency}"
+            )
+        else:
+            seen_dependencies.add(dependency)
         if not _SHA256_REQUIREMENT_HASH_RE.search(line):
             errors.append(
                 f"requirements.lock.txt line {number} has no sha256 artifact hash"
@@ -523,10 +543,11 @@ def check_release(
     paths = [
         p for p in root.rglob("*")
         if ".git" not in p.relative_to(root).parts
+        and not _is_ignored_worktree_metadata(p, root)
     ]
     if tracked is not None:
         warnings.append("checking all release files, including untracked files")
-        for path in root.rglob("*"):
+        for path in paths:
             if path.is_file():
                 artifact_error = _is_forbidden_release_artifact(path, root)
                 if artifact_error:
