@@ -55,7 +55,16 @@ import asyncio
 import copy
 import inspect
 import threading
+import weakref
 from typing import Any
+
+
+_ASYNC_CLOSE_TIMEOUT_SECONDS = 1.0
+_ASYNC_CLOSE_STATES_LOCK = threading.Lock()
+_ASYNC_CLOSE_STATES: dict[int, dict[str, object]] = {}
+_CLOSE_CALL_TIMEOUT_SECONDS: float | None = None
+_CLOSE_CALL_STATES_LOCK = threading.Lock()
+_CLOSE_CALL_STATES: dict[int, dict[str, object]] = {}
 
 
 def _log_close_failure(context: str, exc: BaseException) -> None:
@@ -64,6 +73,260 @@ def _log_close_failure(context: str, exc: BaseException) -> None:
         silent_log(context, exc)
     except Exception:
         pass
+
+
+async def _await_close_result(awaitable):
+    return await awaitable
+
+
+def _discard_unstarted_awaitable(awaitable) -> None:
+    close = getattr(awaitable, "close", None)
+    if callable(close):
+        try:
+            close()
+            return
+        except Exception:
+            pass
+    cancel = getattr(awaitable, "cancel", None)
+    if callable(cancel):
+        try:
+            cancel()
+        except Exception:
+            pass
+
+
+def _async_close_state_owns(state: dict[str, object], owner) -> bool:
+    owner_ref = state.get("owner_ref")
+    if isinstance(owner_ref, weakref.ReferenceType):
+        return owner_ref() is owner
+    return state.get("owner") is owner
+
+
+def _run_async_close_bounded(
+    owner,
+    awaitable,
+) -> tuple[bool, bool, BaseException | None]:
+    """Run one async close generation without blocking shutdown forever."""
+    try:
+        timeout = float(_ASYNC_CLOSE_TIMEOUT_SECONDS)
+    except (TypeError, ValueError, OverflowError):
+        timeout = 1.0
+    if not 0.0 < timeout < float("inf"):
+        timeout = 1.0
+
+    key = id(owner)
+    created = False
+    construction_error: BaseException | None = None
+    with _ASYNC_CLOSE_STATES_LOCK:
+        state = _ASYNC_CLOSE_STATES.get(key)
+        if state is None or not _async_close_state_owns(state, owner):
+            state = {
+                "done": threading.Event(),
+                "succeeded": False,
+                "error": None,
+            }
+
+            def drop_collected_owner(
+                owner_ref: weakref.ReferenceType,
+                state_key: int = key,
+            ) -> None:
+                with _ASYNC_CLOSE_STATES_LOCK:
+                    current = _ASYNC_CLOSE_STATES.get(state_key)
+                    if (
+                        current is not None
+                        and current.get("owner_ref") is owner_ref
+                    ):
+                        _ASYNC_CLOSE_STATES.pop(state_key, None)
+
+            try:
+                state["owner_ref"] = weakref.ref(owner, drop_collected_owner)
+            except TypeError:
+                # Some extension types cannot be weak-referenced. Retain them
+                # only until their in-flight close has actually completed.
+                state["owner"] = owner
+                state["drop_when_done"] = True
+
+            def runner() -> None:
+                try:
+                    result = asyncio.run(_await_close_result(awaitable))
+                    state["succeeded"] = result is not False
+                    if result is False:
+                        state["error"] = RuntimeError(
+                            "exchange close reported incomplete"
+                        )
+                except BaseException as exc:
+                    state["error"] = exc
+                finally:
+                    state["done"].set()
+                    if state.get("drop_when_done"):
+                        with _ASYNC_CLOSE_STATES_LOCK:
+                            if _ASYNC_CLOSE_STATES.get(key) is state:
+                                _ASYNC_CLOSE_STATES.pop(key, None)
+
+            try:
+                thread = threading.Thread(
+                    target=runner,
+                    name="exchange-async-close",
+                    daemon=True,
+                )
+            except BaseException as exc:
+                construction_error = exc
+                state = None
+            else:
+                state["thread"] = thread
+                _ASYNC_CLOSE_STATES[key] = state
+                created = True
+
+    if construction_error is not None:
+        _discard_unstarted_awaitable(awaitable)
+        return True, False, construction_error
+
+    if created:
+        try:
+            state["thread"].start()
+        except BaseException as exc:
+            with _ASYNC_CLOSE_STATES_LOCK:
+                if _ASYNC_CLOSE_STATES.get(key) is state:
+                    _ASYNC_CLOSE_STATES.pop(key, None)
+            _discard_unstarted_awaitable(awaitable)
+            return True, False, exc
+    else:
+        # A previous close for this exact client is still authoritative.
+        # Dispose the newly returned, never-awaited object without starting a
+        # second cleanup generation against the same HTTP session.
+        _discard_unstarted_awaitable(awaitable)
+
+    done = state["done"]
+    if not done.wait(timeout=timeout):
+        return (
+            False,
+            False,
+            TimeoutError(
+                f"async exchange close exceeded {timeout:.3f}s"
+            ),
+        )
+
+    with _ASYNC_CLOSE_STATES_LOCK:
+        if _ASYNC_CLOSE_STATES.get(key) is state:
+            _ASYNC_CLOSE_STATES.pop(key, None)
+    error = state.get("error")
+    return True, bool(state.get("succeeded")), (
+        error if isinstance(error, BaseException) else None
+    )
+
+
+def _close_call_state_owns(state: dict[str, object], owner) -> bool:
+    owner_ref = state.get("owner_ref")
+    if isinstance(owner_ref, weakref.ReferenceType):
+        return owner_ref() is owner
+    return state.get("owner") is owner
+
+
+def _run_close_call_bounded(
+    owner,
+    closer,
+) -> tuple[bool, bool, BaseException | None]:
+    """Invoke sync/async close code without blocking shutdown indefinitely."""
+    raw_timeout = _CLOSE_CALL_TIMEOUT_SECONDS
+    if raw_timeout is None:
+        raw_timeout = _ASYNC_CLOSE_TIMEOUT_SECONDS
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError, OverflowError):
+        timeout = 1.0
+    if not 0.0 < timeout < float("inf"):
+        timeout = 1.0
+
+    key = id(owner)
+    created = False
+    construction_error: BaseException | None = None
+    with _CLOSE_CALL_STATES_LOCK:
+        state = _CLOSE_CALL_STATES.get(key)
+        if state is None or not _close_call_state_owns(state, owner):
+            state = {
+                "done": threading.Event(),
+                "succeeded": False,
+                "error": None,
+            }
+
+            def drop_collected_owner(
+                owner_ref: weakref.ReferenceType,
+                state_key: int = key,
+            ) -> None:
+                with _CLOSE_CALL_STATES_LOCK:
+                    current = _CLOSE_CALL_STATES.get(state_key)
+                    if (
+                        current is not None
+                        and current.get("owner_ref") is owner_ref
+                    ):
+                        _CLOSE_CALL_STATES.pop(state_key, None)
+
+            try:
+                state["owner_ref"] = weakref.ref(owner, drop_collected_owner)
+            except TypeError:
+                state["owner"] = owner
+                state["drop_when_done"] = True
+
+            def runner() -> None:
+                try:
+                    result = closer()
+                    if inspect.isawaitable(result):
+                        result = asyncio.run(_await_close_result(result))
+                    state["succeeded"] = result is not False
+                    if result is False:
+                        state["error"] = RuntimeError(
+                            "exchange close reported incomplete"
+                        )
+                except BaseException as exc:
+                    state["error"] = exc
+                finally:
+                    state["done"].set()
+                    if state.get("drop_when_done"):
+                        with _CLOSE_CALL_STATES_LOCK:
+                            if _CLOSE_CALL_STATES.get(key) is state:
+                                _CLOSE_CALL_STATES.pop(key, None)
+
+            try:
+                thread = threading.Thread(
+                    target=runner,
+                    name="exchange-close",
+                    daemon=True,
+                )
+            except BaseException as exc:
+                construction_error = exc
+                state = None
+            else:
+                state["thread"] = thread
+                _CLOSE_CALL_STATES[key] = state
+                created = True
+
+    if construction_error is not None:
+        return True, False, construction_error
+
+    if created:
+        try:
+            state["thread"].start()
+        except BaseException as exc:
+            with _CLOSE_CALL_STATES_LOCK:
+                if _CLOSE_CALL_STATES.get(key) is state:
+                    _CLOSE_CALL_STATES.pop(key, None)
+            return True, False, exc
+
+    done = state["done"]
+    if not done.wait(timeout=timeout):
+        return (
+            False,
+            False,
+            TimeoutError(f"exchange close exceeded {timeout:.3f}s"),
+        )
+
+    with _CLOSE_CALL_STATES_LOCK:
+        if _CLOSE_CALL_STATES.get(key) is state:
+            _CLOSE_CALL_STATES.pop(key, None)
+    error = state.get("error")
+    return True, bool(state.get("succeeded")), (
+        error if isinstance(error, BaseException) else None
+    )
 
 
 def _shallow_auth_cfg(exchange) -> dict:
@@ -114,54 +377,65 @@ def _build_clone(src) -> Any:
     cls = type(src)
     cfg = _shallow_auth_cfg(src)
     clone = cls(cfg)
-    # Carry over timeout
-    clone.timeout = getattr(src, "timeout", 10_000)
-    # Use CCXT's canonical setter so symbols, currencies and reverse indexes
-    # are initialized together with the deep-copied market dictionaries.
-    src_markets = getattr(src, "markets", None)
-    if src_markets:
-        try:
-            markets = copy.deepcopy(src_markets)
-        except (TypeError, copy.Error):
+    try:
+        # Carry over timeout
+        clone.timeout = getattr(src, "timeout", 10_000)
+        # Use CCXT's canonical setter so symbols, currencies and reverse
+        # indexes are initialized together with the deep-copied market
+        # dictionaries.
+        src_markets = getattr(src, "markets", None)
+        if src_markets:
             try:
-                markets = dict(src_markets)
-            except TypeError:
-                markets = src_markets
-        src_currencies = getattr(src, "currencies", None) or {}
-        try:
-            currencies = copy.deepcopy(src_currencies)
-        except (TypeError, copy.Error):
-            try:
-                currencies = dict(src_currencies)
-            except TypeError:
-                currencies = src_currencies
-        setter = getattr(clone, "set_markets", None)
-        if callable(setter):
-            setter(markets, currencies)
-        else:
-            clone.markets = markets
-            clone.symbols = list(getattr(src, "symbols", None) or markets)
-            clone.currencies = currencies
-            src_by_id = getattr(src, "markets_by_id", None)
-            if src_by_id:
+                markets = copy.deepcopy(src_markets)
+            except (TypeError, copy.Error):
                 try:
-                    clone.markets_by_id = copy.deepcopy(src_by_id)
-                except (TypeError, copy.Error):
-                    clone.markets_by_id = dict(src_by_id)
-    # Clone construction bypasses exchange_config._finalize_connection().  The
-    # initial server-time difference is already present in the copied options,
-    # so do not add another startup network request, but do install the same
-    # signed-request self-heal and periodic refresh boundary as the base.
-    from config.exchange_config import (  # type: ignore
-        _apply_ssl_workaround,
-        _install_nonce_selfheal,
-    )
+                    markets = dict(src_markets)
+                except TypeError:
+                    markets = src_markets
+            src_currencies = getattr(src, "currencies", None) or {}
+            try:
+                currencies = copy.deepcopy(src_currencies)
+            except (TypeError, copy.Error):
+                try:
+                    currencies = dict(src_currencies)
+                except TypeError:
+                    currencies = src_currencies
+            setter = getattr(clone, "set_markets", None)
+            if callable(setter):
+                setter(markets, currencies)
+            else:
+                clone.markets = markets
+                clone.symbols = list(getattr(src, "symbols", None) or markets)
+                clone.currencies = currencies
+                src_by_id = getattr(src, "markets_by_id", None)
+                if src_by_id:
+                    try:
+                        clone.markets_by_id = copy.deepcopy(src_by_id)
+                    except (TypeError, copy.Error):
+                        clone.markets_by_id = dict(src_by_id)
+        # Clone construction bypasses exchange_config._finalize_connection().
+        # The initial server-time difference is already present in the copied
+        # options, so do not add another startup network request, but do install
+        # the same signed-request self-heal and periodic refresh boundary.
+        from config.exchange_config import (  # type: ignore
+            _apply_ssl_workaround,
+            _install_nonce_selfheal,
+        )
 
-    clone = _apply_ssl_workaround(clone)
-    clone._clock_periodic_refresh_enabled = False
-    clone = _install_nonce_selfheal(clone)
-    clone._clock_periodic_refresh_enabled = True
-    return clone
+        clone = _apply_ssl_workaround(clone)
+        clone._clock_periodic_refresh_enabled = False
+        clone = _install_nonce_selfheal(clone)
+        clone._clock_periodic_refresh_enabled = True
+        return clone
+    except BaseException:
+        # A constructor can open an HTTP session before market/transport setup
+        # fails.  Such a clone is not registered and would otherwise be
+        # unreachable by every regular shutdown path.
+        try:
+            ThreadLocalExchange._close_one(clone)
+        except BaseException:
+            pass
+        raise
 
 
 class ThreadLocalExchange:
@@ -360,29 +634,18 @@ class ThreadLocalExchange:
             closer = None
             close_error = exc
         if callable(closer):
-            try:
-                result = closer()
-                # async ccxt close() returns a coroutine; run it to completion.
-                if inspect.iscoroutine(result):
-                    try:
-                        completed = asyncio.run(result)
-                    except Exception as exc:
-                        close_error = exc
-                        result.close()
-                    else:
-                        if completed is not False:
-                            return True
-                        close_error = RuntimeError(
-                            "exchange close reported incomplete"
-                        )
-                else:
-                    if result is not False:
-                        return True
-                    close_error = RuntimeError(
-                        "exchange close reported incomplete"
-                    )
-            except Exception as exc:
-                close_error = exc
+            completed, succeeded, error = _run_close_call_bounded(clone, closer)
+            if not completed:
+                _log_close_failure(
+                    "thread-local exchange close",
+                    error or TimeoutError("exchange close timed out"),
+                )
+                return False
+            if succeeded:
+                return True
+            close_error = error or RuntimeError(
+                "exchange close reported incomplete"
+            )
         try:
             sess = getattr(clone, "session", None)
         except Exception as exc:
@@ -390,21 +653,25 @@ class ThreadLocalExchange:
             close_error = exc
         if sess is not None:
             try:
-                result = sess.close()
-                if inspect.iscoroutine(result):
-                    try:
-                        completed = asyncio.run(result)
-                    except Exception:
-                        result.close()
-                        raise
-                    if completed is False:
-                        raise RuntimeError(
+                completed, succeeded, error = _run_close_call_bounded(
+                    sess,
+                    sess.close,
+                )
+                if not completed:
+                    _log_close_failure(
+                        "thread-local exchange close",
+                        error or TimeoutError("exchange session close timed out"),
+                    )
+                    return False
+                if not succeeded:
+                    failure = (
+                        error
+                        if isinstance(error, Exception)
+                        else RuntimeError(
                             "exchange session close reported incomplete"
                         )
-                elif result is False:
-                    raise RuntimeError(
-                        "exchange session close reported incomplete"
                     )
+                    raise failure
                 return True
             except Exception as exc:
                 close_error = exc
@@ -420,19 +687,7 @@ class ThreadLocalExchange:
     #  Internal: per-thread clone resolution 
 
     def _get_clone(self):
-        if self._closed:
-            raise RuntimeError("exchange wrapper is shut down")
-        clone = getattr(self._tls, "clone", None)
-        generation = self._clone_generation
-        if (
-            clone is not None
-            and getattr(self._tls, "clone_generation", None) == generation
-        ):
-            return clone
-        # Serialize build + registration with close_all().  Otherwise a clone
-        # built while close_all() clears the index can escape that close and
-        # remain live but untracked.
-        with self._clones_lock:
+        while True:
             if self._closed:
                 raise RuntimeError("exchange wrapper is shut down")
             generation = self._clone_generation
@@ -442,11 +697,25 @@ class ThreadLocalExchange:
                 and getattr(self._tls, "clone_generation", None) == generation
             ):
                 return clone
+            # Construction can enter CCXT/SSL code.  Keep it outside the clone
+            # index mutex so shutdown can invalidate the generation promptly.
             clone = _build_clone(self._base)
-            self._tls.clone = clone
-            self._tls.clone_generation = generation
-            self._clones.append((threading.current_thread(), clone))
-            return clone
+            retry = False
+            with self._clones_lock:
+                if self._closed:
+                    pass
+                elif self._clone_generation != generation:
+                    retry = True
+                else:
+                    self._tls.clone = clone
+                    self._tls.clone_generation = generation
+                    self._clones.append((threading.current_thread(), clone))
+                    return clone
+            # A concurrent close_all()/shutdown won the race.  The freshly
+            # built clone never became visible, so close it outside the mutex.
+            self._close_one(clone)
+            if not retry:
+                raise RuntimeError("exchange wrapper is shut down")
 
     #  Attribute proxying 
 

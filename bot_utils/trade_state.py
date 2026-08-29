@@ -883,9 +883,17 @@ class TradeState:
 
         if rejection_reason is not None:
             import sys as _sys
-            _sys.stderr.write(
-                f"[TradeState] REJECT add({sym}): {rejection_reason}\n"
-            )
+            try:
+                stderr = _sys.stderr
+                if stderr is not None:
+                    stderr.write(
+                        f"[TradeState] REJECT add({sym}): {rejection_reason}\n"
+                    )
+            except Exception:
+                # The launcher owns the bot's stderr pipe. Losing that UI
+                # consumer must never turn a state rejection into a worker
+                # exception or change the fail-closed return value below.
+                pass
             # surface the reject on the event bus so the dashboard /
             # logger / Telegram-alert can react. Wrapped in try/except so
             # the rejection still happens even if the event bus is down.

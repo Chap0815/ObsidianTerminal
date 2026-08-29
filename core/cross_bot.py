@@ -868,12 +868,15 @@ class CrossBot(FuturesBot):
         full = f"{base}/USDT:USDT"
         inflight_active = CrossBot._safe_float(
             self, d.get("entry_inflight_until"), 0.0) > time.time()
+        recovery_blocked = (
+            self._entry_recovery_runtime_health().get("ok") is False
+        )
         expected_side = CrossBot._safe_exchange_text(
             d.get("position_type")
         ).upper()
         pos, unavailable = self._fetch_exchange_position(full, expected_side)
         if pos is None:
-            if inflight_active:
+            if inflight_active or recovery_blocked:
                 return False
             if unavailable:
                 return False
@@ -921,7 +924,7 @@ class CrossBot(FuturesBot):
         except Exception:
             cs = self._safe_float(d.get("contract_size"), 1.0) or 1.0
 
-        self.state.update_many(base, {
+        persisted = self.state.update_many(base, {
             "buy": entry,
             "highest": max(self._safe_float(d.get("highest"), entry), entry),
             "last_price": entry,
@@ -934,6 +937,13 @@ class CrossBot(FuturesBot):
             ),
             "provisional": False,
         })
+        if persisted is not True:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: exchange position verified, but "
+                "durable provisional-state healing failed",
+                "ERROR",
+            )
+            return False
         log_event(f"[{self.BOT_NAME}] {base}: provisional leg verified "
                   f"from exchange position ({contracts:g} contracts)", "WARN")
         return True

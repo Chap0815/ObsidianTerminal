@@ -433,7 +433,7 @@ class ExitsMixin:
                     if curr <= 0:
                         self._note_spot_price_unavailable(sym, log_event)
                         continue
-                    self._clear_spot_price_unavailable(sym)
+                    self._clear_spot_price_unavailable(sym, log_event)
                     try:
                         self._check_position_exits(sym, d, curr)
                     except Exception as e:
@@ -567,23 +567,27 @@ class ExitsMixin:
         """Batched fetch_tickers  chunked to TICKER_BATCH_SIZE per call to
         keep each URL under the HTTP 414 (URI Too Long) limit.
 
-        On a chunk failure the missing symbols are simply absent from the
-        result  _get_current_price then does a per-symbol fetch for them.
-        The atomic API budget gate runs before each exchange call.
+        A symbol omitted by a successful chunk may use one direct fallback.
+        A failed chunk must not fan out into one request per open position and
+        amplify the same transport outage. The atomic API budget gate runs
+        before each exchange call.
         """
         if not symbols:
+            self._batch_ticker_failed_pairs = frozenset()
             return {}
         out: dict = {}
+        failed_pairs: set[str] = set()
+        pairs = [f"{s}/USDT" for s in symbols]
         try:
             from bot_utils.api_budget import record_api_error, try_consume_api_call
         except ImportError as exc:
+            self._batch_ticker_failed_pairs = frozenset(pairs)
             try:
                 self._log_error("spot ticker API budget import", exc)
             except Exception:
                 pass
             return {}
 
-        pairs = [f"{s}/USDT" for s in symbols]
         for i in range(0, len(pairs), TICKER_BATCH_SIZE):
             chunk = pairs[i:i + TICKER_BATCH_SIZE]
             reservation = None
@@ -598,13 +602,16 @@ class ExitsMixin:
                     self._log_error("spot batch ticker API budget", e)
                 except Exception:
                     pass
+                failed_pairs.update(chunk)
                 continue
             if not reservation:
+                failed_pairs.update(chunk)
                 continue
             try:
                 result = self.ex.fetch_tickers(chunk) or {}
                 out.update(result)
             except Exception as e:
+                failed_pairs.update(chunk)
                 try:
                     record_api_error(
                         endpoint="fetch_tickers",
@@ -614,8 +621,7 @@ class ExitsMixin:
                     pass
                 if self._is_rate_limited(e):
                     self._set_ticker_backoff()
-                # Continue with whatever we have  _get_current_price
-                # will fall back to per-symbol fetches for missing ones.
+        self._batch_ticker_failed_pairs = frozenset(failed_pairs)
         return out
 
     def _is_rate_limited(self, exc: BaseException) -> bool:
@@ -642,13 +648,24 @@ class ExitsMixin:
             counts = {}
             self._price_unavail_counts = counts
         counts[sym] = counts.get(sym, 0) + 1
-        if counts[sym] in (1, 5) or counts[sym] % 10 == 0:
-            log_event(f"Price for {sym} unavailable", "WARN")
+        count = counts[sym]
+        if count == 5 or count % 10 == 0:
+            log_event(
+                f"{sym}: price unavailable for {count} consecutive ticks - "
+                f"exit protection is blind; monitoring continues",
+                "WARN",
+            )
 
-    def _clear_spot_price_unavailable(self, sym: str) -> None:
+    def _clear_spot_price_unavailable(self, sym: str, log_event=None) -> None:
         counts = getattr(self, "_price_unavail_counts", None)
         if counts:
-            counts.pop(sym, None)
+            previous = counts.pop(sym, 0)
+            if previous >= 5 and callable(log_event):
+                log_event(
+                    f"{sym}: price feed recovered after {previous} "
+                    f"unavailable ticks; exit protection restored",
+                    "OK",
+                )
 
     def _maybe_persist_last_price(self, sym: str, curr: float) -> None:
         """Persist last_price only every LAST_PRICE_PERSIST_INTERVAL_SEC, not
@@ -685,6 +702,9 @@ class ExitsMixin:
                 v = safe_positive_float(t.get("close"), 0.0)
             if v > 0:
                 return v
+        failed_pairs = getattr(self, "_batch_ticker_failed_pairs", ())
+        if pair in failed_pairs:
+            return 0.0
         if self._ticker_backoff_active():
             return 0.0
         reservation = None
@@ -801,13 +821,26 @@ class ExitsMixin:
         if d.get("accounting_already_booked"):
             ExitsMixin._cleanup_accounted_close_state(self, sym, d)
             return
+        warned_incidents = getattr(
+            self, "_verified_flat_accounting_incidents", None
+        )
+        if not isinstance(warned_incidents, dict):
+            warned_incidents = {}
+            self._verified_flat_accounting_incidents = warned_incidents
         if d.get("verified_flat_pending_accounting"):
-            log_event(
-                f"{sym}: position already verified flat; waiting for "
-                f"combined offline accounting",
-                "WARN",
+            incident = (
+                str(d.get("verified_flat_at") or ""),
+                str(d.get("verified_flat_reason") or ""),
             )
+            if warned_incidents.get(sym) != incident:
+                log_event(
+                    f"{sym}: position already verified flat; waiting for "
+                    f"combined offline accounting",
+                    "WARN",
+                )
+                warned_incidents[sym] = incident
             return
+        warned_incidents.pop(sym, None)
         if d.get("accounting_pending"):
             from core.symbol_locks import close_lock
             try:
@@ -823,6 +856,13 @@ class ExitsMixin:
                         "accounting_pending"
                     ):
                         return
+                    from core.spot_bot_reconcile import (
+                        _defer_spot_accounting_retry,
+                        _record_spot_offline_close,
+                        _spot_accounting_retry_due,
+                    )
+                    if not _spot_accounting_retry_due(live):
+                        return
                     pending_fields = {
                         key: value
                         for key, value in live.items()
@@ -837,7 +877,6 @@ class ExitsMixin:
                             "ERROR",
                         )
                         return
-                    from core.spot_bot_reconcile import _record_spot_offline_close
                     if _record_spot_offline_close(self, sym, live):
                         booked = dict(live)
                         booked.update({
@@ -853,6 +892,8 @@ class ExitsMixin:
                         ExitsMixin._cleanup_accounted_close_state(
                             self, sym, booked
                         )
+                    else:
+                        _defer_spot_accounting_retry(self, sym, live)
             except Exception as exc:
                 self._log_error(f"spot pending accounting retry {sym}", exc)
             return

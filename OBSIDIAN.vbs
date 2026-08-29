@@ -1,4 +1,4 @@
-' OBSIDIAN.vbs - startet das Trading Terminal ohne CMD-Fenster.
+' OBSIDIAN.vbs - startet den crash-sicheren UI-Supervisor ohne CMD-Fenster.
 ' Bevorzugt das lokale .venv, danach portable python/, danach System-Python.
 
 Set WshShell = CreateObject("WScript.Shell")
@@ -16,8 +16,8 @@ Else
     strPython = "pythonw"
 End If
 
-strLauncher = strScriptDir & "\launcher.pyw"
-WshShell.Run """" & strPython & """ """ & strLauncher & """", 0, False
+WshShell.CurrentDirectory = strScriptDir
+WshShell.Run """" & strPython & """ -m launcher.supervisor", 0, False
 
 Set FSO = Nothing
 Set WshShell = Nothing

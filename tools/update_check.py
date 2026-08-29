@@ -7,6 +7,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 from tools.ensure_git import find_git
@@ -25,6 +27,20 @@ CONFIG_PATHS = [
     CONFIG_PATH,
 ]
 _UPDATE_JSON_MAX_BYTES = 1024 * 1024
+_RUNNING_STATUS_STALE_SECONDS = 3 * 60 * 60
+_STATUS_MAX_FUTURE_SKEW_SECONDS = 5 * 60
+
+
+def _running_status_activity_timestamp(data: dict, *, now: float) -> float | None:
+    """Return the newest plausible phase timestamp, falling back safely."""
+    for key in ("updated_at", "started_at"):
+        try:
+            value = datetime.fromisoformat(str(data.get(key) or "").strip()).timestamp()
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+        if 0.0 < value <= now + _STATUS_MAX_FUTURE_SKEW_SECONDS:
+            return value
+    return None
 
 
 def _read_json(path: Path) -> dict:
@@ -103,9 +119,31 @@ def _last_update_status() -> dict:
     data = _read_json(UPDATE_STATUS_PATH)
     if not isinstance(data, dict):
         return {}
+    if data.get("status") == "running":
+        now = time.time()
+        activity_ts = _running_status_activity_timestamp(data, now=now)
+        if (
+            activity_ts is None
+            or now - activity_ts > _RUNNING_STATUS_STALE_SECONDS
+        ):
+            data["status"] = "failed"
+            data["message"] = (
+                "Update-Status ist verwaist: Der Updateprozess besitzt keinen "
+                "plausiblen frischen Aktivitaetszeitpunkt."
+            )
+            data["returncode"] = 1
     if "message" in data:
         data["message"] = _redact_text(str(data.get("message") or ""))
-    allowed = {"status", "message", "started_at", "finished_at", "returncode", "remote", "branch"}
+    allowed = {
+        "status",
+        "message",
+        "started_at",
+        "updated_at",
+        "finished_at",
+        "returncode",
+        "remote",
+        "branch",
+    }
     return {k: data.get(k) for k in allowed if k in data}
 
 

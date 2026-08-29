@@ -135,14 +135,22 @@ def backtest_asof_ms():
     fetch behave as if "now" were the END of that UTC day and drop any later
     candle. This enforces the In-Sample/Out-of-Sample wall structurally: the
     optimizer runs WITH it set so it can never see the locked OOS window; the
-    risk/red-team runs WITHOUT it (full history). Empty/invalid  None (no cut).
+    risk/red-team runs WITHOUT it (full history). Empty means no cutoff;
+    malformed non-empty values fail closed so a typo cannot expose the locked
+    OOS window.
     Affects only the backtest fetchers that consult it  never live trading."""
     raw = (os.getenv("BACKTEST_ASOF") or "").strip()
     if not raw:
         return None
     try:
-        d = datetime.strptime(raw, "%Y-%m-%d").replace(
-            hour=23, minute=59, second=59, tzinfo=timezone.utc)
+        d = datetime.strptime(raw, "%Y-%m-%d")
+        if d.strftime("%Y-%m-%d") != raw:
+            raise ValueError("date is not canonical YYYY-MM-DD")
+        d = d.replace(
+            hour=23, minute=59, second=59, tzinfo=timezone.utc
+        )
         return int(d.timestamp() * 1000)
-    except ValueError:
-        return None
+    except (ValueError, OSError, OverflowError) as exc:
+        raise ValueError(
+            "BACKTEST_ASOF must be an exact UTC date in YYYY-MM-DD format"
+        ) from exc

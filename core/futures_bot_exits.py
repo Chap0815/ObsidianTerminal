@@ -1627,9 +1627,8 @@ class FuturesExitsMixin:
             ticker = self.ticker_cache.get(self.ex, symbol_full, timeout=5.0,
                                            critical=True)
             curr = FuturesExitsMixin._ticker_price(ticker)
-        except Exception as e:
+        except Exception:
             curr = 0.0
-            log_event(f"Monitor: Price for {sym} unavailable: {e}", "WARN")
         if not math.isfinite(curr) or curr <= 0:
             # DON'T go blind: every safety check below (liq-buffer protection,
             # SL/trailing) and the last_price write the killswitch reads live

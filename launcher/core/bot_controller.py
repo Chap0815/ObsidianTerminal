@@ -41,6 +41,47 @@ from core.pre_start_check import (
 )
 
 
+_RESTART_UI_HANDOFF_TIMEOUT_SECONDS = 10.0
+
+
+def _post_ui(app, callback, *, delay_ms: int = 0) -> bool:
+    post = getattr(app, "post_ui", None)
+    if callable(post):
+        return post(callback, delay_ms=delay_ms) is not False
+    app.after(delay_ms, callback)
+    return True
+
+
+def _start_critical_worker(app, target, *, name: str):
+    registry = getattr(app, "critical_workers", None)
+    start = getattr(registry, "start", None)
+    if callable(start):
+        return start(target, name=name, daemon=True)
+    thread = threading.Thread(target=target, name=name, daemon=True)
+    thread.start()
+    return thread
+
+
+def _bounded_exception_summary(exc: BaseException, limit: int = 240) -> str:
+    """Return a one-line, redacted UI diagnostic for lifecycle failures."""
+    kind = type(exc).__name__
+    try:
+        detail = str(exc).replace("\r", " ").replace("\n", " ")
+    except Exception:
+        detail = ""
+    try:
+        from core.logger import redact
+
+        detail = redact(detail)
+    except Exception:
+        # Error details can contain command lines or environment-derived
+        # values. If the redactor itself is unavailable, retain only the
+        # exception type rather than risking a credential in the UI.
+        detail = ""
+    detail = detail[:max(0, int(limit))].strip()
+    return f"{kind}: {detail}" if detail else kind
+
+
 def _fmt_num(value, default=0, precision=1) -> str:
     try:
         number = float(value)
@@ -197,7 +238,7 @@ def format_start_params(name: str, snapshot: dict) -> str:
     return param_line
 
 
-def _wait_for_bot_ready(name: str, bot, timeout_sec: float = 15.0) -> tuple[bool, str]:
+def _wait_for_bot_ready(name: str, bot, timeout_sec: float = 180.0) -> tuple[bool, str]:
     import time as _time
     try:
         from core.runtime_status import read_runtime_status
@@ -307,25 +348,49 @@ def start_bot(app, name: str) -> None:
         # Reset failure is display-only and must not stop the bot either.
         pass
     log_to_card(card, "system", "Loading: " + format_start_params(name, snapshot))
-    bot.start(current_config_snapshot=snapshot)
+    try:
+        bot.start(current_config_snapshot=snapshot)
+    except Exception as exc:
+        # A Windows CreateProcess/guard/thread-start failure belongs to this
+        # button action. Do not let it escape through Tk's callback dispatcher
+        # and leave the operator with only a console traceback.
+        log_to_card(
+            card,
+            "error",
+            f"Start failed: {_bounded_exception_summary(exc)}",
+        )
+        return
 
     def _ready_worker():
         ready, detail = _wait_for_bot_ready(name, bot)
         if detail == "superseded by newer run":
             return
         if ready:
-            app.after(0, lambda: log_to_card(
+            _post_ui(app, lambda: log_to_card(
                 card, "system", f"Started - ready ({detail})"))
         elif bot.is_running():
-            app.after(0, lambda: log_to_card(
+            _post_ui(app, lambda: log_to_card(
                 card, "warn", f"Started but not ready: {detail}"))
         else:
-            app.after(0, lambda: log_to_card(
+            _post_ui(app, lambda: log_to_card(
                 card, "error", f"Start failed: {detail}"))
 
-    threading.Thread(target=_ready_worker,
-                     name=f"ready-{name}",
-                     daemon=True).start()
+    try:
+        threading.Thread(
+            target=_ready_worker,
+            name=f"ready-{name}",
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        # The subprocess has already started successfully. A local diagnostic
+        # thread failure must not escape the Tk callback or imply that the bot
+        # itself failed to start.
+        log_to_card(
+            card,
+            "warn",
+            "Started; readiness monitor unavailable: "
+            f"{_bounded_exception_summary(exc)}",
+        )
 
 
 #  Stop 
@@ -416,8 +481,6 @@ def stop_bot(app, name: str) -> None:
         show_futures_stop_dialog,
         show_spot_stop_dialog,
     )
-    import threading as _threading
-
     card = app.cards[name]
     bot = app.bots[name]
     if not bot.is_running():
@@ -467,14 +530,16 @@ def stop_bot(app, name: str) -> None:
                     graceful_close=False,
                 )
                 _release_dead_process_close_locks(stopped_pid)
-            app.after(0, lambda: log_to_card(card, "system", "Stopped"))
+            _post_ui(app, lambda: log_to_card(card, "system", "Stopped"))
         except Exception as e:
-            app.after(0, lambda err=e: log_to_card(
+            _post_ui(app, lambda err=e: log_to_card(
                 card, "warn", f"Stop failed: {err}"))
 
-    _threading.Thread(target=_instant_stop_worker,
-                       name=f"stop-{name}",
-                       daemon=True).start()
+    _start_critical_worker(
+        app,
+        _instant_stop_worker,
+        name=f"stop-{name}",
+    )
 
 
 #  Restart 
@@ -494,8 +559,6 @@ def restart_bot(app, name: str) -> None:
       3. wait for poll==None (typically <500ms)
       4. start_bot()  reads fresh config and restarts
     """
-    import threading as _threading
-
     card = app.cards[name]
     bot = app.bots[name]
     in_flight = getattr(app, "_restart_in_progress", set())
@@ -535,19 +598,83 @@ def restart_bot(app, name: str) -> None:
                     )
                     _release_dead_process_close_locks(stopped_pid)
             except Exception as e:
-                app.after(0, lambda err=e: log_to_card(
+                _post_ui(app, lambda err=e: log_to_card(
                     card, "warn", f"Restart aborted: {err}"))
                 return
 
             # Step 2: start with the new config (on the UI thread, since
-            # start_bot touches widgets)
-            app.after(0, lambda: start_bot(app, name))
+            # start_bot touches widgets). Keep the critical worker and the
+            # per-bot restart claim alive until that handoff has actually run.
+            # Otherwise a clean launcher close between queueing and dispatch
+            # can strand the already-stopped bot with no remaining owner.
+            handoff_complete = threading.Event()
+            handoff_lock = threading.Lock()
+            handoff_state = {"cancelled": False, "started": False}
+
+            def _start_on_ui() -> None:
+                with handoff_lock:
+                    if handoff_state["cancelled"]:
+                        return
+                    handoff_state["started"] = True
+                try:
+                    start_bot(app, name)
+                finally:
+                    handoff_complete.set()
+
+            accepted = _post_ui(app, _start_on_ui)
+            if accepted:
+                try:
+                    handoff_timeout = max(
+                        0.01,
+                        float(_RESTART_UI_HANDOFF_TIMEOUT_SECONDS),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    handoff_timeout = 10.0
+                if not handoff_complete.wait(timeout=handoff_timeout):
+                    cancelled_before_start = False
+                    with handoff_lock:
+                        if not handoff_state["started"]:
+                            handoff_state["cancelled"] = True
+                            cancelled_before_start = True
+                    if cancelled_before_start:
+                        message = (
+                            "Restart aborted: UI start handoff timed out; "
+                            "bot remains stopped"
+                        )
+                        stderr = sys.stderr
+                        if stderr is not None:
+                            try:
+                                stderr.write(f"[Restart] {name}: {message}\n")
+                            except Exception:
+                                pass
+                        _post_ui(
+                            app,
+                            lambda msg=message: log_to_card(card, "error", msg),
+                        )
+                    else:
+                        # The UI callback acquired ownership immediately before
+                        # the deadline. Retain the claim until start_bot() has
+                        # actually returned; cancelling mid-start could permit
+                        # a concurrent stop/restart against a partial launch.
+                        handoff_complete.wait()
+            else:
+                stderr = sys.stderr
+                if stderr is not None:
+                    try:
+                        stderr.write(
+                            f"[Restart] {name}: UI start handoff rejected; "
+                            "bot remains stopped\n"
+                        )
+                    except Exception:
+                        pass
         finally:
             in_flight.discard(name)
 
-    _threading.Thread(target=_restart_worker,
-                       name=f"restart-{name}",
-                       daemon=True).start()
+    _start_critical_worker(
+        app,
+        _restart_worker,
+        name=f"restart-{name}",
+    )
 
 
 #  Simulation toggle helper 
@@ -672,15 +799,16 @@ def _async_simple_stop_owned(app, name: str, card: dict, update) -> None:
             except Exception:
                 pass
         update("Stop failed - bot is still running; positions unchanged")
-        app.after(0, lambda: log_to_card(
+        _post_ui(app, lambda: log_to_card(
             card,
             "error",
             "Stop failed: bot is still running; no success was reported",
         ))
         return
     update("Done. Positions left open  reconciled on next start.")
-    app.after(0, lambda: log_to_card(card, "system",
-                                       "Stopped (positions kept open)"))
+    _post_ui(app, lambda: log_to_card(
+        card, "system", "Stopped (positions kept open)"
+    ))
 
 
 def async_close_and_stop_spot(app, name: str, update) -> None:
@@ -695,7 +823,7 @@ def _async_close_and_stop_spot_owned(app, name: str, update) -> None:
     card = app.cards[name]
     close_modes = close_modes_for_stop(name)
     def _log(severity, msg):
-        app.after(0, lambda: log_to_card(card, severity, msg))
+        _post_ui(app, lambda: log_to_card(card, severity, msg))
 
     update("Sending shutdown signal to bot")
     try:
@@ -742,7 +870,7 @@ def _async_close_and_stop_futures_owned(
     """Graceful shutdown + fallback close for FUTURES."""
     close_modes = close_modes_for_stop(name)
     def _log(severity, msg):
-        app.after(0, lambda: log_to_card(card, severity, msg))
+        _post_ui(app, lambda: log_to_card(card, severity, msg))
 
     update("Sending shutdown signal to bot")
     try:
@@ -830,7 +958,7 @@ def _async_emergency_close_owned(
             mode_errors[bot_name] = str(exc)
 
     def _log(severity, msg):
-        app.after(0, lambda: log_to_card(card, severity, msg))
+        _post_ui(app, lambda: log_to_card(card, severity, msg))
 
     # Step 1: kill futures subprocesses immediately. We don't want them to
     # race with the launcher by trying to close the same positions.

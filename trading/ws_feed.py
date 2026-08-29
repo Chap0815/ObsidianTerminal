@@ -20,7 +20,10 @@ from bot_utils.api_budget import try_consume_api_call
 from bot_utils.safe_numeric import safe_positive_float
 from bot_utils.silent_log import silent_log
 from core.constants import TICKER_STALE_MAX_SEC
-from trading.l2_stream import build_public_async_config
+from trading.l2_stream import (
+    build_public_async_config,
+    close_public_async_exchange,
+)
 
 CACHE_STALE_SEC    = TICKER_STALE_MAX_SEC
 REST_POLL_INTERVAL = 5.0
@@ -46,27 +49,8 @@ def _ws_session_is_stable(
 
 
 async def _close_async_exchange(exchange) -> None:
-    """Finish one async client close even if shutdown is requested again."""
-    close_task = asyncio.create_task(exchange.close())
-    cancellation_requested = False
-    while not close_task.done():
-        try:
-            await asyncio.shield(close_task)
-        except asyncio.CancelledError:
-            cancellation_requested = True
-            current = asyncio.current_task()
-            if current is not None:
-                current.uncancel()
-        except Exception:
-            break
-    try:
-        close_task.result()
-    except asyncio.CancelledError:
-        cancellation_requested = True
-    except Exception:
-        pass
-    if cancellation_requested:
-        raise asyncio.CancelledError
+    """Close one async client under the shared bounded transport contract."""
+    await close_public_async_exchange(exchange)
 
 
 def _clone_exchange(exchange):
@@ -171,20 +155,37 @@ class WebSocketFeed:
     def stop(self) -> None:
         self._running = False
         loop = self._loop
-        if loop and loop.is_running():
-            # The owned main coroutine closes the active ccxt.pro client in its
-            # ``finally`` block.  Cancel that task instead of launching a
-            # detached second close and force-stopping its loop mid-cleanup.
-            def _shutdown() -> None:
-                with self._ws_main_task_lock:
-                    task = self._ws_main_task
-                if task is not None and not task.done():
-                    task.cancel()
-            try:
-                loop.call_soon_threadsafe(_shutdown)
-            except Exception:
-                loop.call_soon_threadsafe(loop.stop)
-        self._close_rest_clones()
+        try:
+            if loop and loop.is_running():
+                # The owned main coroutine closes the active ccxt.pro client
+                # in its ``finally`` block. Cancel that task instead of
+                # launching a detached second close and force-stopping its
+                # loop mid-cleanup.
+                def _shutdown() -> None:
+                    with self._ws_main_task_lock:
+                        task = self._ws_main_task
+                    if task is not None and not task.done():
+                        task.cancel()
+                try:
+                    loop.call_soon_threadsafe(_shutdown)
+                except Exception as dispatch_exc:
+                    try:
+                        stop = getattr(loop, "stop", None)
+                        if callable(stop):
+                            loop.call_soon_threadsafe(stop)
+                    except Exception as stop_exc:
+                        silent_log("stop WebSocket event loop", stop_exc)
+                    else:
+                        silent_log(
+                            "cancel WebSocket event loop task",
+                            dispatch_exc,
+                        )
+        except Exception as exc:
+            silent_log("inspect WebSocket event loop during stop", exc)
+        finally:
+            # Loop dispatch is best-effort, but owned REST clients must always
+            # reach their close path even when the asyncio handle is broken.
+            self._close_rest_clones()
 
     def _close_rest_clones(self) -> bool:
         with self._rest_clones_lock:
@@ -288,15 +289,54 @@ class WebSocketFeed:
     def _start_ws(self, symbols: List[str]) -> None:
         def _run() -> None:
             completed_normally = False
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-            previous_handler = self._loop.get_exception_handler()
-            self._loop.set_exception_handler(self._handle_loop_exception)
-            main_task = self._loop.create_task(self._ws_main(symbols))
+            loop = None
+            previous_handler = None
+            main_coro = None
+            main_task = None
+            try:
+                loop = asyncio.new_event_loop()
+                self._loop = loop
+                asyncio.set_event_loop(loop)
+                previous_handler = loop.get_exception_handler()
+                loop.set_exception_handler(self._handle_loop_exception)
+                main_coro = self._ws_main(symbols)
+                main_task = loop.create_task(main_coro)
+                main_coro = None
+            except Exception as exc:
+                if main_coro is not None:
+                    try:
+                        main_coro.close()
+                    except Exception:
+                        pass
+                if loop is not None:
+                    try:
+                        loop.set_exception_handler(previous_handler)
+                    except Exception:
+                        pass
+                    try:
+                        loop.close()
+                    except Exception:
+                        pass
+                if self._loop is loop:
+                    self._loop = None
+                with self._start_lock:
+                    self._ws_thread_started = False
+                    self._ws_mode = False
+                with self._cache_lock:
+                    self._cache.clear()
+                silent_log("bootstrap WebSocket ticker worker", exc)
+                try:
+                    self._ensure_rest_poller()
+                except Exception as fallback_exc:
+                    silent_log(
+                        "start WebSocket bootstrap REST fallback",
+                        fallback_exc,
+                    )
+                return
             with self._ws_main_task_lock:
                 self._ws_main_task = main_task
             try:
-                self._loop.run_until_complete(main_task)
+                loop.run_until_complete(main_task)
                 completed_normally = True
             except asyncio.CancelledError:
                 # stop() requested cancellation; _ws_main's per-client finally
@@ -329,13 +369,15 @@ class WebSocketFeed:
                     if self._ws_main_task is main_task:
                         self._ws_main_task = None
                 try:
-                    self._loop.set_exception_handler(previous_handler)
+                    loop.set_exception_handler(previous_handler)
                 except Exception:
                     pass
                 try:
-                    self._loop.close()
+                    loop.close()
                 except Exception:
                     pass
+                if self._loop is loop:
+                    self._loop = None
                 restart_symbols = None
                 with self._start_lock:
                     self._ws_thread_started = False
@@ -598,20 +640,66 @@ class WebSocketFeed:
                 return {}
             return _my_clone().fetch_ticker(sym)
 
-        with ThreadPoolExecutor(
+        pool = ThreadPoolExecutor(
             max_workers=_MAX_REST_WORKERS,
             thread_name_prefix="ws-rest",
-        ) as pool:
+        )
+        try:
+            # Keep the executor's physical work queue bounded across timeout
+            # cycles. ``Future.cancel()`` cannot stop a request that already
+            # entered CCXT, and cancelled queued work is not synchronously
+            # removed from ThreadPoolExecutor's internal queue. Without an
+            # outstanding-work permit, every later cycle could enqueue another
+            # full symbol batch behind the same stuck workers.
+            inflight_slots = threading.BoundedSemaphore(_MAX_REST_WORKERS)
+            inflight_symbols: set[str] = set()
+            inflight_lock = threading.Lock()
+
+            def _release_inflight(_completed, symbol: str) -> None:
+                with inflight_lock:
+                    inflight_symbols.discard(symbol)
+                inflight_slots.release()
+
+            symbol_cursor = 0
             while self._running:
                 cycle_start = time.monotonic()
                 with self._symbols_lock:
-                    symbols     = list(self._symbols)
+                    symbols = sorted(self._symbols)
 
                 if not symbols:
                     time.sleep(0.5)
                     continue
 
-                future_map = {pool.submit(_fetch, sym): sym for sym in symbols}
+                symbol_cursor %= len(symbols)
+                ordered_symbols = (
+                    symbols[symbol_cursor:] + symbols[:symbol_cursor]
+                )
+
+                future_map = {}
+                examined = 0
+                for sym in ordered_symbols:
+                    if not inflight_slots.acquire(blocking=False):
+                        break
+                    examined += 1
+                    with inflight_lock:
+                        if sym in inflight_symbols:
+                            inflight_slots.release()
+                            continue
+                        inflight_symbols.add(sym)
+                    try:
+                        future = pool.submit(_fetch, sym)
+                        future.add_done_callback(
+                            lambda completed, symbol=sym: _release_inflight(
+                                completed, symbol
+                            )
+                        )
+                    except Exception:
+                        with inflight_lock:
+                            inflight_symbols.discard(sym)
+                        inflight_slots.release()
+                        raise
+                    future_map[future] = sym
+                symbol_cursor = (symbol_cursor + examined) % len(symbols)
 
                 try:
                     for fut in as_completed(future_map,
@@ -646,6 +734,12 @@ class WebSocketFeed:
                 while slept < remaining and self._running:
                     time.sleep(min(0.5, remaining - slept))
                     slept += 0.5
+        finally:
+            # A timed-out CCXT request may remain inside DNS/TLS/socket code.
+            # Never let ThreadPoolExecutor.__exit__ turn the REST-poller daemon
+            # into an unbounded join. stop() closes the owned clients to wake
+            # their I/O; completion callbacks release the bounded permits.
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def __repr__(self) -> str:
         return (

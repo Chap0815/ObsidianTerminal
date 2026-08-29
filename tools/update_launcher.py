@@ -45,6 +45,11 @@ LOG_PATH = LOG_DIR / "update_last.log"
 STATUS_PATH = LOG_DIR / "update_status.json"
 UPDATE_MARKER = ROOT / ".update_in_progress"
 UPDATE_STATUS_JSON_MAX_BYTES = 1024 * 1024
+_CIM_SCAN_TIMEOUT_SEC = 8
+_CIM_SCAN_MAX_OUTPUT_BYTES = 256 * 1024
+_CIM_SCAN_ATTEMPTS = 2
+_TASKLIST_SCAN_TIMEOUT_SEC = 5
+_TASKLIST_SCAN_MAX_OUTPUT_BYTES = 64 * 1024
 _UPDATE_LOG_LOCK = threading.Lock()
 
 
@@ -72,6 +77,39 @@ def _redact_text(value: object) -> str:
         return text
 
 
+def _append_log_fallback(line: str) -> bool:
+    """Keep updater diagnostics available while product modules are replaced."""
+    try:
+        payload = str(line).encode("utf-8", errors="replace")
+        limit = max(1, int(UPDATE_LOG_MAX_BYTES))
+        backups = max(0, int(UPDATE_LOG_BACKUPS))
+        if len(payload) > limit:
+            payload = payload[-limit:]
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        current_size = LOG_PATH.stat().st_size if LOG_PATH.is_file() else 0
+        if current_size + len(payload) > limit:
+            if backups:
+                for index in range(backups, 0, -1):
+                    source = (
+                        LOG_PATH
+                        if index == 1
+                        else Path(f"{LOG_PATH}.{index - 1}")
+                    )
+                    target = Path(f"{LOG_PATH}.{index}")
+                    if not source.is_file():
+                        continue
+                    target.unlink(missing_ok=True)
+                    os.replace(source, target)
+            else:
+                LOG_PATH.unlink(missing_ok=True)
+        with LOG_PATH.open("ab") as stream:
+            stream.write(payload)
+            stream.flush()
+        return LOG_PATH.stat().st_size <= limit
+    except (OSError, TypeError, ValueError, OverflowError):
+        return False
+
+
 def _append_log(message: str) -> None:
     """Append a bounded diagnostic record without blocking the update path."""
     try:
@@ -89,6 +127,8 @@ def _append_log(message: str) -> None:
                     UPDATE_LOG_MAX_BYTES,
                     UPDATE_LOG_BACKUPS,
                 )
+            else:
+                _append_log_fallback(line)
     except Exception:
         # Status JSON remains the authoritative UI signal if logging is not
         # writable (read-only install, full disk, antivirus lock, etc.).
@@ -114,7 +154,11 @@ def _write_status(
         if value:
             payload[key] = value
     if status == "running":
-        payload["started_at"] = _now()
+        payload["started_at"] = (
+            previous.get("started_at")
+            if previous.get("status") == "running" and previous.get("started_at")
+            else _now()
+        )
     else:
         payload["finished_at"] = _now()
     if returncode is not None:
@@ -355,7 +399,10 @@ def _copy_runtime_tree(
             elif stat.S_ISREG(entry_stat.st_mode):
                 if _runtime_entry_ignored(entry.name, is_dir=False):
                     continue
-                _hash_regular_file(source_path, entry_stat)
+                # The exact source tree is hash-bound both before and after
+                # this copy, and the copied tree is hash-bound afterwards.
+                # Re-read/rehash every source file here as well would add a
+                # fourth full-runtime pass without strengthening those proofs.
                 _validate_external_runtime_location(
                     temp_root,
                     expected_root,
@@ -458,13 +505,25 @@ def _pid_alive(pid: int) -> bool:
 
         return psutil.pid_exists(pid)
     except Exception:
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-            text=True,
-            capture_output=True,
-            **_hidden_kwargs(),
-        )
-        return str(pid) in (result.stdout or "")
+        try:
+            result = run_bounded_capture(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                cwd=str(ROOT),
+                timeout=_TASKLIST_SCAN_TIMEOUT_SEC,
+                max_output_bytes=_TASKLIST_SCAN_MAX_OUTPUT_BYTES,
+                wrapper_python=sys.executable,
+                **_hidden_kwargs(),
+            )
+        except Exception:
+            # Parent death is a prerequisite for mutation. An unavailable
+            # fallback scan therefore means "possibly alive", never "dead".
+            return True
+        if result.returncode != 0 or (result.stderr or "").strip():
+            return True
+        return re.search(
+            rf"(?<![0-9]){re.escape(str(pid))}(?![0-9])",
+            result.stdout or "",
+        ) is not None
 
 
 def _launcher_processes() -> list[str]:
@@ -533,6 +592,8 @@ def _cmdline_is_launcher(cmdline_lower: str, cwd: object = None) -> bool:
         or "setup_wizard.pyw" in compact
         or "-m launcher.main" in compact
         or "-m launcher/main" in compact
+        or "-m launcher.supervisor" in compact
+        or "-m launcher/supervisor" in compact
     )
     if not launcher_like:
         return False
@@ -545,6 +606,8 @@ def _cmdline_is_launcher(cmdline_lower: str, cwd: object = None) -> bool:
     return bool(
         "-m launcher.main" in compact
         or "-m launcher/main" in compact
+        or "-m launcher.supervisor" in compact
+        or "-m launcher/supervisor" in compact
         or re.search(r"(?:^|\s)[\"']?(?:launcher|setup_wizard)\.pyw(?:[\"']?(?:\s|$))", compact)
     )
 
@@ -555,15 +618,21 @@ def _launcher_processes_via_cim() -> list[str]:
     ).replace("'", "''")
     script = (
         "$ErrorActionPreference='Stop'; "
+        "$ProgressPreference='SilentlyContinue'; "
         f"$root='{root}'; "
         f"$current={os.getpid()}; "
         "$scanPid=$PID; "
-        "$all=@(Get-CimInstance Win32_Process); "
+        "$all=@(Get-CimInstance -ClassName Win32_Process "
+        "-Property ProcessId,ParentProcessId,Name,CommandLine); "
+        "$capturePid=[int](($all | Where-Object { "
+        "$_.ProcessId -eq $scanPid } | Select-Object -First 1).ParentProcessId); "
         "if (-not ($all.ProcessId -contains $current) -or "
-        "-not ($all.ProcessId -contains $scanPid)) { "
+        "-not ($all.ProcessId -contains $scanPid) -or "
+        "$capturePid -le 0 -or -not ($all.ProcessId -contains $capturePid)) { "
         "throw 'runtime process scan missing process-table anchor' }; "
         "$all | Where-Object { $_.ProcessId -gt 0 -and "
-        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid } | "
+        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid -and "
+        "$_.ProcessId -ne $capturePid } | "
         "ForEach-Object { "
         "$name=[string]$_.Name; $line=[string]$_.CommandLine; "
         "$nameLow=$name.ToLower(); "
@@ -577,21 +646,15 @@ def _launcher_processes_via_cim() -> list[str]:
         "$norm=$line.ToLower().Replace('\\','/'); "
         "$launcherLike=($norm.Contains('launcher.pyw') -or "
         "$norm.Contains('setup_wizard.pyw') -or "
-        "$norm.Contains('-m launcher.main')); "
+        "$norm.Contains('-m launcher.main') -or "
+        "$norm.Contains('-m launcher.supervisor')); "
         "if ($launcherLike) { if ($norm.Contains($root)) { "
         "'pid ' + $_.ProcessId } else { "
         "'runtime process scan unknown (pid ' + $_.ProcessId + ')' } } } }; "
         "'runtime process scan ok (count ' + $all.Count + ')'"
     )
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            cwd=str(ROOT),
-            text=True,
-            capture_output=True,
-            timeout=8,
-            **_hidden_kwargs(),
-        )
+        result = _run_cim_process_scan(script)
     except Exception as exc:
         raise RuntimeError("launcher scan unavailable") from exc
     if result.returncode != 0:
@@ -613,7 +676,7 @@ def _launcher_processes_via_cim() -> list[str]:
         if lines
         else None
     )
-    if sentinel is None or int(sentinel.group(1)) < 2:
+    if sentinel is None or int(sentinel.group(1)) < 3:
         raise RuntimeError("launcher scan returned malformed CIM output")
     out: list[str] = []
     seen: set[int] = set()
@@ -634,6 +697,32 @@ def _launcher_processes_via_cim() -> list[str]:
             seen.add(pid)
             out.append(text)
     return out
+
+
+def _run_cim_process_scan(script: str) -> subprocess.CompletedProcess[str]:
+    """Run one read-only CIM scan with bounded output and one safe retry."""
+    last_result: subprocess.CompletedProcess[str] | None = None
+    last_error: BaseException | None = None
+    for _attempt in range(_CIM_SCAN_ATTEMPTS):
+        try:
+            result = run_bounded_capture(
+                ["powershell", "-NoProfile", "-Command", script],
+                cwd=str(ROOT),
+                timeout=_CIM_SCAN_TIMEOUT_SEC,
+                max_output_bytes=_CIM_SCAN_MAX_OUTPUT_BYTES,
+                wrapper_python=sys.executable,
+                **_hidden_kwargs(),
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+        last_result = result
+        if result.returncode == 0 and not (result.stderr or "").strip():
+            return result
+    if last_result is not None:
+        return last_result
+    assert last_error is not None
+    raise last_error
 
 
 def _wait_for_launcher_exit(parent_pid: int, timeout: float = 45.0) -> None:
@@ -665,10 +754,15 @@ def _restart_launcher() -> None:
 
 
 def _run_update() -> int:
-    with tempfile.TemporaryDirectory(prefix="obsidian_update_python_") as tmp:
+    _write_status("running", "Sichere Update-Runtime wird vorbereitet")
+    with tempfile.TemporaryDirectory(
+        prefix="obsidian_update_python_",
+        ignore_cleanup_errors=True,
+    ) as tmp:
         update_python, runtime_copy = _external_update_python(Path(tmp))
         if runtime_copy is not None:
             _append_log(f"Nutze externe temporaere Update-Runtime: {runtime_copy}")
+        _write_status("running", "Update wird installiert und verifiziert")
         cmd = [update_python, str(ROOT / "tools" / "update_from_git.py")]
         _append_log("Starte Update: " + " ".join(cmd))
         proc = run_bounded_capture(
@@ -677,6 +771,12 @@ def _run_update() -> int:
             timeout=7200,
             wrapper_python=update_python,
             **_hidden_kwargs(),
+        )
+    if Path(tmp).exists():
+        _append_log(
+            "WARN: temporaere Update-Runtime konnte nach dem verifizierten "
+            "Update nicht vollstaendig entfernt werden; der installierte "
+            "Produktstand bleibt gueltig."
         )
     if proc.stdout:
         _append_log("STDOUT:\n" + proc.stdout.rstrip())
@@ -800,41 +900,60 @@ def _run_with_progress_window(args: argparse.Namespace) -> int:
         return _main_impl(args)
 
     done: "queue.Queue[int]" = queue.Queue(maxsize=1)
-    win = tk.Tk()
-    win.title("Obsidian Update")
-    win.resizable(False, False)
-    win.configure(bg="#10101a")
-
-    width, height = 420, 130
+    completed_result: dict[str, int | None] = {"value": None}
+    win = None
     try:
-        x = int((win.winfo_screenwidth() - width) / 2)
-        y = int((win.winfo_screenheight() - height) / 2)
-        win.geometry(f"{width}x{height}+{x}+{y}")
-    except Exception:
-        win.geometry(f"{width}x{height}")
+        win = tk.Tk()
+        win.title("Obsidian Update")
+        win.resizable(False, False)
+        win.configure(bg="#10101a")
 
-    title = tk.Label(
-        win,
-        text="Obsidian wird aktualisiert",
-        fg="#f4f2ff",
-        bg="#10101a",
-        font=("Segoe UI", 12, "bold"),
-    )
-    title.pack(anchor="w", padx=18, pady=(16, 6))
-    label = tk.Label(
-        win,
-        text="Update wird vorbereitet ...",
-        fg="#a9a3c8",
-        bg="#10101a",
-        font=("Segoe UI", 9),
-        wraplength=380,
-        justify="left",
-    )
-    label.pack(anchor="w", padx=18)
-    bar = ttk.Progressbar(win, orient="horizontal", mode="indeterminate", length=380)
-    bar.pack(padx=18, pady=(14, 6))
-    bar.start(12)
-    update_done = {"value": False}
+        width, height = 420, 130
+        try:
+            x = int((win.winfo_screenwidth() - width) / 2)
+            y = int((win.winfo_screenheight() - height) / 2)
+            win.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            win.geometry(f"{width}x{height}")
+
+        title = tk.Label(
+            win,
+            text="Obsidian wird aktualisiert",
+            fg="#f4f2ff",
+            bg="#10101a",
+            font=("Segoe UI", 12, "bold"),
+        )
+        title.pack(anchor="w", padx=18, pady=(16, 6))
+        label = tk.Label(
+            win,
+            text="Update wird vorbereitet ...",
+            fg="#a9a3c8",
+            bg="#10101a",
+            font=("Segoe UI", 9),
+            wraplength=380,
+            justify="left",
+        )
+        label.pack(anchor="w", padx=18)
+        bar = ttk.Progressbar(
+            win,
+            orient="horizontal",
+            mode="indeterminate",
+            length=380,
+        )
+        bar.pack(padx=18, pady=(14, 6))
+        bar.start(12)
+        update_done = {"value": False}
+    except Exception as exc:
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        _append_log(
+            "Progress-Fenster nicht verfuegbar; Update laeuft ohne UI weiter: "
+            f"{type(exc).__name__}"
+        )
+        return _main_impl(args)
 
     def on_close() -> None:
         if not update_done["value"]:
@@ -852,6 +971,10 @@ def _run_with_progress_window(args: argparse.Namespace) -> int:
         try:
             rc = _main_impl(args)
         finally:
+            # Keep the authoritative result outside the notification queue as
+            # well. Queue delivery is only a wakeup mechanism and must not be
+            # the sole copy of a completed update outcome.
+            completed_result["value"] = int(rc)
             try:
                 done.put_nowait(rc)
             except Exception:
@@ -861,25 +984,70 @@ def _run_with_progress_window(args: argparse.Namespace) -> int:
         try:
             rc = done.get_nowait()
         except queue.Empty:
-            label.configure(text=_status_text())
-            win.after(400, tick)
-            return
+            completed = completed_result["value"]
+            if completed is not None:
+                rc = int(completed)
+            else:
+                try:
+                    label.configure(text=_status_text())
+                    win.after(400, tick)
+                except Exception as exc:
+                    _append_log(
+                        "Progress-Fenster waehrend Updateanzeige ausgefallen: "
+                        f"{type(exc).__name__}; Worker laeuft ohne UI weiter."
+                    )
+                    try:
+                        win.destroy()
+                    except Exception:
+                        try:
+                            win.quit()
+                        except Exception:
+                            pass
+                return
+        completed_result["value"] = int(rc)
         update_done["value"] = True
-        bar.stop()
-        label.configure(text=("Update abgeschlossen. Launcher startet neu ..." if rc == 0 else _status_text()))
-        win.after(1200, win.destroy)
+        try:
+            bar.stop()
+            label.configure(text=("Update abgeschlossen. Launcher startet neu ..." if rc == 0 else _status_text()))
+            win.after(1200, win.destroy)
+        except Exception as exc:
+            _append_log(
+                "Progress-Fenster nach Updateende ausgefallen: "
+                f"{type(exc).__name__}; Ergebnis bleibt erhalten."
+            )
+            try:
+                win.destroy()
+            except Exception:
+                try:
+                    win.quit()
+                except Exception:
+                    pass
 
-    threading.Thread(target=worker, daemon=False).start()
+    worker_thread = threading.Thread(target=worker, daemon=False)
+    worker_thread.start()
     win.after(200, tick)
     try:
         win.mainloop()
     except Exception:
         pass
+    if completed_result["value"] is not None:
+        return int(completed_result["value"])
     try:
         return int(done.get_nowait())
     except Exception:
-        data = _read_status()
-        return 0 if data.get("status") == "success" else 1
+        # A broken/destroyed progress window does not stop a non-daemon update
+        # worker. Wait explicitly for its authoritative result instead of
+        # returning a stale status from an earlier update attempt.
+        _append_log(
+            "Progress-Fenster vor Updateende beendet; warte ohne UI auf "
+            "den laufenden Updateprozess."
+        )
+        try:
+            worker_thread.join()
+            return int(done.get_nowait())
+        except Exception:
+            data = _read_status()
+            return 0 if data.get("status") == "success" else 1
 
 
 if __name__ == "__main__":

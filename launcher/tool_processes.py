@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+import psutil
+
 
 KNOWN_TOOL_MODULES = (
     "tools.backtester",
@@ -202,9 +204,38 @@ def _close_process_streams(proc: Any) -> None:
 
 def _alive(proc: Any) -> bool:
     try:
-        return proc.poll() is None
+        poll = getattr(proc, "poll", None)
+        if callable(poll):
+            return poll() is None
+        is_running = getattr(proc, "is_running", None)
+        if callable(is_running) and not is_running():
+            return False
+        status = getattr(proc, "status", None)
+        if callable(status) and status() == psutil.STATUS_ZOMBIE:
+            return False
+        return callable(is_running)
     except Exception:
         return True
+
+
+def _spawned_descendants(proc: Any) -> tuple[list[Any], bool]:
+    """Snapshot descendants while their registered parent is still alive."""
+    pid = getattr(proc, "pid", None)
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid <= 0
+        or not _alive(proc)
+    ):
+        return [], True
+    try:
+        parent = psutil.Process(pid)
+        return parent.children(recursive=True), True
+    except psutil.NoSuchProcess:
+        return [], True
+    except (psutil.AccessDenied, OSError):
+        # A parent-only stop is not proof that launcher-owned workers died.
+        return [], False
 
 
 def _wait_group(processes: Iterable[Any], timeout: float) -> list[Any]:
@@ -234,9 +265,22 @@ def stop_tool_processes(
     terminate_timeout: float = 3.0,
     kill_timeout: float = 2.0,
 ) -> bool:
-    """Terminate, kill if needed, and reap a process group within two bounds."""
+    """Terminate, kill if needed, and reap process trees within two bounds."""
     unique = {id(proc): proc for proc in processes if proc is not None}
-    alive = [proc for proc in unique.values() if _alive(proc)]
+    roots = [proc for proc in unique.values() if _alive(proc)]
+    discovery_ok = True
+    descendants: dict[int, Any] = {}
+    for root in roots:
+        children, discovered = _spawned_descendants(root)
+        discovery_ok = discovery_ok and discovered
+        for child in children:
+            try:
+                descendants.setdefault(int(child.pid), child)
+            except Exception:
+                discovery_ok = False
+    # Stop roots first so they cannot intentionally enqueue further workers,
+    # then stop the already-snapshotted descendants.
+    alive = roots + list(descendants.values())
     for proc in alive:
         try:
             proc.terminate()
@@ -249,14 +293,14 @@ def stop_tool_processes(
         except Exception:
             pass
     survivors = _wait_group(survivors, kill_timeout)
-    for proc in unique.values():
+    for proc in alive:
         if not _alive(proc):
             try:
                 proc.wait(timeout=0)
             except Exception:
                 pass
             _close_process_streams(proc)
-    return not survivors
+    return discovery_ok and not survivors
 
 
 def start_registered_tool_process(

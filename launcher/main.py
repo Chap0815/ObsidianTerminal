@@ -15,6 +15,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+from collections import deque
 import io
 import os
 import shutil
@@ -158,6 +159,107 @@ class _BoundedTextStream:
         return False
 
 
+class _BoundedMemoryTextStream:
+    """Last-resort text sink that retains only a bounded UTF-8 suffix."""
+
+    encoding = "utf-8"
+    errors = "replace"
+    _COALESCE_MAX_BYTES = 64 * 1024
+
+    def __init__(self, *, max_bytes: int = LAUNCHER_STDIO_MAX_BYTES):
+        self._max_bytes = max(1, int(max_bytes))
+        self._lock = threading.RLock()
+        self._chunks: deque[bytes] = deque()
+        self._size = 0
+        self._closed = False
+
+    @staticmethod
+    def _complete_utf8_suffix(encoded: bytes, max_bytes: int) -> bytes:
+        start = max(0, len(encoded) - max_bytes)
+        while start < len(encoded) and encoded[start] & 0xC0 == 0x80:
+            start += 1
+        return encoded[start:]
+
+    def write(self, value: str) -> int:
+        if not isinstance(value, str):
+            raise TypeError(f"write() argument must be str, not {type(value).__name__}")
+        requested_chars = len(value)
+        encoded = value.encode(self.encoding, errors=self.errors)
+        with self._lock:
+            if self._closed:
+                raise ValueError("I/O operation on closed file")
+            if len(encoded) >= self._max_bytes:
+                retained = self._complete_utf8_suffix(encoded, self._max_bytes)
+                self._chunks.clear()
+                if retained:
+                    self._chunks.append(retained)
+                self._size = len(retained)
+                return requested_chars
+            if encoded:
+                if (
+                    self._chunks
+                    and len(self._chunks[-1]) + len(encoded)
+                    <= self._COALESCE_MAX_BYTES
+                ):
+                    self._chunks[-1] += encoded
+                else:
+                    self._chunks.append(encoded)
+                self._size += len(encoded)
+            while self._size > self._max_bytes and self._chunks:
+                excess = self._size - self._max_bytes
+                oldest = self._chunks[0]
+                if excess >= len(oldest):
+                    self._chunks.popleft()
+                    self._size -= len(oldest)
+                    continue
+                cut = excess
+                while cut < len(oldest) and oldest[cut] & 0xC0 == 0x80:
+                    cut += 1
+                if cut >= len(oldest):
+                    self._chunks.popleft()
+                else:
+                    self._chunks[0] = oldest[cut:]
+                self._size -= cut
+        return requested_chars
+
+    def getvalue(self) -> str:
+        with self._lock:
+            if self._closed:
+                raise ValueError("I/O operation on closed file")
+            return b"".join(self._chunks).decode(self.encoding)
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise ValueError("I/O operation on closed file")
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._chunks.clear()
+            self._size = 0
+
+    def fileno(self) -> int:
+        raise io.UnsupportedOperation("fileno")
+
+    def isatty(self) -> bool:
+        return False
+
+    def readable(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return not self.closed
+
+    def seekable(self) -> bool:
+        return False
+
+
 def _ensure_std_streams() -> None:
     """Ensure ``sys.stdout``/``sys.stderr`` exist and cap the stdio log.
 
@@ -204,7 +306,7 @@ def _ensure_std_streams() -> None:
         try:
             return _BoundedTextStream(log_path)
         except Exception:
-            return io.StringIO()  # last-resort in-memory sink
+            return _BoundedMemoryTextStream()
 
     if sys.stderr is None or sys.stdout is None:
         # One shared handle avoids Windows rotation/truncation races between
@@ -259,6 +361,14 @@ def _cleanup_setup_env_temps(project_root: str) -> None:
         cleanup_stale_env_temps(project_root)
 
 
+def _initialize_database_for_launcher() -> None:
+    """Prepare the schema without starting bot-owned DB worker threads."""
+    from core.database import init_db as _init_db  # type: ignore
+    _init_db(start_background_workers=False)
+    from core.runtime_status import cleanup_runtime_status_temps
+    cleanup_runtime_status_temps()
+
+
 def main() -> None:
     # No console window, however we were launched (relaunch under pythonw).
     if _relaunch_windowless():
@@ -299,10 +409,7 @@ def main() -> None:
     # bot has started yet AND the DB doesn't exist those reads return empty.
     # init_db() is idempotent + schema-locked, safe to call at startup.
     try:
-        from core.database import init_db as _init_db  # type: ignore
-        _init_db()
-        from core.runtime_status import cleanup_runtime_status_temps
-        cleanup_runtime_status_temps()
+        _initialize_database_for_launcher()
     except Exception as _e:
         # Non-fatal  launcher can still show the UI, individual bot
         # starts will re-trigger init_db() and may succeed there.
@@ -315,6 +422,10 @@ def main() -> None:
 
     app = ObsidianApp()
     app.mainloop()
+    if not bool(getattr(app, "_clean_shutdown_completed", False)):
+        raise SystemExit(
+            "launcher mainloop ended without verified clean shutdown"
+        )
 
 
 if __name__ == "__main__":

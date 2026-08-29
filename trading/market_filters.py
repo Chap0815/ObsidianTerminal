@@ -767,7 +767,7 @@ def check_spread_quality(
     except (TypeError, ValueError, OverflowError):
         return False, f"{symbol}: invalid spread threshold"
     cache_key = f"spread_{symbol}_{threshold:.6f}_{int(bool(fail_closed))}"
-    now = time.time()
+    now = time.monotonic()
     entry = _spread_cache.get(cache_key)
     if entry and entry["expires"] > now:
         return entry["value"]

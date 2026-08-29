@@ -58,6 +58,15 @@ _BACKTEST_CONFIG_FLAGS = {
 }
 
 
+def _post_ui(app, callback, *, delay_ms: int = 0) -> bool:
+    """Hand worker completions to Tk only through the app-owned dispatcher."""
+    post = getattr(app, "post_ui", None)
+    if callable(post):
+        return post(callback, delay_ms=delay_ms) is not False
+    app.after(delay_ms, callback)
+    return True
+
+
 OPTIMIZER_CONFIG_MAPPING = {
     "min_pump":          "MIN_PUMP",
     "activation_profit": "ACTIVATION_PROFIT",
@@ -1581,8 +1590,8 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             def _reap():
                 if not _stop_owned_process(proc):
                     try:
-                        dlg.after(
-                            0,
+                        _post_ui(
+                            app,
                             lambda stopped_proc=proc: (
                                 _mark_process_survivor_if_open(stopped_proc)
                             ),

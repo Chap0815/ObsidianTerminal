@@ -25,6 +25,7 @@ _STATUS_MAX_CONTAINER_ITEMS = 256
 _STATUS_MAX_KEY_CHARS = 256
 _STATUS_LOCK_TIMEOUT_SEC = 1.0
 _STATUS_LOCK_CHECK_SEC = 0.01
+_STATUS_TEMP_CLEANUP_MAX_FILES = 512
 _CLOCK_OFFSET_MAX_AGE_SECONDS = 6.0 * 60.0 * 60.0
 _BUILD_ID_CHARS = 16
 _BUILD_CREATED_AT_MAX_CHARS = 128
@@ -230,17 +231,22 @@ def cleanup_runtime_status_temps(logs_root: str | os.PathLike[str] | None = None
     cutoff = time.time() - max(0.0, float(min_age_sec))
     removed = 0
     try:
-        candidates = list(root.glob("*/runtime_status*.tmp"))
+        candidates = islice(
+            root.glob("*/runtime_status*.tmp"),
+            _STATUS_TEMP_CLEANUP_MAX_FILES,
+        )
+        for path in candidates:
+            try:
+                if path.stat().st_mtime > cutoff:
+                    continue
+                path.unlink()
+                removed += 1
+            except Exception as exc:
+                _log_status_write_failure(
+                    f"cleanup_runtime_status_temps({path})", exc
+                )
     except Exception:
-        return 0
-    for path in candidates:
-        try:
-            if path.stat().st_mtime > cutoff:
-                continue
-            path.unlink()
-            removed += 1
-        except Exception as exc:
-            _log_status_write_failure(f"cleanup_runtime_status_temps({path})", exc)
+        return removed
     return removed
 
 

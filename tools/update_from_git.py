@@ -85,6 +85,9 @@ PROTECTED_LOCAL_CONFIG_SUFFIXES = (
     ".local.yml",
     ".user.yml",
 )
+_CIM_SCAN_TIMEOUT_SEC = 8
+_CIM_SCAN_MAX_OUTPUT_BYTES = 256 * 1024
+_CIM_SCAN_ATTEMPTS = 2
 CODE_DIRS = {
     "bots", "bot_utils", "config", "core", "launcher", "llm_slots",
     "news", "tools", "trading",
@@ -93,6 +96,7 @@ LIVE_STATUSES = {"starting", "started", "ready", "running", "degraded"}
 UPDATE_MARKER = ROOT / ".update_in_progress"
 UPDATE_SYNC_PATH = ROOT / ".update_synced.json"
 UPDATE_STATUS_PATH = ROOT / "logs" / "update_status.json"
+UPDATE_STATUS_JSON_MAX_BYTES = 1024 * 1024
 UPDATE_CONFIG_JSON_MAX_BYTES = 1024 * 1024
 UPDATE_MARKER_MAX_BYTES = 64 * 1024
 DEPLOY_MANIFEST_JSON_MAX_BYTES = 4 * 1024 * 1024
@@ -253,15 +257,38 @@ def _write_update_status(
     returncode: int | None = None,
     **fields: Any,
 ) -> None:
+    try:
+        previous = _read_bounded_json_file(
+            UPDATE_STATUS_PATH,
+            UPDATE_STATUS_JSON_MAX_BYTES,
+            "update status JSON",
+            encoding="utf-8-sig",
+        )
+        if not isinstance(previous, dict):
+            previous = {}
+    except Exception:
+        previous = {}
     payload: dict[str, Any] = {
         "status": status,
         "message": _redact_text(message)[:1200],
     }
     payload.update({k: _redact_obj(v) for k, v in fields.items() if v is not None})
+    previous_running = previous.get("status") == "running"
+    if previous_running:
+        for key in ("remote", "branch"):
+            if key not in payload and previous.get(key) is not None:
+                payload[key] = _redact_obj(previous[key])
+    now = datetime.now().isoformat(timespec="seconds")
+    previous_started = str(previous.get("started_at") or "").strip()[:64]
     if status == "running":
-        payload["started_at"] = datetime.now().isoformat(timespec="seconds")
+        payload["started_at"] = (
+            previous_started if previous_running and previous_started else now
+        )
     else:
-        payload["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        if previous_running and previous_started:
+            payload["started_at"] = previous_started
+        payload["finished_at"] = now
+    payload["updated_at"] = now
     if returncode is not None:
         payload["returncode"] = returncode
     try:
@@ -758,15 +785,21 @@ def _running_bot_processes_via_cim() -> list[str]:
     ) or "$false"
     script = (
         "$ErrorActionPreference='Stop'; "
+        "$ProgressPreference='SilentlyContinue'; "
         f"$root='{root}'; "
         f"$current={os.getpid()}; "
         "$scanPid=$PID; "
-        "$all=@(Get-CimInstance Win32_Process); "
+        "$all=@(Get-CimInstance -ClassName Win32_Process "
+        "-Property ProcessId,ParentProcessId,Name,CommandLine); "
+        "$capturePid=[int](($all | Where-Object { "
+        "$_.ProcessId -eq $scanPid } | Select-Object -First 1).ParentProcessId); "
         "if (-not ($all.ProcessId -contains $current) -or "
-        "-not ($all.ProcessId -contains $scanPid)) { "
+        "-not ($all.ProcessId -contains $scanPid) -or "
+        "$capturePid -le 0 -or -not ($all.ProcessId -contains $capturePid)) { "
         "throw 'bot process scan missing process-table anchor' }; "
         "$all | Where-Object { $_.ProcessId -gt 0 -and "
-        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid } | "
+        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid -and "
+        "$_.ProcessId -ne $capturePid } | "
         "ForEach-Object { "
         "$name=[string]$_.Name; $line=[string]$_.CommandLine; "
         "$nameLow=$name.ToLower(); "
@@ -784,14 +817,7 @@ def _running_bot_processes_via_cim() -> list[str]:
         "'bot process scan ok (count ' + $all.Count + ')'"
     )
     try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            cwd=str(ROOT),
-            text=True,
-            capture_output=True,
-            timeout=8,
-            **_hidden_kwargs(),
-        )
+        r = _run_cim_process_scan(script)
     except Exception as exc:
         raise RuntimeError("bot process scan unavailable via CIM") from exc
     if r.returncode != 0:
@@ -813,7 +839,7 @@ def _running_bot_processes_via_cim() -> list[str]:
         if lines
         else None
     )
-    if sentinel is None or int(sentinel.group(1)) < 2:
+    if sentinel is None or int(sentinel.group(1)) < 3:
         raise RuntimeError("bot process scan returned malformed CIM output")
     for text in lines[:-1]:
         if re.fullmatch(
@@ -834,6 +860,32 @@ def _running_bot_processes_via_cim() -> list[str]:
             seen.add(pid)
             out.append(text)
     return out
+
+
+def _run_cim_process_scan(script: str) -> subprocess.CompletedProcess[str]:
+    """Run one read-only CIM scan with bounded output and one safe retry."""
+    last_result: subprocess.CompletedProcess[str] | None = None
+    last_error: BaseException | None = None
+    for _attempt in range(_CIM_SCAN_ATTEMPTS):
+        try:
+            result = run_bounded_capture(
+                ["powershell", "-NoProfile", "-Command", script],
+                cwd=str(ROOT),
+                timeout=_CIM_SCAN_TIMEOUT_SEC,
+                max_output_bytes=_CIM_SCAN_MAX_OUTPUT_BYTES,
+                wrapper_python=sys.executable,
+                **_hidden_kwargs(),
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+        last_result = result
+        if result.returncode == 0 and not (result.stderr or "").strip():
+            return result
+    if last_result is not None:
+        return last_result
+    assert last_error is not None
+    raise last_error
 
 
 def _running_launchers() -> list[str]:
@@ -902,6 +954,8 @@ def _cmdline_is_launcher(cmdline_lower: str, cwd: object = None) -> bool:
         or "setup_wizard.pyw" in compact
         or "-m launcher.main" in compact
         or "-m launcher/main" in compact
+        or "-m launcher.supervisor" in compact
+        or "-m launcher/supervisor" in compact
     )
     if not launcher_like:
         return False
@@ -914,6 +968,8 @@ def _cmdline_is_launcher(cmdline_lower: str, cwd: object = None) -> bool:
     return bool(
         "-m launcher.main" in compact
         or "-m launcher/main" in compact
+        or "-m launcher.supervisor" in compact
+        or "-m launcher/supervisor" in compact
         or re.search(r"(?:^|\s)[\"']?(?:launcher|setup_wizard)\.pyw(?:[\"']?(?:\s|$))", compact)
     )
 
@@ -924,15 +980,21 @@ def _running_launchers_via_cim() -> list[str]:
     ).replace("'", "''")
     script = (
         "$ErrorActionPreference='Stop'; "
+        "$ProgressPreference='SilentlyContinue'; "
         f"$root='{root}'; "
         f"$current={os.getpid()}; "
         "$scanPid=$PID; "
-        "$all=@(Get-CimInstance Win32_Process); "
+        "$all=@(Get-CimInstance -ClassName Win32_Process "
+        "-Property ProcessId,ParentProcessId,Name,CommandLine); "
+        "$capturePid=[int](($all | Where-Object { "
+        "$_.ProcessId -eq $scanPid } | Select-Object -First 1).ParentProcessId); "
         "if (-not ($all.ProcessId -contains $current) -or "
-        "-not ($all.ProcessId -contains $scanPid)) { "
+        "-not ($all.ProcessId -contains $scanPid) -or "
+        "$capturePid -le 0 -or -not ($all.ProcessId -contains $capturePid)) { "
         "throw 'runtime process scan missing process-table anchor' }; "
         "$all | Where-Object { $_.ProcessId -gt 0 -and "
-        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid } | "
+        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid -and "
+        "$_.ProcessId -ne $capturePid } | "
         "ForEach-Object { "
         "$name=[string]$_.Name; $line=[string]$_.CommandLine; "
         "$nameLow=$name.ToLower(); "
@@ -946,21 +1008,15 @@ def _running_launchers_via_cim() -> list[str]:
         "$norm=$line.ToLower().Replace('\\','/'); "
         "$launcherLike=($norm.Contains('launcher.pyw') -or "
         "$norm.Contains('setup_wizard.pyw') -or "
-        "$norm.Contains('-m launcher.main')); "
+        "$norm.Contains('-m launcher.main') -or "
+        "$norm.Contains('-m launcher.supervisor')); "
         "if ($launcherLike) { if ($norm.Contains($root)) { "
         "'launcher pid ' + $_.ProcessId } else { "
         "'runtime process scan unknown (pid ' + $_.ProcessId + ')' } } } }; "
         "'runtime process scan ok (count ' + $all.Count + ')'"
     )
     try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-        cwd=str(ROOT),
-        text=True,
-        capture_output=True,
-        timeout=8,
-        **_hidden_kwargs(),
-    )
+        r = _run_cim_process_scan(script)
     except Exception as exc:
         raise RuntimeError("launcher scan unavailable") from exc
     if r.returncode != 0:
@@ -982,7 +1038,7 @@ def _running_launchers_via_cim() -> list[str]:
         if lines
         else None
     )
-    if sentinel is None or int(sentinel.group(1)) < 2:
+    if sentinel is None or int(sentinel.group(1)) < 3:
         raise RuntimeError("launcher scan returned malformed CIM output")
     out: list[str] = []
     seen: set[int] = set()
@@ -1162,14 +1218,20 @@ def _running_tool_processes_via_cim() -> list[str]:
     """Scan Python command lines via CIM with strict root attribution."""
     script = (
         "$ErrorActionPreference='Stop'; "
+        "$ProgressPreference='SilentlyContinue'; "
         f"$current={os.getpid()}; "
         "$scanPid=$PID; "
-        "$all=@(Get-CimInstance Win32_Process); "
+        "$all=@(Get-CimInstance -ClassName Win32_Process "
+        "-Property ProcessId,ParentProcessId,Name,CommandLine); "
+        "$capturePid=[int](($all | Where-Object { "
+        "$_.ProcessId -eq $scanPid } | Select-Object -First 1).ParentProcessId); "
         "if (-not ($all.ProcessId -contains $current) -or "
-        "-not ($all.ProcessId -contains $scanPid)) { "
+        "-not ($all.ProcessId -contains $scanPid) -or "
+        "$capturePid -le 0 -or -not ($all.ProcessId -contains $capturePid)) { "
         "throw 'runtime process scan missing process-table anchor' }; "
         "$all | Where-Object { $_.ProcessId -gt 0 -and "
-        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid } | "
+        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid -and "
+        "$_.ProcessId -ne $capturePid } | "
         "ForEach-Object { "
         "$name=[string]$_.Name; $line=[string]$_.CommandLine; "
         "$pythonLike=($name.ToLower() -match '^python(?:w|[0-9.]*)?\\.exe$'); "
@@ -1185,14 +1247,7 @@ def _running_tool_processes_via_cim() -> list[str]:
         "'runtime process scan ok (count ' + $all.Count + ')'"
     )
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            cwd=str(ROOT),
-            text=True,
-            capture_output=True,
-            timeout=8,
-            **_hidden_kwargs(),
-        )
+        result = _run_cim_process_scan(script)
     except Exception as exc:
         raise RuntimeError("tool process scan unavailable via CIM") from exc
     if result.returncode != 0:
@@ -1208,7 +1263,7 @@ def _running_tool_processes_via_cim() -> list[str]:
         if lines
         else None
     )
-    if sentinel is None or int(sentinel.group(1)) < 2:
+    if sentinel is None or int(sentinel.group(1)) < 3:
         raise RuntimeError("tool process scan returned malformed CIM output")
     out: list[str] = []
     seen: set[int] = set()
@@ -1258,15 +1313,21 @@ def _running_dashboard_processes_via_cim() -> list[tuple[int, str]]:
     ).replace("'", "''")
     script = (
         "$ErrorActionPreference='Stop'; "
+        "$ProgressPreference='SilentlyContinue'; "
         f"$root='{root}'; "
         f"$current={os.getpid()}; "
         "$scanPid=$PID; "
-        "$all=@(Get-CimInstance Win32_Process); "
+        "$all=@(Get-CimInstance -ClassName Win32_Process "
+        "-Property ProcessId,ParentProcessId,Name,CommandLine); "
+        "$capturePid=[int](($all | Where-Object { "
+        "$_.ProcessId -eq $scanPid } | Select-Object -First 1).ParentProcessId); "
         "if (-not ($all.ProcessId -contains $current) -or "
-        "-not ($all.ProcessId -contains $scanPid)) { "
+        "-not ($all.ProcessId -contains $scanPid) -or "
+        "$capturePid -le 0 -or -not ($all.ProcessId -contains $capturePid)) { "
         "throw 'runtime process scan missing process-table anchor' }; "
         "$all | Where-Object { $_.ProcessId -gt 0 -and "
-        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid } | "
+        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid -and "
+        "$_.ProcessId -ne $capturePid } | "
         "ForEach-Object { "
         "$name=[string]$_.Name; $line=[string]$_.CommandLine; "
         "$nameLow=$name.ToLower(); "
@@ -1286,14 +1347,7 @@ def _running_dashboard_processes_via_cim() -> list[tuple[int, str]]:
         "'runtime process scan ok (count ' + $all.Count + ')'"
     )
     try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            cwd=str(ROOT),
-            text=True,
-            capture_output=True,
-            timeout=8,
-            **_hidden_kwargs(),
-        )
+        r = _run_cim_process_scan(script)
     except Exception as exc:
         raise RuntimeError("dashboard scan unavailable via CIM") from exc
     if r.returncode != 0:
@@ -1319,7 +1373,7 @@ def _running_dashboard_processes_via_cim() -> list[tuple[int, str]]:
         if lines
         else None
     )
-    if sentinel is None or int(sentinel.group(1)) < 2:
+    if sentinel is None or int(sentinel.group(1)) < 3:
         raise RuntimeError("dashboard scan returned malformed CIM output")
     for text in lines[:-1]:
         if re.fullmatch(
@@ -1613,23 +1667,28 @@ def _runtime_env_in_use(path: Path) -> bool:
 
 def _runtime_env_in_use_via_cim(path: Path) -> bool:
     script = (
+        "$ErrorActionPreference='Stop'; "
+        "$ProgressPreference='SilentlyContinue'; "
         f"$current={os.getpid()}; "
-        "$items=@(Get-CimInstance Win32_Process | "
-        "Where-Object { $_.ProcessId -gt 0 -and $_.ProcessId -ne $current } | "
+        "$scanPid=$PID; "
+        "$all=@(Get-CimInstance -ClassName Win32_Process "
+        "-Property ProcessId,ParentProcessId,ExecutablePath,CommandLine); "
+        "$capturePid=[int](($all | Where-Object { "
+        "$_.ProcessId -eq $scanPid } | Select-Object -First 1).ParentProcessId); "
+        "if (-not ($all.ProcessId -contains $current) -or "
+        "-not ($all.ProcessId -contains $scanPid) -or "
+        "$capturePid -le 0 -or -not ($all.ProcessId -contains $capturePid)) { "
+        "throw 'runtime process scan missing process-table anchor' }; "
+        "$items=@($all | Where-Object { $_.ProcessId -gt 0 -and "
+        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid -and "
+        "$_.ProcessId -ne $capturePid } | "
         "ForEach-Object { "
         "[pscustomobject]@{pid=[int64]$_.ProcessId; "
         "exe=$_.ExecutablePath; cmdline=$_.CommandLine} }); "
         "ConvertTo-Json -InputObject $items -Compress"
     )
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            cwd=str(ROOT),
-            text=True,
-            capture_output=True,
-            timeout=8,
-            **_hidden_kwargs(),
-        )
+        result = _run_cim_process_scan(script)
     except Exception as exc:
         raise RuntimeError("runtime process scan unavailable via CIM") from exc
     if result.returncode != 0:
@@ -2938,7 +2997,14 @@ def _update_existing_repo(
     backup = _backup_user_files()
     protected_hashes = _stash_protected_files(backup)
     with tempfile.TemporaryDirectory(prefix="obsidian_runtime_rollback_") as runtime_tmp:
-        runtime_snapshot = _snapshot_runtime_env(Path(runtime_tmp))
+        # Product-only updates never mutate the managed Python environment.
+        # Snapshot its large tree only when the requirements delta can cause a
+        # dependency installation and therefore needs runtime rollback.
+        runtime_snapshot = (
+            _snapshot_runtime_env(Path(runtime_tmp))
+            if dependency_update_needed
+            else None
+        )
         marker_preexisting = (
             update_marker_exists(UPDATE_MARKER.parent)
             if preserve_marker_on_rollback is None
@@ -3009,7 +3075,7 @@ def _bootstrap_from_private_repo(
     with tempfile.TemporaryDirectory(prefix="obsidian_update_") as tmp:
         clone_dir = Path(tmp) / "repo"
         snapshot_dir = Path(tmp) / "rollback"
-        runtime_snapshot = _snapshot_runtime_env(Path(tmp) / "runtime")
+        runtime_snapshot = None
         marker_preexisting = (
             update_marker_exists(UPDATE_MARKER.parent)
             if preserve_marker_on_rollback is None
@@ -3032,6 +3098,14 @@ def _bootstrap_from_private_repo(
                 or _dependency_update_needed_from_path(
                     clone_dir / "requirements.lock.txt"
                 )
+            )
+            # Product-only bootstrap updates do not mutate the managed Python
+            # environment. Avoid copying its large tree unless dependency
+            # rollback can actually become necessary.
+            runtime_snapshot = (
+                _snapshot_runtime_env(Path(tmp) / "runtime")
+                if dependency_update_needed
+                else None
             )
             _snapshot_current_app(snapshot_dir)
             _write_update_marker("bootstrap", owner=marker_owner)

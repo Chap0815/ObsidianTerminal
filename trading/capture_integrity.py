@@ -39,6 +39,7 @@ DAY_MAX_TOTAL_OUTAGE = timedelta(hours=1)
 DAY_MAX_OUTAGE_EPISODES = 6
 CONTINUITY_WINDOW_DAYS = 30
 CONTINUITY_MAX_DEGRADED_RATIO = 0.20
+INTEGRITY_REPORT_MAX_BYTES = 4 * 1024 * 1024
 
 
 def _capture_now_utc() -> datetime:
@@ -106,6 +107,17 @@ def _manifest_file(path: Path, relative_path: str, **metadata) -> dict:
     }
 
 
+def _raise_partition_drift(day: str, path: str, reason: str, exc=None) -> None:
+    """Fail closed while retaining the exact immutable artifact diagnosis."""
+    message = (
+        "sealed capture partition drifted: "
+        f"day={day} path={path} reason={reason}"
+    )
+    if exc is not None:
+        raise RuntimeError(message) from exc
+    raise RuntimeError(message)
+
+
 def _linklike(path: Path) -> bool:
     if path.is_symlink():
         return True
@@ -114,6 +126,24 @@ def _linklike(path: Path) -> bool:
     except (AttributeError, OSError):
         return False
     return bool(attributes & 0x400)
+
+
+def _read_integrity_report_bytes(path: Path) -> bytes:
+    if _linklike(path.parent) or _linklike(path):
+        raise RuntimeError("capture integrity report path is linked")
+    with path.open("rb") as handle:
+        encoded = handle.read(INTEGRITY_REPORT_MAX_BYTES + 1)
+    if len(encoded) > INTEGRITY_REPORT_MAX_BYTES:
+        raise ValueError("capture integrity report exceeds size limit")
+    return encoded
+
+
+def _read_integrity_report(path: Path) -> dict:
+    try:
+        text = _read_integrity_report_bytes(path).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("capture integrity report is not valid UTF-8") from exc
+    return _json(text)
 
 
 def _day_bounds(day: date) -> tuple[datetime, datetime]:
@@ -283,6 +313,157 @@ def _connection_epoch_gaps(
     return gaps, sorted(set(issues))
 
 
+class _CoverageGapTracker:
+    """Compute exact receipt-time gaps without retaining every observation."""
+
+    def __init__(
+        self,
+        intervals: dict[str, list[tuple[datetime, datetime]]],
+        *,
+        stream: str,
+        maximum_gap: timedelta,
+    ) -> None:
+        self._stream = stream
+        self._maximum_gap = maximum_gap
+        self._states = {
+            market: [
+                {
+                    "start": started,
+                    "end": ended,
+                    "first": None,
+                    "last": None,
+                    "cadence_gaps": [],
+                }
+                for started, ended in expected
+                if ended - started >= maximum_gap
+            ]
+            for market, expected in intervals.items()
+        }
+        self._cursor = {market: 0 for market in self._states}
+
+    def observe(self, market: str, observed_at: datetime) -> None:
+        states = self._states.get(market)
+        if not states:
+            return
+        cursor = self._cursor[market]
+        while cursor < len(states) and states[cursor]["end"] < observed_at:
+            cursor += 1
+        self._cursor[market] = cursor
+        index = cursor
+        while index < len(states) and states[index]["start"] <= observed_at:
+            state = states[index]
+            if observed_at <= state["end"]:
+                previous = state["last"]
+                if (
+                    previous is not None
+                    and observed_at - previous > self._maximum_gap
+                ):
+                    state["cadence_gaps"].append(_gap_record(
+                        self._stream,
+                        market,
+                        "cadence_gap",
+                        previous,
+                        observed_at,
+                    ))
+                if state["first"] is None:
+                    state["first"] = observed_at
+                state["last"] = observed_at
+            index += 1
+
+    def finish(self) -> list[dict]:
+        gaps = []
+        for market, states in self._states.items():
+            for state in states:
+                first = state["first"]
+                last = state["last"]
+                if first is None:
+                    gaps.append(_gap_record(
+                        self._stream,
+                        market,
+                        "missing_interval",
+                        state["start"],
+                        state["end"],
+                    ))
+                    continue
+                if first - state["start"] > self._maximum_gap:
+                    gaps.append(_gap_record(
+                        self._stream,
+                        market,
+                        "start_gap",
+                        state["start"],
+                        first,
+                    ))
+                if state["end"] - last > self._maximum_gap:
+                    gaps.append(_gap_record(
+                        self._stream,
+                        market,
+                        "end_gap",
+                        last,
+                        state["end"],
+                    ))
+                gaps.extend(state["cadence_gaps"])
+        return gaps
+
+
+class _ConnectionEpochGapTracker:
+    """Stream epoch transitions in receipt order with bounded pending state."""
+
+    def __init__(self, day: date) -> None:
+        self._day_start, self._day_end = _day_bounds(day)
+        self._pending_time: datetime | None = None
+        self._pending_epochs: set[int] = set()
+        self._previous_time: datetime | None = None
+        self._previous_epoch: int | None = None
+        self._gaps: list[dict] = []
+        self._issues: set[str] = set()
+
+    def observe(self, observed_at: datetime, epoch: int) -> None:
+        if self._pending_time is None:
+            self._pending_time = observed_at
+        elif observed_at != self._pending_time:
+            self._flush_pending()
+            self._pending_time = observed_at
+        self._pending_epochs.add(epoch)
+
+    def _flush_pending(self) -> None:
+        observed_at = self._pending_time
+        if observed_at is None:
+            return
+        for epoch in sorted(self._pending_epochs):
+            if self._previous_time is None or self._previous_epoch is None:
+                self._previous_time = observed_at
+                self._previous_epoch = epoch
+                continue
+            if epoch == self._previous_epoch:
+                self._previous_time = max(self._previous_time, observed_at)
+                continue
+            if epoch < self._previous_epoch:
+                self._issues.add("l2_stream_connection_epoch_regressed")
+                continue
+            started = max(self._day_start, self._previous_time)
+            ended = min(self._day_end, observed_at)
+            if ended <= started and started < self._day_end:
+                ended = min(
+                    self._day_end,
+                    started + timedelta(microseconds=1),
+                )
+            if ended > started:
+                self._gaps.append(_gap_record(
+                    "transport",
+                    "ALL_USDT_SWAPS",
+                    "connection_epoch_change",
+                    started,
+                    ended,
+                ))
+            self._previous_time = observed_at
+            self._previous_epoch = epoch
+        self._pending_epochs.clear()
+
+    def finish(self) -> tuple[list[dict], list[str]]:
+        self._flush_pending()
+        return self._gaps, sorted(self._issues)
+
+
 def capture_continuity_health(reports: list[dict]) -> dict:
     """Grade the latest consecutive 30-day window without hiding gap days."""
     normalized = []
@@ -396,7 +577,16 @@ def _validate_event_universe(payload: dict) -> None:
         raise ValueError("capture universe contract is invalid")
 
 
-def _partition_rows(path: Path, stream: str, day: date) -> tuple[dict, dict]:
+def _partition_rows(
+    path: Path,
+    stream: str,
+    day: date,
+    *,
+    coverage_intervals: (
+        dict[str, list[tuple[datetime, datetime]]] | None
+    ) = None,
+    maximum_gap: timedelta | None = None,
+) -> tuple[dict, dict]:
     if _linklike(path):
         raise ValueError(f"{stream} partition is linked")
     for suffix in ("-wal", "-shm"):
@@ -409,14 +599,22 @@ def _partition_rows(path: Path, stream: str, day: date) -> tuple[dict, dict]:
         timeout=30.0,
     )
     connection.row_factory = sqlite3.Row
-    samples: dict[str, list[datetime]] = defaultdict(list)
     overview_rows = []
     connection_epochs = set()
     warnings = set()
     event_count = 0
     websocket_trade_events = 0
     websocket_trade_identities: dict[tuple[str, str], tuple] = {}
-    connection_epoch_observations: list[tuple[datetime, int]] = []
+    if (coverage_intervals is None) != (maximum_gap is None):
+        raise ValueError("coverage contract is incomplete")
+    coverage_tracker = None
+    if coverage_intervals is not None and maximum_gap is not None:
+        coverage_tracker = _CoverageGapTracker(
+            coverage_intervals,
+            stream=stream,
+            maximum_gap=maximum_gap,
+        )
+    epoch_tracker = _ConnectionEpochGapTracker(day) if stream == "l2_stream" else None
     future_limit = _capture_now_utc() + timedelta(minutes=1)
     try:
         quick = connection.execute("PRAGMA quick_check").fetchall()
@@ -432,10 +630,18 @@ def _partition_rows(path: Path, stream: str, day: date) -> tuple[dict, dict]:
         )
         if columns != EVENT_COLUMNS or schema != EVENT_SCHEMA:
             raise ValueError(f"{stream} schema mismatch")
+        receipt_ordered = stream in {"depth", "l2_stream"}
+        order_expression = (
+            "julianday(received_time),received_time"
+            if receipt_ordered
+            else "exchange_time"
+        )
+        if receipt_ordered:
+            connection.execute("PRAGMA temp_store=FILE")
         for row in connection.execute(
             "SELECT event_id,market_id,exchange_time,received_time,"
             "schema_version,quality_flags_json,payload_json "
-            "FROM venue_events ORDER BY exchange_time,event_id"
+            f"FROM venue_events ORDER BY {order_expression},event_id"
         ):
             event_count += 1
             for identity_field in ("event_id", "market_id"):
@@ -489,8 +695,8 @@ def _partition_rows(path: Path, stream: str, day: date) -> tuple[dict, dict]:
                     raise ValueError("l2 quality contract is incomplete")
                 _validate_l2_payload(payload)
             market_id = str(row["market_id"])
-            if stream in {"depth", "l2_stream"}:
-                samples[market_id].append(received_time)
+            if coverage_tracker is not None:
+                coverage_tracker.observe(market_id, received_time)
             if stream == "overview":
                 overview_rows.append({
                     "received_time": received_time,
@@ -578,25 +784,29 @@ def _partition_rows(path: Path, stream: str, day: date) -> tuple[dict, dict]:
                     raise ValueError(f"{stream} connection epoch is invalid")
                 if epoch_required:
                     connection_epochs.add(epoch)
-                    if stream == "l2_stream":
-                        connection_epoch_observations.append(
-                            (received_time, epoch)
-                        )
+                    if epoch_tracker is not None:
+                        epoch_tracker.observe(received_time, epoch)
     finally:
         connection.close()
     if not event_count:
         raise ValueError(f"{stream} partition is empty")
+    coverage_gaps = coverage_tracker.finish() if coverage_tracker else []
+    if epoch_tracker is None:
+        connection_epoch_gaps, connection_epoch_issues = [], []
+    else:
+        connection_epoch_gaps, connection_epoch_issues = epoch_tracker.finish()
     return _manifest_file(
         path,
         f"{stream}/{path.name}",
         events=event_count,
         warnings=sorted(warnings),
     ), {
-        "samples": dict(samples),
         "overview": overview_rows,
         "websocket_trade_events": websocket_trade_events,
         "connection_epochs": sorted(connection_epochs),
-        "connection_epoch_observations": connection_epoch_observations,
+        "coverage_gaps": coverage_gaps,
+        "connection_epoch_gaps": connection_epoch_gaps,
+        "connection_epoch_issues": connection_epoch_issues,
     }
 
 
@@ -729,6 +939,16 @@ def validate_capture_day(
     availability_gaps = []
     manifest = []
     stream_data = {}
+    intervals = {}
+    rest_gap = timedelta(
+        seconds=max(
+            30.0,
+            float(micro_interval_seconds) * max(1, int(max_symbols)) * 2.5,
+        )
+    )
+    l2_gap = timedelta(
+        seconds=max(10.0, float(l2_sample_interval_seconds) * 10.0)
+    )
     for stream in CORE_STREAMS:
         path = root / stream / f"{day.isoformat()}.sqlite3"
         try:
@@ -744,7 +964,19 @@ def validate_capture_day(
             issues.append(f"{stream}:partition_missing")
             continue
         try:
-            entry, data = _partition_rows(path, stream, day)
+            coverage_gap = {
+                "depth": rest_gap,
+                "l2_stream": l2_gap,
+            }.get(stream)
+            entry, data = _partition_rows(
+                path,
+                stream,
+                day,
+                coverage_intervals=(
+                    intervals if coverage_gap is not None else None
+                ),
+                maximum_gap=coverage_gap,
+            )
         except (OSError, sqlite3.Error, ValueError) as exc:
             issues.append(f"{stream}:{type(exc).__name__}:{str(exc)[:400]}")
             try:
@@ -770,67 +1002,35 @@ def validate_capture_day(
             continue
         manifest.append(entry)
         stream_data[stream] = data
-    if "overview" in stream_data:
-        intervals, overview_issues, overview_gaps = _membership_intervals(
-            stream_data["overview"]["overview"], day
-        )
-        issues.extend(overview_issues)
-        availability_gaps.extend(overview_gaps)
-    else:
-        intervals = {}
-    rest_gap = timedelta(
-        seconds=max(
-            30.0,
-            float(micro_interval_seconds) * max(1, int(max_symbols)) * 2.5,
-        )
-    )
-    l2_gap = timedelta(
-        seconds=max(10.0, float(l2_sample_interval_seconds) * 10.0)
-    )
-    if intervals:
-        if "depth" in stream_data:
-            availability_gaps.extend(
-                _coverage_gaps(
-                    stream_data["depth"]["samples"],
-                    intervals,
-                    stream="depth",
-                    maximum_gap=rest_gap,
-                )
+        if stream == "overview":
+            intervals, overview_issues, overview_gaps = _membership_intervals(
+                data["overview"], day
             )
+            issues.extend(overview_issues)
+            availability_gaps.extend(overview_gaps)
+        elif stream in {"depth", "l2_stream"}:
+            availability_gaps.extend(
+                data.get("coverage_gaps", [])
+            )
+        if stream == "l2_stream":
+            availability_gaps.extend(
+                data.get("connection_epoch_gaps", [])
+            )
+            issues.extend(data.get("connection_epoch_issues", []))
     observed_epochs = {
         epoch
         for stream in ("trades", "l2_stream")
         for epoch in stream_data.get(stream, {}).get("connection_epochs", [])
     }
-    if "l2_stream" in stream_data:
-        epoch_gaps, epoch_issues = _connection_epoch_gaps(
-            stream_data["l2_stream"].get(
-                "connection_epoch_observations", []
-            ),
-            day,
-        )
-        availability_gaps.extend(epoch_gaps)
-        issues.extend(epoch_issues)
     if (
         "trades" in stream_data
         and not stream_data["trades"].get("websocket_trade_events")
     ):
         issues.append("trades_ws_primary_stream_missing")
-    if intervals:
-        if "l2_stream" in stream_data:
-            availability_gaps.extend(
-                _coverage_gaps(
-                    stream_data["l2_stream"]["samples"],
-                    intervals,
-                    stream="l2_stream",
-                    maximum_gap=l2_gap,
-                )
-            )
-        # Public trades are event-driven.  Silence is not proof of transport
-        # loss, so it must never invent an outage for a low-activity market.
-        # Shared connection epochs remain visible in the availability report;
-        # actual outage windows are established by periodic overview/depth and
-        # the sampled L2 stream.
+    # Public trades are event-driven. Silence is not proof of transport loss,
+    # so it must never invent an outage for a low-activity market. Shared
+    # connection epochs remain visible in the availability report; actual
+    # outage windows come from periodic overview/depth and sampled L2.
     availability = _availability_summary(
         availability_gaps,
         day,
@@ -876,8 +1076,10 @@ def _atomic_create(path: Path, payload: dict) -> None:
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
+    if len(encoded) > INTEGRITY_REPORT_MAX_BYTES:
+        raise ValueError("capture integrity report exceeds size limit")
     if path.exists():
-        existing = path.read_bytes()
+        existing = _read_integrity_report_bytes(path)
         if existing != encoded:
             raise RuntimeError("sealed capture report changed")
         return
@@ -892,7 +1094,7 @@ def _atomic_create(path: Path, payload: dict) -> None:
         try:
             os.link(temporary, path)
         except FileExistsError:
-            if path.read_bytes() != encoded:
+            if _read_integrity_report_bytes(path) != encoded:
                 raise RuntimeError("sealed capture report changed")
     finally:
         temporary.unlink(missing_ok=True)
@@ -903,6 +1105,7 @@ def _verify_sealed_report(
     report: dict,
     *,
     expected_day: date | str,
+    verification_cache: dict[str, tuple] | None = None,
 ) -> None:
     if not isinstance(report, dict) or report.get("schema_version") != 1:
         raise RuntimeError("sealed capture report schema is invalid")
@@ -959,17 +1162,45 @@ def _verify_sealed_report(
                 "sealed capture manifest core partition bindings are incomplete"
             )
     else:
-        # Invalid seals can legitimately omit a missing core partition. That
-        # absence is itself immutable evidence: a file appearing later must not
-        # silently change the sealed day's truth while the report stays fixed.
+        issues = report.get("issues")
+        issue_rows = issues if isinstance(issues, list) else []
+        # Legacy invalid seals omitted both genuinely missing partitions and
+        # partitions that existed but failed validation.  The hash-bound issue
+        # identifies which state was sealed.  Preserve that existence truth;
+        # never reinterpret every omission as a missing file.
         for relative_path in required_paths - manifest_paths:
             path = root / relative_path
+            stream = relative_path.split("/", 1)[0]
+            stream_issues = [
+                issue for issue in issue_rows
+                if isinstance(issue, str) and issue.startswith(f"{stream}:")
+            ]
+            absent_markers = (
+                f"{stream}:partition_missing",
+                f"{stream}:partition_escaped_root",
+                f"{stream}:partition_parent_linked",
+            )
+            sealed_as_present = bool(stream_issues) and not any(
+                issue.startswith(absent_markers) for issue in stream_issues
+            )
+            if sealed_as_present:
+                if not path.is_file():
+                    _raise_partition_drift(
+                        expected_day_text, relative_path, "missing_sealed_file"
+                    )
+                continue
             if path.exists():
-                raise RuntimeError("sealed capture partition drifted")
+                _raise_partition_drift(
+                    expected_day_text, relative_path, "unexpected_file"
+                )
             for suffix in ("-wal", "-shm"):
                 sidecar = Path(f"{path}{suffix}")
                 if sidecar.exists() and sidecar.stat().st_size:
-                    raise RuntimeError("sealed capture partition drifted")
+                    _raise_partition_drift(
+                        expected_day_text,
+                        f"{relative_path}{suffix}",
+                        "unexpected_nonempty_sidecar",
+                    )
     for item in manifest_items:
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
             raise RuntimeError("sealed capture manifest is invalid")
@@ -980,12 +1211,64 @@ def _verify_sealed_report(
             raise RuntimeError("sealed capture manifest escaped root") from exc
         if relative.as_posix() != item["path"] or _linklike(path):
             raise RuntimeError("sealed capture manifest path is invalid")
-        if (
-            not path.is_file()
-            or path.stat().st_size != item.get("bytes")
-            or _sha256(path) != item.get("sha256")
-        ):
-            raise RuntimeError("sealed capture partition drifted")
+        if not path.is_file():
+            _raise_partition_drift(
+                expected_day_text, item["path"], "missing_manifest_file"
+            )
+        try:
+            stat_before = path.stat()
+            cache_key = str(path.resolve())
+            signature = (
+                item.get("sha256"),
+                item.get("bytes"),
+                stat_before.st_size,
+                stat_before.st_mtime_ns,
+                stat_before.st_ctime_ns,
+                stat_before.st_dev,
+                stat_before.st_ino,
+            )
+        except OSError as exc:
+            _raise_partition_drift(
+                expected_day_text, item["path"], "stat_unavailable", exc
+            )
+        if stat_before.st_size != item.get("bytes"):
+            if verification_cache is not None:
+                verification_cache.pop(cache_key, None)
+            _raise_partition_drift(
+                expected_day_text, item["path"], "byte_length_mismatch"
+            )
+        if verification_cache is None or verification_cache.get(
+            cache_key
+        ) != signature:
+            if _sha256(path) != item.get("sha256"):
+                if verification_cache is not None:
+                    verification_cache.pop(cache_key, None)
+                _raise_partition_drift(
+                    expected_day_text, item["path"], "sha256_mismatch"
+                )
+            try:
+                stat_after = path.stat()
+            except OSError as exc:
+                _raise_partition_drift(
+                    expected_day_text, item["path"], "restat_unavailable", exc
+                )
+            after_signature = (
+                item.get("sha256"),
+                item.get("bytes"),
+                stat_after.st_size,
+                stat_after.st_mtime_ns,
+                stat_after.st_ctime_ns,
+                stat_after.st_dev,
+                stat_after.st_ino,
+            )
+            if after_signature != signature:
+                if verification_cache is not None:
+                    verification_cache.pop(cache_key, None)
+                _raise_partition_drift(
+                    expected_day_text, item["path"], "changed_during_hash"
+                )
+            if verification_cache is not None:
+                verification_cache[cache_key] = signature
         if path.name.endswith(".sqlite3"):
             for suffix in ("-wal", "-shm"):
                 sidecar = Path(f"{path}{suffix}")
@@ -995,7 +1278,11 @@ def _verify_sealed_report(
                     and sidecar.is_file()
                     and sidecar.stat().st_size
                 ):
-                    raise RuntimeError("sealed capture partition drifted")
+                    _raise_partition_drift(
+                        expected_day_text,
+                        sidecar_relative,
+                        "unexpected_nonempty_sidecar",
+                    )
 
 
 def _remove_empty_sidecars(root: Path, report: dict) -> None:
@@ -1014,6 +1301,7 @@ def seal_closed_capture_days(
     micro_interval_seconds: float,
     l2_sample_interval_seconds: float,
     partition_guard=None,
+    verification_cache: dict[str, tuple] | None = None,
 ) -> dict:
     root = Path(root)
     now = _capture_now_utc()
@@ -1062,8 +1350,13 @@ def seal_closed_capture_days(
         with guard:
             report_path = root / "integrity" / f"{day.isoformat()}.json"
             if report_path.exists():
-                report = _json(report_path.read_text(encoding="utf-8"))
-                _verify_sealed_report(root, report, expected_day=day)
+                report = _read_integrity_report(report_path)
+                _verify_sealed_report(
+                    root,
+                    report,
+                    expected_day=day,
+                    verification_cache=verification_cache,
+                )
             else:
                 report = validate_capture_day(
                     root,

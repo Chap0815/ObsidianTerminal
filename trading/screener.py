@@ -112,8 +112,36 @@ _fail_cache: dict = {}
 # Debounced disk writes
 _FAIL_CACHE_PERSIST_INTERVAL = 30.0
 _FAIL_CACHE_JSON_MAX_BYTES = 2 * 1024 * 1024
+_FAIL_CACHE_MAX_ENTRIES = 4096
 _fail_cache_dirty = False
 _fail_cache_last_persist = 0.0
+
+
+def _bounded_fail_cache(cache: dict, now: float) -> dict:
+    """Retain active suppressions first and cap persistent cache cardinality."""
+    if len(cache) <= _FAIL_CACHE_MAX_ENTRIES:
+        return cache
+    ranked = sorted(
+        cache.items(),
+        key=lambda item: (
+            item[1].get("hard_until", 0.0) > now,
+            item[1].get("hard_until", 0.0),
+            item[0],
+        ),
+        reverse=True,
+    )
+    return dict(ranked[:_FAIL_CACHE_MAX_ENTRIES])
+
+
+def _make_fail_cache_room_locked(key: str, now: float) -> bool:
+    """Make bounded room without discarding a currently active suppression."""
+    if key in _fail_cache or len(_fail_cache) < _FAIL_CACHE_MAX_ENTRIES:
+        return True
+    for candidate, entry in tuple(_fail_cache.items()):
+        if entry.get("hard_until", 0.0) <= now:
+            _fail_cache.pop(candidate, None)
+            return True
+    return False
 
 
 def _validated_fail_cache(raw, now: float) -> dict:
@@ -138,7 +166,7 @@ def _validated_fail_cache(raw, now: float) -> dict:
             clean[key] = {"count": 0, "hard_until": hard_until}
         elif count > 0:
             clean[key] = {"count": min(count, 2), "hard_until": 0.0}
-    return clean
+    return _bounded_fail_cache(clean, now)
 
 
 def _read_fail_cache(now: float) -> dict:
@@ -208,6 +236,8 @@ def _save_fail_cache_locked(force: bool = False) -> bool:
                         "hard_until": 0.0,
                     }
 
+            merged = _bounded_fail_cache(merged, now)
+
             if not atomic_save_json(_FAIL_CACHE_FILE, merged):
                 return False
 
@@ -243,6 +273,8 @@ def _record_indicator_fail(symbol: str, timeframe: str) -> bool:
     key = f"{symbol}|{timeframe}"
     now = time.time()
     with _fail_cache_lock:
+        if not _make_fail_cache_room_locked(key, now):
+            return True
         entry = _fail_cache.get(key, {"count": 0, "hard_until": 0})
         if entry["hard_until"] > now:
             return True
@@ -760,6 +792,23 @@ def _detach_clone_pool() -> list:
         return clones
 
 
+def _detach_clone_pool_generation(clones: list, source) -> list:
+    """Detach only the pool generation used by the calling scan."""
+    expected = list(clones)
+    with _CLONE_POOL_LOCK:
+        if _CLONE_POOL_KEY["source"] is not source:
+            return []
+        if len(_CLONE_POOL) != len(expected) or any(
+            current is not prior
+            for current, prior in zip(_CLONE_POOL, expected, strict=True)
+        ):
+            return []
+        detached = list(_CLONE_POOL)
+        _CLONE_POOL.clear()
+        _CLONE_POOL_KEY["source"] = None
+        return detached
+
+
 def _retire_clone_pool_after(clones: list, futures) -> None:
     """Close detached clones only after every submitted worker has stopped."""
     clones = list(clones)
@@ -1256,10 +1305,11 @@ def get_top_momentum_coins(
     pool = ThreadPoolExecutor(
         max_workers=n_workers, thread_name_prefix="screener-worker"
     )
+    future_map = {}
+    clones_retired = False
     try:
-        future_map = {
-            pool.submit(_fetch_with_clone, sym, tf): (sym, tf) for sym, tf in tasks
-        }
+        for sym, tf in tasks:
+            future_map[pool.submit(_fetch_with_clone, sym, tf)] = (sym, tf)
         try:
             for future in as_completed(future_map, timeout=_GATHER_TIMEOUT_SEC):
                 sym, tf = future_map[future]
@@ -1296,8 +1346,21 @@ def get_top_momentum_coins(
             # Running futures cannot be cancelled safely. Detach this pool so
             # the next scan gets fresh sessions, but close it only after every
             # worker has actually returned.
-            retired = _detach_clone_pool()
+            retired = _detach_clone_pool_generation(clones, exchange)
             _retire_clone_pool_after(retired, future_map)
+            clones_retired = True
+    except BaseException:
+        # A submit/as_completed failure can happen after earlier workers have
+        # started. They must not remain attached to the reusable clone pool.
+        if future_map and not clones_retired:
+            for future in future_map:
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
+            retired = _detach_clone_pool_generation(clones, exchange)
+            _retire_clone_pool_after(retired, future_map)
+        raise
     finally:
         try:
             pool.shutdown(wait=False, cancel_futures=True)

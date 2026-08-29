@@ -2990,7 +2990,10 @@ class FuturesReconcileMixin:
             # SIM: reconcile against the exchange is a no-op; stay quiet (no
             # log line). We still run lock-gc / clone-reaping periodically.
             while not self._shutdown_event.is_set():
-                self._shutdown_event.wait(timeout=self.GC_LOCKS_INTERVAL_SEC)
+                if self._shutdown_event.wait(
+                    timeout=self.GC_LOCKS_INTERVAL_SEC
+                ):
+                    return
                 try:
                     n = gc_idle_locks()
                     if n:

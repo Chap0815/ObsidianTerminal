@@ -25,6 +25,8 @@ from core.clock import now_utc
 from core.constants import SPOT_NON_POSITION_ASSETS
 
 _SPOT_ORPHAN_MAX_USDT = 1_000_000_000.0
+_SPOT_ACCOUNTING_RETRY_BASE_SEC = 30.0
+_SPOT_ACCOUNTING_RETRY_MAX_SEC = 300.0
 
 
 def _finite_float_or_none(value) -> float | None:
@@ -45,6 +47,44 @@ def _positive_float_or_none(value) -> float | None:
 def _nonnegative_float_or_none(value) -> float | None:
     parsed = _finite_float_or_none(value)
     return parsed if parsed is not None and parsed >= 0 else None
+
+
+def _spot_accounting_retry_due(
+    row: dict,
+    *,
+    now_epoch: float | None = None,
+) -> bool:
+    if not isinstance(row, dict):
+        return True
+    retry_at = _finite_float_or_none(row.get("accounting_retry_next_at"))
+    if retry_at is None:
+        return True
+    current = time.time() if now_epoch is None else float(now_epoch)
+    return current >= retry_at
+
+
+def _defer_spot_accounting_retry(bot, sym: str, row: dict) -> float:
+    attempts_raw = row.get("accounting_retry_attempts", 0)
+    try:
+        attempts = max(0, int(attempts_raw)) + 1
+    except (TypeError, ValueError, OverflowError):
+        attempts = 1
+    delay = min(
+        _SPOT_ACCOUNTING_RETRY_MAX_SEC,
+        _SPOT_ACCOUNTING_RETRY_BASE_SEC * (2 ** min(attempts - 1, 8)),
+    )
+    retry_at = time.time() + delay
+    try:
+        bot.state.update_many(
+            sym,
+            {
+                "accounting_retry_attempts": attempts,
+                "accounting_retry_next_at": retry_at,
+            },
+        )
+    except Exception:
+        pass
+    return delay
 
 
 def _is_true_bool(value) -> bool:
@@ -1160,7 +1200,10 @@ def _gate_missing_for_removal(bot, sym, state_row, strikes, threshold: int = 2) 
                 "ERROR",
             )
             return False
+        if not _spot_accounting_retry_due(close_row):
+            return False
         if not _record_spot_offline_close(bot, sym, close_row):
+            _defer_spot_accounting_retry(bot, sym, close_row)
             log_event(
                 f" Spot reconciliation: {sym} missing on exchange but "
                 f"offline-close accounting failed  state kept for retry",
@@ -1586,7 +1629,13 @@ class ReconcileMixin:
                 self._shutdown_event.wait(timeout=self.GC_LOCKS_INTERVAL_SEC)
                 if self._shutdown_event.is_set():
                     return
-                self._recover_simulated_entry_tca_pending()
+                try:
+                    self._recover_simulated_entry_tca_pending()
+                except Exception as e:
+                    try:
+                        self._log_error("SIM TCA recovery", e)
+                    except Exception:
+                        pass
                 try:
                     reaped = self.ex.reap_dead_thread_clones()
                     if reaped:

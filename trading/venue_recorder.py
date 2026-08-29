@@ -27,6 +27,7 @@ from core.constants import NONCRYPTO_BASES
 
 
 MAX_PARTITION_CLOCK_AGE_MS = 86_400_000
+_CAPTURE_CONTROL_JSON_MAX_BYTES = 64 * 1024
 
 
 def _capture_now_ms() -> int:
@@ -69,6 +70,10 @@ class SQLitePartitionWriter:
         self.max_storage_bytes = max(0, int(float(max_storage_gib) * 1024**3))
         self._connections: dict[Path, sqlite3.Connection] = {}
         self._lock = threading.Lock()
+        # Epoch allocation only protects capture_state.json.  It may wait up
+        # to 15 seconds on the cross-process lock after a reconnect, so it
+        # must not occupy the data-plane lock used by every REST/L2 write.
+        self._control_lock = threading.Lock()
         self._partition_locks: dict[str, threading.RLock] = {}
         self._control_path = self.root / "capture_state.json"
 
@@ -129,11 +134,14 @@ class SQLitePartitionWriter:
 
     def _load_control_state_locked(self) -> dict:
         try:
-            raw = self._control_path.read_text(encoding="utf-8")
+            with self._control_path.open("rb") as handle:
+                raw = handle.read(_CAPTURE_CONTROL_JSON_MAX_BYTES + 1)
         except FileNotFoundError:
             return {"schema_version": 1, "connection_epoch": 0}
+        if len(raw) > _CAPTURE_CONTROL_JSON_MAX_BYTES:
+            raise RuntimeError("capture control state exceeds size limit")
         try:
-            value = json.loads(raw)
+            value = json.loads(raw.decode("utf-8-sig"))
         except (json.JSONDecodeError, UnicodeError) as exc:
             raise RuntimeError("capture control state is invalid") from exc
         if not isinstance(value, dict) or value.get("schema_version") != 1:
@@ -180,7 +188,7 @@ class SQLitePartitionWriter:
         lock_path = self.root / ".capture_state.lock"
         self._assert_scoped_path(self._control_path)
         self._assert_scoped_path(lock_path)
-        with self._lock:
+        with self._control_lock:
             with portalocker.Lock(
                 str(lock_path),
                 mode="a",
@@ -397,7 +405,20 @@ class SQLitePartitionWriter:
                     self._assert_partition_writable(path)
                     connection.commit()
                 except Exception:
-                    connection.rollback()
+                    try:
+                        connection.rollback()
+                    except Exception:
+                        # A failed rollback proves that this handle is not a
+                        # safe transaction boundary anymore. Never mask the
+                        # original write error and never reuse the handle on
+                        # the next capture event.
+                        try:
+                            connection.close()
+                        except Exception:
+                            pass
+                        finally:
+                            if self._connections.get(path) is connection:
+                                self._connections.pop(path, None)
                     raise
         return path
 
@@ -698,6 +719,9 @@ class VenueRecorder:
     """Exchange-neutral overview, REST microstructure, and shadow L2 capture."""
 
     CAPTURE_FAILURE_THRESHOLD = 3
+    _INTEGRITY_STOP_TIMEOUT_SEC = 15.0
+    GAP_WARNING_INTERVAL_SEC = 60.0
+    GAP_WARNING_KEYS_MAX = 64
 
     def __init__(
         self,
@@ -730,6 +754,7 @@ class VenueRecorder:
         self.micro_interval = max(1.0, float(micro_interval_seconds))
         self.overview_interval = max(self.micro_interval, float(overview_interval_seconds))
         self.log_event = log_event
+        self._gap_warning_seen_at: dict[str, float] = {}
         self._health_callback = health_callback
         self._priority_loader = priority_loader
         self._last_priority_symbols: list[str] = []
@@ -759,6 +784,10 @@ class VenueRecorder:
         self._integrity_errors_total = 0
         self._last_integrity_error = ""
         self._integrity_incident_key = None
+        # Process-local proof cache: unchanged manifest artifacts are not
+        # re-read in full on every hourly integrity pass. Any stat identity
+        # change forces a fresh SHA-256 verification.
+        self._integrity_verification_cache: dict[str, tuple] = {}
         self.l2_mode = str(l2_mode).strip().lower()
         self._l2_collector = None
         if self.l2_mode == "shadow":
@@ -850,8 +879,45 @@ class VenueRecorder:
         if not self.log_event:
             return
         try:
+            current = time.monotonic()
+            context_key = str(context or "capture gap")[:120]
+            error_key = type(exc).__name__[:40]
+            key = f"{context_key}|{error_key}"
+            seen = getattr(self, "_gap_warning_seen_at", None)
+            if not isinstance(seen, dict):
+                seen = {}
+                self._gap_warning_seen_at = seen
+            previous = seen.get(key)
+            if (
+                isinstance(previous, (int, float))
+                and current - float(previous) < self.GAP_WARNING_INTERVAL_SEC
+            ):
+                return
+            seen[key] = current
+            if len(seen) > self.GAP_WARNING_KEYS_MAX:
+                newest = sorted(
+                    seen.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:self.GAP_WARNING_KEYS_MAX]
+                self._gap_warning_seen_at = dict(newest)
+        except Exception:
+            # Throttling is display hygiene only. If its own bookkeeping is
+            # unavailable, retain the original immediate warning behavior.
+            pass
+        detail = ""
+        try:
+            from core.logger import clean_user_text, redact
+
+            detail = clean_user_text(redact(str(exc)), max_chars=240)
+            detail = " ".join(detail.splitlines()).strip()
+        except Exception:
+            detail = ""
+        try:
             self.log_event(
-                f"Venue recorder {context}: {type(exc).__name__}", "WARN"
+                f"Venue recorder {context}: {type(exc).__name__}"
+                + (f": {detail}" if detail else ""),
+                "WARN",
             )
         except Exception:
             pass
@@ -1388,6 +1454,7 @@ class VenueRecorder:
                 partition_guard=getattr(
                     self.writer, "partition_guard", None
                 ),
+                verification_cache=self._integrity_verification_cache,
             )
         except Exception as exc:
             incident_key = (
@@ -1455,6 +1522,19 @@ class VenueRecorder:
                 self._last_integrity_error,
             )
 
+    def _wait_for_integrity_worker(self, *, timeout: float) -> bool:
+        """Return only after the seal worker is quiescent or timeout expires."""
+        with self._integrity_lock:
+            thread = self._integrity_thread
+        if thread is None:
+            return True
+        try:
+            if thread.is_alive():
+                thread.join(timeout=max(0.0, float(timeout)))
+            return not thread.is_alive()
+        except Exception:
+            return False
+
     def run(self, shutdown_event: threading.Event) -> None:
         next_overview = 0.0
         l2_started = False
@@ -1480,6 +1560,9 @@ class VenueRecorder:
         l2_errors_consecutive = 0
         l2_errors_total = 0
         last_l2_error = ""
+        l2_probe_errors_consecutive = 0
+        l2_probe_errors_total = 0
+        last_l2_probe_error = ""
 
         def note_l2_failure(exc: Exception) -> None:
             nonlocal l2_errors_consecutive, l2_errors_total, last_l2_error
@@ -1491,6 +1574,21 @@ class VenueRecorder:
             nonlocal l2_errors_consecutive, last_l2_error
             l2_errors_consecutive = 0
             last_l2_error = ""
+
+        def note_l2_probe_failure(exc: Exception) -> None:
+            nonlocal l2_probe_errors_consecutive
+            nonlocal l2_probe_errors_total
+            nonlocal last_l2_probe_error
+            l2_probe_errors_consecutive += 1
+            l2_probe_errors_total += 1
+            last_l2_probe_error = (
+                f"{type(exc).__name__}: {str(exc)[:160]}"
+            )
+
+        def note_l2_probe_success() -> None:
+            nonlocal l2_probe_errors_consecutive, last_l2_probe_error
+            l2_probe_errors_consecutive = 0
+            last_l2_probe_error = ""
 
         try:
             if self._l2_collector is not None:
@@ -1596,6 +1694,17 @@ class VenueRecorder:
                             last_overview_error = (
                                 f"{type(exc).__name__}: {str(exc)[:160]}"
                             )
+                            if self._universe:
+                                # Keep sampling the last validated universe,
+                                # but do not hammer the overview endpoint once
+                                # per micro cycle throughout a network outage.
+                                retry_delay = max(
+                                    self.micro_interval,
+                                    min(self.overview_interval, 30.0),
+                                )
+                                next_overview = (
+                                    time.monotonic() + retry_delay
+                                )
                         else:
                             overview_captures_total += 1
                             last_overview_error = ""
@@ -1648,7 +1757,23 @@ class VenueRecorder:
                     captures_total += 1
                     last_capture_success_wall_ts = time.time()
                     last_capture_error = ""
-                rest_data_health = self._rest_data_health()
+                try:
+                    rest_data_health = self._rest_data_health()
+                except Exception as exc:
+                    self._log_gap("REST health synthesis gap", exc)
+                    rest_data_health = {
+                        "ok": False,
+                        "stale_after_seconds": None,
+                        "overview_stale_after_seconds": None,
+                        "missing_or_invalid": ["REST_HEALTH:unavailable"],
+                        "trade_audit_warnings": [],
+                        "overview": {
+                            "valid": False,
+                            "age_seconds": None,
+                            "flags": ["health_snapshot_unavailable"],
+                        },
+                        "markets": {},
+                    }
                 (
                     integrity_health,
                     integrity_errors_total,
@@ -1666,6 +1791,7 @@ class VenueRecorder:
                 collector_l2_errors_total = 0
                 collector_l2_errors_consecutive = 0
                 collector_last_l2_error = ""
+                l2_probe_failed = False
                 if l2_enabled:
                     healthy_marker = getattr(
                         self._l2_collector, "is_healthy", None
@@ -1681,7 +1807,8 @@ class VenueRecorder:
                             )
                         except Exception as exc:
                             l2_data_healthy = False
-                            note_l2_failure(exc)
+                            l2_probe_failed = True
+                            note_l2_probe_failure(exc)
                             self._log_gap("L2 health read gap", exc)
                     trade_marker = getattr(
                         self._l2_collector, "trades_healthy", False
@@ -1694,7 +1821,8 @@ class VenueRecorder:
                         )
                     except Exception as exc:
                         trade_stream_healthy = False
-                        note_l2_failure(exc)
+                        l2_probe_failed = True
+                        note_l2_probe_failure(exc)
                         self._log_gap("trade stream health read gap", exc)
                     snapshot_marker = getattr(
                         self._l2_collector, "health_snapshot", None
@@ -1728,17 +1856,25 @@ class VenueRecorder:
                             if isinstance(last_marker, str):
                                 collector_last_l2_error = last_marker[:256]
                         except Exception as exc:
-                            note_l2_failure(exc)
+                            l2_probe_failed = True
+                            note_l2_probe_failure(exc)
                             self._log_gap("stream health snapshot gap", exc)
+                    if not l2_probe_failed:
+                        note_l2_probe_success()
                 effective_l2_errors_consecutive = max(
                     l2_errors_consecutive,
+                    l2_probe_errors_consecutive,
                     collector_l2_errors_consecutive,
                 )
                 effective_l2_errors_total = (
-                    l2_errors_total + collector_l2_errors_total
+                    l2_errors_total
+                    + l2_probe_errors_total
+                    + collector_l2_errors_total
                 )
                 effective_last_l2_error = (
-                    last_l2_error or collector_last_l2_error
+                    last_l2_error
+                    or last_l2_probe_error
+                    or collector_last_l2_error
                 )
                 l2_ok = not l2_enabled or (
                     l2_started
@@ -1823,6 +1959,17 @@ class VenueRecorder:
                 except Exception as exc:
                     producers_quiescent = False
                     self._log_gap("L2 stop gap", exc)
+            integrity_quiescent = self._wait_for_integrity_worker(
+                timeout=self._INTEGRITY_STOP_TIMEOUT_SEC,
+            )
+            if not integrity_quiescent:
+                producers_quiescent = False
+                self._log_gap(
+                    "capture integrity stop gap",
+                    RuntimeError(
+                        "integrity worker remains alive after shutdown timeout"
+                    ),
+                )
             close = getattr(self.writer, "close", None)
             if producers_quiescent and callable(close):
                 try:

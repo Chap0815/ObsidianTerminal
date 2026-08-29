@@ -98,6 +98,20 @@ _MEXC_RATE_LIMIT_CODE_RE = re.compile(
     r'(?:["\']?code["\']?\s*[:=]\s*510\b|\bcode\s+510\b)',
     re.IGNORECASE,
 )
+_HTTP_RATE_LIMIT_CODE_RE = re.compile(
+    r"(?:^\s*429\b|\bhttp(?:/[0-9.]+)?\s+429\b|"
+    r"\bstatus(?:\s+code)?\s*[:=]?\s*429\b|"
+    r"\bcode\s*[:=]\s*429\b|\[\s*429\s*\])",
+    re.IGNORECASE,
+)
+_HTTP_SERVER_ERROR_CODE_RE = re.compile(
+    r"(?:^\s*(?:502|503|504)\b|"
+    r"\bhttp(?:/[0-9.]+)?\s+(?:502|503|504)\b|"
+    r"\bstatus(?:\s+code)?\s*[:=]?\s*(?:502|503|504)\b|"
+    r"\bcode\s*[:=]\s*(?:502|503|504)\b|"
+    r"\[\s*(?:502|503|504)\s*\])",
+    re.IGNORECASE,
+)
 
 
 def is_rate_limited(exc: BaseException) -> bool:
@@ -113,7 +127,7 @@ def is_rate_limited(exc: BaseException) -> bool:
     if _RATE_LIMIT_EXC and isinstance(exc, _RATE_LIMIT_EXC):
         return True
     s = str(exc).lower()
-    return ("429" in s or "too many requests" in s
+    return (bool(_HTTP_RATE_LIMIT_CODE_RE.search(s)) or "too many requests" in s
             or "rate limit" in s or "ratelimit" in s
             or "too frequent" in s
             or bool(_MEXC_RATE_LIMIT_CODE_RE.search(s)))
@@ -127,9 +141,8 @@ def is_server_error(exc: BaseException) -> bool:
     endpoint, so these get the same longer, capped backoff as a 429.
     """
     s = str(exc).lower()
-    return ("502" in s or "bad gateway" in s
-            or "503" in s or "service unavailable" in s
-            or "504" in s or "gateway time" in s)
+    return (bool(_HTTP_SERVER_ERROR_CODE_RE.search(s)) or "bad gateway" in s
+            or "service unavailable" in s or "gateway time" in s)
 
 
 def is_transient_network(exc: BaseException) -> bool:

@@ -22,6 +22,7 @@ import json
 import math
 import os
 import sqlite3
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -337,6 +338,54 @@ def get_trade_metrics_snapshot(
     return _read_trade_metrics(bot_modes, include_global_total=True)
 
 
+def get_trade_metrics_signature(
+    bot_modes: dict[str, bool | None],
+) -> tuple:
+    """Return a cheap invalidation key for the expensive position rebuild.
+
+    The runtime ``trades`` ledger is append-only after schema migration, so its
+    primary-key high-water mark changes for every new partial or terminal
+    fragment.  The small current-day rows are included separately so a daily
+    accounting repair invalidates the cache without reconstructing all historic
+    positions on every launcher poll.
+    """
+    resolved = {
+        str(bot): _metrics_bot_key(bot, mode_is_sim)
+        for bot, mode_is_sim in bot_modes.items()
+    }
+    mode_signature = tuple(sorted(resolved.items()))
+    today, _start_utc, _end_utc = _metrics_day_bounds()
+    conn = _open_metrics_snapshot()
+    if conn is None:
+        return mode_signature, today, 0, ()
+    try:
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM trades").fetchone()
+        high_water = int(row[0] if row else 0)
+        if high_water < 0:
+            raise ValueError("trade high-water mark must be nonnegative")
+
+        bot_keys = tuple(sorted(set(resolved.values())))
+        daily_rows = ()
+        if bot_keys:
+            placeholders = ",".join("?" for _ in bot_keys)
+            daily_rows = tuple(
+                tuple(row)
+                for row in conn.execute(
+                    f"SELECT bot_name, total_profit, trade_count, is_paused "
+                    f"FROM daily_pnl WHERE trade_date=? "
+                    f"AND bot_name IN ({placeholders}) ORDER BY bot_name",
+                    (today, *bot_keys),
+                ).fetchall()
+            )
+        return mode_signature, today, high_water, daily_rows
+    except Exception as exc:
+        if isinstance(exc, MetricsDbReadError):
+            raise
+        raise MetricsDbReadError(str(exc)) from exc
+    finally:
+        conn.close()
+
+
 def get_bot_stats_batch(
     bot_modes: dict[str, bool | None],
 ) -> dict[str, dict]:
@@ -436,7 +485,7 @@ def get_open_trades(log_dir: str, bot_name: str = None,
 
 #  Market regime + futures count 
 
-def get_market_info():
+def _get_market_info_with_query(query):
     """Latest market regime row with most current Fear & Greed value.
 
     F&G is taken from the most recent market_regime row that has a
@@ -448,7 +497,7 @@ def get_market_info():
         datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=5)
     ).strftime("%Y-%m-%d %H:%M:%S")
     # Regime + BTC from last real scan (not a CACHED_FG row)
-    rows = query_db(
+    rows = query(
         "SELECT regime, btc_24h, fear_greed, timestamp "
         "FROM market_regime "
         "WHERE regime != 'CACHED_FG' AND btc_24h IS NOT NULL "
@@ -489,7 +538,7 @@ def get_market_info():
 
     # Most current F&G from ANY market_regime row (incl. CACHED_FG)
     try:
-        fg_rows = query_db(
+        fg_rows = query(
             "SELECT fear_greed FROM market_regime "
             "WHERE fear_greed IS NOT NULL AND timestamp <= ? "
             "ORDER BY timestamp DESC LIMIT 25",
@@ -514,6 +563,11 @@ def get_market_info():
     return {"regime": regime, "btc_24h": btc_24h, "fg": fg, "timestamp": ts}
 
 
+def get_market_info():
+    """Compatibility reader using its own read-only DB snapshot."""
+    return _get_market_info_with_query(query_db)
+
+
 def get_futures_state_count(bot_name: str = None,
                             mode_is_sim: bool | None = None) -> int:
     """Number of rows in ``futures_state``. Pass ``bot_name`` to count only ONE
@@ -530,6 +584,38 @@ def get_futures_state_count(bot_name: str = None,
     else:
         rows = query_db_dict("SELECT * FROM futures_state")
     return sum(1 for row in rows if is_futures_state_fresh(row))
+
+
+def get_futures_state_counts(
+    bot_modes: Mapping[str, bool | None],
+) -> dict[str, int]:
+    """Count several bot namespaces from one futures-state snapshot."""
+    if not bot_modes:
+        return {}
+    keys_by_bot = {
+        bot: _metrics_bot_keys(bot, mode_is_sim)
+        for bot, mode_is_sim in bot_modes.items()
+    }
+    owners: dict[str, list[str]] = {}
+    for bot, keys in keys_by_bot.items():
+        for key in keys:
+            owners.setdefault(key, []).append(bot)
+    all_keys = tuple(owners)
+    placeholders = ",".join("?" for _ in all_keys)
+    rows = query_db_dict(
+        f"SELECT * FROM futures_state WHERE bot_name IN ({placeholders})",
+        all_keys,
+    )
+    result = {bot: 0 for bot in bot_modes}
+    for row in rows:
+        if not is_futures_state_fresh(row):
+            continue
+        bot_key = row.get("bot_name")
+        if not isinstance(bot_key, str):
+            continue
+        for bot in owners.get(bot_key, ()):
+            result[bot] += 1
+    return result
 
 
 #  LLM (Ollama) availability 
@@ -660,7 +746,7 @@ def _exchange_display_name() -> str:
     return name.capitalize() if name else "Exchange"
 
 
-def get_exchange_status() -> dict:
+def _get_exchange_status_with_query(query) -> dict:
     """Determine exchange connection status.
 
     Primary source: ``api_rate_global``  written on EVERY bot API call.
@@ -687,7 +773,7 @@ def get_exchange_status() -> dict:
         return delta
 
     #  Primary: api_rate_global (written every scan cycle) 
-    rows = query_db(
+    rows = query(
         "SELECT called_at FROM api_rate_global WHERE called_at <= ? "
         "ORDER BY called_at DESC LIMIT 1",
         (latest_plausible,),
@@ -704,7 +790,7 @@ def get_exchange_status() -> dict:
             pass
 
     #  Fallback: market_regime 
-    rows = query_db(
+    rows = query(
         "SELECT timestamp FROM market_regime WHERE timestamp <= ? "
         "ORDER BY timestamp DESC LIMIT 1",
         (latest_plausible,),
@@ -720,6 +806,38 @@ def get_exchange_status() -> dict:
         return {"active": False, "label": f"{exch}  Inactive"}
     except Exception:
         return {"active": False, "label": f"{exch}  Unknown"}
+
+
+def get_exchange_status() -> dict:
+    """Compatibility reader using its own read-only DB snapshot."""
+    return _get_exchange_status_with_query(query_db)
+
+
+def get_market_dashboard_snapshot() -> tuple[dict | None, dict]:
+    """Return market regime and exchange liveness from one DB snapshot."""
+    conn = _open_metrics_snapshot()
+    if conn is None:
+        def no_rows(_sql, _params=()):
+            return []
+
+        return (
+            _get_market_info_with_query(no_rows),
+            _get_exchange_status_with_query(no_rows),
+        )
+
+    def query(sql: str, params: tuple = ()) -> list:
+        try:
+            return conn.execute(sql, params).fetchall()
+        except Exception as exc:
+            raise MetricsDbReadError(str(exc)) from exc
+
+    try:
+        return (
+            _get_market_info_with_query(query),
+            _get_exchange_status_with_query(query),
+        )
+    finally:
+        conn.close()
 
 
 #  Unrealized PnL 
@@ -753,26 +871,78 @@ def get_unrealized_pnl_futures(bot_name: str = None,
     return float(total)
 
 
-def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
-                            mode_is_sim: bool | None = None) -> float:
-    """Unrealized PnL for open spot positions in the bot's (mode-aware) state.
+def get_unrealized_pnl_futures_batch(
+    bot_modes: Mapping[str, bool | None],
+) -> dict[str, float]:
+    """Aggregate several futures namespaces from one state snapshot."""
+    if not bot_modes:
+        return {}
+    keys_by_bot = {
+        bot: _metrics_bot_keys(bot, mode_is_sim)
+        for bot, mode_is_sim in bot_modes.items()
+    }
+    owners: dict[str, list[str]] = {}
+    for bot, keys in keys_by_bot.items():
+        for key in keys:
+            owners.setdefault(key, []).append(bot)
+    all_keys = tuple(owners)
+    placeholders = ",".join("?" for _ in all_keys)
+    rows = query_db_dict(
+        f"SELECT * FROM futures_state WHERE bot_name IN ({placeholders})",
+        all_keys,
+    )
+    result = {bot: 0.0 for bot in bot_modes}
+    for row in rows:
+        if not is_futures_state_fresh(row):
+            continue
+        bot_key = row.get("bot_name")
+        if not isinstance(bot_key, str):
+            continue
+        pnl, _pct = futures_unrealized_from_row(row)
+        for bot in owners.get(bot_key, ()):
+            result[bot] += pnl
+    return {bot: float(total) for bot, total in result.items()}
+
+
+def get_unrealized_pnl_spots(
+    requests: Mapping[str | None, tuple[str, bool | None]],
+    exchange=None,
+) -> dict[str | None, float]:
+    """Price several spot states with one union ticker batch.
 
     Strategy:
-      1. Try one ``fetch_tickers()`` batch call for all open symbols.
+      1. Try one ``fetch_tickers()`` batch call for all requested symbols.
       2. For any symbol the batch didn't price, fall back to a single
          ``fetch_ticker()`` call.
-      3. Errors are logged via the standard ``logging`` module  never
-         silently swallowed.
+      3. Attribute shared prices independently to each bot's positions.
     """
-    trades = load_json(_spot_state_file(log_dir, bot_name, mode_is_sim))
-    if not trades:
-        return 0.0
+    trades_by_bot: dict[str, dict] = {}
+    for bot_name, request in requests.items():
+        try:
+            log_dir, mode_is_sim = request
+        except (TypeError, ValueError):
+            trades_by_bot[bot_name] = {}
+            continue
+        trades = load_json(_spot_state_file(log_dir, bot_name, mode_is_sim))
+        trades_by_bot[bot_name] = trades if isinstance(trades, dict) else {}
+
+    result = {bot_name: 0.0 for bot_name in requests}
+    symbols = sorted(
+        {
+            symbol
+            for trades in trades_by_bot.values()
+            for symbol in trades
+            if isinstance(symbol, str) and symbol
+        }
+    )
+    if not symbols:
+        return result
     if exchange is None:
-        return 0.0
+        return result
 
     #  Step 1: batch ticker fetch 
     price_map: dict = {}  # sym  current price (float)
-    pairs = [f"{sym}/USDT" for sym in trades]
+    pairs = [f"{sym}/USDT" for sym in symbols]
     try:
         try:
             from bot_utils.api_budget import try_consume_api_call
@@ -784,7 +954,7 @@ def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
             ) from exc
         batch = exchange.fetch_tickers(pairs) or {}
         # Instrument the launcher's own API consumption
-        for sym in trades:
+        for sym in symbols:
             t = batch.get(f"{sym}/USDT") or {}
             p = _finite_float_or_none(t.get("last"))
             if p is None or p <= 0:
@@ -798,7 +968,7 @@ def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
             "[UnrPnL] fetch_tickers batch failed (%s), using individual calls", e)
 
     #  Step 2: fallback per-symbol fetches 
-    for sym in trades:
+    for sym in symbols:
         if sym in price_map:
             continue
         try:
@@ -819,21 +989,32 @@ def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
         except Exception:
             pass  # price unavailable  position contributes 0
 
-    #  Step 3: compute PnL 
-    total = 0.0
-    for sym, d in trades.items():
-        try:
-            # trades.json may use the legacy schema ("buy") or the
-            # StateManager schema ("buy_price"). Accept both.
-            buy_raw = _state_value_prefer_key(d, "buy_price", "buy")
-            buy = _finite_float_or_none(buy_raw)
-            amount = _finite_float_or_none(d.get("amount"))
-            if buy is None or amount is None or buy <= 0 or amount <= 0:
-                continue
-            curr = price_map.get(sym, 0.0)
-            if curr > 0:
-                total += spot_unrealized_pnl(buy, curr, amount)
-        except Exception:
-            pass
+    #  Step 3: compute PnL independently per bot.
+    for bot_name, trades in trades_by_bot.items():
+        total = 0.0
+        for sym, d in trades.items():
+            try:
+                # trades.json may use the legacy schema ("buy") or the
+                # StateManager schema ("buy_price"). Accept both.
+                buy_raw = _state_value_prefer_key(d, "buy_price", "buy")
+                buy = _finite_float_or_none(buy_raw)
+                amount = _finite_float_or_none(d.get("amount"))
+                if buy is None or amount is None or buy <= 0 or amount <= 0:
+                    continue
+                curr = price_map.get(sym, 0.0)
+                if curr > 0:
+                    total += spot_unrealized_pnl(buy, curr, amount)
+            except Exception:
+                pass
+        result[bot_name] = round(total, 2)
+    return result
 
-    return round(total, 2)
+
+def get_unrealized_pnl_spot(log_dir: str, exchange=None, bot_name: str = None,
+                            mode_is_sim: bool | None = None) -> float:
+    """Compatibility wrapper for one spot bot's unrealized PnL."""
+    request_key = bot_name
+    return get_unrealized_pnl_spots(
+        {request_key: (log_dir, mode_is_sim)},
+        exchange,
+    )[request_key]

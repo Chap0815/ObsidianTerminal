@@ -26,6 +26,48 @@ from launcher.ui.logging_panel import log_to_card
 from launcher.ui.theme import force_dark_titlebar
 
 
+class _DialogRefreshGate:
+    """Allow one refresh worker and reject completions from stale generations."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active = False
+        self._generation = 0
+
+    def claim(self) -> int | None:
+        with self._lock:
+            if self._active:
+                return None
+            self._generation += 1
+            self._active = True
+            return self._generation
+
+    def finish(self, generation: int) -> bool:
+        with self._lock:
+            if not self._active or generation != self._generation:
+                return False
+            self._active = False
+            return True
+
+
+def _post_ui(app, callback, *, delay_ms: int = 0) -> bool:
+    post = getattr(app, "post_ui", None)
+    if callable(post):
+        return post(callback, delay_ms=delay_ms) is not False
+    app.after(delay_ms, callback)
+    return True
+
+
+def _start_critical_worker(app, target, *, name: str):
+    registry = getattr(app, "critical_workers", None)
+    start = getattr(registry, "start", None)
+    if callable(start):
+        return start(target, name=name, daemon=True)
+    thread = threading.Thread(target=target, name=name, daemon=True)
+    thread.start()
+    return thread
+
+
 def show_state_read_error_dialog(app, title: str, detail: str) -> None:
     """Fail-closed dialog when position state cannot be read."""
     dlg = ctk.CTkToplevel(app)
@@ -118,9 +160,9 @@ def show_busy_dialog(app, title: str, intro: str, worker, **worker_kwargs) -> No
     prog.start()
 
     def update_fn(msg: str) -> None:
-        # Thread-safe UI update
+        # The worker only enqueues; Tcl is entered by the UI owner thread.
         try:
-            app.after(0, lambda: status_var.set(msg))
+            _post_ui(app, lambda: status_var.set(msg))
         except Exception:
             pass
 
@@ -132,9 +174,32 @@ def show_busy_dialog(app, title: str, intro: str, worker, **worker_kwargs) -> No
             update_fn(f"Failed: {e}")
         finally:
             # Clean up on the main thread
-            app.after(400, lambda: (prog.stop(), dlg.destroy()))
+            _post_ui(
+                app,
+                lambda: (prog.stop(), dlg.destroy()),
+                delay_ms=400,
+            )
 
-    threading.Thread(target=_run, daemon=True).start()
+    try:
+        _start_critical_worker(
+            app,
+            _run,
+            name=f"busy-{title}",
+        )
+    except Exception as exc:
+        try:
+            prog.stop()
+        except Exception:
+            pass
+        detail = str(exc).replace("\r", " ").replace("\n", " ")[:160]
+        try:
+            status_var.set(f"Failed to start: {detail}")
+        except Exception:
+            pass
+        try:
+            dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        except Exception:
+            pass
 
 
 #  Spot stop dialog 
@@ -303,8 +368,14 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
             lambda update: async_simple_stop(app, name, app.cards[name], update),
         )
 
+    refresh_gate = _DialogRefreshGate()
+
     def _refresh_prices():
         """Live refresh on demand, in a background thread."""
+        generation = refresh_gate.claim()
+        if generation is None:
+            price_note.configure(text=" Refresh already in progress")
+            return
         price_note.configure(text=" Refreshing prices")
 
         def _bg():
@@ -314,6 +385,8 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
                 )
             except Exception:
                 def _fail():
+                    if not refresh_gate.finish(generation):
+                        return
                     try:
                         if dlg.winfo_exists():
                             price_note.configure(
@@ -322,12 +395,15 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
                     except Exception:
                         pass
                 try:
-                    app.after(0, _fail)
+                    if not _post_ui(app, _fail):
+                        refresh_gate.finish(generation)
                 except Exception:
-                    pass
+                    refresh_gate.finish(generation)
                 return
 
             def _apply():
+                if not refresh_gate.finish(generation):
+                    return
                 try:
                     if not dlg.winfo_exists():
                         return
@@ -403,12 +479,17 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
                     pass
 
             try:
-                app.after(0, _apply)
+                if not _post_ui(app, _apply):
+                    refresh_gate.finish(generation)
             except Exception:
-                pass
+                refresh_gate.finish(generation)
 
-        threading.Thread(target=_bg, daemon=True,
-                          name=f"refresh-spot-{name}").start()
+        try:
+            threading.Thread(target=_bg, daemon=True,
+                              name=f"refresh-spot-{name}").start()
+        except Exception:
+            refresh_gate.finish(generation)
+            price_note.configure(text=" Refresh could not start")
 
     action_color = COLORS["danger"] if not sim_mode else COLORS["warning"]
     close_button_pnl = (
@@ -634,8 +715,14 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
     def _cancel():
         dlg.destroy()
 
+    refresh_gate = _DialogRefreshGate()
+
     def _refresh_prices_fut():
         """Futures live-refresh in background."""
+        generation = refresh_gate.claim()
+        if generation is None:
+            price_note_fut.configure(text=" Refresh already in progress")
+            return
         price_note_fut.configure(text=" Refreshing prices")
 
         def _bg():
@@ -643,6 +730,8 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
                 refreshed = refresh_positions_with_live_prices(list(positions))
             except Exception:
                 def _fail():
+                    if not refresh_gate.finish(generation):
+                        return
                     try:
                         if dlg.winfo_exists():
                             price_note_fut.configure(
@@ -651,12 +740,15 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
                     except Exception:
                         pass
                 try:
-                    app.after(0, _fail)
+                    if not _post_ui(app, _fail):
+                        refresh_gate.finish(generation)
                 except Exception:
-                    pass
+                    refresh_gate.finish(generation)
                 return
 
             def _apply():
+                if not refresh_gate.finish(generation):
+                    return
                 try:
                     if not dlg.winfo_exists():
                         return
@@ -771,12 +863,17 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
                     pass
 
             try:
-                app.after(0, _apply)
+                if not _post_ui(app, _apply):
+                    refresh_gate.finish(generation)
             except Exception:
-                pass
+                refresh_gate.finish(generation)
 
-        threading.Thread(target=_bg, daemon=True,
-                          name="refresh-futures-stop").start()
+        try:
+            threading.Thread(target=_bg, daemon=True,
+                              name="refresh-futures-stop").start()
+        except Exception:
+            refresh_gate.finish(generation)
+            price_note_fut.configure(text=" Refresh could not start")
 
     action_color = COLORS["danger"] if not sim_mode else COLORS["warning"]
     close_button_pnl = (
@@ -1154,7 +1251,11 @@ def async_stop_all_and_quit(app, update, close_positions: bool) -> None:
             finally:
                 barriers.close()
 
-        app.after(shutdown_delay_ms, _shutdown_with_barrier_release)
+        _post_ui(
+            app,
+            _shutdown_with_barrier_release,
+            delay_ms=shutdown_delay_ms,
+        )
         transferred_to_shutdown = True
     finally:
         if not transferred_to_shutdown:
@@ -1220,8 +1321,24 @@ def _async_stop_all_and_quit_owned(
     for bot in running_bots:
         t = threading.Thread(target=_stop_worker,
                               args=(bot, close_positions), daemon=True)
-        t.start()
-        stop_threads.append(t)
+        try:
+            t.start()
+        except Exception as exc:
+            # Earlier stop workers already own live process mutations. Keep
+            # every restart barrier until those workers have been joined; a
+            # later Thread.start failure must never unwind the outer ExitStack
+            # while an earlier stop is still in progress.
+            with stop_errors_lock:
+                stop_errors.append(
+                    f"{bot}: stop worker start failed: {exc}"
+                )
+            try:
+                if t.is_alive():
+                    stop_threads.append(t)
+            except Exception:
+                pass
+        else:
+            stop_threads.append(t)
 
     for t in stop_threads:
         t.join()
@@ -1246,7 +1363,7 @@ def _async_stop_all_and_quit_owned(
                 close_modes = close_modes_for_stop(bot_name)
 
                 def _log(severity, msg, _c=card):
-                    app.after(0, lambda: log_to_card(_c, severity, msg))
+                    _post_ui(app, lambda: log_to_card(_c, severity, msg))
 
                 # CROSS is futures-type (is_futures=True)  use the futures
                 # close path so realized PnL is booked and futures_state cleared.
@@ -1279,8 +1396,23 @@ def _async_stop_all_and_quit_owned(
 
         for bot in BOT_ORDER:
             t = threading.Thread(target=_close_worker, args=(bot,), daemon=True)
-            t.start()
-            close_threads.append(t)
+            try:
+                t.start()
+            except Exception as exc:
+                # Preserve the same barrier-ownership contract during the
+                # fallback-close phase. Join any worker that did start before
+                # reporting failure and leaving the application open.
+                with close_errors_lock:
+                    close_errors.append(
+                        f"{bot}: close worker start failed: {exc}"
+                    )
+                try:
+                    if t.is_alive():
+                        close_threads.append(t)
+                except Exception:
+                    pass
+            else:
+                close_threads.append(t)
 
         for t in close_threads:
             t.join()
@@ -1288,7 +1420,7 @@ def _async_stop_all_and_quit_owned(
             update("Close verification failed  application left open")
             try:
                 from tkinter import messagebox
-                app.after(0, lambda: messagebox.showerror(
+                _post_ui(app, lambda: messagebox.showerror(
                     "Close verification failed",
                     "Some positions could not be verified/closed:\n"
                     + "\n".join(close_errors[:8])

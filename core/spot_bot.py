@@ -988,40 +988,45 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             last_runtime_status = 0.0
             self._last_hourly_status = 0.0
             while not self._shutdown_event.is_set():
-                # Scheduling must be immune to wall-clock corrections.  The
-                # launcher treats a missing runtime-status refresh as a stalled
-                # process, so a backwards OS-clock jump must not pause this
-                # cadence for the duration of the jump.
-                now = time.monotonic()
-                if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_SEC:
-                    tc = self.state.count()
-                    log_event(
-                        f" {self.BOT_NAME} heartbeat  "
-                        f"Open: {tc}/{self.C('MAX_OPEN_TRADES')}  "
-                        f"Monitor={'' if self._monitor_thread.is_alive() else ''}  "
-                        f"Scan={'' if self._scan_thread.is_alive() else ''}",
-                        "INFO"
-                    )
-                    self._publish_periodic_runtime_status(
-                        write_runtime_status, log_snapshot=True
-                    )
-                    last_heartbeat = now
-                if now - last_runtime_status >= 5.0:
-                    self._publish_periodic_runtime_status(
-                        write_runtime_status, log_snapshot=False
-                    )
-                    last_runtime_status = now
-                # Hourly Telegram status (realized + unrealized PnL + positions).
-                # Self-throttling; covers SPOT and TREND (both SpotBot).
                 try:
-                    from bot_utils.status_report import maybe_send_hourly_status
-                    self._last_hourly_status = maybe_send_hourly_status(
-                        bot_name=self.BOT_NAME, is_futures=False,
-                        simulation=self.simulation, state=self.state,
-                        last_sent=self._last_hourly_status,
-                    )
-                except Exception:
-                    pass
+                    # Scheduling must be immune to wall-clock corrections. The
+                    # coordinator itself must also survive a transient DB,
+                    # status or diagnostic failure while its safety workers are
+                    # still alive.
+                    now = time.monotonic()
+                    if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_SEC:
+                        tc = self.state.count()
+                        log_event(
+                            f" {self.BOT_NAME} heartbeat  "
+                            f"Open: {tc}/{self.C('MAX_OPEN_TRADES')}  "
+                            f"Monitor={'' if self._monitor_thread.is_alive() else ''}  "
+                            f"Scan={'' if self._scan_thread.is_alive() else ''}",
+                            "INFO"
+                        )
+                        self._publish_periodic_runtime_status(
+                            write_runtime_status, log_snapshot=True
+                        )
+                        last_heartbeat = now
+                    if now - last_runtime_status >= 5.0:
+                        self._publish_periodic_runtime_status(
+                            write_runtime_status, log_snapshot=False
+                        )
+                        last_runtime_status = now
+                    # Self-throttling hourly status; never lifecycle-critical.
+                    try:
+                        from bot_utils.status_report import maybe_send_hourly_status
+                        self._last_hourly_status = maybe_send_hourly_status(
+                            bot_name=self.BOT_NAME, is_futures=False,
+                            simulation=self.simulation, state=self.state,
+                            last_sent=self._last_hourly_status,
+                        )
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    try:
+                        self._log_error("runtime coordinator", exc)
+                    except Exception:
+                        pass
                 self._shutdown_event.wait(timeout=2)
         except KeyboardInterrupt:
             self._shutdown_handler(signum="KeyboardInterrupt")
@@ -1076,6 +1081,13 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                     raw_ex.load_markets()
                     break
                 except Exception as le:
+                    if is_authentication_error(le):
+                        log_event(
+                            "load_markets authentication failed; "
+                            "startup retry skipped until credentials are fixed",
+                            "WARN",
+                        )
+                        raise
                     if attempt == 3:
                         raise
                     wait = 5 * (2 ** (attempt - 1))
@@ -1234,12 +1246,16 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             return
         runner.join(timeout=self.SHUTDOWN_DEADLINE_SEC)
 
-        self._emergency_in_progress = runner.is_alive()
+        # The worker owns the in-progress latch and clears it in ``finally``.
+        # Never write a sampled ``True`` back here: the worker can terminate
+        # between is_alive() returning and the assignment, which would relatch
+        # an already-finished partial close and block every later retry.
+        runner_alive = runner.is_alive()
         if result["done"] and result["failed_count"] == 0:
             self._emergency_closed = True
             self._emergency_in_progress = False
         else:
-            if runner.is_alive():
+            if runner_alive:
                 log_event(
                     f" Emergency close exceeded {self.SHUTDOWN_DEADLINE_SEC}s "
                     f"deadline. Open positions may remain  a repeat shutdown "

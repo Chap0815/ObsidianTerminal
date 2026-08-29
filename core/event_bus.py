@@ -243,14 +243,18 @@ class EventBus:
 
             is_critical = event_type in _CRITICAL_EVENTS
             if is_critical:
-                # Per-handler deadline so one slow/full slot doesn't starve the
-                # next. Each handler gets up to _CRITICAL_PUT_TIMEOUT seconds;
-                # queue.Full on one handler is recorded via _emergency_log but
-                # does NOT skip the remaining handlers.
+                # One total deadline bounds the calling trading thread even
+                # when many subscribers share a full queue. Every handler is
+                # still attempted or recorded via the emergency path.
+                publish_deadline = time.monotonic() + _CRITICAL_PUT_TIMEOUT
                 for handler in handlers:
                     try:
+                        remaining = max(
+                            0.0,
+                            publish_deadline - time.monotonic(),
+                        )
                         self._work_queue.put(
-                            (handler, event), timeout=_CRITICAL_PUT_TIMEOUT)
+                            (handler, event), timeout=remaining)
                     except queue.Full:
                         # Record AND keep going  losing the DB-logger
                         # handler shouldn't lose the Telegram-alert one.
@@ -354,13 +358,18 @@ class EventBus:
 
     def _watchdog_loop(self) -> None:
         while not self._shutdown_event.wait(5.0):
-            alive = [t for t in self._worker_threads if t.is_alive()]
-            missing = self._n_workers - len(alive)
-            if (missing > 0 and not self._stopped
-                    and not self._shutdown_event.is_set()):
-                self._worker_threads = alive
-                for _ in range(missing):
-                    self._spawn_worker(len(self._worker_threads))
+            try:
+                alive = [t for t in self._worker_threads if t.is_alive()]
+                missing = self._n_workers - len(alive)
+                if (missing > 0 and not self._stopped
+                        and not self._shutdown_event.is_set()):
+                    self._worker_threads = alive
+                    for _ in range(missing):
+                        self._spawn_worker(len(self._worker_threads))
+            except Exception as exc:
+                # Thread creation and liveness probes can fail transiently.
+                # Keep the sole recovery owner alive for the next cycle.
+                _log_handler_error("event_bus watchdog repair", exc)
 
     def _emergency_log(self, event: Event) -> None:
         try:

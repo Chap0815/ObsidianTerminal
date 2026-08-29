@@ -17,6 +17,7 @@ import sys
 import threading  # tmp filename uses get_ident()
 import time  # retry sleep between os.replace attempts
 from contextlib import contextmanager
+from functools import lru_cache
 from tkinter import font as tkfont
 
 from core.constants import CONFIG_AUDIT_BACKUPS, CONFIG_AUDIT_MAX_BYTES
@@ -719,10 +720,16 @@ def _get_pythonw_exe() -> str:
 
 #  Font helper 
 
+@lru_cache(maxsize=1)
+def _available_font_families() -> frozenset[str]:
+    """Enumerate Tk fonts once for both synchronous startup selectors."""
+    return frozenset(tkfont.families())
+
+
 def _safe_mono_font() -> str:
     """First installed monospaced font from a small preference list."""
     try:
-        avail = set(tkfont.families())
+        avail = _available_font_families()
         for f in ("Cascadia Mono", "JetBrains Mono", "Consolas", "Courier New"):
             if f in avail:
                 return f
@@ -737,7 +744,7 @@ def _safe_display_font() -> str:
     gives the terminal its 'instrument' character for titles + eyebrows; falls
     back gracefully to Segoe UI so the launcher never renders a missing font."""
     try:
-        avail = set(tkfont.families())
+        avail = _available_font_families()
         for f in ("Bahnschrift", "Bahnschrift SemiBold", "Segoe UI Semibold",
                   "Segoe UI"):
             if f in avail:
@@ -1246,10 +1253,11 @@ def _save_config_unlocked(
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, allow_nan=False)
             f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
+            # Modes and entry gates must not be published from a temp file
+            # whose contents the OS could not durably flush. On failure the
+            # outer cleanup removes the temp and preserves the last-good
+            # config instead of reporting a non-durable save as successful.
+            os.fsync(f.fileno())
         # Windows retries: target may be open by the launcher poller.
         last_err = None
         for _ in range(8):

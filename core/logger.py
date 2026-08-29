@@ -224,9 +224,16 @@ _STRUCT_LOG_PATH_OVERRIDE = [None]
 _STRUCT_LOG_QUEUE: queue.Queue = queue.Queue(maxsize=5000)
 
 _STRUCT_WRITE_FAILS       = 0
+_STRUCT_WRITE_LOSSES      = 0
 _STRUCT_WRITE_FAIL_LOCK   = threading.Lock()
 _STRUCT_WRITE_FAIL_MAX    = 5
 _STRUCT_WRITE_RETRY_MAX   = 5
+_STRUCT_LOG_ITEM_MAX_BYTES = 64 * 1024
+_STRUCT_LOG_CONTAINER_MAX_ITEMS = 64
+_STRUCT_LOG_MAX_DEPTH = 6
+_STRUCT_LOG_MAX_NODES = 128
+_STRUCT_LOG_STRING_MAX_CHARS = 2 * 1024
+_STRUCT_LOG_FIELD_MAX_BYTES = 16 * 1024
 
 _STRUCT_WRITER_THREAD: threading.Thread = None
 _STRUCT_WRITER_LOCK = threading.Lock()
@@ -236,7 +243,7 @@ _STRUCT_WRITER_RETRY_SECONDS = 60.0
 
 def _struct_log_writer() -> None:
     """Outer try/except keeps the thread alive across any error class."""
-    global _STRUCT_WRITE_FAILS
+    global _STRUCT_WRITE_FAILS, _STRUCT_WRITE_LOSSES
     while True:
         try:
             try:
@@ -278,6 +285,8 @@ def _struct_log_writer() -> None:
                             except Exception:
                                 pass
                         if attempts >= _STRUCT_WRITE_RETRY_MAX:
+                            with _STRUCT_WRITE_FAIL_LOCK:
+                                _STRUCT_WRITE_LOSSES += 1
                             break
                         # Keep the accepted record unfinished until durable.
                         # Retry transient Windows/rotation failures, but do
@@ -346,7 +355,10 @@ def flush_structured_logs(timeout: float = 2.0) -> bool:
         try:
             if _STRUCT_LOG_QUEUE.unfinished_tasks == 0:
                 with _STRUCT_WRITE_FAIL_LOCK:
-                    return _STRUCT_WRITE_FAILS == 0
+                    return (
+                        _STRUCT_WRITE_FAILS == 0
+                        and _STRUCT_WRITE_LOSSES == 0
+                    )
             _ensure_struct_writer()
         except Exception:
             return False
@@ -921,38 +933,162 @@ def _log_struct_submit_error(context: str, exc: Exception) -> None:
         pass
 
 
-def _build_struct_log_item(event: str, fields: dict) -> tuple[str, str]:
-    record = {"ts": _date(), "event": _safe_log_text(event)}
-    for k, v in fields.items():
-        try:
-            if isinstance(v, (str, int, float, bool, type(None))):
-                record[k] = _redact_value(v, k)
-            elif isinstance(v, (list, tuple)):
-                json.dumps(v)
-                record[k] = _redact_value(list(v), k)
-            elif isinstance(v, dict):
-                json.dumps(v)
-                record[k] = _redact_value(v, k)
-            else:
-                record[k] = _redact_value(_safe_log_text(v), k)
-        except Exception:
-            record[k] = _redact_value(_safe_log_text(v), k)
+def _bounded_struct_key(value: object, index: int) -> str:
+    if isinstance(value, str) and len(value) <= 256:
+        return value
+    if isinstance(value, (int, float, bool, type(None))):
+        text = str(value)
+        if len(text) <= 256:
+            return text
+    return f"[bounded_key_{index}]"
 
-    path = _struct_log_path()
-    try:
+
+def _bounded_struct_value(
+    value,
+    *,
+    field_name: object = None,
+    depth: int = 0,
+    state: dict,
+    seen: set[int],
+):
+    state["nodes"] += 1
+    if state["nodes"] > _STRUCT_LOG_MAX_NODES:
+        state["truncated"] = True
+        return "[TRUNCATED_NODE_BUDGET]"
+    if field_name is not None and _is_secret_field_name(field_name):
+        return "***REDACTED***"
+    if isinstance(value, str):
+        if len(value) > _STRUCT_LOG_STRING_MAX_CHARS:
+            state["truncated"] = True
+            return f"[TRUNCATED_STRING chars={len(value)}]"
+        return _redact_value(value, field_name)
+    if isinstance(value, (int, bool, type(None))):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _safe_log_text(value)
+    if depth >= _STRUCT_LOG_MAX_DEPTH:
+        state["truncated"] = True
+        return "[TRUNCATED_DEPTH]"
+    if isinstance(value, dict):
+        identity = id(value)
+        if identity in seen:
+            state["truncated"] = True
+            return "[TRUNCATED_CYCLE]"
+        seen.add(identity)
+        bounded = {}
+        try:
+            for index, (key, nested) in enumerate(value.items()):
+                if index >= _STRUCT_LOG_CONTAINER_MAX_ITEMS:
+                    state["truncated"] = True
+                    break
+                safe_key = _bounded_struct_key(key, index)
+                bounded[safe_key] = _bounded_struct_value(
+                    nested,
+                    field_name=safe_key,
+                    depth=depth + 1,
+                    state=state,
+                    seen=seen,
+                )
+        except Exception:
+            state["truncated"] = True
+            bounded["_iteration_error"] = type(value).__name__
+        finally:
+            seen.discard(identity)
+        return bounded
+    if isinstance(value, (list, tuple)):
+        identity = id(value)
+        if identity in seen:
+            state["truncated"] = True
+            return "[TRUNCATED_CYCLE]"
+        seen.add(identity)
+        bounded = []
+        try:
+            for index, nested in enumerate(value):
+                if index >= _STRUCT_LOG_CONTAINER_MAX_ITEMS:
+                    state["truncated"] = True
+                    break
+                bounded.append(
+                    _bounded_struct_value(
+                        nested,
+                        depth=depth + 1,
+                        state=state,
+                        seen=seen,
+                    )
+                )
+        except Exception:
+            state["truncated"] = True
+            bounded.append(f"[ITERATION_ERROR:{type(value).__name__}]")
+        finally:
+            seen.discard(identity)
+        return bounded
+    text = _safe_log_text(value)
+    if len(text) > _STRUCT_LOG_STRING_MAX_CHARS:
+        state["truncated"] = True
+        return f"[TRUNCATED_OBJECT type={type(value).__name__}]"
+    return _redact_value(text, field_name)
+
+
+def _build_struct_log_item(event: str, fields: dict) -> tuple[str, str]:
+    event_text = _safe_log_text(event)
+    event_truncated = len(event_text) > _STRUCT_LOG_STRING_MAX_CHARS
+    if event_truncated:
+        event_text = "[TRUNCATED_EVENT]"
+    else:
+        event_text = _redact_value(event_text, "event")
+    record = {"ts": _date(), "event": event_text}
+    truncated_fields = []
+    added_fields = []
+    for index, (key, value) in enumerate(fields.items()):
+        if index >= _STRUCT_LOG_CONTAINER_MAX_ITEMS:
+            truncated_fields.append("[top_level_item_limit]")
+            break
+        safe_key = _bounded_struct_key(key, index)
+        state = {"nodes": 0, "truncated": False}
+        try:
+            safe_value = _bounded_struct_value(
+                value,
+                field_name=safe_key,
+                state=state,
+                seen=set(),
+            )
+            field_size = len(
+                json.dumps(
+                    safe_value,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            )
+            if field_size > _STRUCT_LOG_FIELD_MAX_BYTES:
+                safe_value = f"[TRUNCATED_FIELD bytes={field_size}]"
+                state["truncated"] = True
+        except Exception:
+            safe_value = f"[UNSERIALIZABLE:{type(value).__name__}]"
+            state["truncated"] = True
+        record[safe_key] = safe_value
+        added_fields.append(safe_key)
+        if state["truncated"]:
+            truncated_fields.append(safe_key)
+    if event_truncated:
+        record["_event_truncated"] = True
+    if truncated_fields:
+        record["_truncated_fields"] = truncated_fields
+
+    line = json.dumps(record, ensure_ascii=False, allow_nan=False)
+    while len(line.encode("utf-8")) > _STRUCT_LOG_ITEM_MAX_BYTES and added_fields:
+        removed = added_fields.pop()
+        record.pop(removed, None)
+        if removed not in truncated_fields:
+            truncated_fields.append(removed)
+        record["_truncated_fields"] = truncated_fields
         line = json.dumps(record, ensure_ascii=False, allow_nan=False)
-    except (TypeError, ValueError, OverflowError):
-        safe_record = {"ts": record.get("ts"), "event": record.get("event")}
-        for k, v in record.items():
-            if k in safe_record:
-                continue
-            try:
-                json.dumps(v, allow_nan=False)
-                safe_record[k] = v
-            except (TypeError, ValueError, OverflowError):
-                safe_record[k] = _redact_value(_safe_log_text(v), k)
-        line = json.dumps(safe_record, ensure_ascii=False, allow_nan=False)
-    return line, path
+    if len(line.encode("utf-8")) > _STRUCT_LOG_ITEM_MAX_BYTES:
+        record = {
+            "ts": record["ts"],
+            "event": "[TRUNCATED_STRUCTURED_EVENT]",
+            "_truncated_fields": ["[item_byte_limit]"],
+        }
+        line = json.dumps(record, ensure_ascii=False, allow_nan=False)
+    return line, _struct_log_path()
 
 
 def log_struct(event: str, **fields) -> bool:
@@ -988,7 +1124,7 @@ def _record_struct_queue_drop() -> None:
     with _STRUCT_DROP_LOCK:
         _STRUCT_DROP_COUNTER[0] += 1
         n = _STRUCT_DROP_COUNTER[0]
-        now = time.time()
+        now = time.monotonic()
         last = _STRUCT_DROP_LAST_WARN[0]
         if (now - last) >= 30.0:
             _STRUCT_DROP_LAST_WARN[0] = now
@@ -1209,7 +1345,12 @@ def _read_logger_state_json(path: str):
         object_pairs_hook=_logger_state_object_without_duplicate_keys,
     )
 
-def _preserve_corrupt_json(path: str, max_backups: int = 3) -> None:
+def _preserve_corrupt_json(
+    path: str,
+    max_backups: int = 3,
+    *,
+    move: bool = False,
+) -> None:
     """Copy one corrupt state file aside with a bounded forensic history."""
     directory = os.path.dirname(os.path.abspath(path)) or "."
     basename = os.path.basename(path)
@@ -1219,7 +1360,13 @@ def _preserve_corrupt_json(path: str, max_backups: int = 3) -> None:
         f"{basename}.corrupt.{stamp}.{os.getpid()}",
     )
     try:
-        shutil.copy2(path, backup)
+        if move:
+            # Oversized state can be arbitrarily large. Quarantine it with a
+            # same-filesystem rename instead of copying the whole untrusted
+            # input before the bot can continue startup.
+            os.replace(path, backup)
+        else:
+            shutil.copy2(path, backup)
         prefix = f"{basename}.corrupt."
         candidates = sorted(
             (
@@ -1246,6 +1393,8 @@ def load_j(f, default=None, *, preserve_corrupt: bool = False):
         try:
             return _read_logger_state_json(f)
         except _LoggerStateTooLarge as e:
+            if preserve_corrupt:
+                _preserve_corrupt_json(f, move=True)
             log_event(
                 f"Read error ({_safe_log_text(f)}): {_safe_log_text(e)}",
                 "WARN",
@@ -1320,6 +1469,7 @@ _LEGACY_REBUILD_LOCK = threading.Lock()
 _LAST_LEGACY_REBUILD = 0.0
 _LEGACY_REBUILD_INTERVAL_SEC = 3600.0  # rebuild at most once per hour
 _LEGACY_REBUILD_RETRY_SEC = 60.0
+_LEGACY_HISTORY_ROW_MAX_BYTES = 64 * 1024
 
 # Lock ordering: when more than one of the locks below must be held
 # simultaneously, always acquire in this order to prevent deadlock:
@@ -1328,6 +1478,69 @@ _LEGACY_REBUILD_RETRY_SEC = 60.0
 #  3. _LEGACY_REBUILD_LOCK  (inner  rare maintenance only)
 # Currently no code path acquires more than one at a time, so this is a
 # forward-looking constraint for future maintenance.
+
+
+def _stream_legacy_history(snapshot_path: str, legacy_path: str) -> bool:
+    """Atomically rebuild one JSON array with bounded per-row memory."""
+    target_tmp = (
+        f"{legacy_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    )
+    try:
+        _ensure_dir(os.path.dirname(legacy_path))
+        with open(snapshot_path, "rb") as source, open(
+            target_tmp, "w", encoding="utf-8"
+        ) as target:
+            target.write("[")
+            first = True
+            while True:
+                raw_line = source.readline(_LEGACY_HISTORY_ROW_MAX_BYTES + 1)
+                if not raw_line:
+                    break
+                if len(raw_line) > _LEGACY_HISTORY_ROW_MAX_BYTES:
+                    raise ValueError("legacy history row exceeds size limit")
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    entry = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeError):
+                    continue
+                encoded = json.dumps(
+                    entry,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+                target.write("\n  " if first else ",\n  ")
+                target.write(encoded)
+                first = False
+            target.write("\n]\n" if not first else "]\n")
+            target.flush()
+            try:
+                os.fsync(target.fileno())
+            except (AttributeError, OSError):
+                pass
+        for attempt in range(8):
+            try:
+                os.replace(target_tmp, legacy_path)
+                return True
+            except PermissionError:
+                if attempt >= 7:
+                    raise
+                time.sleep(0.05)
+    except Exception as exc:
+        log_event(
+            f"Write error ({_safe_log_text(legacy_path)}): "
+            f"{_safe_log_text(exc)}",
+            "WARN",
+        )
+    finally:
+        try:
+            if os.path.exists(target_tmp):
+                os.remove(target_tmp)
+        except OSError:
+            pass
+    return False
 
 
 def _legacy_rebuild_worker(jsonl_path: str, legacy_path: str) -> None:
@@ -1354,26 +1567,9 @@ def _legacy_rebuild_worker(jsonl_path: str, legacy_path: str) -> None:
             except Exception:
                 return
 
-        # Step 2: parse temp at leisure  no lock held, no original handle.
-        entries: list = []
-        try:
-            with open(temp_path, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entries.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-        except Exception:
-            return
-
-        # Step 3: write the legacy file (also outside the trade-log lock).
-        try:
-            save_j(legacy_path, entries)
-        except Exception:
-            pass
+        # Step 2: parse and write the legacy file at leisure. The source copy
+        # is immutable, each row is bounded, and no full Python list exists.
+        _stream_legacy_history(temp_path, legacy_path)
     finally:
         # Clean up temp regardless of outcome
         try:
@@ -1714,7 +1910,7 @@ def _record_tg_failure(reason: str, recipient_key: str) -> None:
         )
         state["count"] = int(state["count"]) + 1
         n = int(state["count"])
-        now = time.time()
+        now = time.monotonic()
         if n == 1:
             notice = (
                 f"Telegram delivery temporarily unavailable for one configured "
@@ -1811,7 +2007,7 @@ def send_telegram(token, chat_id, msg) -> bool:
             accepted_all = False
             # Surface telegram queue overflow to the visible log (rate-limited)
             # so the user notices when alerts stop arriving.
-            now_t = time.time()
+            now_t = time.monotonic()
             if (now_t - _TG_OVERFLOW_LAST_WARN) >= 30.0:
                 _TG_OVERFLOW_LAST_WARN = now_t
                 try:

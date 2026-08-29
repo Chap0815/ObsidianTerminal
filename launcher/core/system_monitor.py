@@ -9,7 +9,9 @@ result cache attached to :func:`_query_nvidia_smi`.
 from __future__ import annotations
 
 import math
+import os
 import subprocess
+import threading
 import time
 
 try:
@@ -21,19 +23,15 @@ except ImportError:
 
 from launcher.config.settings import subprocess_no_window_kwargs
 
+_NVIDIA_SUCCESS_CACHE_SEC = 3.0
+_NVIDIA_FAILURE_CACHE_SEC = 30.0
+_NVIDIA_PROBE_LOCK = threading.Lock()
 
-#  GPU via nvidia-smi (3 s cache) 
 
-def _query_nvidia_smi():
-    """Query nvidia-smi for GPU load + VRAM usage.
+#  GPU via nvidia-smi (3 s cache)
 
-    Cached for 3 s  the launcher's refresh loop ticks every 500 ms and we
-    don't want to fork a subprocess that often. Returns ``None`` when
-    nvidia-smi is missing or fails.
-    """
-    now = time.monotonic()
-    if _query_nvidia_smi._cached_until > now:
-        return _query_nvidia_smi._last_result
+def _probe_nvidia_smi() -> dict | None:
+    """Perform one bounded sensor subprocess call and validate its output."""
     try:
         kw = subprocess_no_window_kwargs()
         result = subprocess.run(
@@ -75,13 +73,94 @@ def _query_nvidia_smi():
                     }
     except Exception:
         data = None
-    _query_nvidia_smi._last_result = data
-    _query_nvidia_smi._cached_until = now + 3.0
     return data
+
+
+def _nvidia_probe_worker() -> None:
+    data = _probe_nvidia_smi()
+    cache_seconds = (
+        _NVIDIA_SUCCESS_CACHE_SEC
+        if data is not None
+        else _NVIDIA_FAILURE_CACHE_SEC
+    )
+    with _NVIDIA_PROBE_LOCK:
+        _query_nvidia_smi._last_result = data
+        _query_nvidia_smi._cached_until = time.monotonic() + cache_seconds
+        _query_nvidia_smi._probe_active = False
+
+
+def _query_nvidia_smi():
+    """Return cached GPU sensors and refresh them without blocking the poller."""
+    now = time.monotonic()
+    with _NVIDIA_PROBE_LOCK:
+        cached = _query_nvidia_smi._last_result
+        if _query_nvidia_smi._cached_until > now:
+            return cached
+        if _query_nvidia_smi._probe_active:
+            return cached
+        _query_nvidia_smi._probe_active = True
+    try:
+        worker = threading.Thread(
+            target=_nvidia_probe_worker,
+            daemon=True,
+            name="launcher-nvidia-probe",
+        )
+        worker.start()
+    except Exception:
+        with _NVIDIA_PROBE_LOCK:
+            _query_nvidia_smi._probe_active = False
+            _query_nvidia_smi._cached_until = (
+                now + _NVIDIA_FAILURE_CACHE_SEC
+            )
+    return cached
 
 
 _query_nvidia_smi._last_result = None      # type: ignore[attr-defined]
 _query_nvidia_smi._cached_until = 0        # type: ignore[attr-defined]
+_query_nvidia_smi._probe_active = False    # type: ignore[attr-defined]
+
+
+def _query_windows_commit_memory() -> dict | None:
+    """Return Windows commit usage, which physical-RAM stats do not expose."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        query = kernel32.GlobalMemoryStatusEx
+        query.argtypes = [ctypes.POINTER(MemoryStatusEx)]
+        query.restype = wintypes.BOOL
+        if not query(ctypes.byref(status)):
+            return None
+        limit = int(status.ullTotalPageFile)
+        available = int(status.ullAvailPageFile)
+        if limit <= 0 or available < 0 or available > limit:
+            return None
+        used = limit - available
+        return {
+            "percent": used / limit * 100.0,
+            "used_bytes": used,
+            "limit_bytes": limit,
+        }
+    except Exception:
+        return None
 
 
 #  Aggregate system stats 
@@ -90,6 +169,7 @@ def get_system_stats() -> dict:
     """Combined CPU / RAM / GPU snapshot. All fields are ``None`` when their
     source is unavailable so the UI can render "N/A" instead of zeros."""
     stats = {"cpu": None, "ram": None, "ram_used_gb": None, "ram_total_gb": None,
+             "commit": None, "commit_used_gb": None, "commit_limit_gb": None,
              "gpu": None, "gpu_name": None,
              "vram_pct": None, "vram_used_mb": None, "vram_total_mb": None}
     if HAS_PSUTIL:
@@ -101,6 +181,11 @@ def get_system_stats() -> dict:
             stats["ram_total_gb"] = mem.total / (1024 ** 3)
         except Exception:
             pass
+    commit = _query_windows_commit_memory()
+    if commit:
+        stats["commit"] = commit["percent"]
+        stats["commit_used_gb"] = commit["used_bytes"] / (1024 ** 3)
+        stats["commit_limit_gb"] = commit["limit_bytes"] / (1024 ** 3)
     nv = _query_nvidia_smi()
     if nv:
         stats["gpu"] = nv["load"]

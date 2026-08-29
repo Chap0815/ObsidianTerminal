@@ -44,6 +44,8 @@ _WINDOWS_GATE_WORKER = (
     "            sys.argv[4:],\n"
     "            creationflags=creationflags,\n"
     "            startupinfo=startupinfo,\n"
+    "            stdout=(sys.stdout.buffer if sys.stdout is not None else None),\n"
+    "            stderr=(sys.stderr.buffer if sys.stderr is not None else None),\n"
     "    ) as child:\n"
     "        returncode = child.wait()\n"
     "except BaseException:\n"

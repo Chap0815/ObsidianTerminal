@@ -35,6 +35,7 @@ import customtkinter as ctk
 import requests as _req
 
 from bot_utils.config import _read_config_json
+from bot_utils.subprocess_capture import run_bounded_capture
 
 try:
     import psutil  # noqa: F401  (used inside _refresh via HAS_PSUTIL)
@@ -98,8 +99,11 @@ from launcher.config.settings import (
     subprocess_no_window_kwargs,
 )
 from launcher.tool_processes import ToolProcessRegistry, stop_tool_processes
+from launcher.ui.concurrency import CriticalWorkerRegistry
 
 _ERROR_LOG_VIEW_MAX_BYTES = 1024 * 1024
+_UPDATE_CHECK_CAPTURE_MAX_BYTES = 256 * 1024
+_UI_DISPATCH_QUEUE_MAX = 4096
 
 
 def _error_log_path() -> str:
@@ -160,6 +164,7 @@ from launcher.ui.components.widgets import (
     Sparkline,
     attach_tooltip,
 )
+from launcher.ui.cadence import PeriodicGate
 from launcher.ui.dialogs.prompt_editor import PromptEditor
 from launcher.ui.scaling import apply_scaling
 from launcher.ui.theme import force_dark_titlebar
@@ -195,10 +200,27 @@ def _runtime_monotonic_age(rs: dict, *, now: float | None = None) -> float | Non
     return (time.monotonic() if now is None else now) - mono
 
 
+def _post_ui(app, callback, *, delay_ms: int = 0) -> None:
+    post = getattr(app, "post_ui", None)
+    if callable(post):
+        post(callback, delay_ms=delay_ms)
+        return
+    app.after(delay_ms, callback)
+
+
 class ObsidianApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
+        self._ui_owner_thread = threading.get_ident()
+        self._ui_dispatch_queue: queue.Queue[tuple[int, object]] = (
+            queue.Queue(maxsize=_UI_DISPATCH_QUEUE_MAX)
+        )
+        self._ui_dispatch_retry: tuple[int, object] | None = None
+        self._ui_dispatch_closed = False
+        self._clean_shutdown_completed = False
+        self.critical_workers = CriticalWorkerRegistry()
+        self.after(25, self._drain_posted_ui)
         self.tool_processes = ToolProcessRegistry()
         self.config = load_config()
         self._ollama_switch_lock = threading.Lock()
@@ -294,6 +316,7 @@ class ObsidianApp(ctk.CTk):
         self._dashboard_port = None
 
         self._pulse_step = 0
+        self._dashboard_refresh_gate = PeriodicGate(interval_seconds=1.0)
         self._vc_offset  = 0.0   # Virtual Capital Anzeigeoffset (kein DB-Reset)
         self._bad_hours_refresh_ctr = 0   # throttle: refresh BadHoursRow every ~30s
         self.param_rows     = {bot: {} for bot in BOT_ORDER}
@@ -323,6 +346,48 @@ class ObsidianApp(ctk.CTk):
         self._pulse()
         self.after(2500, self._check_for_updates_async)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def post_ui(self, callback, *, delay_ms: int = 0) -> bool:
+        """Schedule a callback without ever entering Tcl from a worker."""
+        if not callable(callback) or self._ui_dispatch_closed:
+            return False
+        delay = max(0, int(delay_ms))
+        if threading.get_ident() == self._ui_owner_thread:
+            self.after(delay, callback)
+        else:
+            try:
+                self._ui_dispatch_queue.put_nowait((delay, callback))
+            except queue.Full:
+                return False
+        return True
+
+    def _drain_posted_ui(self) -> None:
+        if self._ui_dispatch_closed:
+            return
+        for _index in range(256):
+            pending = getattr(self, "_ui_dispatch_retry", None)
+            if pending is not None:
+                self._ui_dispatch_retry = None
+                delay, callback = pending
+            else:
+                try:
+                    delay, callback = self._ui_dispatch_queue.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                self.after(delay, callback)
+            except Exception:
+                # Preserve order and retry on the next drain. A transient Tcl
+                # scheduling error must not permanently sever every later
+                # worker-to-UI completion notification.
+                self._ui_dispatch_retry = (delay, callback)
+                break
+        try:
+            self.after(25, self._drain_posted_ui)
+        except Exception:
+            # Expected only while Tcl is being torn down. No worker is allowed
+            # to enter Tcl to revive the pump from outside the owner thread.
+            pass
 
     def _set_content_minsize(self) -> None:
         """Floor the window at the measured natural content size so dragging it
@@ -623,6 +688,10 @@ class ObsidianApp(ctk.CTk):
         self.bar_cpu.pack(fill="x", pady=1)
         self.bar_ram  = MiniBar(bars_box, "RAM",  COLORS["aggressive"], height=20)
         self.bar_ram.pack(fill="x", pady=1)
+        self.bar_commit = MiniBar(
+            bars_box, "COMMIT", COLORS["danger"], height=20
+        )
+        self.bar_commit.pack(fill="x", pady=1)
         self.bar_gpu  = MiniBar(bars_box, "GPU",  COLORS["purple"],     height=20)
         self.bar_gpu.pack(fill="x", pady=1)
         self.bar_vram = MiniBar(bars_box, "VRAM", COLORS["violet"],     height=20)
@@ -2726,12 +2795,13 @@ class ObsidianApp(ctk.CTk):
 
         def _worker() -> None:
             try:
-                r = subprocess.run(
-                    [_get_python_exe(), "-m", "tools.update_check", "--json"],
+                update_python = _get_python_exe()
+                r = run_bounded_capture(
+                    [update_python, "-m", "tools.update_check", "--json"],
                     cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
                     timeout=15,
+                    max_output_bytes=_UPDATE_CHECK_CAPTURE_MAX_BYTES,
+                    wrapper_python=update_python,
                     **subprocess_no_window_kwargs(),
                 )
                 raw = (r.stdout or "").strip()
@@ -2744,9 +2814,25 @@ class ObsidianApp(ctk.CTk):
                     }
             except Exception as exc:
                 data = {"ok": False, "reason": "check_failed", "message": str(exc)}
-            self.after(0, lambda d=data: self._apply_update_check_result(d))
+            _post_ui(self, lambda d=data: self._apply_update_check_result(d))
 
-        threading.Thread(target=_worker, daemon=True).start()
+        try:
+            worker = threading.Thread(
+                target=_worker,
+                daemon=True,
+                name="launcher-update-check",
+            )
+            worker.start()
+        except Exception:
+            self._update_check_started = False
+            try:
+                self._apply_update_check_result({
+                    "ok": False,
+                    "reason": "check_failed",
+                    "message": "Update-Check konnte nicht gestartet werden.",
+                })
+            except Exception:
+                pass
 
     def _apply_update_check_result(self, data: dict) -> None:
         try:
@@ -3033,7 +3119,7 @@ class ObsidianApp(ctk.CTk):
                         )
 
                 try:
-                    self.after(0, _log_current_worker_error)
+                    _post_ui(self, _log_current_worker_error)
                 except Exception:
                     pass
             with self._ollama_switch_lock:
@@ -3108,7 +3194,7 @@ class ObsidianApp(ctk.CTk):
                 if self._ollama_switch_is_current(new_model, generation):
                     self._log_to_card(self.cards[log_target], severity, msg)
             try:
-                self.after(0, _emit_if_current)
+                _post_ui(self, _emit_if_current)
             except Exception:
                 pass
 
@@ -3379,7 +3465,7 @@ class ObsidianApp(ctk.CTk):
                 except Exception:
                     return
             try:
-                self.after(0, _apply_models_to_ui)
+                _post_ui(self, _apply_models_to_ui)
             except Exception:
                 pass
 
@@ -3604,8 +3690,19 @@ class ObsidianApp(ctk.CTk):
                 except Exception:
                     pass
                 self._refresh_err_logged = True
+        else:
+            self._refresh_err_logged = False
         finally:
-            self.after(500, self._refresh_tick)
+            try:
+                self.after(500, self._refresh_tick)
+            except Exception:
+                # A one-off Tcl scheduling failure must not permanently sever
+                # the only log/status refresh cadence. During real teardown the
+                # second attempt also fails and is intentionally ignored.
+                try:
+                    self.after(500, self._refresh_tick)
+                except Exception:
+                    pass
 
     def _safe_pack_before(self, widget, before, **kw):
         """pack(before=...) but never raise: on TclError (e.g. the reference
@@ -3644,7 +3741,11 @@ class ObsidianApp(ctk.CTk):
         try:
             if not self.bots[bot].is_running():
                 return None
-            rs = read_runtime_status(BOT_META[bot]["log_dir"])
+            cached = self.poller.get_all()
+            statuses = cached.get("runtime_status") or {}
+            rs = statuses.get(bot) if isinstance(statuses, dict) else None
+            if not isinstance(rs, dict):
+                return None
             run_id = str(getattr(self.bots[bot], "run_id", "") or "")
             if run_id and str(rs.get("run_id") or "") != run_id:
                 return None
@@ -3658,17 +3759,26 @@ class ObsidianApp(ctk.CTk):
             return None
         return None
 
-    def _external_runtime_status(self, bot: str) -> dict | None:
-        """Fresh runtime_status from a bot process not owned by this launcher."""
+    def _external_runtime_status(
+        self,
+        bot: str,
+        *,
+        require_fresh: bool = False,
+    ) -> dict | None:
+        """Runtime status from a verified bot not owned by this launcher.
+
+        Process identity remains a lifecycle blocker even if its heartbeat is
+        stale. Callers that consume telemetry values can require freshness.
+        """
         try:
             if self.bots[bot].is_running():
                 return None
             rs = read_runtime_status(BOT_META[bot]["log_dir"])
-            if not _runtime_status_is_fresh(rs):
-                return None
             pid = positive_int_or_zero(rs.get("pid"))
             from core.process_identity import pid_matches_bot
             if not pid_matches_bot(pid, bot):
+                return None
+            if require_fresh and not _runtime_status_is_fresh(rs):
                 return None
             return rs
         except Exception:
@@ -3691,7 +3801,7 @@ class ObsidianApp(ctk.CTk):
         shows a STALE mode (e.g. LIVE while the bot is really SIM) and a later
         Save would write the stale in-memory mode back over the real on-disk one.
         Re-reading the authoritative flag fixes both. Throttled to ~2s."""
-        now = time.time()
+        now = time.monotonic()
         if now - getattr(self, "_sim_sync_ts", 0.0) < 2.0:
             return
         self._sim_sync_ts = now
@@ -3710,7 +3820,12 @@ class ObsidianApp(ctk.CTk):
             if self.bots[bot].is_running():
                 continue
             external_rs = self._external_runtime_status(bot)
-            external_sim = _runtime_simulation_flag(external_rs)
+            external_sim = (
+                _runtime_simulation_flag(external_rs)
+                if external_rs is not None
+                and _runtime_status_is_fresh(external_rs)
+                else None
+            )
             if external_sim is not None:
                 if bool(self.config.get(bot, {}).get("SIMULATION", True)) != external_sim:
                     self.config.setdefault(bot, {})["SIMULATION"] = external_sim
@@ -3739,7 +3854,6 @@ class ObsidianApp(ctk.CTk):
         # Logs verarbeiten
         now_ts = time.time()
         now_monotonic = time.monotonic()
-        self._sync_sim_state()
         for bot in BOT_ORDER:
             card = self.cards[bot]
             q = self.log_queues[bot]
@@ -3800,6 +3914,12 @@ class ObsidianApp(ctk.CTk):
                         card, self._classify_severity(due_line), due_line
                     )
 
+        # Log queues remain responsive at 500 ms, while the expensive full
+        # CTk render and config/status reads run at most once per second.
+        if not self._dashboard_refresh_gate.due(now_monotonic):
+            return
+        self._sync_sim_state()
+
         cache = self.poller.get_all()
         global_llm = cache.get("llm") or {"online": False}
         global_llm_online = bool(global_llm.get("online"))
@@ -3814,7 +3934,12 @@ class ObsidianApp(ctk.CTk):
             if running:
                 status_label = "Active"
                 try:
-                    rs = read_runtime_status(BOT_META[bot]["log_dir"])
+                    statuses = cache.get("runtime_status") or {}
+                    rs = (
+                        statuses.get(bot)
+                        if isinstance(statuses, dict)
+                        else {}
+                    )
                     run_id = str(getattr(self.bots[bot], "run_id", "") or "")
                     if str(rs.get("run_id") or "") == run_id:
                         stale_age = _runtime_monotonic_age(rs)
@@ -3838,8 +3963,10 @@ class ObsidianApp(ctk.CTk):
                 try:
                     card["status"].set(
                         status_label + " - " + ("SIM" if _is_sim else "LIVE"))
-                    card["led"].configure(
-                        text_color=COLORS["info"] if _is_sim else COLORS["success"])
+                    self._set_card_led_color(
+                        card,
+                        COLORS["info"] if _is_sim else COLORS["success"],
+                    )
                 except Exception:
                     pass
                 card["start_btn"].configure(state="disabled",
@@ -3865,7 +3992,7 @@ class ObsidianApp(ctk.CTk):
                     card["status"].set(
                         f"External {status_label} - "
                         f"{'SIM' if _is_sim else 'LIVE'}")
-                    card["led"].configure(text_color=COLORS["warning"])
+                    self._set_card_led_color(card, COLORS["warning"])
                 except Exception:
                     card["status"].set("External Active")
                 card["start_btn"].configure(state="disabled",
@@ -3882,7 +4009,7 @@ class ObsidianApp(ctk.CTk):
             else:
                 card["status"].set("Stopped")
                 try:
-                    card["led"].configure(text_color=COLORS["text_muted"])
+                    self._set_card_led_color(card, COLORS["text_muted"])
                 except Exception:
                     pass
                 card["start_btn"].configure(state="normal",
@@ -4298,6 +4425,17 @@ class ObsidianApp(ctk.CTk):
         else:
             self.bar_ram.value_var.set("N/A")
             self.bar_ram.bar.set(0)
+        if sys_stats.get("commit") is not None:
+            commit_text = (
+                f"{sys_stats['commit_used_gb']:.1f}/"
+                f"{sys_stats['commit_limit_gb']:.0f}GB"
+            )
+            self.bar_commit.update_value(
+                sys_stats["commit"], subtitle=commit_text
+            )
+        else:
+            self.bar_commit.value_var.set("N/A")
+            self.bar_commit.bar.set(0)
         if sys_stats.get("gpu") is not None:
             self.bar_gpu.update_value(sys_stats["gpu"])
         else:
@@ -4397,6 +4535,14 @@ class ObsidianApp(ctk.CTk):
         # NOTE: rescheduling is handled by _refresh_tick() (the guarded driver),
         # so a crash anywhere above can never stop the refresh loop.
 
+    @staticmethod
+    def _set_card_led_color(card: dict, color: str) -> None:
+        """Avoid expensive CTk redraws when the requested color is unchanged."""
+        if card.get("_led_color") == color:
+            return
+        card["led"].configure(text_color=color)
+        card["_led_color"] = color
+
     def _pulse(self):
         self._pulse_step = (self._pulse_step + 1) % 20
         phase = abs(10 - self._pulse_step) / 10.0
@@ -4427,10 +4573,10 @@ class ObsidianApp(ctk.CTk):
 
                 # Soft pulse.
                 color = base_color if phase > 0.3 else self._darker(base_color, 0.4)
-                card["led"].configure(text_color=color)
+                self._set_card_led_color(card, color)
             else:
                 # Stopped: static red, no blinking.
-                card["led"].configure(text_color=COLORS["danger"])
+                self._set_card_led_color(card, COLORS["danger"])
 
         self.after(150, self._pulse)
 
@@ -4555,6 +4701,20 @@ class ObsidianApp(ctk.CTk):
 
     def _shutdown_clean(self, *, tools_stopped: bool = False):
         """Clean shutdown after every registered tool is proven stopped."""
+        worker_registry = getattr(self, "critical_workers", None)
+        active_names = getattr(worker_registry, "active_names", None)
+        active = tuple(active_names()) if callable(active_names) else ()
+        if active:
+            try:
+                from tkinter import messagebox
+                messagebox.showerror(
+                    "Obsidian Shutdown",
+                    "Der Launcher bleibt geoeffnet, weil eine kritische "
+                    "Operation noch laeuft: " + ", ".join(active[:4]),
+                )
+            except Exception:
+                pass
+            return False
         if (
             not tools_stopped
             and not ObsidianApp._stop_registered_tools_for_shutdown(self)
@@ -4599,10 +4759,84 @@ class ObsidianApp(ctk.CTk):
             if self.streamlit is dashboard:
                 self.streamlit = None
         try:
-            self.poller.stop()
+            poller_stopped = self.poller.stop()
         except Exception:
-            pass
-        self.destroy()
+            poller_stopped = False
+        if poller_stopped is False:
+            if not tools_stopped:
+                registry = getattr(self, "tool_processes", None)
+                resume = getattr(
+                    registry, "resume_after_aborted_shutdown", None
+                )
+                if callable(resume):
+                    try:
+                        resume()
+                    except Exception:
+                        pass
+            poller_resumed = False
+            resume_poller = getattr(
+                self.poller, "resume_after_aborted_stop", None
+            )
+            if callable(resume_poller):
+                try:
+                    poller_resumed = bool(resume_poller())
+                except Exception:
+                    pass
+            try:
+                from tkinter import messagebox
+                recovery_note = (
+                    ""
+                    if poller_resumed
+                    else "\nDie Datenanzeige konnte nicht wieder aktiviert werden."
+                )
+                messagebox.showerror(
+                    "Obsidian Shutdown",
+                    "Der Launcher bleibt geoeffnet, weil der Datenpoller "
+                    "noch einen laufenden Request besitzt."
+                    + recovery_note,
+                )
+            except Exception:
+                pass
+            return False
+        self._ui_dispatch_closed = True
+        self._clean_shutdown_completed = True
+        try:
+            self.destroy()
+        except Exception as exc:
+            # Tk teardown can fail transiently while Windows is processing a
+            # nested modal callback. The root may still be usable; reopen the
+            # dispatcher and every successfully stopped read-side lifecycle
+            # instead of leaving a live but permanently stale/deaf UI.
+            self._ui_dispatch_closed = False
+            self._clean_shutdown_completed = False
+            resume_poller = getattr(
+                self.poller, "resume_after_aborted_stop", None
+            )
+            if callable(resume_poller):
+                try:
+                    resume_poller()
+                except Exception:
+                    pass
+            if not tools_stopped:
+                registry = getattr(self, "tool_processes", None)
+                resume_registry = getattr(
+                    registry, "resume_after_aborted_shutdown", None
+                )
+                if callable(resume_registry):
+                    try:
+                        resume_registry()
+                    except Exception:
+                        pass
+            stderr = sys.stderr
+            if stderr is not None:
+                try:
+                    stderr.write(
+                        "[Launcher] window teardown failed; UI remains open: "
+                        f"{type(exc).__name__}\n"
+                    )
+                except Exception:
+                    pass
+            return False
         return True
 
     def _show_quit_no_positions_dialog(self):

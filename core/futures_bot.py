@@ -598,48 +598,61 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         threads: dict[str, bool],
     ) -> tuple[str, dict[str, Any]]:
         """Combine worker liveness with reported component health."""
-        try:
-            strategy_health = self._strategy_runtime_health()
-            if not isinstance(strategy_health, dict):
-                strategy_health = {
+        def read_health(reader) -> dict[str, Any]:
+            try:
+                health = reader()
+            except Exception as exc:
+                return {
                     "ok": False,
-                    "error_type": "invalid_strategy_health_payload",
+                    "error_type": type(exc).__name__,
                 }
-        except Exception as exc:
+            if not isinstance(health, dict):
+                return {
+                    "ok": False,
+                    "error_type": "invalid_health_payload",
+                }
+            return health
+
+        strategy_health = read_health(self._strategy_runtime_health)
+        if strategy_health.get("error_type") == "invalid_health_payload":
             strategy_health = {
                 "ok": False,
-                "error_type": type(exc).__name__,
+                "error_type": "invalid_strategy_health_payload",
             }
         strategy_ok = not strategy_health or strategy_health.get("ok") is True
-        ticker_health = self._ticker_runtime_health()
+        ticker_health = read_health(self._ticker_runtime_health)
         ticker_ok = not ticker_health or ticker_health.get("ok") is True
-        markout_health = self._markout_runtime_health()
+        markout_health = read_health(self._markout_runtime_health)
         markout_ok = not markout_health or markout_health.get("ok") is True
-        sim_evidence_health = self._sim_evidence_runtime_health()
+        sim_evidence_health = read_health(self._sim_evidence_runtime_health)
         sim_evidence_ok = (
             not sim_evidence_health
             or sim_evidence_health.get(
                 "runtime_ok", sim_evidence_health.get("ok")
             ) is True
         )
-        venue_health = self._venue_runtime_health()
+        venue_health = read_health(self._venue_runtime_health)
         venue_ok = not venue_health or venue_health.get("ok") is True
-        private_api_health = self._private_api_runtime_health()
+        private_api_health = read_health(self._private_api_runtime_health)
         private_api_ok = (
             not private_api_health
             or private_api_health.get("ok") is True
         )
-        entry_recovery_health = self._entry_recovery_runtime_health()
+        entry_recovery_health = read_health(
+            self._entry_recovery_runtime_health
+        )
         entry_recovery_ok = (
             not entry_recovery_health
             or entry_recovery_health.get("ok") is True
         )
-        exit_recovery_health = self._exit_recovery_runtime_health()
+        exit_recovery_health = read_health(self._exit_recovery_runtime_health)
         exit_recovery_ok = (
             not exit_recovery_health
             or exit_recovery_health.get("ok") is True
         )
-        position_integrity_health = self._position_integrity_runtime_health()
+        position_integrity_health = read_health(
+            self._position_integrity_runtime_health
+        )
         position_integrity_ok = (
             not position_integrity_health
             or position_integrity_health.get(
@@ -1798,43 +1811,50 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             last_runtime_status = 0.0
             self._last_hourly_status = 0.0
             while not self._shutdown_event.is_set():
-                # Scheduling must be immune to wall-clock corrections.  The
-                # launcher treats a missing runtime-status refresh as a stalled
-                # process, so a backwards OS-clock jump must not pause this
-                # cadence for the duration of the jump.
-                now = time.monotonic()
-                if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_SEC:
-                    tc = state_exposure_count(self.state)
-                    sm_marker = "  SAFE_MODE" if self.safe_mode.is_active() else ""
-                    log_event(
-                        f" {self.BOT_NAME} heartbeat  "
-                        f"Open: {tc}/{self.C('MAX_OPEN_TRADES')}  "
-                        f"Monitor={'' if self._monitor_thread.is_alive() else ''}  "
-                        f"Scan={'' if self._scan_thread.is_alive() else ''}"
-                        f"{sm_marker}",
-                        "INFO"
-                    )
-                    self._publish_periodic_runtime_status(
-                        write_runtime_status, log_snapshot=True
-                    )
-                    last_heartbeat = now
-                if now - last_runtime_status >= 5.0:
-                    self._publish_periodic_runtime_status(
-                        write_runtime_status, log_snapshot=False
-                    )
-                    last_runtime_status = now
-                # Hourly Telegram status (realized + unrealized PnL + positions).
-                # Self-throttling; covers FUTURES and CROSS (both FuturesBot).
                 try:
-                    from bot_utils.status_report import maybe_send_hourly_status
-                    self._last_hourly_status = maybe_send_hourly_status(
-                        bot_name=self.BOT_NAME, is_futures=True,
-                        simulation=self.simulation, state=self.state,
-                        last_sent=self._last_hourly_status,
-                        safe_mode_active=self.safe_mode.is_active(),
-                    )
-                except Exception:
-                    pass
+                    # Scheduling must be immune to wall-clock corrections. The
+                    # coordinator itself must also survive a transient DB,
+                    # status or diagnostic failure while its safety workers are
+                    # still alive.
+                    now = time.monotonic()
+                    if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_SEC:
+                        tc = state_exposure_count(self.state)
+                        sm_marker = (
+                            "  SAFE_MODE" if self.safe_mode.is_active() else ""
+                        )
+                        log_event(
+                            f" {self.BOT_NAME} heartbeat  "
+                            f"Open: {tc}/{self.C('MAX_OPEN_TRADES')}  "
+                            f"Monitor={'' if self._monitor_thread.is_alive() else ''}  "
+                            f"Scan={'' if self._scan_thread.is_alive() else ''}"
+                            f"{sm_marker}",
+                            "INFO"
+                        )
+                        self._publish_periodic_runtime_status(
+                            write_runtime_status, log_snapshot=True
+                        )
+                        last_heartbeat = now
+                    if now - last_runtime_status >= 5.0:
+                        self._publish_periodic_runtime_status(
+                            write_runtime_status, log_snapshot=False
+                        )
+                        last_runtime_status = now
+                    # Self-throttling hourly status; never lifecycle-critical.
+                    try:
+                        from bot_utils.status_report import maybe_send_hourly_status
+                        self._last_hourly_status = maybe_send_hourly_status(
+                            bot_name=self.BOT_NAME, is_futures=True,
+                            simulation=self.simulation, state=self.state,
+                            last_sent=self._last_hourly_status,
+                            safe_mode_active=self.safe_mode.is_active(),
+                        )
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    try:
+                        self._log_error("runtime coordinator", exc)
+                    except Exception:
+                        pass
                 self._shutdown_event.wait(timeout=2)
         except KeyboardInterrupt:
             self._shutdown_handler(signum="KeyboardInterrupt")
@@ -1888,6 +1908,30 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 )
                 return False
 
+        raw_ex = None
+        wrapped_ex = None
+        connected = False
+
+        def _cleanup_failed_connection() -> None:
+            target = wrapped_ex if wrapped_ex is not None else raw_ex
+            if target is None:
+                return
+            method_name = "shutdown" if wrapped_ex is not None else "close"
+            closer = getattr(target, method_name, None)
+            if callable(closer):
+                try:
+                    result = closer()
+                    if result is False:
+                        raise RuntimeError(
+                            "failed startup exchange cleanup remained incomplete"
+                        )
+                except Exception as close_err:
+                    self._log_error(
+                        "exchange cleanup after failed startup", close_err
+                    )
+            if getattr(self, "ex", None) is target:
+                self.ex = None
+
         try:
             raw_ex = self.EXCHANGE_FACTORY()
             # HTTP timeout  higher at startup for slow load_markets
@@ -1910,6 +1954,13 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     raw_ex.load_markets()
                     break
                 except Exception as le:
+                    if is_authentication_error(le):
+                        log_event(
+                            "load_markets authentication failed; "
+                            "startup retry skipped until credentials are fixed",
+                            "WARN",
+                        )
+                        raise
                     if attempt == 3:
                         raise
                     wait = 5 * (2 ** (attempt - 1))
@@ -1961,6 +2012,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             try:
                 from bot_utils.thread_exchange import ThreadLocalExchange
                 self.ex = ThreadLocalExchange(raw_ex)
+                wrapped_ex = self.ex
             except Exception as wrap_err:
                 # A shared CCXT instance is not safe across the scan, monitor
                 # and reconcile threads.  Refuse startup instead of reviving
@@ -1972,10 +2024,6 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     f"refusing unsafe shared exchange startup",
                     "WARN",
                 )
-                try:
-                    raw_ex.close()
-                except Exception as close_err:
-                    self._log_error("exchange cleanup after wrapper failure", close_err)
                 return False
 
             # Smoke test of the futures API surface.
@@ -2019,11 +2067,15 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                         f"will retry)", "INFO")
 
             log_event("Futures API connection established", "INFO")
+            connected = True
             return True
         except Exception as e:
             log_event(f"Futures connection failed: {e}", "WARN")
             self._log_error("Connection", e)
             return False
+        finally:
+            if not connected:
+                _cleanup_failed_connection()
 
     #  Shutdown 
 
@@ -2118,14 +2170,18 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             self._log_error("Emergency close thread start", exc)
             return
         runner.join(timeout=self.SHUTDOWN_DEADLINE_SEC)
-        self._emergency_in_progress = runner.is_alive()
+        # The worker owns the in-progress latch and clears it in ``finally``.
+        # Never write a sampled ``True`` back here: the worker can terminate
+        # between is_alive() returning and the assignment, which would relatch
+        # an already-finished partial close and block every later retry.
+        runner_alive = runner.is_alive()
         if result["done"] and result["failed_count"] == 0:
             # Fully flat  latch so atexit/repeat-signal won't redo the work.
             self._emergency_closed = True
             self._emergency_in_progress = False
         else:
             # Leave UN-latched so a repeat SIGTERM / atexit retries the rest.
-            if runner.is_alive():
+            if runner_alive:
                 log_event(
                     f" Emergency close exceeded {self.SHUTDOWN_DEADLINE_SEC}s "
                     f"deadline. Open positions may remain  a repeat shutdown "

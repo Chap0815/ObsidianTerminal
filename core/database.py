@@ -24,6 +24,7 @@ from core.paths import DB_PATH_STR as DB_PATH, ensure_runtime_dirs
 from core.constants import (
     MARKET_FILTER_CACHE_TTL_SECONDS,
     MARKET_REGIME_EVIDENCE_MAX_AGE_SECONDS,
+    MAX_SLIPPAGE_PCT,
     SIM_CAPTURE_CONTRACT_SCHEMA,
 )
 from trading.experiment_registry_contract import (
@@ -985,7 +986,7 @@ def _reconcile_portfolio_reservations(conn) -> tuple[int, int]:
         raise
 
 
-def init_db() -> None:
+def init_db(*, start_background_workers: bool = True) -> None:
     global _INIT_DB_DONE
     with _INIT_DB_LOCK:
         if _INIT_DB_DONE:
@@ -1021,8 +1022,9 @@ def init_db() -> None:
             )
     with _INIT_DB_LOCK:
         _INIT_DB_DONE = True
-    _start_maintenance_thread()
-    _start_vacuum_scheduler()
+    if start_background_workers:
+        _start_maintenance_thread()
+        _start_vacuum_scheduler()
     # Use log_event instead of print so the message goes through the
     # structured logger. Also: every bot subprocess calls init_db()
     # at startup  using print wrote "Database initialized" once per
@@ -2294,18 +2296,21 @@ def save_trade_db(
     elif position_type == "SHORT":
         close_move_pct = (buy_price - sell_price) / buy_price * 100.0
     if close_move_pct is not None and math.isfinite(close_move_pct):
-        excursion_tolerance = max(1e-6, abs(close_move_pct) * 1e-6)
+        # The sampled excursion values stop before the exchange's final fill.
+        # Include a bounded execution delta in the observed range instead of
+        # rejecting valid accounting. A larger conflict remains a structural
+        # evidence error and must not poison the trade journal.
         excursion_error = None
-        if (
-            mfe_pct is not None
-            and close_move_pct > mfe_pct + excursion_tolerance
-        ):
-            excursion_error = "close move exceeds MFE"
-        elif (
-            mae_pct is not None
-            and close_move_pct < mae_pct - excursion_tolerance
-        ):
-            excursion_error = "close move is below MAE"
+        if mfe_pct is not None and close_move_pct > mfe_pct:
+            if close_move_pct - mfe_pct <= MAX_SLIPPAGE_PCT:
+                mfe_pct = close_move_pct
+            else:
+                excursion_error = "close move exceeds MFE"
+        if mae_pct is not None and close_move_pct < mae_pct:
+            if mae_pct - close_move_pct <= MAX_SLIPPAGE_PCT:
+                mae_pct = close_move_pct
+            else:
+                excursion_error = "close move is below MAE"
         if excursion_error is not None:
             try:
                 from core.logger import log_event
@@ -7420,6 +7425,7 @@ _ORDER_RECOVERY_SOURCE_STATES = frozenset({
     "conflict",
 })
 _ORDER_RECOVERY_MAX_ITEMS = 8
+_ORDER_RECOVERY_SCAN_MAX_ROWS = 1024
 _ORDER_ZERO_FILL_MIN_AGE_SECONDS = 60
 _ORDER_ZERO_FILL_QUORUM_INTERVAL_SECONDS = 15
 _ORDER_ZERO_FILL_REQUIRED_SOURCES = frozenset({
@@ -7585,9 +7591,12 @@ def claim_due_order_intent_recoveries(
                 WHERE intent.bot_name=?
                   AND intent.status!='FINALIZED'
                   AND UPPER(TRIM(intent.mode))!='SIM'
-             ORDER BY intent.created_at, intent.intent_id""",
-            (validated_bot,),
+             ORDER BY intent.created_at, intent.intent_id
+                LIMIT ?""",
+            (validated_bot, _ORDER_RECOVERY_SCAN_MAX_ROWS + 1),
         ).fetchall()
+        if len(rows) > _ORDER_RECOVERY_SCAN_MAX_ROWS:
+            raise ValueError("order recovery queue exceeds scan limit")
         for raw_row in rows:
             if len(claimed) >= limit:
                 break
@@ -8077,6 +8086,25 @@ def finalize_qualified_zero_fill_order_intent(
         raise
 
 
+def _order_recovery_overflow_health(unresolved_count: int) -> dict:
+    return {
+        "ok": False,
+        "component": "entry_recovery",
+        "state": "blocked",
+        "reason": "recovery_queue_overflow",
+        "unresolved_count": unresolved_count,
+        "oldest_age_seconds": 0.0,
+        "next_retry_at": None,
+        "next_retry_seconds": 0.0,
+        "max_attempt_count": 0,
+        "budget_denied": False,
+        "zero_fill_qualified_count": 0,
+        "evidence_counts": {},
+        "source_counts": {},
+        "items": [],
+    }
+
+
 def order_intent_recovery_health(
     bot_name: str,
     *,
@@ -8095,7 +8123,27 @@ def order_intent_recovery_health(
         now_dt = _utcnow()
     else:
         _, now_dt = _trade_timestamp_db(now, "recovery health time")
-    rows = get_connection().execute(
+    connection = get_connection()
+    count_row = connection.execute(
+        """SELECT COUNT(*) AS unresolved_count
+             FROM order_intents AS intent
+            WHERE intent.bot_name=?
+              AND intent.status!='FINALIZED'
+              AND UPPER(TRIM(intent.mode))!='SIM'""",
+        (validated_bot,),
+    ).fetchone()
+    unresolved_count = (
+        count_row["unresolved_count"] if count_row is not None else 0
+    )
+    if (
+        isinstance(unresolved_count, bool)
+        or not isinstance(unresolved_count, int)
+        or unresolved_count < 0
+    ):
+        raise ValueError("order recovery queue count is invalid")
+    if unresolved_count > _ORDER_RECOVERY_SCAN_MAX_ROWS:
+        return _order_recovery_overflow_health(unresolved_count)
+    rows = connection.execute(
         """SELECT intent.symbol, intent.status, intent.created_at,
                   recovery.attempt_count, recovery.next_attempt_at,
                   recovery.evidence_state, recovery.source_status_json,
@@ -8110,9 +8158,14 @@ def order_intent_recovery_health(
             WHERE intent.bot_name=?
               AND intent.status!='FINALIZED'
               AND UPPER(TRIM(intent.mode))!='SIM'
-         ORDER BY intent.created_at, intent.intent_id""",
-        (validated_bot,),
+         ORDER BY intent.created_at, intent.intent_id
+            LIMIT ?""",
+        (validated_bot, _ORDER_RECOVERY_SCAN_MAX_ROWS + 1),
     ).fetchall()
+    if len(rows) > _ORDER_RECOVERY_SCAN_MAX_ROWS:
+        return _order_recovery_overflow_health(
+            max(unresolved_count, len(rows))
+        )
     if not rows:
         return {
             "ok": True,

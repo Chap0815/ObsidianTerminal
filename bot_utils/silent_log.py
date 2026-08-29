@@ -26,6 +26,8 @@ import time
 from collections import OrderedDict
 from typing import Callable, Optional
 
+from bot_utils.errors import _fallback_bounded_append
+
 try:
     from core.constants import SILENT_LOG_BACKUPS, SILENT_LOG_MAX_BYTES
 except Exception:
@@ -175,6 +177,13 @@ def _persist(msg: str) -> None:
         with _PERSIST_LOCK:
             if _append_rotating_text is not None:
                 _append_rotating_text(
+                    path,
+                    line,
+                    SILENT_LOG_MAX_BYTES,
+                    SILENT_LOG_BACKUPS,
+                )
+            else:
+                _fallback_bounded_append(
                     path,
                     line,
                     SILENT_LOG_MAX_BYTES,

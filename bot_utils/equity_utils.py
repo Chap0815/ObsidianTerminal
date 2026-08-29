@@ -430,6 +430,7 @@ def compute_spot_equity(ex) -> Optional[dict]:
 
         # Try bulk first  much faster, fewer API calls.
         ticker_cache: dict = {}
+        batch_fetch_failed = False
         try:
             if (
                 getattr(ex, "has", {}).get("fetchTickers")
@@ -440,6 +441,13 @@ def compute_spot_equity(ex) -> Optional[dict]:
                     ticker_cache = tickers
         except Exception:
             ticker_cache = {}
+            batch_fetch_failed = True
+
+        if batch_fetch_failed:
+            # Stablecoin free cash alone is not total spot equity when priced
+            # holdings exist. Expose an unavailable snapshot instead of a
+            # deceptively low but apparently complete dashboard balance.
+            return None
 
         for coin, amount in non_stable_holdings.items():
             pair = symbol_pairs[coin]
@@ -455,6 +463,7 @@ def compute_spot_equity(ex) -> Optional[dict]:
             # Fall back to per-symbol fetch
             if (
                 price <= 0
+                and not batch_fetch_failed
                 and try_consume_api_call("dashboard_spot_fetch_ticker")
             ):
                 try:

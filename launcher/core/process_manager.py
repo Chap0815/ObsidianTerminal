@@ -27,7 +27,7 @@ from __future__ import annotations
 import os
 import queue
 import re
-from collections import deque
+from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import contextmanager
 import signal
@@ -58,6 +58,37 @@ _LEVEL_THEN_TIMESTAMP_RE = re.compile(
     r"BUY|SELL|WIN|LOSS)\s+\[\d{2}:\d{2}:\d{2}\]\s+",
     re.IGNORECASE,
 )
+_UI_LOG_LINE_MAX_CHARS = 16 * 1024
+_UI_LOG_LINE_TRUNCATED = " [launcher line truncated]"
+
+
+class _BoundedStdoutLineReader:
+    """Read text-pipe lines without ever materializing an unbounded line."""
+
+    def __init__(self, stream, *, max_chars: int = _UI_LOG_LINE_MAX_CHARS):
+        self._stream = stream
+        self._max_chars = max(1, int(max_chars))
+        self._discarding = False
+
+    @staticmethod
+    def _has_delimiter(chunk: str) -> bool:
+        return chunk.endswith(("\n", "\r"))
+
+    def read(self) -> tuple[str, bool]:
+        while True:
+            chunk = self._stream.readline(self._max_chars + 1)
+            if chunk == "":
+                raise StopIteration
+            if self._discarding:
+                if self._has_delimiter(chunk):
+                    self._discarding = False
+                continue
+            if self._has_delimiter(chunk):
+                return chunk, False
+            if len(chunk) <= self._max_chars:
+                return chunk, False
+            self._discarding = True
+            return chunk[:self._max_chars], True
 
 
 def _clean_shutdown_proven(shutdown: object) -> bool:
@@ -111,6 +142,11 @@ def _redact_ui_log_line(line: str) -> str:
         safe = redact(str(line))
         if not isinstance(safe, str):
             raise TypeError("redactor returned non-text")
+        if len(safe) > _UI_LOG_LINE_MAX_CHARS:
+            safe = (
+                safe[:_UI_LOG_LINE_MAX_CHARS - len(_UI_LOG_LINE_TRUNCATED)]
+                + _UI_LOG_LINE_TRUNCATED
+            )
         return safe
     except Exception:
         # Never expose the original line when the redaction layer is broken.
@@ -219,10 +255,14 @@ class BoundedLogQueue:
 
     def __init__(self, maxsize: int = 5000) -> None:
         self.maxsize = max(1, int(maxsize))
-        self._items = deque()
+        self._items: OrderedDict[int, tuple[str, int]] = OrderedDict()
+        self._priority_items = [OrderedDict() for _level in range(4)]
+        self._next_item_id = 0
+        self._priority_counts = [0, 0, 0, 0]
         self._lock = threading.Lock()
         self._dropped_routine = 0
         self._dropped_important = 0
+        self._force_item_before_drop_summary = False
 
     @staticmethod
     def _priority(line: str) -> int:
@@ -246,50 +286,65 @@ class BoundedLogQueue:
         else:
             self._dropped_routine += 1
 
+    def _append_item(self, item: str, priority: int) -> None:
+        self._next_item_id += 1
+        item_id = self._next_item_id
+        self._items[item_id] = (item, priority)
+        self._priority_items[priority][item_id] = None
+        self._priority_counts[priority] += 1
+
+    def _remove_item(self, item_id: int) -> tuple[str, int]:
+        item, priority = self._items.pop(item_id)
+        self._priority_items[priority].pop(item_id, None)
+        self._priority_counts[priority] -= 1
+        return item, priority
+
     def put_nowait(self, line: str) -> None:
         item = str(line)
         priority = self._priority(item)
         with self._lock:
             if len(self._items) < self.maxsize:
-                self._items.append((item, priority))
+                self._append_item(item, priority)
                 return
 
             victim = None
             if priority:
                 for lower_level in range(priority):
-                    victim = next(
-                        (
-                            i
-                            for i, (_text, level) in enumerate(self._items)
-                            if level == lower_level
-                        ),
-                        None,
-                    )
-                    if victim is not None:
-                        break
+                    candidates = self._priority_items[lower_level]
+                    if not candidates:
+                        continue
+                    victim = next(iter(candidates))
+                    break
                 if victim is None and priority == 3:
-                    victim = 0
+                    victim = next(iter(self._items))
             else:
-                victim = next(
-                    (i for i, (_text, level) in enumerate(self._items) if level == 0),
-                    None,
-                )
+                candidates = self._priority_items[0]
+                if candidates:
+                    victim = next(iter(candidates))
 
             if victim is None:
                 self._record_drop(priority)
                 return
-            _dropped_text, dropped_priority = self._items[victim]
-            del self._items[victim]
+            _dropped_text, dropped_priority = self._remove_item(victim)
             self._record_drop(dropped_priority)
-            self._items.append((item, priority))
+            self._append_item(item, priority)
 
     def get_nowait(self) -> str:
         with self._lock:
-            if self._dropped_routine or self._dropped_important:
+            has_drops = bool(
+                self._dropped_routine or self._dropped_important
+            )
+            if has_drops and (
+                not self._force_item_before_drop_summary or not self._items
+            ):
                 routine = self._dropped_routine
                 important = self._dropped_important
                 self._dropped_routine = 0
                 self._dropped_important = 0
+                # Under sustained producer pressure, force one real queued
+                # line after every summary. Otherwise each read can observe a
+                # fresh drop and the bounded queue never drains at all.
+                self._force_item_before_drop_summary = bool(self._items)
                 parts = []
                 if routine:
                     parts.append(
@@ -305,7 +360,10 @@ class BoundedLogQueue:
                 )
             if not self._items:
                 raise queue.Empty
-            return self._items.popleft()[0]
+            self._force_item_before_drop_summary = False
+            item_id = next(iter(self._items))
+            item, _priority = self._remove_item(item_id)
+            return item
 
     def qsize(self) -> int:
         with self._lock:
@@ -437,9 +495,10 @@ class BotProcess:
             self.proc = spawned_proc
             self.start_config = current_config_snapshot
             try:
+                reader_run_id = self.run_id
                 threading.Thread(
                     target=self._reader,
-                    args=(spawned_proc,),
+                    args=(spawned_proc, reader_run_id),
                     daemon=True,
                 ).start()
             except Exception:
@@ -506,7 +565,8 @@ class BotProcess:
 
     def _mark_runtime_stopped(self, returncode=None, *,
                               expected_run_id: str | None = None,
-                              expected_pid: int | None = None) -> None:
+                              expected_pid: int | None = None,
+                              stopped_by: str = "launcher") -> None:
         if not self.bot_name:
             return
         try:
@@ -553,7 +613,11 @@ class BotProcess:
                         last.get("open_positions")
                     ),
                     "previous_status": str(last.get("status") or ""),
-                    "stopped_by": "launcher",
+                    "stopped_by": (
+                        stopped_by
+                        if stopped_by in {"launcher", "process_exit"}
+                        else "launcher"
+                    ),
                     "returncode": returncode,
                     "shutdown": shutdown,
                 }
@@ -746,13 +810,41 @@ class BotProcess:
         # atomic, and Popen.poll() is documented as thread-safe. This lets
         # the launcher's polling loop check status while a slow stop() is
         # still mid-wait, without deadlocking against the lifecycle lock.
-        return self.proc is not None and self.proc.poll() is None
+        proc = self.proc
+        if proc is None:
+            return False
+        try:
+            return proc.poll() is None
+        except Exception:
+            # An invalid/transient Windows process handle is an unknown
+            # lifecycle state, never proof of exit. Keep the bot owned and
+            # block duplicate start/stop decisions until a later probe can
+            # determine the real state.
+            return True
 
     #  Stdout reader 
 
-    def _enqueue_log_line(self, line: str) -> None:
+    def _enqueue_log_line(
+        self,
+        line: str,
+        *,
+        expected_run_id: str | None = None,
+    ) -> None:
         """Queue one line without ever blocking the bot process."""
-        line = _redact_ui_log_line(line)
+        self._enqueue_redacted_log_line(
+            _redact_ui_log_line(line),
+            expected_run_id=expected_run_id,
+        )
+
+    def _enqueue_redacted_log_line(
+        self,
+        line: str,
+        *,
+        expected_run_id: str | None = None,
+    ) -> None:
+        """Queue text that already crossed the subprocess redaction boundary."""
+        if expected_run_id is not None and self.run_id != expected_run_id:
+            return
         try:
             self.log_queue.put_nowait(line)
         except queue.Full:
@@ -762,26 +854,108 @@ class BotProcess:
             except (queue.Empty, queue.Full):
                 pass
 
-    def _reader(self, proc: subprocess.Popen) -> None:
+    def _reader(
+        self,
+        proc: subprocess.Popen,
+        expected_run_id: str | None = None,
+    ) -> None:
         if not proc or not proc.stdout:
             return
+        if expected_run_id is None:
+            expected_run_id = self.run_id
         stdout = proc.stdout
         compactor = RepeatedLogCompactor()
+        pipe_error_reported = False
         try:
-            for line in stdout:
+            reader = _BoundedStdoutLineReader(stdout)
+            while self.run_id == expected_run_id:
+                try:
+                    line, line_truncated = reader.read()
+                except StopIteration:
+                    break
+                except OSError as exc:
+                    try:
+                        process_alive = proc.poll() is None
+                    except Exception:
+                        process_alive = True
+                    if not process_alive:
+                        break
+                    if not pipe_error_reported:
+                        self._enqueue_log_line(
+                            "WARN [launcher] "
+                            f"{self.bot_name or 'bot'} stdout read interrupted "
+                            f"({type(exc).__name__}); retrying",
+                            expected_run_id=expected_run_id,
+                        )
+                        pipe_error_reported = True
+                    # A transient Windows pipe read error must not abandon the
+                    # live child's only consumer. Retain the same iterator and
+                    # run generation, with a bounded retry cadence so a broken
+                    # handle cannot spin one CPU core.
+                    time.sleep(0.1)
+                    continue
+                if self.run_id != expected_run_id:
+                    break
                 line = line.rstrip("\n").rstrip("\r")
                 if line and "\r" not in line:
+                    if line_truncated:
+                        line += _UI_LOG_LINE_TRUNCATED
                     line = _redact_ui_log_line(line)
                     # Drop-oldest policy: if the queue is full, ditch the
                     # oldest line and append the new one. Without this the
                     # reader could block forever and new logs would stop
                     # appearing in the UI.
                     for output_line in compactor.push(line):
-                        self._enqueue_log_line(output_line)
+                        self._enqueue_redacted_log_line(
+                            output_line,
+                            expected_run_id=expected_run_id,
+                        )
         finally:
-            for output_line in compactor.flush():
-                self._enqueue_log_line(output_line)
+            if self.run_id == expected_run_id:
+                for output_line in compactor.flush():
+                    self._enqueue_redacted_log_line(
+                        output_line,
+                        expected_run_id=expected_run_id,
+                    )
             try:
                 stdout.close()
             except Exception:
                 pass
+            # EOF normally means the owned child exited.  Publish that fact
+            # immediately instead of leaving its last ``ready`` heartbeat for
+            # the next launcher session to diagnose as a stale live PID.  A
+            # process is cleared only when both its object and run generation
+            # are still current; concurrent stop/restart paths retain authority
+            # over every other generation.
+            returncode = None
+            try:
+                returncode = proc.poll()
+                if returncode is None:
+                    try:
+                        returncode = proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        returncode = None
+            except Exception:
+                returncode = None
+            if returncode is not None:
+                owned_exit = False
+                with self._lifecycle_lock:
+                    if self.proc is proc and self.run_id == expected_run_id:
+                        self.proc = None
+                        if self._failed_start_owned_proc is proc:
+                            self._failed_start_owned_proc = None
+                        owned_exit = True
+                if owned_exit:
+                    if returncode != 0:
+                        self._enqueue_log_line(
+                            "ERROR [launcher] "
+                            f"{self.bot_name or 'bot'} process exited unexpectedly "
+                            f"(returncode={returncode})",
+                            expected_run_id=expected_run_id,
+                        )
+                    self._mark_runtime_stopped(
+                        returncode,
+                        expected_run_id=expected_run_id,
+                        expected_pid=getattr(proc, "pid", 0),
+                        stopped_by="process_exit",
+                    )

@@ -29,11 +29,71 @@ from trading.venue_recorder import (
 )
 
 
+_PUBLIC_ASYNC_CLOSE_TIMEOUT_SECONDS = 5.0
+_TRADE_UPDATE_MAX_ROWS = 20_000
+
+
 def _capture_now_ms() -> int:
     """Exchange-anchored capture receipt time in epoch milliseconds."""
     from core.clock import now_ms
 
     return int(now_ms())
+
+
+def _consume_async_task_result(task: asyncio.Future) -> None:
+    try:
+        task.exception()
+    except BaseException:
+        pass
+
+
+async def close_public_async_exchange(
+    exchange,
+    *,
+    timeout_seconds: float = _PUBLIC_ASYNC_CLOSE_TIMEOUT_SECONDS,
+) -> bool:
+    """Close one public async client without wedging reconnect or shutdown."""
+    try:
+        budget = float(timeout_seconds)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("async exchange close timeout must be finite") from exc
+    if not math.isfinite(budget) or budget <= 0.0:
+        raise ValueError("async exchange close timeout must be finite and positive")
+    close = getattr(exchange, "close", None)
+    if not callable(close):
+        return True
+    try:
+        task = asyncio.ensure_future(close())
+    except Exception:
+        return False
+
+    async def finish_bounded() -> bool:
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+        except TimeoutError:
+            task.cancel()
+            # Give cancellation-aware aiohttp/CCXT cleanup one loop turn, but
+            # never await a cancellation-resistant close without a deadline.
+            await asyncio.sleep(0)
+            if task.done():
+                _consume_async_task_result(task)
+            else:
+                task.add_done_callback(_consume_async_task_result)
+            return False
+        except Exception:
+            return False
+        return True
+
+    try:
+        return await finish_bounded()
+    except asyncio.CancelledError:
+        # A caller cancellation requests shutdown; it must not skip client
+        # cleanup, but cleanup still obeys the same hard deadline.
+        current = asyncio.current_task()
+        if current is not None:
+            current.uncancel()
+        await finish_bounded()
+        raise
 
 
 class OrderBookValidationError(ValueError):
@@ -362,7 +422,16 @@ class L2ShadowCollector:
         except (TypeError, ValueError, OverflowError):
             return None
 
-    def record_order_book(self, symbol: str, book: dict) -> bool:
+    def record_order_book(
+        self,
+        symbol: str,
+        book: dict,
+        *,
+        received_ms: int | None = None,
+        observed_at_monotonic: float | None = None,
+        connection_epoch: int | None = None,
+        universe: tuple[str, ...] | None = None,
+    ) -> bool:
         """Validate and optionally persist one sampled unified snapshot."""
         try:
             normalized = normalize_order_book(book, depth_levels=self.depth_levels)
@@ -371,8 +440,13 @@ class L2ShadowCollector:
             self._log_invalid_snapshot(symbol, exc)
             return False
 
-        now_monotonic = time.monotonic()
-        received_ms = _capture_now_ms()
+        now_monotonic = (
+            time.monotonic()
+            if observed_at_monotonic is None
+            else observed_at_monotonic
+        )
+        if received_ms is None:
+            received_ms = _capture_now_ms()
         with self._state_lock:
             previous_nonce = self._last_nonce.get(symbol)
             current_nonce = normalized["nonce"]
@@ -389,7 +463,8 @@ class L2ShadowCollector:
                 return False
             self._last_persist[symbol] = now_monotonic
             self._updates_since_sample[symbol] = 0
-            connection_epoch = self._connection_epoch
+            if connection_epoch is None:
+                connection_epoch = self._connection_epoch
 
         flags = ["sequence_unverified"]
         exchange_ms = normalized["timestamp"]
@@ -425,7 +500,9 @@ class L2ShadowCollector:
         payload = {
             "venue": self.exchange_id,
             "symbol": symbol,
-            "universe": list(self._symbol_snapshot()),
+            "universe": list(
+                self._symbol_snapshot() if universe is None else universe
+            ),
             "bids": normalized["bids"],
             "asks": normalized["asks"],
             "nonce": normalized["nonce"],
@@ -486,12 +563,38 @@ class L2ShadowCollector:
             )
         return True
 
-    def record_trades(self, symbol: str, trades) -> bool:
+    def record_trades(
+        self,
+        symbol: str,
+        trades,
+        *,
+        received_ms: int | None = None,
+        observed_at_monotonic: float | None = None,
+        connection_epoch: int | None = None,
+        universe: tuple[str, ...] | None = None,
+    ) -> bool:
         """Persist one bounded CCXT-Pro public-trade update."""
-        if not isinstance(trades, (list, tuple)) or not trades:
+        if not isinstance(trades, (list, tuple)):
             self._mark_trade_unhealthy(symbol, "EmptyTradeUpdate")
             return False
-        received_ms = _capture_now_ms()
+        try:
+            trade_count = len(trades)
+        except Exception:
+            self._mark_trade_unhealthy(symbol, "MalformedTradeUpdate")
+            return False
+        if trade_count <= 0:
+            self._mark_trade_unhealthy(symbol, "EmptyTradeUpdate")
+            return False
+        if trade_count > _TRADE_UPDATE_MAX_ROWS:
+            self._mark_trade_unhealthy(symbol, "OversizedTradeUpdate")
+            return False
+        if received_ms is None:
+            received_ms = _capture_now_ms()
+        if observed_at_monotonic is None:
+            observed_at_monotonic = time.monotonic()
+        if connection_epoch is None:
+            with self._state_lock:
+                connection_epoch = self._connection_epoch
         normalized = []
         seen: dict[str, tuple] = {}
         try:
@@ -565,7 +668,7 @@ class L2ShadowCollector:
                 self._health_trade_duplicates_suppressed += duplicate_count
             self._mark_trade_healthy(
                 symbol,
-                observed_at_monotonic=time.monotonic(),
+                observed_at_monotonic=observed_at_monotonic,
             )
             return True
         received_time = self._iso8601(received_ms)
@@ -581,10 +684,12 @@ class L2ShadowCollector:
                 payload = {
                     "venue": self.exchange_id,
                     "symbol": symbol,
-                    "universe": list(self._symbol_snapshot()),
+                    "universe": list(
+                        self._symbol_snapshot() if universe is None else universe
+                    ),
                     "trades": day_trades,
                     "stream_source": "ccxt_pro",
-                    "connection_epoch": self._connection_epoch,
+                    "connection_epoch": connection_epoch,
                     "continuity_status": "websocket_observed_id_deduplicated",
                 }
                 digest = hashlib.blake2s(
@@ -633,7 +738,10 @@ class L2ShadowCollector:
         if duplicate_count:
             with self._health_lock:
                 self._health_trade_duplicates_suppressed += duplicate_count
-        self._mark_trade_healthy(symbol, observed_at_monotonic=time.monotonic())
+        self._mark_trade_healthy(
+            symbol,
+            observed_at_monotonic=observed_at_monotonic,
+        )
         return True
 
     def _log_invalid_snapshot(
@@ -795,12 +903,35 @@ class L2ShadowCollector:
             raise RuntimeError(f"ccxt.pro has no adapter for {self.exchange_id}")
         return exchange_class(config)
 
+    @staticmethod
+    async def _persist_off_loop(callback, *args, **kwargs):
+        """Keep the loop responsive and drain durable work before cancellation."""
+        task = asyncio.create_task(asyncio.to_thread(callback, *args, **kwargs))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+
     async def _watch_symbol(self, async_exchange, symbol: str) -> None:
         while not self._should_stop() and symbol in self._symbol_snapshot():
             book = await async_exchange.watch_order_book(symbol, self.depth_levels)
+            received_ms = _capture_now_ms()
+            observed_at_monotonic = time.monotonic()
+            universe = self._symbol_snapshot()
+            with self._state_lock:
+                connection_epoch = self._connection_epoch
             if self._should_stop() or symbol not in self._symbol_snapshot():
                 return
-            self.record_order_book(symbol, book)
+            await self._persist_off_loop(
+                self.record_order_book,
+                symbol,
+                book,
+                received_ms=received_ms,
+                observed_at_monotonic=observed_at_monotonic,
+                connection_epoch=connection_epoch,
+                universe=universe,
+            )
 
     async def _watch_trade_symbol(self, async_exchange, symbol: str) -> None:
         watcher = getattr(async_exchange, "watch_trades", None)
@@ -812,9 +943,22 @@ class L2ShadowCollector:
         try:
             while not self._should_stop() and symbol in self._symbol_snapshot():
                 trades = await watcher(symbol)
+                received_ms = _capture_now_ms()
+                observed_at_monotonic = time.monotonic()
+                universe = self._symbol_snapshot()
+                with self._state_lock:
+                    connection_epoch = self._connection_epoch
                 if self._should_stop() or symbol not in self._symbol_snapshot():
                     return
-                self.record_trades(symbol, trades)
+                await self._persist_off_loop(
+                    self.record_trades,
+                    symbol,
+                    trades,
+                    received_ms=received_ms,
+                    observed_at_monotonic=observed_at_monotonic,
+                    connection_epoch=connection_epoch,
+                    universe=universe,
+                )
         finally:
             self._mark_trade_watcher_inactive(symbol)
 
@@ -1043,10 +1187,7 @@ class L2ShadowCollector:
                     ):
                         exchanges.append(exchange)
                 for exchange in exchanges:
-                    try:
-                        await exchange.close()
-                    except Exception:
-                        pass
+                    await close_public_async_exchange(exchange)
             if self._should_stop():
                 break
             wait = min(backoff * random.uniform(0.75, 1.25), self.reconnect_max_seconds)
@@ -1066,12 +1207,23 @@ class L2ShadowCollector:
             return
         self._shutdown_event = shutdown_event
         self._stop_event.clear()
-        self._thread = threading.Thread(
+        # A replacement thread must prove its own stream freshness.  Retaining
+        # the previous generation's samples lets the recorder report healthy
+        # for one stale window before the new transport has connected.
+        with self._health_lock:
+            prior_error_type = self._health_error_type
+            prior_reconnect_attempts = self._health_reconnect_attempts
+        self._begin_health_check(
+            error_type=prior_error_type,
+            reconnect_attempts=prior_reconnect_attempts,
+        )
+        candidate = threading.Thread(
             target=self._thread_main,
             name=f"L2Shadow-{self.exchange_id}",
             daemon=True,
         )
-        self._thread.start()
+        candidate.start()
+        self._thread = candidate
 
     def stop(self, *, timeout: float = 5.0) -> bool:
         self._stop_event.set()

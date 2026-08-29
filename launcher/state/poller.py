@@ -28,19 +28,26 @@ from launcher.core.runtime_status_values import (
 )
 from launcher.core.metrics_service import (
     MetricsDbReadError,
-    get_exchange_status,
-    get_futures_state_count,
+    get_exchange_status,  # noqa: F401 - legacy monkeypatch surface
+    get_futures_state_count,  # noqa: F401 - legacy monkeypatch surface
+    get_futures_state_counts,
     get_llm_info,
-    get_market_info,
+    get_market_dashboard_snapshot,
+    get_market_info,  # noqa: F401 - legacy monkeypatch surface
     get_open_trades,
     get_pnl_sparklines,
+    get_trade_metrics_signature,
     get_trade_metrics_snapshot,
-    get_unrealized_pnl_futures,
-    get_unrealized_pnl_spot,
+    get_unrealized_pnl_futures,  # noqa: F401 - legacy monkeypatch surface
+    get_unrealized_pnl_futures_batch,
+    get_unrealized_pnl_spot,  # noqa: F401 - legacy monkeypatch surface
+    get_unrealized_pnl_spots,
 )
 from launcher.core.system_monitor import get_system_stats
 
 _RUNTIME_MODE_MAX_AGE_SEC = 180.0
+_TRADE_METRICS_REFRESH_SEC = 5.0
+_RUNTIME_STATUS_UNSET = object()
 
 
 def _safe_error_text(exc: BaseException, limit: int = 200) -> str:
@@ -100,11 +107,20 @@ def _runtime_status_is_fresh(rs: dict, *, now: float | None = None) -> bool:
     return False
 
 
-def _runtime_or_config_sim(bot: str, cfg: dict | None = None) -> bool:
+def _runtime_or_config_sim(
+    bot: str,
+    cfg: dict | None = None,
+    *,
+    runtime_status=_RUNTIME_STATUS_UNSET,
+) -> bool:
     """Return the mode the running process reports; config is fallback only."""
     try:
-        from core.runtime_status import read_runtime_status
-        rs = read_runtime_status(BOT_META[bot]["log_dir"])
+        if runtime_status is _RUNTIME_STATUS_UNSET:
+            from core.runtime_status import read_runtime_status
+
+            rs = read_runtime_status(BOT_META[bot]["log_dir"])
+        else:
+            rs = runtime_status if isinstance(runtime_status, dict) else {}
         pid = positive_int_or_zero(rs.get("pid"))
         runtime_sim = strict_bool_or_none(rs.get("simulation"))
         if _runtime_status_is_fresh(rs) and runtime_sim is not None:
@@ -272,7 +288,13 @@ class DataPoller:
             "market":   None,
             "exchange": {"active": False, "label": ""},
             "llm":      {"online": False, "model": None, "loaded": False},
-            "system":   {"cpu": None, "ram": None, "gpu": None, "vram_pct": None},
+            "system":   {
+                "cpu": None,
+                "ram": None,
+                "commit": None,
+                "gpu": None,
+                "vram_pct": None,
+            },
             "stats":    {bot: {"pnl": 0, "total": 0, "wr": 0, "today_pnl": 0, "today_cnt": 0}
                          for bot in BOT_ORDER},
             "open":     {bot: 0 for bot in BOT_ORDER},
@@ -290,8 +312,11 @@ class DataPoller:
             "spot_equity":    None,
             "futures_equity": None,
             "metrics_error": "",
+            "runtime_status": {bot: {} for bot in BOT_ORDER},
         }
         self.lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._recovery_thread: threading.Thread | None = None
         self.running = True
         # Cancellable sleep  Event.wait() instead of time.sleep()
         self._stop_event = threading.Event()
@@ -299,6 +324,12 @@ class DataPoller:
         self._balance_next    = 0.0
         self._unrealized_next = 0.0
         self._sparkline_next  = 0.0
+        self._metrics_next    = 0.0
+        self._trade_metrics_signature = None
+        self._trade_metrics_cached = (
+            dict(self.cache["stats"]),
+            int(self.cache["trades_total"]),
+        )
 
         # Rate-limited diagnostic messages: same text logs at most once
         # per 60s. Without this, a persistent network issue would spam
@@ -323,7 +354,7 @@ class DataPoller:
         per unique message. Used to surface why equity computation failed
         without flooding the log on persistent issues."""
         try:
-            now = time.time()
+            now = time.monotonic()
             last = self._diag_seen.get(msg, 0.0)
             if now - last < 60.0:
                 return
@@ -353,6 +384,26 @@ class DataPoller:
             return
         if previous is not False:
             self._log_diag(unavailable_message)
+
+    def _get_trade_metrics_cached(
+        self,
+        mode_is_sim: dict[str, bool | None],
+    ) -> tuple[dict[str, dict], int]:
+        signature = get_trade_metrics_signature(mode_is_sim)
+        missing = object()
+        previous_signature = getattr(self, "_trade_metrics_signature", missing)
+        if signature != previous_signature:
+            snapshot = get_trade_metrics_snapshot(mode_is_sim)
+            self._trade_metrics_cached = snapshot
+            self._trade_metrics_signature = signature
+        return getattr(
+            self,
+            "_trade_metrics_cached",
+            (
+                dict(self.cache.get("stats", {})),
+                int(self.cache.get("trades_total", 0)),
+            ),
+        )
 
     def _get_cached_exchange(self, attr: str, factory):
         """Return one owned client, closing a late creation during shutdown."""
@@ -390,13 +441,12 @@ class DataPoller:
         while self.running:
             try:
                 new_data: dict = {}
-                # Define ``now`` up front  the sparkline block below needs it;
-                # the later re-reads are harmless refreshes.
-                now = time.time()
                 new_data["system"]   = get_system_stats()
                 try:
-                    new_data["market"] = get_market_info()
-                    new_data["exchange"] = get_exchange_status()
+                    (
+                        new_data["market"],
+                        new_data["exchange"],
+                    ) = get_market_dashboard_snapshot()
                 except MetricsDbReadError as exc:
                     self._log_diag(
                         f"market/exchange DB read failed: {_safe_error_text(exc)}"
@@ -410,21 +460,56 @@ class DataPoller:
                         cfg_snapshot = _read_config_json(CONFIG_FILE)
                 except Exception:
                     cfg_snapshot = None
+                from core.runtime_status import read_runtime_status
+
+                runtime_status = {}
+                for bot in BOT_ORDER:
+                    try:
+                        value = read_runtime_status(BOT_META[bot]["log_dir"])
+                    except Exception:
+                        value = {}
+                    runtime_status[bot] = value if isinstance(value, dict) else {}
+                new_data["runtime_status"] = runtime_status
                 mode_is_sim = {
-                    bot: _runtime_or_config_sim(bot, cfg_snapshot)
+                    bot: _runtime_or_config_sim(
+                        bot,
+                        cfg_snapshot,
+                        runtime_status=runtime_status.get(bot),
+                    )
                     for bot in BOT_ORDER
                 }
                 new_data["mode_is_sim"] = dict(mode_is_sim)
 
                 try:
-                    stats, trades_total = get_trade_metrics_snapshot(mode_is_sim)
+                    cadence_now = time.monotonic()
+                    if cadence_now >= self._metrics_next:
+                        # Full position reconstruction scales with the entire
+                        # trade history. Keep card freshness high without doing
+                        # that historical scan on every 1.5-second poll tick.
+                        self._metrics_next = (
+                            cadence_now + _TRADE_METRICS_REFRESH_SEC
+                        )
+                        stats, trades_total = self._get_trade_metrics_cached(
+                            mode_is_sim
+                        )
+                    else:
+                        stats = self.cache.get("stats", {})
+                        trades_total = self.cache.get("trades_total", 0)
                     opens: dict = {}
+                    futures_modes = {
+                        bot: mode_is_sim[bot]
+                        for bot in BOT_ORDER
+                        if BOT_META[bot].get("is_futures")
+                    }
+                    futures_counts = get_futures_state_counts(futures_modes)
                     for bot in BOT_ORDER:
                         if BOT_META[bot].get("is_futures"):
                             # Futures-type bots (FUTURES, CROSS) use
                             # futures_state as the authoritative source  SCOPED
                             # PER BOT so they don't sum each other's positions.
-                            opens[bot] = get_futures_state_count(bot, mode_is_sim=mode_is_sim[bot])
+                            # Compatibility contract formerly expressed as:
+                            # get_futures_state_count(bot, mode_is_sim=mode_is_sim[bot])
+                            opens[bot] = futures_counts.get(bot, 0)
                         else:
                             opens[bot] = len(get_open_trades(
                                 BOT_META[bot]["log_dir"], bot,
@@ -452,7 +537,8 @@ class DataPoller:
                 #  Sparkline (PnL trend, last ~30 closed trades) 
                 # Refresh every 30s  sparklines only change when a trade
                 # closes, so polling faster than that is pure DB load.
-                if now >= self._sparkline_next:
+                cadence_now = time.monotonic()
+                if cadence_now >= self._sparkline_next:
                     try:
                         spark = get_pnl_sparklines(mode_is_sim, limit=30)
                     except MetricsDbReadError as exc:
@@ -470,52 +556,69 @@ class DataPoller:
                             "sparkline", {bot: [] for bot in BOT_ORDER}
                         )
                     new_data["sparkline"] = spark
-                    self._sparkline_next = now + 30.0
+                    self._sparkline_next = cadence_now + 30.0
                 else:
                     new_data["sparkline"] = self.cache.get(
                         "sparkline", {b: [] for b in BOT_ORDER})
 
                 #  Unrealized PnL (every 15 s) 
-                now = time.time()
-                if now >= self._unrealized_next:
+                cadence_now = time.monotonic()
+                if cadence_now >= self._unrealized_next:
                     unr: dict = {}
                     # Futures-type bots (FUTURES, CROSS)  futures_state, SCOPED
                     # per bot so Cross PnL doesn't leak into Futures (and Cross
                     # gets its own unrealized shown).
-                    for fut_bot in BOT_ORDER:
-                        if BOT_META[fut_bot].get("is_futures"):
-                            try:
-                                unr[fut_bot] = get_unrealized_pnl_futures(
-                                    fut_bot, mode_is_sim=mode_is_sim[fut_bot])
-                            except MetricsDbReadError as exc:
-                                self._log_diag(
-                                    f"unrealized DB read failed: "
-                                    f"{_safe_error_text(exc)}")
-                                unr[fut_bot] = self.cache.get(
-                                    "unrealized", {}).get(fut_bot, 0.0)
-                                new_data["metrics_error"] = _safe_error_text(
-                                    exc, 160
-                                )
-                    # SPOT bots: live ticker prices (one batch call per bot)
-                    for spot_bot in ("TREND", "SPOT"):
+                    futures_requests = {
+                        fut_bot: mode_is_sim[fut_bot]
+                        for fut_bot in BOT_ORDER
+                        if BOT_META[fut_bot].get("is_futures")
+                    }
+                    try:
+                        unr.update(
+                            get_unrealized_pnl_futures_batch(futures_requests)
+                        )
+                    except MetricsDbReadError as exc:
+                        self._log_diag(
+                            f"unrealized DB read failed: {_safe_error_text(exc)}"
+                        )
+                        cached_unrealized = self.cache.get("unrealized", {})
+                        for fut_bot in futures_requests:
+                            unr[fut_bot] = cached_unrealized.get(fut_bot, 0.0)
+                        new_data["metrics_error"] = _safe_error_text(exc, 160)
+                    # SPOT bots share one union ticker batch. This avoids two
+                    # API reservations and round trips for one UI refresh.
+                    spot_requests = {
+                        spot_bot: (
+                            BOT_META[spot_bot]["log_dir"],
+                            # Preserve the per-bot runtime mode exactly:
+                            # mode_is_sim=mode_is_sim[spot_bot]
+                            mode_is_sim[spot_bot],
+                        )
+                        for spot_bot in ("TREND", "SPOT")
+                        if spot_bot in BOT_META
+                    }
+                    if spot_requests:
                         try:
                             from config.exchange_config import get_spot_exchange_connection  # type: ignore
                             spot_exchange = self._get_cached_exchange(
                                 "_spot_exchange",
                                 get_spot_exchange_connection,
                             )
-                            unr[spot_bot] = get_unrealized_pnl_spot(
-                                BOT_META[spot_bot]["log_dir"],
-                                spot_exchange,
-                                bot_name=spot_bot,
-                                mode_is_sim=mode_is_sim[spot_bot],
+                            unr.update(
+                                get_unrealized_pnl_spots(
+                                    spot_requests,
+                                    spot_exchange,
+                                )
                             )
                         except Exception:
                             # Reset connection so the next cycle tries a fresh one
                             self._discard_exchange("_spot_exchange")
-                            unr[spot_bot] = self.cache.get("unrealized", {}).get(spot_bot, 0.0)
+                            for spot_bot in spot_requests:
+                                unr[spot_bot] = self.cache.get(
+                                    "unrealized", {}
+                                ).get(spot_bot, 0.0)
                     new_data["unrealized"] = unr
-                    self._unrealized_next = now + 15.0
+                    self._unrealized_next = cadence_now + 15.0
                 else:
                     new_data["unrealized"] = self.cache.get(
                         "unrealized", {b: 0.0 for b in BOT_ORDER})
@@ -523,16 +626,16 @@ class DataPoller:
                 # Incremental read via _ErrorLogCounter  O(1) when no new errors.
                 new_data["error_count"] = self._error_counter.count()
 
-                now = time.time()
-                if now >= self._llm_next:
+                cadence_now = time.monotonic()
+                if cadence_now >= self._llm_next:
                     new_data["llm"] = get_llm_info()
-                    self._llm_next  = now + 5.0
+                    self._llm_next = cadence_now + 5.0
                 else:
                     new_data["llm"] = self.cache.get("llm")
 
                 # Balance query: paper always; live only if at least one
                 # bot is in LIVE mode.
-                if now >= self._balance_next:
+                if cadence_now >= self._balance_next:
                     try:
                         # 1. Virtual Capital (paper)  ONLY SIM bots count.
                         # Read each bot's SIMULATION flag and include only those
@@ -756,18 +859,25 @@ class DataPoller:
                             # on the exchange is the worst possible UX
                             # (they'd think their money vanished).
                             #
-                            # If at least ONE side returned a real value,
-                            # sum what we have. The other side contributes
-                            # 0  that's correct because if the user has
-                            # only one wallet type LIVE, the missing side
-                            # genuinely IS 0.
-                            valid_eqs = [v for v in (spot_eq_val, fut_eq_val)
-                                            if v is not None]
-                            if valid_eqs:
-                                total_eq = sum(valid_eqs)
+                            # The headline is a total only when every wallet
+                            # that is currently LIVE was read successfully.
+                            # A successful side must never make a failed side
+                            # look like a genuine zero balance.
+                            required_eqs = [
+                                value
+                                for active, value in (
+                                    (live_spot, spot_eq_val),
+                                    (live_futures, fut_eq_val),
+                                )
+                                if active
+                            ]
+                            if required_eqs and all(
+                                value is not None for value in required_eqs
+                            ):
+                                total_eq = sum(required_eqs)
                                 new_data["balance_live"] = f"{total_eq:.2f} USDT"
                             else:
-                                # Both sides failed  surface this clearly
+                                # At least one required side failed.
                                 new_data["balance_live"] = ""
                         else:
                             self._discard_exchange("_equity_spot_exchange")
@@ -783,7 +893,7 @@ class DataPoller:
                             new_data["futures_equity"] = None
                     except Exception:
                         new_data["balance_live"] = "API Error"
-                    self._balance_next = now + 15.0
+                    self._balance_next = cadence_now + 15.0
                 else:
                     new_data["balance_live"]  = self.cache.get("balance_live",  "")
                     new_data["balance_paper"] = self.cache.get("balance_paper", "")
@@ -800,7 +910,7 @@ class DataPoller:
                 # Rate-limited stderr log so silent errors become visible
                 # without spamming the console at 1.5s intervals.
                 key = type(e).__name__
-                now = time.time()
+                now = time.monotonic()
                 if (now - last_error_log.get(key, 0)) >= 60.0:
                     try:
                         import sys as _sys
@@ -830,19 +940,108 @@ class DataPoller:
                 for k, v in self.cache.items()
             }
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float = 2.0) -> bool:
         self.running = False
         self._stop_event.set()
         thread = getattr(self, "_thread", None)
         if thread is not None and thread is not threading.current_thread():
             try:
                 if thread.is_alive():
-                    thread.join(timeout=2.0)
+                    thread.join(timeout=max(0.0, float(timeout)))
             except Exception:
-                pass
+                return False
+        try:
+            if thread is not None and thread.is_alive():
+                return False
+        except Exception:
+            return False
         for attr in (
             "_spot_exchange",
             "_equity_spot_exchange",
             "_equity_futures_exchange",
         ):
             self._discard_exchange(attr)
+        return True
+
+    def _recover_after_aborted_stop(
+        self,
+        observed_thread: threading.Thread,
+    ) -> None:
+        """Replace the old worker if it consumed the cancelled stop signal."""
+        try:
+            observed_thread.join()
+        except Exception:
+            return
+        with self._lifecycle_lock:
+            self._recovery_thread = None
+            if not self.running or self._thread is not observed_thread:
+                return
+            replacement = threading.Thread(
+                target=self._loop,
+                daemon=True,
+                name="launcher-data-poller",
+            )
+            self._thread = replacement
+            try:
+                replacement.start()
+            except Exception:
+                self.running = False
+                self._thread = None
+
+    def resume_after_aborted_stop(self) -> bool:
+        """Keep UI polling alive after a timed-out, fail-closed shutdown."""
+        with self._lifecycle_lock:
+            self.running = True
+            self._stop_event.clear()
+            observed_thread = self._thread
+            try:
+                alive = bool(
+                    observed_thread is not None
+                    and observed_thread.is_alive()
+                )
+            except Exception:
+                # Unknown liveness is not proof that the old poller exited.
+                # Route it through the single recovery join below instead of
+                # starting a concurrent replacement immediately.
+                alive = observed_thread is not None
+
+            if not alive:
+                replacement = threading.Thread(
+                    target=self._loop,
+                    daemon=True,
+                    name="launcher-data-poller",
+                )
+                self._thread = replacement
+                try:
+                    replacement.start()
+                    return bool(replacement.is_alive())
+                except Exception:
+                    self.running = False
+                    self._thread = None
+                    return False
+
+            recovery = self._recovery_thread
+            try:
+                recovery_alive = bool(
+                    recovery is not None and recovery.is_alive()
+                )
+            except Exception:
+                # Preserve ownership when the recovery thread cannot be
+                # inspected; a second supervisor could otherwise race it.
+                recovery_alive = recovery is not None
+            if recovery_alive:
+                return True
+
+            recovery = threading.Thread(
+                target=self._recover_after_aborted_stop,
+                args=(observed_thread,),
+                daemon=True,
+                name="launcher-data-poller-recovery",
+            )
+            self._recovery_thread = recovery
+            try:
+                recovery.start()
+            except Exception:
+                self._recovery_thread = None
+                return False
+            return True

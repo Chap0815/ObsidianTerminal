@@ -444,6 +444,11 @@ class TrendFuturesBot(FuturesBot):
                         "accounting_pending"
                     ):
                         return True
+                    from core.futures_bot_reconcile import (
+                        _offline_accounting_retry_due,
+                    )
+                    if not _offline_accounting_retry_due(live):
+                        return True
                     pending_fields = {
                         key: value
                         for key, value in live.items()
@@ -2502,19 +2507,23 @@ class TrendFuturesBot(FuturesBot):
         interval = self._i("MONITOR_INTERVAL", self.DEFAULT_MONITOR_INTERVAL)
         log_event(f"Trend-Futures safety monitor started "
                   f"(interval {interval}s)", "INFO")
-        last_ks = 0.0
+        last_ks_monotonic = None
         while not self._shutdown_event.is_set():
             try:
                 trades = dict(self.state.get_all())
-                now = time.time()
-                if now - last_ks >= 60:
+                now_wall = time.time()
+                now_monotonic = time.monotonic()
+                if (
+                    last_ks_monotonic is None
+                    or now_monotonic - last_ks_monotonic >= 60.0
+                ):
                     try:
                         if self._check_killswitch(trades) is not False:
-                            last_ks = now
+                            last_ks_monotonic = now_monotonic
                     except Exception as e:
                         self._log_error("trend killswitch", e)
                 if trades:
-                    self._maybe_persist_funding_for_all(trades, now)
+                    self._maybe_persist_funding_for_all(trades, now_wall)
                     for base, d in trades.items():
                         if self._shutdown_event.is_set():
                             break
@@ -2540,9 +2549,12 @@ class TrendFuturesBot(FuturesBot):
         full = f"{base}/USDT:USDT"
         inflight_active = self._safe_float(
             d.get("entry_inflight_until"), 0.0) > time.time()
+        recovery_blocked = (
+            self._entry_recovery_runtime_health().get("ok") is False
+        )
         pos, unavailable = self._fetch_exchange_position(full, "LONG")
         if pos is None:
-            if inflight_active:
+            if inflight_active or recovery_blocked:
                 return False
             if unavailable:
                 return False
@@ -2585,7 +2597,14 @@ class TrendFuturesBot(FuturesBot):
             "liquidation_price": liq,
             "initial_liq_distance": distance_to_liquidation_pct(entry, liq, "LONG"),
         }
-        self.state.update_many(base, fields)
+        persisted = self.state.update_many(base, fields)
+        if persisted is not True:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: exchange position verified, but "
+                "durable provisional-state healing failed",
+                "ERROR",
+            )
+            return False
         log_event(f"[{self.BOT_NAME}] {base}: provisional entry verified "
                   f"from exchange position ({contracts:g} contracts)", "WARN")
         return True

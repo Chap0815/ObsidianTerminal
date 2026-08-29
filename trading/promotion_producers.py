@@ -167,6 +167,22 @@ def _normalize_validation_periods(periods: Any) -> dict[str, list[dict]]:
             raise ValueError(
                 "normal and stressed position populations do not match"
             )
+        normal_nets = {
+            position["position_id"]: position["net"]
+            for position in normal["positions"]
+        }
+        for position in stressed["positions"]:
+            stressed_net = position["net"]
+            normal_net = normal_nets[position["position_id"]]
+            if stressed_net > normal_net and not math.isclose(
+                stressed_net,
+                normal_net,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    "stressed validation net exceeds matching normal net"
+                )
     return by_profile
 
 
