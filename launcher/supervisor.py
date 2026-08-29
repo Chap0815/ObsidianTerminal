@@ -150,7 +150,7 @@ def supervise_launcher(
     crash_attempt = 0
 
     while True:
-        started_at = monotonic()
+        started_at = None
         spawn_failed = False
         process = None
         try:
@@ -186,6 +186,9 @@ def supervise_launcher(
                 # lifetime of the UI child.
                 with process_start_guard(str(root)):
                     process = spawn(command, **kwargs)
+                    # Only actual child uptime may reset the consecutive-crash
+                    # budget. Barrier/Popen latency is not a stable UI run.
+                    started_at = monotonic()
             except UpdateInProgressError as exc:
                 if process is None:
                     return last_returncode
@@ -225,7 +228,11 @@ def supervise_launcher(
                     f"{exc}",
                 )
                 return 1
-        run_seconds = max(0.0, monotonic() - started_at)
+        run_seconds = (
+            max(0.0, monotonic() - started_at)
+            if started_at is not None
+            else 0.0
+        )
         if last_returncode == 0:
             return 0
         if not spawn_failed:

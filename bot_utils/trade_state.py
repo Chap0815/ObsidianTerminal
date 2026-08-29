@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import copy
 import inspect
-import json
 import math
 import threading
 import time
@@ -24,6 +23,7 @@ from typing import Optional, Dict, Any, List
 
 from bot_utils.state_persist import (atomic_save_json,
                                        _is_canonical_position_symbol,
+                                       _valid_buy_time,
                                        _valid_pending_accounting_items,
                                        validate_spot_state,
                                        validate_futures_state)
@@ -223,6 +223,8 @@ def _normalize_position_row(
         or position_type not in ("LONG", "SHORT")
     ):
         return None, f"invalid position_type={position_type!r}"
+    if not _valid_buy_time(data.get("buy_time")):
+        return None, f"invalid buy_time={data.get('buy_time')!r}"
 
     raw_buy = data.get("buy_price")
     buy_val = _finite_float_or_none(raw_buy)
@@ -247,6 +249,7 @@ def _normalize_position_row(
         normalized["buy_price"] = buy_val
     if "buy" in normalized:
         normalized["buy"] = buy_val
+    normalized["amount"] = amount
 
     raw_leverage = normalized.get("leverage")
     leverage = _finite_float_or_none(raw_leverage)
@@ -606,6 +609,7 @@ class TradeState:
         try:
             from core.database import (
                 _base_symbol,
+                _strict_claim_extra_object,
                 get_open_positions_db,
                 remove_pending_open_position_claim,
             )
@@ -623,13 +627,13 @@ class TradeState:
             try:
                 symbol = row.get("symbol", "")
                 base = _base_symbol(symbol)
-                extra = json.loads(row.get("extra_json") or "{}")
+                extra = _strict_claim_extra_object(row.get("extra_json"))
             except (AttributeError, TypeError, ValueError):
                 continue
             if (
                 not base
                 or base in local_bases
-                or not isinstance(extra, dict)
+                or extra is None
                 or extra.get("claim_release_pending") is not True
             ):
                 continue

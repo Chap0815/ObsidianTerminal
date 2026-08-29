@@ -33,6 +33,12 @@ _INT_FIELDS = frozenset((
     "MAX_OPEN_TRADES", "SCAN_INTERVAL", "MONITOR_INTERVAL",
     "COOLDOWN_AFTER_SL", "MAX_NEW_TRADES_PER_TICK",
     "FAILED_ENTRY_MAX_AGE_MIN",
+    "TREND_VOTE_MIN", "TREND_EXIT_VOTE",
+    "TREND_SMA_FAST", "TREND_SMA_SLOW",
+    "TREND_CROSS_FAST", "TREND_CROSS_SLOW",
+    "TREND_VOL_TARGET", "TREND_VOL_TARGET_LOOKBACK",
+    "TREND_EXIT_STALE_LIMIT", "XSEC_K", "XSEC_LOOKBACK_HOURS",
+    "XSEC_REBALANCE_HOURS", "XSEC_UNIVERSE_SIZE", "CRASH_WINDOW",
 ))
 # LEVERAGE is kept as a FLOAT so a bot can run a fractional EFFECTIVE leverage
 # (e.g. 1.5: size notional = margin*1.5, send ceil()=2 to the exchange as the
@@ -136,6 +142,13 @@ _CLAMP_DEFAULTS = {
     "ENTRY_QUALITY_SHADOW_MIN_SCORE": 85.0,
 }
 
+_TREND_WINDOW_PAIRS = {
+    "TREND_SMA_FAST": ("TREND_SMA_FAST", "TREND_SMA_SLOW"),
+    "TREND_SMA_SLOW": ("TREND_SMA_FAST", "TREND_SMA_SLOW"),
+    "TREND_CROSS_FAST": ("TREND_CROSS_FAST", "TREND_CROSS_SLOW"),
+    "TREND_CROSS_SLOW": ("TREND_CROSS_FAST", "TREND_CROSS_SLOW"),
+}
+
 _POSITION_LIMIT_BY_BOT = {
     "SPOT": 500.0,
     "FUTURES": 500.0,
@@ -149,6 +162,18 @@ def _position_limit(bot_name: str) -> float:
     return _POSITION_LIMIT_BY_BOT.get(str(bot_name or "").upper(), 500.0)
 
 
+def _finite_integral_or_none(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        return None
+    return int(numeric)
+
+
 def _clamp(key, value):
     spec = _CLAMPS.get(key)
     if spec is None:
@@ -157,7 +182,12 @@ def _clamp(key, value):
     try:
         if isinstance(value, bool):
             raise ValueError("boolean is not a numeric config value")
-        converted = cast(value)
+        if cast is int:
+            converted = _finite_integral_or_none(value)
+            if converted is None:
+                raise ValueError("integer config value required")
+        else:
+            converted = cast(value)
         if isinstance(converted, float) and not math.isfinite(converted):
             raise ValueError("non-finite numeric config value")
         return max(lo, min(hi, converted))
@@ -536,9 +566,21 @@ def get_live_value(bot_name: str, key: str, default: Any = None,
                 return fallback_cfg.get(key, default)
             return _clamp(key, fv)
         if key in _INT_FIELDS:
-            if isinstance(raw, bool):
-                raise ValueError("boolean is not a numeric config value")
-            return _clamp(key, int(raw))
+            parsed_int = _finite_integral_or_none(raw)
+            if parsed_int is None:
+                raise ValueError("integer config value required")
+            pair = _TREND_WINDOW_PAIRS.get(key)
+            if pair is not None:
+                fast_key, slow_key = pair
+                fast = _finite_integral_or_none(section.get(fast_key))
+                slow = _finite_integral_or_none(section.get(slow_key))
+                if fast is None or slow is None:
+                    return fallback_cfg.get(key, default)
+                fast = _clamp(fast_key, fast)
+                slow = _clamp(slow_key, slow)
+                if fast >= slow:
+                    return fallback_cfg.get(key, default)
+            return _clamp(key, parsed_int)
         fb = fallback_cfg.get(key, default)
         if isinstance(fb, bool):
             parsed = parse_explicit_bool(raw)

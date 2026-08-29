@@ -635,7 +635,8 @@ def main(argv: list[str] | None = None) -> int:
                 source,
                 dst,
                 ignore=shutil.ignore_patterns(
-                    ".git", ".pytest_cache", ".ruff_cache", ".venv",
+                    ".git", ".SynologyWorkingDirectory", "desktop.ini",
+                    ".pytest_cache", ".ruff_cache", ".venv",
                     "venv", "__pycache__",
                     "data", "logs",
                     "optimizer_results", "research_kitraining", "research_run2",

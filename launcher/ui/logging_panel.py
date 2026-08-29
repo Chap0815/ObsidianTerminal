@@ -59,6 +59,7 @@ _EXPLICIT_LEVEL_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 _DISPLAY_SEPARATOR_RE = re.compile(r"^\s*[-=_*#]{8,}\s*$")
@@ -165,6 +166,10 @@ class LiveLogDisplayFilter:
         text = _EMBEDDED_LEVEL_RE.sub("", text, count=1)
         text = _LEADING_LEVEL_RE.sub("", text, count=1)
         text = _BARE_LEVEL_RE.sub("", text, count=1)
+        # Reconnect attempt numbers describe one continuing incident. Keeping
+        # the counter in the fingerprint made every retry look like a distinct
+        # warning and bypassed the bounded repeat window in the visible UI.
+        text = re.sub(r"\s*\(attempt\s+\d+\)\s*$", "", text, flags=re.IGNORECASE)
         return re.sub(r"\s+", " ", text).strip().casefold()
 
     @staticmethod
@@ -412,6 +417,11 @@ def is_benign_info_line(line: str) -> bool:
         return True
     if "news module loaded:" in lower:
         return True
+    if (
+        "transport reconnected after" in lower
+        and "validating l2 research data" in lower
+    ):
+        return True
     return False
 
 
@@ -437,13 +447,17 @@ def is_known_warn_line(line: str) -> bool:
 def classify_severity(line: str) -> str:
     """Map a raw bot stdout line to one of the severity tags used by the log
     box. Detection order matters  see comments below."""
-    upper = line.upper()
-    lower = line.lower()
+    # The process reader receives the logger's ANSI-coloured stdout.  Classify
+    # the visible text so authoritative WARN/OK/ERROR levels and known INFO
+    # recovery contexts survive before the UI strips colour codes to render.
+    text = _ANSI_SGR_RE.sub("", str(line or ""))
+    upper = text.upper()
+    lower = text.lower()
 
     # A level explicitly supplied by the bot is authoritative. In particular,
     # wording such as "retry failed" must not turn an intentional WARN into a
     # red ERROR badge, while an OK recovery containing "Timeout" stays green.
-    explicit = _explicit_level(line)
+    explicit = _explicit_level(text)
     if explicit == "OK":
         return "ok"
     if explicit in ("WARN", "WARNING"):
@@ -455,7 +469,7 @@ def classify_severity(line: str) -> str:
     if explicit in ("BUY", "SELL", "WIN", "LOSS"):
         return explicit.lower()
 
-    if is_benign_info_line(line):
+    if is_benign_info_line(text):
         return "info"
     if "margin-mode precheck unavailable" in lower and "WARN" in upper:
         return "warn"
@@ -489,7 +503,7 @@ def classify_severity(line: str) -> str:
     if any(k in lower for k in _benign):
         return "warn"
 
-    if is_known_warn_line(line):
+    if is_known_warn_line(text):
         return "warn"
 
     # 1. Real errors (highest priority)

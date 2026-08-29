@@ -1096,6 +1096,20 @@ def _atomic_create(path: Path, payload: dict) -> None:
         except FileExistsError:
             if _read_integrity_report_bytes(path) != encoded:
                 raise RuntimeError("sealed capture report changed")
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except (AttributeError, OSError):
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(directory_fd)
+                except OSError:
+                    pass
     finally:
         temporary.unlink(missing_ok=True)
 

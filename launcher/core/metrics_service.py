@@ -43,6 +43,11 @@ from news.http_limits import read_bounded_json_response
 class MetricsDbReadError(RuntimeError):
     """Raised when an existing launcher metrics DB cannot be read."""
 
+
+class MetricsMarketDataError(RuntimeError):
+    """Raised when active launcher positions cannot be priced completely."""
+
+
 _METRICS_STATE_JSON_MAX_BYTES = 4 * 1024 * 1024
 
 
@@ -90,7 +95,12 @@ def query_db(sql: str, params: tuple = ()) -> list:
         return []
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+        uri_path = Path(DB_PATH).resolve().as_posix()
+        conn = sqlite3.connect(
+            f"file:{uri_path}?mode=ro",
+            uri=True,
+            timeout=20.0,
+        )
         conn.execute("PRAGMA busy_timeout=20000")
         rows = conn.execute(sql, params).fetchall()
         conn.close()
@@ -109,7 +119,12 @@ def query_db_dict(sql: str, params: tuple = ()) -> list[dict]:
         return []
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+        uri_path = Path(DB_PATH).resolve().as_posix()
+        conn = sqlite3.connect(
+            f"file:{uri_path}?mode=ro",
+            uri=True,
+            timeout=20.0,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=20000")
         rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
@@ -927,18 +942,24 @@ def get_unrealized_pnl_spots(
         trades_by_bot[bot_name] = trades if isinstance(trades, dict) else {}
 
     result = {bot_name: 0.0 for bot_name in requests}
-    symbols = sorted(
-        {
-            symbol
-            for trades in trades_by_bot.values()
-            for symbol in trades
-            if isinstance(symbol, str) and symbol
-        }
-    )
+    symbols = sorted({
+        symbol
+        for trades in trades_by_bot.values()
+        for symbol, trade in trades.items()
+        if (
+            isinstance(symbol, str)
+            and symbol
+            and isinstance(trade, dict)
+            and (_finite_float_or_none(
+                _state_value_prefer_key(trade, "buy_price", "buy")
+            ) or 0.0) > 0.0
+            and (_finite_float_or_none(trade.get("amount")) or 0.0) > 0.0
+        )
+    })
     if not symbols:
         return result
     if exchange is None:
-        return result
+        raise MetricsMarketDataError("spot price unavailable: no exchange")
 
     #  Step 1: batch ticker fetch 
     price_map: dict = {}  # sym  current price (float)
@@ -988,6 +1009,12 @@ def get_unrealized_pnl_spots(
                 price_map[sym] = p
         except Exception:
             pass  # price unavailable  position contributes 0
+
+    missing_prices = [symbol for symbol in symbols if symbol not in price_map]
+    if missing_prices:
+        raise MetricsMarketDataError(
+            "spot price unavailable: " + ", ".join(missing_prices)
+        )
 
     #  Step 3: compute PnL independently per bot.
     for bot_name, trades in trades_by_bot.items():

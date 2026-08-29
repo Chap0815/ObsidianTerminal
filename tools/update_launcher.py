@@ -164,8 +164,27 @@ def _write_status(
     if returncode is not None:
         payload["returncode"] = returncode
     tmp = STATUS_PATH.with_name(f"{STATUS_PATH.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, STATUS_PATH)
+    published = False
+    try:
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        for attempt in range(8):
+            try:
+                os.replace(tmp, STATUS_PATH)
+                published = True
+                break
+            except PermissionError:
+                if attempt >= 7:
+                    raise
+                time.sleep(0.05)
+    finally:
+        if not published:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _hidden_kwargs() -> dict:

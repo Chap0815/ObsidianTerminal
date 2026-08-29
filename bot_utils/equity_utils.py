@@ -82,18 +82,6 @@ def _never_raises_none(func):
     return guarded
 
 
-def _futures_free_only(free: float) -> dict:
-    return {
-        "free":         round(free, 4),
-        "in_positions": 0.0,
-        "unrealized":   0.0,
-        "equity":       round(free, 4),
-        "open_count":   0,
-        "positions":    [],
-        "source":       "free-only (fetch_positions unavailable)",
-    }
-
-
 def _read_usdt_free(bal: dict) -> Optional[float]:
     """Pull the FREE USDT amount from a ccxt balance dict.
 
@@ -282,49 +270,65 @@ def compute_futures_equity(ex) -> Optional[dict]:
 
     # Position margin + unrealized
     if not try_consume_api_call("dashboard_futures_fetch_positions"):
-        return _futures_free_only(free)
+        return None
     try:
         positions = ex.fetch_positions()
     except Exception:
-        # Without positions we don't know what's bound. Return what we
-        # know but flag that the unrealized side is incomplete.
-        return _futures_free_only(free)
+        # Free margin is not total wallet equity while positions are unknown.
+        return None
     if not isinstance(positions, list):
-        return _futures_free_only(free)
+        return None
+
+    # A malformed row cannot safely be treated as a closed position: doing so
+    # would silently omit its margin and PnL from an apparently complete total.
+    from bot_utils.futures_order import _position_contracts_abs
+
+    if any(
+        not isinstance(position, dict)
+        or _position_contracts_abs(position) is None
+        for position in positions
+    ):
+        return None
 
     margin_sum, upnl_sum, count, details = _sum_position_margin_and_upnl(positions)
 
-    # MEXC quirk: ccxt's fetch_positions() returns unrealizedPnl=0 for
-    # every position because MEXC doesn't include it in the response.
-    # If we detect this (we have open positions but uPnL is exactly 0),
-    # augment from the bot's futures_state table  same data source the
-    # sidebar's 'Unrealized' label uses, kept fresh every 15s by the
-    # monitor loop.
+    # MEXC currently omits unrealizedPnl from normalized position rows.  Fill
+    # only those specifically missing values from the live bot state.  Every
+    # missing exchange value must have a matching DB row; a partial merge would
+    # make an understated account total look complete in the dashboard.
     augmented_source = None
-    if count > 0 and abs(upnl_sum) < 1e-9:
+    open_positions = [
+        position
+        for position in positions
+        if (_position_contracts_abs(position) or 0.0) > 0.0
+    ]
+    missing_upnl = [
+        detail
+        for position, detail in zip(open_positions, details)
+        if not any(
+            _finite_float_or_none(position.get(field)) is not None
+            for field in ("unrealizedPnl", "unrealized_pnl")
+        )
+    ]
+    if missing_upnl:
         try:
             # Lazy import  equity_utils mustn't hard-depend on the bot's
             # DB layer (it should still work in a fresh test environment).
             from core.database import get_futures_state  # type: ignore
             db_rows = get_futures_state() or []
             db_by_sym = _live_futures_state_by_symbol(db_rows)
-            # Merge into details: each detail dict already has symbol (base).
-            new_upnl_sum = 0.0
-            had_any_match = False
-            for d in details:
+            for d in missing_upnl:
                 sym_base = d.get("symbol", "")
                 row = db_by_sym.get(sym_base)
-                if row is not None:
-                    d["unrealized"] = round(row["unrealized"], 4)
-                    had_any_match = True
-                new_upnl_sum += d["unrealized"]
-            if had_any_match:
-                upnl_sum = new_upnl_sum
-                augmented_source = " (uPnL from futures_state DB)"
+                if row is None:
+                    return None
+                d["unrealized"] = round(row["unrealized"], 4)
+            upnl_sum = sum(d["unrealized"] for d in details)
+            if not math.isfinite(upnl_sum):
+                return None
+            augmented_source = " (missing uPnL from futures_state DB)"
         except Exception:
-            # DB unavailable / fresh install / different bot  keep the
-            # exchange's zeroes. Better than crashing.
-            pass
+            return None
 
     equity_total = free + margin_sum + upnl_sum
     if not math.isfinite(equity_total):
@@ -476,10 +480,11 @@ def compute_spot_equity(ex) -> Optional[dict]:
                     price = 0.0
 
             if price <= 0:
-                # Can't price this coin  skip it (dust, delisted, etc.).
-                # We DON'T silently substitute 0 into a "valid" total 
-                # we just exclude it from the count.
-                continue
+                # An amount cannot be classified as dust without a price.  A
+                # partial wallet valuation would look complete to the launcher
+                # and understate equity, so expose the whole snapshot as
+                # unavailable until every actual holding can be priced.
+                return None
 
             value_usdt = amount * price
             if (

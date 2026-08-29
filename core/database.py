@@ -1721,14 +1721,20 @@ def _maintenance_cycle() -> None:
     cleanup_old_market_regime()
 
 
-def _start_maintenance_thread() -> None:
+def _start_maintenance_thread() -> bool:
     global _MAINT_THREAD_STARTED
     with _MAINT_LOCK:
         if _MAINT_THREAD_STARTED:
-            return
-        threading.Thread(target=_maintenance_loop, name="db-maintenance",
-                         daemon=True).start()
+            return True
+        thread = _start_optional_db_thread(
+            target=_maintenance_loop,
+            name="db-maintenance",
+            failure_context="start DB maintenance worker",
+        )
+        if thread is None:
+            return False
         _MAINT_THREAD_STARTED = True
+        return True
 
 
 def _gc_api_rate_global() -> None:
@@ -1805,6 +1811,21 @@ def _gc_market_regime_top_n() -> None:
 
 _VACUUM_LOCK   = threading.Lock()
 _VACUUM_THREAD = None
+
+
+def _start_optional_db_thread(*, target, name: str, failure_context: str):
+    """Start non-critical DB maintenance without endangering bot startup."""
+    try:
+        candidate = threading.Thread(
+            target=target,
+            name=name,
+            daemon=True,
+        )
+        candidate.start()
+        return candidate
+    except Exception as exc:
+        _log_db_background_failure(failure_context, exc)
+        return None
 
 
 def _vacuum_worker() -> None:
@@ -1887,18 +1908,26 @@ def _vacuum_worker() -> None:
                                 ),
                             )
                     conn.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_db_background_failure("DB vacuum scheduler", exc)
         _time.sleep(3600)
 
 
-def _start_vacuum_scheduler() -> None:
+def _start_vacuum_scheduler() -> bool:
     global _VACUUM_THREAD
     with _VACUUM_LOCK:
-        if _VACUUM_THREAD is None or not _VACUUM_THREAD.is_alive():
-            _VACUUM_THREAD = threading.Thread(target=_vacuum_worker,
-                                              name="db-vacuum", daemon=True)
-            _VACUUM_THREAD.start()
+        if _VACUUM_THREAD is not None and _VACUUM_THREAD.is_alive():
+            return True
+        candidate = _start_optional_db_thread(
+            target=_vacuum_worker,
+            name="db-vacuum",
+            failure_context="start DB vacuum worker",
+        )
+        if candidate is None:
+            _VACUUM_THREAD = None
+            return False
+        _VACUUM_THREAD = candidate
+        return True
 
 
 # 
@@ -3189,13 +3218,14 @@ def finalize_interrupted_futures_candidates(
                 if claim_base == base:
                     claimed = True
                     break
-                try:
-                    extra = json.loads(claim["extra_json"] or "{}")
-                except (TypeError, ValueError):
-                    extra = {}
+                extra = _strict_claim_extra_object(claim["extra_json"])
+                if extra is None:
+                    # Ambiguous ownership metadata must keep the lifecycle
+                    # candidate alive for a later/manual consistency repair.
+                    claimed = True
+                    break
                 if (
-                    isinstance(extra, dict)
-                    and str(extra.get("entry_id") or "").strip() == entry_id
+                    str(extra.get("entry_id") or "").strip() == entry_id
                 ):
                     claimed = True
                     break
@@ -5222,7 +5252,10 @@ def check_and_consume_global_api(bot_name: str, endpoint: str = "",
     durable gate is unavailable, and otherwise ``True`` or the reservation id.
     Critical calls bypass the normal cap but are still durably accounted.
     """
-    from core.constants import API_RATE_HARD_MAX_PER_MINUTE
+    from core.constants import (
+        API_LEDGER_CLOCK_ROLLBACK_TOLERANCE_SECONDS,
+        API_RATE_HARD_MAX_PER_MINUTE,
+    )
 
     validated_bot = _required_text_db(
         bot_name, "bot_name", max_length=64
@@ -5254,10 +5287,16 @@ def check_and_consume_global_api(bot_name: str, endpoint: str = "",
             now = _utcnow()
             now_str = now.strftime("%Y-%m-%d %H:%M:%S")
             cutoff = (now - timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S")
+            latest_recent = (
+                now
+                + timedelta(
+                    seconds=API_LEDGER_CLOCK_ROLLBACK_TOLERANCE_SECONDS
+                )
+            ).strftime("%Y-%m-%d %H:%M:%S")
             row = conn.execute(
                 "SELECT COUNT(*) FROM api_rate_global "
                 "WHERE called_at >= ? AND called_at <= ?",
-                (cutoff, now_str),
+                (cutoff, latest_recent),
             ).fetchone()
             count = row[0] if row else 0
             if count >= max_per_minute and not critical:
@@ -5596,14 +5635,12 @@ def remove_pending_open_position_claim(bot_name: str, symbol: str) -> bool:
         if row is None:
             conn.commit()
             return True
-        try:
-            extra = json.loads(row["extra_json"] or "{}")
-        except (TypeError, ValueError):
+        extra = _strict_claim_extra_object(row["extra_json"])
+        if extra is None:
             conn.execute("ROLLBACK")
             return False
         if (
-            not isinstance(extra, dict)
-            or extra.get("claim_release_pending") is not True
+            extra.get("claim_release_pending") is not True
         ):
             conn.execute("ROLLBACK")
             return False
@@ -6878,10 +6915,7 @@ def transition_order_intent(
                         WHERE intent_id=?""",
                     (validated_intent_id,),
                 ).fetchone()
-                try:
-                    claim_extra = json.loads(claim["extra_json"] or "{}")
-                except (TypeError, ValueError):
-                    claim_extra = None
+                claim_extra = _strict_claim_extra_object(claim["extra_json"])
                 exact_generation = (
                     isinstance(claim_extra, dict)
                     and claim_extra.get("entry_id") == validated_intent_id
@@ -7999,10 +8033,9 @@ def finalize_qualified_zero_fill_order_intent(
         ).fetchone()
         if claim is None:
             raise ValueError("zero-fill claim is missing")
-        try:
-            claim_extra = json.loads(claim["extra_json"] or "{}")
-        except (TypeError, ValueError) as exc:
-            raise ValueError("zero-fill claim metadata is invalid") from exc
+        claim_extra = _strict_claim_extra_object(claim["extra_json"])
+        if claim_extra is None:
+            raise ValueError("zero-fill claim metadata is invalid")
         claim_amount = _required_finite_float_db(
             claim["amount"], "zero-fill claim amount", minimum=0.0
         )

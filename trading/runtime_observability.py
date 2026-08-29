@@ -1,7 +1,6 @@
 """Fail-soft runtime consistency and observability helpers."""
 from __future__ import annotations
 
-import json
 import math
 import threading
 import time
@@ -170,10 +169,12 @@ def _direction(value: Any) -> str:
 
 def _claim_extra(row: Mapping[str, Any]) -> dict[str, Any]:
     try:
-        value = json.loads(str(row.get("extra_json") or "{}"))
-    except (TypeError, ValueError, json.JSONDecodeError):
+        from core.database import _strict_claim_extra_object
+
+        value = _strict_claim_extra_object(row.get("extra_json"))
+    except (ImportError, TypeError, ValueError):
         return {}
-    return value if isinstance(value, dict) else {}
+    return value if value is not None else {}
 
 
 def _has_raw_partial_evidence(extra: Mapping[str, Any]) -> bool:

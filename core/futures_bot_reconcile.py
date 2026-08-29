@@ -9,7 +9,6 @@ Two reconciliation paths:
 """
 from __future__ import annotations
 
-import json
 import math
 import time
 from datetime import datetime, timezone
@@ -852,7 +851,11 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
     """
     from core.database import save_trade_db
     from core.logger import log_event
-    from bot_utils import safe_proportional_fee, safe_funding_scale
+    from bot_utils import (
+        futures_contract_size_or_none,
+        safe_funding_scale,
+        safe_proportional_fee,
+    )
     from bot_utils.futures_order import FUTURES_DEFAULT_TAKER_FEE
 
     entry = _positive_float_or_none(state_row.get("buy"))
@@ -870,10 +873,9 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
         return False, {}
 
     symbol_full = f"{sym}/USDT:USDT"
-    try:
-        contract_size = bot._get_contract_size(symbol_full)
-    except Exception:
-        contract_size = 1.0
+    contract_size = futures_contract_size_or_none(
+        getattr(bot, "ex", None), symbol_full
+    )
     ratio_sold = min(1.0, sold_contracts / local_amt)
     margin_sold = round(margin * ratio_sold, 8)
     margin_remaining = max(0.0, margin - margin_sold)
@@ -950,17 +952,20 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
         funding_total, sold_contracts, original_amount,
         partial_sold=partial_sold,
     )
-    close_fee = (
-        close_fee_actual
-        if (
-            _futures_close_fee_is_known(source)
-            and math.isfinite(close_fee_actual)
-        )
-        else _estimate_futures_close_fee_usdt(
+    if _futures_close_fee_is_known(source) and math.isfinite(close_fee_actual):
+        close_fee = close_fee_actual
+    else:
+        if contract_size is None:
+            log_event(
+                f" Reconciliation: {sym} external futures partial fee "
+                "cannot be estimated without verified contract size",
+                "WARN",
+            )
+            return False, {}
+        close_fee = _estimate_futures_close_fee_usdt(
             sold_contracts, contract_size, close_price,
             FUTURES_DEFAULT_TAKER_FEE,
         )
-    )
     profit_usdt = round(gross_pnl - entry_fee - close_fee - funding_partial, 4)
     prev_realized = _finite_float_or_none(
         state_row.get("partial_profit_realized", 0.0))
@@ -1479,6 +1484,7 @@ class FuturesReconcileMixin:
                 from core.database import (
                     _base_symbol,
                     _causal_entry_id_db,
+                    _strict_claim_extra_object,
                     get_open_positions_db,
                 )
 
@@ -1506,8 +1512,10 @@ class FuturesReconcileMixin:
                         clear_barrier = False
                         break
                     try:
-                        claim_extra = json.loads(row.get("extra_json") or "{}")
-                        if not isinstance(claim_extra, dict):
+                        claim_extra = _strict_claim_extra_object(
+                            row.get("extra_json")
+                        )
+                        if claim_extra is None:
                             raise ValueError("claim metadata is not an object")
                         if (
                             claim_extra.get("entry_sizing_recovery_pending") is True
@@ -1704,18 +1712,19 @@ class FuturesReconcileMixin:
                 and not ambiguous_exchange_bases
             ):
                 log_event(
-                    f" Reconciliation ABORT: {len(local_state)} local "
-                    f"position(s) but exchange returned 0  possible API "
-                    f"glitch. Refusing to wipe state. Verify manually "
-                    f"and restart bot if exchange truly is empty.",
+                    f" Reconciliation verification: {len(local_state)} local "
+                    f"position(s) but the global exchange snapshot returned 0; "
+                    f"keeping state and verifying each symbol before any "
+                    f"offline-close decision.",
                     "WARN"
                 )
                 try:
                     if not bool(getattr(self, "simulation", True)):
                         send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                            f" [{self.BOT_NAME}] Reconcile aborted!\n"
+                            f" [{self.BOT_NAME}] Reconcile verification\n"
                             f"{len(local_state)} local position(s) but "
-                            f"exchange shows 0. Check the exchange manually."
+                            f"the global exchange snapshot shows 0. State is "
+                            f"kept while each symbol is verified."
                         )
                 except Exception:
                     pass
@@ -2994,6 +3003,13 @@ class FuturesReconcileMixin:
                     timeout=self.GC_LOCKS_INTERVAL_SEC
                 ):
                     return
+                try:
+                    self._recover_simulated_entry_tca_pending()
+                except Exception as exc:
+                    try:
+                        self._log_error("SIM TCA recovery", exc)
+                    except Exception:
+                        pass
                 try:
                     n = gc_idle_locks()
                     if n:

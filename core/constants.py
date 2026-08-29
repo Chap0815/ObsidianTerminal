@@ -14,6 +14,8 @@ from shared_limits import (
     API_RATE_HARD_MAX_PER_MINUTE as API_RATE_HARD_MAX_PER_MINUTE,
 )
 
+API_LEDGER_CLOCK_ROLLBACK_TOLERANCE_SECONDS = 5
+
 
 def _bounded_env_float(
     name: str, default: float, *, minimum: float, maximum: float

@@ -91,12 +91,14 @@ def _date():
 
 _CONSOLE_FAILURE_REPORTED = [False]
 _CONSOLE_FAILURE_LOCK = threading.Lock()
+_CONSOLE_WRITE_LOCK = threading.Lock()
 
 
 def _safe_console_print(*args, **kwargs) -> None:
     """Best-effort console output that never breaks trading control flow."""
     try:
-        print(*args, **kwargs)
+        with _CONSOLE_WRITE_LOCK:
+            print(*args, **kwargs)
         return
     except Exception as exc:
         error_type = type(exc).__name__
@@ -1434,10 +1436,10 @@ def save_j(f, d):
                 allow_nan=False,
             )
             fh.flush()
-            try:
-                os.fsync(fh.fileno())
-            except (AttributeError, OSError):
-                pass
+            # This is atomic_save_json's fallback writer. Preserve the same
+            # durability contract instead of acknowledging an unflushed state
+            # snapshot as persisted.
+            os.fsync(fh.fileno())
         for _attempt in range(8):
             try:
                 os.replace(tmp, f)
@@ -1467,6 +1469,7 @@ def save_j(f, d):
 _TRADE_LOG_LOCK = threading.Lock()
 _LEGACY_REBUILD_LOCK = threading.Lock()
 _LAST_LEGACY_REBUILD = 0.0
+_LEGACY_REBUILD_RUNNING = False
 _LEGACY_REBUILD_INTERVAL_SEC = 3600.0  # rebuild at most once per hour
 _LEGACY_REBUILD_RETRY_SEC = 60.0
 _LEGACY_HISTORY_ROW_MAX_BYTES = 64 * 1024
@@ -1579,20 +1582,38 @@ def _legacy_rebuild_worker(jsonl_path: str, legacy_path: str) -> None:
             pass
 
 
+def _legacy_rebuild_worker_singleflight(
+    jsonl_path: str,
+    legacy_path: str,
+) -> None:
+    """Run one rebuild and always release its process-local admission latch."""
+    global _LEGACY_REBUILD_RUNNING
+    try:
+        _legacy_rebuild_worker(jsonl_path, legacy_path)
+    finally:
+        with _LEGACY_REBUILD_LOCK:
+            _LEGACY_REBUILD_RUNNING = False
+
+
 def _maybe_rebuild_legacy(jsonl_path: str, legacy_path: str) -> None:
     """Rebuild legacy file at most once per hour, on a background thread."""
-    global _LAST_LEGACY_REBUILD
+    global _LAST_LEGACY_REBUILD, _LEGACY_REBUILD_RUNNING
     now = time.monotonic()
     with _LEGACY_REBUILD_LOCK:
+        if _LEGACY_REBUILD_RUNNING:
+            return
         if now - _LAST_LEGACY_REBUILD < _LEGACY_REBUILD_INTERVAL_SEC:
             return
+        _LEGACY_REBUILD_RUNNING = True
         try:
             candidate = threading.Thread(
-                target=_legacy_rebuild_worker, args=(jsonl_path, legacy_path),
+                target=_legacy_rebuild_worker_singleflight,
+                args=(jsonl_path, legacy_path),
                 daemon=True, name="legacy-history-rebuild",
             )
             candidate.start()
         except BaseException:
+            _LEGACY_REBUILD_RUNNING = False
             # A job that never started must not consume the full hourly slot.
             # Keep a short retry delay to avoid hot-looping repeated failures.
             _LAST_LEGACY_REBUILD = (

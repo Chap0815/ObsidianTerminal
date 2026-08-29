@@ -696,14 +696,11 @@ def _persist_spot_external_partial_state(
 
 
 def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
-    import json as _json
+    from core.database import _strict_claim_extra_object
 
-    try:
-        extra = _json.loads(pos.get("extra_json") or "{}")
-    except Exception:
-        extra = {}
-    if not isinstance(extra, dict):
-        extra = {}
+    extra = _strict_claim_extra_object(pos.get("extra_json"))
+    if extra is None:
+        return None
     if extra.get("claim_release_pending") is True:
         return None
 

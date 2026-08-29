@@ -11,7 +11,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Mapping, Sequence
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.silent_log import silent_log
 
 
@@ -249,7 +253,18 @@ def _mexc_private_fee_loader(exchange, symbol: str) -> dict[str, float] | None:
     market_id = market.get("id")
     if not callable(method) or not market_id:
         return None
-    raw = method({"symbol": market_id})
+    reservation = try_consume_api_call(
+        "mexc_private_fee_rate",
+        return_reservation=True,
+    )
+    if not reservation:
+        return None
+    try:
+        raw = method({"symbol": market_id})
+    except Exception:
+        if isinstance(reservation, ApiCallReservation):
+            record_api_error("mexc_private_fee_rate", reservation)
+        raise
     data = raw.get("data") if isinstance(raw, dict) else None
     if not isinstance(data, dict):
         return None

@@ -451,6 +451,11 @@ class WebSocketFeed:
                         and all(self.is_fresh(sym) for sym in current_syms)
                     )
                     if all_current_symbols_healthy:
+                        # A reconnect is not merely informational: confirmed
+                        # WS coverage hands ownership back from the temporary
+                        # REST pool.  The REST session observes this flag and
+                        # exits without remaining as a duplicate price source.
+                        self._ws_mode = True
                         healthy_now = time.monotonic()
                         if healthy_since is None:
                             healthy_since = healthy_now
@@ -492,6 +497,20 @@ class WebSocketFeed:
             except Exception as e:
                 error_type = type(e).__name__
                 reconnect_attempts += 1
+                # Normal transport exceptions are handled inside this retry
+                # loop and therefore never reach the outer thread wrapper.
+                # Activate the documented REST fallback here, clear the WS
+                # generation's cache, and keep reconnecting in parallel.
+                with self._cache_lock:
+                    self._cache.clear()
+                self._ws_mode = False
+                try:
+                    self._ensure_rest_poller()
+                except Exception as fallback_exc:
+                    silent_log(
+                        "start interrupted WebSocket REST fallback",
+                        fallback_exc,
+                    )
                 try:
                     from core.logger import log_struct
                     log_struct(
@@ -661,7 +680,7 @@ class WebSocketFeed:
                 inflight_slots.release()
 
             symbol_cursor = 0
-            while self._running:
+            while self._running and not self._ws_mode:
                 cycle_start = time.monotonic()
                 with self._symbols_lock:
                     symbols = sorted(self._symbols)
@@ -731,7 +750,11 @@ class WebSocketFeed:
                 elapsed   = time.monotonic() - cycle_start
                 remaining = max(0.0, REST_POLL_INTERVAL - elapsed)
                 slept     = 0.0
-                while slept < remaining and self._running:
+                while (
+                    slept < remaining
+                    and self._running
+                    and not self._ws_mode
+                ):
                     time.sleep(min(0.5, remaining - slept))
                     slept += 0.5
         finally:

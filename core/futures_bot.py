@@ -237,11 +237,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         fill_price: float,
         fee_rate: float,
         notional_usdt: float,
+        arrival_unavailable_reason: str | None = None,
     ) -> dict[str, Any]:
         """Build the bounded SIM-evidence WAL committed with position state."""
         from core.logger import _date as _utc_now_str
 
-        return {
+        pending = {
             "version": 1,
             "entry_id": str(entry_id),
             "bot_name": str(self.BOT_NAME).upper(),
@@ -253,6 +254,15 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "notional_usdt": float(notional_usdt),
             "filled_at": _utc_now_str(),
         }
+        if arrival_unavailable_reason is not None:
+            allowed_reasons = {
+                "capture_contract_size_unavailable",
+                "entry_orderbook_unavailable",
+            }
+            if arrival_unavailable_reason not in allowed_reasons:
+                raise ValueError("SIM TCA arrival-unavailable reason is invalid")
+            pending["arrival_unavailable_reason"] = arrival_unavailable_reason
+        return pending
 
     def _finalize_simulated_entry_tca(
         self,
@@ -260,6 +270,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         pending: dict,
         *,
         restart_recovery: bool = False,
+        arrival_book: dict | None = None,
     ) -> bool:
         """Persist post-state SIM evidence; retain WAL until it is durable."""
         context = f"{self.BOT_NAME} {base} SIM TCA durable finalize"
@@ -303,6 +314,9 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     error_type=(
                         "ContractSizeUnavailable"
                         if unavailable_reason
+                        == "capture_contract_size_unavailable"
+                        else "EntryOrderBookUnavailable"
+                        if unavailable_reason == "entry_orderbook_unavailable"
                         else "ArrivalBookNotRecoverable"
                     ),
                 )
@@ -324,6 +338,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     notional_usdt=pending["notional_usdt"],
                     filled_at=pending["filled_at"],
                     depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
+                    arrival_book=arrival_book,
                 )
 
             if not has_durable_simulated_entry_tca(
@@ -949,9 +964,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 if valid and float(pending["fee_rate"]) >= 1.0:
                     valid = False
                 unavailable = pending.get("arrival_unavailable_reason")
-                if unavailable is not None and unavailable != (
-                    "capture_contract_size_unavailable"
-                ):
+                if unavailable is not None and unavailable not in {
+                    "capture_contract_size_unavailable",
+                    "entry_orderbook_unavailable",
+                }:
                     valid = False
             filled_epoch = 0.0
             if valid:

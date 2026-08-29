@@ -597,32 +597,51 @@ class ThreadLocalExchange:
             source_currencies = getattr(self._base, "currencies", None) or {}
             with self._clones_lock:
                 clones = [clone for _thread, clone in self._clones]
+            refresh_error = None
             for clone in clones:
                 try:
-                    clone_markets = copy.deepcopy(source_markets)
-                except (TypeError, copy.Error):
-                    clone_markets = dict(source_markets)
-                try:
-                    clone_currencies = copy.deepcopy(source_currencies)
-                except (TypeError, copy.Error):
-                    clone_currencies = dict(source_currencies)
-                setter = getattr(clone, "set_markets", None)
-                if callable(setter):
-                    setter(clone_markets, clone_currencies)
-                else:
-                    clone.markets = clone_markets
-                    clone.symbols = list(
-                        getattr(self._base, "symbols", None) or clone_markets
-                    )
-                    clone.currencies = clone_currencies
                     try:
-                        clone.markets_by_id = copy.deepcopy(
-                            getattr(self._base, "markets_by_id", {})
-                        )
+                        clone_markets = copy.deepcopy(source_markets)
                     except (TypeError, copy.Error):
-                        clone.markets_by_id = dict(
-                            getattr(self._base, "markets_by_id", {})
+                        clone_markets = dict(source_markets)
+                    try:
+                        clone_currencies = copy.deepcopy(source_currencies)
+                    except (TypeError, copy.Error):
+                        clone_currencies = dict(source_currencies)
+                    setter = getattr(clone, "set_markets", None)
+                    if callable(setter):
+                        setter(clone_markets, clone_currencies)
+                    else:
+                        clone.markets = clone_markets
+                        clone.symbols = list(
+                            getattr(self._base, "symbols", None) or clone_markets
                         )
+                        clone.currencies = clone_currencies
+                        try:
+                            clone.markets_by_id = copy.deepcopy(
+                                getattr(self._base, "markets_by_id", {})
+                            )
+                        except (TypeError, copy.Error):
+                            clone.markets_by_id = dict(
+                                getattr(self._base, "markets_by_id", {})
+                            )
+                except Exception as exc:
+                    refresh_error = exc
+                    break
+            if refresh_error is not None:
+                # The canonical refresh succeeded, but the existing clone set
+                # is no longer coherent. Invalidate the whole generation so
+                # every owner rebuilds from the refreshed base on next use.
+                try:
+                    from bot_utils.silent_log import silent_log
+
+                    silent_log(
+                        "thread-local exchange clone market refresh",
+                        refresh_error,
+                    )
+                except Exception:
+                    pass
+                self.close_all()
             return markets
 
     @staticmethod

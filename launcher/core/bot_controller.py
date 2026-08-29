@@ -320,7 +320,19 @@ def start_bot(app, name: str) -> None:
     app._mark_dirty(name, False)
     snapshot = dict(app.config.get(name, {}))
 
-    issues = run_pre_start_checks(name)
+    # A real launcher start is the safe ownership boundary for retiring a
+    # crashed predecessor's stale heartbeat. Standalone diagnostics remain
+    # read-only because run_pre_start_checks() still defaults cleanup=False.
+    try:
+        issues = run_pre_start_checks(name, cleanup=True)
+    except Exception as exc:
+        log_to_card(
+            card,
+            "error",
+            "Pre-start check failed - start aborted: "
+            f"{_bounded_exception_summary(exc)}",
+        )
+        return
     if issues:
         for line in format_issues(issues):
             severity = "error" if line.startswith("ERROR ") else "warn"

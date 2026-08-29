@@ -13,7 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from bot_utils.config import parse_explicit_bool
+from bot_utils.config import (
+    _INT_FIELDS,
+    _finite_integral_or_none,
+    parse_explicit_bool,
+)
 from core.paths import BOT_CONFIG, DB_PATH, PROJECT_ROOT
 from core.runtime_status import (
     get_build_info,
@@ -480,6 +484,7 @@ def _check_runtime(bot_name: str, meta: dict, *, cleanup: bool = False) -> list[
                         bot_name,
                         "stopped",
                         bool(status.get("simulation", True)),
+                        process_pid=0,
                         threads={"monitor": False, "scan": False, "reconcile": False},
                         extra={
                             "previous_status": state,
@@ -490,15 +495,17 @@ def _check_runtime(bot_name: str, meta: dict, *, cleanup: bool = False) -> list[
                     )
                 except Exception:
                     pass
-                msg = (
-                    "marked stopped"
-                    if published is not False
-                    else "status publish failed; left unchanged"
-                )
+                if published is True:
+                    # The predecessor is conclusively absent and its last
+                    # status was durably retired. The replacement status keeps
+                    # the audit context; no unresolved warning remains for the
+                    # operator-facing pre-start log.
+                    return []
+                msg = "status publish failed; left unchanged"
             else:
                 msg = "left unchanged"
             return [_issue(
-                "warn", "runtime_status_stale",
+                "error" if cleanup else "warn", "runtime_status_stale",
                 f"{bot_name}: stale runtime_status said {state} but pid {pid} is not alive; {msg}"
             )]
     return []
@@ -525,6 +532,13 @@ def _check_config(bot_name: str | None,
         if not sim and name not in visible:
             issues.append(_issue("error", "hidden_live_bot",
                                  f"{name}: LIVE but hidden in UI.VISIBLE_BOTS"))
+        for key in sorted(_INT_FIELDS):
+            if key in section and _finite_integral_or_none(section[key]) is None:
+                issues.append(_issue(
+                    "error",
+                    "config_integer_required",
+                    f"{name}: {key} must be a finite whole number",
+                ))
         for key in ("POSITION_SIZE", "MAX_OPEN_TRADES", "MAX_DAILY_LOSS"):
             try:
                 val = _finite_float(section.get(key))
@@ -704,6 +718,21 @@ def _check_config(bot_name: str | None,
                 issues.append(_issue(
                     "error", "config_numeric",
                     f"{name}: {key} is not numeric/finite"))
+        for fast_key, slow_key in (
+            ("TREND_SMA_FAST", "TREND_SMA_SLOW"),
+            ("TREND_CROSS_FAST", "TREND_CROSS_SLOW"),
+        ):
+            if fast_key not in section or slow_key not in section:
+                continue
+            fast = _finite_integral_or_none(section[fast_key])
+            slow = _finite_integral_or_none(section[slow_key])
+            if fast is not None and slow is not None and fast >= slow:
+                issues.append(_issue(
+                    "error",
+                    "trend_window_order_invalid",
+                    f"{name}: {fast_key}={fast} must be below "
+                    f"{slow_key}={slow}",
+                ))
     return issues
 
 
@@ -780,8 +809,10 @@ def _check_state_and_claims(bot_name: str | None,
                 except (TypeError, ValueError):
                     amount = invested = 0.0
                 try:
-                    extra = json.loads(r.get("extra_json") or "{}")
-                except (TypeError, ValueError):
+                    from core.database import _strict_claim_extra_object
+
+                    extra = _strict_claim_extra_object(r.get("extra_json"))
+                except (ImportError, TypeError, ValueError):
                     extra = None
                 if (
                     isinstance(extra, dict)

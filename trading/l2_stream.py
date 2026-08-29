@@ -392,6 +392,12 @@ class L2ShadowCollector:
                 # A newly selected stream belongs to a new validation
                 # generation; do not inherit the prior universe's healthy
                 # latch before every desired symbol has produced a sample.
+                # Once the previous generation proved healthy, its transport
+                # incident is resolved.  Retaining that context would report
+                # the same reconnect recovery again for every universe growth.
+                if self._health_ok_logged:
+                    self._health_error_type = None
+                    self._health_reconnect_attempts = 0
                 self._health_ok_logged = False
 
     def _symbol_snapshot(self) -> tuple[str, ...]:

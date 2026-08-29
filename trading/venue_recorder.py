@@ -604,11 +604,14 @@ class SQLitePartitionWriter:
             def _storage_bytes() -> int:
                 total = 0
                 for item in self.root.glob("*/*"):
-                    if item.is_file():
-                        try:
-                            total += item.stat().st_size
-                        except OSError:
-                            pass
+                    try:
+                        item_stat = item.stat()
+                    except OSError as exc:
+                        raise RuntimeError(
+                            "venue capture storage size unavailable"
+                        ) from exc
+                    if stat.S_ISREG(item_stat.st_mode):
+                        total += item_stat.st_size
                 return total
             total = _storage_bytes()
             if total > self.max_storage_bytes and first_cleanup_error is None:
@@ -1378,7 +1381,6 @@ class VenueRecorder:
         overview_stale_after = max(30.0, self.overview_interval * 2.5)
         markets = {}
         with self._rest_health_lock:
-            observations_available = bool(self._rest_health)
             overview_item = self._rest_health.get(
                 ("ALL_USDT_SWAPS", "overview")
             )
@@ -1429,7 +1431,10 @@ class VenueRecorder:
             if streams["trades"]["valid"] is not True
         )
         return {
-            "ok": not missing if observations_available else True,
+            # Missing evidence is not healthy evidence. In particular, the
+            # first status publication must stay degraded until overview and
+            # every required depth stream produced a valid observation.
+            "ok": not missing,
             "stale_after_seconds": stale_after,
             "overview_stale_after_seconds": overview_stale_after,
             "missing_or_invalid": missing,

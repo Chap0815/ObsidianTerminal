@@ -2951,8 +2951,20 @@ def _update_existing_repo(
     _run([git, "fetch", "origin", branch], timeout=300)
     _verify_ref_has_no_runtime_files(git, "FETCH_HEAD")
     if _is_ancestor(git, "FETCH_HEAD", "HEAD"):
-        _print("Lokaler Stand ist neuer oder identisch zum Remote; kein Downgrade ausgefuehrt.")
-        return
+        try:
+            _verify_updated_tree()
+        except Exception as exc:
+            _print(
+                "Lokaler Stand ist neuer oder identisch, aber die installierte "
+                "Manifestparitaet ist beschaedigt; Reparaturpfad wird ausgefuehrt: "
+                f"{type(exc).__name__}"
+            )
+        else:
+            _print(
+                "Lokaler Stand ist neuer oder identisch zum Remote und "
+                "manifestgleich; kein Downgrade ausgefuehrt."
+            )
+            return
     if not _is_ancestor(git, "HEAD", "FETCH_HEAD") and _is_shallow_repo(git):
         _print("Shallow Git history detected; deepening history before ancestry check.")
         _run([git, "fetch", "--deepen", "100", "origin", branch], timeout=300, check=False)

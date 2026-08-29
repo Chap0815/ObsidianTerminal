@@ -141,10 +141,10 @@ def atomic_save_json(path: str, data) -> bool:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(serialized)
             f.flush()
-            try:
-                os.fsync(f.fileno())
-            except (AttributeError, OSError):
-                pass
+            # Position state is restart truth. A failed durability flush must
+            # not be converted into a successful publish: leave the last-good
+            # target untouched and let the caller fail closed.
+            os.fsync(f.fileno())
 
         # Windows retry: target file may be open by the launcher's poller.
         # Retry count + sleep configurable via env vars
@@ -309,6 +309,7 @@ def _validate_state(trades: dict,
         if amt <= 0:
             rejected.append(f"{sym}(amount={raw_amount})")
             continue
+        d["amount"] = amt
 
         if require_position_type and d.get("position_type") not in ("LONG", "SHORT"):
             rejected.append(f"{sym}(position_type)")
@@ -361,6 +362,8 @@ def _validate_state(trades: dict,
                     rejected.append(f"{sym}(invested-overflow)")
                     continue
                 d["invested_usdt"] = reconstructed
+            else:
+                d["invested_usdt"] = invested
 
         # Heal NaN/Inf in optional numeric fields
         for field in ("highest", "fees_paid",

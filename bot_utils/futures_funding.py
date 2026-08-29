@@ -280,7 +280,7 @@ def fetch_realized_funding(ex,
             ts = h.get("timestamp")
             try:
                 ts_i = int(ts) if ts is not None and not isinstance(ts, bool) else None
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 ts_i = None
             if amt is None or ts_i is None:
                 unverifiable_row = True
@@ -448,17 +448,16 @@ def get_funding_info(
             from config.exchange_config import safe_fetch_open_interest
             oi = safe_fetch_open_interest(ex, symbol_full)
             if oi is not None:
-                # CCXT can expose both the base/contracts quantity and its
-                # quote value.  This function promises USDT millions, so the
-                # explicit quote value is authoritative when both are present.
-                for k in ("openInterestValue", "openInterestAmount", "openInterest"):
-                    v = oi.get(k)
-                    if v is None and isinstance(oi.get("info"), dict):
-                        v = oi["info"].get(k)
-                    parsed_oi = _finite_float_or_none(v)
-                    if parsed_oi is not None and parsed_oi > 0:
-                        oi_usdt = parsed_oi / 1_000_000
-                        break
+                # CCXT separates contract/base quantity
+                # (openInterestAmount) from quote-currency money value
+                # (openInterestValue). This function promises USDT millions,
+                # so an amount can never substitute for the explicit value.
+                value = oi.get("openInterestValue")
+                if value is None and isinstance(oi.get("info"), dict):
+                    value = oi["info"].get("openInterestValue")
+                parsed_oi = _finite_float_or_none(value)
+                if parsed_oi is not None and parsed_oi > 0:
+                    oi_usdt = parsed_oi / 1_000_000
         except Exception:
             pass
 

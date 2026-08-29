@@ -43,6 +43,7 @@ from trading.xsec_signal import (
 
 _REBALANCE_STATE_PARAM = "REBALANCE_STATE_V2"
 _REBALANCE_STATE_SCHEMA = 1
+_MONITOR_TICKER_BATCH_SIZE = 20
 
 
 def _encode_rebalance_state(slot: int, recent_returns, crash_flat: bool) -> str:
@@ -157,6 +158,12 @@ class CrossBot(FuturesBot):
     BOT_NAME = "CROSS"
     BUY_PREFIX = "xmom"
     NEWS_MODULE_PATH = ""          # no LLM - overridden _news below
+
+    def __init__(self, simulation: bool = True):
+        super().__init__(simulation=simulation)
+        # New legs remain blocked until the monitor has produced one complete
+        # current-price account-risk decision for this process generation.
+        self._cross_risk_snapshot_ok = False
 
     #  No news/LLM: satisfy FuturesBot.run()'s `_ = self._news` check 
     @property
@@ -866,8 +873,10 @@ class CrossBot(FuturesBot):
         from core.logger import log_event
 
         full = f"{base}/USDT:USDT"
+        from core.clock import now_ms
+
         inflight_active = CrossBot._safe_float(
-            self, d.get("entry_inflight_until"), 0.0) > time.time()
+            self, d.get("entry_inflight_until"), 0.0) > now_ms() / 1000.0
         recovery_blocked = (
             self._entry_recovery_runtime_health().get("ok") is False
         )
@@ -919,10 +928,20 @@ class CrossBot(FuturesBot):
         if contracts is None or contracts <= 0 or entry <= 0:
             return False
         try:
-            from bot_utils import futures_contract_size
-            cs = futures_contract_size(self.ex, full)
+            from bot_utils import futures_contract_size_or_none
+
+            cs = futures_contract_size_or_none(self.ex, full)
         except Exception:
-            cs = self._safe_float(d.get("contract_size"), 1.0) or 1.0
+            cs = self._safe_float(d.get("contract_size"), 0.0)
+        cs = self._safe_float(cs, 0.0)
+        leverage = self._safe_float(d.get("leverage"), 0.0)
+        if cs <= 0.0 or leverage <= 0.0:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: provisional leg money metadata "
+                "could not be verified - kept fail-closed",
+                "ERROR",
+            )
+            return False
 
         persisted = self.state.update_many(base, {
             "buy": entry,
@@ -933,7 +952,7 @@ class CrossBot(FuturesBot):
             "contract_size": cs,
             "invested_usdt": (
                 contracts * cs * entry
-                / max(1.0, self._safe_float(d.get("leverage"), 1.0))
+                / leverage
             ),
             "provisional": False,
         })
@@ -1235,15 +1254,25 @@ class CrossBot(FuturesBot):
         if state_unavailable:
             return False
         if bool(getattr(self, "_cross_crash_flat", False)):
-            return slot != self._last_rebalance_slot
-        return slot != self._last_rebalance_slot or empty
+            return slot > self._last_rebalance_slot
+        return slot > self._last_rebalance_slot or empty
 
     def _mark_rebalanced(self) -> None:
         """Persist the current slot as consumed - called only AFTER a rebalance
         actually applied a book, so an interrupted/failed rebalance retries on
         the next loop instead of being skipped until the next slot."""
         iv = self._rebalance_interval_sec()
-        slot = int(time.time()) // iv
+        observed_slot = int(time.time()) // iv
+        previous_slot = getattr(self, "_last_rebalance_slot", -1)
+        if (
+            isinstance(previous_slot, bool)
+            or not isinstance(previous_slot, int)
+        ):
+            previous_slot = -1
+        # A wall-clock correction must never move the durable cadence marker
+        # backwards. Otherwise the corrected clock re-enters the already
+        # consumed slot and applies a second portfolio rebalance.
+        slot = max(observed_slot, previous_slot)
         self._last_rebalance_slot = slot
         if not CrossBot._persist_rebalance_state(self, slot):
             exc = RuntimeError("rebalance state persistence failed")
@@ -1319,6 +1348,13 @@ class CrossBot(FuturesBot):
             log_event(f"[{self.BOT_NAME}] SAFE_MODE - top-up skipped "
                       f"({self.safe_mode.reason()})", "WAIT")
             return True
+        if getattr(self, "_cross_risk_snapshot_ok", True) is not True:
+            log_event(
+                f"[{self.BOT_NAME}] top-up skipped - account risk snapshot "
+                "is unavailable",
+                "WAIT",
+            )
+            return False
         try:
             paused, why = is_bot_paused(
                 self.BOT_NAME, exchange=self.ex, simulation=self.simulation)
@@ -1472,7 +1508,7 @@ class CrossBot(FuturesBot):
                     if side not in {"LONG", "SHORT"}
                 )
                 if long_n == short_n and not invalid_sides and not operation_raised:
-                    self._neutrality_settle_until = time.time() + 120.0
+                    self._neutrality_settle_until = time.monotonic() + 120.0
                 elif long_n != short_n or invalid_sides:
                     self._neutrality_settle_until = 0.0
                     self._last_neutrality_check = 0.0
@@ -1511,6 +1547,9 @@ class CrossBot(FuturesBot):
             getattr(self, "_rebalance_state_load_error", "") or ""
         )
         crash_flat = bool(getattr(self, "_cross_crash_flat", False))
+        risk_snapshot_ok = (
+            getattr(self, "_cross_risk_snapshot_ok", True) is True
+        )
         raw_last_slot = getattr(self, "_last_rebalance_slot", None)
         last_slot = (
             raw_last_slot
@@ -1547,7 +1586,7 @@ class CrossBot(FuturesBot):
             crash_flat
             and last_slot is not None
             and current_slot is not None
-            and current_slot != last_slot
+            and current_slot > last_slot
         )
         return {
             "ok": (
@@ -1555,6 +1594,7 @@ class CrossBot(FuturesBot):
                 and not slot_persist_pending
                 and not state_persist_pending
                 and not state_load_error
+                and risk_snapshot_ok
             ),
             "component": "cross_scan",
             "consecutive_errors": errors,
@@ -1562,6 +1602,7 @@ class CrossBot(FuturesBot):
             "rebalance_state_persist_pending": state_persist_pending,
             "rebalance_state_load_error": state_load_error,
             "crash_flat": crash_flat,
+            "account_risk_snapshot_ok": risk_snapshot_ok,
             "last_rebalance_slot": last_slot,
             "current_rebalance_slot": current_slot,
             "next_rebalance_wall_ts": next_rebalance_wall_ts,
@@ -1724,6 +1765,13 @@ class CrossBot(FuturesBot):
             log_event(f"[{self.BOT_NAME}] SAFE_MODE - rebalance skipped "
                       f"({self.safe_mode.reason()})", "WAIT")
             return True
+        if getattr(self, "_cross_risk_snapshot_ok", True) is not True:
+            log_event(
+                f"[{self.BOT_NAME}] rebalance skipped - account risk snapshot "
+                "is unavailable",
+                "WAIT",
+            )
+            return False
         paused, why = is_bot_paused(
             self.BOT_NAME, exchange=self.ex, simulation=self.simulation)
         if paused:
@@ -1749,7 +1797,7 @@ class CrossBot(FuturesBot):
         slot_advanced = last_slot is None
         if last_slot is not None:
             current_slot = int(time.time()) // CrossBot._rebalance_interval_sec(self)
-            slot_advanced = current_slot != last_slot
+            slot_advanced = current_slot > last_slot
         was_crash_flat = bool(getattr(self, "_cross_crash_flat", False))
         staged_returns = advance_crash_history(
             list(self._recent_rebalance_returns),
@@ -1840,7 +1888,7 @@ class CrossBot(FuturesBot):
                 self._closed_leg_moves_since_rebalance = current_closed_moves[
                     len(closed_moves_consumed):
                 ]
-        self._neutrality_settle_until = time.time() + 120.0
+        self._neutrality_settle_until = time.monotonic() + 120.0
         # Mark this slot consumed ONLY now that a book was actually applied, so
         # a restart inside the same slot resumes instead of re-rebalancing.
         self._mark_rebalanced()
@@ -2064,12 +2112,23 @@ class CrossBot(FuturesBot):
             bal = min(bal, cap)
         return bal
 
-    def _snapshot_cross_legs(self, trades) -> dict:
+    def _snapshot_cross_legs(
+        self,
+        trades,
+        ticker_snapshot=None,
+        failed_ticker_symbols=None,
+    ) -> dict:
         """{base: (entry, qty_signed, mm_rate, mark)} for the equity-aware cross
         liq. Marks from the ticker cache, mm from the exchange tier (0.01 if
         unavailable). Legs with bad/missing data are skipped - they simply don't
         contribute to the other legs' liq estimate."""
         snap: Dict[str, tuple] = {}
+        if failed_ticker_symbols is None:
+            failed_ticker_symbols = getattr(
+                self,
+                "_monitor_failed_ticker_symbols",
+                (),
+            )
         try:
             from bot_utils import get_maintenance_margin_rate
         except Exception:
@@ -2090,8 +2149,15 @@ class CrossBot(FuturesBot):
                 if entry <= 0 or amt <= 0:
                     continue
                 full = f"{base}/USDT:USDT"
-                tk = self.ticker_cache.get(self.ex, full, timeout=5.0)
+                tk = (
+                    ticker_snapshot.get(full)
+                    if isinstance(ticker_snapshot, dict)
+                    else None
+                )
                 mark = CrossBot._ticker_price(tk)
+                if mark <= 0 and full not in failed_ticker_symbols:
+                    tk = self.ticker_cache.get(self.ex, full, timeout=5.0)
+                    mark = CrossBot._ticker_price(tk)
                 if mark <= 0:
                     continue
                 # LIVE state amount is in CONTRACTS; SIM state amount is already
@@ -2365,6 +2431,7 @@ class CrossBot(FuturesBot):
     def _open_leg(self, base: str, full: str, side: str, notional: float,
                   price: float, lev: float,
                   quality_context: dict | None = None) -> None:
+        from core.clock import now_ms
         from core.logger import log_event, log_struct, _date as _utc
         from core.database import is_claimed_by_other, claim_symbol_for_entry
         # Re-check the claim right before opening (race with another bot).
@@ -2415,12 +2482,15 @@ class CrossBot(FuturesBot):
         # open without a fresh bid/ask; SIM may fall back to the signal price.
         exec_price = entry_price
         book_ok = False
+        arrival_book = None
+        arrival_book_unavailable = False
         spread_pct = None
         max_spread = self._f("XSEC_MAX_SPREAD_PCT", 0.5)
         try:
             if not try_consume_api_call("cross_entry_fetch_order_book"):
                 raise RuntimeError("API budget denied")
             ob = self.ex.fetch_order_book(full, limit=5)
+            arrival_book = ob
             bids = (ob or {}).get("bids") or []
             asks = (ob or {}).get("asks") or []
             if bids and asks:
@@ -2447,6 +2517,7 @@ class CrossBot(FuturesBot):
                 log_event(f"[{self.BOT_NAME}] {base}: orderbook unavailable "
                           f"({type(exc).__name__}) - skip live leg", "WARN")
                 return
+            arrival_book_unavailable = True
         if not book_ok and not self.simulation:
             log_event(f"[{self.BOT_NAME}] {base}: orderbook empty - skip live leg",
                       "WARN")
@@ -2561,6 +2632,11 @@ class CrossBot(FuturesBot):
                     fill_price=fill,
                     fee_rate=fee_rate,
                     notional_usdt=notional,
+                    arrival_unavailable_reason=(
+                        "entry_orderbook_unavailable"
+                        if arrival_book_unavailable
+                        else None
+                    ),
                 )
             except Exception as exc:
                 silent_log(
@@ -2575,9 +2651,9 @@ class CrossBot(FuturesBot):
                     fill_price=fill,
                     fee_rate=fee_rate,
                     notional_usdt=notional,
-                )
-                sim_tca_pending["arrival_unavailable_reason"] = (
-                    "capture_contract_size_unavailable"
+                    arrival_unavailable_reason=(
+                        "capture_contract_size_unavailable"
+                    ),
                 )
         else:
             #  LIVE: cross-margin market order 
@@ -2773,7 +2849,7 @@ class CrossBot(FuturesBot):
                 "entry_quality_reasons": ",".join(quality.reasons),
                 "entry_id": entry_id,
                 "provisional": True,
-                "entry_inflight_until": time.time() + 120.0,
+                "entry_inflight_until": now_ms() / 1000.0 + 120.0,
             })
             if provisional_added is False:
                 emit_entry_lifecycle(
@@ -3077,7 +3153,11 @@ class CrossBot(FuturesBot):
                     base, "sim state write failed after entry")
             return
         if sim_tca_pending is not None:
-            self._finalize_simulated_entry_tca(base, sim_tca_pending)
+            self._finalize_simulated_entry_tca(
+                base,
+                sim_tca_pending,
+                arrival_book=arrival_book,
+            )
         emit_entry_lifecycle(
             entry_id, bot=self.BOT_NAME, symbol=base,
             stage="opened", mode=entry_mode, fill_price=fill,
@@ -4040,13 +4120,81 @@ class CrossBot(FuturesBot):
             if self._shutdown_event.wait(timeout=interval):
                 return
 
+    def _monitor_ticker_snapshot(
+        self,
+        trades: dict,
+    ) -> tuple[dict, frozenset[str]]:
+        """Fetch all active-leg prices in bounded bulk requests.
+
+        Symbols omitted by a healthy bulk response may use the bounded direct
+        fallback. A failed whole chunk must not fan out into one critical REST
+        request per open leg and amplify the same transport/rate-limit fault.
+        """
+        symbols = [f"{base}/USDT:USDT" for base in trades]
+        snapshot = {}
+        failed_symbols = set()
+        if not symbols or not callable(getattr(self.ex, "fetch_tickers", None)):
+            return snapshot, frozenset()
+        try:
+            from bot_utils.api_budget import record_api_error
+        except ImportError:
+            record_api_error = None
+        for index in range(0, len(symbols), _MONITOR_TICKER_BATCH_SIZE):
+            chunk = symbols[index:index + _MONITOR_TICKER_BATCH_SIZE]
+            try:
+                reservation = try_consume_api_call(
+                    "cross_monitor_fetch_tickers",
+                    critical=True,
+                    return_reservation=True,
+                )
+            except Exception:
+                reservation = None
+            if not reservation:
+                failed_symbols.update(chunk)
+                continue
+            try:
+                rows = self.ex.fetch_tickers(chunk)
+            except Exception:
+                failed_symbols.update(chunk)
+                if callable(record_api_error):
+                    try:
+                        record_api_error(
+                            endpoint="cross_monitor_fetch_tickers",
+                            reservation=reservation,
+                        )
+                    except Exception:
+                        pass
+                continue
+            if not isinstance(rows, dict):
+                failed_symbols.update(chunk)
+                if callable(record_api_error):
+                    try:
+                        record_api_error(
+                            endpoint="cross_monitor_fetch_tickers",
+                            reservation=reservation,
+                        )
+                    except Exception:
+                        pass
+                continue
+            for symbol in chunk:
+                ticker = rows.get(symbol)
+                if CrossBot._ticker_price(ticker) > 0:
+                    snapshot[symbol] = ticker
+        return snapshot, frozenset(failed_symbols)
+
     def _check_daily_killswitch(self, trades: dict) -> bool:
         """Flatten the book + SAFE_MODE when today's realized+unrealized PnL
         breaches MAX_DAILY_LOSS. Throttled to ~60s. One-shot SAFE_MODE then
         blocks the next rebalance from re-opening."""
-        now = time.time()
-        if now - getattr(self, "_last_ks_check", 0.0) < 60.0:
-            return True
+        now = time.monotonic()
+        previous = getattr(self, "_last_ks_check", None)
+        if previous is not None:
+            try:
+                elapsed = now - float(previous)
+            except (TypeError, ValueError, OverflowError):
+                elapsed = 60.0
+            if 0.0 <= elapsed < 60.0:
+                return True
         self._last_ks_check = now
         try:
             from core.database import get_today_pnl
@@ -4133,11 +4281,16 @@ class CrossBot(FuturesBot):
             return False
 
     def _monitor_tick(self) -> None:
+        # Every tick must earn a fresh account-risk proof.  If any unexpected
+        # monitor exception escapes before normal price/killswitch evaluation,
+        # rebalance and top-up remain fail-closed on the previous blind state.
+        self._cross_risk_snapshot_ok = False
         from core.database import upsert_futures_state
         from core.logger import log_event
         from bot_utils.futures_math import price_move_pct, calc_unrealized_pnl
         raw_trades = self.state.get_all()
         if not raw_trades:
+            self._cross_risk_snapshot_ok = True
             return
         for base, d in list(raw_trades.items()):
             if d.get("provisional"):
@@ -4153,6 +4306,7 @@ class CrossBot(FuturesBot):
                     self, base, d, log_event=log_event)
         trades = CrossBot._active_legs(self, raw_trades)
         if not trades:
+            self._cross_risk_snapshot_ok = not bool(self.state.get_all())
             return
         monitored_trades = {}
         invalid_sides = []
@@ -4167,6 +4321,7 @@ class CrossBot(FuturesBot):
             normalized["position_type"] = side
             monitored_trades[base] = normalized
         if invalid_sides:
+            self._cross_risk_snapshot_ok = False
             log_event(
                 f"[{self.BOT_NAME}] monitor invalid active-leg sides "
                 f"{sorted(invalid_sides)} - unsafe portfolio math skipped",
@@ -4174,11 +4329,65 @@ class CrossBot(FuturesBot):
             )
         if not monitored_trades:
             return
+        ticker_snapshot, failed_ticker_symbols = (
+            CrossBot._monitor_ticker_snapshot(
+            self,
+            monitored_trades,
+            )
+        )
+        self._monitor_failed_ticker_symbols = failed_ticker_symbols
+        # Resolve every leg price exactly once.  The account killswitch and
+        # per-leg exits must consume the same current-tick evidence; previously
+        # the bulk snapshot was fetched here but the killswitch still read the
+        # preceding tick's ``last_price`` from state.
+        monitor_prices = {}
+        for base in monitored_trades:
+            full = f"{base}/USDT:USDT"
+            curr = CrossBot._ticker_price(ticker_snapshot.get(full))
+            if curr <= 0 and full not in failed_ticker_symbols:
+                try:
+                    tk = self.ticker_cache.get(
+                        self.ex,
+                        full,
+                        timeout=5.0,
+                        critical=True,
+                    )
+                    curr = CrossBot._ticker_price(tk)
+                except Exception:
+                    curr = 0.0
+            if curr <= 0 and full not in failed_ticker_symbols:
+                try:
+                    curr = CrossBot._safe_positive_price(
+                        self._fallback_mark_price(full)
+                    )
+                except Exception:
+                    curr = 0.0
+            monitor_prices[base] = curr
+            if curr > 0:
+                ticker_snapshot[full] = {"last": curr}
+
+        risk_trades = {
+            base: dict(row) for base, row in monitored_trades.items()
+        }
+        for base, curr in monitor_prices.items():
+            if curr > 0:
+                risk_trades[base]["last_price"] = curr
         # Account-level daily-loss killswitch (flatten + SAFE_MODE). Without
         # this, only the next rebalance (up to REBALANCE_HOURS away) would stop
         # new entries - a bleeding book would run unprotected between rebalances.
-        if not invalid_sides:
-            CrossBot._check_daily_killswitch(self, monitored_trades)
+        prices_complete = all(
+            price > 0 for price in monitor_prices.values()
+        )
+        risk_check_ok = False
+        if not invalid_sides and prices_complete:
+            risk_check_ok = (
+                CrossBot._check_daily_killswitch(self, risk_trades) is True
+            )
+        else:
+            # Retry immediately when evidence returns instead of honoring an
+            # earlier successful throttle timestamp.
+            self._last_ks_check = 0.0
+        self._cross_risk_snapshot_ok = risk_check_ok
         self._maybe_persist_funding_for_all(monitored_trades, time.time())
         disaster = self._f("PER_LEG_DISASTER_STOP", -25.0)
         liq_safety = max(0.0, min(95.0, self._f("LIQ_SAFETY_PCT", 20.0)))
@@ -4189,7 +4398,10 @@ class CrossBot(FuturesBot):
         else:
             try:
                 _collateral = self._equity()
-                _legs = self._snapshot_cross_legs(monitored_trades)
+                _legs = self._snapshot_cross_legs(
+                    monitored_trades,
+                    ticker_snapshot,
+                )
             except Exception:
                 _collateral, _legs = 0.0, {}
         for base, d in monitored_trades.items():
@@ -4209,34 +4421,21 @@ class CrossBot(FuturesBot):
             if not self.state.has(base):   # closed this tick (killswitch) - skip
                 continue
             full = f"{base}/USDT:USDT"
-            try:
-                tk = self.ticker_cache.get(self.ex, full, timeout=5.0, critical=True)
-                curr = CrossBot._ticker_price(tk)
-            except Exception:
-                curr = 0.0
+            curr = monitor_prices.get(base, 0.0)
             if curr <= 0:
                 try:
-                    curr = CrossBot._safe_positive_price(
-                        self._fallback_mark_price(full)
-                    )
+                    self._note_price_unavailable(base)
                 except Exception:
-                    curr = 0.0
-                if curr <= 0:
-                    try:
-                        self._note_price_unavailable(base)
-                    except Exception:
-                        pass
-                    continue
-            if curr <= 0:
+                    pass
                 continue
             try:
                 self._clear_price_unavailable(base)
             except Exception:
                 pass
-            self.state.update(base, "last_price", curr)
             pos_type = d.get("position_type", "LONG")
             entry = CrossBot._safe_positive_price(d.get("buy"))
             if entry <= 0:
+                self.state.update_many(base, {"last_price": curr})
                 continue
             raw_lev = d.get("leverage")
             lev_state = None
@@ -4250,6 +4449,7 @@ class CrossBot(FuturesBot):
             margin_state = CrossBot._safe_float(
                 self, d.get("invested_usdt"), 0.0)
             if lev_state is None or margin_state <= 0:
+                self.state.update_many(base, {"last_price": curr})
                 continue
             move = price_move_pct(entry, curr, pos_type)
             prev_mfe = CrossBot._safe_float(
@@ -4259,6 +4459,7 @@ class CrossBot(FuturesBot):
             mfe_pct = max(prev_mfe, move)
             mae_pct = min(prev_mae, move)
             telemetry = {
+                "last_price": curr,
                 "max_profit_pct": mfe_pct,
                 "min_profit_pct": mae_pct,
                 "giveback_pct": max(0.0, mfe_pct - move),
@@ -4449,7 +4650,10 @@ class CrossBot(FuturesBot):
         # window - the rebalance does its own neutrality pass.
         if getattr(self, "_rebalance_in_progress", False):
             return
-        now = time.time()
+        # Both deadlines are process-local relative durations.  A Windows wall
+        # clock correction must neither suppress neutrality checks for hours
+        # nor bypass the post-rebalance settle window.
+        now = time.monotonic()
         if not force and now < getattr(self, "_neutrality_settle_until", 0.0):
             return
         if not force and now - getattr(self, "_last_neutrality_check", 0.0) < 180.0:
@@ -4506,7 +4710,11 @@ class CrossBot(FuturesBot):
             ):
                 invalid_bases.append(base)
                 continue
-            notional = margin * lev
+            # Dollar-neutrality is a CURRENT exposure invariant.  ``margin *
+            # leverage`` is the entry notional and stays constant while prices
+            # diverge; scale it by the marked price ratio so the guard sees the
+            # actual linear-contract exposure of the remaining leg.
+            notional = margin * lev * (last / entry)
             if not math.isfinite(notional) or notional <= 0:
                 invalid_bases.append(base)
                 continue

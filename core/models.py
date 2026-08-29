@@ -284,6 +284,20 @@ class Position:
 
         known = set(cls.__dataclass_fields__)
         numeric_fields = _numeric_fields_for(cls)
+        boolean_fields = {"partial_sold", "break_even", "be_active"}
+        required_money_fields = {
+            "buy_price",
+            "amount",
+            "invested_usdt",
+            "leverage",
+        }
+
+        # Persisted state must never apply Python truthiness to textual or
+        # numeric lookalikes (for example ``"false"`` is truthy).  These
+        # markers alter partial-TP, breakeven and close-accounting behaviour.
+        for fld in boolean_fields:
+            if fld in d and not isinstance(d[fld], bool):
+                raise ValueError(f"{fld} is not boolean")
 
         # Coerce + reject inf/nan
         for fld in numeric_fields:
@@ -296,17 +310,27 @@ class Position:
                 try:
                     v = float(v)
                 except (TypeError, ValueError, OverflowError):
+                    if fld in required_money_fields:
+                        raise ValueError(f"{fld} is not numeric")
                     d.pop(fld, None)
                     continue
-            if v is not None:
-                try:
-                    fv = float(v)
-                    if math.isnan(fv) or math.isinf(fv):
-                        d.pop(fld, None)
-                        continue
-                    d[fld] = fv
-                except (TypeError, ValueError, OverflowError):
-                    d.pop(fld, None)
+            if v is None:
+                if fld in required_money_fields:
+                    raise ValueError(f"{fld} is not numeric")
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError, OverflowError) as exc:
+                if fld in required_money_fields:
+                    raise ValueError(f"{fld} is not numeric") from exc
+                d.pop(fld, None)
+                continue
+            if math.isnan(fv) or math.isinf(fv):
+                if fld in required_money_fields:
+                    raise ValueError(f"{fld} is not finite")
+                d.pop(fld, None)
+                continue
+            d[fld] = fv
 
         clean = {k: v for k, v in d.items() if k in known}
         skip = {"entry_order", "exit_orders", "opened_at"}

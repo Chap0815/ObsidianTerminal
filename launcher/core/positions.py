@@ -462,10 +462,10 @@ def _state_path_for_mode(bot_name: str, simulation: bool) -> str:
 
 def _get_futures_state_for_mode(get_futures_state_fn, bot_name: str,
                                 simulation: bool) -> list:
-    try:
-        return get_futures_state_fn(bot_name, mode_is_sim=simulation)
-    except TypeError:
-        return get_futures_state_fn(bot_name)
+    # The runtime and release are manifest-bound and always ship the scoped DB
+    # API together.  Retrying without ``mode_is_sim`` on an internal TypeError
+    # can turn a failed SIM read into a LIVE read inside the direct-close path.
+    return get_futures_state_fn(bot_name, mode_is_sim=simulation)
 
 
 def _state_paths_for_all_modes(bot_name: str) -> list[tuple[str, str]]:
@@ -1843,6 +1843,10 @@ def _direct_close_remaining_futures(
 
                     # Pull real fill price + exit fee from the order
                     if isinstance(order, dict):
+                        from bot_utils.futures_order import (
+                            _extract_order_fee_futures_known,
+                            _order_with_fee_context,
+                        )
                         from bot_utils.order_utils import order_id_text_or_none
                         exchange_order_id = (
                             order_id_text_or_none(order.get("id"))
@@ -1855,13 +1859,17 @@ def _direct_close_remaining_futures(
                                 if fv is not None:
                                     curr = fv
                                     break
-                        try:
-                            fee_obj = order.get("fee") or {}
-                            fc_cost = _non_negative_finite(fee_obj.get("cost"))
-                            if fc_cost is not None and fc_cost > 0:
-                                exit_fee = fc_cost
-                        except Exception:
-                            pass
+                        fee_order = _order_with_fee_context(
+                            order,
+                            ex=ex,
+                            symbol_full=symbol_full,
+                            contract_size=contract_size,
+                        )
+                        parsed_exit_fee, exit_fee_known = (
+                            _extract_order_fee_futures_known(fee_order)
+                        )
+                        if exit_fee_known:
+                            exit_fee = parsed_exit_fee
                         # Recompute PnL with the REAL fill + REAL exit fee
                         if pos_type == "LONG":
                             price_move = (curr - entry) / entry * 100.0

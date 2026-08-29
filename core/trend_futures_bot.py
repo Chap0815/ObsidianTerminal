@@ -139,6 +139,45 @@ class TrendFuturesBot(FuturesBot):
         # paths; using it here can submit the wrong number of contracts.
         return 0.0
 
+    def _position_contract_size(self, full: str, row: dict,
+                                _fallback_reader) -> float:
+        """Resolve close accounting size from durable entry evidence first."""
+        for key in ("entry_contract_size", "contract_size"):
+            value = TrendFuturesBot._safe_float(self, row.get(key), 0.0)
+            if value > 0.0:
+                return value
+        try:
+            raw_value = _fallback_reader(getattr(self, "ex", None), full)
+            value = TrendFuturesBot._safe_float(
+                self,
+                raw_value,
+                0.0,
+            )
+        except Exception:
+            raw_value = None
+            value = 0.0
+        if value > 0.0:
+            return value
+        if raw_value is not None:
+            return 0.0
+        amount = TrendFuturesBot._safe_float(self, row.get("amount"), 0.0)
+        entry = TrendFuturesBot._safe_float(self, row.get("buy"), 0.0)
+        margin = TrendFuturesBot._safe_float(
+            self,
+            row.get("invested_usdt"),
+            0.0,
+        )
+        leverage = TrendFuturesBot._safe_float(
+            self,
+            row.get("leverage"),
+            0.0,
+        )
+        if amount > 0.0 and entry > 0.0 and margin > 0.0 and leverage > 0.0:
+            derived = (margin * leverage) / (amount * entry)
+            if math.isfinite(derived) and derived > 0.0:
+                return derived
+        return 0.0
+
     def _bool_cfg(self, key: str, default: bool = False) -> bool:
         value = self.C(key, default)
         if isinstance(value, bool):
@@ -589,7 +628,15 @@ class TrendFuturesBot(FuturesBot):
             log_event(f"[{self.BOT_NAME}] ticker fetch failed: {e}", "WARN")
             return {}
         cands: List[Tuple[float, str, str]] = []
+        if not isinstance(tickers, dict):
+            log_event(
+                f"[{self.BOT_NAME}] ticker fetch returned invalid payload",
+                "WARN",
+            )
+            return {}
         for sym, t in tickers.items():
+            if not isinstance(sym, str) or not isinstance(t, dict):
+                continue
             if not sym.endswith(":USDT"):
                 continue
             base = sym.split("/")[0].upper()
@@ -1204,6 +1251,7 @@ class TrendFuturesBot(FuturesBot):
                 margin_mode=margin_mode,
                 entry_inflight=True,
                 entry_shadow=shadow,
+                contract_size=cs,
             ):
                 emit_entry_lifecycle(
                     entry_id, bot=self.BOT_NAME, symbol=base,
@@ -1343,6 +1391,7 @@ class TrendFuturesBot(FuturesBot):
                             0.0, provisional=False,
                             lev_cap=lev_cap, mm_rate=mm,
                             entry_shadow=shadow,
+                            contract_size=cs,
                             margin_mode=margin_mode,
                         )
                         if not tracked:
@@ -1469,6 +1518,7 @@ class TrendFuturesBot(FuturesBot):
             provisional=provisional, lev_cap=lev_cap, mm_rate=mm,
             entry_shadow=shadow, margin_mode=margin_mode,
             sim_tca_pending=sim_tca_pending,
+            contract_size=cs,
         )
         if not tracked:
             emit_entry_lifecycle(
@@ -1666,7 +1716,8 @@ class TrendFuturesBot(FuturesBot):
                       entry_shadow: Optional[dict] = None,
                       margin_mode: str = "isolated",
                       entry_inflight: bool = False,
-                      sim_tca_pending: Optional[dict] = None) -> bool:
+                      sim_tca_pending: Optional[dict] = None,
+                      contract_size: Optional[float] = None) -> bool:
         from core.logger import _date as _utc
         from bot_utils import calc_liquidation_price, distance_to_liquidation_pct
         # Liquidation uses the INTEGER leverage the exchange runs (ceil) + real
@@ -1685,9 +1736,14 @@ class TrendFuturesBot(FuturesBot):
             "strategy": "trend", "provisional": provisional,
         }
         if provisional and entry_inflight:
-            row["entry_inflight_until"] = time.time() + 120.0
+            from core.clock import now_ms
+
+            row["entry_inflight_until"] = now_ms() / 1000.0 + 120.0
         if sim_tca_pending is not None:
             row[self._SIM_TCA_PENDING_FIELD] = sim_tca_pending
+        stored_contract_size = self._safe_float(contract_size, 0.0)
+        if stored_contract_size > 0.0:
+            row["entry_contract_size"] = stored_contract_size
         if entry_shadow:
             row.update({
                 "entry_id": entry_shadow.get("entry_id"),
@@ -1998,11 +2054,13 @@ class TrendFuturesBot(FuturesBot):
                 f"invalid close price - state kept for review", "WARN")
             return
         exch_oid = None
-        try:
-            from bot_utils import futures_contract_size
-            cs = _positive_float(futures_contract_size(self.ex, full), 0.0)
-        except Exception:
-            cs = 1.0
+        from bot_utils import futures_contract_size
+        cs = TrendFuturesBot._position_contract_size(
+            self,
+            full,
+            d,
+            futures_contract_size,
+        )
         live_close_already_verified = False
         if not self.simulation and d.get("pending_close_price"):
             try:
@@ -2547,8 +2605,10 @@ class TrendFuturesBot(FuturesBot):
         from bot_utils import calc_liquidation_price, distance_to_liquidation_pct
 
         full = f"{base}/USDT:USDT"
+        from core.clock import now_ms
+
         inflight_active = self._safe_float(
-            d.get("entry_inflight_until"), 0.0) > time.time()
+            d.get("entry_inflight_until"), 0.0) > now_ms() / 1000.0
         recovery_blocked = (
             self._entry_recovery_runtime_health().get("ok") is False
         )
@@ -2718,13 +2778,15 @@ class TrendFuturesBot(FuturesBot):
         amount = abs(self._safe_float(d.get("amount"), 0.0))
         margin = self._safe_float(d.get("invested_usdt"), 0.0)
         if margin <= 0 and amount > 0:
-            try:
-                from bot_utils import futures_contract_size
-                cs = self._safe_float(futures_contract_size(self.ex, full), 1.0)
-                if cs <= 0:
-                    cs = 1.0
-            except Exception:
-                cs = 1.0
+            from bot_utils import futures_contract_size
+            cs = TrendFuturesBot._position_contract_size(
+                self,
+                full,
+                d,
+                futures_contract_size,
+            )
+            if cs <= 0.0:
+                return
             margin = (amount * cs * entry) / lev
         if margin <= 0:
             return

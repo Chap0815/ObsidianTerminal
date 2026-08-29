@@ -624,7 +624,32 @@ def _closed_daily_bars(bars: list) -> list:
         if last_ts >= today_start_ms:
             out = out[:-1]
     except Exception:
-        out = out[:-1]
+        return []
+    # A syntactically valid OHLCV response can still be stale, duplicated or
+    # reordered. Regime decisions require the latest eight completed UTC days
+    # as one contiguous causal history, not merely eight rows.
+    if len(out) < 8:
+        return out
+    try:
+        recent_timestamps = []
+        for row in out[-8:]:
+            raw_timestamp = row[0]
+            if isinstance(raw_timestamp, bool):
+                return []
+            timestamp = int(float(raw_timestamp))
+            if timestamp != float(raw_timestamp):
+                return []
+            recent_timestamps.append(timestamp)
+        expected_last = today_start_ms - day_ms
+        if recent_timestamps[-1] != expected_last:
+            return []
+        if any(
+            right - left != day_ms
+            for left, right in zip(recent_timestamps, recent_timestamps[1:])
+        ):
+            return []
+    except (IndexError, TypeError, ValueError, OverflowError):
+        return []
     return out
 
 

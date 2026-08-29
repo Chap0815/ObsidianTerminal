@@ -115,18 +115,35 @@ def _record_slippage_into(
     trigger_safe_mode: Optional[Callable],
     log_event: Optional[Callable],
 ) -> float:
-    if expected_price <= 0 or actual_fill <= 0:
-        return 0.0
-    normalized_side = str(side).strip().lower()
-    if normalized_side == "buy":
-        adverse_delta = actual_fill - expected_price
-    elif normalized_side == "sell":
-        adverse_delta = expected_price - actual_fill
+    def positive_finite_price(value) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if math.isfinite(parsed) and parsed > 0.0 else None
+
+    expected = positive_finite_price(expected_price)
+    actual = positive_finite_price(actual_fill)
+    if expected is None or actual is None:
+        # A completed fill whose reference or execution price cannot be
+        # quantified is never evidence of zero slippage. Count it as adverse
+        # so repeated malformed fill evidence trips the existing circuit.
+        slippage_pct = math.inf
     else:
-        # Unknown direction cannot be classified safely; retain the
-        # conservative legacy behavior for malformed callers.
-        adverse_delta = abs(actual_fill - expected_price)
-    slippage_pct = max(0.0, adverse_delta) / expected_price * 100
+        normalized_side = str(side).strip().lower()
+        if normalized_side == "buy":
+            adverse_delta = actual - expected
+        elif normalized_side == "sell":
+            adverse_delta = expected - actual
+        else:
+            # Unknown direction cannot be classified safely; retain the
+            # conservative absolute-distance behavior for malformed callers.
+            adverse_delta = abs(actual - expected)
+        slippage_pct = max(0.0, adverse_delta) / expected * 100
+        if not math.isfinite(slippage_pct):
+            slippage_pct = math.inf
     now = time.monotonic()
     abnormal = slippage_pct > MAX_SLIPPAGE_PCT
 

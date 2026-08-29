@@ -390,7 +390,7 @@ class ExitsMixin:
 
         idle_ticks = 0
         last_idle_log = 0.0
-        last_killswitch = 0.0
+        last_killswitch_monotonic = None
         KILLSWITCH_INTERVAL = 60.0   # check daily-loss every 60s
         consecutive_errors = 0
         MONITOR_ERR_THRESHOLD = 5
@@ -399,13 +399,20 @@ class ExitsMixin:
             try:
                 trades = self.state.get_all()
                 now = time.time()
+                now_monotonic = time.monotonic()
+
+                killswitch_due = (
+                    last_killswitch_monotonic is None
+                    or now_monotonic - last_killswitch_monotonic
+                    >= KILLSWITCH_INTERVAL
+                )
 
                 # Daily-loss killswitch (independent of open positions 
                 # we want to trip even AFTER all positions closed at a
                 # loss so the bot doesn't keep opening new ones)
-                if (now - last_killswitch) >= KILLSWITCH_INTERVAL:
+                if not trades and killswitch_due:
                     if self._check_daily_killswitch(trades) is not False:
-                        last_killswitch = now
+                        last_killswitch_monotonic = now_monotonic
 
                 if not trades:
                     idle_ticks += 1
@@ -426,10 +433,26 @@ class ExitsMixin:
                 # Batch ticker fetch
                 batch = self._batch_tickers(list(trades.keys()))
 
+                # Resolve every position price exactly once per monitor tick.
+                # The daily-loss gate and the exit checks must make their
+                # decisions from the same current market snapshot, rather than
+                # letting the gate read the previous tick's ``last_price``.
+                current_prices = {
+                    sym: self._get_current_price(sym, batch, d)
+                    for sym, d in trades.items()
+                }
+                risk_trades = {sym: dict(d) for sym, d in trades.items()}
+                for sym, curr in current_prices.items():
+                    if curr > 0:
+                        risk_trades[sym]["last_price"] = curr
+                if killswitch_due:
+                    if self._check_daily_killswitch(risk_trades) is not False:
+                        last_killswitch_monotonic = now_monotonic
+
                 for sym, d in trades.items():
                     if self._shutdown_event.is_set():
                         break
-                    curr = self._get_current_price(sym, batch, d)
+                    curr = current_prices[sym]
                     if curr <= 0:
                         self._note_spot_price_unavailable(sym, log_event)
                         continue

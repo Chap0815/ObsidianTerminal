@@ -151,6 +151,11 @@ def classify_order_state(order) -> str:
     filled = _finite_nonnegative_order_value(order.get("filled"))
     amount = _finite_nonnegative_order_value(order.get("amount"))
 
+    # Some venue/native recovery payloads use ``filled`` instead of CCXT's
+    # canonical ``closed``.  Require physical fill evidence before accepting
+    # that alias as terminal; status text alone must not create a phantom fill.
+    if status == "filled" and filled > 0:
+        return ORDER_STATE_FILLED
     if status == "closed":
         return ORDER_STATE_FILLED
     if status in ("canceled", "cancelled"):
@@ -1946,36 +1951,41 @@ def _extract_order_fee_futures_known(order) -> tuple[float, bool]:
 FUTURES_DEFAULT_TAKER_FEE = 0.001
 
 
+def futures_contract_size_or_none(ex, symbol_full: str) -> float | None:
+    """Return a positive contract size only when market metadata proves it."""
+    try:
+        markets = getattr(ex, "markets", None) or {}
+        market = markets.get(symbol_full) or {}
+        info = market.get("info") or {}
+        if not isinstance(info, dict):
+            info = {}
+        for candidate in (
+            market.get("contractSize"),
+            market.get("contract_size"),
+            info.get("contractSize"),
+            info.get("contract_size"),
+        ):
+            if candidate is None:
+                continue
+            try:
+                value = float(candidate)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(value) and value > 0:
+                return value
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        pass
+    return None
+
+
 def futures_contract_size(ex, symbol_full: str) -> float:
-    """Contract size for a futures market from CCXT metadata (default 1.0).
+    """Contract size for general futures calculations (legacy default 1.0).
 
     USDT-M perpetuals are usually 1, but some contracts (1000SATS, MEME, Bybit
   inverse, ) use 100/1000/etc. Any fee/notional math MUST multiply by this,
     otherwise the value is wrong by the contractSize factor.
     """
-    try:
-        markets = getattr(ex, "markets", None) or {}
-        m = markets.get(symbol_full) or {}
-        info = m.get("info") or {}
-        if not isinstance(info, dict):
-            info = {}
-        for cs in (
-            m.get("contractSize"),
-            m.get("contract_size"),
-            info.get("contractSize"),
-            info.get("contract_size"),
-        ):
-            if cs is None:
-                continue
-            try:
-                v = float(cs)
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if math.isfinite(v) and v > 0:
-                return v
-        return 1.0
-    except (TypeError, ValueError, OverflowError, AttributeError):
-        return 1.0
+    return futures_contract_size_or_none(ex, symbol_full) or 1.0
 
 
 def _exchange_id(ex) -> str:

@@ -114,7 +114,7 @@ class FuturesScanMixin:
                     log_event(
                         f"[{self.BOT_NAME}] New entries disabled by config; "
                         "existing positions remain monitored",
-                        "WARN",
+                        "INFO",
                     )
                 log_struct(
                     "entry_admission_gate",

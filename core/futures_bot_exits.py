@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from core.logger import _date as _utc_now_str
 
+import inspect
 import math
 import time
 from datetime import datetime, timezone
@@ -39,6 +40,26 @@ from bot_utils import (
 )
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.order_utils import order_id_text_or_none
+
+
+def _fetch_positions_compat_once(exchange, symbol_full: str):
+    """Call one adapter shape without retrying a remote ``TypeError``."""
+    fetch_positions = exchange.fetch_positions
+    try:
+        parameters = inspect.signature(fetch_positions).parameters.values()
+        needs_symbols = any(
+            parameter.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+            and parameter.default is inspect.Parameter.empty
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        needs_symbols = False
+    if needs_symbols:
+        return fetch_positions([symbol_full])
+    return fetch_positions()
 
 
 _PARTIAL_EXIT_CLIENT_ID = "partial_exit_client_order_id"
@@ -629,6 +650,8 @@ def _recover_or_submit_futures_full_exit(
 
 
 class FuturesExitsMixin:
+    _MARK_FALLBACK_CACHE_TTL_SEC = 2.0
+
     def _record_futures_exit_shadow(
         self, sym: str, d: dict, *, move_pct: float,
         mfe_pct: float, mae_pct: float, now=None,
@@ -826,6 +849,30 @@ class FuturesExitsMixin:
         parsed = cls._safe_finite_float(value, default)
         return parsed if parsed > 0 else default
 
+    @classmethod
+    def _reconstructed_margin_usdt(
+        cls, *, amount, contract_size, entry_price, leverage
+    ) -> float | None:
+        amount_value = cls._safe_positive_float(amount, 0.0)
+        contract_value = cls._safe_positive_float(contract_size, 0.0)
+        entry_value = cls._safe_positive_float(entry_price, 0.0)
+        leverage_value = cls._safe_positive_float(leverage, 0.0)
+        if not all(
+            value > 0.0
+            for value in (
+                amount_value,
+                contract_value,
+                entry_value,
+                leverage_value,
+            )
+        ):
+            return None
+        try:
+            margin = amount_value * contract_value * entry_value / leverage_value
+        except OverflowError:
+            return None
+        return margin if math.isfinite(margin) and margin > 0.0 else None
+
     @staticmethod
     def _precision_amount_or_none(value):
         if isinstance(value, bool):
@@ -1000,7 +1047,7 @@ class FuturesExitsMixin:
 
         idle_ticks = 0
         last_idle_log = 0.0
-        last_killswitch = 0.0
+        last_killswitch_monotonic = None
         try:
             from core.constants import KILLSWITCH_CHECK_INTERVAL_SEC as KILLSWITCH_INTERVAL
         except Exception:
@@ -1013,16 +1060,20 @@ class FuturesExitsMixin:
             try:
                 trades = self.state.get_all()
                 now = time.time()
+                now_monotonic = time.monotonic()
 
   # Killswitch  ADAPTIVE cadence: normally 60s, but tighten to
                 # ~8s once today's loss is past 70% of the limit, so a fast 20%
                 # drop can't overshoot the cap between checks. This runs even
                 # with an empty book so a just-realized loss still blocks the
                 # next entry.
-                if (now - last_killswitch) >= ks_interval:
+                if (
+                    last_killswitch_monotonic is None
+                    or now_monotonic - last_killswitch_monotonic >= ks_interval
+                ):
                     ks_ok = self._check_killswitch(trades)
                     if ks_ok is not False:
-                        last_killswitch = now
+                        last_killswitch_monotonic = now_monotonic
                         try:
                             _today = getattr(self, "_ks_last_total", 0.0)
                             _maxloss = float(self.C("MAX_DAILY_LOSS", -30.0))
@@ -1405,15 +1456,62 @@ class FuturesExitsMixin:
         """
         if self.simulation:
             return 0.0
+        now = time.monotonic()
+        exchange_id = id(getattr(self, "ex", None))
+        cached_at = getattr(self, "_fallback_marks_cached_at", None)
+        cached_exchange_id = getattr(
+            self,
+            "_fallback_marks_exchange_id",
+            None,
+        )
+        cached_marks = getattr(self, "_fallback_marks", None)
+        if (
+            isinstance(cached_marks, dict)
+            and cached_exchange_id == exchange_id
+            and isinstance(cached_at, (int, float))
+            and not isinstance(cached_at, bool)
+            and 0.0 <= now - float(cached_at)
+            <= FuturesExitsMixin._MARK_FALLBACK_CACHE_TTL_SEC
+        ):
+            return FuturesExitsMixin._safe_positive_price(
+                cached_marks.get(symbol_full)
+            )
         try:
-            if not try_consume_api_call(
-                "futures_exit_mark_fetch_positions", critical=True
-            ):
+            reservation = try_consume_api_call(
+                "futures_exit_mark_fetch_positions",
+                critical=True,
+                return_reservation=True,
+            )
+            if not reservation:
                 return 0.0
-            poss = self.ex.fetch_positions([symbol_full]) or []
-            for p in poss:
-                if not isinstance(p, dict):
-                    continue
+            try:
+                poss = _fetch_positions_compat_once(
+                    self.ex,
+                    symbol_full,
+                ) or []
+            except Exception:
+                try:
+                    from bot_utils.api_budget import (
+                        ApiCallReservation,
+                        record_api_error,
+                    )
+
+                    if isinstance(reservation, ApiCallReservation):
+                        record_api_error(
+                            "futures_exit_mark_fetch_positions",
+                            reservation,
+                        )
+                except Exception:
+                    pass
+                raise
+            valid_positions = [p for p in poss if isinstance(p, dict)]
+            marks = {}
+            for p in valid_positions:
+                position_symbol = p.get("symbol")
+                if not isinstance(position_symbol, str) or not position_symbol:
+                    if len(valid_positions) != 1:
+                        continue
+                    position_symbol = symbol_full
                 raw_info = p.get("info")
                 info = raw_info if isinstance(raw_info, dict) else {}
                 for raw_mark in (
@@ -1424,15 +1522,22 @@ class FuturesExitsMixin:
                 ):
                     mark = FuturesExitsMixin._safe_positive_price(raw_mark)
                     if mark > 0:
-                        return mark
+                        marks[position_symbol] = mark
+                        break
+            self._fallback_marks = marks
+            self._fallback_marks_cached_at = time.monotonic()
+            self._fallback_marks_exchange_id = exchange_id
+            return FuturesExitsMixin._safe_positive_price(
+                marks.get(symbol_full)
+            )
         except Exception:
             pass
         return 0.0
 
     def _note_price_unavailable(self, sym: str) -> None:
         """Count consecutive ticks with NO usable price (ticker AND mark both
-  dead) and escalate once past a threshold  a leveraged position with no
-        price is running without liq protection, so it must not fail silently."""
+  dead) and report once past a threshold. LIVE positions require a safety
+        escalation; SIM positions receive a non-actionable research notice."""
         from core.logger import log_event
         counts = getattr(self, "_price_unavail_counts", None)
         if counts is None:
@@ -1440,11 +1545,21 @@ class FuturesExitsMixin:
             self._price_unavail_counts = counts
         counts[sym] = counts.get(sym, 0) + 1
         if counts[sym] == 5:                      # ~5 consecutive monitor ticks
-            log_event(
-                f"{sym}: price unavailable for {counts[sym]} consecutive ticks "
-                f"(ticker AND mark) - liq protection is BLIND on this leveraged "
-                f"position. Check the symbol on the exchange / close manually.",
-                "WARN")
+            if bool(getattr(self, "simulation", False)):
+                log_event(
+                    f"{sym}: SIM price unavailable for {counts[sym]} "
+                    "consecutive ticks (ticker unavailable; no exchange "
+                    "position exists) - paper exit evaluation deferred",
+                    "INFO",
+                )
+            else:
+                log_event(
+                    f"{sym}: price unavailable for {counts[sym]} consecutive "
+                    "ticks (ticker AND mark) - liq protection is BLIND on this "
+                    "leveraged position. Check the symbol on the exchange / "
+                    "close manually.",
+                    "WARN",
+                )
             try:
                 if not self.simulation:
                     from core.logger import send_telegram
@@ -1666,15 +1781,21 @@ class FuturesExitsMixin:
         # Sanity: heal margin if broken (defensive)
         if margin <= 0:
             try:
-                _amt = FuturesExitsMixin._safe_nonnegative_amount(
-                    d.get("amount", 0))
+                from bot_utils import futures_contract_size_or_none
+
                 # contract_size-aware: _amt is in CONTRACTS, so notional =
                 # amount * contract_size * price (required for contract_size!=1
                 # coins, else the healed margin feeds the full-close PnL wrong).
-                _cs = FuturesExitsMixin._safe_positive_float(
-                    self._get_contract_size(f"{sym}/USDT:USDT"), 1.0)
-                if _amt > 0 and entry > 0 and lev > 0:
-                    margin = round((_amt * _cs * entry) / lev, 4)
+                repaired_margin = FuturesExitsMixin._reconstructed_margin_usdt(
+                    amount=d.get("amount"),
+                    contract_size=futures_contract_size_or_none(
+                        self.ex, f"{sym}/USDT:USDT"
+                    ),
+                    entry_price=entry,
+                    leverage=lev,
+                )
+                if repaired_margin is not None:
+                    margin = round(repaired_margin, 4)
             except Exception:
                 pass
         if margin <= 0:

@@ -68,6 +68,11 @@ class TickerCache:
         self._futures = set()
         self._inflight_sem = threading.Semaphore(in_flight_max)
         self._in_flight_max = in_flight_max
+        self._symbol_locks_lock = threading.Lock()
+        # Values are ``[lock, registered_callers]``.  Entries exist only while
+        # a caller owns or waits for the coalescing lock; idle symbols must not
+        # accumulate forever as a rotating market universe is scanned.
+        self._symbol_locks: dict[tuple[int, str], list] = {}
         self._rate_limited_until = 0.0
         self._stats_lock = threading.Lock()
         self._stats = {
@@ -370,21 +375,41 @@ class TickerCache:
           TickerOverloaded  pool saturated; stale cache also missing
         """
         self._note("requests")
+        fetch_key = (id(ex), symbol_full)
+        with self._symbol_locks_lock:
+            lock_entry = self._symbol_locks.get(fetch_key)
+            if lock_entry is None:
+                lock_entry = [threading.Lock(), 0]
+                self._symbol_locks[fetch_key] = lock_entry
+            lock_entry[1] += 1
+            symbol_lock = lock_entry[0]
         try:
-            ticker = self._get(
-                ex,
-                symbol_full,
-                timeout=timeout,
-                critical=critical,
-                allow_extended_rate_limit_stale=(
-                    allow_extended_rate_limit_stale
-                ),
-            )
+            # Concurrent monitor/reconcile callers for one symbol share the
+            # first completed fetch via the cache instead of multiplying the
+            # same exchange request and its rate-limit pressure.
+            with symbol_lock:
+                ticker = self._get(
+                    ex,
+                    symbol_full,
+                    timeout=timeout,
+                    critical=critical,
+                    allow_extended_rate_limit_stale=(
+                        allow_extended_rate_limit_stale
+                    ),
+                )
         except Exception:
             self._note_request_result(ok=False)
             raise
-        self._note_request_result(ok=True)
-        return ticker
+        else:
+            self._note_request_result(ok=True)
+            return ticker
+        finally:
+            with self._symbol_locks_lock:
+                current = self._symbol_locks.get(fetch_key)
+                if current is lock_entry:
+                    lock_entry[1] -= 1
+                    if lock_entry[1] <= 0:
+                        self._symbol_locks.pop(fetch_key, None)
 
     def _get(self, ex, symbol_full: str, timeout: float = 5.0,
              critical: bool = False,
@@ -434,6 +459,22 @@ class TickerCache:
             )
 
         permit_owned_by_caller = True
+        api_reservation = None
+
+        def _record_fetch_api_error() -> None:
+            try:
+                from bot_utils.api_budget import (
+                    ApiCallReservation,
+                    record_api_error,
+                )
+
+                if isinstance(api_reservation, ApiCallReservation):
+                    record_api_error("fetch_ticker", api_reservation)
+            except Exception:
+                # Health accounting must never replace the causal ticker
+                # exception or disturb price-protection fallback behavior.
+                pass
+
         try:
             # Atomic cross-process budget gate BEFORE the fetch (not just
             # record_api_call() after) so bot subprocesses can't collectively
@@ -441,10 +482,14 @@ class TickerCache:
             # freshest stale cache (exits still get a price < stale_max), else skip.
             try:
                 from bot_utils.api_budget import try_consume_api_call
-                _allowed = try_consume_api_call("fetch_ticker", critical=critical)
+                api_reservation = try_consume_api_call(
+                    "fetch_ticker",
+                    critical=critical,
+                    return_reservation=True,
+                )
             except Exception:
-                _allowed = False
-            if not _allowed:
+                api_reservation = None
+            if not api_reservation:
                 self._note("budget_denied")
                 stale = self._stale(
                     symbol_full, time.monotonic(), self.stale_max
@@ -486,6 +531,7 @@ class TickerCache:
             try:
                 ticker = future.result(timeout=timeout) or {}
             except _FutTimeout:
+                _record_fetch_api_error()
                 self._note_fetch_result(fetch_started_at, ok=False)
                 cancelled = False
                 try:
@@ -509,6 +555,7 @@ class TickerCache:
                     f"and no fresh cache (<{self.stale_max}s) available"
                 )
             except Exception as e:
+                _record_fetch_api_error()
                 self._note_fetch_result(fetch_started_at, ok=False)
                 if self._is_rate_limited(e):
                     self._rate_limited_until = (
@@ -532,6 +579,7 @@ class TickerCache:
             post_now = time.monotonic()
             ticker = _normalize_ticker_price(ticker)
             if ticker is None:
+                _record_fetch_api_error()
                 self._note("invalid_payloads")
                 self._note_fetch_result(fetch_started_at, ok=False)
                 stale = self._stale(symbol_full, post_now, self.stale_max)

@@ -223,9 +223,10 @@ def _raw_futures_balance_row(
 
 def _futures_balance_values(
     balance: dict, currency: str = "USDT"
-) -> tuple[float | None, float | None]:
+) -> tuple[float | None, float | None, bool]:
     free = _balance_value(balance, "free", currency)
     equity = _balance_value(balance, "total", currency)
+    native_equity_known = False
     raw = _raw_futures_balance_row(balance, currency)
     if raw is not None:
         raw_free = _finite(
@@ -242,7 +243,8 @@ def _futures_balance_values(
             free = raw_free
         if raw_equity is not None and raw_equity > 0.0:
             equity = raw_equity
-    return free, equity
+            native_equity_known = True
+    return free, equity, native_equity_known
 
 
 def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
@@ -256,7 +258,7 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
         )
         if not isinstance(balance, dict) or not isinstance(positions_raw, list):
             raise ValueError("malformed account snapshot")
-        free, equity = _futures_balance_values(balance)
+        free, equity, native_equity_known = _futures_balance_values(balance)
         if (
             free is None
             or equity is None
@@ -386,6 +388,12 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
                     cluster=_symbol_cluster(symbol),
                 )
             )
+        exchange_id = str(getattr(exchange, "id", "") or "").strip().lower()
+        if exchange_id == "mexc" and positions and not native_equity_known:
+            # CCXT derives MEXC swap ``total`` from availableBalance and does
+            # not include position margin.  With an open position only the
+            # exchange-native equity field is a complete account denominator.
+            raise ValueError("USDT equity unavailable for open MEXC positions")
         return PortfolioSnapshot(
             equity,
             free,
@@ -432,6 +440,20 @@ def collect_spot_snapshot(exchange) -> PortfolioSnapshot:
                 raise ValueError(f"spot amount unavailable for {asset}")
             if amount > 0.0:
                 normalized_totals.append((str(asset).upper(), amount))
+        symbols = [
+            f"{asset}/USDT"
+            for asset, _amount in normalized_totals
+            if asset != "USDT"
+        ]
+        tickers = {}
+        if symbols:
+            fetched_tickers = _budgeted_api_call(
+                "portfolio_guard_fetch_tickers",
+                lambda: exchange.fetch_tickers(symbols),
+            )
+            if not isinstance(fetched_tickers, dict):
+                raise ValueError("spot ticker snapshot unavailable")
+            tickers = fetched_tickers
         equity = 0.0
         positions = []
         for normalized_asset, amount in normalized_totals:
@@ -441,12 +463,11 @@ def collect_spot_snapshot(exchange) -> PortfolioSnapshot:
                     raise ValueError("spot equity overflow")
                 continue
             symbol = f"{normalized_asset}/USDT"
-            ticker = _budgeted_api_call(
-                "portfolio_guard_fetch_ticker",
-                lambda: exchange.fetch_ticker(symbol),
-            )
+            ticker = tickers.get(symbol)
+            if not isinstance(ticker, dict):
+                raise ValueError(f"spot valuation unavailable for {normalized_asset}")
             price = _finite(
-                (ticker or {}).get("last") or (ticker or {}).get("close")
+                ticker.get("last") or ticker.get("close")
             )
             if price is None or price <= 0.0:
                 raise ValueError(f"spot valuation unavailable for {normalized_asset}")

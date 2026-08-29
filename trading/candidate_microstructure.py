@@ -6,6 +6,9 @@ alter an entry.  Unified order books remain snapshot/sequence-unverified.
 from __future__ import annotations
 
 import math
+import inspect
+import threading
+import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 
@@ -14,6 +17,37 @@ from core.constants import SIM_CAPTURE_CONTRACT_SCHEMA
 
 
 _SUPPORTED_SIM_TCA_BOTS = frozenset({"CROSS", "FUTREND", "SPOT", "TREND"})
+_SIM_TCA_RATE_LIMIT_COOLDOWN_SECONDS = 12.0
+_SIM_TCA_RATE_LIMIT_LOCK = threading.Lock()
+_SIM_TCA_RATE_LIMIT_UNTIL = 0.0
+
+
+def _sim_tca_rate_limit_active() -> bool:
+    with _SIM_TCA_RATE_LIMIT_LOCK:
+        return time.monotonic() < _SIM_TCA_RATE_LIMIT_UNTIL
+
+
+def _open_sim_tca_rate_limit_cooldown() -> None:
+    global _SIM_TCA_RATE_LIMIT_UNTIL
+    until = time.monotonic() + _SIM_TCA_RATE_LIMIT_COOLDOWN_SECONDS
+    with _SIM_TCA_RATE_LIMIT_LOCK:
+        _SIM_TCA_RATE_LIMIT_UNTIL = max(_SIM_TCA_RATE_LIMIT_UNTIL, until)
+
+
+def _consume_with_optional_reservation(consume, endpoint: str):
+    """Request a ledger handle while preserving narrow legacy test doubles."""
+    try:
+        parameters = inspect.signature(consume).parameters.values()
+        supports_reservation = any(
+            parameter.name == "return_reservation"
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        supports_reservation = True
+    if supports_reservation:
+        return consume(endpoint, return_reservation=True)
+    return consume(endpoint)
 
 
 def _positive(value, name: str) -> float:
@@ -78,6 +112,7 @@ def capture_simulated_entry_tca(
     record_tca=None,
     schedule_markouts=None,
     persist_snapshot=None,
+    arrival_book: dict | None = None,
 ) -> bool:
     """Record SIM arrival/fill/markouts without creating an order intent."""
     default_persistence = False
@@ -133,26 +168,72 @@ def capture_simulated_entry_tca(
                 normalized_entry_id, normalized_bot
             ):
                 return False
-        failure_reason = "api_budget_check_failed"
-        if consume_api is None:
-            from bot_utils.api_budget import try_consume_api_call as consume
-        else:
-            consume = consume_api
-        if not consume("candidate_microstructure_fetch_order_book"):
-            if default_persistence:
-                _persist_sim_tca_capture_failure(
-                    entry_id=normalized_entry_id,
-                    bot_name=normalized_bot,
-                    symbol=normalized_symbol,
-                    side=normalized_side,
-                    reference_price=reference,
-                    measured_at=measured_at,
-                    reason="api_budget_denied",
-                    error_type="ApiBudgetDenied",
+        book = arrival_book
+        if book is None:
+            if _sim_tca_rate_limit_active():
+                if default_persistence:
+                    _persist_sim_tca_capture_failure(
+                        entry_id=normalized_entry_id,
+                        bot_name=normalized_bot,
+                        symbol=normalized_symbol,
+                        side=normalized_side,
+                        reference_price=reference,
+                        measured_at=measured_at,
+                        reason="rate_limit_cooldown",
+                        error_type="RateLimitCooldown",
+                    )
+                return False
+            failure_reason = "api_budget_check_failed"
+            if consume_api is None:
+                from bot_utils.api_budget import (
+                    try_consume_api_call as consume,
                 )
-            return False
-        failure_reason = "orderbook_fetch_failed"
-        book = exchange.fetch_order_book(normalized_symbol, limit=levels)
+            else:
+                consume = consume_api
+            endpoint = "candidate_microstructure_fetch_order_book"
+            reservation = (
+                _consume_with_optional_reservation(consume, endpoint)
+                if consume_api is None
+                else consume(endpoint)
+            )
+            if not reservation:
+                if default_persistence:
+                    _persist_sim_tca_capture_failure(
+                        entry_id=normalized_entry_id,
+                        bot_name=normalized_bot,
+                        symbol=normalized_symbol,
+                        side=normalized_side,
+                        reference_price=reference,
+                        measured_at=measured_at,
+                        reason="api_budget_denied",
+                        error_type="ApiBudgetDenied",
+                    )
+                return False
+            failure_reason = "orderbook_fetch_failed"
+            try:
+                book = exchange.fetch_order_book(
+                    normalized_symbol,
+                    limit=levels,
+                )
+            except Exception as exc:
+                try:
+                    from bot_utils.api_budget import (
+                        ApiCallReservation,
+                        record_api_error,
+                    )
+
+                    if isinstance(reservation, ApiCallReservation):
+                        record_api_error(endpoint, reservation)
+                except Exception:
+                    pass
+                try:
+                    from bot_utils.network_retry import is_rate_limited
+
+                    if is_rate_limited(exc):
+                        _open_sim_tca_rate_limit_cooldown()
+                except Exception:
+                    pass
+                raise
         failure_reason = "arrival_tca_invalid"
         from trading.execution_quality import build_arrival_tca, compute_fill_tca
 

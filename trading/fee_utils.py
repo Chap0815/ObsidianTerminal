@@ -123,7 +123,12 @@ def extract_fee_usdt_known(
         ]
         if valid_entries:
             total = 0.0
-            all_known = True
+            # A plural fee array is complete only when every component is a
+            # structurally usable fee row.  Silently dropping one malformed
+            # component and declaring the remaining subtotal authoritative
+            # can understate money accounting and suppress a valid singular
+            # exchange summary or final refetch.
+            all_known = len(valid_entries) == len(fees_list)
             for fee_dict in valid_entries:
                 fee, known = _fee_to_usdt_known(
                     fee_dict, order, base_override)

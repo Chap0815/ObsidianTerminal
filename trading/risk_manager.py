@@ -14,7 +14,11 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import core.constants as C
-from bot_utils.config import _read_config_json
+from bot_utils.config import (
+    _INT_FIELDS,
+    _finite_integral_or_none,
+    _read_config_json,
+)
 from core.constants import MarketRegime
 from core.database import (
     get_recent_trades, get_param, get_param_text, set_param,
@@ -237,6 +241,29 @@ def validate_config_or_die(bot_name: str) -> dict:
             f"{missing}. Refusing to start.", "WARN")
         _fatal_exit(1)
     try:
+        for key in sorted(_INT_FIELDS):
+            if key in cfg and _finite_integral_or_none(cfg[key]) is None:
+                log_event(
+                    f"[{bot_name}] FATAL: {key} must be a finite whole "
+                    f"number. Refusing to start.",
+                    "WARN",
+                )
+                _fatal_exit(1)
+        for fast_key, slow_key in (
+            ("TREND_SMA_FAST", "TREND_SMA_SLOW"),
+            ("TREND_CROSS_FAST", "TREND_CROSS_SLOW"),
+        ):
+            if fast_key not in cfg or slow_key not in cfg:
+                continue
+            fast = _finite_integral_or_none(cfg[fast_key])
+            slow = _finite_integral_or_none(cfg[slow_key])
+            if fast is not None and slow is not None and fast >= slow:
+                log_event(
+                    f"[{bot_name}] FATAL: {fast_key}={fast} must be below "
+                    f"{slow_key}={slow}. Refusing to start.",
+                    "WARN",
+                )
+                _fatal_exit(1)
         mdl = _require_finite_float(cfg["MAX_DAILY_LOSS"], "MAX_DAILY_LOSS")
         if mdl >= 0 or mdl < -1000:
             log_event(f"[{bot_name}] FATAL: MAX_DAILY_LOSS={mdl} out of safe range", "WARN")
@@ -1437,13 +1464,18 @@ def check_kill_switches(bot_name: str, exchange=None,
         except Exception:
             _win_now = datetime.now(timezone.utc).replace(tzinfo=None)
         one_hour_ago = (_win_now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
-        now_str = _win_now.strftime("%Y-%m-%d %H:%M:%S")
+        latest_recent = (
+            _win_now
+            + timedelta(
+                seconds=C.API_LEDGER_CLOCK_ROLLBACK_TOLERANCE_SECONDS
+            )
+        ).strftime("%Y-%m-%d %H:%M:%S")
         row = conn.execute("""
             SELECT COUNT(*) AS total,
                    SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END) AS errors
             FROM api_rate_global
             WHERE called_at >= ? AND called_at <= ? AND ok IN (0, 1)
-        """, (one_hour_ago, now_str)).fetchone()
+        """, (one_hour_ago, latest_recent)).fetchone()
         if row and row[0] and row[0] > 10:
             err_rate = (row[1] or 0) / row[0]
             # Threshold read from constants.py (editable in one place).

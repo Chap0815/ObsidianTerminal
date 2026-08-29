@@ -57,7 +57,11 @@ def _read_expected_bot_count(default: int = _DEFAULT_API_CONSUMER_COUNT) -> int:
         count = int(os.environ.get("API_EXPECTED_BOT_COUNT", str(default)))
     except (TypeError, ValueError, OverflowError):
         return default
-    return count if count >= 1 else default
+    # The deployment always has the five bot processes plus the launcher as
+    # potential API consumers.  An understated override would multiply the
+    # effective cluster allowance during a SQLite outage (each process applies
+    # MAX/count locally), defeating the conservative fallback contract.
+    return max(default, count) if count >= 1 else default
 
 
 MAX_API_CALLS_PER_MINUTE = _read_limit_from_env()
@@ -257,6 +261,9 @@ def budget_remaining() -> int:
     try:
         from core.database import _tight_connection
         from datetime import datetime, timezone, timedelta
+        from core.constants import (
+            API_LEDGER_CLOCK_ROLLBACK_TOLERANCE_SECONDS,
+        )
         # Match the exchange-anchored clock the rows were written with.
         try:
             from core.clock import now_utc as _now_utc
@@ -265,12 +272,17 @@ def budget_remaining() -> int:
             _win_now = datetime.now(timezone.utc)
         cutoff = (_win_now - timedelta(seconds=60)
                    ).strftime("%Y-%m-%d %H:%M:%S")
-        now_str = _win_now.strftime("%Y-%m-%d %H:%M:%S")
+        latest_recent = (
+            _win_now
+            + timedelta(
+                seconds=API_LEDGER_CLOCK_ROLLBACK_TOLERANCE_SECONDS
+            )
+        ).strftime("%Y-%m-%d %H:%M:%S")
         conn = _tight_connection()
         row = conn.execute(
             "SELECT COUNT(*) FROM api_rate_global "
             "WHERE called_at >= ? AND called_at <= ?",
-            (cutoff, now_str),
+            (cutoff, latest_recent),
         ).fetchone()
         count = row[0] if row else 0
         return max(0, MAX_API_CALLS_PER_MINUTE - count)

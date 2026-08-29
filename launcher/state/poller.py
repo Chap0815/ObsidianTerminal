@@ -892,7 +892,32 @@ class DataPoller:
                             new_data["spot_equity"]    = None
                             new_data["futures_equity"] = None
                     except Exception:
-                        new_data["balance_live"] = "API Error"
+                        # Never combine a fresh aggregate failure with stale
+                        # wallet details from an older successful cycle. Close
+                        # owned clients so the next cadence starts with clean
+                        # transports, while preserving which wallet modes are
+                        # currently LIVE independently of API availability.
+                        self._discard_exchange("_equity_spot_exchange")
+                        self._discard_exchange("_equity_futures_exchange")
+                        live_spot = any(
+                            not mode_is_sim.get(bot, True)
+                            and not BOT_META.get(bot, {}).get("is_futures")
+                            for bot in BOT_ORDER
+                        )
+                        live_futures = any(
+                            not mode_is_sim.get(bot, True)
+                            and bool(BOT_META.get(bot, {}).get("is_futures"))
+                            for bot in BOT_ORDER
+                        )
+                        new_data.update({
+                            "balance_live": "API Error",
+                            "balance_live_spot": "",
+                            "balance_live_futures": "",
+                            "live_spot_active": live_spot,
+                            "live_futures_active": live_futures,
+                            "spot_equity": None,
+                            "futures_equity": None,
+                        })
                     self._balance_next = cadence_now + 15.0
                 else:
                     new_data["balance_live"]  = self.cache.get("balance_live",  "")
