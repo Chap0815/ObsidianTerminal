@@ -1029,6 +1029,169 @@ class CrossBot(FuturesBot):
             fund = 0.0
         return fee, fund
 
+    def _prepare_cross_sim_pending_accounting(
+        self,
+        base: str,
+        row: dict,
+        *,
+        log_event,
+    ) -> dict | None:
+        """Make a legacy CROSS-SIM full-close marker replayable.
+
+        Older/failed shutdown accounting can leave only
+        ``accounting_pending`` plus the original paper-position fields.  SIM
+        has no physical exchange exposure, so its stored last/entry price is
+        sufficient deterministic close evidence.  LIVE remains fail-closed
+        and never enters this recovery path.
+        """
+        if not self.simulation or row.get("accounting_pending") is not True:
+            return None
+
+        close_price = (
+            CrossBot._safe_positive_price(
+                row.get("accounting_pending_sell_price")
+            )
+            or CrossBot._safe_positive_price(row.get("last_price"))
+            or CrossBot._safe_positive_price(row.get("buy"))
+        )
+        entry = CrossBot._safe_positive_price(row.get("buy"))
+        margin = CrossBot._safe_float(
+            self, row.get("invested_usdt"), 0.0
+        )
+        leverage = CrossBot._safe_float(self, row.get("leverage"), 1.0)
+        position_type = CrossBot._safe_exchange_text(
+            row.get("position_type")
+        ).upper()
+        if (
+            close_price <= 0
+            or entry <= 0
+            or margin <= 0
+            or leverage <= 0
+            or position_type not in {"LONG", "SHORT"}
+        ):
+            log_event(
+                f"[{self.BOT_NAME}] {base}: incomplete SIM accounting marker "
+                "has invalid recovery inputs; state kept fail-closed",
+                "ERROR",
+            )
+            return None
+
+        from bot_utils.futures_math import calc_unrealized_pnl, price_move_pct
+        from core.logger import _date as _utc
+
+        gross_pnl, _ = calc_unrealized_pnl(
+            entry, close_price, margin, leverage, position_type
+        )
+        move_pct = price_move_pct(
+            entry, close_price, position_type
+        )
+        full_symbol = f"{base}/USDT:USDT"
+        notional = self._notional_from_state(row)
+        total_fees = self._cross_sim_roundtrip_fee(full_symbol, notional)
+        funding = CrossBot._safe_float(
+            self, row.get("funding_paid"), 0.0
+        )
+        total_fees, funding = self._clamp_cross_sim_costs(
+            full_symbol,
+            row,
+            total_fees,
+            funding,
+            log_event=log_event,
+        )
+        net_pnl = round(gross_pnl - total_fees - funding, 4)
+        mfe_pct = max(
+            CrossBot._safe_float(
+                self, row.get("max_profit_pct"), move_pct
+            ),
+            move_pct,
+        )
+        mae_pct = min(
+            CrossBot._safe_float(
+                self, row.get("min_profit_pct"), move_pct
+            ),
+            move_pct,
+        )
+        pending_fields = {
+            "accounting_pending": True,
+            "accounting_pending_reason": (
+                row.get("accounting_pending_reason")
+                or "Cross SIM legacy close recovery"
+            ),
+            "accounting_pending_sell_price": close_price,
+            "accounting_pending_sell_time": (
+                row.get("accounting_pending_sell_time") or _utc()
+            ),
+            "accounting_pending_profit_pct": move_pct,
+            "accounting_pending_profit_usdt": net_pnl,
+            "accounting_pending_mode_is_sim": True,
+            "accounting_pending_fees_usdt": total_fees,
+            "accounting_pending_funding_paid": funding,
+            "accounting_pending_exchange_order_id": row.get(
+                "accounting_pending_exchange_order_id"
+            ),
+            "accounting_pending_mfe_pct": mfe_pct,
+            "accounting_pending_mae_pct": mae_pct,
+            "accounting_pending_giveback_pct": max(0.0, mfe_pct - move_pct),
+            "accounting_pending_entry_quality_score": row.get(
+                "entry_quality_score"
+            ),
+            "accounting_pending_entry_quality_label": row.get(
+                "entry_quality_label"
+            ),
+            "accounting_pending_entry_quality_reasons": row.get(
+                "entry_quality_reasons"
+            ),
+            "accounting_pending_funding_unverified": False,
+            "entry_funding_window_unverified": False,
+        }
+        try:
+            persisted = self.state.update_many(base, pending_fields)
+        except Exception as exc:
+            persisted = False
+            self._log_error(
+                f"cross SIM pending-accounting repair {base}", exc
+            )
+        if persisted is not True:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: repaired SIM accounting marker "
+                "was not durable; state kept fail-closed",
+                "ERROR",
+            )
+            return None
+        return self.state.get(base)
+
+    def _retry_cross_sim_pending_accounting(
+        self,
+        base: str,
+        row: dict,
+        *,
+        log_event,
+    ) -> bool:
+        if not self.simulation or row.get("accounting_pending") is not True:
+            return False
+        from core.futures_bot_reconcile import (
+            _defer_offline_accounting_retry,
+            _offline_accounting_retry_due,
+        )
+
+        if not _offline_accounting_retry_due(row):
+            return False
+        prepared = CrossBot._prepare_cross_sim_pending_accounting(
+            self,
+            base,
+            row,
+            log_event=log_event,
+        )
+        if prepared is None:
+            _defer_offline_accounting_retry(self, base, row)
+            return False
+        self._close_leg(base, prepared, reason="pending accounting retry")
+        recovered = not self.state.has(base)
+        if not recovered:
+            current = self.state.get(base) or prepared
+            _defer_offline_accounting_retry(self, base, current)
+        return recovered
+
     def _maybe_persist_funding_for_all(self, trades: dict,
                                        now_epoch: float) -> None:
         if not self.simulation:
@@ -4331,6 +4494,16 @@ class CrossBot(FuturesBot):
         from core.logger import log_event
         from bot_utils.futures_math import price_move_pct, calc_unrealized_pnl
         raw_trades = self.state.get_all()
+        if self.simulation:
+            for base, row in list(raw_trades.items()):
+                if row.get("accounting_pending") is True:
+                    CrossBot._retry_cross_sim_pending_accounting(
+                        self,
+                        base,
+                        row,
+                        log_event=log_event,
+                    )
+            raw_trades = self.state.get_all()
         if not raw_trades:
             self._cross_risk_snapshot_ok = True
             return

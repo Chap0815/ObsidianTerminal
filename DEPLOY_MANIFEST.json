@@ -1,6 +1,6 @@
 {
-  "build_id": "d361a657f770b0ae",
-  "created_at": "2026-08-30 11:48:50",
+  "build_id": "1ec7947c50f3e5a0",
+  "created_at": "2026-08-30 15:51:11",
   "source": "update_deploy_manifest.py",
   "file_count": 199,
   "files": [
@@ -61,8 +61,8 @@
     },
     {
       "path": "bot_utils/futures_exits.py",
-      "sha256": "33da4e13252ed84aa0fc57b6cc58da76340788721bc7d526ee723ccfdc976df3",
-      "bytes": 58197
+      "sha256": "7d951776bbbe404483803eaa5eebc2185788697225119db7171fff26bec53bcc",
+      "bytes": 58856
     },
     {
       "path": "bot_utils/futures_funding.py",
@@ -251,8 +251,8 @@
     },
     {
       "path": "core/cross_bot.py",
-      "sha256": "d7cd7d97374ca852993db6927a2b5b4db9e11f9d11e3c1770c2dac9008059896",
-      "bytes": 213422
+      "sha256": "e1d52717399bdcd7ac44cde8732f87abeb59a6b32a631b0e60a556bbc81461a8",
+      "bytes": 219769
     },
     {
       "path": "core/database.py",

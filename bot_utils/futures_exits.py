@@ -675,8 +675,22 @@ def _close_single_position_impl(*,
             fill_price = curr
             fill_source = "simulation"
             if amount > 0 and fill_price > 0:
-                close_fee = amount * _cs * fill_price * taker_fee_rate(
-                    ex, symbol_full)
+                # CROSS paper state stores ``amount`` in base coins, not in
+                # exchange contracts (see CrossBot._open_leg). Applying the
+                # venue contract size a second time can inflate low-price-coin
+                # fees by orders of magnitude and strand the durable
+                # accounting marker when the DB sanity guard rejects it.
+                simulation_contract_size = (
+                    1.0
+                    if str(bot_name or "").strip().upper() == "CROSS"
+                    else _cs
+                )
+                close_fee = (
+                    amount
+                    * simulation_contract_size
+                    * fill_price
+                    * taker_fee_rate(ex, symbol_full)
+                )
         else:
             try:
                 close_side = "sell" if pos_type == "LONG" else "buy"
