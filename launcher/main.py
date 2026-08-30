@@ -30,6 +30,7 @@ if _PREIMPORT_PROJECT_ROOT not in sys.path:
 from update_barrier import (  # noqa: E402 - pre-import root bootstrap above
     UpdateInProgressError,
     assert_process_start_allowed,
+    ensure_runtime_install_mutex,
     process_start_guard,
     update_lifecycle_lock,
 )
@@ -37,6 +38,7 @@ from env_setup_files import (  # noqa: E402 - pre-import root bootstrap above
     cleanup_stale_env_temps,
 )
 
+ensure_runtime_install_mutex()
 try:
     assert_process_start_allowed(_PREIMPORT_PROJECT_ROOT)
 except UpdateInProgressError as exc:

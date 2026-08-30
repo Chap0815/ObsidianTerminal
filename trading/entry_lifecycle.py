@@ -12,7 +12,7 @@ from typing import Any
 
 
 _TERMINAL_STAGES = frozenset((
-    "opened", "blocked", "aborted", "order_failed", "state_failed",
+    "opened", "blocked", "aborted", "order_failed",
 ))
 _MAX_TRACKED_ENTRIES = 4096
 _MAX_STAGES_PER_ENTRY = 32

@@ -174,11 +174,22 @@ def get_system_stats() -> dict:
              "vram_pct": None, "vram_used_mb": None, "vram_total_mb": None}
     if HAS_PSUTIL:
         try:
-            stats["cpu"] = psutil.cpu_percent(interval=None)
+            cpu = float(psutil.cpu_percent(interval=None))
+            if math.isfinite(cpu) and 0.0 <= cpu <= 100.0:
+                stats["cpu"] = cpu
             mem = psutil.virtual_memory()
-            stats["ram"] = mem.percent
-            stats["ram_used_gb"] = mem.used / (1024 ** 3)
-            stats["ram_total_gb"] = mem.total / (1024 ** 3)
+            ram = float(mem.percent)
+            used = float(mem.used)
+            total = float(mem.total)
+            if (
+                all(math.isfinite(value) for value in (ram, used, total))
+                and 0.0 <= ram <= 100.0
+                and 0.0 <= used <= total
+                and total > 0.0
+            ):
+                stats["ram"] = ram
+                stats["ram_used_gb"] = used / (1024 ** 3)
+                stats["ram_total_gb"] = total / (1024 ** 3)
         except Exception:
             pass
     commit = _query_windows_commit_memory()

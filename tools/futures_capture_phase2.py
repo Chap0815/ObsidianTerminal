@@ -487,6 +487,7 @@ def _normalized_phase2_stats(stats: dict) -> dict:
             "gross": 0.0,
             "costs": 0.0,
             "net": 0.0,
+            "max_dd": 0.0,
             "total_fees": 0.0,
             "total_funding": 0.0,
         })
@@ -879,23 +880,69 @@ def build_validation_fragment_inputs(
         raw_positions = positions.get("positions")
         if positions.get("evidence_valid") is not True or not isinstance(raw_positions, list):
             raise ValueError("phase-2 independent positions are unavailable")
+        initial_capital = stats.get("initial_capital")
+        if (
+            isinstance(initial_capital, bool)
+            or not isinstance(initial_capital, (int, float))
+            or not math.isfinite(float(initial_capital))
+            or float(initial_capital) <= 0.0
+        ):
+            raise ValueError("phase-2 position summaries conflict with raw evidence")
+        equity = peak = float(initial_capital)
+        reconstructed_drawdown = 0.0
+        nets_by_exit: dict[float, list[float]] = {}
+        reconstructed_liquidations = 0
+        for row in raw_positions:
+            if not isinstance(row, dict):
+                raise ValueError("phase-2 raw position evidence is invalid")
+            exit_time = row.get("exit_time")
+            net = row.get("net")
+            liquidated = row.get("liquidated")
+            if (
+                isinstance(exit_time, bool)
+                or not isinstance(exit_time, (int, float))
+                or not math.isfinite(float(exit_time))
+                or isinstance(net, bool)
+                or not isinstance(net, (int, float))
+                or not math.isfinite(float(net))
+                or not isinstance(liquidated, bool)
+            ):
+                raise ValueError("phase-2 raw position evidence is invalid")
+            nets_by_exit.setdefault(float(exit_time), []).append(float(net))
+            reconstructed_liquidations += int(liquidated)
+        for exit_time in sorted(nets_by_exit):
+            equity += math.fsum(nets_by_exit[exit_time])
+            peak = max(peak, equity)
+            if peak > 0.0:
+                reconstructed_drawdown = max(
+                    reconstructed_drawdown,
+                    (peak - equity) / peak * 100.0,
+                )
+        if (
+            not _values_match(stats.get("max_dd"), reconstructed_drawdown)
+            or stats.get("liquidation_count") != reconstructed_liquidations
+        ):
+            raise ValueError("phase-2 position summaries conflict with raw evidence")
         periods.append({
             "profile": task.get("cost_profile"),
             "scope": task.get("scope"),
             "fold_index": task.get("fold_index"),
             "period_start": period.get("start"),
             "period_end": period.get("end"),
+            "initial_capital": initial_capital,
             "positions": [
                 {
                     "position_id": row.get("position_id"),
                     "symbol": row.get("symbol"),
                     "regime": row.get("regime"),
+                    "exit_time": row.get("exit_time"),
                     "net": row.get("net"),
+                    "liquidated": row.get("liquidated"),
                 }
                 for row in raw_positions
             ],
-            "max_drawdown_pct": stats.get("max_dd"),
-            "liquidation_count": stats.get("liquidation_count"),
+            "max_drawdown_pct": reconstructed_drawdown,
+            "liquidation_count": reconstructed_liquidations,
         })
     return {
         "eligible_observation_count": paired,

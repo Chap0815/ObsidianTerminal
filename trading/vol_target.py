@@ -8,6 +8,7 @@ deployed capital ~unchanged). Pure + timeframe-agnostic. Off unless enabled.
 """
 from __future__ import annotations
 
+import math
 import statistics
 from typing import List, Optional
 
@@ -17,13 +18,18 @@ def realized_vol(closes: List[float], lookback: int = 30) -> Optional[float]:
     there isn't enough history."""
     if not closes or lookback < 2 or len(closes) < lookback + 1:
         return None
-    window = closes[-(lookback + 1):]
-    rets = [window[i] / window[i - 1] - 1
-            for i in range(1, len(window)) if window[i - 1]]
-    if len(rets) < 2:
+    try:
+        window = [float(value) for value in closes[-(lookback + 1):]]
+    except (TypeError, ValueError, OverflowError):
         return None
+    if any(not math.isfinite(value) or value <= 0.0 for value in window):
+        return None
+    rets = [
+        window[i] / window[i - 1] - 1
+        for i in range(1, len(window))
+    ]
     v = statistics.pstdev(rets)
-    return v if v > 0 else None
+    return v if math.isfinite(v) and v > 0 else None
 
 
 def vol_target_multiplier(coin_vol: Optional[float],

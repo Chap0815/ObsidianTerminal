@@ -54,6 +54,8 @@ from bot_utils import (
 )
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.runtime_threads import (finalize_runtime_shutdown,
+                                       format_runtime_thread_liveness,
+                                       shared_runtime_resource_closers,
                                        start_threads_or_shutdown)
 from bot_utils.silent_log import silent_log
 from bot_utils.trade_state import state_exposure_count
@@ -143,6 +145,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         # Idempotency flag for emergency close (prevents double-run when both
         # SIGINT and atexit fire)
         self._emergency_closed = False
+        self._shutdown_positions_preserved = False
 
         # Threads
         self._monitor_thread: Optional[threading.Thread] = None
@@ -1251,6 +1254,9 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     "projected_required_bytes": bounded_nonnegative(
                         raw_storage.get("projected_required_bytes")
                     ),
+                    "required_capacity_bytes": bounded_nonnegative(
+                        raw_storage.get("required_capacity_bytes")
+                    ),
                     "filesystem_free_bytes": bounded_nonnegative(
                         raw_storage.get("filesystem_free_bytes")
                     ),
@@ -1260,6 +1266,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     "headroom_ratio": bounded_float(
                         raw_storage.get("headroom_ratio")
                     ),
+                    "operational_reserve_ratio": bounded_float(
+                        raw_storage.get("operational_reserve_ratio")
+                    ),
+                    "capacity_state": str(
+                        raw_storage.get("capacity_state") or ""
+                    )[:32],
                 },
                 "consecutive_capture_errors": nonnegative_int(
                     "consecutive_capture_errors"
@@ -1828,6 +1840,8 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             self._last_hourly_status = 0.0
             while not self._shutdown_event.is_set():
                 try:
+                    if self._consume_launcher_shutdown_request(log_event):
+                        break
                     # Scheduling must be immune to wall-clock corrections. The
                     # coordinator itself must also survive a transient DB,
                     # status or diagnostic failure while its safety workers are
@@ -1835,14 +1849,16 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     now = time.monotonic()
                     if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_SEC:
                         tc = state_exposure_count(self.state)
+                        thread_liveness = format_runtime_thread_liveness(
+                            self._runtime_threads()
+                        )
                         sm_marker = (
                             "  SAFE_MODE" if self.safe_mode.is_active() else ""
                         )
                         log_event(
                             f" {self.BOT_NAME} heartbeat  "
                             f"Open: {tc}/{self.C('MAX_OPEN_TRADES')}  "
-                            f"Monitor={'' if self._monitor_thread.is_alive() else ''}  "
-                            f"Scan={'' if self._scan_thread.is_alive() else ''}"
+                            f"Threads: {thread_liveness}"
                             f"{sm_marker}",
                             "INFO"
                         )
@@ -1889,13 +1905,13 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         # A fetch that was already running during the signal handler may have
         # completed while core threads were joining. Confirm pool teardown now
         # so a non-daemon executor worker cannot be reported as cleanly closed.
+        resource_closers = shared_runtime_resource_closers()
+        resource_closers["ticker_cache"] = self._shutdown_ticker_cache_if_flat
         finalize_runtime_shutdown(
             self,
             write_runtime_status,
             log_event,
-            resource_closers={
-                "ticker_cache": self._shutdown_ticker_cache_if_flat,
-            },
+            resource_closers=resource_closers,
         )
 
     #  Exchange connect 
@@ -2095,9 +2111,50 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
 
     #  Shutdown 
 
+    def _consume_launcher_shutdown_request(self, log_event) -> bool:
+        """Consume one launcher request on the bot's main thread."""
+        from bot_utils.shutdown_control import (
+            CLOSE_POSITIONS,
+            PRESERVE_POSITIONS,
+            consume_shutdown_request,
+        )
+
+        try:
+            mode = consume_shutdown_request()
+        except Exception as exc:
+            self._log_error("Launcher shutdown control", exc)
+            return False
+        if mode is None:
+            return False
+        if mode == CLOSE_POSITIONS:
+            self._shutdown_handler(signum="Launcher close request")
+            return True
+        if mode != PRESERVE_POSITIONS:
+            return False
+        with self._shutdown_lock:
+            if getattr(self, "_emergency_in_progress", False):
+                log_event(
+                    "Preserve-position shutdown refused while emergency close "
+                    "is already in progress",
+                    "WARN",
+                )
+                return False
+            self._shutdown_positions_preserved = True
+            self._shutdown_event.set()
+            self._reconcile_wakeup_event.set()
+        log_event(
+            "Launcher preserve-position shutdown received; positions remain "
+            "open while runtime resources close cleanly",
+            "INFO",
+        )
+        return True
+
     def _shutdown_ticker_cache_if_flat(self) -> bool:
         """Keep price fetching alive while an emergency retry is still needed."""
-        if not getattr(self, "_emergency_closed", False):
+        if not (
+            getattr(self, "_emergency_closed", False)
+            or getattr(self, "_shutdown_positions_preserved", False)
+        ):
             return False
         cache = getattr(self, "ticker_cache", None)
         if cache is None:
@@ -2129,6 +2186,8 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         # remaining legs are retried). _emergency_in_progress prevents a concurrent
         # second run; _shutdown_event is still set so the rest of the bot winds down.
         with self._shutdown_lock:
+            if getattr(self, "_shutdown_positions_preserved", False):
+                return
             if getattr(self, "_emergency_closed", False):
                 return
             self._shutdown_event.set()

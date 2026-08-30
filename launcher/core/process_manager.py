@@ -12,10 +12,9 @@ Notable design points:
   (``core/``, ``config/``, ``tools/``, ``prompts/``, ``data/``) regardless of
   whether you launch from a Desktop shortcut, a terminal, or via ``python -m``.
 
-* On Windows the bot subprocess is started with
-  ``CREATE_NEW_PROCESS_GROUP`` so the launcher can later send
-  ``CTRL_BREAK_EVENT`` for graceful shutdowns. Without that flag the signal
-  silently no-ops.
+* Every managed run owns an atomic PID-/run-ID-bound shutdown control record.
+  ``CTRL_BREAK_EVENT`` is only a best-effort close-path wakeup on Windows;
+  clean preserve-position shutdowns do not depend on console signals.
 
 * The reader thread uses a *drop-oldest* policy when the queue is full so
   long-running bots cannot deadlock the launcher when the UI consumer falls
@@ -42,6 +41,14 @@ from launcher.core.runtime_status_values import (
     nonnegative_int_or_zero,
     positive_int_or_zero,
     strict_bool_or_none,
+)
+from bot_utils.shutdown_control import (
+    CLOSE_POSITIONS,
+    PRESERVE_POSITIONS,
+    SHUTDOWN_CONTROL_ENV,
+    cleanup_shutdown_control,
+    prepare_shutdown_control,
+    publish_shutdown_request,
 )
 from update_barrier import process_start_guard
 
@@ -96,9 +103,11 @@ def _clean_shutdown_proven(shutdown: object) -> bool:
         return False
     reasons = shutdown.get("reasons")
     resources = shutdown.get("resources")
+    emergency_closed = shutdown.get("emergency_closed") is True
+    positions_preserved = shutdown.get("positions_preserved") is True
     return (
         shutdown.get("complete") is True
-        and shutdown.get("emergency_closed") is True
+        and emergency_closed != positions_preserved
         and shutdown.get("emergency_in_progress") is False
         and isinstance(reasons, list)
         and not reasons
@@ -315,8 +324,14 @@ class BoundedLogQueue:
                         continue
                     victim = next(iter(candidates))
                     break
-                if victim is None and priority == 3:
-                    victim = next(iter(self._items))
+                if victim is None:
+                    # Under sustained warnings/trades/errors, retain current
+                    # operational evidence instead of pinning the queue to its
+                    # oldest same-priority snapshot.  The explicit drop notice
+                    # still records that one important line was displaced.
+                    candidates = self._priority_items[priority]
+                    if candidates:
+                        victim = next(iter(candidates))
             else:
                 candidates = self._priority_items[0]
                 if candidates:
@@ -386,9 +401,8 @@ class BotProcess:
     log_queue :
         Queue that the reader thread pushes stdout lines into.
     supports_graceful :
-        If ``True``, ``stop(graceful_close=True)`` sends ``SIGTERM`` /
-        ``CTRL_BREAK_EVENT`` and waits up to 45 s before resorting to a
-        hard ``kill()``. All current bots support this.
+        If ``True``, both close-position and preserve-position stops use the
+        run-bound clean shutdown channel. All current bots support this.
     module :
         Module path for ``python -m`` invocation
         (e.g. ``"bots.main_bot_balanced"``). Preferred over ``script``
@@ -407,9 +421,11 @@ class BotProcess:
         self.start_config: dict | None = None
         self.run_id: str | None = None
         self._failed_start_owned_proc: subprocess.Popen | None = None
+        self._shutdown_control_path: str | None = None
         self.supports_graceful = supports_graceful
         self._lifecycle_lock = threading.Lock()
         self._stop_close_operation_active = False
+        self._stop_requested_run_id: str | None = None
 
     #  Lifecycle 
 
@@ -456,6 +472,7 @@ class BotProcess:
             if self.bot_name:
                 env["BOT_NAME"] = self.bot_name
                 env["OBSIDIAN_LAUNCHER_PRESTART_OK"] = "1"
+            self._stop_requested_run_id = None
             self.run_id = uuid.uuid4().hex
             env["BOT_RUN_ID"] = self.run_id
 
@@ -468,6 +485,13 @@ class BotProcess:
 
             spawned_proc = None
             try:
+                control_path = prepare_shutdown_control(
+                    PROJECT_ROOT,
+                    self.bot_name or "BOT",
+                    self.run_id,
+                )
+                self._shutdown_control_path = control_path
+                env[SHUTDOWN_CONTROL_ENV] = control_path
                 with process_start_guard(PROJECT_ROOT):
                     spawned_proc = subprocess.Popen(
                         argv,
@@ -491,6 +515,7 @@ class BotProcess:
                     rollback_complete = True
                 if rollback_complete:
                     self.run_id = None
+                    self._cleanup_shutdown_control()
                 raise
             self.proc = spawned_proc
             self.start_config = current_config_snapshot
@@ -498,7 +523,7 @@ class BotProcess:
                 reader_run_id = self.run_id
                 threading.Thread(
                     target=self._reader,
-                    args=(spawned_proc, reader_run_id),
+                    args=(spawned_proc, reader_run_id, control_path),
                     daemon=True,
                 ).start()
             except Exception:
@@ -507,6 +532,7 @@ class BotProcess:
                     if self.proc is spawned_proc:
                         self.proc = None
                     self.run_id = None
+                    self._cleanup_shutdown_control()
                 else:
                     self._failed_start_owned_proc = spawned_proc
                 raise
@@ -562,6 +588,36 @@ class BotProcess:
         if reaped:
             self._close_process_stdout(proc)
         return reaped
+
+    def _cleanup_shutdown_control(self, expected_path: str | None = None) -> None:
+        current_path = getattr(self, "_shutdown_control_path", None)
+        path = expected_path or current_path
+        if not path:
+            return
+        try:
+            cleanup_shutdown_control(path, project_root=PROJECT_ROOT)
+        except Exception:
+            pass
+        if getattr(self, "_shutdown_control_path", None) == path:
+            self._shutdown_control_path = None
+
+    def _request_shutdown_control(
+        self,
+        proc: subprocess.Popen,
+        run_id: str,
+        mode: str,
+    ) -> bool:
+        path = self._shutdown_control_path
+        if not path:
+            return False
+        publish_shutdown_request(
+            path,
+            run_id=run_id,
+            pid=int(proc.pid),
+            mode=mode,
+            project_root=PROJECT_ROOT,
+        )
+        return True
 
     def _mark_runtime_stopped(self, returncode=None, *,
                               expected_run_id: str | None = None,
@@ -653,9 +709,9 @@ class BotProcess:
         """Stop the bot subprocess.
 
         ``graceful_close``
-            If ``True`` give the bot's atexit/signal handler a chance to run
-            before terminating. On Windows the bot must have been started
-            with ``CREATE_NEW_PROCESS_GROUP``.
+            If ``True``, request a clean shutdown which closes positions. If
+            ``False``, request a clean shutdown which preserves positions.
+            Unmanaged legacy children retain the hard-stop fallback.
 
         The graceful path allows 75s total (see ``_GRACEFUL_TIMEOUT_SEC``) so
         there is headroom past the bot's own SHUTDOWN_DEADLINE_SEC for the
@@ -669,7 +725,7 @@ class BotProcess:
         # block ``is_running()`` if it ever needed the same lock  and
         # also block any concurrent start() call from happening once
         # the process is genuinely dead.
-        already_exited: tuple[int | None, str, int] | None = None
+        already_exited: tuple[int | None, str, int, str | None] | None = None
         with self._lifecycle_lock:
             if self.proc is None:
                 return None
@@ -688,15 +744,26 @@ class BotProcess:
                     returncode_to_mark,
                     run_id_to_mark,
                     pid_to_mark,
+                    getattr(self, "_shutdown_control_path", None),
                 )
             else:
                 proc_to_stop = self.proc
                 run_id_to_stop = self.run_id or ""
                 pid_to_stop = proc_to_stop.pid
+                control_path_to_stop = getattr(
+                    self, "_shutdown_control_path", None
+                )
+                self._stop_requested_run_id = run_id_to_stop
         if already_exited is not None:
-            returncode_to_mark, run_id_to_mark, pid_to_mark = already_exited
+            (
+                returncode_to_mark,
+                run_id_to_mark,
+                pid_to_mark,
+                control_path_to_mark,
+            ) = already_exited
             if close_failed_start_stdout:
                 self._close_process_stdout(proc_to_mark)
+            self._cleanup_shutdown_control(control_path_to_mark)
             self._mark_runtime_stopped(
                 returncode_to_mark,
                 expected_run_id=run_id_to_mark,
@@ -704,17 +771,40 @@ class BotProcess:
             )
             return pid_to_mark
 
-        #  Send the signal OUTSIDE the lock 
-        signal_ok = False
+        # Publish the authoritative run-bound request before attempting the
+        # optional console signal. Hidden Windows children can acknowledge
+        # CTRL_BREAK without ever receiving it; the control record is the
+        # reliable path and is consumed by the bot's main thread.
+        control_ok = False
+        control_mode = CLOSE_POSITIONS if graceful_close else PRESERVE_POSITIONS
+        if self.supports_graceful:
+            try:
+                control_ok = self._request_shutdown_control(
+                    proc_to_stop,
+                    run_id_to_stop,
+                    control_mode,
+                )
+            except Exception as exc:
+                stderr = sys.stderr
+                if stderr is not None:
+                    try:
+                        stderr.write(
+                            "[BotProcess] shutdown control request failed: "
+                            f"{type(exc).__name__}: {exc}\n"
+                        )
+                    except Exception:
+                        pass
+
+        # Send the signal OUTSIDE the lock. It is only a close-path wakeup;
+        # preserve-position shutdowns must never invoke the signal handler.
+        signal_ok = control_ok
         if graceful_close and self.supports_graceful:
             try:
                 if sys.platform == "win32":
                     # CTRL_BREAK_EVENT works only with CREATE_NEW_PROCESS_GROUP.
-                    # On some Python 3.13 + Windows 11 combinations the handle
-                    # becomes invalid ([WinError 6]) even when the flag was set.
-                    # We catch this and fall through to terminate() immediately
-                    # instead of waiting 75s for a graceful close that can't
-                    # happen.
+                    # Best-effort wakeup only. The run-bound control request
+                    # remains authoritative if the console handle is invalid
+                    # or Windows reports success without delivering the event.
                     proc_to_stop.send_signal(signal.CTRL_BREAK_EVENT)
                     signal_ok = True
                 else:
@@ -726,16 +816,34 @@ class BotProcess:
                     try:
                         stdout.write(
                             f"[BotProcess] graceful signal unavailable: {e} "
-                            f"- using terminate()\n"
+                            + (
+                                "- shutdown control remains active\n"
+                                if control_ok
+                                else "- using terminate()\n"
+                            )
                         )
                     except Exception:
                         pass
+
+        if not graceful_close and self.supports_graceful and not control_ok:
+            with self._lifecycle_lock:
+                if self._stop_requested_run_id == run_id_to_stop:
+                    self._stop_requested_run_id = None
+            raise RuntimeError(
+                "preserve-position shutdown control unavailable; "
+                "bot process left running"
+            )
 
         if signal_ok:
             # Signal sent  give the bot time to clean up gracefully.
             try:
                 proc_to_stop.wait(timeout=self._GRACEFUL_TIMEOUT_SEC)
             except Exception as exc:
+                if not graceful_close and control_ok:
+                    raise RuntimeError(
+                        "preserve-position shutdown did not finish; "
+                        "bot process left running"
+                    ) from exc
                 stderr = sys.stderr
                 if stderr is not None:
                     try:
@@ -798,6 +906,7 @@ class BotProcess:
                 self._failed_start_owned_proc = None
         if close_failed_start_stdout:
             self._close_process_stdout(proc_to_stop)
+        self._cleanup_shutdown_control(control_path_to_stop)
         self._mark_runtime_stopped(
             proc_to_stop.poll(),
             expected_run_id=run_id_to_stop,
@@ -858,6 +967,7 @@ class BotProcess:
         self,
         proc: subprocess.Popen,
         expected_run_id: str | None = None,
+        expected_control_path: str | None = None,
     ) -> None:
         if not proc or not proc.stdout:
             return
@@ -939,14 +1049,22 @@ class BotProcess:
                 returncode = None
             if returncode is not None:
                 owned_exit = False
+                expected_stop = False
                 with self._lifecycle_lock:
                     if self.proc is proc and self.run_id == expected_run_id:
+                        expected_stop = (
+                            getattr(self, "_stop_requested_run_id", None)
+                            == expected_run_id
+                        )
                         self.proc = None
+                        if expected_stop:
+                            self._stop_requested_run_id = None
                         if self._failed_start_owned_proc is proc:
                             self._failed_start_owned_proc = None
                         owned_exit = True
                 if owned_exit:
-                    if returncode != 0:
+                    self._cleanup_shutdown_control(expected_control_path)
+                    if not expected_stop:
                         self._enqueue_log_line(
                             "ERROR [launcher] "
                             f"{self.bot_name or 'bot'} process exited unexpectedly "
@@ -957,5 +1075,7 @@ class BotProcess:
                         returncode,
                         expected_run_id=expected_run_id,
                         expected_pid=getattr(proc, "pid", 0),
-                        stopped_by="process_exit",
+                        stopped_by=(
+                            "launcher" if expected_stop else "process_exit"
+                        ),
                     )

@@ -16,7 +16,7 @@ import math
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Tuple, List, Optional, Callable
 
 
@@ -68,6 +68,7 @@ _POSITION_BOOLEAN_FIELDS = frozenset((
     "verified_flat_pending_accounting",
     "full_exit_outcome_uncertain",
     "partial_exit_outcome_uncertain",
+    "partial_tp_blocked_min_notional",
 ))
 
 _POSITION_SYMBOL_MAX_LENGTH = 64
@@ -219,7 +220,22 @@ def _valid_buy_time(value) -> bool:
         parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError, OverflowError):
         return False
-    return parsed.strftime("%Y-%m-%d %H:%M:%S") == value
+    if parsed.strftime("%Y-%m-%d %H:%M:%S") != value:
+        return False
+    # ``buy_time`` is a UTC recovery anchor.  A materially future anchor can
+    # hide real fills from offline-close reconstruction and suppress age-based
+    # protection indefinitely.  Retain a small clock-skew allowance.
+    return parsed <= (
+        datetime.now(timezone.utc).replace(tzinfo=None)
+        + timedelta(minutes=5)
+    )
+
+
+def _normalized_margin_mode_or_none(value):
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if normalized in {"isolated", "cross"} else None
 
 
 def _replace_nonfinite_values(value):
@@ -311,9 +327,30 @@ def _validate_state(trades: dict,
             continue
         d["amount"] = amt
 
+        raw_original_amount = d.get("original_amount")
+        if raw_original_amount is not None:
+            original_amount = _finite_float_or_none(raw_original_amount)
+            tolerance = max(1e-12, amt * 1e-9)
+            if (
+                original_amount is None
+                or original_amount <= 0.0
+                or original_amount + tolerance < amt
+            ):
+                rejected.append(f"{sym}(original_amount)")
+                continue
+            d["original_amount"] = original_amount
+
         if require_position_type and d.get("position_type") not in ("LONG", "SHORT"):
             rejected.append(f"{sym}(position_type)")
             continue
+
+        raw_margin_mode = d.get("margin_mode")
+        if raw_margin_mode is not None:
+            margin_mode = _normalized_margin_mode_or_none(raw_margin_mode)
+            if margin_mode is None:
+                rejected.append(f"{sym}(margin_mode)")
+                continue
+            d["margin_mode"] = margin_mode
 
         if not _valid_buy_time(d.get("buy_time")):
             rejected.append(f"{sym}(buy_time)")
@@ -367,7 +404,7 @@ def _validate_state(trades: dict,
 
         # Heal NaN/Inf in optional numeric fields
         for field in ("highest", "fees_paid",
-                       "initial_entry_fee", "original_amount",
+                       "initial_entry_fee",
                        "funding_paid", "liquidation_price"):
             v = d.get(field)
             if v is not None:

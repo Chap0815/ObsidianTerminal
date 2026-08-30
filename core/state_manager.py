@@ -94,7 +94,7 @@ class _SingleWriterJSON:
         path_key = os.path.normcase(canonical_path)
         with cls._instances_lock:
             inst = cls._instances.get(path_key)
-            if inst is None:
+            if inst is None or not inst._thread.is_alive():
                 inst = cls(canonical_path)
                 cls._instances[path_key] = inst
             return inst
@@ -107,6 +107,8 @@ class _SingleWriterJSON:
         self._seq = 0
         self._floor_rev = 0
         self._stop = False
+        self._accepting = True
+        self._inflight = False
         self._thread = threading.Thread(
             target=self._run, daemon=True,
             name=f"state-json-{os.path.basename(path)}",
@@ -120,19 +122,24 @@ class _SingleWriterJSON:
         self._seq = highest + 1
         return self._seq
 
-    def submit(self, payload: dict, rev: int | None = None) -> None:
+    def submit(self, payload: dict, rev: int | None = None) -> bool:
         with self._cv:
+            if not self._accepting:
+                return False
             if rev is None:
                 rev = self._next_revision_locked()
             else:
                 self._seq = max(self._seq, rev)
             if rev < self._floor_rev:
-                return
+                return True
             self._latest = (rev, payload)
             self._cv.notify()
+            return True
 
     def write_now(self, payload: dict, rev: int | None = None) -> bool:
         with self._cv:
+            if not self._accepting:
+                return False
             if rev is None:
                 rev = self._next_revision_locked()
             else:
@@ -155,61 +162,101 @@ class _SingleWriterJSON:
             return False
 
     def _run(self) -> None:
-        while not self._stop:
+        while True:
             with self._cv:
                 while self._latest is None and not self._stop:
                     self._cv.wait(timeout=2.0)
+                if self._stop and self._latest is None:
+                    return
                 item = self._latest
                 self._latest = None
+                self._inflight = item is not None
             if item is None:
                 continue
             rev, payload = item
-            retry_delay = 0.1
-            last_warning_at = 0.0
-            while not self._stop:
-                with self._cv:
-                    if rev < self._floor_rev:
-                        break
-                    pending = self._latest
-                    # A same/newer complete snapshot supersedes this failed
-                    # attempt. The outer loop will persist that generation.
-                    if pending is not None and pending[0] >= rev:
-                        break
-                try:
-                    with self._write_lock:
-                        with self._cv:
-                            if rev < self._floor_rev:
-                                break
-                        self._write_atomic(payload)
-                    # Once a revision is durable, a late older submit must not
-                    # be able to overwrite it.
+            try:
+                retry_delay = 0.1
+                last_warning_at = 0.0
+                while not self._stop:
                     with self._cv:
-                        self._floor_rev = max(self._floor_rev, rev)
-                    break
-                except Exception as e:
-                    now = time.monotonic()
-                    if last_warning_at == 0.0 or now - last_warning_at >= 60.0:
-                        last_warning_at = now
-                        try:
-                            from core.logger import log_event
-                            log_event(
-                                f"[StateManager] JSON write failed for "
-                                f"{self.path}: {e}; retrying",
-                                "WARN",
-                            )
-                        except Exception:
-                            pass
-                    # Keep the latest full snapshot alive across transient
-                    # Windows reader locks/disk contention. Condition.wait()
-                    # wakes immediately for a newer submit or shutdown.
-                    with self._cv:
-                        if self._stop or rev < self._floor_rev:
+                        if rev < self._floor_rev:
                             break
                         pending = self._latest
+                        # A same/newer complete snapshot supersedes this failed
+                        # attempt. The outer loop will persist that generation.
                         if pending is not None and pending[0] >= rev:
                             break
-                        self._cv.wait(timeout=retry_delay)
-                    retry_delay = min(2.0, retry_delay * 2.0)
+                    try:
+                        with self._write_lock:
+                            with self._cv:
+                                if rev < self._floor_rev:
+                                    break
+                            self._write_atomic(payload)
+                        # Once a revision is durable, a late older submit must not
+                        # be able to overwrite it.
+                        with self._cv:
+                            self._floor_rev = max(self._floor_rev, rev)
+                        break
+                    except Exception as e:
+                        now = time.monotonic()
+                        if last_warning_at == 0.0 or now - last_warning_at >= 60.0:
+                            last_warning_at = now
+                            try:
+                                from core.logger import log_event
+                                log_event(
+                                    f"[StateManager] JSON write failed for "
+                                    f"{self.path}: {e}; retrying",
+                                    "WARN",
+                                )
+                            except Exception:
+                                pass
+                        # Keep the latest full snapshot alive across transient
+                        # Windows reader locks/disk contention. Condition.wait()
+                        # wakes immediately for a newer submit or shutdown.
+                        with self._cv:
+                            if self._stop or rev < self._floor_rev:
+                                break
+                            pending = self._latest
+                            if pending is not None and pending[0] >= rev:
+                                break
+                            self._cv.wait(timeout=retry_delay)
+                        retry_delay = min(2.0, retry_delay * 2.0)
+            finally:
+                with self._cv:
+                    self._inflight = False
+                    self._cv.notify_all()
+
+    def shutdown(self, timeout: float = 5.0) -> bool:
+        """Flush the newest accepted generation, stop, join and unregister."""
+        try:
+            timeout = max(0.0, float(timeout))
+        except (TypeError, ValueError, OverflowError):
+            timeout = 0.0
+        deadline = time.monotonic() + timeout
+        with self._cv:
+            self._accepting = False
+            self._cv.notify_all()
+            while (
+                (self._latest is not None or self._inflight)
+                and self._thread.is_alive()
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._cv.wait(timeout=remaining)
+            if self._latest is not None or self._inflight:
+                return False
+            self._stop = True
+            self._cv.notify_all()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if self._thread.is_alive():
+            return False
+        path_key = os.path.normcase(self.path)
+        with self._instances_lock:
+            if self._instances.get(path_key) is self:
+                self._instances.pop(path_key, None)
+        return True
 
     def _write_atomic(self, payload: dict) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
@@ -250,6 +297,23 @@ class _SingleWriterJSON:
                     os.remove(tmp)
             except OSError:
                 pass
+
+
+def shutdown_state_json_writers(timeout: float = 2.0) -> bool:
+    """Flush and close every process-global state JSON writer."""
+    try:
+        timeout = max(0.0, float(timeout))
+    except (TypeError, ValueError, OverflowError):
+        timeout = 0.0
+    deadline = time.monotonic() + timeout
+    with _SingleWriterJSON._instances_lock:
+        writers = tuple(dict.fromkeys(_SingleWriterJSON._instances.values()))
+    all_closed = True
+    for writer in writers:
+        remaining = max(0.0, deadline - time.monotonic())
+        if not writer.shutdown(timeout=remaining):
+            all_closed = False
+    return all_closed
 
 
 # 

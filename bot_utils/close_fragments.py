@@ -27,16 +27,38 @@ def _order_id_text_or_none(value: Any) -> str | None:
     return order_id_text_or_none(value)
 
 
+def _durable_number(state: dict, key: str, default: float = 0.0) -> float:
+    """Read present close evidence strictly; absence alone keeps legacy defaults."""
+    if key not in state:
+        return default
+    value = state[key]
+    if value is None or isinstance(value, bool):
+        raise ValueError(f"invalid durable close fragment field: {key}")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"invalid durable close fragment field: {key}") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"invalid durable close fragment field: {key}")
+    return parsed
+
+
 def pending_close_values(state: dict) -> tuple[float, float, float, str | None]:
-    amount = max(0.0, _f(state.get("pending_close_filled_amount")))
-    notional = max(0.0, _f(state.get("pending_close_notional_sum")))
-    fee = _f(state.get("pending_close_fee"))
-    fallback_price = max(0.0, _f(state.get("pending_close_price")))
+    if not isinstance(state, dict):
+        raise ValueError("durable close fragment state must be a mapping")
+    amount = _durable_number(state, "pending_close_filled_amount")
+    notional = _durable_number(state, "pending_close_notional_sum")
+    fee = _durable_number(state, "pending_close_fee")
+    fallback_price = _durable_number(state, "pending_close_price")
+    if amount < 0.0 or notional < 0.0 or fallback_price < 0.0:
+        raise ValueError("durable close fragment values must be non-negative")
+    if amount > 0.0 and notional <= 0.0 and fallback_price <= 0.0:
+        raise ValueError("durable close fill amount has no price evidence")
+    if amount <= 0.0 and notional > 0.0:
+        raise ValueError("durable close notional has no fill amount")
     price = (notional / amount) if amount > 0 and notional > 0 else fallback_price
     if not math.isfinite(price):
-        amount = 0.0
-        price = 0.0
-        fee = 0.0
+        raise ValueError("durable close fragment average price is invalid")
     oid = _order_id_text_or_none(state.get("pending_close_order_id"))
     return amount, price, fee, oid
 

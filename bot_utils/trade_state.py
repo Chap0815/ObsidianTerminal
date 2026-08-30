@@ -22,7 +22,9 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 from bot_utils.state_persist import (atomic_save_json,
+                                       _POSITION_BOOLEAN_FIELDS,
                                        _is_canonical_position_symbol,
+                                       _normalized_margin_mode_or_none,
                                        _valid_buy_time,
                                        _valid_pending_accounting_items,
                                        validate_spot_state,
@@ -42,6 +44,7 @@ _CLAIM_FIELDS = frozenset((
 
 _CLAIM_NUMERIC_FIELDS = frozenset((
     "amount", "invested_usdt", "buy_price", "buy", "leverage",
+    "original_amount",
 ))
 
 _CLAIM_EXTRA_FIELDS = frozenset((
@@ -161,7 +164,9 @@ def _validate_numeric_field(key: str, value) -> Optional[str]:
     parsed = _finite_float_or_none(value)
     if parsed is None:
         return f"invalid {key}=non-numeric"
-    if key in ("buy", "buy_price", "amount", "leverage") and parsed <= 0:
+    if key in (
+        "buy", "buy_price", "amount", "leverage", "original_amount"
+    ) and parsed <= 0:
         return f"invalid {key}={parsed!r}"
     if key == "invested_usdt" and parsed < 0:
         return f"invalid {key}={parsed!r}"
@@ -223,6 +228,11 @@ def _normalize_position_row(
         or position_type not in ("LONG", "SHORT")
     ):
         return None, f"invalid position_type={position_type!r}"
+    raw_margin_mode = data.get("margin_mode")
+    if raw_margin_mode is not None:
+        margin_mode = _normalized_margin_mode_or_none(raw_margin_mode)
+        if margin_mode is None:
+            return None, f"invalid margin_mode={raw_margin_mode!r}"
     if not _valid_buy_time(data.get("buy_time")):
         return None, f"invalid buy_time={data.get('buy_time')!r}"
 
@@ -249,7 +259,21 @@ def _normalize_position_row(
         normalized["buy_price"] = buy_val
     if "buy" in normalized:
         normalized["buy"] = buy_val
+    if raw_margin_mode is not None:
+        normalized["margin_mode"] = margin_mode
     normalized["amount"] = amount
+
+    raw_original_amount = normalized.get("original_amount")
+    if raw_original_amount is not None:
+        original_amount = _finite_float_or_none(raw_original_amount)
+        tolerance = max(1e-12, amount * 1e-9)
+        if (
+            original_amount is None
+            or original_amount <= 0.0
+            or original_amount + tolerance < amount
+        ):
+            return None, f"invalid original_amount={raw_original_amount!r}"
+        normalized["original_amount"] = original_amount
 
     raw_leverage = normalized.get("leverage")
     leverage = _finite_float_or_none(raw_leverage)
@@ -273,6 +297,8 @@ def _reject_update_reason(fields: dict) -> Optional[str]:
     if nonfinite_path is not None:
         return f"non-finite {nonfinite_path}"
     for key, value in fields.items():
+        if key in _POSITION_BOOLEAN_FIELDS and not isinstance(value, bool):
+            return f"invalid {key}=non-boolean"
         if key in (
             "accounting_pending_partials",
             "unpriced_external_partials",

@@ -227,4 +227,7 @@ def position_age_minutes(opened_at, now: datetime | None = None) -> float | None
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
-    return max(0.0, (current.astimezone(timezone.utc) - opened.astimezone(timezone.utc)).total_seconds() / 60.0)
+    age_minutes = (
+        current.astimezone(timezone.utc) - opened.astimezone(timezone.utc)
+    ).total_seconds() / 60.0
+    return age_minutes if age_minutes >= 0.0 else None

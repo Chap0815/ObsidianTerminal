@@ -599,7 +599,10 @@ def compare_position_layers(
         money_issues.append(f"exchange_without_state:{symbol}")
 
     for symbol in sorted(state_symbols & exchange_symbols):
-        state_amount = _positive_float(states[symbol].get("amount"))
+        # Local state is canonical ownership evidence and must store an
+        # unsigned positive quantity.  Only venue position snapshots may use a
+        # signed amount to encode SHORT direction.
+        state_amount = _strict_positive_float(states[symbol].get("amount"))
         exchange_amount = _positive_float(exchange[symbol].get("amount"))
         if state_amount is None:
             money_issues.append(f"state_amount_invalid:{symbol}")
@@ -630,8 +633,8 @@ def compare_position_layers(
             if "amount" not in claims[symbol]:
                 continue
             raw_claim_amount = claims[symbol].get("amount")
-            state_amount = _positive_float(states[symbol].get("amount"))
-            claim_amount = _positive_float(raw_claim_amount)
+            state_amount = _strict_positive_float(states[symbol].get("amount"))
+            claim_amount = _strict_positive_float(raw_claim_amount)
             if claim_amount is None:
                 money_issues.append(f"claim_amount_invalid:{symbol}")
             elif state_amount is not None:
@@ -644,6 +647,7 @@ def compare_position_layers(
                     )
 
     state_entry_ids: dict[str, str] = {}
+    entry_id_symbols: dict[str, set[str]] = {}
     for symbol, row in sorted(states.items()):
         raw_entry_id = row.get("entry_id")
         entry_id = _safe_entry_id(raw_entry_id)
@@ -657,6 +661,7 @@ def compare_position_layers(
             metadata_issues.append(f"state_{issue}_entry_id:{symbol}")
         else:
             state_entry_ids[symbol] = entry_id
+            entry_id_symbols.setdefault(entry_id, set()).add(symbol)
         if row.get("entry_quality_score") is None:
             metadata_issues.append(f"state_missing_quality:{symbol}")
     if claims is not None:
@@ -678,6 +683,7 @@ def compare_position_layers(
                 metadata_issues.append(f"claim_{issue}_entry_id:{symbol}")
             else:
                 claim_entry_ids[symbol] = entry_id
+                entry_id_symbols.setdefault(entry_id, set()).add(symbol)
             if extra.get("entry_quality_score") is None:
                 metadata_issues.append(f"claim_missing_quality:{symbol}")
         for symbol in sorted(state_symbols & claim_symbols):
@@ -692,6 +698,11 @@ def compare_position_layers(
                     f"entry_id_mismatch:{symbol}:{state_entry_id}:"
                     f"{claim_entry_id}"
                 )
+    for entry_id, symbols in sorted(entry_id_symbols.items()):
+        if len(symbols) > 1:
+            metadata_issues.append(
+                f"entry_id_reused:{entry_id}:{','.join(sorted(symbols))}"
+            )
 
     return {
         "ok": not money_issues,
@@ -987,10 +998,15 @@ def _runtime_observability_fingerprint(
     except Exception:
         ticker_health = {"ok": False, "state": "health_unavailable"}
     if ticker_health:
+        ticker_ok = ticker_health.get("ok") is True
         ticker_state = (
-            ticker_health.get("ok") is True,
-            str(ticker_health.get("state") or "")[:64],
-            str(ticker_health.get("reason") or "")[:96],
+            (True, "healthy", "")
+            if ticker_ok
+            else (
+                False,
+                str(ticker_health.get("state") or "")[:64],
+                str(ticker_health.get("reason") or "")[:96],
+            )
         )
     else:
         ticker_state = (

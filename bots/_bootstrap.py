@@ -1,23 +1,28 @@
 """Shared startup bootstrap for bot entrypoints."""
+
 from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 
 BOT_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BOT_PROJECT_ROOT not in sys.path:
     sys.path.insert(0, BOT_PROJECT_ROOT)
 
-from update_barrier import (  # noqa: E402 - direct-script root bootstrap above
+from update_barrier import (  # noqa: E402
     UpdateInProgressError,
+    assert_root_bound_lock_handle,
     assert_process_start_allowed,
+    ensure_runtime_install_mutex,
+    prepare_root_bound_lock_path,
 )
 
 
 def _guard_update_barrier(root: str) -> None:
+    ensure_runtime_install_mutex()
     try:
         assert_process_start_allowed(root)
     except UpdateInProgressError as exc:
@@ -74,14 +79,10 @@ def bot_instance_guard(bot_name: str) -> Iterator[None]:
 
     import portalocker
 
-    lock_path = (
-        Path(BOT_PROJECT_ROOT)
-        / "logs"
-        / f".{normalized.lower()}_instance.lock"
-    )
+    lock_relative = Path("logs") / f".{normalized.lower()}_instance.lock"
     lock = None
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = prepare_root_bound_lock_path(BOT_PROJECT_ROOT, lock_relative)
         lock = portalocker.Lock(
             str(lock_path),
             mode="a+",
@@ -89,8 +90,16 @@ def bot_instance_guard(bot_name: str) -> Iterator[None]:
             check_interval=0.05,
             fail_when_locked=True,
         )
-        lock.acquire()
-    except (portalocker.LockException, OSError) as exc:
+        handle = lock.acquire()
+        assert_root_bound_lock_handle(BOT_PROJECT_ROOT, lock_relative, handle)
+    except (portalocker.LockException, OSError, UpdateInProgressError) as exc:
+        if lock is not None:
+            try:
+                lock.release()
+            except (portalocker.LockException, OSError) as release_exc:
+                raise SystemExit(
+                    f"{normalized}: unsafe instance lock cleanup failed"
+                ) from release_exc
         raise SystemExit(
             f"{normalized}: instance lock unavailable; "
             "another bot instance may already be running"

@@ -298,12 +298,29 @@ def evaluate_promotion(
         reasons.append("stressed walk-forward positive fold count is invalid")
     elif stressed_positive_folds * 2 <= walk_forward_folds:
         reasons.append("stressed walk-forward folds are not predominantly positive")
+    if (
+        stressed_positive_folds is not None
+        and positive_folds is not None
+        and stressed_positive_folds > positive_folds
+    ):
+        reasons.append("stressed walk-forward improves normal evidence")
     holdout_net = _finite(evidence.final_holdout_net_after_cost)
     if holdout_net is None or holdout_net <= 0.0:
         reasons.append("final holdout net after cost is not positive")
     stressed_holdout_net = _finite(evidence.stressed_final_holdout_net_after_cost)
     if stressed_holdout_net is None or stressed_holdout_net <= 0.0:
         reasons.append("stressed final holdout net after cost is not positive")
+    elif (
+        holdout_net is not None
+        and stressed_holdout_net > holdout_net
+        and not math.isclose(
+            stressed_holdout_net,
+            holdout_net,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+    ):
+        reasons.append("stressed final holdout improves normal evidence")
     drawdown = _finite(evidence.oos_max_drawdown_pct)
     if drawdown is None or drawdown < 0.0:
         reasons.append("OOS max drawdown is invalid")
@@ -314,6 +331,18 @@ def evaluate_promotion(
         reasons.append("stressed OOS max drawdown is invalid")
     elif stressed_drawdown > maximum_oos_drawdown_pct:
         reasons.append("stressed OOS max drawdown exceeds limit")
+    elif (
+        drawdown is not None
+        and drawdown >= 0.0
+        and stressed_drawdown < drawdown
+        and not math.isclose(
+            stressed_drawdown,
+            drawdown,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+    ):
+        reasons.append("stressed OOS drawdown improves normal evidence")
     if evidence.monte_carlo_passed is not True:
         reasons.append("monte-carlo robustness failed")
     monte_carlo_runs = _evidence_nonnegative_integer(evidence.monte_carlo_runs)
@@ -395,6 +424,17 @@ def evaluate_promotion(
         reasons.append(
             "stressed OOS net after best position removal is not positive"
         )
+    elif (
+        outlier_net is not None
+        and stressed_outlier_net > outlier_net
+        and not math.isclose(
+            stressed_outlier_net,
+            outlier_net,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+    ):
+        reasons.append("stressed outlier result improves normal evidence")
     liquidation_count = _evidence_nonnegative_integer(
         evidence.oos_liquidation_count
     )

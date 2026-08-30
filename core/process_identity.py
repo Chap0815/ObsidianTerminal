@@ -11,6 +11,45 @@ import re
 from pathlib import Path
 
 
+def _windows_pid_alive(pid: int) -> bool:
+    """Probe a Windows PID without sending a console control signal.
+
+    ``os.kill(pid, 0)`` is not a POSIX-style existence probe on Windows.  A
+    failed query is therefore treated as alive unless Windows explicitly says
+    that the PID is invalid; uncertainty must block lifecycle actions.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        open_process.restype = wintypes.HANDLE
+        get_exit_code = kernel32.GetExitCodeProcess
+        get_exit_code.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        get_exit_code.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        handle = open_process(0x1000, False, pid)
+        if not handle:
+            # ERROR_INVALID_PARAMETER is Windows' documented result for a PID
+            # that does not identify a process.  Access denied and all other
+            # failures remain conservatively alive/unknown.
+            return ctypes.get_last_error() != 87
+        try:
+            exit_code = wintypes.DWORD()
+            if not get_exit_code(handle, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == 259  # STILL_ACTIVE
+        finally:
+            close_handle(handle)
+    except Exception:
+        return True
+
+
 def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -19,9 +58,15 @@ def pid_alive(pid: int) -> bool:
         return psutil.pid_exists(pid)
     except Exception:
         pass
+    if os.name == "nt":
+        return _windows_pid_alive(pid)
     try:
         os.kill(pid, 0)
         return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
     except OSError:
         return False
     except Exception:

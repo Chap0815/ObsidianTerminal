@@ -3,15 +3,18 @@ REM ================================================================
 REM   OBSIDIAN TRADING TERMINAL - Update aus privatem Git
 REM ================================================================
 setlocal enableextensions
+set PYTHONPATH=
+set PYTHONHOME=
+set PYTHONNOUSERSITE=1
 cd /d "%~dp0"
-
-if exist "%~dp0.venv\Scripts\python.exe" (
-    "%~dp0.venv\Scripts\python.exe" "%~dp0tools\update_from_git.py" %*
-    goto :end
-)
 
 if exist "%~dp0python\python.exe" (
     "%~dp0python\python.exe" "%~dp0tools\update_from_git.py" %*
+    goto :end
+)
+
+if exist "%~dp0.venv\Scripts\python.exe" (
+    "%~dp0.venv\Scripts\python.exe" "%~dp0tools\update_from_git.py" %*
     goto :end
 )
 

@@ -20,6 +20,8 @@ def finite_float_or_none(value) -> float | None:
 def positive_int_or_zero(value) -> int:
     if isinstance(value, bool):
         return 0
+    if isinstance(value, float) and not value.is_integer():
+        return 0
     try:
         parsed = int(value)
     except (TypeError, ValueError, OverflowError):
@@ -29,6 +31,8 @@ def positive_int_or_zero(value) -> int:
 
 def nonnegative_int_or_zero(value) -> int:
     if isinstance(value, bool):
+        return 0
+    if isinstance(value, float) and not value.is_integer():
         return 0
     try:
         parsed = int(value)

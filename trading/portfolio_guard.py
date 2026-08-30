@@ -51,6 +51,16 @@ def _finite(value) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _price_or_zero(value, symbol: str) -> float:
+    """Return usable unsigned price evidence; reject impossible negatives."""
+    parsed = _finite(value)
+    if parsed is None or parsed == 0.0:
+        return 0.0
+    if parsed < 0.0:
+        raise ValueError(f"negative price evidence for {symbol}")
+    return parsed
+
+
 def _safe_lower_text(value) -> str:
     try:
         return str(value).strip().lower()
@@ -210,6 +220,7 @@ def _raw_futures_balance_row(
     data = info.get("data")
     candidates = data if isinstance(data, list) else [data]
     normalized_currency = str(currency).strip().upper()
+    matches = []
     for row in candidates:
         if not isinstance(row, dict):
             continue
@@ -217,8 +228,10 @@ def _raw_futures_balance_row(
             "asset"
         )
         if str(row_currency or "").strip().upper() == normalized_currency:
-            return row
-    return None
+            matches.append(row)
+    if len(matches) > 1:
+        raise ValueError(f"ambiguous native {normalized_currency} balance rows")
+    return matches[0] if matches else None
 
 
 def _futures_balance_values(
@@ -290,18 +303,30 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
                 raise ValueError("position notional unavailable")
             contracts = parsed_contracts or 0.0
             notional = abs(parsed_notional or 0.0)
-            symbol = str(raw.get("symbol") or "UNKNOWN")
+            raw_symbol = raw.get("symbol")
+            if (
+                not isinstance(raw_symbol, str)
+                or not raw_symbol
+                or raw_symbol != raw_symbol.strip()
+            ):
+                raise ValueError("position symbol unavailable")
+            symbol = raw_symbol
             if contracts <= 0.0 and notional <= 0.0:
                 continue
             market = markets.get(symbol) if isinstance(markets, dict) else {}
             market = market if isinstance(market, dict) else {}
             info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+            raw_contract_size = raw.get("contractSize")
+            if raw_contract_size is None:
+                raw_contract_size = market.get("contractSize")
+            contract_size = None
+            if raw_contract_size is not None:
+                contract_size = _finite(raw_contract_size)
+                if contract_size is None or contract_size <= 0.0:
+                    raise ValueError(
+                        f"contract size unavailable for {symbol}"
+                    )
             if contracts > 0.0 and notional > 0.0:
-                direct_contract_size = abs(
-                    _finite(raw.get("contractSize"))
-                    or _finite(market.get("contractSize"))
-                    or 0.0
-                )
                 direct_price = 0.0
                 for raw_price in (
                     raw.get("markPrice"),
@@ -309,13 +334,13 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
                     info.get("fairPrice"),
                     info.get("fair_price"),
                 ):
-                    candidate = abs(_finite(raw_price) or 0.0)
+                    candidate = _price_or_zero(raw_price, symbol)
                     if candidate > 0.0:
                         direct_price = candidate
                         break
-                if direct_contract_size > 0.0 and direct_price > 0.0:
+                if contract_size is not None and direct_price > 0.0:
                     physical_notional = (
-                        contracts * direct_contract_size * direct_price
+                        contracts * contract_size * direct_price
                     )
                     if not math.isfinite(physical_notional):
                         raise ValueError(
@@ -328,12 +353,7 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
                             f"position notional conflicts for {symbol}"
                         )
             if notional <= 0.0:
-                contract_size = abs(
-                    _finite(raw.get("contractSize"))
-                    or _finite(market.get("contractSize"))
-                    or 0.0
-                )
-                if contract_size <= 0.0:
+                if contract_size is None:
                     raise ValueError(f"contract size unavailable for {symbol}")
                 if tickers is None:
                     try:
@@ -365,7 +385,7 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
                 price_source = ""
                 price = 0.0
                 for candidate_source, raw_price in sources:
-                    candidate = abs(_finite(raw_price) or 0.0)
+                    candidate = _price_or_zero(raw_price, symbol)
                     if candidate > 0.0:
                         price_source = candidate_source
                         price = candidate
@@ -529,7 +549,11 @@ def evaluate_exchange_entry(
     reservation_reader=None,
 ) -> PortfolioDecision:
     normalized_mode = normalize_gate_mode(mode)
-    normalized_account = str(account_type).strip().lower()
+    if not isinstance(account_type, str):
+        raise ValueError("portfolio account type is invalid")
+    normalized_account = account_type.strip().lower()
+    if normalized_account not in {"spot", "futures"}:
+        raise ValueError("portfolio account type is invalid")
     snapshot = (
         collect_spot_snapshot(exchange)
         if normalized_account == "spot"

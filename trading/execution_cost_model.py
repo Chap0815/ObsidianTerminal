@@ -145,7 +145,9 @@ def validate_execution_cost_arrival(payload: dict) -> None:
     """Validate optional modern top-of-book geometry in an arrival payload."""
     quote_fields = ("bid", "ask", "mid")
     present = tuple(field in payload for field in quote_fields)
-    if not all(present):
+    if any(present) and not all(present):
+        raise ValueError("arrival quote geometry is incomplete")
+    if not any(present):
         return
     bid = _finite(payload["bid"], positive=True)
     ask = _finite(payload["ask"], positive=True)
@@ -170,7 +172,9 @@ def validate_execution_cost_fill(payload: dict) -> None:
     """Validate optional modern total-cost decomposition in a fill payload."""
     component_fields = ("shortfall_vs_mid_bps", "fee_bps")
     present = tuple(field in payload for field in component_fields)
-    if not all(present):
+    if any(present) and not all(present):
+        raise ValueError("fill total-cost decomposition is incomplete")
+    if not any(present):
         return
     shortfall = _finite(payload["shortfall_vs_mid_bps"])
     fee_bps = _finite(payload["fee_bps"])

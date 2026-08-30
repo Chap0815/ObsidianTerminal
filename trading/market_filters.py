@@ -14,6 +14,7 @@ import threading
 import time
 import requests
 from collections import OrderedDict
+from collections.abc import Mapping
 from typing import Optional
 from dotenv import load_dotenv
 from core.constants import (
@@ -148,16 +149,15 @@ def check_tradability(exchange, symbol_full: str) -> tuple[bool, str]:
     if base in NONCRYPTO_BASES:
         return False, "non-crypto market skipped"
     try:
-        markets = getattr(exchange, "markets", None) or {}
-        if markets:
-            if symbol in markets:
-                market = markets.get(symbol) or {}
-            elif f"{base}/USDT" in markets:
-                market = markets.get(f"{base}/USDT") or {}
-            else:
-                return False, "market not available"
-            if market.get("active") is False:
-                return False, "market inactive"
+        markets = getattr(exchange, "markets", None)
+        if not isinstance(markets, Mapping) or not markets:
+            return False, "market metadata unavailable"
+        if symbol in markets:
+            market = markets.get(symbol) or {}
+        else:
+            return False, "market not available"
+        if market.get("active") is False:
+            return False, "market inactive"
     except Exception as exc:
         return False, f"market metadata error ({type(exc).__name__})"
     return True, ""
@@ -662,9 +662,26 @@ def get_market_regime(exchange) -> dict:
             if not try_consume_api_call("market_regime_fetch_ticker"):
                 raise RuntimeError("API budget exhausted before market-regime ticker")
             ticker_24h = exchange.fetch_ticker(symbol)
-            btc_24h = float(ticker_24h.get("percentage", 0) or 0)
-            if not math.isfinite(btc_24h):
-                btc_24h = 0.0
+            raw_percentage = ticker_24h.get("percentage")
+            percentage_missing = (
+                raw_percentage is None
+                or (
+                    isinstance(raw_percentage, str)
+                    and not raw_percentage.strip()
+                )
+            )
+            if percentage_missing:
+                btc_24h = None
+            else:
+                if isinstance(raw_percentage, bool):
+                    raise RuntimeError(
+                        "market-regime ticker percentage is invalid"
+                    )
+                btc_24h = float(raw_percentage)
+                if not math.isfinite(btc_24h):
+                    raise RuntimeError(
+                        "market-regime ticker percentage is invalid"
+                    )
 
             if not try_consume_api_call("market_regime_fetch_ohlcv"):
                 raise RuntimeError("API budget exhausted before market-regime OHLCV")
@@ -689,7 +706,7 @@ def get_market_regime(exchange) -> dict:
             # (KuCoin z.B. nicht; Bitget/MEXC schon). Fallback: 24h-nderung
             # selbst aus den ohnehin geladenen, geschlossenen Tagescandles berechnen
             # exchange-unabhngig.
-            if not btc_24h:
+            if btc_24h is None:
                 try:
                     if len(closed_prices) >= 2:
                         prev_close = closed_prices[-2]
@@ -697,7 +714,9 @@ def get_market_regime(exchange) -> dict:
                         if prev_close:
                             btc_24h = ((last_close - prev_close) / prev_close) * 100
                 except Exception:
-                    pass  # bleibt 0.0 wenn auch das nicht klappt
+                    pass
+            if btc_24h is None or not math.isfinite(btc_24h):
+                raise RuntimeError("market-regime 24h change is unavailable")
 
             if len(closed_bars) >= 8:
                 btc_7d = (
@@ -796,6 +815,13 @@ def check_spread_quality(
     entry = _spread_cache.get(cache_key)
     if entry and entry["expires"] > now:
         return entry["value"]
+
+    if not try_consume_api_call("market_filter_fetch_spread_order_book"):
+        return (
+            (False, f"{symbol}: spread API budget unavailable")
+            if fail_closed
+            else (True, "OK")
+        )
 
     try:
         ob = exchange.fetch_order_book(symbol, limit=1)

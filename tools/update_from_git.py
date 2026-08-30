@@ -436,7 +436,11 @@ def _git() -> str:
     raise RuntimeError("Git wurde nicht gefunden. Bitte Git for Windows installieren.")
 
 
-def is_valid_git_worktree(cwd: Path = ROOT) -> bool:
+def is_valid_git_worktree(
+    cwd: Path = ROOT,
+    *,
+    raise_on_error: bool = False,
+) -> bool:
     """Return True only when ``cwd`` is exactly the app Git worktree root."""
     try:
         r = _run([_git(), "rev-parse", "--is-inside-work-tree"],
@@ -449,6 +453,8 @@ def is_valid_git_worktree(cwd: Path = ROOT) -> bool:
             return False
         return Path((top.stdout or "").strip()).resolve() == cwd.resolve()
     except Exception:
+        if raise_on_error:
+            raise
         return False
 
 
@@ -1061,7 +1067,39 @@ def _running_launchers_via_cim() -> list[str]:
     return out
 
 
-def _running_dashboard_processes() -> list[tuple[int, str]]:
+DashboardTarget = tuple[int, str, float]
+
+
+def _dashboard_scope_matches(
+    raw_name: object,
+    raw_exe: object,
+    raw_cmdline: object,
+    raw_cwd: object,
+) -> bool:
+    name = str(raw_name or "").lower()
+    exe_name = Path(str(raw_exe or "")).name.lower()
+    cmd_exe_name = ""
+    if isinstance(raw_cmdline, (list, tuple)) and raw_cmdline:
+        cmd_exe_name = Path(str(raw_cmdline[0])).name.lower()
+    python_like = any(
+        re.fullmatch(r"python(?:w|[0-9.]*)?\.exe", value)
+        for value in (name, exe_name, cmd_exe_name)
+    )
+    if not python_like or not isinstance(raw_cmdline, (list, tuple)):
+        return False
+    commandline = " ".join(str(value) for value in raw_cmdline)
+    normalized = commandline.replace("\\", "/").lower()
+    if "streamlit" not in normalized or "tools/dashboard.py" not in normalized:
+        return False
+    root_cwd = str(ROOT).replace("\\", "/").lower().rstrip("/")
+    root_command = root_cwd + "/"
+    cwd_normalized = str(raw_cwd or "").replace("\\", "/").lower()
+    if raw_cwd is None:
+        return root_command in normalized
+    return root_command in normalized or cwd_normalized.rstrip("/") == root_cwd
+
+
+def _running_dashboard_processes() -> list[DashboardTarget]:
     try:
         import psutil  # type: ignore
     except Exception:
@@ -1069,12 +1107,12 @@ def _running_dashboard_processes() -> list[tuple[int, str]]:
     current = os.getpid()
     root_cwd = str(ROOT).replace("\\", "/").lower().rstrip("/")
     root_command = root_cwd + "/"
-    out: list[tuple[int, str]] = []
+    out: list[DashboardTarget] = []
     scan_incomplete = False
     saw_current_pid = False
     try:
         processes = psutil.process_iter(
-            ["pid", "name", "exe", "cmdline", "cwd"]
+            ["pid", "name", "exe", "cmdline", "cwd", "create_time"]
         )
         for proc in processes:
             try:
@@ -1091,6 +1129,7 @@ def _running_dashboard_processes() -> list[tuple[int, str]]:
                 raw_exe = proc.info.get("exe")
                 raw_cmdline = proc.info.get("cmdline")
                 raw_cwd = proc.info.get("cwd")
+                create_time = float(proc.info.get("create_time") or 0.0)
                 name = str(raw_name or "").lower()
                 exe_name = Path(str(raw_exe or "")).name.lower()
                 cmd_exe_name = ""
@@ -1123,7 +1162,10 @@ def _running_dashboard_processes() -> list[tuple[int, str]]:
                 continue
             if root_command not in norm and cwd_norm.rstrip("/") != root_cwd:
                 continue
-            out.append((pid, f"dashboard pid {pid}"))
+            if not create_time > 0.0:
+                scan_incomplete = True
+                continue
+            out.append((pid, f"dashboard pid {pid}", create_time))
     except Exception:
         scan_incomplete = True
     if not saw_current_pid:
@@ -1307,7 +1349,7 @@ def _running_tool_processes_via_cim() -> list[str]:
     return out
 
 
-def _running_dashboard_processes_via_cim() -> list[tuple[int, str]]:
+def _running_dashboard_processes_via_cim() -> list[DashboardTarget]:
     root = (
         str(ROOT).replace("\\", "/").lower().rstrip("/") + "/"
     ).replace("'", "''")
@@ -1318,7 +1360,7 @@ def _running_dashboard_processes_via_cim() -> list[tuple[int, str]]:
         f"$current={os.getpid()}; "
         "$scanPid=$PID; "
         "$all=@(Get-CimInstance -ClassName Win32_Process "
-        "-Property ProcessId,ParentProcessId,Name,CommandLine); "
+        "-Property ProcessId,ParentProcessId,Name,CommandLine,CreationDate); "
         "$capturePid=[int](($all | Where-Object { "
         "$_.ProcessId -eq $scanPid } | Select-Object -First 1).ParentProcessId); "
         "if (-not ($all.ProcessId -contains $current) -or "
@@ -1341,7 +1383,11 @@ def _running_dashboard_processes_via_cim() -> list[tuple[int, str]]:
         "$norm=$line.ToLower().Replace('\\','/'); "
         "if ($norm.Contains('streamlit') -and "
         "$norm.Contains('tools/dashboard.py')) { "
-        "if ($norm.Contains($root)) { [string]$_.ProcessId } "
+        "if ($norm.Contains($root)) { "
+        "$created=([datetime]$_.CreationDate).ToUniversalTime(); "
+        "$epoch=($created-[datetime]'1970-01-01Z').TotalSeconds; "
+        "([string]$_.ProcessId + '|' + "
+        "$epoch.ToString('R',[Globalization.CultureInfo]::InvariantCulture)) } "
         "else { 'runtime process scan unknown (pid ' + "
         "$_.ProcessId + ')' } } } }; "
         "'runtime process scan ok (count ' + $all.Count + ')'"
@@ -1357,7 +1403,7 @@ def _running_dashboard_processes_via_cim() -> list[tuple[int, str]]:
         )
     if (r.stderr or "").strip():
         raise RuntimeError("dashboard scan unavailable via CIM")
-    out: list[tuple[int, str]] = []
+    out: list[DashboardTarget] = []
     seen: set[int] = set()
     current = os.getpid()
     lines = [
@@ -1383,48 +1429,197 @@ def _running_dashboard_processes_via_cim() -> list[tuple[int, str]]:
             raise RuntimeError(
                 "dashboard scan returned incomplete CIM output"
             )
-        if re.fullmatch(r"[1-9][0-9]*", text) is None:
+        match = re.fullmatch(
+            r"([1-9][0-9]*)\|([0-9]+(?:\.[0-9]+)?)",
+            text,
+        )
+        if match is None:
             raise RuntimeError(
                 "dashboard scan returned malformed CIM output"
             )
-        pid = int(text)
+        pid = int(match.group(1))
+        create_time = float(match.group(2))
         if pid == current:
             raise RuntimeError(
                 "dashboard scan returned malformed CIM output"
             )
         if pid not in seen:
             seen.add(pid)
-            out.append((pid, f"dashboard pid {pid}"))
+            out.append((pid, f"dashboard pid {pid}", create_time))
     return out
+
+
+def _dashboard_target_is_current(target: DashboardTarget) -> bool:
+    pid, _label, expected_create_time = target
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        current = _running_dashboard_processes_via_cim()
+        return any(
+            current_pid == pid
+            and abs(current_create_time - expected_create_time) <= 1e-3
+            for current_pid, _current_label, current_create_time in current
+        )
+    try:
+        proc = psutil.Process(pid)
+        create_time = float(proc.create_time())
+        cmdline = proc.cmdline()
+        cwd = proc.cwd()
+        name = proc.name()
+        exe = proc.exe()
+    except tuple(
+        cls
+        for cls in (
+            getattr(psutil, "NoSuchProcess", None),
+            getattr(psutil, "ZombieProcess", None),
+        )
+        if isinstance(cls, type)
+    ):
+        return False
+    except Exception as exc:
+        raise RuntimeError(
+            f"dashboard identity could not be revalidated for pid {pid}"
+        ) from exc
+    return (
+        abs(create_time - expected_create_time) <= 1e-3
+        and _dashboard_scope_matches(name, exe, cmdline, cwd)
+    )
+
+
+def _run_dashboard_taskkill(pid: int, *, force: bool) -> None:
+    command = ["taskkill", "/PID", str(int(pid)), "/T"]
+    if force:
+        command.append("/F")
+    try:
+        subprocess.run(
+            command,
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            timeout=8,
+            check=False,
+            **_hidden_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
 
 
 def _terminate_dashboard_processes() -> list[str]:
     targets = _running_dashboard_processes()
     if not targets:
         return []
-    for pid, _label in targets:
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
-                cwd=str(ROOT),
-                text=True,
-                capture_output=True,
-                timeout=8,
-                **_hidden_kwargs(),
-            )
-        except Exception:
-            pass
+    stopped: list[str] = []
+    for target in targets:
+        pid, label, _create_time = target
+        if not _dashboard_target_is_current(target):
+            stopped.append(label)
+            continue
+        _run_dashboard_taskkill(pid, force=False)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if not _dashboard_target_is_current(target):
+                break
+            time.sleep(0.05)
+        if _dashboard_target_is_current(target):
+            # PID, creation time and root scope must still match immediately
+            # before the destructive force-kill boundary.
+            if not _dashboard_target_is_current(target):
+                stopped.append(label)
+                continue
+            _run_dashboard_taskkill(pid, force=True)
+        stopped.append(label)
     remaining = _running_dashboard_processes()
     if remaining:
-        labels = ", ".join(label for _pid, label in remaining)
+        labels = ", ".join(label for _pid, label, _created in remaining)
         raise RuntimeError(f"dashboard processes still running: {labels}")
-    return [label for _pid, label in targets]
+    return stopped
+
+
+def _path_is_reparse(path: Path) -> bool:
+    try:
+        if path.is_symlink() or path.is_junction():
+            return True
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except FileNotFoundError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse_flag and attributes & reparse_flag)
+
+
+def _root_bound_absolute(path: Path, root: Path, *, label: str) -> tuple[Path, Path]:
+    root_absolute = Path(os.path.abspath(root))
+    path_absolute = Path(os.path.abspath(path))
+    try:
+        path_absolute.relative_to(root_absolute)
+    except ValueError as exc:
+        raise RuntimeError(f"{label} escapes the application root: {path}") from exc
+    return path_absolute, root_absolute
+
+
+def _assert_real_directory(path: Path, *, label: str) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{label} does not exist: {path}") from exc
+    if _path_is_reparse(path) or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"{label} is a link, reparse point, or non-directory: {path}")
+
+
+def _assert_existing_directory_chain(
+    root_absolute: Path,
+    directory: Path,
+    *,
+    label: str,
+) -> None:
+    _assert_real_directory(root_absolute, label="application root")
+    relative = directory.relative_to(root_absolute)
+    current = root_absolute
+    for part in relative.parts:
+        current = current / part
+        try:
+            current.lstat()
+        except FileNotFoundError:
+            break
+        _assert_real_directory(current, label=label)
+
+
+def _ensure_root_bound_directory(path: Path, root: Path, *, label: str) -> Path:
+    path_absolute, root_absolute = _root_bound_absolute(path, root, label=label)
+    _assert_existing_directory_chain(root_absolute, path_absolute, label=label)
+    path_absolute.mkdir(parents=True, exist_ok=True)
+    _assert_existing_directory_chain(root_absolute, path_absolute, label=label)
+    _assert_real_directory(path_absolute, label=label)
+    try:
+        path_absolute.resolve(strict=True).relative_to(root_absolute.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"{label} resolves outside the application root") from exc
+    return path_absolute
+
+
+def _prepare_root_bound_file(path: Path, root: Path, *, label: str) -> Path:
+    path_absolute, root_absolute = _root_bound_absolute(path, root, label=label)
+    _ensure_root_bound_directory(path_absolute.parent, root_absolute, label=label)
+    try:
+        info = path_absolute.lstat()
+    except FileNotFoundError:
+        return path_absolute
+    if _path_is_reparse(path_absolute) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"{label} is a link, reparse point, or non-file: {path}")
+    return path_absolute
 
 
 def _copy_file(src: Path, dst: Path) -> None:
-    if src.exists():
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+    try:
+        source_info = src.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError(f"backup source is not safely inspectable: {src}") from exc
+    if _path_is_reparse(src) or not stat.S_ISREG(source_info.st_mode):
+        raise RuntimeError(f"backup source is a link, reparse point, or non-file: {src}")
+    safe_dst = _prepare_root_bound_file(dst, ROOT, label="backup destination")
+    shutil.copy2(src, safe_dst)
+    _prepare_root_bound_file(safe_dst, ROOT, label="backup destination")
 
 
 def _sha256(path: Path) -> str:
@@ -1437,7 +1632,16 @@ def _sha256(path: Path) -> str:
 
 def _backup_user_files() -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    backup = BACKUP_ROOT / f"update_{stamp}"
+    safe_backup_root = _ensure_root_bound_directory(
+        BACKUP_ROOT,
+        ROOT,
+        label="backup root",
+    )
+    backup = _ensure_root_bound_directory(
+        safe_backup_root / f"update_{stamp}",
+        ROOT,
+        label="backup directory",
+    )
     for rel in PROTECTED_FILES:
         _copy_file(ROOT / rel, backup / rel)
     _prune_old_backups()
@@ -1447,11 +1651,41 @@ def _backup_user_files() -> Path:
 def _prune_old_backups(keep: int | None = None) -> None:
     try:
         keep = BACKUP_KEEP if keep is None else int(keep)
-        backups = sorted(
-            [path for path in BACKUP_ROOT.glob("update_*") if path.is_dir()],
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
+        root_stat = BACKUP_ROOT.lstat()
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or stat.S_ISLNK(root_stat.st_mode)
+            or (
+                reparse_flag
+                and getattr(root_stat, "st_file_attributes", 0) & reparse_flag
+            )
+        ):
+            return
+        root_resolved = BACKUP_ROOT.resolve(strict=True)
+        candidates: list[tuple[float, Path]] = []
+        for path in BACKUP_ROOT.glob("update_*"):
+            path_stat = path.lstat()
+            if (
+                not stat.S_ISDIR(path_stat.st_mode)
+                or stat.S_ISLNK(path_stat.st_mode)
+                or (
+                    reparse_flag
+                    and getattr(path_stat, "st_file_attributes", 0)
+                    & reparse_flag
+                )
+                or path.resolve(strict=True).parent != root_resolved
+            ):
+                continue
+            candidates.append((float(path_stat.st_mtime), path))
+        backups = [
+            path
+            for _modified, path in sorted(
+                candidates,
+                key=lambda item: item[0],
+                reverse=True,
+            )
+        ]
         for old in backups[max(0, keep):]:
             _rmtree(old)
     except Exception:
@@ -2111,8 +2345,12 @@ def _rewrite_manifest_file_from_index(rel: str) -> bool:
         return False
 
 
-def _verify_deploy_manifest_hashes() -> None:
-    manifest_path = ROOT / "DEPLOY_MANIFEST.json"
+def _verify_deploy_manifest_hashes_at(
+    root: Path,
+    *,
+    repair_from_index: bool = False,
+) -> None:
+    manifest_path = root / "DEPLOY_MANIFEST.json"
     if not manifest_path.exists():
         raise RuntimeError("Update unvollstaendig, DEPLOY_MANIFEST.json fehlt")
     try:
@@ -2151,9 +2389,13 @@ def _verify_deploy_manifest_hashes() -> None:
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             problems.append(f"{rel}: manifest hash fehlt/ungueltig")
             continue
-        path = ROOT / rel
+        path = root / rel
         if not path.is_file():
-            if not _rewrite_manifest_file_from_index(rel):
+            if not (
+                repair_from_index
+                and root == ROOT
+                and _rewrite_manifest_file_from_index(rel)
+            ):
                 problems.append(f"{rel}: fehlt")
                 continue
         try:
@@ -2163,7 +2405,11 @@ def _verify_deploy_manifest_hashes() -> None:
             )
             hash_mismatch = (not byte_mismatch and _sha256(path) != expected_hash)
             if byte_mismatch or hash_mismatch:
-                if _rewrite_manifest_file_from_index(rel):
+                if (
+                    repair_from_index
+                    and root == ROOT
+                    and _rewrite_manifest_file_from_index(rel)
+                ):
                     byte_mismatch = (
                         expected_bytes is not None
                         and path.stat().st_size != int(expected_bytes)
@@ -2202,6 +2448,20 @@ def _verify_deploy_manifest_hashes() -> None:
         raise RuntimeError(
             "Update-Manifest-Pruefung fehlgeschlagen: build_id stimmt nicht"
         )
+
+
+def _verify_deploy_manifest_hashes() -> None:
+    _verify_deploy_manifest_hashes_at(ROOT, repair_from_index=True)
+
+
+def _verify_update_source_tree(source_root: Path) -> None:
+    """Verify every source byte before bootstrap copies or runtime mutation."""
+    _verify_deploy_manifest_hashes_at(source_root)
+
+
+def _verify_before_dependency_install() -> None:
+    """Establish complete installed-tree integrity before pip or import code."""
+    _verify_deploy_manifest_hashes()
 
 
 def _split_git_paths(stdout: str) -> list[str]:
@@ -2515,6 +2775,7 @@ def _verify_repo_tree_matches_manifest(src_repo: Path) -> None:
 
 def _copy_tracked_tree(src_repo: Path) -> None:
     _verify_repo_tree_matches_manifest(src_repo)
+    _verify_update_source_tree(src_repo)
     allowed_paths = _release_manifest_paths(src_repo)
     for rel in sorted(allowed_paths):
         rel_posix = Path(rel).as_posix()
@@ -3036,6 +3297,7 @@ def _update_existing_repo(
             _verify_no_tracked_runtime_files(ROOT)
             _restore_user_files(backup)
             _verify_protected_files(protected_hashes)
+            _verify_before_dependency_install()
             dependency_install_started = dependency_update_needed
             _install_dependencies_if_present(
                 force_active_runtime=dependency_update_needed)
@@ -3104,6 +3366,7 @@ def _bootstrap_from_private_repo(
             ], cwd=ROOT, timeout=300)
             _configure_git_manifest_checkout(git, clone_dir)
             _force_git_manifest_checkout(git, clone_dir)
+            _verify_update_source_tree(clone_dir)
             _verify_no_tracked_runtime_files(clone_dir)
             dependency_update_needed = (
                 force_dependency_reinstall
@@ -3126,6 +3389,7 @@ def _bootstrap_from_private_repo(
             _copy_tracked_tree(clone_dir)
             _restore_user_files(backup)
             _verify_protected_files(protected_hashes)
+            _verify_before_dependency_install()
             dependency_install_started = dependency_update_needed
             _install_dependencies_if_present(
                 force_active_runtime=dependency_update_needed,

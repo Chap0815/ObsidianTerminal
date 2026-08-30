@@ -86,6 +86,7 @@ def _validated_ok(value) -> int:
 
 # Process-local fallback counter  used only if SQLite is unreachable.
 _call_log_fallback: list = []
+_burst_call_log_fallback: dict[str, list[float]] = {}
 _lock = threading.Lock()
 
 # Cached bot name to attribute calls in the DB.
@@ -102,9 +103,43 @@ class ApiCallReservation:
 
     allowed: bool
     row_id: Optional[int] = None
+    ledger_endpoint: Optional[str] = None
 
     def __bool__(self) -> bool:
         return self.allowed
+
+
+_MEXC_CONTRACT_DEPTH_ENDPOINT = "mexc_contract_depth"
+_MEXC_CONTRACT_DEPTH_BURST_MAX = 16
+_MEXC_CONTRACT_DEPTH_BURST_WINDOW_SECONDS = 2
+_MEXC_CONTRACT_BOTS = frozenset({"CROSS", "FUTURES", "FUTREND"})
+_MEXC_CONTRACT_DEPTH_SOURCES = frozenset({
+    "candidate_microstructure_fetch_order_book",
+    "cross_entry_fetch_order_book",
+    "cross_exit_fetch_order_book",
+    "entry_executor_fetch_order_book",
+    "futures_entry_fetch_spread_book",
+    "futrend_shadow_fetch_order_book",
+    "market_filter_fetch_spread_order_book",
+    "venue_recorder_fetch_order_book",
+})
+
+
+def _durable_endpoint_policy(
+    bot_name: str,
+    endpoint: str,
+) -> tuple[str, Optional[int], Optional[int]]:
+    """Return the shared ledger scope and optional short-window policy."""
+    if (
+        bot_name in _MEXC_CONTRACT_BOTS
+        and endpoint in _MEXC_CONTRACT_DEPTH_SOURCES
+    ):
+        return (
+            _MEXC_CONTRACT_DEPTH_ENDPOINT,
+            _MEXC_CONTRACT_DEPTH_BURST_MAX,
+            _MEXC_CONTRACT_DEPTH_BURST_WINDOW_SECONDS,
+        )
+    return endpoint, None, None
 
 
 def _resolve_bot_name() -> str:
@@ -128,6 +163,33 @@ def _fallback_record(now: float) -> None:
         _call_log_fallback.append(now)
         cutoff = now - 60.0
         _call_log_fallback[:] = [t for t in _call_log_fallback if t >= cutoff]
+
+
+def _fallback_burst_record(scope: str, now: float, window_seconds: int) -> None:
+    with _lock:
+        cutoff = now - float(window_seconds)
+        recent = [
+            timestamp
+            for timestamp in _burst_call_log_fallback.get(scope, ())
+            if timestamp >= cutoff
+        ]
+        recent.append(now)
+        _burst_call_log_fallback[scope] = recent
+
+
+def _fallback_burst_count(scope: str, now: float, window_seconds: int) -> int:
+    with _lock:
+        cutoff = now - float(window_seconds)
+        recent = [
+            timestamp
+            for timestamp in _burst_call_log_fallback.get(scope, ())
+            if timestamp >= cutoff
+        ]
+        if recent:
+            _burst_call_log_fallback[scope] = recent
+        else:
+            _burst_call_log_fallback.pop(scope, None)
+        return len(recent)
 
 
 def _fallback_count(now: float) -> int:
@@ -210,7 +272,7 @@ def record_api_error(
             marked = mark_global_api_call_error(
                 reservation.row_id,
                 _resolve_bot_name(),
-                endpoint=endpoint,
+                endpoint=reservation.ledger_endpoint or endpoint,
             )
             if marked is None:
                 _mark_db_failed()
@@ -324,9 +386,19 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
     if not isinstance(return_reservation, bool):
         raise ValueError("return_reservation must be boolean")
 
+    bot_name = _resolve_bot_name()
+    ledger_endpoint, burst_max, burst_window = _durable_endpoint_policy(
+        bot_name,
+        endpoint,
+    )
+
     def _result(allowed: bool, row_id: Optional[int] = None):
         if return_reservation:
-            return ApiCallReservation(bool(allowed), row_id)
+            return ApiCallReservation(
+                bool(allowed),
+                row_id,
+                ledger_endpoint=ledger_endpoint,
+            )
         return bool(allowed)
 
     now_mono = time.monotonic()
@@ -336,39 +408,69 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
     # plus the launcher, which also performs budgeted exchange calls.
     expected_bot_count = _read_expected_bot_count()
 
+    def _burst_fallback_exhausted() -> bool:
+        if burst_max is None or burst_window is None:
+            return False
+        per_process_cap = max(1, burst_max // expected_bot_count)
+        return (
+            _fallback_burst_count(
+                ledger_endpoint,
+                now_mono,
+                burst_window,
+            )
+            >= per_process_cap
+        )
+
+    def _record_fallback_admission() -> None:
+        _fallback_record(now_mono)
+        if burst_max is not None and burst_window is not None:
+            _fallback_burst_record(
+                ledger_endpoint,
+                now_mono,
+                burst_window,
+            )
+
     if not _db_available():
         # Process-local fallback. Conservative: each process enforces
         # its OWN budget so N bots at MAX/N each  MAX global.
         used = _fallback_count(now_mono)
         per_proc_cap = max(1, MAX_API_CALLS_PER_MINUTE // expected_bot_count)
-        if used >= per_proc_cap:
+        if used >= per_proc_cap or _burst_fallback_exhausted():
             # exit-critical calls (price for an OPEN position, close/verify)
             # must NOT be starved by the budget  a missed stop-loss is far
             # worse than a marginal over-budget. Record it (keep the count
             # honest) but allow it through.
             if critical:
-                _fallback_record(now_mono)
+                _record_fallback_admission()
                 return _result(True)
             return _result(False)
-        _fallback_record(now_mono)
+        _record_fallback_admission()
         return _result(True)
 
     try:
         from core.database import check_and_consume_global_api
+        gate_kwargs = {
+            "max_per_minute": MAX_API_CALLS_PER_MINUTE,
+            "ok": ok,
+            "return_reservation": True,
+            "critical": critical,
+        }
+        if burst_max is not None and burst_window is not None:
+            gate_kwargs.update({
+                "burst_max_per_window": burst_max,
+                "burst_window_seconds": burst_window,
+            })
         ok_call = check_and_consume_global_api(
-            _resolve_bot_name(),
-            endpoint=endpoint or "",
-            max_per_minute=MAX_API_CALLS_PER_MINUTE,
-            ok=ok,
-            return_reservation=True,
-            critical=critical,
+            bot_name,
+            endpoint=ledger_endpoint,
+            **gate_kwargs,
         )
         if ok_call is None:
             raise RuntimeError("global API budget gate unavailable")
         if ok_call:
             # Mirror to fallback so a sudden DB outage still has recent
             # data to estimate from.
-            _fallback_record(now_mono)
+            _record_fallback_admission()
             row_id = (
                 int(ok_call)
                 if not isinstance(ok_call, bool) and int(ok_call) > 0
@@ -384,10 +486,10 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
         # cap so trading continues during transient DB issues.
         used = _fallback_count(now_mono)
         per_proc_cap = max(1, MAX_API_CALLS_PER_MINUTE // expected_bot_count)
-        if used >= per_proc_cap:
+        if used >= per_proc_cap or _burst_fallback_exhausted():
             if critical:   # never starve exit-critical calls
-                _fallback_record(now_mono)
+                _record_fallback_admission()
                 return _result(True)
             return _result(False)
-        _fallback_record(now_mono)
+        _record_fallback_admission()
         return _result(True)

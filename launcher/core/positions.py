@@ -445,8 +445,10 @@ def _state_path_for(bot_name: str, simulation: bool | None = None) -> str:
     try:
         from bot_utils.sim_flag import read_simulation_flag, sim_state_path
         if simulation is None:
-            simulation = bool(read_simulation_flag(bot_name))
-        return sim_state_path(base, bool(simulation))
+            simulation = read_simulation_flag(bot_name)
+        if not isinstance(simulation, bool):
+            raise ValueError("simulation mode must be boolean")
+        return sim_state_path(base, simulation)
     except Exception as e:
         raise RuntimeError(
             f"{bot_name}: cannot resolve SIM/LIVE state path safely: {e}"
@@ -1678,11 +1680,13 @@ def _direct_close_remaining_futures(
             except Exception:
                 from bot_utils import safe_remaining_funding, safe_proportional_fee
                 contract_size = 1.0
-            initial_entry_fee = (
-                _non_negative_finite(p.get("initial_entry_fee"))
-                or _non_negative_finite(p.get("fees_paid"))
-                or (notional * taker_fee)
+            initial_entry_fee = _non_negative_finite(
+                p.get("initial_entry_fee")
             )
+            if initial_entry_fee is None:
+                initial_entry_fee = _non_negative_finite(p.get("fees_paid"))
+            if initial_entry_fee is None:
+                initial_entry_fee = notional * taker_fee
             entry_fee = safe_proportional_fee(
                 initial_entry_fee, amount, original_amount,
                 partial_sold=partial_sold,
@@ -1799,14 +1803,9 @@ def _direct_close_remaining_futures(
                             )
                             break  # success
                         except Exception as _e:
-                            _msg = str(_e).lower()
-                            _is_rate = (
-                                "too frequent" in _msg
-                                or '"code":510' in _msg
-                                or "code 510" in _msg
-                                or "429" in _msg
-                                or "too many requests" in _msg
-                            )
+                            from bot_utils.network_retry import is_rate_limited
+
+                            _is_rate = is_rate_limited(_e)
                             if not _is_rate:
                                 try:
                                     from bot_utils.futures_order import (

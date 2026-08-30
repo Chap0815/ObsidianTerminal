@@ -1272,12 +1272,10 @@ def _async_stop_all_and_quit_owned(
     then exit the application.
 
     The signal sent to each bot matches the user's intent:
-      close_positions=True  graceful (SIGTERM/CTRL_BREAK_EVENT) 
-                                bot's handler runs emergency_close_all
-                                positions closed with PnL recorded.
-      close_positions=False  hard kill (TerminateProcess/SIGKILL) 
-                                bot dies instantly, signal handler NEVER
-                                runs, positions stay open on exchange.
+      close_positions=True   run-bound clean request; the bot runs its
+                             emergency close and records realized PnL.
+      close_positions=False  run-bound clean preserve request; workers,
+                             DB and logs finalize while positions stay open.
     """
     from launcher.core.positions import (
         direct_close_remaining_futures,

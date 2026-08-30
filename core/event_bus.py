@@ -113,7 +113,13 @@ def _coerce_payload(payload: Any) -> dict:
 
 
 class EventBus:
-    def __init__(self, worker_threads: int = 2, history_size: int = 500):
+    def __init__(
+        self,
+        worker_threads: int = 2,
+        history_size: int = 500,
+        *,
+        lazy_workers: bool = False,
+    ):
         self._lock         = threading.Lock()
         self._handlers: Dict[str, List[Handler]] = defaultdict(list)
         self._wildcard: List[Handler]            = []
@@ -123,42 +129,59 @@ class EventBus:
         self._publish_lock = threading.Lock()
         self._publish_condition = threading.Condition(self._publish_lock)
         self._publish_inflight = 0
+        self._sync_publish_local = threading.local()
         self._accepting = True
         self._shutdown_lock = threading.Lock()
         self._shutdown_event = threading.Event()
         self._stopped      = False
         self._n_workers    = worker_threads
         self._worker_threads: List[threading.Thread] = []
+        self._startup_lock = threading.Lock()
+        self._watchdog: threading.Thread | None = None
+        if not lazy_workers:
+            self._ensure_consumers_started()
 
-        for i in range(worker_threads):
-            self._spawn_worker(i)
-
-        self._watchdog = threading.Thread(
-            target=self._watchdog_loop, name="event-bus-watchdog", daemon=True)
-        try:
-            self._watchdog.start()
-        except Exception as exc:
-            # Constructor failure must not strand already-started consumers
-            # that no caller can ever shut down because the bus was not
-            # returned. Close admission and wake every published worker.
-            self._accepting = False
-            self._stopped = True
-            self._shutdown_event.set()
-            for _ in self._worker_threads:
-                try:
-                    self._work_queue.put_nowait(_WORKER_STOP)
-                except queue.Full:
-                    break
-            for worker in self._worker_threads:
-                try:
-                    worker.join(timeout=1.0)
-                except (RuntimeError, AttributeError):
-                    pass
-            _log_handler_error("event_bus watchdog start", exc)
-            raise
+    def _ensure_consumers_started(self) -> None:
+        """Start consumers once, only when a lazy bus gains a subscriber."""
+        with self._startup_lock:
+            if self._stopped or self._shutdown_event.is_set():
+                return
+            if self._watchdog is not None and self._watchdog.is_alive():
+                return
+            self._worker_threads = [
+                thread for thread in self._worker_threads if thread.is_alive()
+            ]
+            for _ in range(self._n_workers - len(self._worker_threads)):
+                self._spawn_worker(len(self._worker_threads))
+            candidate = threading.Thread(
+                target=self._watchdog_loop,
+                name="event-bus-watchdog",
+                daemon=True,
+            )
+            self._watchdog = candidate
+            try:
+                candidate.start()
+            except Exception as exc:
+                # Constructor/lazy-start failure must not strand consumers.
+                self._accepting = False
+                self._stopped = True
+                self._shutdown_event.set()
+                for _ in self._worker_threads:
+                    try:
+                        self._work_queue.put_nowait(_WORKER_STOP)
+                    except queue.Full:
+                        break
+                for worker in self._worker_threads:
+                    try:
+                        worker.join(timeout=1.0)
+                    except (RuntimeError, AttributeError):
+                        pass
+                _log_handler_error("event_bus watchdog start", exc)
+                raise
 
     def subscribe(self, event_type: str, handler: Handler,
                   *, replace: bool = False) -> None:
+        self._ensure_consumers_started()
         with self._lock:
             if event_type == "*":
                 if replace:
@@ -287,24 +310,46 @@ class EventBus:
         with self._publish_condition:
             if not self._accepting or self._stopped:
                 return
-        safe_payload = _coerce_payload(payload)
-        event = Event(event_type, safe_payload, emitted_by)
+            self._publish_inflight += 1
+        previous_sync_depth = int(
+            getattr(self._sync_publish_local, "depth", 0)
+        )
+        self._sync_publish_local.depth = previous_sync_depth + 1
+        try:
+            safe_payload = _coerce_payload(payload)
+            event = Event(event_type, safe_payload, emitted_by)
 
-        with self._lock:
-            specific = list(self._handlers.get(event_type, []))
-            if event_type in _SUPPRESS_FROM_WILDCARD:
-                handlers = specific
+            with self._lock:
+                specific = list(self._handlers.get(event_type, []))
+                if event_type in _SUPPRESS_FROM_WILDCARD:
+                    handlers = specific
+                else:
+                    handlers = specific + list(self._wildcard)
+
+            for handler in handlers:
+                try:
+                    handler(
+                        event.event_type,
+                        _payload_for_handler(event.event_type, event.payload),
+                    )
+                except Exception as exc:
+                    _log_handler_error(
+                        f"event_bus emit_sync {event.event_type}", exc
+                    )
+        finally:
+            if previous_sync_depth:
+                self._sync_publish_local.depth = previous_sync_depth
             else:
-                handlers = specific + list(self._wildcard)
-
-        for handler in handlers:
-            try:
-                handler(
-                    event.event_type,
-                    _payload_for_handler(event.event_type, event.payload),
-                )
-            except Exception as exc:
-                _log_handler_error(f"event_bus emit_sync {event.event_type}", exc)
+                try:
+                    del self._sync_publish_local.depth
+                except AttributeError:
+                    pass
+            with self._publish_condition:
+                self._publish_inflight -= 1
+                if self._publish_inflight == 0:
+                    if not self._accepting:
+                        self._stopped = True
+                    self._publish_condition.notify_all()
 
     def get_history(self, event_type: str = None, limit: int = 100) -> List[dict]:
         with self._history_lock:
@@ -386,7 +431,7 @@ class EventBus:
         except Exception:
             pass
 
-    def shutdown(self, timeout: float = 5.0) -> None:
+    def shutdown(self, timeout: float = 5.0) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout))
         with self._shutdown_lock:
             workers = list(self._worker_threads)
@@ -397,12 +442,15 @@ class EventBus:
                 with self._publish_condition:
                     self._accepting = False
                     self._shutdown_event.set()
-                    while self._publish_inflight:
+                    sync_depth = int(
+                        getattr(self._sync_publish_local, "depth", 0)
+                    )
+                    while self._publish_inflight > sync_depth:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0.0:
                             break
                         self._publish_condition.wait(timeout=remaining)
-                    publications_drained = self._publish_inflight == 0
+                    publications_drained = self._publish_inflight <= sync_depth
 
                 if publications_drained:
                     workers = [thread for thread in self._worker_threads
@@ -432,7 +480,10 @@ class EventBus:
 
             self._shutdown_event.set()
 
-            for thread in workers + [self._watchdog]:
+            lifecycle_threads = list(workers)
+            if self._watchdog is not None:
+                lifecycle_threads.append(self._watchdog)
+            for thread in lifecycle_threads:
                 if thread is current:
                     continue
                 remaining = deadline - time.monotonic()
@@ -442,6 +493,14 @@ class EventBus:
                     thread.join(timeout=remaining)
                 except (RuntimeError, AttributeError):
                     pass
+            with self._publish_condition:
+                inflight = self._publish_inflight
+            unfinished = self._work_queue.unfinished_tasks
+            return (
+                inflight == 0
+                and unfinished == 0
+                and not any(thread.is_alive() for thread in lifecycle_threads)
+            )
 
     def __repr__(self) -> str:
         with self._lock:
@@ -460,8 +519,27 @@ def get_bus() -> EventBus:
     if _BUS is None:
         with _BUS_LOCK:
             if _BUS is None:
-                _BUS = EventBus(worker_threads=2, history_size=500)
+                _BUS = EventBus(
+                    worker_threads=2,
+                    history_size=500,
+                    lazy_workers=True,
+                )
     return _BUS
+
+
+def shutdown_global_bus(timeout: float = 2.0) -> bool:
+    """Close and reset the process-global bus for truthful bot shutdown."""
+    global _BUS
+    with _BUS_LOCK:
+        bus = _BUS
+    if bus is None:
+        return True
+    if not bus.shutdown(timeout=timeout):
+        return False
+    with _BUS_LOCK:
+        if _BUS is bus:
+            _BUS = None
+    return True
 
 
 def _console_log_handler(event_type: str, payload: dict) -> None:

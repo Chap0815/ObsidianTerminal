@@ -171,17 +171,9 @@ def _pid_alive(pid: int, payload_boot_fp: str = "") -> bool:
         return False
     if payload_boot_fp and payload_boot_fp != _BOOT_FP:
         return False
-    try:
-        if os.name == "nt":
-            try:
-                import psutil  # type: ignore
-                return psutil.pid_exists(pid)
-            except ImportError:
-                return True
-        os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError):
-        return False
+    from core.process_identity import pid_alive
+
+    return pid_alive(pid)
 
 
 @contextmanager
@@ -482,8 +474,14 @@ def _persist(path: str, data: dict) -> bool:
                 for symbol, expiry in merged.items()
             }
             _atomic_write_json(path, snapshot)
-            data.clear()
+            # Readers intentionally avoid the persistence lock in the entry
+            # hot path. Publish additions/refreshes before removing expired
+            # keys so they can observe an old protective cooldown briefly, but
+            # never a transient empty mapping between clear() and update().
             data.update(snapshot)
+            for symbol in tuple(data):
+                if symbol not in snapshot:
+                    data.pop(symbol, None)
         return True
     except Exception:
         try:

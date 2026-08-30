@@ -87,6 +87,9 @@ EXCLUDED_REL_PATHS = {
     "prompts/spot.txt",
     "prompts/futures.txt",
 }
+RUNTIME_REFERENCE_ROOTS = frozenset(
+    {"bot_utils", "bots", "core", "launcher", "trading"}
+)
 
 
 def _is_linklike(path: Path) -> bool:
@@ -340,6 +343,32 @@ def _verify_manifest_snapshot(root: Path, manifest: dict) -> None:
         raise RuntimeError("release tree changed before manifest publication")
 
 
+def _reference_projection(manifest: dict, reference_root: Path) -> dict[str, dict]:
+    reference_records = {
+        str(item["path"]): item
+        for item in _collect_source_records(reference_root)
+    }
+    release_records = {
+        str(item["path"]): item for item in manifest.get("files", [])
+    }
+    runtime_reference_paths = {
+        path
+        for path in reference_records
+        if path.lower().endswith(".py")
+        and path.split("/", 1)[0].lower() in RUNTIME_REFERENCE_ROOTS
+    }
+    missing_runtime = runtime_reference_paths - set(release_records)
+    if missing_runtime:
+        raise RuntimeError("release payload does not match reference source")
+    projection: dict[str, dict] = {}
+    for path, release_item in release_records.items():
+        reference_item = reference_records.get(path)
+        if reference_item != release_item:
+            raise RuntimeError("release payload does not match reference source")
+        projection[path] = reference_item
+    return projection
+
+
 def build_manifest(root: Path) -> dict:
     root = _manifest_root(root)
     files = _collect_source_records(root)
@@ -356,10 +385,26 @@ def build_manifest(root: Path) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".")
+    parser.add_argument("--reference-source")
     args = parser.parse_args(argv)
     root = _manifest_root(args.root)
+    if not root.name.lower().endswith("_release"):
+        raise ValueError(
+            "manifest publication requires a release root ending in _Release"
+        )
     manifest = build_manifest(root)
+    reference_root = None
+    reference_projection = None
+    if args.reference_source:
+        reference_root = _manifest_root(args.reference_source)
+        reference_projection = _reference_projection(manifest, reference_root)
     _verify_manifest_snapshot(root, manifest)
+    if (
+        reference_root is not None
+        and _reference_projection(manifest, reference_root)
+        != reference_projection
+    ):
+        raise RuntimeError("reference source changed before manifest publication")
     out = root / "DEPLOY_MANIFEST.json"
     encoded = json.dumps(manifest, indent=2).encode("utf-8")
     _publish_manifest(out, encoded)

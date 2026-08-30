@@ -564,6 +564,36 @@ def close_thread_local_conn() -> bool:
     return all_closed
 
 
+def _enable_full_sync_for_venue_boundary(conn) -> int:
+    """Select FULL durability for one pre-venue journal transaction only."""
+    if getattr(conn, "in_transaction", False):
+        raise RuntimeError(
+            "venue-boundary durability must be selected before BEGIN"
+        )
+    row = conn.execute("PRAGMA synchronous").fetchone()
+    if row is None:
+        raise RuntimeError("SQLite synchronous mode is unavailable")
+    previous = int(row[0])
+    conn.execute("PRAGMA synchronous=FULL")
+    confirmed = conn.execute("PRAGMA synchronous").fetchone()
+    if confirmed is None or int(confirmed[0]) < 2:
+        raise RuntimeError("SQLite FULL durability could not be confirmed")
+    return previous
+
+
+def _restore_sync_after_venue_boundary(conn, previous: int) -> None:
+    """Restore the default without masking an already durable commit."""
+    try:
+        conn.execute(f"PRAGMA synchronous={int(previous)}")
+    except Exception as exc:
+        # Remaining at FULL is safe and affects only this connection. Make a
+        # failed performance-mode restore observable without downgrading the
+        # already committed venue boundary.
+        _log_db_background_failure(
+            "restore SQLite synchronous mode after venue boundary", exc
+        )
+
+
 def _tight_connection() -> sqlite3.Connection:
     from core.constants import API_RATE_DB_TIMEOUT_SEC
     conn = getattr(_tight_conn_local, "conn", None)
@@ -634,6 +664,7 @@ _INIT_DB_DONE = False
 _SCHEMA_LOCK_NAME = "schema_migration"
 # VACUUM coordinator lock  only one process per cluster vacuums
 _VACUUM_LOCK_NAME = "vacuum_coordinator"
+_MAINTENANCE_LOCK_NAME = "maintenance_coordinator"
 _ADVISORY_LOCK_MAX_TTL_SEC = 24 * 3600
 _VACUUM_LOCK_TTL_SEC = 7 * 24 * 3600
 
@@ -708,6 +739,79 @@ def _try_advisory_lock(conn, lock_name: str, holder_id: str,
     except Exception:
         try:
             conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+def _try_or_renew_advisory_lease(
+    conn,
+    lock_name: str,
+    holder_id: str,
+    *,
+    ttl_sec: int | float,
+) -> bool:
+    """Acquire or renew one process lease without write-locking followers.
+
+    The optimistic read keeps non-owners out of ``BEGIN IMMEDIATE`` during a
+    healthy lease. The transaction repeats the ownership check so expiry and
+    concurrent acquisition remain race-free.
+    """
+    lock_name, holder_id, validated_ttl = _validated_advisory_lock_db(
+        lock_name,
+        holder_id,
+        ttl_sec,
+        validate_ttl=True,
+    )
+    assert validated_ttl is not None
+    now = _utcnow()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    expires_at = (now + timedelta(seconds=validated_ttl)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    row = conn.execute(
+        "SELECT holder_id, expires_at FROM advisory_locks WHERE lock_name=?",
+        (lock_name,),
+    ).fetchone()
+    if row is not None and str(row[0]) != holder_id and str(row[1]) >= now_str:
+        return False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM advisory_locks WHERE lock_name=? AND expires_at < ?",
+            (lock_name, now_str),
+        )
+        row = conn.execute(
+            "SELECT holder_id FROM advisory_locks WHERE lock_name=?",
+            (lock_name,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO advisory_locks "
+                "(lock_name, holder_id, acquired_at, expires_at) "
+                "VALUES (?,?,?,?)",
+                (lock_name, holder_id, now_str, expires_at),
+            )
+        elif str(row[0]) == holder_id:
+            conn.execute(
+                "UPDATE advisory_locks SET expires_at=? "
+                "WHERE lock_name=? AND holder_id=?",
+                (expires_at, lock_name, holder_id),
+            )
+        else:
+            conn.rollback()
+            return False
+        conn.commit()
+        return True
+    except sqlite3.OperationalError:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    except Exception:
+        try:
+            conn.rollback()
         except Exception:
             pass
         raise
@@ -1007,6 +1111,7 @@ def init_db(*, start_background_workers: bool = True) -> None:
             "Stop other bot processes or remove a stale schema lock after "
             "verifying no migration is active."
         )
+    schema_lock_released = False
     try:
         _run_migrations(conn)
         try:
@@ -1015,11 +1120,17 @@ def init_db(*, start_background_workers: bool = True) -> None:
             _log_db_background_failure("startup junk claim purge", exc)
         _reconcile_portfolio_reservations(conn)
     finally:
-        if _release_schema_lock(conn, holder_id) is False:
+        schema_lock_released = _release_schema_lock(conn, holder_id)
+        if schema_lock_released is False:
             _log_db_background_failure(
                 "release schema migration lock",
                 RuntimeError("schema lock remains until TTL expiry"),
             )
+    if not schema_lock_released:
+        raise RuntimeError(
+            "Database schema migration lock release failed; "
+            "startup remains incomplete until the lock can be reacquired."
+        )
     with _INIT_DB_LOCK:
         _INIT_DB_DONE = True
     if start_background_workers:
@@ -1660,23 +1771,75 @@ def _run_migrations(conn) -> None:
 # 
 
 _MAINT_THREAD_STARTED = False
-_MAINT_LOCK           = threading.Lock()
-_MAINT_INTERVAL_SEC   = 300.0
+_MAINT_THREAD: threading.Thread | None = None
+_MAINT_LOCK = threading.Lock()
+_MAINT_STOP_EVENT = threading.Event()
+_MAINT_INTERVAL_SEC = 300.0
+_MAINT_LEASE_TTL_SEC = 600.0
+_MAINT_FOLLOWER_RETRY_SEC = 15.0
 
 LEARNING_LOG_RETENTION_DAYS = 180  # auto-tuner audit log retention
 
 
 def _maintenance_loop() -> None:
-    while True:
-        try:
-            _time.sleep(_MAINT_INTERVAL_SEC)
-            _maintenance_cycle()
-        except Exception:
+    holder_id = f"maintenance-{os.getpid()}-{_time.time():.6f}"
+    lease_held = False
+    wait_seconds = _MAINT_INTERVAL_SEC
+    try:
+        while not _MAINT_STOP_EVENT.wait(wait_seconds):
+            conn = None
             try:
-                from core.logger import log_event
-                log_event("[db] maintenance loop error (continuing)", "WARN")
-            except Exception:
-                pass
+                conn = sqlite3.connect(DB_PATH, timeout=10.0)
+                acquired = _try_or_renew_advisory_lease(
+                    conn,
+                    _MAINTENANCE_LOCK_NAME,
+                    holder_id,
+                    ttl_sec=_MAINT_LEASE_TTL_SEC,
+                )
+                lease_held = lease_held or acquired
+                if acquired:
+                    _maintenance_cycle()
+                    wait_seconds = _MAINT_INTERVAL_SEC
+                else:
+                    wait_seconds = _MAINT_FOLLOWER_RETRY_SEC
+            except Exception as exc:
+                _log_db_background_failure("DB maintenance coordinator", exc)
+                wait_seconds = _MAINT_FOLLOWER_RETRY_SEC
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception as exc:
+                        _log_db_background_failure(
+                            "close DB maintenance lease connection", exc
+                        )
+    finally:
+        if lease_held:
+            conn = None
+            try:
+                conn = sqlite3.connect(DB_PATH, timeout=2.0)
+                if not _release_advisory_lock(
+                    conn,
+                    _MAINTENANCE_LOCK_NAME,
+                    holder_id,
+                ):
+                    _log_db_background_failure(
+                        "release DB maintenance coordinator lease",
+                        RuntimeError("maintenance lease remains until TTL expiry"),
+                    )
+            except Exception as exc:
+                _log_db_background_failure(
+                    "release DB maintenance coordinator lease", exc
+                )
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception as exc:
+                        _log_db_background_failure(
+                            "close DB maintenance lease release connection", exc
+                        )
+        close_thread_local_conn()
 
 
 def _maintenance_cycle() -> None:
@@ -1714,48 +1877,58 @@ def _maintenance_cycle() -> None:
                 _log_db_background_failure(
                     "close DB maintenance connection", exc
                 )
-    _gc_api_rate_global()
-    _gc_expired_blacklist()
-    _gc_learning_log()
-    _gc_market_regime_top_n()
-    cleanup_old_market_regime()
+    for context, operation in (
+        ("GC API rate ledger", _gc_api_rate_global),
+        ("GC expired blacklist", _gc_expired_blacklist),
+        ("GC learning log", _gc_learning_log),
+        ("GC market regime row cap", _gc_market_regime_top_n),
+        ("GC market regime retention", cleanup_old_market_regime),
+    ):
+        try:
+            operation()
+        except Exception as exc:
+            _log_db_background_failure(f"DB maintenance {context}", exc)
 
 
 def _start_maintenance_thread() -> bool:
-    global _MAINT_THREAD_STARTED
+    global _MAINT_THREAD, _MAINT_THREAD_STARTED
     with _MAINT_LOCK:
-        if _MAINT_THREAD_STARTED:
+        if _MAINT_THREAD is not None and _MAINT_THREAD.is_alive():
             return True
+        _MAINT_STOP_EVENT.clear()
         thread = _start_optional_db_thread(
             target=_maintenance_loop,
             name="db-maintenance",
             failure_context="start DB maintenance worker",
         )
         if thread is None:
+            _MAINT_THREAD = None
+            _MAINT_THREAD_STARTED = False
             return False
+        _MAINT_THREAD = thread
         _MAINT_THREAD_STARTED = True
         return True
 
 
 def _gc_api_rate_global() -> None:
+    now = _utcnow()
+    cutoff = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    latest_plausible = (now + timedelta(minutes=5)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
     try:
-        now = _utcnow()
-        cutoff = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
-        latest_plausible = (now + timedelta(minutes=5)).strftime(
-            "%Y-%m-%d %H:%M:%S"
+        conn.execute(
+            "DELETE FROM api_rate_global "
+            "WHERE called_at < ? OR called_at > ?",
+            (cutoff, latest_plausible),
         )
-        conn = sqlite3.connect(DB_PATH, timeout=10.0)
-        try:
-            conn.execute(
-                "DELETE FROM api_rate_global "
-                "WHERE called_at < ? OR called_at > ?",
-                (cutoff, latest_plausible),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        conn.commit()
     except Exception:
-        pass
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _gc_expired_blacklist() -> None:
@@ -1765,52 +1938,57 @@ def _gc_expired_blacklist() -> None:
     below removes entries immediately on expiry (the launcher's "Cleanup DB
     Now" button)  both are correct, they differ deliberately.
     """
+    cutoff = (_utcnow() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
     try:
-        cutoff = (_utcnow() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-        conn = sqlite3.connect(DB_PATH, timeout=10.0)
-        try:
-            conn.execute("DELETE FROM coin_blacklist WHERE blacklisted_until < ?", (cutoff,))
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute(
+            "DELETE FROM coin_blacklist WHERE blacklisted_until < ?", (cutoff,)
+        )
+        conn.commit()
     except Exception:
-        pass
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _gc_learning_log() -> None:
+    cutoff = (_utcnow() - timedelta(days=LEARNING_LOG_RETENTION_DAYS)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
     try:
-        cutoff = (_utcnow() - timedelta(days=LEARNING_LOG_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-        conn = sqlite3.connect(DB_PATH, timeout=10.0)
-        try:
-            conn.execute("DELETE FROM learning_log WHERE timestamp < ?", (cutoff,))
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute("DELETE FROM learning_log WHERE timestamp < ?", (cutoff,))
+        conn.commit()
     except Exception:
-        pass
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _gc_market_regime_top_n() -> None:
     """Effizientes DELETE via id-threshold statt NOT IN."""
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=10.0)
-        try:
-            row = conn.execute(
-                "SELECT id FROM market_regime ORDER BY id DESC LIMIT 1 OFFSET ?",
-                (MARKET_REGIME_RETENTION_ROWS - 1,),
-            ).fetchone()
-            if row:
-                threshold_id = row[0]
-                conn.execute("DELETE FROM market_regime WHERE id < ?", (threshold_id,))
-                conn.commit()
-        finally:
-            conn.close()
+        row = conn.execute(
+            "SELECT id FROM market_regime ORDER BY id DESC LIMIT 1 OFFSET ?",
+            (MARKET_REGIME_RETENTION_ROWS - 1,),
+        ).fetchone()
+        if row:
+            threshold_id = row[0]
+            conn.execute("DELETE FROM market_regime WHERE id < ?", (threshold_id,))
+            conn.commit()
     except Exception:
-        pass
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-_VACUUM_LOCK   = threading.Lock()
-_VACUUM_THREAD = None
+_VACUUM_LOCK = threading.Lock()
+_VACUUM_STOP_EVENT = threading.Event()
+_VACUUM_THREAD: threading.Thread | None = None
 
 
 def _start_optional_db_thread(*, target, name: str, failure_context: str):
@@ -1831,17 +2009,18 @@ def _start_optional_db_thread(*, target, name: str, failure_context: str):
 def _vacuum_worker() -> None:
     """Cross-process VACUUM coordination via advisory_locks.
 
-    Launcher + each bot calls init_db(), which starts a _vacuum_worker thread.
+    Each bot process calls init_db(), which starts a _vacuum_worker thread.
     To stop every process vacuuming independently, take an advisory lock named
     ``vacuum_coordinator`` with a 7-day TTL before vacuuming; if another process
     holds it, skip. The TTL enforces "no re-vacuum for 7 days" across the whole
     process cluster. Only runs inside the 03:00-05:00 UTC quiet window.
     """
-    _time.sleep(3600)
+    if _VACUUM_STOP_EVENT.wait(3600):
+        return
     QUIET_HOUR_START = 3   # UTC
     QUIET_HOUR_END   = 5
     last_run_date = None
-    while True:
+    while not _VACUUM_STOP_EVENT.is_set():
         now = _utcnow()
         in_quiet_window = QUIET_HOUR_START <= now.hour < QUIET_HOUR_END
         today_str = now.strftime("%Y-%m-%d")
@@ -1872,7 +2051,8 @@ def _vacuum_worker() -> None:
                             conn.close()
                         except Exception:
                             pass
-                        _time.sleep(3600)
+                        if _VACUUM_STOP_EVENT.wait(3600):
+                            return
                         continue
                     free = conn.execute("PRAGMA freelist_count").fetchone()
                     total = conn.execute("PRAGMA page_count").fetchone()
@@ -1910,7 +2090,8 @@ def _vacuum_worker() -> None:
                     conn.close()
             except Exception as exc:
                 _log_db_background_failure("DB vacuum scheduler", exc)
-        _time.sleep(3600)
+        if _VACUUM_STOP_EVENT.wait(3600):
+            return
 
 
 def _start_vacuum_scheduler() -> bool:
@@ -1918,6 +2099,7 @@ def _start_vacuum_scheduler() -> bool:
     with _VACUUM_LOCK:
         if _VACUUM_THREAD is not None and _VACUUM_THREAD.is_alive():
             return True
+        _VACUUM_STOP_EVENT.clear()
         candidate = _start_optional_db_thread(
             target=_vacuum_worker,
             name="db-vacuum",
@@ -1928,6 +2110,46 @@ def _start_vacuum_scheduler() -> bool:
             return False
         _VACUUM_THREAD = candidate
         return True
+
+
+def shutdown_database_background_workers(timeout: float = 2.0) -> bool:
+    """Stop and join process-owned DB workers and close the caller connection.
+
+    The function is idempotent and intentionally returns ``False`` while a
+    worker remains alive, allowing the runtime finalizer to retry instead of
+    publishing an untruthful clean shutdown.
+    """
+    global _MAINT_THREAD, _MAINT_THREAD_STARTED, _VACUUM_THREAD
+    try:
+        timeout = max(0.0, float(timeout))
+    except (TypeError, ValueError, OverflowError):
+        timeout = 0.0
+    _MAINT_STOP_EVENT.set()
+    _VACUUM_STOP_EVENT.set()
+    with _MAINT_LOCK:
+        maint_thread = _MAINT_THREAD
+    with _VACUUM_LOCK:
+        vacuum_thread = _VACUUM_THREAD
+    deadline = _time.monotonic() + timeout
+    current = threading.current_thread()
+    for thread in (maint_thread, vacuum_thread):
+        if thread is None or thread is current or not thread.is_alive():
+            continue
+        remaining = max(0.0, deadline - _time.monotonic())
+        thread.join(timeout=remaining)
+    maint_alive = bool(maint_thread and maint_thread.is_alive())
+    vacuum_alive = bool(vacuum_thread and vacuum_thread.is_alive())
+    if not maint_alive:
+        with _MAINT_LOCK:
+            if _MAINT_THREAD is maint_thread:
+                _MAINT_THREAD = None
+                _MAINT_THREAD_STARTED = False
+    if not vacuum_alive:
+        with _VACUUM_LOCK:
+            if _VACUUM_THREAD is vacuum_thread:
+                _VACUUM_THREAD = None
+    connection_closed = close_thread_local_conn()
+    return not maint_alive and not vacuum_alive and connection_closed
 
 
 # 
@@ -2739,7 +2961,10 @@ def save_expectancy_candidate(
             if not isinstance(quality_decision, dict):
                 raise ValueError("quality_decision must be a dictionary")
             decision_score = _required_finite_float_db(
-                quality_decision.get("score"), "quality_decision.score"
+                quality_decision.get("score"),
+                "quality_decision.score",
+                minimum=0.0,
+                maximum=100.0,
             )
             decision_minimum = _required_finite_float_db(
                 quality_decision.get("minimum_score"),
@@ -2779,6 +3004,14 @@ def save_expectancy_candidate(
     except (TypeError, ValueError, OverflowError):
         return False
     if not isinstance(features, dict):
+        return False
+    feature_score = features.get("score")
+    if feature_score is not None and (
+        isinstance(feature_score, bool)
+        or not isinstance(feature_score, (int, float))
+        or not math.isfinite(float(feature_score))
+        or not 0.0 <= float(feature_score) <= 100.0
+    ):
         return False
     try:
         encoded_features = json.dumps(
@@ -5245,7 +5478,9 @@ def check_and_consume_global_api(bot_name: str, endpoint: str = "",
                                  max_per_minute: int = 900,
                                  ok: int = 1,
                                  return_reservation: bool = False,
-                                 critical: bool = False):
+                                 critical: bool = False,
+                                 burst_max_per_window: int | None = None,
+                                 burst_window_seconds: int | None = None):
     """Atomically reserve one global API slot.
 
     Returns ``False`` only for a non-critical cap denial, ``None`` when the
@@ -5278,6 +5513,27 @@ def check_and_consume_global_api(bot_name: str, endpoint: str = "",
         raise ValueError("return_reservation must be boolean")
     if not isinstance(critical, bool):
         raise ValueError("critical must be boolean")
+    if (burst_max_per_window is None) != (burst_window_seconds is None):
+        raise ValueError(
+            "burst_max_per_window and burst_window_seconds must be paired"
+        )
+    if burst_max_per_window is not None:
+        if (
+            isinstance(burst_max_per_window, bool)
+            or not isinstance(burst_max_per_window, int)
+            or not 1 <= burst_max_per_window <= API_RATE_HARD_MAX_PER_MINUTE
+        ):
+            raise ValueError(
+                "burst_max_per_window must be a positive bounded integer"
+            )
+        if (
+            isinstance(burst_window_seconds, bool)
+            or not isinstance(burst_window_seconds, int)
+            or not 1 <= burst_window_seconds <= 60
+        ):
+            raise ValueError(
+                "burst_window_seconds must be between 1 and 60"
+            )
 
     global _API_PRUNE_COUNTER
     try:
@@ -5302,6 +5558,19 @@ def check_and_consume_global_api(bot_name: str, endpoint: str = "",
             if count >= max_per_minute and not critical:
                 conn.execute("ROLLBACK")
                 return False
+            if burst_max_per_window is not None and not critical:
+                burst_cutoff = (
+                    now - timedelta(seconds=burst_window_seconds)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                burst_row = conn.execute(
+                    "SELECT COUNT(*) FROM api_rate_global "
+                    "WHERE endpoint=? AND called_at >= ? AND called_at <= ?",
+                    (validated_endpoint, burst_cutoff, latest_recent),
+                ).fetchone()
+                burst_count = burst_row[0] if burst_row else 0
+                if burst_count >= burst_max_per_window:
+                    conn.execute("ROLLBACK")
+                    return False
             inserted = conn.execute(
                 "INSERT INTO api_rate_global "
                 "(called_at, bot_name, endpoint, ok) VALUES (?,?,?,?)",
@@ -6509,6 +6778,7 @@ def create_order_intent(
     conn = get_connection()
 
     def _insert() -> None:
+        previous_sync = _enable_full_sync_for_venue_boundary(conn)
         try:
             conn.execute("BEGIN IMMEDIATE")
             collision = conn.execute(
@@ -6542,6 +6812,8 @@ def create_order_intent(
         except Exception:
             conn.rollback()
             raise
+        finally:
+            _restore_sync_after_venue_boundary(conn, previous_sync)
     try:
         _insert()
     except sqlite3.OperationalError as exc:
@@ -6699,6 +6971,17 @@ def transition_order_intent(
         else None
     )
     conn = get_connection()
+    durable_venue_boundary = target in {
+        "SUBMITTING",
+        "CANCELING",
+        "FALLBACK_SUBMITTING",
+        "RECOVERY_REQUIRED",
+    }
+    previous_sync = (
+        _enable_full_sync_for_venue_boundary(conn)
+        if durable_venue_boundary
+        else None
+    )
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -7028,6 +7311,9 @@ def transition_order_intent(
     except Exception:
         conn.rollback()
         raise
+    finally:
+        if previous_sync is not None:
+            _restore_sync_after_venue_boundary(conn, previous_sync)
 
 
 def record_order_intent_fallback_evidence(
@@ -7614,6 +7900,7 @@ def claim_due_order_intent_recoveries(
 
     conn = get_connection()
     claimed: list[dict] = []
+    previous_sync = _enable_full_sync_for_venue_boundary(conn)
     try:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
@@ -7711,6 +7998,8 @@ def claim_due_order_intent_recoveries(
     except Exception:
         conn.rollback()
         raise
+    finally:
+        _restore_sync_after_venue_boundary(conn, previous_sync)
     return claimed
 
 

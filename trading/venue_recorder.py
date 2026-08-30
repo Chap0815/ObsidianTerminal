@@ -28,6 +28,7 @@ from core.constants import NONCRYPTO_BASES
 
 MAX_PARTITION_CLOCK_AGE_MS = 86_400_000
 _CAPTURE_CONTROL_JSON_MAX_BYTES = 64 * 1024
+_CAPACITY_OPERATIONAL_RESERVE_RATIO = 1.05
 
 
 def _capture_now_ms() -> int:
@@ -97,13 +98,7 @@ class SQLitePartitionWriter:
             )
 
     @staticmethod
-    def _linklike(path: Path) -> bool:
-        try:
-            value = path.lstat()
-        except FileNotFoundError:
-            return False
-        except OSError as exc:
-            raise RuntimeError("capture path cannot be inspected") from exc
+    def _stat_is_linklike(value) -> bool:
         reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
         return bool(
             stat.S_ISLNK(value.st_mode)
@@ -112,6 +107,16 @@ class SQLitePartitionWriter:
                 and getattr(value, "st_file_attributes", 0) & reparse_flag
             )
         )
+
+    @classmethod
+    def _linklike(cls, path: Path) -> bool:
+        try:
+            value = path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise RuntimeError("capture path cannot be inspected") from exc
+        return cls._stat_is_linklike(value)
 
     def _assert_scoped_path(self, path: Path) -> None:
         root_absolute = self.root.absolute()
@@ -605,11 +610,15 @@ class SQLitePartitionWriter:
                 total = 0
                 for item in self.root.glob("*/*"):
                     try:
-                        item_stat = item.stat()
+                        item_stat = item.lstat()
                     except OSError as exc:
                         raise RuntimeError(
                             "venue capture storage size unavailable"
                         ) from exc
+                    if self._stat_is_linklike(item_stat):
+                        raise RuntimeError(
+                            "venue capture storage artifact is linked"
+                        )
                     if stat.S_ISREG(item_stat.st_mode):
                         total += item_stat.st_size
                 return total
@@ -629,8 +638,11 @@ class SQLitePartitionWriter:
         measurement_errors = 0
         for item in self.root.glob("*/*"):
             try:
-                item_stat = item.stat()
+                item_stat = item.lstat()
             except OSError:
+                measurement_errors += 1
+                continue
+            if self._stat_is_linklike(item_stat):
                 measurement_errors += 1
                 continue
             if not stat.S_ISREG(item_stat.st_mode):
@@ -668,6 +680,11 @@ class SQLitePartitionWriter:
             if self.max_storage_bytes > 0 and filesystem_capacity is not None
             else None
         )
+        required_capacity = (
+            math.ceil(projected * _CAPACITY_OPERATIONAL_RESERVE_RATIO)
+            if projected is not None
+            else None
+        )
         capacity_ok = (
             False
             if measurement_errors
@@ -675,11 +692,31 @@ class SQLitePartitionWriter:
             if projected is None or self.max_storage_bytes <= 0
             else (
                 total <= self.max_storage_bytes
-                and self.max_storage_bytes >= projected
+                and required_capacity is not None
+                and self.max_storage_bytes >= required_capacity
                 and filesystem_capacity is not None
-                and filesystem_capacity >= projected
+                and filesystem_capacity >= required_capacity
             )
         )
+        headroom_ratio = (
+            None
+            if (
+                measurement_errors
+                or not projected
+                or effective_capacity is None
+            )
+            else effective_capacity / projected
+        )
+        if measurement_errors or filesystem_capacity is None:
+            capacity_state = "unavailable"
+        elif projected is None or self.max_storage_bytes <= 0:
+            capacity_state = "collecting"
+        elif capacity_ok:
+            capacity_state = "healthy"
+        elif headroom_ratio is not None and headroom_ratio >= 1.0:
+            capacity_state = "low_headroom"
+        else:
+            capacity_state = "insufficient"
         return {
             "total_bytes": total,
             "measurement_complete": measurement_errors == 0,
@@ -688,18 +725,15 @@ class SQLitePartitionWriter:
             "closed_days_observed": len(closed),
             "peak_closed_day_bytes": peak,
             "projected_required_bytes": projected,
+            "required_capacity_bytes": required_capacity,
             "filesystem_free_bytes": filesystem_free,
             "filesystem_capacity_bytes": filesystem_capacity,
             "capacity_ok": capacity_ok,
-            "headroom_ratio": (
-                None
-                if (
-                    measurement_errors
-                    or not projected
-                    or effective_capacity is None
-                )
-                else effective_capacity / projected
+            "capacity_state": capacity_state,
+            "operational_reserve_ratio": (
+                _CAPACITY_OPERATIONAL_RESERVE_RATIO
             ),
+            "headroom_ratio": headroom_ratio,
         }
 
     def close(self) -> bool:
@@ -962,6 +996,8 @@ class VenueRecorder:
         ended_ms: int,
         flags: tuple[str, ...] = (),
         market_id: str | None = None,
+        health_symbol: str | None = None,
+        health_stream: str | None = None,
     ) -> Path:
         market_id = market_id or self._market_id(self.exchange, symbol)
         if ended_ms < started_ms and "wallclock_non_monotonic" not in flags:
@@ -1005,7 +1041,7 @@ class VenueRecorder:
             flags = (*flags, "invalid_exchange_timestamp")
         digest_input = json.dumps(payload, sort_keys=True, default=str)
         digest = hashlib.blake2s(digest_input.encode("utf-8"), digest_size=8).hexdigest()
-        return self.writer.write(
+        path = self.writer.write(
             VenueEvent(
                 event_id=(
                     f"{kind}:{market_id}:{event_clock}:"
@@ -1025,6 +1061,13 @@ class VenueRecorder:
                 quality_flags=flags,
             )
         )
+        if health_stream is not None:
+            self._record_rest_observation(
+                health_symbol or market_id,
+                health_stream,
+                flags,
+            )
+        return path
 
     def capture_overview(self) -> int:
         endpoint = "venue_recorder_fetch_tickers"
@@ -1161,11 +1204,8 @@ class VenueRecorder:
             ended_ms=ended,
             flags=tuple(overview_flags),
             market_id="ALL_USDT_SWAPS",
-        )
-        self._record_rest_observation(
-            "ALL_USDT_SWAPS",
-            "overview",
-            overview_flags,
+            health_symbol="ALL_USDT_SWAPS",
+            health_stream="overview",
         )
         return len(candidates)
 
@@ -1245,8 +1285,9 @@ class VenueRecorder:
             started_ms=started_book,
             ended_ms=ended_book,
             flags=tuple(flags),
+            health_symbol=symbol,
+            health_stream="depth",
         )
-        self._record_rest_observation(symbol, "depth", flags)
         trades_endpoint = "venue_recorder_fetch_trades"
         trades_reservation = self._require_api_budget(trades_endpoint)
         started_trades = _capture_now_ms()
@@ -1352,8 +1393,9 @@ class VenueRecorder:
             started_ms=started_trades,
             ended_ms=ended_trades,
             flags=tuple(trade_flags),
+            health_symbol=symbol,
+            health_stream="trades",
         )
-        self._record_rest_observation(symbol, "trades", trade_flags)
         return book_path, trades_path
 
     def _record_rest_observation(

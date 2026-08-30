@@ -1261,6 +1261,8 @@ def analyze_independent_positions(
                 row.get("is_partial") is not (index < len(fragments) - 1)
                 for index, row in enumerate(fragments)
             )
+            or any(not isinstance(row.get("liquidated"), bool) for row in fragments)
+            or any(row.get("liquidated") is True for row in fragments[:-1])
         ):
             return {"evidence_valid": False, "reason": "position_fragments_incomplete"}
         symbol = fragments[0].get("symbol")
@@ -1304,13 +1306,59 @@ def analyze_independent_positions(
             "symbol": symbol,
             "side": side,
             "entry_time": entry_time,
-            "exit_time": exit_time,
+            "exit_time": exit_numbers[-1],
             "regime": _entry_regime(indexed, symbol, entry_time),
             "net": net,
+            "liquidated": terminal[0]["liquidated"],
         })
     reported = stats.get("full_trades")
     if reported != len(positions):
         return {"evidence_valid": False, "reason": "position_count_mismatch"}
+    try:
+        initial_capital = _finite(
+            stats.get("initial_capital"), "initial capital", minimum=0.0
+        )
+        reported_drawdown = _finite(
+            stats.get("max_dd"), "maximum drawdown", minimum=0.0
+        )
+    except ValueError:
+        return {"evidence_valid": False, "reason": "position_summary_invalid"}
+    reported_liquidations = stats.get("liquidation_count")
+    if (
+        initial_capital <= 0.0
+        or isinstance(reported_liquidations, bool)
+        or not isinstance(reported_liquidations, int)
+        or reported_liquidations < 0
+    ):
+        return {"evidence_valid": False, "reason": "position_summary_invalid"}
+    equity = initial_capital
+    peak = initial_capital
+    reconstructed_drawdown = 0.0
+    nets_by_exit = defaultdict(list)
+    for position in positions:
+        nets_by_exit[position["exit_time"]].append(position["net"])
+    for exit_time in sorted(nets_by_exit):
+        equity += math.fsum(nets_by_exit[exit_time])
+        if not math.isfinite(equity):
+            return {"evidence_valid": False, "reason": "position_summary_invalid"}
+        peak = max(peak, equity)
+        if peak > 0.0:
+            reconstructed_drawdown = max(
+                reconstructed_drawdown,
+                (peak - equity) / peak * 100.0,
+            )
+    reconstructed_liquidations = sum(
+        position["liquidated"] for position in positions
+    )
+    if not math.isclose(
+        reported_drawdown,
+        reconstructed_drawdown,
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    ):
+        return {"evidence_valid": False, "reason": "position_drawdown_mismatch"}
+    if reported_liquidations != reconstructed_liquidations:
+        return {"evidence_valid": False, "reason": "position_liquidation_mismatch"}
     symbol_counts = Counter(row["symbol"] for row in positions)
     regime_counts = Counter(row["regime"] for row in positions)
     positive_by_symbol = Counter()
@@ -1333,6 +1381,9 @@ def analyze_independent_positions(
         "evidence_valid": True,
         "positions": positions,
         "independent_positions": len(positions),
+        "initial_capital": initial_capital,
+        "max_drawdown_pct": reconstructed_drawdown,
+        "liquidation_count": reconstructed_liquidations,
         "position_ids_unique_within_period": len(groups) == len(positions),
         "symbol_counts": dict(sorted(symbol_counts.items())),
         "regime_counts": dict(sorted(regime_counts.items())),

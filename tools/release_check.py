@@ -1,28 +1,30 @@
 from __future__ import annotations
-# ruff: noqa: E402  # script bootstraps the project root before local imports
 
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib import request
 
 sys.dont_write_bytecode = True
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools.release_requirements import (
+from tools.release_requirements import (  # noqa: E402, I001
     RELEASE_TOOL_FILES,
     REQUIRED_MANIFEST_FILES,
     REQUIRED_RELEASE_DIRS,
     REQUIRED_RELEASE_ITEMS,
 )
-from tools.update_deploy_manifest import build_manifest
+from tools.update_deploy_manifest import build_manifest  # noqa: E402
 
 
 FORBIDDEN_DIRS = {
@@ -91,6 +93,14 @@ FORBIDDEN_REL_PATHS = {
 }
 REQUIRED = REQUIRED_RELEASE_ITEMS
 _SHA256_REQUIREMENT_HASH_RE = re.compile(r"--hash=sha256:[0-9a-fA-F]{64}(?:\s|$)")
+_EXACT_REQUIREMENT_RE = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)(?:\s|$)"
+)
+DEPENDENCY_ADVISORY_POLICY_REL = Path("config/dependency_advisory_policy.json")
+DEPENDENCY_ADVISORY_POLICY_MAX_BYTES = 1024 * 1024
+DEPENDENCY_ADVISORY_MAX_AGE = timedelta(days=30)
+DEPENDENCY_ADVISORY_FUTURE_TOLERANCE = timedelta(minutes=5)
+OSV_QUERYBATCH_URL = "https://api.osv.dev/v1/querybatch"
 RELEASE_METADATA_MAX_BYTES = 4 * 1024 * 1024
 RELEASE_TEXT_MAX_BYTES = 4 * 1024 * 1024
 RELEASE_TEXT_SUFFIXES = {
@@ -197,6 +207,245 @@ def _requirements_hash_errors(path: Path) -> list[str]:
     if pins == 0:
         errors.append("requirements.lock.txt contains no pinned dependencies")
     return errors
+
+
+def _normalized_package_name(value: object) -> str:
+    return re.sub(r"[-_.]+", "-", str(value or "").strip()).lower()
+
+
+def _locked_requirements(path: Path) -> dict[str, tuple[str, str]]:
+    """Return normalized package -> (display name, exact version)."""
+    locked: dict[str, tuple[str, str]] = {}
+    lines = _read_release_text(
+        path,
+        max_bytes=RELEASE_METADATA_MAX_BYTES,
+        label="requirements.lock.txt",
+    ).splitlines()
+    for number, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _EXACT_REQUIREMENT_RE.match(line)
+        if match is None:
+            raise ValueError(
+                f"requirements.lock.txt line {number} is not an exact pin"
+            )
+        display_name, version = match.groups()
+        normalized = _normalized_package_name(display_name)
+        if normalized in locked:
+            raise ValueError(
+                f"requirements.lock.txt line {number} duplicates {normalized}"
+            )
+        locked[normalized] = (display_name, version)
+    if not locked:
+        raise ValueError("requirements.lock.txt contains no pinned dependencies")
+    return locked
+
+
+def _numeric_version_tuple(value: object) -> tuple[int, ...] | None:
+    text = str(value or "").strip()
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", text) is None:
+        return None
+    return tuple(int(part) for part in text.split("."))
+
+
+def _dependency_advisory_errors(root: Path) -> list[str]:
+    """Validate the offline OSV snapshot bound to this exact lock file."""
+    lock_path = root / "requirements.lock.txt"
+    policy_path = root / DEPENDENCY_ADVISORY_POLICY_REL
+    try:
+        locked = _locked_requirements(lock_path)
+        policy = json.loads(
+            _read_release_text(
+                policy_path,
+                max_bytes=DEPENDENCY_ADVISORY_POLICY_MAX_BYTES,
+                label=str(DEPENDENCY_ADVISORY_POLICY_REL),
+            )
+        )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        return [f"dependency advisory policy unreadable: {exc}"]
+    if not isinstance(policy, dict) or policy.get("schema_version") != 1:
+        return ["dependency advisory policy schema is unsupported"]
+
+    errors: list[str] = []
+    try:
+        retrieved_text = str(policy.get("retrieved_at_utc") or "").strip()
+        retrieved_at = datetime.fromisoformat(
+            retrieved_text.replace("Z", "+00:00")
+        )
+        if retrieved_at.tzinfo is None:
+            raise ValueError("timezone is required")
+        retrieved_at = retrieved_at.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        errors.append("dependency advisory policy has invalid retrieval time")
+    else:
+        now = datetime.now(timezone.utc)
+        if retrieved_at > now + DEPENDENCY_ADVISORY_FUTURE_TOLERANCE:
+            errors.append("dependency advisory policy retrieval time is in the future")
+        elif now - retrieved_at > DEPENDENCY_ADVISORY_MAX_AGE:
+            errors.append(
+                "dependency advisory policy is older than 30 days; run the "
+                "explicit OSV policy refresh and review every result"
+            )
+    expected_lock_hash = str(policy.get("requirements_lock_sha256") or "").lower()
+    actual_lock_hash = _sha256(lock_path)
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_lock_hash):
+        errors.append("dependency advisory policy has invalid lock hash")
+    elif expected_lock_hash != actual_lock_hash:
+        errors.append(
+            "dependency advisory policy is stale for requirements.lock.txt; "
+            "run the explicit OSV policy refresh and review every result"
+        )
+
+    floors = policy.get("safety_floors")
+    if not isinstance(floors, dict) or not floors:
+        errors.append("dependency advisory policy has no safety floors")
+    else:
+        for raw_name, raw_floor in sorted(floors.items()):
+            name = _normalized_package_name(raw_name)
+            locked_item = locked.get(name)
+            floor = _numeric_version_tuple(raw_floor)
+            if locked_item is None:
+                errors.append(f"dependency safety floor references missing pin: {name}")
+                continue
+            version = _numeric_version_tuple(locked_item[1])
+            if floor is None or version is None:
+                errors.append(f"dependency safety floor is not numeric for {name}")
+            elif version < floor:
+                errors.append(
+                    f"dependency {name}=={locked_item[1]} is below safety floor "
+                    f"{raw_floor}"
+                )
+
+    advisories = policy.get("advisories")
+    if not isinstance(advisories, list):
+        errors.append("dependency advisory policy advisories must be a list")
+        return errors
+    seen_ids: set[str] = set()
+    for index, item in enumerate(advisories, 1):
+        if not isinstance(item, dict):
+            errors.append(f"dependency advisory entry {index} is invalid")
+            continue
+        name = _normalized_package_name(item.get("package"))
+        version = str(item.get("version") or "").strip()
+        advisory_id = str(item.get("id") or "").strip().upper()
+        decision = str(item.get("decision") or "").strip().lower()
+        rationale = str(item.get("rationale") or "").strip()
+        locked_item = locked.get(name)
+        if locked_item is None or locked_item[1] != version:
+            errors.append(
+                f"dependency advisory {advisory_id or index} is not bound to "
+                "the exact locked package version"
+            )
+        if not advisory_id or advisory_id in seen_ids:
+            errors.append(f"dependency advisory entry {index} has invalid/duplicate id")
+        else:
+            seen_ids.add(advisory_id)
+        if decision == "blocked":
+            errors.append(
+                f"dependency advisory blocks release: {name}=={version} {advisory_id}"
+            )
+        elif decision != "waived" or len(rationale) < 20:
+            errors.append(
+                f"dependency advisory requires explicit review: "
+                f"{name}=={version} {advisory_id}"
+            )
+    return errors
+
+
+def _refresh_dependency_advisory_policy(source: Path, output: Path) -> None:
+    """Explicitly query OSV and write an unapproved, review-required snapshot."""
+    lock_path = source / "requirements.lock.txt"
+    locked = _locked_requirements(lock_path)
+    queries = [
+        {
+            "package": {"ecosystem": "PyPI", "name": display_name},
+            "version": version,
+        }
+        for _name, (display_name, version) in sorted(locked.items())
+    ]
+    body = json.dumps({"queries": queries}, separators=(",", ":")).encode("utf-8")
+    http_request = request.Request(
+        OSV_QUERYBATCH_URL,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": "obsidian-release-check/1"},
+        method="POST",
+    )
+    with request.urlopen(http_request, timeout=30) as response:
+        raw = response.read(DEPENDENCY_ADVISORY_POLICY_MAX_BYTES + 1)
+    if len(raw) > DEPENDENCY_ADVISORY_POLICY_MAX_BYTES:
+        raise RuntimeError("OSV response exceeds policy size limit")
+    payload = json.loads(raw.decode("utf-8"))
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, list) or len(results) != len(queries):
+        raise RuntimeError("OSV returned an incomplete query batch")
+    advisories: list[dict[str, str]] = []
+    ordered_locked = [item for item in sorted(locked.items())]
+    for (name, (_display_name, version)), result in zip(
+        ordered_locked, results, strict=True
+    ):
+        vulns = result.get("vulns", []) if isinstance(result, dict) else []
+        if not isinstance(vulns, list):
+            raise TypeError(f"OSV returned malformed advisories for {name}")
+        for vuln in vulns:
+            if not isinstance(vuln, dict):
+                raise TypeError(f"OSV returned a malformed advisory for {name}")
+            advisory_id = str(vuln.get("id") or "").strip().upper()
+            if not advisory_id:
+                raise RuntimeError(f"OSV returned an advisory without id for {name}")
+            advisories.append(
+                {
+                    "package": name,
+                    "version": version,
+                    "id": advisory_id,
+                    "decision": "review_required",
+                    "rationale": "",
+                }
+            )
+    existing_floors: dict[str, str] = {}
+    current_policy = source / DEPENDENCY_ADVISORY_POLICY_REL
+    try:
+        current = json.loads(
+            _read_release_text(
+                current_policy,
+                max_bytes=DEPENDENCY_ADVISORY_POLICY_MAX_BYTES,
+                label=str(DEPENDENCY_ADVISORY_POLICY_REL),
+            )
+        )
+        if isinstance(current, dict) and isinstance(current.get("safety_floors"), dict):
+            existing_floors = {
+                str(key): str(value)
+                for key, value in current["safety_floors"].items()
+            }
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        pass
+    snapshot = {
+        "schema_version": 1,
+        "source": OSV_QUERYBATCH_URL,
+        "retrieved_at_utc": datetime.now(timezone.utc).isoformat(),
+        "requirements_lock_sha256": _sha256(lock_path),
+        "safety_floors": existing_floors,
+        "advisories": sorted(
+            advisories, key=lambda item: (item["package"], item["id"])
+        ),
+    }
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    if temporary.exists():
+        raise RuntimeError(f"temporary policy path already exists: {temporary}")
+    encoded = (json.dumps(snapshot, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _build_id_from_manifest_files(files: list[dict]) -> str:
@@ -441,6 +690,7 @@ def check_release(
     requirements_path = root / "requirements.lock.txt"
     if requirements_path.exists():
         errors.extend(_requirements_hash_errors(requirements_path))
+        errors.extend(_dependency_advisory_errors(root))
 
     manifest_path = root / "DEPLOY_MANIFEST.json"
     if manifest_path.exists():
@@ -617,8 +867,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--strict-release-name", action="store_true")
     parser.add_argument("--simulate-copy", action="store_true")
     parser.add_argument("--reference-source")
+    parser.add_argument(
+        "--refresh-advisory-policy",
+        metavar="OUTPUT",
+        help=(
+            "explicitly query OSV and write a review-required offline policy; "
+            "normal release checks never use the network"
+        ),
+    )
     args = parser.parse_args(argv)
     source = Path(args.source).resolve()
+    if args.refresh_advisory_policy:
+        try:
+            _refresh_dependency_advisory_policy(
+                source,
+                Path(args.refresh_advisory_policy),
+            )
+        except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+            print(f"ERROR: dependency advisory refresh failed: {exc}")
+            return 1
+        print(f"Advisory policy candidate written: {args.refresh_advisory_policy}")
+        print("Review every entry and replace review_required before release.")
+        return 0
     reference = (
         Path(args.reference_source).resolve() if args.reference_source else None
     )

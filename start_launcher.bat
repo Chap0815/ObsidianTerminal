@@ -7,16 +7,19 @@ REM Es erscheint kein schwarzes Konsolenfenster. Diese .bat schliesst
 REM sich nach dem Start sofort selbst.
 
 cd /d "%~dp0"
+set PYTHONPATH=
+set PYTHONHOME=
+set PYTHONNOUSERSITE=1
 
-REM 1) Projekt-.venv bevorzugen (normale Installation)
-if exist "%~dp0.venv\Scripts\pythonw.exe" (
-    start "" "%~dp0.venv\Scripts\pythonw.exe" -m launcher.supervisor
+REM 1) Eingebettetes pythonw.exe bevorzugen (offizielle Installation)
+if exist "%~dp0python\pythonw.exe" (
+    start "" "%~dp0python\pythonw.exe" -m launcher.supervisor
     goto :eof
 )
 
-REM 2) Eingebettetes pythonw.exe bevorzugen (portable Installation)
-if exist "%~dp0python\pythonw.exe" (
-    start "" "%~dp0python\pythonw.exe" -m launcher.supervisor
+REM 2) Projekt-.venv verwenden, wenn kein privates Bundle vorhanden ist
+if exist "%~dp0.venv\Scripts\pythonw.exe" (
+    start "" "%~dp0.venv\Scripts\pythonw.exe" -m launcher.supervisor
     goto :eof
 )
 

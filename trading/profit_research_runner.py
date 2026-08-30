@@ -173,6 +173,7 @@ def _candidate_events(
     enforce_tca_causality: bool = False,
 ) -> dict[str, dict]:
     selected: dict[str, dict] = {}
+    conflicting_legacy_entries: set[str] = set()
     causal_anchors: dict[str, datetime] = {}
     database = root / "data" / "trading_bot.db"
     try:
@@ -435,14 +436,15 @@ def _candidate_events(
                 paths.append(path)
     for path in sorted(paths):
         try:
-            handle = path.open("r", encoding="utf-8", errors="replace")
+            handle = path.open("rb")
         except OSError:
             continue
         with handle:
-            for line in handle:
+            for raw_line in handle:
                 try:
+                    line = raw_line.decode("utf-8")
                     event = json.loads(line)
-                except (TypeError, ValueError, json.JSONDecodeError):
+                except (TypeError, UnicodeError, ValueError, json.JSONDecodeError):
                     if diagnostics is not None:
                         diagnostics["candidate_records_rejected"] += 1
                     continue
@@ -475,25 +477,32 @@ def _candidate_events(
                     if diagnostics is not None:
                         diagnostics["candidate_records_rejected"] += 1
                     continue
+                candidate = {
+                    "entry_id": entry_id,
+                    "candidate_time": candidate_time,
+                    "features": features,
+                    "schema_version": schema_version,
+                    "direction": direction,
+                    "direction_status": (
+                        "valid" if direction is not None
+                        else "missing" if raw_direction is None
+                        or raw_direction == ""
+                        else "invalid"
+                    ),
+                    "source": "structured_log_legacy",
+                }
                 current = selected.get(entry_id)
-                if current is None or (
-                    current.get("source") != "sqlite"
-                    and candidate_time < current["candidate_time"]
-                ):
-                    selected[entry_id] = {
-                        "entry_id": entry_id,
-                        "candidate_time": candidate_time,
-                        "features": features,
-                        "schema_version": schema_version,
-                        "direction": direction,
-                        "direction_status": (
-                            "valid" if direction is not None
-                            else "missing" if raw_direction is None
-                            or raw_direction == ""
-                            else "invalid"
-                        ),
-                        "source": "structured_log_legacy",
-                    }
+                if current is not None and current.get("source") == "sqlite":
+                    continue
+                if entry_id in conflicting_legacy_entries:
+                    continue
+                if current is None:
+                    selected[entry_id] = candidate
+                elif current != candidate:
+                    selected.pop(entry_id, None)
+                    conflicting_legacy_entries.add(entry_id)
+                    if diagnostics is not None:
+                        diagnostics["conflicting_candidate_records"] += 1
     if enforce_tca_causality:
         for entry_id, event in list(selected.items()):
             anchor = causal_anchors.get(entry_id)

@@ -566,15 +566,19 @@ def _event_diagnostic(value, max_chars: int = 120) -> str:
 def _validate_event_universe(payload: dict) -> None:
     """Require point-in-time universe evidence on non-overview events."""
     universe = payload.get("universe")
-    if (
-        not isinstance(universe, list)
-        or any(
-            not isinstance(symbol, str) or not symbol.strip()
-            for symbol in universe
-        )
-        or len(universe) != len(set(universe))
+    if not isinstance(universe, list):
+        raise ValueError("capture universe is not a list")
+    if not universe:
+        raise ValueError("capture universe is empty")
+    if any(
+        not isinstance(symbol, str)
+        or not symbol
+        or symbol != symbol.strip()
+        for symbol in universe
     ):
-        raise ValueError("capture universe contract is invalid")
+        raise ValueError("capture universe contains an invalid symbol")
+    if len(universe) != len(set(universe)):
+        raise ValueError("capture universe contains duplicate symbols")
 
 
 def _partition_rows(
@@ -1154,6 +1158,21 @@ def _verify_sealed_report(
     ).hexdigest().upper()
     if reported_hash != expected_hash:
         raise RuntimeError("sealed capture report hash is invalid")
+    issues = report.get("issues")
+    if (
+        not isinstance(issues, list)
+        or any(
+            not isinstance(issue, str)
+            or not issue
+            or issue != issue.strip()
+            or len(issue) > 512
+            for issue in issues
+        )
+        or len(issues) != len(set(issues))
+    ):
+        raise RuntimeError("sealed capture report issues are invalid")
+    if (status == "invalid") != bool(issues):
+        raise RuntimeError("sealed capture report status and issues disagree")
     manifest_items = report.get("manifest")
     if not isinstance(manifest_items, list):
         raise RuntimeError("sealed capture manifest is invalid")

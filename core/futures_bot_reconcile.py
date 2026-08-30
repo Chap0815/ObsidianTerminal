@@ -413,6 +413,42 @@ def _reconcile_hedge_mode_or_none(bot) -> bool | None:
     return None
 
 
+def _normalized_margin_mode_or_none(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if normalized in {"isolated", "cross"} else None
+
+
+def _position_margin_mode_evidence(
+    position: dict,
+) -> tuple[str | None, bool]:
+    if not isinstance(position, dict):
+        return None, False
+    info = position.get("info")
+    info = info if isinstance(info, dict) else {}
+    observed = []
+    for source, key in (
+        (position, "marginMode"),
+        (info, "marginMode"),
+        (info, "marginType"),
+    ):
+        if key not in source:
+            continue
+        raw = source.get(key)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            continue
+        normalized = _normalized_margin_mode_or_none(raw)
+        if normalized is None:
+            return None, False
+        observed.append(normalized)
+    if not observed:
+        return None, True
+    if any(value != observed[0] for value in observed[1:]):
+        return None, False
+    return observed[0], True
+
+
 def _trade_side(t: dict) -> str:
     if not isinstance(t, dict):
         return ""
@@ -622,10 +658,16 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
     eligible_trades = []
     for trade in trades:
         if not isinstance(trade, dict):
-            continue
+            return 0.0, 0.0, "unavailable"
         if not explicit_trade_symbol_matches(trade, symbol_full):
             continue
         timestamp_ms = _trade_timestamp_ms_or_none(trade)
+        if timestamp_ms is None and _is_close_trade_for_position(
+            trade,
+            pos_type,
+            hedge_mode=hedge_mode,
+        ):
+            return 0.0, 0.0, "unavailable"
         if timestamp_ms is not None and timestamp_ms > future_ceiling_ms:
             return 0.0, 0.0, "unavailable"
         if timestamp_ms is None or timestamp_ms < boundary_ms:
@@ -650,7 +692,7 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
         amt = _trade_amount(t)
         price = _trade_price(t)
         if amt <= 0 or price <= 0:
-            continue
+            return 0.0, 0.0, "unavailable"
         take = min(amt, max(0.0, target - qty))
         if take <= 0:
             break
@@ -2040,8 +2082,17 @@ class FuturesReconcileMixin:
                         or _finite_float_or_none(info.get("liquidationPrice"))
                         or 0.0
                     )
-                    mm_mode = str(p.get("marginMode") or info.get("marginMode")
-                                  or info.get("marginType") or "").lower()
+                    mm_mode, margin_mode_valid = (
+                        _position_margin_mode_evidence(p)
+                    )
+                    if not margin_mode_valid:
+                        raise ValueError("invalid exchange margin mode")
+                    if mm_mode is None:
+                        mm_mode = _normalized_margin_mode_or_none(
+                            self.C("MARGIN_MODE", "isolated")
+                        )
+                    if mm_mode is None:
+                        raise ValueError("invalid configured margin mode")
                 except (TypeError, ValueError):
                     entry = contracts = lev = liq = 0.0
                     side = None
@@ -2441,7 +2492,7 @@ class FuturesReconcileMixin:
                         "fees_paid": entry_fee,
                         "partial_sold": False, "break_even": False,
                         "be_active": False, "adopted": True,
-                        "margin_mode": mm_mode or self.C("MARGIN_MODE", "isolated"),
+                        "margin_mode": mm_mode,
                     }
                     adopted_state.update(recovered_metadata)
                     if recovered_metadata.get(

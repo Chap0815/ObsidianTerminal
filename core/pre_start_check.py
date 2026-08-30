@@ -5,7 +5,6 @@ import importlib.util
 import hashlib
 import json
 import math
-import os
 import sqlite3
 import sys
 import time
@@ -145,20 +144,14 @@ def _pid_cmdline(pid: int) -> str:
 
 
 def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
     try:
-        import psutil  # type: ignore
-        return psutil.pid_exists(pid)
+        from core.process_identity import pid_alive
+
+        return pid_alive(pid)
     except Exception:
-        pass
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-    except Exception:
-        return False
+        # Pre-start uncertainty must block rather than authorize a second
+        # process.  The shared helper itself is exception-contained.
+        return pid > 0
 
 
 def _state_path(log_dir: str, simulation: bool) -> Path:
@@ -397,9 +390,9 @@ def _check_manifest() -> list[CheckIssue]:
             f"DEPLOY_MANIFEST.json integrity check failed: {exc}",
         ))
     for folder in ("bots", "core", "launcher", "config", "data", "logs"):
-        if not (PROJECT_ROOT / folder).exists():
+        if not (PROJECT_ROOT / folder).is_dir():
             issues.append(_issue("error", "root_incomplete",
-                                 f"required folder missing: {folder}"))
+                                 f"required folder missing or invalid: {folder}"))
     return issues
 
 
@@ -459,6 +452,13 @@ def _check_runtime(bot_name: str, meta: dict, *, cleanup: bool = False) -> list[
                 f"{bot_name}: launcher confirmed prior pid {pid} exited "
                 f"with returncode {returncode}; stale/reused pid ignored",
             )]
+        if not cmdline:
+            return [_issue(
+                "error",
+                "bot_runtime_identity_unknown",
+                f"{bot_name}: runtime_status pid {pid} is alive but its "
+                "process identity is unavailable",
+            )]
         if age_sec < 300:
             return [_issue(
                 "error", "bot_runtime_pid_alive",
@@ -475,6 +475,13 @@ def _check_runtime(bot_name: str, meta: dict, *, cleanup: bool = False) -> list[
             age_sec = time.time() - path.stat().st_mtime
         except Exception:
             age_sec = 0.0
+        if pid <= 0 and age_sec < 300:
+            return [_issue(
+                "error",
+                "runtime_status_invalid",
+                f"{bot_name}: fresh active runtime_status requires a "
+                "positive process id",
+            )]
         if age_sec >= 300:
             if cleanup:
                 published = False

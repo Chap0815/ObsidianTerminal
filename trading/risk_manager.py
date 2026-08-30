@@ -650,7 +650,10 @@ def own_momentum_blocked(bot_name: str, mode_is_sim=None) -> tuple:
             pnl = _finite_float_or_none(t.get("profit_usdt"))
             invested = _finite_float_or_none(t.get("invested_usdt"))
             if pnl is None or invested is None or invested <= 0.0:
-                return False, ""  # corrupt history must not create a false pause
+                return (
+                    True,
+                    "Own-momentum history unavailable - pausing new entries",
+                )
             net += pnl
             total_inv += invested
         # Deadband: only pause on a MEANINGFUL net loss, not fee/rounding noise.
@@ -1015,7 +1018,12 @@ def _analyze_time_patterns(bot_name: str, trades: list):
             try:
                 bt = t.get("buy_time", "")
                 if bt:
-                    utc_dt = datetime.fromisoformat(bt).replace(tzinfo=timezone.utc)
+                    parsed_dt = datetime.fromisoformat(bt)
+                    utc_dt = (
+                        parsed_dt.replace(tzinfo=timezone.utc)
+                        if parsed_dt.tzinfo is None
+                        else parsed_dt.astimezone(timezone.utc)
+                    )
                     h = _get_local_hour(utc_dt)
             except Exception:
                 continue
@@ -1202,6 +1210,38 @@ def score_trade_quality(
 ) -> dict:
     """Score 0-100. PASS>=60, WARN 35-59, SKIP<35.
     Multipliziert Position-Size mit size_multiplier."""
+    numeric_inputs = (
+        rsi_1h,
+        atr_pct,
+        vol_surge,
+        body_ratio,
+        macd_hist,
+        change_pct,
+        fear_greed,
+        price,
+    )
+    parsed_inputs = tuple(_finite_float_or_none(value) for value in numeric_inputs)
+    regime_str = (regime.value if isinstance(regime, MarketRegime)
+                  else str(regime).upper())
+    if any(value is None for value in parsed_inputs):
+        return {
+            "score": 0.0,
+            "verdict": "SKIP",
+            "size_multiplier": 0.0,
+            "symbol": symbol,
+            "regime": regime_str,
+            "reason": "non-finite quality input",
+        }
+    (
+        rsi_1h,
+        atr_pct,
+        vol_surge,
+        body_ratio,
+        macd_hist,
+        change_pct,
+        fear_greed,
+        price,
+    ) = parsed_inputs
     score = 0.0
 
     if 45 <= rsi_1h <= 65:
@@ -1238,8 +1278,6 @@ def score_trade_quality(
     elif macd_hist > 0:
         score += min(15.0, macd_hist * 1000.0)
 
-    regime_str = (regime.value if isinstance(regime, MarketRegime)
-                  else str(regime).upper())
     if regime_str == MarketRegime.BULL.value:
         score += 15
     elif regime_str == MarketRegime.NEUTRAL.value:

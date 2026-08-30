@@ -12,6 +12,43 @@ _SHUTDOWN_RETRY_TIMEOUT_SEC = 15.0
 _FINALIZATION_STATE_CREATION_LOCK = threading.Lock()
 
 
+def _shutdown_event_bus_resource() -> bool:
+    from core.event_bus import shutdown_global_bus
+
+    return shutdown_global_bus(timeout=2.0)
+
+
+def _shutdown_state_json_resource() -> bool:
+    from core.state_manager import shutdown_state_json_writers
+
+    return shutdown_state_json_writers(timeout=2.0)
+
+
+def _shutdown_database_resource() -> bool:
+    from core.database import shutdown_database_background_workers
+
+    return shutdown_database_background_workers(timeout=2.0)
+
+
+def shared_runtime_resource_closers() -> dict[str, object]:
+    """Return process-global resources owned by every current bot process."""
+    return {
+        "event_bus": _shutdown_event_bus_resource,
+        "state_json_writers": _shutdown_state_json_resource,
+        "database_background_workers": _shutdown_database_resource,
+    }
+
+
+def format_runtime_thread_liveness(threads: Mapping[str, bool]) -> str:
+    """Render one compact, truthful heartbeat view of all runtime workers."""
+    if not isinstance(threads, Mapping) or not threads:
+        return "unavailable"
+    return " ".join(
+        f"{str(name)[:32]}={'UP' if alive is True else 'DOWN'}"
+        for name, alive in threads.items()
+    )
+
+
 class _RuntimeShutdownFinalizationState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -63,7 +100,10 @@ def _close_exchange_for_shutdown(
                 RuntimeError("runtime worker is still using the exchange"),
             )
         return False
-    terminal = getattr(owner, "_emergency_closed", False) is True
+    terminal = (
+        getattr(owner, "_emergency_closed", False) is True
+        or getattr(owner, "_shutdown_positions_preserved", False) is True
+    )
     method_names = (
         ("shutdown", "close_all", "close")
         if terminal
@@ -118,8 +158,9 @@ def _schedule_shutdown_finalization_retry(
         def retry_until_terminal() -> None:
             deadline = time.monotonic() + timeout
             converged = False
+            timeout_reported = False
             try:
-                while time.monotonic() < deadline:
+                while True:
                     time.sleep(interval)
                     converged = finalize_runtime_shutdown(
                         owner,
@@ -132,17 +173,28 @@ def _schedule_shutdown_finalization_retry(
                     )
                     if converged:
                         return
-                with state.lock:
-                    completed_elsewhere = state.complete
-                if not converged and not completed_elsewhere:
-                    _report_shutdown_error(
+                    if time.monotonic() < deadline:
+                        continue
+                    with state.lock:
+                        completed_elsewhere = state.complete
+                    if completed_elsewhere:
+                        return
+                    if not timeout_reported:
+                        timeout_reported = True
+                        _report_shutdown_error(
+                            owner,
+                            "Runtime shutdown retry",
+                            TimeoutError(
+                                "shutdown did not converge within "
+                                f"{timeout:.2f}s"
+                            ),
+                        )
+                    if getattr(
                         owner,
-                        "Runtime shutdown retry",
-                        TimeoutError(
-                            "shutdown did not converge within "
-                            f"{timeout:.2f}s"
-                        ),
-                    )
+                        "_shutdown_positions_preserved",
+                        False,
+                    ) is not True:
+                        return
             except Exception as exc:
                 _report_shutdown_error(owner, "Runtime shutdown retry", exc)
             finally:
@@ -197,6 +249,9 @@ def finalize_runtime_shutdown(
             getattr(owner, "_emergency_in_progress", False) is True
         )
         emergency_closed = getattr(owner, "_emergency_closed", False) is True
+        positions_preserved = (
+            getattr(owner, "_shutdown_positions_preserved", False) is True
+        )
         teardown_allowed = (
             threads_known
             and not any(threads.values())
@@ -269,7 +324,9 @@ def finalize_runtime_shutdown(
             reasons.append("thread_status_unavailable")
         if emergency_in_progress:
             reasons.append("emergency_close_in_progress")
-        elif not emergency_closed:
+        elif emergency_closed and positions_preserved:
+            reasons.append("shutdown_position_action_inconsistent")
+        elif not emergency_closed and not positions_preserved:
             reasons.append("emergency_close_incomplete")
         reasons.extend(
             f"{name}_close_failed"
@@ -284,12 +341,15 @@ def finalize_runtime_shutdown(
             "emergency_in_progress": emergency_in_progress,
             "resources": resources,
         }
+        if positions_preserved:
+            shutdown_payload["positions_preserved"] = True
         status_signature = (
             status,
             tuple(sorted(threads.items())),
             tuple(reasons),
             emergency_closed,
             emergency_in_progress,
+            positions_preserved,
             tuple(sorted(resources.items())),
         )
         status_written = state.last_status_signature == status_signature
@@ -375,14 +435,17 @@ def start_threads_or_shutdown(
             except Exception:
                 pass
 
-        deadline = time.monotonic() + max(0.0, float(join_timeout))
+        retry_interval = max(0.01, float(join_timeout))
         for thread in reversed(started):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0.0:
-                break
-            try:
-                if thread.is_alive():
-                    thread.join(timeout=remaining)
-            except Exception:
-                pass
+            while True:
+                try:
+                    alive = thread.is_alive()
+                except Exception:
+                    alive = True
+                if not alive:
+                    break
+                try:
+                    thread.join(timeout=retry_interval)
+                except Exception:
+                    time.sleep(min(retry_interval, 0.25))
         raise

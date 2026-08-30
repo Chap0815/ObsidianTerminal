@@ -16,7 +16,9 @@ import random
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Callable
 
@@ -30,6 +32,7 @@ from trading.venue_recorder import (
 
 
 _PUBLIC_ASYNC_CLOSE_TIMEOUT_SECONDS = 5.0
+_PERSIST_EXECUTOR_MAX_WORKERS = 4
 _TRADE_UPDATE_MAX_ROWS = 20_000
 
 
@@ -404,6 +407,28 @@ class L2ShadowCollector:
         with self._symbols_lock:
             return self._symbols
 
+    def _event_universe(
+        self,
+        symbol: str,
+        universe: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        raw = self._symbol_snapshot() if universe is None else universe
+        if not isinstance(raw, (list, tuple)) or not raw:
+            return None
+        normalized = tuple(raw)
+        if (
+            any(
+                not isinstance(item, str)
+                or not item
+                or item != item.strip()
+                for item in normalized
+            )
+            or len(normalized) != len(set(normalized))
+            or symbol not in normalized
+        ):
+            return None
+        return normalized
+
     def _should_stop(self) -> bool:
         return self._stop_event.is_set() or bool(
             self._shutdown_event and self._shutdown_event.is_set()
@@ -444,6 +469,15 @@ class L2ShadowCollector:
         except OrderBookValidationError as exc:
             self._mark_l2_unhealthy(symbol, type(exc).__name__)
             self._log_invalid_snapshot(symbol, exc)
+            return False
+
+        event_universe = self._event_universe(symbol, universe)
+        if event_universe is None:
+            self._mark_l2_unhealthy(symbol, "InvalidCaptureUniverse")
+            self._log(
+                f"invalid capture universe for L2 symbol {symbol}",
+                "WARN",
+            )
             return False
 
         now_monotonic = (
@@ -506,9 +540,7 @@ class L2ShadowCollector:
         payload = {
             "venue": self.exchange_id,
             "symbol": symbol,
-            "universe": list(
-                self._symbol_snapshot() if universe is None else universe
-            ),
+            "universe": list(event_universe),
             "bids": normalized["bids"],
             "asks": normalized["asks"],
             "nonce": normalized["nonce"],
@@ -593,6 +625,14 @@ class L2ShadowCollector:
             return False
         if trade_count > _TRADE_UPDATE_MAX_ROWS:
             self._mark_trade_unhealthy(symbol, "OversizedTradeUpdate")
+            return False
+        event_universe = self._event_universe(symbol, universe)
+        if event_universe is None:
+            self._mark_trade_unhealthy(symbol, "InvalidCaptureUniverse")
+            self._log(
+                f"invalid capture universe for trade symbol {symbol}",
+                "WARN",
+            )
             return False
         if received_ms is None:
             received_ms = _capture_now_ms()
@@ -690,9 +730,7 @@ class L2ShadowCollector:
                 payload = {
                     "venue": self.exchange_id,
                     "symbol": symbol,
-                    "universe": list(
-                        self._symbol_snapshot() if universe is None else universe
-                    ),
+                    "universe": list(event_universe),
                     "trades": day_trades,
                     "stream_source": "ccxt_pro",
                     "connection_epoch": connection_epoch,
@@ -909,10 +947,16 @@ class L2ShadowCollector:
             raise RuntimeError(f"ccxt.pro has no adapter for {self.exchange_id}")
         return exchange_class(config)
 
-    @staticmethod
-    async def _persist_off_loop(callback, *args, **kwargs):
+    async def _persist_off_loop(self, callback, *args, **kwargs):
         """Keep the loop responsive and drain durable work before cancellation."""
-        task = asyncio.create_task(asyncio.to_thread(callback, *args, **kwargs))
+        executor = getattr(self, "_persist_executor", None)
+        loop = asyncio.get_running_loop()
+        work = partial(callback, *args, **kwargs)
+        task = (
+            loop.run_in_executor(executor, work)
+            if executor is not None
+            else asyncio.create_task(asyncio.to_thread(work))
+        )
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -1078,11 +1122,18 @@ class L2ShadowCollector:
         """Scope the cancellation filter to this collector's private loop."""
         loop = asyncio.get_running_loop()
         previous_handler = loop.get_exception_handler()
+        executor = ThreadPoolExecutor(
+            max_workers=_PERSIST_EXECUTOR_MAX_WORKERS,
+            thread_name_prefix="venue-persist",
+        )
+        self._persist_executor = executor
         loop.set_exception_handler(self._handle_loop_exception)
         try:
             await self._run_async()
         finally:
             loop.set_exception_handler(previous_handler)
+            self._persist_executor = None
+            executor.shutdown(wait=True, cancel_futures=True)
 
     async def _run_async(self) -> None:
         backoff = 2.0

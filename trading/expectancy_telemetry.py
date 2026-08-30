@@ -179,6 +179,7 @@ def _quality_decision(value: dict | None) -> dict | None:
     would_block = value.get("would_block")
     if (
         score is None
+        or not 0.0 <= score <= 100.0
         or minimum_score is None
         or not 0.0 <= minimum_score <= 100.0
         or not label
@@ -244,6 +245,9 @@ def emit_expectancy_candidate(
             normalized_features = candidate
             break
     if schema_version is None or normalized_features is None:
+        return False
+    feature_score = normalized_features.get("score")
+    if feature_score is not None and not 0.0 <= feature_score <= 100.0:
         return False
     normalized_decision = _quality_decision(quality_decision)
     if quality_decision is not None and normalized_decision is None:

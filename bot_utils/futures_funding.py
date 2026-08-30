@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 from bot_utils.api_budget import try_consume_api_call
+from bot_utils.order_utils import order_id_text_or_none
 
 
 def _budget_ok(endpoint: str) -> bool:
@@ -250,7 +251,8 @@ def fetch_realized_funding(ex,
 
     history: list = []
     next_since = since_ms
-    seen_keys = set()
+    seen_event_ids: dict[str, tuple[int, float]] = {}
+    seen_fallback_keys: set[tuple[int, float, str]] = set()
     unverifiable_row = False
     pagination_complete = False
     for _page in range(max_pages):
@@ -289,15 +291,30 @@ def fetch_realized_funding(ex,
             if ts_i < since_ms or (until_ms is not None and ts_i > until_ms):
                 continue
             info = h.get("info") if isinstance(h.get("info"), dict) else {}
-            key = h.get("id") or info.get("id")
-            dedupe = key or (
-                ts_i,
-                h.get("amount"),
-                h.get("symbol") or symbol_full,
-            )
-            if dedupe in seen_keys:
-                continue
-            seen_keys.add(dedupe)
+            raw_event_id = h.get("id")
+            if raw_event_id is None:
+                raw_event_id = info.get("id")
+            if raw_event_id is not None:
+                event_id = order_id_text_or_none(raw_event_id)
+                if event_id is None:
+                    unverifiable_row = True
+                    continue
+                evidence = (ts_i, amt)
+                previous = seen_event_ids.get(event_id)
+                if previous is not None:
+                    if previous != evidence:
+                        unverifiable_row = True
+                    continue
+                seen_event_ids[event_id] = evidence
+            else:
+                fallback_key = (
+                    ts_i,
+                    amt,
+                    _funding_symbol_key(h.get("symbol") or symbol_full),
+                )
+                if fallback_key in seen_fallback_keys:
+                    continue
+                seen_fallback_keys.add(fallback_key)
             history.append(h)
             added += 1
 

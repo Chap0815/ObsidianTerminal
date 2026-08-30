@@ -105,7 +105,11 @@ def safe_fetch_balance_usdt(ex,
               Exception(f"unexpected payload type: {type(bal).__name__}"))
         return None
 
-    # Try standard paths
+    # Collect all standard paths. Unified exchange payloads commonly repeat
+    # the same free balance in more than one layout; contradictory repeats are
+    # ambiguous money truth and must not be resolved by path order.
+    standard_values = []
+    invalid_standard_fields = []
     for path in _PATHS:
         try:
             v = bal
@@ -119,33 +123,96 @@ def safe_fetch_balance_usdt(ex,
             if v is not None:
                 fv = _finite_nonnegative_float(v)
                 if fv is not None:  # accept 0.0 as valid empty
-                    return fv
+                    standard_values.append((path, fv))
+                else:
+                    # Keep diagnostics bounded: hostile integer/string values
+                    # can themselves raise or flood output when repr() is
+                    # attempted.
+                    invalid_standard_fields.append(path)
         except (AttributeError, TypeError, OverflowError):
             continue
+
+    if invalid_standard_fields:
+        _log(
+            "fetch_balance",
+            Exception(
+                "invalid explicit standard USDT free-balance fields: "
+                f"{invalid_standard_fields!r}"
+            ),
+        )
+        return None
+
+    if standard_values:
+        first_path, first_value = standard_values[0]
+        for path, value in standard_values[1:]:
+            if not math.isclose(
+                value, first_value, rel_tol=1e-12, abs_tol=1e-12
+            ):
+                _log(
+                    "fetch_balance",
+                    Exception(
+                        "conflicting standard USDT free-balance fields: "
+                        f"{first_path}={first_value!r}, {path}={value!r}"
+                    ),
+                )
+                return None
+        return first_value
 
     # Last resort: inspect raw "info"  but only when stablecoin is indicated
     info = bal.get("info") if isinstance(bal, dict) else None
     if isinstance(info, dict):
-        raw_currency_value = (
-            info.get("coin") or info.get("currency") or
-            info.get("asset") or info.get("marginCoin") or ""
-        )
-        raw_currency = raw_currency_value.upper() if isinstance(
-            raw_currency_value, str) else "__INVALID__"
-        if raw_currency not in _USDT_IDENTITIES:
+        raw_currencies = [
+            info[key]
+            for key in ("coin", "currency", "asset", "marginCoin")
+            if key in info and info[key] is not None
+        ]
+        currencies = {
+            value.strip().upper()
+            for value in raw_currencies
+            if isinstance(value, str) and value.strip()
+        }
+        if (
+            len(currencies) != 1
+            or currencies != _USDT_IDENTITIES
+            or any(
+                not isinstance(value, str) or not value.strip()
+                for value in raw_currencies
+            )
+        ):
             # This reader funds USDT orders.  A different stablecoin is still
             # portfolio value, but it is not spendable USDT.
             _log("fetch_balance",
-                  Exception(f"info dict currency={raw_currency!r} is not "
-                            f"USDT  refusing raw fallback (returning None "
-                            f"for retry)"))
+                  Exception(f"info dict currencies={raw_currencies!r} do not "
+                            f"prove one USDT identity  refusing raw fallback "
+                            f"(returning None for retry)"))
             return None
+        raw_values = []
         for k in _INFO_KEYS:
             v = info.get(k)
             if v is not None:
                 fv = _finite_nonnegative_float(v)
-                if fv is not None:
-                    return fv
+                if fv is None:
+                    _log(
+                        "fetch_balance",
+                        Exception(f"invalid raw USDT balance field {k}={v!r}"),
+                    )
+                    return None
+                raw_values.append((k, fv))
+        if raw_values:
+            first_key, first_value = raw_values[0]
+            for key, value in raw_values[1:]:
+                if not math.isclose(
+                    value, first_value, rel_tol=1e-12, abs_tol=1e-12
+                ):
+                    _log(
+                        "fetch_balance",
+                        Exception(
+                            "conflicting raw USDT free-balance fields: "
+                            f"{first_key}={first_value!r}, {key}={value!r}"
+                        ),
+                    )
+                    return None
+            return first_value
 
     # return None (not 0.0) for unknown layouts  caller retries.
     _log("fetch_balance",

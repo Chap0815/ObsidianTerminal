@@ -6,7 +6,9 @@ import math
 import json
 import os
 import statistics
+import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,11 +21,19 @@ _PERIOD_KEYS = {
     "fold_index",
     "period_start",
     "period_end",
+    "initial_capital",
     "positions",
     "max_drawdown_pct",
     "liquidation_count",
 }
-_POSITION_KEYS = {"position_id", "symbol", "regime", "net"}
+_POSITION_KEYS = {
+    "position_id",
+    "symbol",
+    "regime",
+    "exit_time",
+    "net",
+    "liquidated",
+}
 _SHADOW_POSITION_KEYS = {
     "position_id",
     "closed_at",
@@ -38,6 +48,16 @@ _FORWARD_REPORT_KEYS = {
     "period_start", "period_end", "positions", "capacity_samples",
 }
 _MAX_FORWARD_ARTIFACT_BYTES = 8 * 1024 * 1024
+_FORWARD_CLOCK_FUTURE_TOLERANCE_SECONDS = 5.0
+
+# One-sided 95% Student-t critical values for 1..30 degrees of freedom.
+# For larger samples df=30 remains deliberately conservative.
+_ONE_SIDED_T95 = (
+    6.3138, 2.9200, 2.3534, 2.1318, 2.0150, 1.9432, 1.8946, 1.8595,
+    1.8331, 1.8125, 1.7959, 1.7823, 1.7709, 1.7613, 1.7531, 1.7459,
+    1.7396, 1.7341, 1.7291, 1.7247, 1.7207, 1.7171, 1.7139, 1.7109,
+    1.7081, 1.7056, 1.7033, 1.7011, 1.6991, 1.6973,
+)
 
 
 def _number(value: Any, name: str) -> float:
@@ -57,6 +77,27 @@ def _count(value: Any, name: str, *, positive: bool = False) -> int:
     return value
 
 
+def _timestamp_number(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a timezone-aware timestamp")
+    if isinstance(value, (int, float)):
+        return _number(value, name)
+    try:
+        parsed = (
+            datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            if isinstance(value, str)
+            else value
+        )
+        if not isinstance(parsed, datetime) or parsed.tzinfo is None:
+            raise ValueError
+        number = parsed.astimezone(timezone.utc).timestamp()
+    except (AttributeError, OSError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a timezone-aware timestamp") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be a timezone-aware timestamp")
+    return number
+
+
 def _period_identity(row: dict) -> tuple:
     return (
         row["scope"],
@@ -66,11 +107,36 @@ def _period_identity(row: dict) -> tuple:
     )
 
 
+def _one_sided_t95(degrees_of_freedom: int) -> float:
+    if degrees_of_freedom < 1:
+        raise ValueError("clustered confidence requires positive degrees of freedom")
+    return _ONE_SIDED_T95[min(degrees_of_freedom, len(_ONE_SIDED_T95)) - 1]
+
+
+def _reconstructed_drawdown_pct(
+    positions: list[dict], initial_capital: float
+) -> float:
+    """Rebuild closed-position equity without inventing same-timestamp order."""
+    by_exit: dict[float, list[float]] = {}
+    for position in positions:
+        by_exit.setdefault(position["exit_time"], []).append(position["net"])
+    equity = initial_capital
+    peak = initial_capital
+    maximum = 0.0
+    for exit_time in sorted(by_exit):
+        equity += math.fsum(by_exit[exit_time])
+        peak = max(peak, equity)
+        if peak > 0.0:
+            maximum = max(maximum, (peak - equity) / peak * 100.0)
+    return maximum
+
+
 def _normalize_validation_periods(periods: Any) -> dict[str, list[dict]]:
     if not isinstance(periods, list) or not periods:
         raise ValueError("validation periods must be a non-empty list")
     by_profile = {"normal": [], "stressed": []}
     position_ids_by_profile = {"normal": set(), "stressed": set()}
+    future_ceiling = time.time() + _FORWARD_CLOCK_FUTURE_TOLERANCE_SECONDS
     for row in periods:
         if not isinstance(row, dict) or set(row) != _PERIOD_KEYS:
             raise ValueError("validation period structure is invalid")
@@ -83,10 +149,17 @@ def _normalize_validation_periods(periods: Any) -> dict[str, list[dict]]:
             _count(fold_index, "walk-forward fold index")
         elif fold_index is not None:
             raise ValueError("final holdout must not have a fold index")
-        start = _number(row["period_start"], "validation period start")
-        end = _number(row["period_end"], "validation period end")
+        start = _timestamp_number(row["period_start"], "validation period start")
+        end = _timestamp_number(row["period_end"], "validation period end")
         if end <= start:
             raise ValueError("validation period must be chronological")
+        if end > future_ceiling:
+            raise ValueError("validation period end is in the future")
+        initial_capital = _number(
+            row["initial_capital"], "validation initial capital"
+        )
+        if initial_capital <= 0.0:
+            raise ValueError("validation initial capital must be positive")
         drawdown = _number(row["max_drawdown_pct"], "validation drawdown")
         liquidations = _count(row["liquidation_count"], "liquidation count")
         if drawdown < 0.0:
@@ -111,20 +184,45 @@ def _normalize_validation_periods(periods: Any) -> dict[str, list[dict]]:
                 or not position["regime"].strip()
             ):
                 raise ValueError("validation position identity is invalid")
+            exit_time = _timestamp_number(position["exit_time"], "position exit time")
+            if not start <= exit_time <= end:
+                raise ValueError("validation position exit is outside its period")
+            if not isinstance(position["liquidated"], bool):
+                raise ValueError("validation position liquidation flag is invalid")
             seen.add(position_id)
             if position_id in position_ids_by_profile[profile]:
                 raise ValueError(
                     "position identity repeats across validation periods"
                 )
             position_ids_by_profile[profile].add(position_id)
-            normalized_positions.append({**position, "net": _number(position["net"], "position net")})
+            normalized_positions.append({
+                **position,
+                "exit_time": exit_time,
+                "net": _number(position["net"], "position net"),
+            })
+        reconstructed_drawdown = _reconstructed_drawdown_pct(
+            normalized_positions, initial_capital
+        )
+        reconstructed_liquidations = sum(
+            position["liquidated"] for position in normalized_positions
+        )
+        if not math.isclose(
+            drawdown,
+            reconstructed_drawdown,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("validation drawdown conflicts with raw positions")
+        if liquidations != reconstructed_liquidations:
+            raise ValueError("validation liquidation count conflicts with raw positions")
         by_profile[profile].append(
             {
                 **row,
                 "period_start": start,
                 "period_end": end,
-                "max_drawdown_pct": drawdown,
-                "liquidation_count": liquidations,
+                "initial_capital": initial_capital,
+                "max_drawdown_pct": reconstructed_drawdown,
+                "liquidation_count": reconstructed_liquidations,
                 "positions": normalized_positions,
             }
         )
@@ -155,12 +253,29 @@ def _normalize_validation_periods(periods: Any) -> dict[str, list[dict]]:
     }
     for normal in by_profile["normal"]:
         stressed = stressed_by_period[_period_identity(normal)]
+        if not math.isclose(
+            normal["initial_capital"],
+            stressed["initial_capital"],
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("normal and stressed initial capital does not match")
         normal_population = {
-            position["position_id"]: (position["symbol"], position["regime"])
+            position["position_id"]: (
+                position["symbol"],
+                position["regime"],
+                position["exit_time"],
+                position["liquidated"],
+            )
             for position in normal["positions"]
         }
         stressed_population = {
-            position["position_id"]: (position["symbol"], position["regime"])
+            position["position_id"]: (
+                position["symbol"],
+                position["regime"],
+                position["exit_time"],
+                position["liquidated"],
+            )
             for position in stressed["positions"]
         }
         if normal_population != stressed_population:
@@ -250,7 +365,8 @@ def build_validation_promotion_fragment(
         / (len(nets) * len(nets))
     )
     clustered_standard_error = math.sqrt(max(0.0, clustered_variance))
-    lower = mean - (1.645 * clustered_standard_error)
+    critical = _one_sided_t95(cluster_count - 1)
+    lower = mean - (critical * clustered_standard_error)
     normal_folds = [row for row in normal_rows if row["scope"] == "walk_forward"]
     stressed_folds = [row for row in stressed_rows if row["scope"] == "walk_forward"]
     normal_holdout = next(row for row in normal_rows if row["scope"] == "final_holdout")
@@ -396,6 +512,8 @@ def build_forward_shadow_promotion_fragment(
         observed_utc_days.add(math.floor(measured_at / 86_400.0))
         participations.append(participation)
         capacity_passed = capacity_passed and row["capacity_allowed"]
+    if end > time.time() + _FORWARD_CLOCK_FUTURE_TOLERANCE_SECONDS:
+        raise ValueError("forward period end is in the future")
     fields = {
         "forward_shadow_days": min(
             len(observed_utc_days),

@@ -163,7 +163,10 @@ def _validated_fail_cache(raw, now: float) -> dict:
         if count < 0 or not math.isfinite(hard_until) or hard_until < 0:
             continue
         if hard_until > now:
-            clean[key] = {"count": 0, "hard_until": hard_until}
+            clean[key] = {
+                "count": 0,
+                "hard_until": min(hard_until, now + _HARD_FAILURE_TTL),
+            }
         elif count > 0:
             clean[key] = {"count": min(count, 2), "hard_until": 0.0}
     return _bounded_fail_cache(clean, now)
@@ -369,7 +372,6 @@ def _is_hard_error(err_str: str) -> bool:
     return bool(_HARD_ERROR_RE.search(err_str or ""))
 
 
-_RATE_LIMIT_MARKERS = ("429", "rate limit", "too many requests", "ddos")
 _CCXT_CANDLES_URL_MARKERS = ("/market/candles", "/klines", "fetch_ohlcv")
 
 
@@ -566,7 +568,9 @@ def _handle_ohlcv_exception(symbol, timeframe, e, bot_name):
         return
 
     # 2. Rate-limit
-    if any(m in err_str for m in _RATE_LIMIT_MARKERS):
+    from bot_utils.network_retry import is_rate_limited
+
+    if is_rate_limited(e):
         _symbol_failure_cache.set((symbol, timeframe), time.time() + _SOFT_FAILURE_TTL)
         return
 

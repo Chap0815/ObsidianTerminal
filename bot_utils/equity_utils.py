@@ -133,6 +133,14 @@ def _read_currency_total_or_free(data: dict) -> float:
     return _read_currency_free(data)
 
 
+def _position_margin_or_none(position: dict) -> float | None:
+    for field in ("initialMargin", "collateral", "margin"):
+        candidate = _finite_float_or_none(position.get(field))
+        if candidate is not None and candidate > 0.0:
+            return candidate
+    return None
+
+
 def _sum_position_margin_and_upnl(positions: list) -> tuple[float, float, int, list]:
     """Walk a fetch_positions() result; sum margin and unrealized PnL.
 
@@ -162,12 +170,7 @@ def _sum_position_margin_and_upnl(positions: list) -> tuple[float, float, int, l
         count += 1
 
         # Margin: try ccxt-standard fields in priority order
-        margin = 0.0
-        for field in ("initialMargin", "collateral", "margin"):
-            candidate = _finite_float_or_none(p.get(field))
-            if candidate is not None and candidate > 0.0:
-                margin = candidate
-                break
+        margin = _position_margin_or_none(p) or 0.0
         total_margin = _finite_add(total_margin, margin)
 
         # Unrealized PnL: ccxt mostly normalizes to unrealizedPnl
@@ -290,6 +293,17 @@ def compute_futures_equity(ex) -> Optional[dict]:
     ):
         return None
 
+    open_positions = [
+        position
+        for position in positions
+        if (_position_contracts_abs(position) or 0.0) > 0.0
+    ]
+    if any(
+        _position_margin_or_none(position) is None
+        for position in open_positions
+    ):
+        return None
+
     margin_sum, upnl_sum, count, details = _sum_position_margin_and_upnl(positions)
 
     # MEXC currently omits unrealizedPnl from normalized position rows.  Fill
@@ -297,11 +311,6 @@ def compute_futures_equity(ex) -> Optional[dict]:
     # missing exchange value must have a matching DB row; a partial merge would
     # make an understated account total look complete in the dashboard.
     augmented_source = None
-    open_positions = [
-        position
-        for position in positions
-        if (_position_contracts_abs(position) or 0.0) > 0.0
-    ]
     missing_upnl = [
         detail
         for position, detail in zip(open_positions, details)

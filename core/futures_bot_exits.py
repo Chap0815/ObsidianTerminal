@@ -3116,6 +3116,21 @@ class FuturesExitsMixin:
                 "WARN",
             )
             return
+        if not self.simulation:
+            try:
+                from bot_utils.close_fragments import pending_close_values
+                pending_close_values(d)
+            except Exception as fragment_error:
+                FuturesExitsMixin._block_close_fragment_recovery(
+                    self,
+                    sym,
+                    log_event,
+                    type(fragment_error).__name__,
+                )
+                self._log_error(
+                    f"read durable close fragment {sym}", fragment_error
+                )
+                return
         fill_price = curr
         close_fee = 0.0
         raw_amount = FuturesExitsMixin._safe_nonnegative_amount(

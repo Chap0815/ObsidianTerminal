@@ -486,8 +486,10 @@ def _spot_state_file(log_dir: str, bot_name: str = None,
         is_sim = (bool(read_simulation_flag(bot_name))
                   if mode_is_sim is None else bool(mode_is_sim))
         return sim_state_path(base, is_sim)
-    except Exception:
-        return base
+    except Exception as exc:
+        raise RuntimeError(
+            f"{bot_name}: cannot resolve SIM/LIVE metrics state path"
+        ) from exc
 
 
 def get_open_trades(log_dir: str, bot_name: str = None,

@@ -249,6 +249,8 @@ class WebSocketFeed:
             return self._seq
 
     def _update_cache(self, symbol: str, ticker: dict) -> bool:
+        if not isinstance(ticker, dict):
+            return False
         price = safe_positive_float(ticker.get("last"), 0.0)
         if price <= 0:
             price = safe_positive_float(ticker.get("close"), 0.0)

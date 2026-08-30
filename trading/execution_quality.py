@@ -1092,6 +1092,17 @@ def run_tca_markout_worker(
             except Exception as exc:
                 errors_total += 1
                 silent_log("execution TCA markout worker", exc)
+                try:
+                    connection_closed = close_thread_local_conn()
+                    if connection_closed is False:
+                        raise RuntimeError(
+                            "failed to reset TCA markout SQLite connection"
+                        )
+                except Exception as reset_exc:
+                    silent_log(
+                        "reset TCA markout SQLite connection",
+                        reset_exc,
+                    )
                 wait_interval = max(interval, 5.0)
                 _report_health({
                     "ok": False,

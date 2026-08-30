@@ -13,9 +13,8 @@ Margin model (consistent for LONG and SHORT):
     margin == notional, so spot accounting is plain notional.
   - At close: capital += margin + PnL_after_exit_fee. Net capital change
     openclose == PnL - entry_fee - exit_fee, for ANY leverage.
-  - On force-liquidation: margin and entry fee were already removed at open;
-    liquidation records the full margin loss plus entry/exit fees so reports
-    match the actual capital path.
+  - On force-liquidation: the exact PnL at the linear maintenance boundary is
+    settled and any equity remaining above the realized loss is released.
   - _free_usdt() returns _capital directly  the margin already left _capital
     at open, so there is no separate "used" portion to subtract.
 """
@@ -125,8 +124,8 @@ class SimPosition:
     leverage:    float = 1.0
     original_amount: float = 0.0
     # margin_locked is the USDT amount removed from _capital at open. On close
-    # it is added back to _capital (along with PnL). On liquidation the trade
-    # booked pnl == -margin_locked and no further capital adjustment is needed.
+    # or liquidation it is released together with the exact price-boundary PnL;
+    # entry and exit fees remain separate transaction costs.
     margin_locked: float = 0.0
 
     def __post_init__(self):
@@ -134,21 +133,20 @@ class SimPosition:
             self.original_amount = self.amount
 
     def liquidation_price(self, maint_margin: float = DEFAULT_MAINT_MARGIN) -> float:
-        """Simple isolated-margin liquidation estimate.
+        """Exact linear isolated-margin liquidation price.
 
-        LONG: liquidates when (price/entry - 1) <= -(1/lev - maint_margin)
-              liq = entry * (1 - 1/lev + maint_margin)
-        SHORT: liquidates when (entry/price - 1) <= -(1/lev - maint_margin)
-              liq = entry * (1 + 1/lev - maint_margin)
-        With leverage<=1 the position cannot be liquidated by isolated margin
-        (returns 0 for LONG and inf-like value for SHORT).
+        The maintenance requirement is evaluated on current notional.  Thus a
+        1x long reaches its boundary at zero, while a 1x short still has a
+        finite boundary because a short's loss is unbounded.
         """
         lev = max(1.0, self.leverage)
-        if lev <= 1.0:
-            return 0.0 if self.side == "buy" else 1e18
+        maint = max(0.0, float(maint_margin))
         if self.side == "buy":
-            return self.entry_price * (1.0 - 1.0/lev + maint_margin)
-        return self.entry_price * (1.0 + 1.0/lev - maint_margin)
+            denominator = 1.0 - maint
+            if denominator <= 0.0:
+                return 0.0
+            return self.entry_price * (1.0 - 1.0 / lev) / denominator
+        return self.entry_price * (1.0 + 1.0 / lev) / (1.0 + maint)
 
 
 @dataclass
@@ -256,16 +254,18 @@ class SimulatedExchange:
         """``used`` here is purely informational (sum of currently-locked
         margins)  it does NOT reduce free."""
         with self._state_lock:
-            positions = self.fetch_positions()
+            snapshots = self._position_snapshots_locked(None)
             used = sum(pos.margin_locked for pos in self._positions.values())
             free = self._free_usdt()
-            unrealized = math.fsum(
-                value
-                for row in positions
-                if (value := row.get("unrealizedPnl")) is not None
-                and math.isfinite(value)
-            )
-            total = self._capital + used + unrealized
+            capital = self._capital
+        positions = self._position_rows(snapshots)
+        unrealized = math.fsum(
+            value
+            for row in positions
+            if (value := row.get("unrealizedPnl")) is not None
+            and math.isfinite(value)
+        )
+        total = capital + used + unrealized
         return {
             "USDT":  {"free": free, "used": used,  "total": total},
             "total": {"USDT": total},
@@ -329,19 +329,25 @@ class SimulatedExchange:
             except TypeError:
                 return []
         with self._state_lock:
-            snapshots = [
-                (
-                    symbol,
-                    pos.side,
-                    pos.amount,
-                    pos.entry_price,
-                    pos.leverage,
-                    pos.margin_locked,
-                    pos.liquidation_price(self._maint_margin),
-                )
-                for symbol, pos in self._positions.items()
-                if selected is None or symbol in selected
-            ]
+            snapshots = self._position_snapshots_locked(selected)
+        return self._position_rows(snapshots)
+
+    def _position_snapshots_locked(self, selected):
+        return [
+            (
+                symbol,
+                pos.side,
+                pos.amount,
+                pos.entry_price,
+                pos.leverage,
+                pos.margin_locked,
+                pos.liquidation_price(self._maint_margin),
+            )
+            for symbol, pos in self._positions.items()
+            if selected is None or symbol in selected
+        ]
+
+    def _position_rows(self, snapshots):
         rows = []
         for (
             symbol,
@@ -533,26 +539,23 @@ class SimulatedExchange:
         """Return True if `current_price` would have liquidated the position.
 
         Caller is responsible for force-closing at the liquidation price."""
-        lev = max(1.0, pos.leverage)
-        if lev <= 1.0:
-            return False
         liq = pos.liquidation_price(self._maint_margin)
         if pos.side == "buy":
-            return current_price <= liq
+            return liq > 0.0 and current_price <= liq
         return current_price >= liq
 
     def _force_liquidate(self, symbol: str, pos: SimPosition) -> dict:
-        """Mark position liquidated, settle loss = full margin.
-
-        Margin and entry fee were already removed from _capital at open. The
-        exit/liquidation fee still reduces capital here, and the trade PnL is
-        net of margin loss plus both fees so reports are not optimistic.
-        """
+        """Mark liquidated and settle exact PnL at the maintenance boundary."""
         liq_price = pos.liquidation_price(self._maint_margin)
         margin    = pos.margin_locked
         exit_fee  = pos.amount * liq_price * self._taker_for(symbol)
-        pnl       = -(margin + pos.fee_usdt + exit_fee)
-        self._capital -= exit_fee
+        gross_pnl = (
+            (liq_price - pos.entry_price) * pos.amount
+            if pos.side == "buy"
+            else (pos.entry_price - liq_price) * pos.amount
+        )
+        pnl = gross_pnl - pos.fee_usdt - exit_fee
+        self._capital += margin + gross_pnl - exit_fee
         self._total_fees += exit_fee
         self._liquidations += 1
 

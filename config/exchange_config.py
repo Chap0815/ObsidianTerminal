@@ -352,6 +352,8 @@ _LAST_TIME_RESYNC = {
 _TIME_RESYNC_MIN_INTERVAL = 2.0   # don't refetch server time more than every 2s
 _CLOCK_OFFSET_MAX_AGE_SECONDS = 6.0 * 60.0 * 60.0
 _CLOCK_REFRESH_RETRY_SECONDS = 5.0 * 60.0
+_EXCHANGE_EPOCH_MIN_MS = 946_684_800_000.0  # 2000-01-01 UTC
+_EXCHANGE_EPOCH_MAX_MS = 16_725_225_600_000.0  # 2500-01-01 UTC
 
 
 def _time_resync_exchange_key(ex) -> str:
@@ -378,11 +380,24 @@ def _finite_time_difference(ex) -> float | None:
 def _publish_clock_offset_ms(offset_ms: float) -> None:
     from core.clock import set_exchange_offset_ms
 
-    set_exchange_offset_ms(offset_ms)
-    if abs(offset_ms) >= _CLOCK_DRIFT_WARN_MS:
+    if isinstance(offset_ms, bool):
+        raise ValueError("exchange clock offset must be numeric")
+    try:
+        normalized_offset = float(offset_ms)
+        exchange_epoch_ms = time.time() * 1000.0 + normalized_offset
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("exchange clock offset is invalid") from exc
+    if (
+        not math.isfinite(normalized_offset)
+        or not math.isfinite(exchange_epoch_ms)
+        or not _EXCHANGE_EPOCH_MIN_MS <= exchange_epoch_ms < _EXCHANGE_EPOCH_MAX_MS
+    ):
+        raise ValueError("exchange clock epoch is outside the millisecond contract")
+    set_exchange_offset_ms(normalized_offset)
+    if abs(normalized_offset) >= _CLOCK_DRIFT_WARN_MS:
         _log_event(
             f"[exchange] local clock differs from server by "
-            f"{offset_ms / 1000.0:+.1f}s  using exchange time as truth "
+            f"{normalized_offset / 1000.0:+.1f}s  using exchange time as truth "
             f"(self-healing; no action needed)", "WARN")
 
 
@@ -442,14 +457,13 @@ def resync_time_difference(ex) -> bool:
             if time_difference is None:
                 return False
             offset_ms = -time_difference
+            _publish_clock_offset_ms(offset_ms)
             _LAST_TIME_RESYNC["mono"] = now
             _LAST_TIME_RESYNC["exchange_key"] = exchange_key
             _LAST_TIME_RESYNC["offset_ms"] = offset_ms
             _log_event(
                 "[exchange] clock-skew self-heal: resynced server-time offset "
                 f"(timeDifference={ex.options.get('timeDifference')}ms)", "WARN")
-            # Re-anchor the bot's own wall clock to the refreshed server time.
-            _publish_clock_offset_ms(offset_ms)
             return True
         except Exception as e:
             _silent("resync_time_difference", e)
@@ -725,10 +739,20 @@ def _ensure_markets_loaded(ex) -> bool:
 
 
 def _is_rate_limited(err_str: str) -> bool:
-    s = err_str.lower()
-    if ("510" in s or "too frequent" in s or "too many request" in s
-            or "rate limit" in s or "ratelimit" in s or "429" in s):
-        return True
+    s = str(err_str).lower()
+    try:
+        from bot_utils.network_retry import is_rate_limited
+
+        if is_rate_limited(RuntimeError(err_str)):
+            return True
+    except Exception:
+        if (
+            "too frequent" in s
+            or "too many request" in s
+            or "rate limit" in s
+            or "ratelimit" in s
+        ):
+            return True
     # MEXC surfaces a rate-limited set_leverage as a spurious ArgumentsRequired
     # ("requires ... openType ... positionType")  proven transient; retry it.
     return "opentype" in s and "positiontype" in s

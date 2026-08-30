@@ -19,7 +19,7 @@ import os
 import threading
 import time
 
-from bot_utils.config import _read_config_json
+from bot_utils.config import _read_config_json, parse_explicit_bool
 from launcher.config.settings import BOT_META, BOT_ORDER, CONFIG_FILE
 from launcher.core.runtime_status_values import (
     finite_float_or_none,
@@ -133,17 +133,23 @@ def _runtime_or_config_sim(
             return runtime_sim
     except Exception:
         pass
+    if isinstance(cfg, dict):
+        section = cfg.get(bot)
+        if section is not None:
+            if not isinstance(section, dict):
+                return True
+            raw_simulation = _RUNTIME_STATUS_UNSET
+            for key, value in section.items():
+                if isinstance(key, str) and key.casefold() == "simulation":
+                    raw_simulation = value
+                    break
+            if raw_simulation is not _RUNTIME_STATUS_UNSET:
+                parsed = parse_explicit_bool(raw_simulation)
+                return True if parsed is None else parsed
     try:
         from bot_utils.sim_flag import read_simulation_flag
         return bool(read_simulation_flag(
             bot, raise_on_corrupt=False, default=True))
-    except Exception:
-        pass
-    try:
-        if cfg is None and os.path.exists(CONFIG_FILE):
-            cfg = _read_config_json(CONFIG_FILE)
-        if isinstance(cfg, dict):
-            return bool(cfg.get(bot, {}).get("SIMULATION", True))
     except Exception:
         pass
     return True
@@ -164,6 +170,7 @@ class _ErrorLogCounter:
     SEPARATOR = "=" * 20
     SEPARATOR_BYTES = SEPARATOR.encode("ascii")
     READ_CHUNK_BYTES = 64 * 1024
+    CONTINUITY_BYTES = 64
 
     def __init__(self, path: str = "error_log.txt"):
         self.path = path
@@ -171,6 +178,27 @@ class _ErrorLogCounter:
         self._cached_count = 0
         self._cached_file_id: tuple[int, int] | None = None
         self._cached_mtime_ns = 0
+        self._cached_tail = b""
+
+    def _tail_at(self, end: int) -> bytes:
+        bounded_end = max(0, int(end))
+        start = max(0, bounded_end - self.CONTINUITY_BYTES)
+        with open(self.path, "rb") as stream:
+            stream.seek(start)
+            return stream.read(bounded_end - start)
+
+    def _remember_tail(self, size: int) -> None:
+        self._cached_tail = self._tail_at(size) if size > 0 else b""
+
+    def _append_continuity_matches(self) -> bool:
+        if self._cached_size <= 0:
+            return True
+        if not self._cached_tail:
+            return False
+        start = self._cached_size - len(self._cached_tail)
+        with open(self.path, "rb") as stream:
+            stream.seek(start)
+            return stream.read(len(self._cached_tail)) == self._cached_tail
 
     def _count_range(self, start: int, length: int) -> int:
         separator = self.SEPARATOR_BYTES
@@ -212,6 +240,7 @@ class _ErrorLogCounter:
             self._cached_count = 0
             self._cached_file_id = None
             self._cached_mtime_ns = 0
+            self._cached_tail = b""
             return 0
         except OSError:
             return self._cached_count  # transient  keep last
@@ -242,6 +271,7 @@ class _ErrorLogCounter:
                 self._cached_size = cur_size
                 self._cached_file_id = file_id
                 self._cached_mtime_ns = mtime_ns
+                self._remember_tail(cur_size)
             except Exception:
                 pass
             return self._cached_count
@@ -252,9 +282,29 @@ class _ErrorLogCounter:
             self._cached_count = 0
             self._cached_file_id = file_id
             self._cached_mtime_ns = mtime_ns
+            self._cached_tail = b""
             return 0
 
         # cur_size > cached_size  read only new bytes (tail).
+        # A same-inode truncate/rewrite can regrow beyond the old size between
+        # poll ticks. Verify a tiny old-tail fingerprint before treating growth
+        # as append-only; otherwise the cached count belongs to different
+        # bytes and a full recount is required.
+        try:
+            append_continuity = self._append_continuity_matches()
+        except Exception:
+            append_continuity = False
+        if not append_continuity:
+            try:
+                self._cached_count = self._count_range(0, cur_size)
+                self._cached_size = cur_size
+                self._cached_file_id = file_id
+                self._cached_mtime_ns = mtime_ns
+                self._remember_tail(cur_size)
+            except Exception:
+                pass
+            return self._cached_count
+
         # Use a small overlap to catch separators spanning the boundary.
         delta_start = max(
             0, self._cached_size - (len(self.SEPARATOR_BYTES) - 1)
@@ -275,6 +325,7 @@ class _ErrorLogCounter:
             self._cached_size   = cur_size
             self._cached_file_id = file_id
             self._cached_mtime_ns = mtime_ns
+            self._remember_tail(cur_size)
         except Exception:
             pass  # keep last known on read failure
         return self._cached_count

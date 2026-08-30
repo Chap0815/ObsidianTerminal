@@ -10,7 +10,7 @@ Einmal ausfuehren -> installiert ALLES was der Bot braucht:
 Was es macht:
   1. Prueft Python-Version (empfohlen: 3.12.10; erlaubt 3.10 - 3.12)
   2. Erstellt/benutzt .venv im Projektordner
-  3. Aktualisiert pip/setuptools/wheel im .venv
+  3. Stellt pip offline aus der Python-Distribution im .venv bereit
   4. Installiert alle Pflicht-Pakete hashgeprueft aus requirements.lock.txt
      im .venv (exakt gepinnte, freigegebene Versionen)
   5. VERIFIZIERT jeden Pflicht-Import in einem frischen Subprozess
@@ -32,6 +32,7 @@ import base64
 import json
 import os
 import platform
+import site
 import shutil
 import subprocess
 import sys
@@ -77,6 +78,7 @@ REQ_FILE = PROJECT_ROOT / "requirements.lock.txt"
 VENV_DIR = PROJECT_ROOT / ".venv"
 INSTALL_CONFIG_MAX_BYTES = 2 * 1024 * 1024
 INSTALL_ENV_MAX_BYTES = 1024 * 1024
+INSTALL_IMPORT_TIMEOUT_SECONDS = 60.0
 
 # Empfohlene Zielversion
 TARGET_PY = (3, 12, 10)
@@ -107,6 +109,30 @@ REQUIRED_IMPORTS = [import_name for _spec, import_name in REQUIRED] + [
 ]
 
 DEFAULT_MODEL = "qwen2.5:14b"
+
+
+def _sanitize_python_environment() -> None:
+    inherited_pythonpath = os.environ.pop("PYTHONPATH", "")
+    os.environ.pop("PYTHONHOME", None)
+    os.environ["PYTHONNOUSERSITE"] = "1"
+
+    external_paths = {
+        os.path.normcase(os.path.abspath(item or os.curdir))
+        for item in inherited_pythonpath.split(os.pathsep)
+        if item
+    }
+    external_paths.discard(os.path.normcase(os.path.abspath(PROJECT_ROOT)))
+    user_sites = site.getusersitepackages()
+    if isinstance(user_sites, str):
+        user_sites = [user_sites]
+    external_paths.update(
+        os.path.normcase(os.path.abspath(item)) for item in user_sites if item
+    )
+    sys.path[:] = [
+        item
+        for item in sys.path
+        if os.path.normcase(os.path.abspath(item or os.curdir)) not in external_paths
+    ]
 
 
 def _read_install_text(
@@ -149,8 +175,33 @@ def _running_in_project_venv() -> bool:
         return False
 
 
+def _is_linked_directory(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    return bool(is_junction and is_junction())
+
+
+def _assert_safe_project_venv() -> None:
+    root = Path(os.path.abspath(PROJECT_ROOT))
+    venv = Path(os.path.abspath(VENV_DIR))
+    try:
+        relative = venv.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("project .venv must remain inside the project root") from exc
+    if not relative.parts:
+        raise ValueError("project .venv must not equal the project root")
+
+    current = venv
+    while current != root:
+        if _is_linked_directory(current):
+            raise ValueError(f"project .venv path must not be linked: {current}")
+        current = current.parent
+
+
 def ensure_project_venv() -> None:
     head("[2/10] Lokales .venv vorbereiten")
+    _assert_safe_project_venv()
     if _running_in_project_venv():
         ok(f"nutze .venv: {sys.executable}")
         return
@@ -170,6 +221,7 @@ def ensure_project_venv() -> None:
     else:
         ok(".venv existiert bereits")
 
+    _assert_safe_project_venv()
     info("starte Installer im .venv neu ...")
     env = os.environ.copy()
     env["OBSIDIAN_INSTALL_VENV"] = "1"
@@ -204,23 +256,34 @@ def _pip(*args, capture=True) -> subprocess.CompletedProcess:
 
 def _can_import(module_name: str) -> tuple[bool, str]:
     """Importiert das Modul in einem FRISCHEN Subprozess (echte Verifikation)."""
-    r = subprocess.run(
-        [sys.executable, "-c", f"import {module_name}"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", f"import {module_name}"],
+            capture_output=True,
+            text=True,
+            timeout=INSTALL_IMPORT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            False,
+            f"import timed out after {INSTALL_IMPORT_TIMEOUT_SECONDS:g} seconds",
+        )
     return r.returncode == 0, (r.stderr or "").strip()
 
 
 def upgrade_pip() -> bool:
-    head("[3/10] pip / setuptools / wheel aktualisieren")
-    info("aktualisiere Build-Tooling (still) ...")
-    r = _pip("install", "--upgrade", "pip", "setuptools", "wheel", "--quiet")
+    head("[3/10] pip offline bereitstellen")
+    info("bootstrappe pip aus der Python-Distribution (ohne Netzwerk) ...")
+    r = subprocess.run(
+        [sys.executable, "-m", "ensurepip", "--upgrade"],
+        capture_output=True,
+        text=True,
+    )
     if r.returncode == 0:
-        ok("pip/setuptools/wheel aktuell")
+        ok("pip offline bereit")
         return True
-    warn("pip-Upgrade nicht vollstaendig  -  fahre trotzdem fort.")
-    return True
+    err("Offline-pip-Bootstrap fehlgeschlagen.")
+    return False
 
 
 def install_packages() -> bool:
@@ -425,6 +488,22 @@ def _model_from_config() -> str:
     return DEFAULT_MODEL
 
 
+def _installed_ollama_models() -> set[str] | None:
+    try:
+        result = subprocess.run(
+            ["ollama", "list"], capture_output=True, text=True, timeout=15
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return {
+        line.split()[0]
+        for line in (result.stdout or "").splitlines()
+        if line.strip() and not line.lower().startswith("name")
+    }
+
+
 def pull_model(ollama_ready: bool) -> bool:
     head("[8/10] LLM-Modell laden")
     if not ollama_ready:
@@ -432,27 +511,21 @@ def pull_model(ollama_ready: bool) -> bool:
         return False
     model = _model_from_config()
     info(f"Modell laut bot_config.json: {model}")
-    try:
-        r = subprocess.run(
-            ["ollama", "list"], capture_output=True, text=True, timeout=15
-        )
-        installed = {
-            line.split()[0]
-            for line in (r.stdout or "").splitlines()
-            if line.strip() and not line.lower().startswith("name")
-        }
-        if model in installed:
-            ok(f"{model}  -  bereits vorhanden")
-            return True
-    except Exception:
-        pass
+    installed = _installed_ollama_models()
+    if installed is not None and model in installed:
+        ok(f"{model}  -  bereits vorhanden")
+        return True
     info(f"{model} wird geladen (mehrere GB, kann dauern) ...\n")
     try:
         # Live-Fortschritt durchreichen
         r = subprocess.run(["ollama", "pull", model])
         if r.returncode == 0:
-            ok(f"{model}  -  geladen")
-            return True
+            installed = _installed_ollama_models()
+            if installed is not None and model in installed:
+                ok(f"{model}  -  geladen und verifiziert")
+                return True
+            err(f"{model}  -  Download meldete Erfolg, Modell fehlt aber")
+            return False
         err(f"{model}  -  Download fehlgeschlagen")
         return False
     except Exception as e:
@@ -511,7 +584,8 @@ def check_env() -> bool:
 #
 
 
-def main() -> None:
+def main() -> int:
+    _sanitize_python_environment()
     print(f"""
 {C.BOLD}{C.B}
    OBSIDIAN TRADING TERMINAL  -  Installer (Python 3.12)    
@@ -522,12 +596,13 @@ def main() -> None:
     if not check_python():
         err("\nAbbruch  -  inkompatible Python-Version.")
         input("\nEnter zum Beenden ...")
-        return
+        return 1
     ensure_project_venv()
 
     steps: list[tuple[str, bool]] = []
-    upgrade_pip()
-    steps.append(("Pakete", install_packages()))
+    pip_ready = upgrade_pip()
+    steps.append(("Pip", pip_ready))
+    steps.append(("Pakete", pip_ready and install_packages()))
     steps.append(("Imports", verify_imports()))
     steps.append(("Git", ensure_git()))
     ollama_ready = check_ollama()
@@ -541,7 +616,7 @@ def main() -> None:
     for name, success in steps:
         (ok if success else err)(name)
         # Pakete + Imports sind harte Voraussetzungen
-        if not success and name in ("Pakete", "Imports"):
+        if not success and name in ("Pip", "Pakete", "Imports"):
             hard_fail = True
 
     print()
@@ -570,13 +645,17 @@ def main() -> None:
 
     print()
     input("Enter zum Beenden ...")
+    return 1 if hard_fail else 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        _exit_code = main()
     except KeyboardInterrupt:
         print("\n\nAbgebrochen.")
+        _exit_code = 130
     except Exception as e:
         print(f"\n{C.R}Unerwarteter Fehler: {e}{C.END}")
         input("\nEnter zum Beenden ...")
+        _exit_code = 1
+    raise SystemExit(_exit_code)

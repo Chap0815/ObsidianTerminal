@@ -204,7 +204,8 @@ class TrendFuturesBot(FuturesBot):
                 if opened.tzinfo is None:
                     opened = opened.replace(tzinfo=timezone.utc)
                 ts = opened.timestamp()
-            return max(0.0, (time.time() - ts) / 60.0)
+            age_minutes = (time.time() - ts) / 60.0
+            return age_minutes if age_minutes >= 0.0 else None
         except Exception:
             return None
 
@@ -735,10 +736,10 @@ class TrendFuturesBot(FuturesBot):
         iv = self._check_interval_sec()
         log_event(f"Trend-Futures engine started (tf={self._timeframe()}, "
                   f"check every {iv//60}min, long-only)", "INFO")
-        last_check = 0.0
+        last_check = time.monotonic() - iv
         while not self._shutdown_event.is_set():
             try:
-                now = time.time()
+                now = time.monotonic()
                 if now - last_check >= iv:
                     last_check = now
                     self._trend_tick()
@@ -1760,7 +1761,20 @@ class TrendFuturesBot(FuturesBot):
                 "entry_quality_label": entry_shadow.get("entry_quality_label"),
                 "entry_quality_reasons": entry_shadow.get("entry_quality_reasons"),
             })
-        return self.state.add(base, row) is not False
+        stored = self.state.add(base, row) is not False
+        if stored and getattr(self, "simulation", None) is False:
+            wakeup = getattr(self, "_reconcile_wakeup_event", None)
+            if wakeup is not None:
+                try:
+                    wakeup.set()
+                except Exception as exc:
+                    try:
+                        self._log_error(
+                            f"trend post-fill reconcile wakeup {base}", exc
+                        )
+                    except Exception:
+                        pass
+        return stored
 
     def _rollback_untracked_live_entry(
         self,

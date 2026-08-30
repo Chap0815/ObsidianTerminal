@@ -315,10 +315,12 @@ def _aggregate_spot_sell_trades(
     eligible_trades = []
     for trade in trades:
         if not isinstance(trade, dict):
-            continue
+            return 0.0, 0.0, "unavailable"
         if not explicit_trade_symbol_matches(trade, pair):
             continue
         timestamp_ms = _trade_timestamp_ms_or_none(trade)
+        if timestamp_ms is None and _trade_side(trade) == "sell":
+            return 0.0, 0.0, "unavailable"
         if timestamp_ms is not None and timestamp_ms > future_ceiling_ms:
             return 0.0, 0.0, "unavailable"
         if timestamp_ms is None or timestamp_ms < boundary_ms:
@@ -336,7 +338,7 @@ def _aggregate_spot_sell_trades(
         amt = _trade_amount(t)
         price = _trade_price(t)
         if amt <= 0 or price <= 0:
-            continue
+            return 0.0, 0.0, "unavailable"
         take = min(amt, max(0.0, target - qty))
         if take <= 0:
             break

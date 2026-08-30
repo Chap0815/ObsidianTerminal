@@ -20,6 +20,7 @@ from typing import BinaryIO
 from update_barrier import (
     UpdateInProgressError,
     assert_process_start_allowed,
+    ensure_runtime_install_mutex,
     process_start_guard,
 )
 
@@ -313,6 +314,7 @@ def _single_supervisor_lock(root: Path):
 
 
 def main() -> int:
+    ensure_runtime_install_mutex()
     with _single_supervisor_lock(_PROJECT_ROOT) as acquired:
         if not acquired:
             return 0

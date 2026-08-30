@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import sys
 import tokenize
+from pathlib import Path
 
 sys.dont_write_bytecode = True
 
@@ -33,7 +34,29 @@ if PROJECT_ROOT not in sys.path:
 
 from launcher.tool_processes import guard_tool_entrypoint  # noqa: E402
 
-guard_tool_entrypoint(__file__, __name__)
+
+def _guard_selftest_entrypoint() -> None:
+    if __name__ != "__main__":
+        return
+    # A vanilla release source is an immutable packaging input, not an
+    # installed runtime.  The normal lifecycle guard deliberately creates its
+    # durable lock under logs/, which would contaminate that input and make a
+    # subsequent release check fail.  Preserve the marker check without
+    # creating runtime state in a *_Release tree.
+    if not os.path.isdir(TESTS_DIR) and Path(PROJECT_ROOT).name.endswith(
+        "_Release"
+    ):
+        from update_barrier import update_marker_exists
+
+        if update_marker_exists(PROJECT_ROOT):
+            raise SystemExit(
+                "Update laeuft oder erfordert Recovery; Selbsttest abgebrochen."
+            )
+        return
+    guard_tool_entrypoint(__file__, __name__)
+
+
+_guard_selftest_entrypoint()
 
 from tools.release_requirements import REQUIRED_RELEASE_ITEMS  # noqa: E402
 
@@ -67,6 +90,17 @@ def _smoke_without_tests() -> int:
         return 1
 
     failed = []
+    sources = []
+    try:
+        with os.scandir(PROJECT_ROOT) as entries:
+            for entry in entries:
+                if (
+                    entry.is_file(follow_symlinks=False)
+                    and entry.name.lower().endswith((".py", ".pyw"))
+                ):
+                    sources.append(entry.path)
+    except OSError as exc:
+        failed.append(f"release root unreadable: {exc}")
     for folder in (
         "bot_utils",
         "bots",
@@ -83,15 +117,16 @@ def _smoke_without_tests() -> int:
             continue
         for base, _dirs, files in os.walk(root):
             for name in files:
-                if not name.endswith(".py"):
+                if not name.lower().endswith((".py", ".pyw")):
                     continue
-                path = os.path.join(base, name)
-                try:
-                    with tokenize.open(path) as fh:
-                        source = fh.read()
-                    compile(source, path, "exec")
-                except Exception as exc:
-                    failed.append(f"{os.path.relpath(path, PROJECT_ROOT)}: {exc}")
+                sources.append(os.path.join(base, name))
+    for path in sources:
+        try:
+            with tokenize.open(path) as fh:
+                source = fh.read()
+            compile(source, path, "exec")
+        except Exception as exc:
+            failed.append(f"{os.path.relpath(path, PROJECT_ROOT)}: {exc}")
     if failed:
         print(" Smoke compile failed:")
         for item in failed[:25]:

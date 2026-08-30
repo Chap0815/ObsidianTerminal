@@ -91,6 +91,22 @@ def _redact_text(text: str) -> str:
     return out
 
 
+def _safe_local_error_text(exc: BaseException) -> str:
+    try:
+        return _redact_text(str(exc))[:300]
+    except Exception:
+        return type(exc).__name__
+
+
+def _local_unavailable(message: str) -> dict:
+    return {
+        "ok": False,
+        "reason": "local_unavailable",
+        "message": message,
+        "last_update": _last_update_status(),
+    }
+
+
 def _find_git() -> str:
     return find_git()
 
@@ -219,13 +235,31 @@ def check_update() -> dict:
 
     local_hash = ""
     local_ahead = False
-    if is_valid_git_worktree(ROOT):
-        local = _run([git, "rev-parse", "HEAD"], timeout=15)
-        if local.returncode == 0:
-            local_hash = _parse_git_object_id(local.stdout)
-        if local_hash and local_hash != remote_hash:
-            ahead = _run([git, "merge-base", "--is-ancestor", remote_hash, "HEAD"], timeout=15)
-            local_ahead = ahead.returncode == 0
+    try:
+        valid_worktree = is_valid_git_worktree(ROOT, raise_on_error=True)
+    except subprocess.TimeoutExpired:
+        return _local_unavailable(
+            "Update-Check Timeout beim lokalen Git-Stand."
+        )
+    except Exception as exc:
+        return _local_unavailable(_safe_local_error_text(exc))
+    if valid_worktree:
+        try:
+            local = _run([git, "rev-parse", "HEAD"], timeout=15)
+            if local.returncode == 0:
+                local_hash = _parse_git_object_id(local.stdout)
+            if local_hash and local_hash != remote_hash:
+                ahead = _run(
+                    [git, "merge-base", "--is-ancestor", remote_hash, "HEAD"],
+                    timeout=15,
+                )
+                local_ahead = ahead.returncode == 0
+        except subprocess.TimeoutExpired:
+            return _local_unavailable(
+                "Update-Check Timeout beim lokalen Git-Stand."
+            )
+        except Exception as exc:
+            return _local_unavailable(_safe_local_error_text(exc))
 
     update_available = ((not local_hash) or local_hash != remote_hash) and not local_ahead
     return {

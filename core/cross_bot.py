@@ -43,6 +43,18 @@ from trading.xsec_signal import (
 
 _REBALANCE_STATE_PARAM = "REBALANCE_STATE_V2"
 _REBALANCE_STATE_SCHEMA = 1
+
+
+def _force_rebalance_token(value) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        generation = float(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(generation) or generation < 0:
+        return None
+    return generation
 _MONITOR_TICKER_BATCH_SIZE = 20
 
 
@@ -1670,8 +1682,8 @@ class CrossBot(FuturesBot):
         # a short settle window afterwards.
         self._rebalance_in_progress = False
         self._neutrality_settle_until = 0.0
-        self._last_rebalance_attempt = 0.0
-        self._last_topup_attempt = 0.0
+        self._last_rebalance_attempt = float("-inf")
+        self._last_topup_attempt = float("-inf")
         self._cross_scan_consecutive_errors = 0
         self._cross_scan_last_operation = ""
         self._cross_scan_last_error = ""
@@ -1688,9 +1700,11 @@ class CrossBot(FuturesBot):
         # button press from a PREVIOUS run doesn't fire a rebalance on boot.
         try:
             from core.database import get_param as _gp
-            self._force_token_seen = float(_gp(self.BOT_NAME, "FORCE_REBALANCE", 0) or 0)
+            self._force_token_seen = _force_rebalance_token(
+                _gp(self.BOT_NAME, "FORCE_REBALANCE", 0)
+            )
         except Exception:
-            self._force_token_seen = 0.0
+            self._force_token_seen = None
         POLL_SEC = 30
         while not self._shutdown_event.is_set():
             operation = "poll"
@@ -1698,7 +1712,7 @@ class CrossBot(FuturesBot):
                 forced = self._consume_force_rebalance()
                 if forced and not CrossBot._load_rebalance_state(self):
                     raise RuntimeError("cross rebalance state unavailable")
-                now = time.time()
+                now = time.monotonic()
                 rebal_ready = forced or (now - self._last_rebalance_attempt) >= 290.0
                 if (forced or self._due_for_rebalance()) and rebal_ready:
                     # Manual force runs immediately; automatic (slot/empty)
@@ -1749,11 +1763,19 @@ class CrossBot(FuturesBot):
         seen within ~one param-cache TTL (60s) of the press."""
         try:
             from core.database import get_param
-            token = float(get_param(self.BOT_NAME, "FORCE_REBALANCE", 0) or 0)
+            generation = _force_rebalance_token(
+                get_param(self.BOT_NAME, "FORCE_REBALANCE", 0)
+            )
         except Exception:
             return False
-        if token > getattr(self, "_force_token_seen", 0.0):
-            self._force_token_seen = token
+        if generation is None:
+            return False
+        seen = getattr(self, "_force_token_seen", None)
+        if seen is None:
+            self._force_token_seen = generation
+            return False
+        if generation > seen:
+            self._force_token_seen = generation
             return True
         return False
 
@@ -3294,6 +3316,26 @@ class CrossBot(FuturesBot):
         live_close_already_verified = False
         pending_accounting = bool(d.get("accounting_pending"))
         pending_oid = d.get("pending_close_order_id")
+        if not self.simulation and any(
+            key in d
+            for key in (
+                "pending_close_filled_amount",
+                "pending_close_notional_sum",
+                "pending_close_price",
+                "pending_close_fee",
+            )
+        ):
+            try:
+                from bot_utils.close_fragments import pending_close_values
+
+                pending_close_values(d)
+            except (TypeError, ValueError, OverflowError):
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: invalid pending close fragment - "
+                    "state kept for reconcile/offline accounting",
+                    "WARN",
+                )
+                return
 
         def _pending_fragment_is_complete(
             fragment_amount: float,

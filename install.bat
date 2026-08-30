@@ -3,7 +3,11 @@ REM ================================================================
 REM   OBSIDIAN TRADING TERMINAL - One-Click Installer (Doppelklick)
 REM   Stellt bei Bedarf Python 3.12 bereit und installiert dann alles.
 REM ================================================================
-setlocal enableextensions
+setlocal enableextensions enabledelayedexpansion
+set PYTHONPATH=
+set PYTHONHOME=
+set PYTHONNOUSERSITE=1
+set RC=1
 title Obsidian Trading Terminal - Installer
 cd /d "%~dp0"
 
@@ -16,6 +20,7 @@ py -3.12 --version >nul 2>nul
 if %errorlevel%==0 (
     echo   [OK] Python 3.12 gefunden ^(py -3.12^).
     py -3.12 install.py
+    set RC=!ERRORLEVEL!
     goto :end
 )
 
@@ -24,6 +29,7 @@ python --version >nul 2>nul
 if %errorlevel%==0 (
     echo   [OK] python im PATH gefunden.
     python install.py
+    set RC=!ERRORLEVEL!
     goto :end
 )
 
@@ -37,6 +43,7 @@ if %errorlevel%==0 (
     if %errorlevel%==0 (
         echo   [OK] Python 3.12 installiert. Starte Installer erneut...
         py -3.12 install.py
+        set RC=!ERRORLEVEL!
         goto :end
     )
     echo.
@@ -58,4 +65,4 @@ echo.
 pause
 
 :end
-endlocal
+endlocal & exit /b %RC%

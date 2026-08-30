@@ -18,6 +18,7 @@ import os
 import math
 import time as _time
 import statistics
+from bisect import bisect_left
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -128,6 +129,41 @@ def calc_round_trip(use_maker: bool = False, strategy: str = "TREND") -> float:
     buy = (maker if use_maker else taker) + SLIPPAGE_PER_SIDE
     sell = taker + SLIPPAGE_PER_SIDE
     return buy + sell
+
+
+def _round_trip_cost_rates(
+    params: dict, *, use_maker: bool, strategy: str
+) -> tuple[float, float]:
+    """Return entry/exit cost rates on their respective quote notionals."""
+    raw = params.get("round_trip_cost_bps")
+    if raw is not None:
+        total = _round_trip_cost_rate(
+            params, use_maker=use_maker, strategy=strategy
+        )
+        return total / 2.0, total / 2.0
+    taker = FUTURES_TAKER_FEE if strategy == "FUTURES" else SPOT_TAKER_FEE
+    entry = (BACKTEST_MAKER_FEE_RATE if use_maker else taker) + SLIPPAGE_PER_SIDE
+    exit_ = taker + SLIPPAGE_PER_SIDE
+    return entry, exit_
+
+
+def _position_cost_usdt(
+    *,
+    entry_notional: float,
+    entry_price: float,
+    exit_price: float,
+    entry_rate: float,
+    exit_rate: float,
+) -> float:
+    """Charge each side on the quote notional actually transacted."""
+    if entry_notional <= 0.0 or entry_price <= 0.0 or exit_price <= 0.0:
+        raise ValueError("position cost requires positive notionals and prices")
+    base_amount = entry_notional / entry_price
+    exit_notional = base_amount * exit_price
+    cost = entry_notional * entry_rate + exit_notional * exit_rate
+    if not math.isfinite(cost) or cost < 0.0:
+        raise ValueError("position cost is invalid")
+    return cost
 
 
 def _round_trip_cost_rate(
@@ -441,6 +477,11 @@ def precompute_index(history: dict) -> tuple:
         rsis = df["rsi"].tolist()
         macds = df["macd_h"].tolist()
         times = df["dt"].tolist()
+        funding_marks = (
+            df["funding_mark_price"].tolist()
+            if "funding_mark_price" in df.columns
+            else [None] * len(df)
+        )
         n = len(df)
 
         # Entry evidence computed on the closed signal bar.  The live screener
@@ -484,11 +525,14 @@ def precompute_index(history: dict) -> tuple:
             if i >= 24 and closes[i - 24] > 0:
                 change_24h = (closes[i] - closes[i - 24]) / closes[i - 24] * 100
             next_open = opens[i + 1] if i + 1 < n else None
+            next_time = times[i + 1] if i + 1 < n else None
             lookup[t] = {
                 "price": closes[i],
                 "high": highs[i],
                 "low": lows[i],
                 "next_open": next_open,
+                "next_time": next_time,
+                "funding_mark_price": funding_marks[i],
                 "change": change_24h,
                 "rsi": rsis[i],
                 "macd_h": macds[i],
@@ -642,12 +686,11 @@ def _liq_price(
     side: str, entry: float, leverage: float, maint: float = DEFAULT_MAINT_MARGIN
 ) -> float:
     lev = max(1.0, leverage)
-    if lev <= 1.0:
-        # No isolated-margin liquidation at 1x leverage
-        return 0.0 if side == "LONG" else 1e18
+    maint = max(0.0, float(maint))
     if side == "LONG":
-        return entry * (1.0 - 1.0 / lev + maint)
-    return entry * (1.0 + 1.0 / lev - maint)
+        denominator = 1.0 - maint
+        return entry * (1.0 - 1.0 / lev) / denominator if denominator > 0.0 else 0.0
+    return entry * (1.0 + 1.0 / lev) / (1.0 + maint)
 
 
 def _bar_excursion_pct(
@@ -718,7 +761,13 @@ def _funding_cost(
     *,
     symbol: str | None = None,
     funding_timeline=None,
+    entry_price: float | None = None,
+    mark_price_resolver=None,
 ) -> float:
+    entry_value = _finite_backtest_value(entry_price, 0.0)
+    if notional < 0.0 or (notional > 0.0 and entry_value <= 0.0):
+        raise ValueError("funding requires positive entry evidence")
+    base_amount = notional / entry_value if notional > 0.0 else 0.0
     if funding_timeline is not None:
         if not symbol:
             raise ValueError("historical funding requires a symbol")
@@ -729,14 +778,36 @@ def _funding_cost(
             entry_time,
             exit_time,
             require_complete=True,
+            base_amount=base_amount,
+            mark_price_resolver=mark_price_resolver,
         ).cost_usdt
     if not funding_8h:
         return 0.0
-    n_settle = count_funding_settlements(
-        _to_epoch_sec(entry_time), _to_epoch_sec(exit_time)
-    )
+    entry_seconds = _to_epoch_sec(entry_time)
+    exit_seconds = _to_epoch_sec(exit_time)
+    n_settle = count_funding_settlements(entry_seconds, exit_seconds)
+    if n_settle == 0:
+        return 0.0
+    if mark_price_resolver is None:
+        raise ValueError("funding settlement marks are unavailable")
+    period = 8 * 3600
+    settlement = (math.floor(entry_seconds / period) + 1) * period
+    settlement_notionals = []
+    while settlement <= exit_seconds:
+        mark = _finite_backtest_value(
+            mark_price_resolver(
+                datetime.fromtimestamp(settlement, tz=timezone.utc)
+            ),
+            0.0,
+        )
+        if mark <= 0.0:
+            raise ValueError("funding settlement mark is unavailable")
+        settlement_notionals.append(base_amount * mark)
+        settlement += period
+    if len(settlement_notionals) != n_settle:
+        raise ValueError("funding settlement evidence is inconsistent")
     signed_rate = funding_8h if side == "LONG" else -funding_8h
-    return signed_rate * n_settle * notional
+    return signed_rate * math.fsum(settlement_notionals)
 
 
 def _closed_trade_record(
@@ -878,10 +949,8 @@ def simulate_fast(
     params: dict = None,
 ) -> dict:
     p = params or {}
-    RT = _round_trip_cost_rate(
-        p,
-        use_maker=use_maker,
-        strategy=strategy,
+    entry_cost_rate, exit_cost_rate = _round_trip_cost_rates(
+        p, use_maker=use_maker, strategy=strategy
     )
     defaults = STRATEGY_DEFAULTS.get(strategy, STRATEGY_DEFAULTS["TREND"])
 
@@ -929,6 +998,46 @@ def simulate_fast(
         getattr(funding_timeline, "charge", None)
     ):
         raise ValueError("historical_funding_timeline must provide charge()")
+    funding_mark_series = {}
+    for symbol, rows in indexed.items():
+        points = sorted(
+            (
+                _to_epoch_sec(timestamp),
+                (
+                    _to_epoch_sec(tick["next_time"])
+                    if tick.get("next_time") is not None
+                    else None
+                ),
+                float(tick.get("funding_mark_price") or 0.0),
+            )
+            for timestamp, tick in rows.items()
+            if isinstance(tick, dict)
+            and _finite_backtest_value(
+                tick.get("funding_mark_price"), 0.0
+            ) > 0.0
+        )
+        funding_mark_series[symbol] = (
+            [point[0] for point in points],
+            points,
+        )
+
+    def funding_mark_resolver(symbol: str):
+        timestamps, points = funding_mark_series.get(symbol, ((), ()))
+
+        def resolve(settlement_time):
+            target = _to_epoch_sec(settlement_time)
+            exact = bisect_left(timestamps, target)
+            if exact < len(points) and timestamps[exact] == target:
+                # Point-in-time capture at the settlement itself.
+                if points[exact][1] is None:
+                    return points[exact][2]
+            prior = exact - 1
+            if prior >= 0 and points[prior][1] == target:
+                # OHLC close is observed at the exclusive end of its bar.
+                return points[prior][2]
+            return None
+
+        return resolve
     position_limit = _backtest_position_limit(strategy)
     position_size = _bounded_backtest_float(
         p.get("position_size", POSITION_SIZE) or POSITION_SIZE,
@@ -1194,7 +1303,13 @@ def simulate_fast(
             )
             notional = float(trade.get("inv") or 0.0) * leverage
             gross_p = notional * profit_pct / 100.0
-            fees = notional * RT
+            fees = _position_cost_usdt(
+                entry_notional=notional,
+                entry_price=entry,
+                exit_price=exit_price,
+                entry_rate=entry_cost_rate,
+                exit_rate=exit_cost_rate,
+            )
             funding = _funding_cost(
                 funding_8h,
                 side,
@@ -1203,6 +1318,8 @@ def simulate_fast(
                 now,
                 symbol=sym,
                 funding_timeline=funding_timeline,
+                entry_price=entry,
+                mark_price_resolver=funding_mark_resolver(sym),
             )
             rec = _closed_trade_record(
                 trade,
@@ -1241,64 +1358,68 @@ def simulate_fast(
             curr = tick["price"]
             bar_high = tick.get("high", curr)
             bar_low = tick.get("low", curr)
+            d["_bar_start_mfe_pct"] = d.get("mfe_pct", 0.0)
+            d["_bar_start_break_even"] = bool(d.get("break_even"))
             _update_excursions(d, side, bar_high, bar_low)
-            if leverage > 1.0:
-                liq = d.get("liq_price")
-                if liq is not None:
-                    liquidated = False
-                    # Intra-bar high/low, NOT the bar close: a real exchange
-                    # liquidates the instant price touches the liq level, even if
-                    # it wicks back by close. Checking only `curr` (close) let
-                    # leveraged positions survive a piercing wick in sim and
-                    # understated liquidation frequency / overstated edge. Mirrors
-                    # the stop-loss fills below, which already use bar_low/bar_high.
-                    if side == "LONG" and bar_low <= liq:
-                        liquidated = True
-                    elif side == "SHORT" and bar_high >= liq:
-                        liquidated = True
-                    if liquidated:
-                        # PnL = -margin (full margin loss)
-                        notional = d["inv"] * leverage
-                        loss_pct = -100.0 / leverage  #  -100% of margin
-                        gross_p = -d["inv"]  # lose the margin
-                        fees = notional * RT
-                        # No funding charged on top of a liquidation: the full
-                        # margin wipeout already subsumes funding accrued during
-                        # the hold (loss is capped at -margin in reality).
-                        rec = _closed_trade_record(
-                            d,
-                            now,
-                            "liquidation",
-                            loss_pct,
-                            gross_p,
-                            fees,
-                            0.0,
-                            notional,
-                            False,
-                            True,
+            liq = d.get("liq_price")
+            if liq is not None and liq > 0.0:
+                liquidated = False
+                # Intra-bar high/low, NOT the bar close: a real exchange
+                # liquidates the instant price touches the liq level, even if
+                # it wicks back by close.
+                if side == "LONG" and bar_low <= liq:
+                    liquidated = True
+                elif side == "SHORT" and bar_high >= liq:
+                    liquidated = True
+                if liquidated:
+                    notional = d["inv"] * leverage
+                    loss_pct = (
+                        (d["buy"] - liq) / d["buy"] * 100.0
+                        if side == "SHORT"
+                        else (liq - d["buy"]) / d["buy"] * 100.0
+                    )
+                    gross_p = notional * loss_pct / 100.0
+                    fees = _position_cost_usdt(
+                        entry_notional=notional,
+                        entry_price=d["buy"],
+                        exit_price=liq,
+                        entry_rate=entry_cost_rate,
+                        exit_rate=exit_cost_rate,
+                    )
+                    rec = _closed_trade_record(
+                        d,
+                        now,
+                        "liquidation",
+                        loss_pct,
+                        gross_p,
+                        fees,
+                        0.0,
+                        notional,
+                        False,
+                        True,
+                    )
+                    closed_trades.append(rec)
+                    total_costs += rec["cost"]
+                    total_gross += gross_p
+                    liquidations += 1
+                    recent_full_rows.append(
+                        (rec["net"], float(d.get("inv") or 0.0))
+                    )
+                    day = _backtest_local_day(now, daily_loss_timezone)
+                    daily_realized_by_day[day] = (
+                        daily_realized_by_day.get(day, 0.0) + rec["net"]
+                    )
+                    if (
+                        cooldown_after_stop_minutes > 0
+                        and _protective_exit_requires_cooldown(
+                            "liquidation", rec["net"]
                         )
-                        closed_trades.append(rec)
-                        total_costs += rec["cost"]
-                        total_gross += gross_p
-                        liquidations += 1
-                        recent_full_rows.append(
-                            (rec["net"], float(d.get("inv") or 0.0))
+                    ):
+                        cooldown_until[sym] = _backtest_cooldown_expiry(
+                            now, cooldown_after_stop_minutes
                         )
-                        day = _backtest_local_day(now, daily_loss_timezone)
-                        daily_realized_by_day[day] = (
-                            daily_realized_by_day.get(day, 0.0) + rec["net"]
-                        )
-                        if (
-                            cooldown_after_stop_minutes > 0
-                            and _protective_exit_requires_cooldown(
-                                "liquidation", rec["net"]
-                            )
-                        ):
-                            cooldown_until[sym] = _backtest_cooldown_expiry(
-                                now, cooldown_after_stop_minutes
-                            )
-                        del open_trades[sym]
-                        continue
+                    del open_trades[sym]
+                    continue
 
         _evaluate_daily_loss(now)
         _flatten_for_daily_loss(now)
@@ -1322,20 +1443,10 @@ def simulate_fast(
             prev_highest = d["highest"]
             prev_lowest = d.get("lowest", d["buy"])
 
-            # Frher Breakeven-Trigger (spiegelt Live-Bot BREAKEVEN_TRIGGER):
-            # greift VOR dem Partial-TP. Sobald der Gewinn be_trig erreicht,
-            # wird der Stop auf den Einstieg gezogen (break_even=True). Genau
-            # dieser Mechanismus wrgt live Trades bei kleinem Plus ab, wenn
-            # be_trig << act ist. Bei be_trig=0 bleibt alles wie bisher.
-            if (
-                be_trig > 0
-                and not d.get("break_even")
-                and d.get("mfe_pct", 0.0) >= be_trig
-            ):
-                d["break_even"] = True
-
             curr_highest = max(prev_highest, bar_high)
             curr_lowest = min(prev_lowest, bar_low)
+            bar_start_mfe = d.get("_bar_start_mfe_pct", 0.0)
+            break_even_was_active = d.get("_bar_start_break_even") is True
             full_exits = []
             liq_safety_price = _liq_safety_exit_price(
                 side=side,
@@ -1357,7 +1468,7 @@ def simulate_fast(
                     sl_price = d["buy"] * (1 + stop_loss / 100)
                     if bar_low <= sl_price:
                         full_exits.append(("stoploss", sl_price))
-            if d.get("break_even"):
+            if break_even_was_active:
                 if side == "SHORT" and bar_high >= d["buy"]:
                     full_exits.append(("break_even", d["buy"]))
                 elif side != "SHORT" and bar_low <= d["buy"]:
@@ -1382,14 +1493,14 @@ def simulate_fast(
                     now=_backtest_utc_datetime(now),
                 ):
                     full_exits.append(("aged_mfe_fallback", curr))
-            if d.get("mfe_pct", 0.0) >= act:
+            if bar_start_mfe >= act:
                 effective_trail = post_partial_trail if d["partial"] else trail
                 if side == "SHORT":
-                    trail_level = curr_lowest * (1 + effective_trail / 100)
+                    trail_level = prev_lowest * (1 + effective_trail / 100)
                     if bar_high >= trail_level:
                         full_exits.append(("trailing", trail_level))
                 else:
-                    trail_level = curr_highest * (1 - effective_trail / 100)
+                    trail_level = prev_highest * (1 - effective_trail / 100)
                     if bar_low <= trail_level:
                         full_exits.append(("trailing", trail_level))
             if full_exits:
@@ -1404,7 +1515,13 @@ def simulate_fast(
                 realized_prof = _exit_pct((reason, exit_price))
                 notional = d["inv"] * leverage
                 gross_p = notional * (realized_prof / 100)
-                fees = notional * RT
+                fees = _position_cost_usdt(
+                    entry_notional=notional,
+                    entry_price=d["buy"],
+                    exit_price=exit_price,
+                    entry_rate=entry_cost_rate,
+                    exit_rate=exit_cost_rate,
+                )
                 funding = _funding_cost(
                     funding_8h,
                     side,
@@ -1413,6 +1530,8 @@ def simulate_fast(
                     now,
                     symbol=sym,
                     funding_timeline=funding_timeline,
+                    entry_price=d["buy"],
+                    mark_price_resolver=funding_mark_resolver(sym),
                 )
                 rec = _closed_trade_record(
                     d,
@@ -1446,11 +1565,31 @@ def simulate_fast(
                 del open_trades[sym]
                 continue
 
+            if (
+                be_trig > 0.0
+                and not d.get("break_even")
+                and d.get("mfe_pct", 0.0) >= be_trig
+            ):
+                # OHLC has no high/low ordering. Arm now, but never apply a
+                # newly-created stop retroactively to this same bar's low/high.
+                d["break_even"] = True
+
             if not d["partial"] and d.get("mfe_pct", 0.0) >= act:
                 sa = d["inv"] * part_pct
                 notional = sa * leverage
                 gross_p = notional * (act / 100)
-                fees = notional * RT
+                partial_exit_price = d["buy"] * (
+                    1.0 - act / 100.0
+                    if side == "SHORT"
+                    else 1.0 + act / 100.0
+                )
+                fees = _position_cost_usdt(
+                    entry_notional=notional,
+                    entry_price=d["buy"],
+                    exit_price=partial_exit_price,
+                    entry_rate=entry_cost_rate,
+                    exit_rate=exit_cost_rate,
+                )
                 funding = _funding_cost(
                     funding_8h,
                     side,
@@ -1459,6 +1598,8 @@ def simulate_fast(
                     now,
                     symbol=sym,
                     funding_timeline=funding_timeline,
+                    entry_price=d["buy"],
+                    mark_price_resolver=funding_mark_resolver(sym),
                 )
                 rec = _closed_trade_record(
                     d,
@@ -1613,11 +1754,16 @@ def simulate_fast(
                 "long_entry_price" if side == "LONG" else "short_entry_price",
                 tick.get("next_open"),
             )
-            candidates.append((abs(chg), sym, tick["price"], entry_price, side))
+            entry_time = tick.get("next_time", now)
+            candidates.append(
+                (abs(chg), sym, tick["price"], entry_price, side, entry_time)
+            )
             entry_filter_counts["candidates"] += 1
 
         candidates.sort(reverse=True)
-        for _, sym, signal_price, next_open, side in candidates[:top_n_per_scan]:
+        for (
+            _, sym, signal_price, next_open, side, entry_time
+        ) in candidates[:top_n_per_scan]:
             if len(open_trades) >= max_open_trades:
                 break
             if next_open is None:
@@ -1633,7 +1779,7 @@ def simulate_fast(
                 "side": side,
                 "partial": False,
                 "break_even": False,
-                "entry_now": now,
+                "entry_now": entry_time,
                 "mfe_pct": 0.0,
                 "mae_pct": 0.0,
                 "realized_net": 0.0,
@@ -1665,7 +1811,13 @@ def simulate_fast(
             )
             notional = float(d.get("inv", 0.0) or 0.0) * leverage
             gross_p = notional * (profit_pct / 100.0)
-            fees = notional * RT
+            fees = _position_cost_usdt(
+                entry_notional=notional,
+                entry_price=entry,
+                exit_price=exit_price,
+                entry_rate=entry_cost_rate,
+                exit_rate=exit_cost_rate,
+            )
             funding = _funding_cost(
                 funding_8h,
                 side,
@@ -1674,6 +1826,8 @@ def simulate_fast(
                 end_time,
                 symbol=sym,
                 funding_timeline=funding_timeline,
+                entry_price=entry,
+                mark_price_resolver=funding_mark_resolver(sym),
             )
             rec = _closed_trade_record(
                 d,
@@ -1735,6 +1889,7 @@ def _empty_backtest_stats(invalid_reason: str | None = None) -> dict:
         "position_net_trades": [],
         "closed_trades": [],
         "closed_positions": [],
+        "initial_capital": INITIAL_CAPITAL,
     }
     if invalid_reason is not None:
         stats["invalid_reason"] = invalid_reason
@@ -1785,6 +1940,7 @@ def _closed_position_summaries(trades: list[dict]) -> list[dict] | None:
                 "exit_time": trade.get("exit_time"),
                 "net": trade["net"],
                 "net_pct": trade.get("net_pct", trade["profit_pct"]),
+                "liquidated": trade.get("liquidated") is True,
             }
             for index, trade in enumerate(trades, start=1)
         ]
@@ -1826,6 +1982,7 @@ def _closed_position_summaries(trades: list[dict]) -> list[dict] | None:
                 "exit_time": terminal[0].get("exit_time"),
                 "net": net,
                 "net_pct": net_pct,
+                "liquidated": terminal[0].get("liquidated") is True,
             }
         )
     try:
@@ -1835,6 +1992,31 @@ def _closed_position_summaries(trades: list[dict]) -> list[dict] | None:
     except (AttributeError, TypeError, ValueError, OverflowError):
         return None
     return summaries
+
+
+def _closed_position_drawdown_pct(
+    closed_positions: list[dict], initial_capital: float
+) -> float:
+    """Reconstruct equity from chronological independent-position closes."""
+    by_exit: dict[float, list[float]] = {}
+    for position in closed_positions:
+        exit_time = position.get("exit_time")
+        # Legacy unit-level callers may supply aggregate fills without temporal
+        # metadata. They cannot feed promotion evidence; keep their accounting
+        # usable as one unordered close bucket without inventing chronology.
+        timestamp = 0.0 if exit_time is None else _to_epoch_sec(exit_time)
+        by_exit.setdefault(timestamp, []).append(position["net"])
+    equity = initial_capital
+    peak = initial_capital
+    maximum = 0.0
+    for timestamp in sorted(by_exit):
+        equity += math.fsum(by_exit[timestamp])
+        if not _finite_stats_number(equity):
+            raise ValueError("nonfinite position equity")
+        peak = max(peak, equity)
+        if peak > 0.0:
+            maximum = max(maximum, (peak - equity) / peak * 100.0)
+    return maximum
 
 
 def _compute_stats(trades: list, total_costs: float, total_gross: float) -> dict:
@@ -1900,19 +2082,12 @@ def _compute_stats(trades: list, total_costs: float, total_gross: float) -> dict
     if not _stats_trade_values_match(total_net, position_net_total):
         return _empty_backtest_stats("inconsistent_position_stats")
 
-    curve = [INITIAL_CAPITAL]
-    for p in [t["net"] for t in trades]:
-        next_value = curve[-1] + p
-        if not _finite_stats_number(next_value):
-            return _empty_backtest_stats("nonfinite_trade_stats")
-        curve.append(next_value)
-    peak, max_dd = curve[0], 0
-    for c in curve:
-        if c > peak:
-            peak = c
-        dd = (peak - c) / peak * 100 if peak > 0 else 0
-        if dd > max_dd:
-            max_dd = dd
+    try:
+        max_dd = _closed_position_drawdown_pct(
+            closed_positions, INITIAL_CAPITAL
+        )
+    except (ArithmeticError, TypeError, ValueError, OverflowError):
+        return _empty_backtest_stats("nonfinite_position_equity")
 
     all_nets = [t["net"] for t in trades]
     sharpe = 0.0
@@ -1987,6 +2162,7 @@ def _compute_stats(trades: list, total_costs: float, total_gross: float) -> dict
         "position_net_trades": position_nets,
         "closed_trades": trades,
         "closed_positions": closed_positions,
+        "initial_capital": INITIAL_CAPITAL,
         "edge": total_net > 0 and exp_val > 0,
     }
 

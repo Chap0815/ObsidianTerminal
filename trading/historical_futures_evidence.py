@@ -16,7 +16,7 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 
 MAX_OVERVIEW_PAYLOAD_BYTES = 8 * 1024 * 1024
@@ -95,6 +95,7 @@ class FundingPeriod:
     rate: float
     observed_time: datetime
     event_id: str
+    mark_price: float | None = None
 
 
 @dataclass(frozen=True)
@@ -179,29 +180,50 @@ class HistoricalFundingTimeline:
     @classmethod
     def from_settled_history(
         cls,
-        history: Mapping[str, Iterable[tuple[datetime, float]]],
+        history: Mapping[
+            str,
+            Iterable[
+                tuple[datetime, float] | tuple[datetime, float, float]
+            ],
+        ],
     ) -> "HistoricalFundingTimeline":
         periods = []
         observations = {}
-        settled_rates: dict[tuple[str, datetime], float] = {}
+        settled_values: dict[
+            tuple[str, datetime], tuple[float, float | None]
+        ] = {}
         for symbol, rows in history.items():
             canonical = _canonical_symbol(symbol)
             if not canonical:
                 continue
             stamps = []
-            for index, (timestamp, raw_rate) in enumerate(rows):
+            for index, raw_row in enumerate(rows):
+                try:
+                    timestamp, raw_rate, *optional_mark = raw_row
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("settled funding row is invalid") from exc
+                if len(optional_mark) > 1:
+                    raise ValueError("settled funding row is invalid")
                 settlement = _as_utc_datetime(timestamp, "funding settlement")
                 rate = _finite(raw_rate)
                 if rate is None:
                     raise ValueError("settled funding rate must be finite")
+                mark_price = (
+                    _finite(optional_mark[0]) if optional_mark else None
+                )
+                if mark_price is not None and mark_price <= 0.0:
+                    raise ValueError("settled funding mark must be positive")
                 key = (canonical, settlement)
-                previous_rate = settled_rates.get(key)
-                if previous_rate is not None and previous_rate != rate:
+                previous_value = settled_values.get(key)
+                if previous_value is not None and previous_value != (
+                    rate,
+                    mark_price,
+                ):
                     raise ValueError(
-                        "conflicting settled funding rates for "
+                        "conflicting settled funding rates or marks for "
                         f"{canonical} at {settlement.isoformat()}"
                     )
-                settled_rates[key] = rate
+                settled_values[key] = (rate, mark_price)
                 stamps.append(settlement)
                 periods.append(FundingPeriod(
                     symbol=canonical,
@@ -209,6 +231,7 @@ class HistoricalFundingTimeline:
                     rate=rate,
                     observed_time=settlement,
                     event_id=f"settled:{canonical}:{index}:{settlement.isoformat()}",
+                    mark_price=mark_price,
                 ))
             observations[canonical] = stamps
         return cls(
@@ -269,6 +292,8 @@ class HistoricalFundingTimeline:
         exit_time,
         *,
         require_complete: bool = True,
+        base_amount: float | None = None,
+        mark_price_resolver: Callable[[datetime], float | None] | None = None,
     ) -> FundingCharge:
         entry = _as_utc_datetime(entry_time, "entry_time")
         exit_ = _as_utc_datetime(exit_time, "exit_time")
@@ -308,8 +333,32 @@ class HistoricalFundingTimeline:
                 f"{stale[0].settlement_time.isoformat()}"
             )
         rates = tuple(row.rate for row in rows)
-        signed = math.fsum(rates) if direction == "LONG" else -math.fsum(rates)
-        return FundingCharge(notional * signed, len(rows), rates)
+        if not rows:
+            return FundingCharge(0.0, 0, rates)
+        amount = _finite(base_amount)
+        if amount is None or amount <= 0.0:
+            raise IncompleteFundingEvidence(
+                "base quantity is required for settlement-mark funding"
+            )
+        signed_costs = []
+        for row in rows:
+            mark = _finite(row.mark_price)
+            if mark is None and mark_price_resolver is not None:
+                try:
+                    mark = _finite(mark_price_resolver(row.settlement_time))
+                except Exception as exc:
+                    raise IncompleteFundingEvidence(
+                        "settlement mark funding evidence is unavailable"
+                    ) from exc
+            if mark is None or mark <= 0.0:
+                raise IncompleteFundingEvidence(
+                    "settlement mark funding evidence is unavailable"
+                )
+            signed_costs.append(amount * mark * row.rate)
+        signed = math.fsum(signed_costs)
+        if direction == "SHORT":
+            signed = -signed
+        return FundingCharge(signed, len(rows), rates)
 
 
 def _coverage_is_complete(

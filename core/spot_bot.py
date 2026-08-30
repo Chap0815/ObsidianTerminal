@@ -51,6 +51,8 @@ from bot_utils import (
 )
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.runtime_threads import (finalize_runtime_shutdown,
+                                       format_runtime_thread_liveness,
+                                       shared_runtime_resource_closers,
                                        start_threads_or_shutdown)
 from bot_utils.silent_log import silent_log
 
@@ -128,6 +130,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         self.safe_mode: Optional[SafeMode] = None
         # idempotency flag for emergency close
         self._emergency_closed = False
+        self._shutdown_positions_preserved = False
         # Threads
         self._monitor_thread: Optional[threading.Thread] = None
         self._scan_thread: Optional[threading.Thread] = None
@@ -989,6 +992,8 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             self._last_hourly_status = 0.0
             while not self._shutdown_event.is_set():
                 try:
+                    if self._consume_launcher_shutdown_request(log_event):
+                        break
                     # Scheduling must be immune to wall-clock corrections. The
                     # coordinator itself must also survive a transient DB,
                     # status or diagnostic failure while its safety workers are
@@ -996,11 +1001,13 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                     now = time.monotonic()
                     if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_SEC:
                         tc = self.state.count()
+                        thread_liveness = format_runtime_thread_liveness(
+                            self._runtime_threads()
+                        )
                         log_event(
                             f" {self.BOT_NAME} heartbeat  "
                             f"Open: {tc}/{self.C('MAX_OPEN_TRADES')}  "
-                            f"Monitor={'' if self._monitor_thread.is_alive() else ''}  "
-                            f"Scan={'' if self._scan_thread.is_alive() else ''}",
+                            f"Threads: {thread_liveness}",
                             "INFO"
                         )
                         self._publish_periodic_runtime_status(
@@ -1044,7 +1051,12 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         ):
             if t and t.is_alive():
                 t.join(timeout=2)
-        finalize_runtime_shutdown(self, write_runtime_status, log_event)
+        finalize_runtime_shutdown(
+            self,
+            write_runtime_status,
+            log_event,
+            resource_closers=shared_runtime_resource_closers(),
+        )
 
     #  Connection 
 
@@ -1177,6 +1189,43 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
 
     #  Shutdown 
 
+    def _consume_launcher_shutdown_request(self, log_event) -> bool:
+        """Consume one launcher request on the bot's main thread."""
+        from bot_utils.shutdown_control import (
+            CLOSE_POSITIONS,
+            PRESERVE_POSITIONS,
+            consume_shutdown_request,
+        )
+
+        try:
+            mode = consume_shutdown_request()
+        except Exception as exc:
+            self._log_error("Launcher shutdown control", exc)
+            return False
+        if mode is None:
+            return False
+        if mode == CLOSE_POSITIONS:
+            self._shutdown_handler(signum="Launcher close request")
+            return True
+        if mode != PRESERVE_POSITIONS:
+            return False
+        with self._shutdown_lock:
+            if getattr(self, "_emergency_in_progress", False):
+                log_event(
+                    "Preserve-position shutdown refused while emergency close "
+                    "is already in progress",
+                    "WARN",
+                )
+                return False
+            self._shutdown_positions_preserved = True
+            self._shutdown_event.set()
+        log_event(
+            "Launcher preserve-position shutdown received; positions remain "
+            "open while runtime resources close cleanly",
+            "INFO",
+        )
+        return True
+
     def _shutdown_handler(self, signum=None, frame=None):
         """Signal handler  sets shutdown event and triggers emergency close.
 
@@ -1190,6 +1239,8 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         """
         from core.logger import log_event
         with self._shutdown_lock:
+            if getattr(self, "_shutdown_positions_preserved", False):
+                return
             if getattr(self, "_emergency_closed", False):
                 return
             self._shutdown_event.set()

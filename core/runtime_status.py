@@ -143,13 +143,30 @@ def _clock_health() -> dict[str, Any]:
         }
 
 
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate runtime-status JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-standard runtime-status JSON constant: {value}")
+
+
 def _read_json(path: Path) -> dict:
     try:
         with path.open("rb") as fh:
             raw = fh.read(_STATUS_JSON_MAX_BYTES + 1)
         if len(raw) > _STATUS_JSON_MAX_BYTES:
             return {}
-        data = json.loads(raw.decode("utf-8-sig"))
+        data = json.loads(
+            raw.decode("utf-8-sig"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -395,6 +412,8 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
                          process_pid: int | None = None,
                          process_run_id: str | None = None) -> bool:
     try:
+        if not isinstance(simulation, bool):
+            raise ValueError("runtime simulation must be boolean")
         path = runtime_status_path(log_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         # Long-running bots pass the snapshot captured during startup so an
@@ -424,17 +443,19 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
         payload = {
             "bot": bot_name,
             "status": status,
-            "simulation": bool(simulation),
+            "simulation": simulation,
             "pid": status_pid,
             "run_id": status_run_id,
-            "updated_at": _utc_now(),
-            "wall_ts": time.time(),
-            "monotonic_ts": time.monotonic(),
+            # Reserved here so ``extra`` cannot override freshness provenance.
+            # The real values are sampled only after the publish lock is held.
+            "updated_at": "",
+            "wall_ts": 0.0,
+            "monotonic_ts": 0.0,
             "build_id": status_build_id,
             "build_source": status_build_source,
             "build_created_at": status_build_created_at,
             "threads": _strict_json_value(threads or {}),
-            "clock_health": _clock_health(),
+            "clock_health": {},
         }
         if extra:
             normalized_extra = _strict_json_value(extra)
@@ -449,6 +470,13 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
         with _runtime_status_path_lock(path) as acquired:
             if not acquired:
                 return False
+            # Freshness must follow the serialized publication order. Sampling
+            # before this lock lets a delayed older writer overwrite a newer
+            # heartbeat with a regressed timestamp.
+            payload["updated_at"] = _utc_now()
+            payload["wall_ts"] = time.time()
+            payload["monotonic_ts"] = time.monotonic()
+            payload["clock_health"] = _clock_health()
             fd, tmp_name = tempfile.mkstemp(
                 prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
             published = False

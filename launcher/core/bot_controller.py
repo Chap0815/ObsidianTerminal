@@ -33,7 +33,7 @@ from launcher.core.positions import (
 )
 from launcher.core.runtime_status_values import positive_int_or_zero
 from launcher.state.poller import _runtime_or_config_sim
-from launcher.ui.logging_panel import log_to_card
+from launcher.ui.logging_panel import begin_log_session, log_to_card
 from core.pre_start_check import (
     format_issues,
     has_errors,
@@ -341,23 +341,13 @@ def start_bot(app, name: str) -> None:
             log_to_card(card, "error", "Start aborted by pre-start check")
             return
 
-    # Close the previous run's display-only aggregation and start the new run
-    # with fresh warning/state fingerprints.  This never touches durable logs.
-    display_filter = card.get("log_filter")
+    # Close the previous run's display-only aggregation, reset warning/state
+    # fingerprints and retain an explicit visual boundary before new stdout.
+    # This never touches durable logs.
     try:
-        flush = getattr(display_filter, "flush", None)
-        if callable(flush):
-            for pending_line in flush():
-                log_to_card(card, "info", pending_line)
+        begin_log_session(card, name, emit=log_to_card)
     except Exception:
         # A cosmetic display helper must never prevent a validated bot start.
-        pass
-    try:
-        reset = getattr(display_filter, "reset", None)
-        if callable(reset):
-            reset()
-    except Exception:
-        # Reset failure is display-only and must not stop the bot either.
         pass
     log_to_card(card, "system", "Loading: " + format_start_params(name, snapshot))
     try:
@@ -787,18 +777,11 @@ def async_simple_stop(app, name: str, card: dict, update) -> None:
 
 
 def _async_simple_stop_owned(app, name: str, card: dict, update) -> None:
-    """Simple async stop WITHOUT closing positions.
-
-    graceful_close MUST be False here: "Stop without closing" means keep
-    positions open on the exchange. graceful_close=True would send
-    SIGTERM / CTRL_BREAK_EVENT and trigger the bot's emergency_close_all_*
-    handler, which SELLS EVERY OPEN POSITION. With graceful_close=False the
-    process is terminated hard (no signal handler runs); trades stay in
-    trades.json and the bot reconciles them on next start.
-    """
+    """Cleanly stop the runtime WITHOUT closing exchange positions."""
     update("Hard-stopping bot  positions stay OPEN on exchange")
     try:
-        # HARD STOP. No graceful close, no bot signal handler.
+        # Run-bound preserve request: workers, DB and logs close cleanly while
+        # the exchange positions remain untouched.
         stopped_pid = _stop_bot_process_verified(
             app.bots[name], graceful_close=False
         )

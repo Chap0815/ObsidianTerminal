@@ -58,18 +58,22 @@ def _finite_metric(value) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+def _invalid_market_data_result() -> str:
+    return "RESULT: WAIT"
+
+
 def analyze_sentiment(
     symbol, change, rsi_15m, rsi_1h, rsi_4h, news, market_regime: dict = None
 ):
     if not is_valid_symbol(symbol):
-        return keyword_fallback(symbol, news, strategy="SPOT")
+        return _invalid_market_data_result()
     if not llm_available():
         return keyword_fallback(symbol, news, strategy="SPOT")
 
     if market_regime is None:
         market_regime = {"regime": "NEUTRAL", "btc_24h": 0.0, "btc_7d": 0.0}
     if not isinstance(market_regime, dict):
-        return keyword_fallback(symbol, news, strategy="SPOT")
+        return _invalid_market_data_result()
 
     metrics = tuple(
         _finite_metric(value)
@@ -83,7 +87,7 @@ def analyze_sentiment(
         )
     )
     if any(value is None for value in metrics):
-        return keyword_fallback(symbol, news, strategy="SPOT")
+        return _invalid_market_data_result()
     change_value, rsi_15m_value, rsi_1h_value, rsi_4h_value, btc_24h, btc_7d = metrics
 
     template = load_prompt_template(
