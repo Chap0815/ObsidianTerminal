@@ -3,10 +3,13 @@ llm_utils.py  LLM availability and keyword fallback.
 """
 from __future__ import annotations
 
+import math
 import time
 import os
 import socket
 import threading
+import portalocker
+from bot_utils.runtime_threads import thread_definitely_never_started
 import requests
 import ollama
 from bot_utils.config import _read_config_json
@@ -19,7 +22,6 @@ from core.constants import (
     LLM_INFERENCE_TIMEOUT,
     LLM_MAX_CONCURRENT,
     LLM_SLOT_WAIT_SEC,
-    LLM_STALE_LOCK_SEC,
 )
 
 
@@ -189,8 +191,34 @@ def _pid_alive(pid: int, payload_boot_fp: str = "") -> bool:
         return False
 
 
+class _LLMSlotLease:
+    """One OS-locked slot handle; process exit releases it automatically."""
+
+    def __init__(self, path: str, lock, handle, payload: bytes) -> None:
+        self.path = path
+        self.lock = lock
+        self.handle = handle
+        self.payload = payload
+        self._released = False
+        self._release_lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._release_lock:
+            if self._released:
+                return
+            self._released = True
+            try:
+                self.lock.release()
+            finally:
+                try:
+                    if not self.handle.closed:
+                        self.handle.close()
+                except Exception:
+                    pass
+
+
 def _acquire_llm_slot():
-    """Claim one of LLM_MAX_CONCURRENT slots. Returns path or None."""
+    """Claim one cross-process OS lock. Returns a lease or ``None``."""
     try:
         os.makedirs(LLM_LOCK_DIR, exist_ok=True)
     except Exception as e:
@@ -206,55 +234,46 @@ def _acquire_llm_slot():
     while time.monotonic() < deadline:
         for slot in range(LLM_MAX_CONCURRENT):
             lock_path = os.path.join(LLM_LOCK_DIR, f"slot_{slot}.lock")
+            lock = None
             try:
-                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                lock = portalocker.Lock(
+                    lock_path,
+                    mode="a+b",
+                    timeout=0.0,
+                    check_interval=0.0,
+                    flags=portalocker.LOCK_EX | portalocker.LOCK_NB,
+                )
+                handle = lock.acquire()
                 try:
-                    os.write(fd, my_payload)
-                finally:
-                    os.close(fd)
-                return (lock_path, my_payload)
-            except FileExistsError:
-                try:
-                    parts = _read_llm_slot_payload(lock_path).split(":")
-                    holder_pid = int(parts[0]) if parts and parts[0].isdigit() else 0
-                    holder_fp = parts[1] if len(parts) > 1 else ""
-                    try:
-                        created_at = float(parts[-1])
-                    except (ValueError, IndexError):
-                        created_at = 0.0
-
-                    age = time.time() - created_at if created_at else 0.0
-                    if age > LLM_STALE_LOCK_SEC or not _pid_alive(holder_pid, holder_fp):
-                        stale = f"{lock_path}.stale.{os.getpid()}.{int(time.time())}"
-                        try:
-                            os.rename(lock_path, stale)
-                            try:
-                                os.remove(stale)
-                            except OSError:
-                                pass
-                        except OSError:
-                            pass
+                    handle.seek(0)
+                    handle.truncate(0)
+                    handle.write(my_payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 except Exception:
-                    pass
+                    raise
+                return _LLMSlotLease(
+                    lock_path,
+                    lock,
+                    handle,
+                    my_payload,
+                )
             except Exception:
-                pass
+                if lock is not None:
+                    try:
+                        lock.release()
+                    except Exception:
+                        pass
         time.sleep(0.3)
 
     return None
 
 
 def _release_llm_slot(lease):
-    if not isinstance(lease, tuple) or len(lease) != 2:
-        return
-    lock_path, owned_payload = lease
-    if not isinstance(lock_path, str) or not isinstance(owned_payload, bytes):
+    if not isinstance(lease, _LLMSlotLease):
         return
     try:
-        with open(lock_path, "rb") as lock_file:
-            current_payload = lock_file.read(4096)
-        if current_payload != owned_payload:
-            return
-        os.remove(lock_path)
+        lease.release()
     except Exception:
         pass
 
@@ -263,20 +282,40 @@ _LAST_USED_MODEL: list  = [None]   # [0] = last model name generate() used
 
 _CLIENT_CACHE: dict = {}           # (host, timeout) -> ollama.Client
 _CLIENT_CACHE_LOCK = threading.Lock()
+_CLIENT_CLOSE_GENERATION = None
+_LLM_SHUTDOWN_EVENT = threading.Event()
 
 
 def _get_ollama_client(host: str, timeout: float):
     """Return a pooled ollama.Client for (host, timeout), creating once."""
     key = (host, timeout)
-    client = _CLIENT_CACHE.get(key)
-    if client is not None:
-        return client
     with _CLIENT_CACHE_LOCK:
+        if _LLM_SHUTDOWN_EVENT.is_set():
+            raise RuntimeError("LLM resources are shutting down")
         client = _CLIENT_CACHE.get(key)
         if client is None:
             client = ollama.Client(host=host, timeout=timeout)
             _CLIENT_CACHE[key] = client
         return client
+
+
+def _close_ollama_client(client) -> bool:
+    """Close one sync Ollama/httpx client without losing retry evidence."""
+    closer = getattr(client, "close", None)
+    if callable(closer):
+        try:
+            if closer() is not False:
+                return True
+        except Exception:
+            pass
+    transport = getattr(client, "_client", None)
+    closer = getattr(transport, "close", None)
+    if not callable(closer):
+        return False
+    try:
+        return closer() is not False
+    except Exception:
+        return False
 
 
 def generate_with_timeout(model: str, prompt: str,
@@ -421,6 +460,8 @@ _STATE = {
 _STATE_LOCK   = threading.Lock()
 _PING_STARTED = False
 _PING_LOCK    = threading.Lock()
+_PING_THREAD: threading.Thread | None = None
+_PING_START_UNCERTAIN = False
 
 
 def _normalise_model_name(name: str) -> str:
@@ -516,7 +557,8 @@ def _do_one_ping() -> str:
         except Exception:
             installed = None
         if attempt < PING_MAX_FAILURES - 1:
-            time.sleep(1.0)
+            if _LLM_SHUTDOWN_EVENT.wait(1.0):
+                return LLM_STATUS_DAEMON_DOWN
     else:
         return LLM_STATUS_DAEMON_DOWN
 
@@ -553,12 +595,14 @@ def _do_one_ping() -> str:
 
 def _ping_loop():
     first = True
-    while True:
-        if not first:
-            time.sleep(PING_INTERVAL_SEC)
+    while not _LLM_SHUTDOWN_EVENT.is_set():
+        if not first and _LLM_SHUTDOWN_EVENT.wait(PING_INTERVAL_SEC):
+            break
         first = False
         try:
             new_status = _do_one_ping()
+            if _LLM_SHUTDOWN_EVENT.is_set():
+                break
             new_avail  = new_status in (LLM_STATUS_MODEL_COLD,
                                          LLM_STATUS_MODEL_HOT)
             log_msg = None
@@ -601,19 +645,240 @@ def _ping_loop():
 
 
 def _ensure_ping_thread_started():
-    global _PING_STARTED
-    if _PING_STARTED:
-        return
+    global _PING_STARTED, _PING_START_UNCERTAIN, _PING_THREAD
+    if _LLM_SHUTDOWN_EVENT.is_set():
+        return False
     with _PING_LOCK:
+        if _LLM_SHUTDOWN_EVENT.is_set():
+            return False
         if _PING_STARTED:
-            return
+            if _PING_START_UNCERTAIN:
+                try:
+                    start_observed = (
+                        _PING_THREAD is not None
+                        and (
+                            _PING_THREAD.is_alive()
+                            or _PING_THREAD.ident is not None
+                        )
+                    )
+                except BaseException:
+                    return False
+                if not start_observed:
+                    return False
+                _PING_START_UNCERTAIN = False
+            return True
         # Non-blocking: do NOT ping inline (that blocks the caller up to
         # ~11s when Ollama is down). Leave state at its UNKNOWN default
         # (available=None  treated as unavailable) and let the background
         # ping thread run the first check and emit the startup log.
         t = threading.Thread(target=_ping_loop, daemon=True, name="LLMPing")
-        t.start()
+        _PING_THREAD = t
         _PING_STARTED = True
+        _PING_START_UNCERTAIN = False
+        try:
+            t.start()
+        except BaseException as exc:
+            if (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(t)
+                and _PING_THREAD is t
+            ):
+                _PING_THREAD = None
+                _PING_STARTED = False
+                _PING_START_UNCERTAIN = False
+            else:
+                # Once start() has been invoked, an exception is not proof
+                # that a custom or ambiguously launched worker was never
+                # queued. Keep this exact generation authoritative.
+                _PING_START_UNCERTAIN = True
+            raise
+        return True
+
+
+def _client_close_generation_unresolved(generation) -> bool:
+    if generation is None:
+        return False
+    if not generation["done"].is_set():
+        return True
+    worker = generation.get("thread")
+    if worker is None:
+        return False
+    try:
+        return bool(worker.is_alive())
+    except BaseException:
+        return True
+
+
+def _run_client_close_generation(generation, cached) -> None:
+    global _CLIENT_CACHE
+    failed = list(cached)
+    try:
+        for item in cached:
+            if _close_ollama_client(item[1]):
+                failed = [entry for entry in failed if entry is not item]
+    finally:
+        with _CLIENT_CACHE_LOCK:
+            for key, client in failed:
+                _CLIENT_CACHE.setdefault(key, client)
+            generation["result"] = not failed
+            generation["done"].set()
+
+
+def _recover_client_prelaunch_locked() -> None:
+    global _CLIENT_CLOSE_GENERATION
+    generation = _CLIENT_CLOSE_GENERATION
+    if generation is None or not generation.get("prelaunch_restore_pending"):
+        return
+    for key, client in generation.get("cached", ()):
+        _CLIENT_CACHE.setdefault(key, client)
+    generation["prelaunch_restore_pending"] = False
+    generation["done"].set()
+    if _CLIENT_CLOSE_GENERATION is generation:
+        _CLIENT_CLOSE_GENERATION = None
+
+
+def shutdown_llm_resources(timeout: float = 0.0) -> bool:
+    """Terminally stop the ping worker and close cached Ollama clients.
+
+    A client whose close fails remains registered for a later finalizer retry.
+    No client is closed while the ping worker can still be running.
+    """
+    global _CLIENT_CLOSE_GENERATION, _PING_START_UNCERTAIN
+    if isinstance(timeout, bool):
+        return False
+    try:
+        requested_timeout = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(requested_timeout):
+        return False
+    budget = min(max(0.0, requested_timeout), threading.TIMEOUT_MAX)
+    deadline = time.monotonic() + budget
+    _LLM_SHUTDOWN_EVENT.set()
+    if not _PING_LOCK.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    ):
+        return False
+    try:
+        ping_thread = _PING_THREAD
+        start_uncertain = _PING_START_UNCERTAIN
+    finally:
+        _PING_LOCK.release()
+    if ping_thread is not None:
+        try:
+            ping_alive = ping_thread.is_alive()
+        except BaseException:
+            return False
+        if ping_alive:
+            try:
+                ping_thread.join(
+                    timeout=max(0.0, deadline - time.monotonic())
+                )
+            except BaseException:
+                return False
+            try:
+                if ping_thread.is_alive():
+                    return False
+            except BaseException:
+                return False
+        if start_uncertain:
+            try:
+                start_observed = ping_thread.ident is not None
+            except BaseException:
+                return False
+            if not start_observed:
+                return False
+            if not _PING_LOCK.acquire(
+                timeout=max(0.0, deadline - time.monotonic())
+            ):
+                return False
+            try:
+                if _PING_THREAD is ping_thread:
+                    _PING_START_UNCERTAIN = False
+            finally:
+                _PING_LOCK.release()
+
+    if not _CLIENT_CACHE_LOCK.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    ):
+        return False
+    start_worker = None
+    cached = []
+    generation = None
+    try:
+        _recover_client_prelaunch_locked()
+        existing = _CLIENT_CLOSE_GENERATION
+        if _client_close_generation_unresolved(existing):
+            generation = existing
+        else:
+            if existing is not None:
+                if existing.get("result") is True and not _CLIENT_CACHE:
+                    return True
+                _CLIENT_CLOSE_GENERATION = None
+            if not _CLIENT_CACHE:
+                return True
+            cached = list(_CLIENT_CACHE.items())
+            generation = {
+                "done": threading.Event(),
+                "result": False,
+                "thread": None,
+                "cached": cached,
+                "prelaunch_restore_pending": False,
+            }
+            try:
+                start_worker = threading.Thread(
+                    target=_run_client_close_generation,
+                    args=(generation, cached),
+                    name="llm-client-close",
+                    daemon=True,
+                )
+            except BaseException:
+                return False
+            generation["thread"] = start_worker
+            _CLIENT_CACHE.clear()
+            _CLIENT_CLOSE_GENERATION = generation
+    finally:
+        _CLIENT_CACHE_LOCK.release()
+
+    if start_worker is not None:
+        try:
+            start_worker.start()
+        except BaseException as exc:
+            if (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(start_worker)
+            ):
+                generation["prelaunch_restore_pending"] = True
+                if _CLIENT_CACHE_LOCK.acquire(
+                    timeout=max(0.0, deadline - time.monotonic())
+                ):
+                    try:
+                        _recover_client_prelaunch_locked()
+                    finally:
+                        _CLIENT_CACHE_LOCK.release()
+            if not isinstance(exc, Exception):
+                raise
+            return False
+
+    worker = generation.get("thread")
+    if worker is not None and worker is not threading.current_thread():
+        try:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        except BaseException:
+            return False
+    if not _CLIENT_CACHE_LOCK.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    ):
+        return False
+    try:
+        return (
+            _CLIENT_CLOSE_GENERATION is generation
+            and generation.get("result") is True
+            and not _client_close_generation_unresolved(generation)
+            and not _CLIENT_CACHE
+        )
+    finally:
+        _CLIENT_CACHE_LOCK.release()
 
 
 def llm_available() -> bool:
@@ -622,7 +887,8 @@ def llm_available() -> bool:
     MODEL_COLD counts as available  Ollama will load it on demand.
     MODEL_MISSING and DAEMON_DOWN return False  keyword fallback.
     """
-    _ensure_ping_thread_started()
+    if not _ensure_ping_thread_started():
+        return False
     with _STATE_LOCK:
         return bool(_STATE["available"])
 

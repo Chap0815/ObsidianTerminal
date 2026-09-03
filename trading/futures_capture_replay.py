@@ -15,7 +15,7 @@ import math
 import os
 import shutil
 import sqlite3
-import stat
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -42,6 +42,8 @@ REPLAY_DATASET_SCHEMA = 3
 REPLAY_SCAN_SECONDS = 150
 REPLAY_MAX_SNAPSHOT_AGE_SECONDS = 120
 REPLAY_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+REPLAY_JSON_ARTIFACT_MAX_BYTES = 256 * 1024 * 1024
+REPLAY_OVERVIEW_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024 * 1024
 _TIMEFRAME_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 
 
@@ -91,33 +93,147 @@ def _sha256_file(path: Path) -> str:
 
 def _atomic_write(path: Path, raw: bytes) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    primary_error: BaseException | None = None
+    temporary_owned = False
+    handle = None
     try:
-        with temporary.open("xb") as handle:
+        handle = temporary.open("xb")
+        temporary_owned = True
+        try:
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if primary_error is None:
+                    primary_error = close_error
+                    raise
+                try:
+                    primary_error.add_note(
+                        "replay atomic-write close failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
         os.replace(temporary, path)
+    except BaseException as exc:
+        if primary_error is None:
+            primary_error = exc
+        raise
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if temporary_owned:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                try:
+                    primary_error.add_note(
+                        "replay atomic-write cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
 
 
 def _fsync_directory(path: Path) -> None:
     try:
-        directory_fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(str(path), flags)
+    except AttributeError:
         return
+    except OSError as exc:
+        if os.name == "nt":
+            if isinstance(exc, PermissionError):
+                return
+            if (
+                isinstance(exc, FileNotFoundError)
+                and path == Path(path.anchor)
+                and path.is_dir()
+            ):
+                return
+        raise
+    primary_error: BaseException | None = None
     try:
         os.fsync(directory_fd)
-    except OSError:
-        pass
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         try:
             os.close(directory_fd)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "replay directory close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
+def _fsync_file(path: Path) -> None:
+    flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+    file_fd = os.open(str(path), flags)
+    primary_error: BaseException | None = None
+    try:
+        os.fsync(file_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            os.close(file_fd)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "replay file close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
+def _fsync_replay_tree(root: Path, *, sync_files: bool) -> None:
+    if sync_files:
+        for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+            if not path.is_file():
+                continue
+            _fsync_file(path)
+    for name in ("overview", "series", "funding"):
+        _fsync_directory(root / name)
+    _fsync_directory(root)
+
+
+def _mark_replay_files_readonly(root: Path) -> None:
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            path.chmod(0o400)
         except OSError:
             pass
+
+
+def _mkdir_with_parent_fsync(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    parent = path.parent
+    while True:
+        _fsync_directory(parent)
+        if parent == parent.parent:
+            break
+        parent = parent.parent
 
 
 def _normalized_bars(raw_rows, timeframe: str) -> list[list[float | int]]:
@@ -228,10 +344,12 @@ def freeze_replay_dataset(
     except ValueError as exc:
         raise ValueError("replay workspace must be a real path") from exc
     datasets = workspace / "datasets"
-    datasets.mkdir(parents=True, exist_ok=True)
+    _mkdir_with_parent_fsync(datasets)
     datasets = _absolute_without_links(datasets, label="replay workspace")
     staging = datasets / f".replay-{os.getpid()}-{uuid.uuid4().hex}"
     staging.mkdir()
+    primary_error: BaseException | None = None
+    result: Path | None = None
     try:
         overview_manifest = []
         overview_dir = staging / "overview"
@@ -239,6 +357,7 @@ def freeze_replay_dataset(
         for index, path in enumerate(overview):
             target = overview_dir / f"{index:04d}-{path.name}"
             source_connection = destination_connection = None
+            primary_error: BaseException | None = None
             try:
                 source_connection = sqlite3.connect(
                     f"file:{path.as_posix()}?mode=ro",
@@ -253,12 +372,38 @@ def freeze_replay_dataset(
                 if integrity != ("ok",):
                     raise ValueError(f"overview partition failed quick_check: {path}")
             except sqlite3.Error as exc:
-                raise ValueError(f"overview partition backup failed: {path}") from exc
+                primary_error = ValueError(
+                    f"overview partition backup failed: {path}"
+                )
+                raise primary_error from exc
+            except BaseException as exc:
+                primary_error = exc
+                raise
             finally:
-                if destination_connection is not None:
-                    destination_connection.close()
-                if source_connection is not None:
-                    source_connection.close()
+                close_error: BaseException | None = None
+                for label, connection in (
+                    ("destination", destination_connection),
+                    ("source", source_connection),
+                ):
+                    if connection is None:
+                        continue
+                    try:
+                        connection.close()
+                    except BaseException as exc:
+                        owner = primary_error or close_error
+                        if owner is None:
+                            close_error = exc
+                            continue
+                        try:
+                            owner.add_note(
+                                f"overview {label} connection close failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                        except BaseException:
+                            pass
+                if primary_error is None and close_error is not None:
+                    raise close_error
+            _fsync_file(target)
             overview_manifest.append({
                 "path": target.relative_to(staging).as_posix(),
                 "bytes": target.stat().st_size,
@@ -358,25 +503,44 @@ def freeze_replay_dataset(
         final = datasets / fingerprint
         if final.exists():
             verify_replay_dataset(final)
-            return final
-        try:
-            os.rename(staging, final)
-        except OSError:
-            if final.is_dir():
-                verify_replay_dataset(final)
-                return final
-            raise
-        _fsync_directory(datasets)
-        for path in final.rglob("*"):
-            if path.is_file():
-                try:
-                    path.chmod(stat.S_IREAD)
-                except OSError:
-                    pass
-        return final
+            _fsync_replay_tree(final, sync_files=False)
+            result = final
+        else:
+            _fsync_replay_tree(staging, sync_files=True)
+            try:
+                os.rename(staging, final)
+            except OSError:
+                if final.is_dir():
+                    verify_replay_dataset(final)
+                    _fsync_replay_tree(final, sync_files=False)
+                    result = final
+                else:
+                    raise
+            else:
+                result = final
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
+        try:
+            shutil.rmtree(staging)
+        except FileNotFoundError:
+            pass
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "replay staging cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            except BaseException:
+                pass
+    if result is None:
+        raise RuntimeError("replay dataset publish did not select a result")
+    _mark_replay_files_readonly(result)
+    _fsync_directory(datasets)
+    return result
 
 
 def _read_manifest(path: Path) -> dict:
@@ -426,6 +590,90 @@ def _read_manifest(path: Path) -> dict:
     return value
 
 
+def _artifact_contract(item: dict, *, group: str) -> tuple[int, str]:
+    expected_bytes = item.get("bytes")
+    expected_sha256 = item.get("sha256")
+    maximum = (
+        REPLAY_OVERVIEW_ARTIFACT_MAX_BYTES
+        if group == "overview"
+        else REPLAY_JSON_ARTIFACT_MAX_BYTES
+    )
+    if (
+        isinstance(expected_bytes, bool)
+        or not isinstance(expected_bytes, int)
+        or expected_bytes <= 0
+        or expected_bytes > maximum
+    ):
+        raise ValueError(f"invalid replay {group} artifact size")
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise ValueError(f"invalid replay {group} artifact fingerprint")
+    return expected_bytes, expected_sha256
+
+
+def _artifact_path(root: Path, item: dict) -> Path:
+    relative = item["path"]
+    try:
+        path = _absolute_without_links(
+            root / Path(relative),
+            label="replay dataset file",
+        )
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"replay dataset file missing or linked: {relative}"
+        ) from exc
+    if not path.is_file():
+        raise ValueError(f"replay dataset file missing: {relative}")
+    return path
+
+
+def _read_verified_artifact(root: Path, item: dict, *, group: str) -> bytes:
+    expected_bytes, expected_sha256 = _artifact_contract(item, group=group)
+    path = _artifact_path(root, item)
+    with path.open("rb") as handle:
+        raw = handle.read(expected_bytes + 1)
+    if (
+        len(raw) != expected_bytes
+        or _sha256_bytes(raw) != expected_sha256
+    ):
+        raise ValueError(
+            f"replay dataset file fingerprint mismatch: {item['path']}"
+        )
+    return raw
+
+
+def _copy_verified_artifact(
+    root: Path,
+    item: dict,
+    destination: Path,
+) -> Path:
+    expected_bytes, expected_sha256 = _artifact_contract(
+        item,
+        group="overview",
+    )
+    source = _artifact_path(root, item)
+    digest = hashlib.sha256()
+    copied = 0
+    with source.open("rb") as reader, destination.open("xb") as writer:
+        while chunk := reader.read(
+            min(1024 * 1024, expected_bytes - copied + 1)
+        ):
+            copied += len(chunk)
+            if copied > expected_bytes:
+                break
+            digest.update(chunk)
+            writer.write(chunk)
+    if copied != expected_bytes or digest.hexdigest() != expected_sha256:
+        raise ValueError(
+            f"replay dataset file fingerprint mismatch: {item['path']}"
+        )
+    return destination
+
+
 def verify_replay_dataset(dataset_root: str | Path) -> dict:
     try:
         root = _absolute_without_links(dataset_root, label="replay dataset root")
@@ -468,6 +716,10 @@ def verify_replay_dataset(dataset_root: str | Path) -> dict:
             if relative in manifest_paths:
                 raise ValueError("replay dataset manifest paths must be unique")
             manifest_paths.add(relative)
+            expected_bytes, expected_sha256 = _artifact_contract(
+                item,
+                group=group,
+            )
             if group == "series":
                 symbol = item.get("symbol")
                 timeframe = item.get("timeframe")
@@ -512,7 +764,10 @@ def verify_replay_dataset(dataset_root: str | Path) -> dict:
                 raise ValueError("replay dataset path escapes root") from exc
             if not path.is_file():
                 raise ValueError(f"replay dataset file missing: {relative}")
-            if path.stat().st_size != item.get("bytes") or _sha256_file(path) != item.get("sha256"):
+            if (
+                path.stat().st_size != expected_bytes
+                or _sha256_file(path) != expected_sha256
+            ):
                 raise ValueError(f"replay dataset file fingerprint mismatch: {relative}")
             expected.add(relative)
     required_timeframes = set(_TIMEFRAME_MS)
@@ -540,14 +795,24 @@ def load_replay_dataset(dataset_root: str | Path) -> ReplayDataset:
     manifest = verify_replay_dataset(dataset_root)
     root = _absolute_without_links(dataset_root, label="replay dataset root")
     payload = manifest["fingerprint_payload"]
-    overview_paths = [root / item["path"] for item in payload["overview"]]
-    snapshots = tuple(load_overview_snapshots(overview_paths))
+    with tempfile.TemporaryDirectory(prefix="tradingbot-replay-") as temporary:
+        temporary_root = Path(temporary)
+        overview_paths = [
+            _copy_verified_artifact(
+                root,
+                item,
+                temporary_root / f"{index:04d}.sqlite3",
+            )
+            for index, item in enumerate(payload["overview"])
+        ]
+        snapshots = tuple(load_overview_snapshots(overview_paths))
     if len(snapshots) < 2:
         raise ValueError("replay dataset requires at least two overview snapshots")
     ohlcv = {}
     for item in payload["series"]:
-        with (root / item["path"]).open("rb") as handle:
-            rows = json.loads(handle.read().decode("utf-8"))
+        rows = json.loads(
+            _read_verified_artifact(root, item, group="series").decode("utf-8")
+        )
         normalized = _normalized_bars(rows, item["timeframe"])
         if (
             len(normalized) != item["rows"]
@@ -560,8 +825,9 @@ def load_replay_dataset(dataset_root: str | Path) -> ReplayDataset:
         )
     funding_history = {}
     for item in payload["funding"]:
-        with (root / item["path"]).open("rb") as handle:
-            rows = json.loads(handle.read().decode("utf-8"))
+        rows = json.loads(
+            _read_verified_artifact(root, item, group="funding").decode("utf-8")
+        )
         normalized = _normalized_funding(rows)
         if (
             len(normalized) != item["rows"]

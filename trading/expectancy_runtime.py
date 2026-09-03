@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
@@ -45,24 +46,77 @@ def _absolute_without_links(path: str | os.PathLike, *, label: str) -> Path:
 
 def _sync_directory(path: Path) -> None:
     try:
-        directory_fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(str(path), flags)
+    except AttributeError:
         return
+    except OSError as exc:
+        if os.name == "nt":
+            if isinstance(exc, PermissionError):
+                return
+            if (
+                isinstance(exc, FileNotFoundError)
+                and path == Path(path.anchor)
+                and path.is_dir()
+            ):
+                return
+        raise
+    primary_error: BaseException | None = None
     try:
         os.fsync(directory_fd)
-    except OSError:
-        pass
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         try:
             os.close(directory_fd)
-        except OSError:
-            pass
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "expectancy directory close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
+def _sync_parent_chain(path: Path) -> None:
+    parent = path.parent
+    while True:
+        _sync_directory(parent)
+        if parent == parent.parent:
+            break
+        parent = parent.parent
+
+
+def _same_file_generation(path: Path, identity: tuple[int, int]) -> bool:
+    try:
+        current = path.stat(follow_symlinks=False)
+    except (OSError, ValueError):
+        return False
+    return (
+        stat.S_ISREG(current.st_mode)
+        and (current.st_dev, current.st_ino) == identity
+    )
+
+
+def _note_cleanup_error(primary: BaseException, error: BaseException) -> None:
+    try:
+        primary.add_note(
+            "expectancy temporary cleanup failed: "
+            f"{type(error).__name__}: {error}"
+        )
+    except BaseException:
+        pass
 
 
 def _publish_expectancy_json(path: str | Path, encoded: bytes, *, label: str) -> Path:
     target = _absolute_without_links(path, label=label)
     target.parent.mkdir(parents=True, exist_ok=True)
     target = _absolute_without_links(target, label=label)
+    _sync_parent_chain(target.parent)
     if not target.parent.is_dir():
         raise ValueError(f"{label} parent must be a real directory")
     fd, temp_name = tempfile.mkstemp(
@@ -71,23 +125,79 @@ def _publish_expectancy_json(path: str | Path, encoded: bytes, *, label: str) ->
         dir=str(target.parent),
     )
     temp = Path(temp_name)
+    fd_owned = True
+    temp_owned = True
+    temp_identity: tuple[int, int] | None = None
     published = False
+    primary_error: BaseException | None = None
     try:
-        with os.fdopen(fd, "wb") as handle:
+        temp_stat = os.fstat(fd)
+        temp_identity = (temp_stat.st_dev, temp_stat.st_ino)
+        handle = None
+        handle_error: BaseException | None = None
+        try:
+            handle = os.fdopen(fd, "wb")
+            fd_owned = False
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            handle_error = exc
+            raise
+        finally:
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException as close_error:
+                    if handle_error is None:
+                        raise
+                    _note_cleanup_error(handle_error, close_error)
         target = _absolute_without_links(target, label=label)
         _absolute_without_links(temp, label=f"{label} temporary path")
         os.replace(temp, target)
+        temp_owned = False
         published = True
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
+        cleanup_error: BaseException | None = None
+        if fd_owned:
+            try:
+                os.close(fd)
+            except BaseException as exc:
+                cleanup_error = exc
+        same_generation = False
+        if temp_owned and temp_identity is not None:
+            try:
+                same_generation = _same_file_generation(temp, temp_identity)
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                else:
+                    _note_cleanup_error(cleanup_error, exc)
+        if same_generation:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                else:
+                    _note_cleanup_error(cleanup_error, exc)
         try:
-            temp.unlink()
-        except OSError:
-            pass
-        if published:
-            _sync_directory(target.parent)
+            if published:
+                _sync_directory(target.parent)
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+            else:
+                _note_cleanup_error(cleanup_error, exc)
+        if cleanup_error is not None:
+            if primary_error is None:
+                raise cleanup_error
+            _note_cleanup_error(primary_error, cleanup_error)
     return target
 
 

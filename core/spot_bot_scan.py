@@ -120,6 +120,44 @@ class ScanMixin:
             return None
         return parsed if math.isfinite(parsed) else None
 
+    def _entry_pre_submit_allowed(self) -> bool:
+        """Revalidate runtime safety gates immediately before a LIVE buy."""
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        if shutdown_event is None or shutdown_event.is_set() is not False:
+            return False
+        safe_mode = getattr(self, "safe_mode", None)
+        if safe_mode is None:
+            return False
+        return safe_mode.is_active() is False
+
+    def _place_buy_order_with_runtime_guard(
+        self,
+        sym: str,
+        row,
+        trade_usdt: float,
+        *,
+        entry_id: str,
+    ):
+        """Arm the base submit guard without changing override signatures."""
+        missing = object()
+        previous = getattr(self, "_active_entry_pre_submit_guard", missing)
+        self._active_entry_pre_submit_guard = self._entry_pre_submit_allowed
+        try:
+            return self._place_buy_order(
+                sym,
+                row,
+                trade_usdt,
+                entry_id=entry_id,
+            )
+        finally:
+            if previous is missing:
+                try:
+                    delattr(self, "_active_entry_pre_submit_guard")
+                except AttributeError:
+                    pass
+            else:
+                self._active_entry_pre_submit_guard = previous
+
     def _rsi_triplet(self, row) -> tuple[float, float, float] | None:
         values = tuple(
             self._finite_float(row.get(key))
@@ -278,11 +316,25 @@ class ScanMixin:
                     return amount, implied_price, cost
         return amount, price, derived_cost
 
-    def _release_entry_claim_if_untracked(self, sym: str) -> bool:
+    def _release_entry_claim_if_untracked(
+        self,
+        sym: str,
+        *,
+        entry_id: str = "",
+    ) -> bool:
         from core.logger import log_event
+        from bot_utils.trade_state import release_claim_if_absent_for_generation
 
         try:
-            released = bool(self.state.release_claim_if_absent(sym))
+            if isinstance(entry_id, str) and entry_id.strip():
+                released = release_claim_if_absent_for_generation(
+                    self.state,
+                    sym,
+                    {"entry_id": entry_id.strip()},
+                )
+            else:
+                result = self.state.release_claim_if_absent(sym)
+                released = result is None or result is True
         except Exception as exc:
             log_event(
                 f"{sym}: entry claim cleanup failed ({exc}) - keeping "
@@ -298,7 +350,13 @@ class ScanMixin:
             )
         return released
 
-    def _cleanup_rolled_back_entry_state(self, sym: str, reason: str) -> bool:
+    def _cleanup_rolled_back_entry_state(
+        self,
+        sym: str,
+        reason: str,
+        *,
+        entry_id: str = "",
+    ) -> bool:
         """Remove a state row after a verified rollback sell.
 
         ``TradeState.add`` can return False after already mutating memory/JSON.
@@ -311,15 +369,38 @@ class ScanMixin:
             "entry_abort_reason": reason,
             "claim_release_pending": True,
         }
+        expected_row = (
+            {"entry_id": entry_id.strip()}
+            if isinstance(entry_id, str) and entry_id.strip()
+            else None
+        )
         try:
-            removed = self.state.remove(sym, restore)
+            from bot_utils.trade_state import remove_with_restore_fields
+
+            removed = remove_with_restore_fields(
+                self.state,
+                sym,
+                restore,
+                expected_row=expected_row,
+            )
         except Exception as exc:
             self._log_error(f"cleanup rolled-back entry {sym}", exc)
             removed = False
         if removed:
             return True
         try:
-            return bool(self.state.release_claim_if_absent(sym))
+            if expected_row is None:
+                result = self.state.release_claim_if_absent(sym)
+                return result is None or result is True
+            from bot_utils.trade_state import (
+                release_claim_if_absent_for_generation,
+            )
+
+            return release_claim_if_absent_for_generation(
+                self.state,
+                sym,
+                expected_row,
+            )
         except Exception as exc:
             self._log_error(f"retry rolled-back entry cleanup {sym}", exc)
             return False
@@ -332,7 +413,11 @@ class ScanMixin:
         reason: str,
     ) -> bool:
         """Close rollback recovery only after durable state/claim cleanup."""
-        cleaned = self._cleanup_rolled_back_entry_state(sym, reason)
+        cleaned = self._cleanup_rolled_back_entry_state(
+            sym,
+            reason,
+            entry_id=entry_id,
+        )
         if cleaned is not True:
             return False
         try:
@@ -427,6 +512,42 @@ class ScanMixin:
                 return
 
     #  One scan tick
+
+    def _mark_spot_entry_recovery_pending(self, client_order_id: str) -> None:
+        """Block LIVE entries until a later complete reconciliation."""
+        lock = getattr(self, "_position_integrity_health_lock", None)
+
+        def _mark() -> None:
+            self._spot_entry_recovery_generation = int(
+                getattr(self, "_spot_entry_recovery_generation", 0)
+            ) + 1
+            self._spot_entry_recovery_blocked = True
+
+        if lock is None:
+            _mark()
+        else:
+            with lock:
+                _mark()
+
+        record_integrity = getattr(
+            self, "_record_position_integrity_health", None
+        )
+        if callable(record_integrity):
+            try:
+                record_integrity(
+                    {
+                        "ok": False,
+                        "claims_available": True,
+                        "metadata_complete": False,
+                        "money_issues": [
+                            "entry_outcome_unknown:"
+                            f"{str(client_order_id)[:96]}"
+                        ],
+                    },
+                    telemetry_phase="reconcile",
+                )
+            except Exception:
+                pass
 
     def _scan_tick(self) -> None:
         from core.logger import log_event
@@ -651,6 +772,15 @@ class ScanMixin:
                 opened_usdt = self._try_open_trade(r, regime, balance)
                 if opened_usdt is not None and not self.simulation and balance is not None:
                     balance = max(0.0, balance - float(opened_usdt))
+            except SpotBuyOutcomeUnknown as e:
+                self._mark_spot_entry_recovery_pending(e.client_order_id)
+                log_event(
+                    f"{sym}: buy outcome unknown; stopping LIVE admission "
+                    "until complete reconciliation",
+                    "ERROR",
+                )
+                self._log_error(f"_try_open_trade {sym}", e)
+                return
             except Exception as e:
                 log_event(f"Open-trade {sym} failed: {e}", "WARN")
                 self._log_error(f"_try_open_trade {sym}", e)
@@ -879,9 +1009,26 @@ class ScanMixin:
             news, "" if analysis_is_keyword else ans
         )
 
-        # Place the order (or simulate)
+        # Candidate analysis/admission can take long enough for the monitor to
+        # stop this same symbol meanwhile. Import the claim function first,
+        # then keep the final in-memory check directly adjacent to the atomic
+        # claim so a newly armed stop cooldown wins the race.
         if not self.simulation:
             from core.database import claim_symbol_for_entry
+        if self._is_in_cooldown(sym):
+            log_event(f"{sym}: entry blocked by fresh cooldown", "WAIT")
+            emit_entry_lifecycle(
+                entry_id,
+                bot=self.BOT_NAME,
+                symbol=sym,
+                stage="blocked",
+                mode=entry_mode,
+                reason="cooldown_recheck",
+            )
+            return None
+
+        # Place the order (or simulate)
+        if not self.simulation:
             if not claim_symbol_for_entry(
                 self.BOT_NAME,
                 sym,
@@ -901,13 +1048,17 @@ class ScanMixin:
                     stage="blocked", mode=entry_mode,
                     reason="claim_conflict")
                 return None
+
         _claimed = not self.simulation
         emit_entry_lifecycle(
             entry_id, bot=self.BOT_NAME, symbol=sym,
             stage="order_attempt", mode=entry_mode)
         try:
-            entry = self._place_buy_order(
-                sym, r, trade_usdt, entry_id=entry_id
+            entry = self._place_buy_order_with_runtime_guard(
+                sym,
+                r,
+                trade_usdt,
+                entry_id=entry_id,
             )
         except SpotBuyOutcomeUnknown as _buy_exc:
             emit_entry_lifecycle(
@@ -921,7 +1072,10 @@ class ScanMixin:
                 stage="order_failed", mode=entry_mode,
                 reason=type(_buy_exc).__name__)
             if _claimed:
-                released = self._release_entry_claim_if_untracked(sym)
+                released = self._release_entry_claim_if_untracked(
+                    sym,
+                    entry_id=entry_id,
+                )
                 if released:
                     from core.database import release_portfolio_reservation
 
@@ -933,7 +1087,10 @@ class ScanMixin:
                 stage="order_failed", mode=entry_mode,
                 reason="no_verified_fill")
             if _claimed:
-                released = self._release_entry_claim_if_untracked(sym)
+                released = self._release_entry_claim_if_untracked(
+                    sym,
+                    entry_id=entry_id,
+                )
                 if released:
                     from core.database import release_portfolio_reservation
 
@@ -986,12 +1143,24 @@ class ScanMixin:
         }
         if sim_tca_pending is not None:
             position_fields[self._SIM_TCA_PENDING_FIELD] = sim_tca_pending
-        if self.state.has(sym):
-            # Keep the provisional buy_time (earliest, most accurate entry time).
-            state_ok = self.state.update_many(sym, position_fields)
-        else:
-            position_fields["buy_time"] = _utc_now_str()
-            state_ok = self.state.add(sym, position_fields)
+        from bot_utils.trade_state import promote_position_generation
+
+        create_fields = dict(position_fields)
+        create_fields["buy_time"] = _utc_now_str()
+        state_ok = promote_position_generation(
+            self.state,
+            sym,
+            position_fields,
+            {"entry_id": entry_id},
+            create_fields=create_fields,
+        )
+        if state_ok is None:
+            log_event(
+                f"Buy {sym}: final state promotion was superseded by another "
+                "entry generation; no rollback was sent",
+                "ERROR",
+            )
+            return
         if state_ok is False and not self.simulation:
             emit_entry_lifecycle(
                 entry_id, bot=self.BOT_NAME, symbol=sym,
@@ -1053,7 +1222,24 @@ class ScanMixin:
             if not self.simulation:
                 from core.database import release_portfolio_reservation
 
-                release_portfolio_reservation(entry_id, status="CONSUMED")
+                try:
+                    release_portfolio_reservation(entry_id, status="CONSUMED")
+                except Exception as reservation_exc:
+                    try:
+                        log_event(
+                            f"Buy {sym}: portfolio reservation consume failed; "
+                            "reservation remains ACTIVE fail-closed",
+                            "ERROR",
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        self._log_error(
+                            f"consume portfolio reservation {sym}",
+                            reservation_exc,
+                        )
+                    except Exception:
+                        pass
             emit_entry_lifecycle(
                 entry_id, bot=self.BOT_NAME, symbol=sym,
                 stage="opened", mode=entry_mode, fill_price=fill_price,
@@ -1483,6 +1669,7 @@ class ScanMixin:
         trade_usdt: float,
         *,
         entry_id: str | None = None,
+        pre_submit_guard=None,
     ):
         """Place a market buy. Returns (amount, fill_price, gross_amount,
         invested_usdt, entry_fee) on success, None on failure.
@@ -1493,6 +1680,25 @@ class ScanMixin:
         the exchange  orphan position).
         """
         from core.logger import log_event
+
+        if pre_submit_guard is None:
+            pre_submit_guard = getattr(
+                self,
+                "_active_entry_pre_submit_guard",
+                None,
+            )
+
+        def _submit_allowed() -> bool:
+            if pre_submit_guard is None:
+                return True
+            try:
+                return pre_submit_guard() is True
+            except Exception as exc:
+                try:
+                    self._log_error(f"spot entry pre-submit guard {sym}", exc)
+                except Exception:
+                    pass
+                return False
 
         # defensive price validation
         price = ScanMixin._positive_float(r.get("price"))
@@ -1645,6 +1851,13 @@ class ScanMixin:
             direct_submit_ack = False
             direct_ack_client_order_id = cid
             try:
+                if not _submit_allowed():
+                    log_event(
+                        f"Buy {sym}: blocked by runtime safety gate before "
+                        "venue submit",
+                        "WAIT",
+                    )
+                    return None
                 if quote_first_buy:
                     # Disable the price-requirement check so we can pass
                     # cost directly. Some ccxt versions need this opt-in.
@@ -1702,6 +1915,13 @@ class ScanMixin:
                     # Param rejected  first call never placed an order; safe
                     # to retry once WITHOUT the clientOrderId param.
                     try:
+                        if not _submit_allowed():
+                            log_event(
+                                f"Buy {sym}: blocked by runtime safety gate "
+                                "before parameter fallback submit",
+                                "WAIT",
+                            )
+                            return None
                         if quote_first_buy:
                             order = _create_market_buy_budgeted(
                                 self.ex,
@@ -1826,8 +2046,10 @@ class ScanMixin:
             provisional_amount = resolved_gross_amount
             try:
                 from core.logger import _date as _utc_now_str_inner
+                from bot_utils.trade_state import promote_position_generation
+
                 provisional_invested_usdt = resolved_invested_usdt
-                provisional_ok = self.state.add(sym, {
+                provisional_row = {
                     "buy": provisional_fill_price,
                     "highest": provisional_fill_price,
                     "lowest": provisional_fill_price,
@@ -1842,7 +2064,20 @@ class ScanMixin:
                     "fees_paid": 0.0,
                     "entry_id": entry_id,
                     "provisional": True,
-                })
+                }
+                provisional_ok = promote_position_generation(
+                    self.state,
+                    sym,
+                    provisional_row,
+                    {"entry_id": entry_id},
+                )
+                if provisional_ok is None:
+                    log_event(
+                        f"Buy {sym}: provisional state was superseded by "
+                        "another entry generation; no rollback was sent",
+                        "ERROR",
+                    )
+                    return None
                 provisional_written = provisional_ok is not False
                 if provisional_ok is False:
                     log_event(
@@ -1911,7 +2146,11 @@ class ScanMixin:
             try:
                 from core.logger import _date as _utc_now_str_inner
                 if not provisional_written:
-                    provisional_ok = self.state.add(sym, {
+                    from bot_utils.trade_state import (
+                        promote_position_generation,
+                    )
+
+                    provisional_row = {
                         "buy": fill_price,
                         "highest": fill_price,
                         "lowest": fill_price,
@@ -1926,7 +2165,21 @@ class ScanMixin:
                         "fees_paid": 0.0,
                         "entry_id": entry_id,
                         "provisional": True,
-                    })
+                    }
+                    provisional_ok = promote_position_generation(
+                        self.state,
+                        sym,
+                        provisional_row,
+                        {"entry_id": entry_id},
+                    )
+                    if provisional_ok is None:
+                        log_event(
+                            f"Buy {sym}: provisional state retry was "
+                            "superseded by another entry generation; no "
+                            "rollback was sent",
+                            "ERROR",
+                        )
+                        return None
                     if provisional_ok is False:
                         log_event(
                             f"Buy {sym}: provisional state-write returned "
@@ -2129,9 +2382,10 @@ class ScanMixin:
                 or latest.get(self._SIM_TCA_PENDING_FIELD) != pending
             ):
                 raise RuntimeError("SIM TCA state changed before WAL clear")
-            if not self.state.update_many(
+            cleared = self.state.update_many(
                 sym, {self._SIM_TCA_PENDING_FIELD: None}
-            ):
+            )
+            if cleared is not None and cleared is not True:
                 raise RuntimeError("SIM TCA WAL clear was not durable")
             return True
         except Exception as exc:

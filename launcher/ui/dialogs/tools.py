@@ -20,6 +20,7 @@ from collections import deque as _deque
 import customtkinter as ctk
 
 from bot_utils.config import _read_config_json
+from bot_utils.runtime_threads import thread_definitely_never_started
 from launcher.config.settings import (
     BOT_META,
     BOT_ORDER,
@@ -910,6 +911,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
     # Subprocess state
     proc_state: dict = {
         "proc": None, "reader_thread": None,
+        "reader_state": None,
         "buffer": _BoundedToolOutputBuffer(),
         "done": False, "exit_code": None, "stop_reading": False,
     }
@@ -1382,7 +1384,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         import_promotion_btn.pack(side="left", padx=(0, 8))
 
     #  Subprocess output reader thread 
-    def _read_stdout(proc, run_generation):
+    def _read_stdout(proc, run_generation, reader_state):
         # Pattern to detect the terminal-style progress bar emitted by the
         # optimizer on stderr (which is merged into stdout via stderr=STDOUT).
         # Example: "  Optimize [] 45/648 (7%) ETA 3s Best: +-1.99"
@@ -1404,7 +1406,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             line = re.sub(r'\x1b\[[0-9;]*m', '', line)
             if not line.strip() or _PROGRESS_BAR_RE.match(line):
                 return
-            proc_state["buffer"].append(line)
+            reader_state["buffer"].append(line)
 
         try:
             # When the optimizer uses '\r' to repaint the same line, readline
@@ -1415,25 +1417,22 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
                 if not chunk:
                     normal_eof = True
                     break
-                if proc_state["stop_reading"]:
+                if reader_state["stop_reading"]:
                     break
                 for raw in framer.feed(chunk):
                     _append_raw_output(raw)
         except Exception as e:
-            proc_state["buffer"].append(f"[Reader-Error] {e}")
+            reader_state["buffer"].append(f"[Reader-Error] {e}")
         finally:
             for raw in framer.finish():
                 _append_raw_output(raw)
-            # Set exit_code BEFORE done  otherwise the UI tick might see
-            # done=True with exit_code=None and treat the run as successful.
             try:
-                proc_state["exit_code"] = proc.wait()
+                reader_state["exit_code"] = proc.wait()
             except Exception:
-                proc_state["exit_code"] = -1
-            if parse_state.get("run_generation") == run_generation:
-                parse_state["output_complete"] = bool(
-                    normal_eof and not proc_state["stop_reading"]
-                )
+                reader_state["exit_code"] = -1
+            reader_state["output_complete"] = bool(
+                normal_eof and not reader_state["stop_reading"]
+            )
             if not _process_is_alive(proc):
                 try:
                     registry = getattr(app, "tool_processes", None)
@@ -1441,7 +1440,40 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
                         registry.unregister(proc)
                 except Exception:
                     pass
-            proc_state["done"] = True
+
+    def _reader_main(reader_state):
+        reader_state["entered"].set()
+        fatal_error = None
+        try:
+            _read_stdout(
+                reader_state["proc"],
+                reader_state["run_generation"],
+                reader_state,
+            )
+        except BaseException as exc:
+            fatal_error = exc
+            reader_state["fatal_error"] = exc
+            raise
+        finally:
+            if fatal_error is not None:
+                try:
+                    reader_state["buffer"].append(
+                        "[Reader-Fatal] "
+                        f"{type(fatal_error).__name__}: {fatal_error}"
+                    )
+                except BaseException:
+                    pass
+            # Publish completion only while this exact reader generation is
+            # still current.  An old reader can therefore never complete or
+            # overwrite a successor run (including after LaunchThenRaise).
+            if proc_state.get("reader_state") is reader_state:
+                proc_state["exit_code"] = reader_state["exit_code"]
+                if parse_state.get("run_generation") == reader_state["run_generation"]:
+                    parse_state["output_complete"] = reader_state[
+                        "output_complete"
+                    ]
+                proc_state["done"] = True
+            reader_state["done"].set()
 
     #  UI tick: poll the buffer every 120ms 
     spinner_chars = ["  ", "  ", "  ", "  "]
@@ -1496,6 +1528,15 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             pass
 
     def _ui_tick():
+        reader_state = proc_state.get("reader_state")
+        if (
+            reader_state is not None
+            and reader_state.get("start_uncertain")
+            and not reader_state["entered"].is_set()
+            and not reader_state["done"].is_set()
+        ):
+            _mark_process_survivor()
+            return
         # Cap at 100 lines per tick so the Tk main thread isn't blocked
         # for seconds when the optimizer dumps 10,000+ lines at once.
         buf = proc_state["buffer"]
@@ -1586,6 +1627,9 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
 
         proc = proc_state.get("proc")
         proc_state["stop_reading"] = True
+        reader_state = proc_state.get("reader_state")
+        if reader_state is not None:
+            reader_state["stop_reading"] = True
         if _process_is_alive(proc):
             def _reap():
                 if not _stop_owned_process(proc):
@@ -1614,9 +1658,21 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
 
     #  Start function: fired on Run click 
     def _start_run():
+        previous_reader = proc_state.get("reader_state")
+        if (
+            previous_reader is not None
+            and not previous_reader["done"].is_set()
+        ):
+            status_var.set(" Previous output reader is still owned")
+            status_lbl.configure(text_color=COLORS["danger"])
+            return
         if _process_is_alive(proc_state.get("proc")):
             _mark_process_survivor()
             return
+
+        if proc_state.get("reader_state") is previous_reader:
+            proc_state["reader_state"] = None
+            proc_state["reader_thread"] = None
 
         bot = bot_var.get()
         days = days_var.get()
@@ -1746,22 +1802,73 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             )
             proc_state["proc"] = proc
 
+            reader_state = {
+                "proc": proc,
+                "run_generation": run_generation,
+                "buffer": proc_state["buffer"],
+                "thread": None,
+                "entered": threading.Event(),
+                "done": threading.Event(),
+                "stop_reading": False,
+                "exit_code": None,
+                "output_complete": False,
+                "fatal_error": None,
+                "start_uncertain": False,
+            }
             reader = threading.Thread(
-                target=_read_stdout,
-                args=(proc, run_generation),
+                target=_reader_main,
+                args=(reader_state,),
                 daemon=True,
             )
-            reader.start()
+            reader_state["thread"] = reader
+            # Ownership is visible before start(): a custom start() may launch
+            # the target and then raise, so post-start publication is unsafe.
+            proc_state["reader_state"] = reader_state
             proc_state["reader_thread"] = reader
+            try:
+                reader.start()
+            except BaseException as start_error:
+                if (
+                    thread_definitely_never_started(reader)
+                    and proc_state.get("reader_state") is reader_state
+                ):
+                    proc_state["reader_state"] = None
+                    proc_state["reader_thread"] = None
+                    reader_state["done"].set()
+                    raise
+                reader_state["start_uncertain"] = True
+                if not isinstance(start_error, Exception):
+                    raise
+                reader_state["buffer"].append(
+                    "[Reader-Start-Uncertain] "
+                    f"{type(start_error).__name__}: {start_error}"
+                )
 
             dlg.after(100, _ui_tick)
 
             status_var.set("")
-        except Exception as e:
+        except BaseException as e:
             proc = proc or proc_state.get("proc")
-            stopped = not _process_is_alive(proc)
-            if not stopped:
-                stopped = _stop_owned_process(proc)
+            stopped = False
+            cleanup_error = None
+            try:
+                stopped = not _process_is_alive(proc)
+                if not stopped:
+                    stopped = _stop_owned_process(proc)
+            except BaseException as exc:
+                cleanup_error = exc
+            if cleanup_error is not None:
+                try:
+                    e.add_note(
+                        "tool process cleanup after reader-start failure: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
+            if not isinstance(e, Exception):
+                # Preserve fatal control-flow after the already-spawned child
+                # has either stopped or remains explicitly registry-owned.
+                raise
             _append_line(f"[ERROR] Failed to start subprocess: {e}")
             status_var.set(f" Failed: {e}")
             status_lbl.configure(text_color=COLORS["danger"])

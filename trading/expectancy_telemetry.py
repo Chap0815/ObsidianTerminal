@@ -6,6 +6,8 @@ import os
 import threading
 import time
 
+from bot_utils.runtime_threads import thread_definitely_never_started
+
 
 EXPECTANCY_FEATURES: dict[str, tuple[str, ...]] = {
     "CROSS": ("score", "spread_bps", "side_sign", "target_side_count"),
@@ -52,6 +54,9 @@ EXPECTANCY_FEATURE_SCHEMAS["CROSS"][2] = (
 _RETENTION_LOCK = threading.Lock()
 _NEXT_RETENTION_CHECK = 0.0
 _RETENTION_RUNNING = False
+_RETENTION_THREAD: threading.Thread | None = None
+_RETENTION_GENERATION = None
+_RETENTION_TERMINAL = False
 _RETENTION_INTERVAL_SECONDS = 3600.0
 _RETENTION_RETRY_SECONDS = 60.0
 _RETENTION_ADVISORY_LOCK_NAME = "research_telemetry_retention"
@@ -68,7 +73,7 @@ def _log_telemetry_error(context: str, exc: BaseException) -> None:
 
 
 def _run_retention_cleanup() -> None:
-    global _NEXT_RETENTION_CHECK, _RETENTION_RUNNING
+    global _NEXT_RETENTION_CHECK, _RETENTION_RUNNING, _RETENTION_THREAD
     failure = None
     acquired = False
     contended = False
@@ -109,35 +114,166 @@ def _run_retention_cleanup() -> None:
                     "release research telemetry retention lock", exc
                 )
         with _RETENTION_LOCK:
-            if failure is not None or contended:
-                retry_at = time.monotonic() + _RETENTION_RETRY_SECONDS
-                _NEXT_RETENTION_CHECK = min(_NEXT_RETENTION_CHECK, retry_at)
-            _RETENTION_RUNNING = False
+            current = threading.current_thread()
+            if _RETENTION_THREAD is None or _RETENTION_THREAD is current:
+                if failure is not None or contended:
+                    retry_at = time.monotonic() + _RETENTION_RETRY_SECONDS
+                    _NEXT_RETENTION_CHECK = min(
+                        _NEXT_RETENTION_CHECK,
+                        retry_at,
+                    )
+                _RETENTION_RUNNING = False
+                _RETENTION_THREAD = None
 
 
 def _schedule_retention_cleanup(now: float | None = None) -> None:
-    global _NEXT_RETENTION_CHECK, _RETENTION_RUNNING
+    global _NEXT_RETENTION_CHECK, _RETENTION_GENERATION
+    global _RETENTION_RUNNING, _RETENTION_THREAD
     observed = time.monotonic() if now is None else now
     if observed < _NEXT_RETENTION_CHECK:
         return
     start_error = None
     with _RETENTION_LOCK:
-        if observed < _NEXT_RETENTION_CHECK or _RETENTION_RUNNING:
+        existing = _RETENTION_GENERATION
+        if existing is not None and not _retention_generation_unresolved(existing):
+            if _RETENTION_GENERATION is existing:
+                _RETENTION_GENERATION = None
+                if _RETENTION_THREAD is existing.get("thread"):
+                    _RETENTION_THREAD = None
+                _RETENTION_RUNNING = False
+        if (
+            _RETENTION_TERMINAL
+            or observed < _NEXT_RETENTION_CHECK
+            or _RETENTION_RUNNING
+            or _retention_generation_unresolved(_RETENTION_GENERATION)
+        ):
             return
         _RETENTION_RUNNING = True
         _NEXT_RETENTION_CHECK = observed + _RETENTION_INTERVAL_SECONDS
+        candidate = None
+        generation = {"thread": None, "done": threading.Event()}
+
+        def run_retention_generation() -> None:
+            try:
+                _run_retention_cleanup()
+            finally:
+                generation["done"].set()
+
         try:
-            threading.Thread(
-                target=_run_retention_cleanup,
+            candidate = threading.Thread(
+                target=run_retention_generation,
                 name="research-telemetry-retention",
                 daemon=True,
-            ).start()
-        except Exception as exc:
+            )
+            generation["thread"] = candidate
+            _RETENTION_THREAD = candidate
+            _RETENTION_GENERATION = generation
+            candidate.start()
+        except BaseException as exc:
             start_error = exc
-            _RETENTION_RUNNING = False
-            _NEXT_RETENTION_CHECK = observed + _RETENTION_RETRY_SECONDS
+            definite_prelaunch = (
+                candidate is None
+                or (
+                    isinstance(exc, Exception)
+                    and thread_definitely_never_started(candidate)
+                )
+            )
+            if definite_prelaunch:
+                generation["done"].set()
+                _RETENTION_RUNNING = False
+                if _RETENTION_THREAD is candidate:
+                    _RETENTION_THREAD = None
+                if _RETENTION_GENERATION is generation:
+                    _RETENTION_GENERATION = None
+                _NEXT_RETENTION_CHECK = (
+                    observed + _RETENTION_RETRY_SECONDS
+                )
     if start_error is not None:
         _log_telemetry_error("start research telemetry retention", start_error)
+        if not isinstance(start_error, Exception):
+            raise start_error
+
+
+def _retention_generation_unresolved(generation) -> bool:
+    if generation is None:
+        return False
+    if not generation["done"].is_set():
+        return True
+    thread = generation.get("thread")
+    if thread is None:
+        return False
+    try:
+        return bool(thread.is_alive())
+    except BaseException:
+        return True
+
+
+def shutdown_expectancy_telemetry_resources(timeout: float = 0.0) -> bool:
+    """Terminally prevent new retention jobs and await the active DB job."""
+    global _RETENTION_GENERATION, _RETENTION_RUNNING
+    global _RETENTION_TERMINAL, _RETENTION_THREAD
+    if isinstance(timeout, bool):
+        return False
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(budget):
+        return False
+    budget = min(max(0.0, budget), threading.TIMEOUT_MAX)
+    deadline = time.monotonic() + budget
+    # Close admission even when a concurrent scheduler currently owns the
+    # lifecycle lock. Work admitted before this edge remains generation-owned.
+    _RETENTION_TERMINAL = True
+    lock_timeout = min(
+        max(0.0, deadline - time.monotonic()),
+        threading.TIMEOUT_MAX,
+    )
+    if not _RETENTION_LOCK.acquire(timeout=lock_timeout):
+        return False
+    try:
+        generation = _RETENTION_GENERATION
+        thread = (
+            generation.get("thread")
+            if generation is not None
+            else _RETENTION_THREAD
+        )
+    finally:
+        _RETENTION_LOCK.release()
+    if thread is not None and thread is not threading.current_thread():
+        try:
+            thread.join(
+                timeout=min(
+                    max(0.0, deadline - time.monotonic()),
+                    threading.TIMEOUT_MAX,
+                )
+            )
+        except BaseException:
+            return False
+    lock_timeout = min(
+        max(0.0, deadline - time.monotonic()),
+        threading.TIMEOUT_MAX,
+    )
+    if not _RETENTION_LOCK.acquire(timeout=lock_timeout):
+        return False
+    try:
+        if generation is not None:
+            if _retention_generation_unresolved(generation):
+                return False
+            if _RETENTION_GENERATION is generation:
+                _RETENTION_GENERATION = None
+                if _RETENTION_THREAD is thread:
+                    _RETENTION_THREAD = None
+                _RETENTION_RUNNING = False
+        return (
+            not _RETENTION_RUNNING
+            and (
+                _RETENTION_THREAD is None
+                or not _RETENTION_THREAD.is_alive()
+            )
+        )
+    finally:
+        _RETENTION_LOCK.release()
 
 
 def _finite(value) -> float | None:
@@ -294,7 +430,12 @@ def emit_expectancy_candidate(
             persistence_fields["feature_snapshot"] = snapshot_payload
         if normalized_decision is not None:
             persistence_fields["quality_decision"] = normalized_decision
-        persisted = bool(persister(**persistence_fields))
+        persistence_result = persister(**persistence_fields)
+        persisted = (
+            persistence_result is True
+            if default_persistence
+            else bool(persistence_result)
+        )
     except Exception as exc:
         persistence_error = exc
         persisted = False
@@ -321,7 +462,7 @@ def emit_expectancy_candidate(
                     mode=str(mode).strip().upper(),
                     reason="expectancy_candidate",
                 )
-                if not priority_persisted:
+                if priority_persisted is not True:
                     _log_telemetry_error(
                         "persist candidate venue priority",
                         RuntimeError(

@@ -5,7 +5,8 @@ Fetches indicators for all candidate symbols in one bounded ThreadPoolExecutor
 pass (per-future and gather-level timeouts so a stuck CCXT call can't stall the
 pool). Brand-new coins get a 24h grace period via symbol_tracker to suppress
 WARN-spam, and the CCXT clone pool is cached at module level (resized to the
-largest n_workers seen, closed via atexit) to avoid per-scan socket churn.
+largest n_workers seen, closed by managed shutdown/atexit) to avoid per-scan
+socket churn.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ from core.logger import log_event
 from core.paths import INDICATOR_FAILURES_STR as _FAIL_CACHE_FILE
 from bot_utils.safe_numeric import safe_positive_float
 from bot_utils.state_persist import atomic_save_json
+from bot_utils.runtime_threads import thread_definitely_never_started
 
 from core.constants import (
     MIN_VOLUME_USDT_SPOT_LIVE,
@@ -241,7 +243,7 @@ def _save_fail_cache_locked(force: bool = False) -> bool:
 
             merged = _bounded_fail_cache(merged, now)
 
-            if not atomic_save_json(_FAIL_CACHE_FILE, merged):
+            if atomic_save_json(_FAIL_CACHE_FILE, merged) is not True:
                 return False
 
         _fail_cache.clear()
@@ -735,24 +737,25 @@ def _clone_exchange(exchange):
         return clone
     except Exception as exc:
         if clone is not None and clone is not src:
-            _close_clone(clone)
+            _close_clone_or_queue(clone)
         raise RuntimeError(
             "independent screener exchange clone unavailable"
         ) from exc
 
 
-def _close_clone(clone) -> None:
+def _close_clone(clone) -> bool:
     """Best-effort close of a CCXT clone's underlying HTTP session. CCXT 4.x
     exposes ``close()`` (sync) or ``session.close()``; older versions only have
     the session attribute. Either way we eat any error  we're in cleanup."""
     if clone is None:
-        return
+        return True
     # 1) Prefer the exchange's own close() if available.
     closer = getattr(clone, "close", None)
     if callable(closer):
         try:
-            closer()
-            return
+            result = closer()
+            if result is None or result is True:
+                return True
         except TypeError:
             # async close  schedule then continue (we just want the
             # socket pool gone; the loop isn't running here)
@@ -763,28 +766,279 @@ def _close_clone(clone) -> None:
     sess = getattr(clone, "session", None)
     if sess is not None:
         try:
-            sess.close()
+            result = sess.close()
+            return result is None or result is True
         except Exception:
-            pass
+            return False
+    return False
 
 
 # Module-level clone pool, reused across calls so we don't churn sockets
 # (each clone holds its own HTTP connection pool).
 _CLONE_POOL: list = []
-_CLONE_POOL_LOCK = threading.Lock()
+_CLONE_POOL_LOCK = threading.RLock()
 _CLONE_POOL_KEY = {"source": None}  # strong object identity, never id()
+_CLONE_POOL_TERMINAL = False
+_CLONE_CLOSE_RETRY: list = []
+_CLONE_RETIREMENTS: set[object] = set()
+_SCREENER_ADMISSION_LOCK = threading.Lock()
+_SCREENER_ACTIVE_SCANS = 0
+_SCREENER_SCAN_LOCAL = threading.local()
+_CLONE_DEFERRED_CLOSE: list = []
+_SCREENER_SHUTDOWN_STATE: dict[str, object] | None = None
 
 
-@atexit.register
+def _begin_screener_scan() -> bool:
+    """Atomically admit one scan before any exchange or API work starts."""
+    global _SCREENER_ACTIVE_SCANS
+    with _SCREENER_ADMISSION_LOCK:
+        if _CLONE_POOL_TERMINAL:
+            return False
+        _SCREENER_ACTIVE_SCANS += 1
+        _SCREENER_SCAN_LOCAL.active = True
+        return True
+
+
+def _retire_clones_async(clones: list) -> None:
+    """Close a detached generation without blocking the scan that released it."""
+    clones = list(clones)
+    if not clones:
+        return
+    retirement = object()
+    with _CLONE_POOL_LOCK:
+        _CLONE_RETIREMENTS.add(retirement)
+
+    def _close_generation() -> None:
+        try:
+            for clone in clones:
+                _close_clone_or_queue(clone)
+        finally:
+            with _CLONE_POOL_LOCK:
+                _CLONE_RETIREMENTS.discard(retirement)
+
+    try:
+        worker = threading.Thread(
+            target=_close_generation,
+            name="screener-clone-retirement",
+            daemon=True,
+        )
+    except BaseException:
+        with _CLONE_POOL_LOCK:
+            _CLONE_RETIREMENTS.discard(retirement)
+            for clone in clones:
+                if not any(clone is prior for prior in _CLONE_CLOSE_RETRY):
+                    _CLONE_CLOSE_RETRY.append(clone)
+        return
+    try:
+        worker.start()
+    except BaseException:
+        # Once start() was invoked, even ident=None cannot prove that no OS
+        # thread exists: Python may still be waiting for bootstrap publication.
+        # Keep the marker authoritative until the candidate's own finally.
+        return
+
+
+def _end_screener_scan() -> None:
+    """Release one scan lease and retire deferred source generations."""
+    global _SCREENER_ACTIVE_SCANS
+    with _SCREENER_ADMISSION_LOCK:
+        _SCREENER_SCAN_LOCAL.active = False
+        if _SCREENER_ACTIVE_SCANS > 0:
+            _SCREENER_ACTIVE_SCANS -= 1
+        if _SCREENER_ACTIVE_SCANS == 0 and _CLONE_DEFERRED_CLOSE:
+            deferred = list(_CLONE_DEFERRED_CLOSE)
+            _CLONE_DEFERRED_CLOSE.clear()
+            # Publish retirement ownership before active=0 becomes visible to
+            # shutdown. This closes the detach -> marker handoff window.
+            _retire_clones_async(deferred)
+
+
+def _close_clone_or_queue(clone) -> bool:
+    """Close a detached clone, retaining explicit failures for shutdown."""
+    closed = _close_clone(clone)
+    if closed is False:
+        with _CLONE_POOL_LOCK:
+            if not any(clone is prior for prior in _CLONE_CLOSE_RETRY):
+                _CLONE_CLOSE_RETRY.append(clone)
+    return closed is not False
+
+
 def _shutdown_clone_pool() -> None:
-    """Close all cached clones at interpreter exit so we don't leave
-    half-open sockets behind."""
+    """Synchronous compatibility helper used by focused pool tests."""
     with _CLONE_POOL_LOCK:
         clones = list(_CLONE_POOL)
+        clones.extend(_CLONE_CLOSE_RETRY)
         _CLONE_POOL.clear()
+        _CLONE_CLOSE_RETRY.clear()
         _CLONE_POOL_KEY["source"] = None
+    with _SCREENER_ADMISSION_LOCK:
+        clones.extend(_CLONE_DEFERRED_CLOSE)
+        _CLONE_DEFERRED_CLOSE.clear()
     for c in clones:
         _close_clone(c)
+
+
+def _run_screener_shutdown_generation(state: dict[str, object]) -> None:
+    """Perform potentially blocking close/file I/O outside the caller."""
+    result = False
+    try:
+        with _SCREENER_ADMISSION_LOCK:
+            deferred = list(_CLONE_DEFERRED_CLOSE)
+            _CLONE_DEFERRED_CLOSE.clear()
+        with _CLONE_POOL_LOCK:
+            retirements_pending = bool(_CLONE_RETIREMENTS)
+            if not retirements_pending:
+                clones = list(_CLONE_POOL)
+                clones.extend(_CLONE_CLOSE_RETRY)
+                clones.extend(deferred)
+                _CLONE_POOL.clear()
+                _CLONE_CLOSE_RETRY.clear()
+                _CLONE_POOL_KEY["source"] = None
+        if retirements_pending:
+            with _SCREENER_ADMISSION_LOCK:
+                _CLONE_DEFERRED_CLOSE.extend(deferred)
+            return
+
+        failed = [clone for clone in clones if _close_clone(clone) is False]
+        with _CLONE_POOL_LOCK:
+            for clone in failed:
+                if not any(clone is prior for prior in _CLONE_CLOSE_RETRY):
+                    _CLONE_CLOSE_RETRY.append(clone)
+            clones_closed = not _CLONE_CLOSE_RETRY and not _CLONE_RETIREMENTS
+
+        # The failure backoff is part of the screener's restart behavior.
+        # Persistence may include a bounded portalocker wait, so it belongs to
+        # this owned worker rather than the bot's shutdown caller.
+        cache_persisted = flush_fail_cache_at_exit()
+        result = clones_closed and cache_persisted
+    finally:
+        state["result"] = result
+        done = state.get("done")
+        if isinstance(done, threading.Event):
+            done.set()
+
+
+def _screener_shutdown_state_unresolved(state: dict[str, object] | None) -> bool:
+    if state is None:
+        return False
+    done = state.get("done")
+    if not isinstance(done, threading.Event) or not done.is_set():
+        return True
+    worker = state.get("thread")
+    if worker is None:
+        return False
+    try:
+        return bool(worker.is_alive())
+    except BaseException:
+        return True
+
+
+def shutdown_screener_resources(timeout: float = 1.0) -> bool:
+    """Terminally close screener resources within one end-to-end deadline."""
+    global _CLONE_POOL_TERMINAL, _SCREENER_SHUTDOWN_STATE
+    if isinstance(timeout, bool):
+        return False
+    try:
+        requested_timeout = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(requested_timeout):
+        return False
+    budget = min(max(0.0, requested_timeout), threading.TIMEOUT_MAX)
+    deadline = time.monotonic() + budget
+
+    if not _SCREENER_ADMISSION_LOCK.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    ):
+        return False
+    start_worker = None
+    try:
+        # Tests may explicitly install a fresh non-terminal lifecycle. In the
+        # real process this transition is one-way.
+        if not _CLONE_POOL_TERMINAL:
+            _SCREENER_SHUTDOWN_STATE = None
+        _CLONE_POOL_TERMINAL = True
+        if _SCREENER_ACTIVE_SCANS:
+            return False
+
+        state = _SCREENER_SHUTDOWN_STATE
+        if state is not None:
+            if not _screener_shutdown_state_unresolved(state):
+                if state.get("result") is True:
+                    return True
+                _SCREENER_SHUTDOWN_STATE = None
+                state = None
+
+        if state is None:
+            done = threading.Event()
+            state = {"done": done, "result": False}
+            try:
+                worker = threading.Thread(
+                    target=_run_screener_shutdown_generation,
+                    args=(state,),
+                    name="screener-shutdown",
+                    daemon=True,
+                )
+                state["thread"] = worker
+                _SCREENER_SHUTDOWN_STATE = state
+            except BaseException:
+                if (
+                    _SCREENER_SHUTDOWN_STATE is state
+                ):
+                    _SCREENER_SHUTDOWN_STATE = None
+                return False
+            start_worker = worker
+    finally:
+        _SCREENER_ADMISSION_LOCK.release()
+
+    if start_worker is not None:
+        try:
+            start_worker.start()
+        except BaseException as exc:
+            # After invoking start(), retain this exact state regardless of
+            # ident/liveness visibility; a pre-bootstrap OS thread may own the
+            # target already and will publish completion itself.
+            if (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(start_worker)
+            ):
+                done.set()
+                if _SCREENER_ADMISSION_LOCK.acquire(
+                    timeout=max(0.0, deadline - time.monotonic())
+                ):
+                    try:
+                        if _SCREENER_SHUTDOWN_STATE is state:
+                            _SCREENER_SHUTDOWN_STATE = None
+                    finally:
+                        _SCREENER_ADMISSION_LOCK.release()
+            return False
+
+    worker = state.get("thread")
+    if worker is not None and worker is not threading.current_thread():
+        try:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        except BaseException:
+            return False
+    if not _SCREENER_ADMISSION_LOCK.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    ):
+        return False
+    try:
+        return (
+            _SCREENER_SHUTDOWN_STATE is state
+            and state.get("result") is True
+            and not _screener_shutdown_state_unresolved(state)
+        )
+    finally:
+        _SCREENER_ADMISSION_LOCK.release()
+
+
+def _shutdown_clone_pool_at_exit() -> bool:
+    """Bounded interpreter-exit fallback for the managed runtime closer."""
+    return shutdown_screener_resources(timeout=1.0)
+
+
+atexit.register(_shutdown_clone_pool_at_exit)
 
 
 def _detach_clone_pool() -> list:
@@ -821,11 +1075,14 @@ def _retire_clone_pool_after(clones: list, futures) -> None:
         return
     if not pending:
         for clone in clones:
-            _close_clone(clone)
+            _close_clone_or_queue(clone)
         return
 
     remaining = [len(pending)]
     close_lock = threading.Lock()
+    retirement = object()
+    with _CLONE_POOL_LOCK:
+        _CLONE_RETIREMENTS.add(retirement)
 
     def _worker_done(_future) -> None:
         to_close = None
@@ -835,7 +1092,9 @@ def _retire_clone_pool_after(clones: list, futures) -> None:
                 to_close = clones
         if to_close is not None:
             for clone in to_close:
-                _close_clone(clone)
+                _close_clone_or_queue(clone)
+            with _CLONE_POOL_LOCK:
+                _CLONE_RETIREMENTS.discard(retirement)
 
     for future in pending:
         future.add_done_callback(_worker_done)
@@ -853,14 +1112,21 @@ def _get_clone_pool(exchange, n_workers: int) -> list:
       Subsequent call needing same or fewer workers:
           slice the existing pool.
 
-    Clones live for the rest of the process. They are closed in the
-    atexit handler above. If the source exchange object changes
+    Clones live until managed process shutdown (with atexit as fallback).
+    If the source exchange object changes
     (e.g. user reconnected), we drop the old pool and rebuild.
     """
     old = []
     abandoned = []
     build_error = None
     selected = []
+    # An already admitted public scan remains entitled to finish after the
+    # terminal transition. Direct/private pool admission after shutdown does
+    # not acquire that lease and is rejected.
+    if _CLONE_POOL_TERMINAL and not getattr(
+        _SCREENER_SCAN_LOCAL, "active", False
+    ):
+        raise RuntimeError("screener resources are shutting down")
     with _CLONE_POOL_LOCK:
         if _CLONE_POOL_KEY["source"] is not exchange:
             # Build a replacement generation transactionally. If construction
@@ -888,12 +1154,19 @@ def _get_clone_pool(exchange, n_workers: int) -> list:
             else:
                 selected = list(_CLONE_POOL[:n_workers])
     for clone in abandoned:
-        _close_clone(clone)
+        _close_clone_or_queue(clone)
     if build_error is not None:
         raise build_error
-    # Close old sessions after releasing the pool lock.
+    # A concurrent older scan may still use the replaced source generation.
+    # Hold those clones until every admitted scan has released its lease.
+    if old:
+        with _SCREENER_ADMISSION_LOCK:
+            if _SCREENER_ACTIVE_SCANS > 1:
+                _CLONE_DEFERRED_CLOSE.extend(old)
+                old = []
+    # Close old sessions after releasing both ownership locks.
     for clone in old:
-        _close_clone(clone)
+        _close_clone_or_queue(clone)
     return selected
 
 
@@ -1109,7 +1382,7 @@ def _score_candidates(
     return top_coins
 
 
-def get_top_momentum_coins(
+def _get_top_momentum_coins_impl(
     limit: int = 5,
     exchange=None,
     min_pump: float = 3.0,
@@ -1417,3 +1690,28 @@ def get_top_momentum_coins(
     # keep BOTH rows so the bot's direction logic can pick the stronger.
     combined = pd.concat(result_frames, ignore_index=True)
     return combined
+
+
+def get_top_momentum_coins(
+    limit: int = 5,
+    exchange=None,
+    min_pump: float = 3.0,
+    bot_name: str = "",
+    direction: str = "long",
+    quiet_market: bool = False,
+) -> "pd.DataFrame":
+    """Run one terminally admitted market scan with an owned resource lease."""
+    if not _begin_screener_scan():
+        log_event("Screener scan skipped: resources are shutting down", "WAIT")
+        return pd.DataFrame()
+    try:
+        return _get_top_momentum_coins_impl(
+            limit=limit,
+            exchange=exchange,
+            min_pump=min_pump,
+            bot_name=bot_name,
+            direction=direction,
+            quiet_market=quiet_market,
+        )
+    finally:
+        _end_screener_scan()

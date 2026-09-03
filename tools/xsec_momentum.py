@@ -57,12 +57,60 @@ def _absolute_without_links(path: Path, *, label: str) -> Path:
     return requested
 
 
+def _sync_directory(path: Path) -> None:
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(str(path), flags)
+    except AttributeError:
+        return
+    except OSError as exc:
+        if os.name == "nt":
+            if isinstance(exc, PermissionError):
+                return
+            if (
+                isinstance(exc, FileNotFoundError)
+                and path == Path(path.anchor)
+                and path.is_dir()
+            ):
+                return
+        raise
+    primary_error: BaseException | None = None
+    try:
+        os.fsync(directory_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            os.close(directory_fd)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "CROSS replay directory close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
+def _sync_parent_chain(path: Path) -> None:
+    parent = path.parent
+    while True:
+        _sync_directory(parent)
+        if parent == parent.parent:
+            break
+        parent = parent.parent
+
+
 def _write_immutable_report(path: Path, encoded: bytes) -> Path:
     if not isinstance(encoded, bytes) or len(encoded) > MAX_XSEC_REPORT_BYTES:
         raise ValueError("CROSS replay output is oversized")
     path = _absolute_without_links(path, label="CROSS replay output")
     path.parent.mkdir(parents=True, exist_ok=True)
     path = _absolute_without_links(path, label="CROSS replay output")
+    _sync_parent_chain(path.parent)
 
     def existing_matches() -> bool:
         if _is_linklike(path) or not path.is_file():
@@ -77,45 +125,126 @@ def _write_immutable_report(path: Path, encoded: bytes) -> Path:
 
     if path.exists() or _is_linklike(path):
         if existing_matches():
+            _sync_directory(path.parent)
             return path
         raise FileExistsError("immutable CROSS replay output conflict")
 
-    temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    )
+    temporary: Path | None = None
+    temporary_owned = False
+    primary_error: BaseException | None = None
+    result: Path | None = None
+    handle = None
     try:
-        with temporary.open("xb") as handle:
+        for attempt in range(3):
+            candidate = path.with_name(
+                f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            candidate = _absolute_without_links(
+                candidate, label="temporary CROSS replay output"
+            )
+            try:
+                handle = candidate.open("xb")
+            except FileExistsError:
+                if attempt == 2:
+                    raise
+                continue
+            temporary = candidate
+            temporary_owned = True
+            break
+        if handle is None or temporary is None:
+            raise RuntimeError("CROSS replay temporary allocation failed")
+        try:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if primary_error is None:
+                    primary_error = close_error
+                    raise
+                try:
+                    primary_error.add_note(
+                        "CROSS replay temporary close failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
+        path = _absolute_without_links(path, label="CROSS replay output")
+        _absolute_without_links(temporary, label="temporary CROSS replay output")
         try:
             os.link(temporary, path)
         except FileExistsError as exc:
             if existing_matches():
-                return path
-            raise FileExistsError(
-                "immutable CROSS replay output conflict"
-            ) from exc
-        try:
-            directory_fd = os.open(str(path.parent), os.O_RDONLY)
-        except OSError:
-            directory_fd = None
-        if directory_fd is not None:
-            try:
-                os.fsync(directory_fd)
-            except OSError:
-                pass
-            finally:
-                try:
-                    os.close(directory_fd)
-                except OSError:
-                    pass
+                result = path
+            else:
+                raise FileExistsError(
+                    "immutable CROSS replay output conflict"
+                ) from exc
+        else:
+            result = path
+    except BaseException as exc:
+        if primary_error is None:
+            primary_error = exc
+        raise
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-    return path
+        cleanup_error: BaseException | None = None
+        if temporary_owned and temporary is not None:
+            for _attempt in range(2):
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    temporary_owned = False
+                    break
+                except OSError as exc:
+                    cleanup_error = exc
+                except BaseException as exc:
+                    cleanup_error = exc
+                    break
+                else:
+                    temporary_owned = False
+                    break
+            if not temporary_owned:
+                cleanup_error = None
+        sync_error: BaseException | None = None
+        if temporary is not None:
+            try:
+                _sync_directory(path.parent)
+            except BaseException as exc:
+                sync_error = exc
+        if primary_error is not None:
+            for label, secondary_error in (
+                ("temporary cleanup", cleanup_error),
+                ("directory sync", sync_error),
+            ):
+                if secondary_error is None:
+                    continue
+                try:
+                    primary_error.add_note(
+                        f"CROSS replay {label} failed: "
+                        f"{type(secondary_error).__name__}: {secondary_error}"
+                    )
+                except BaseException:
+                    pass
+        elif sync_error is not None:
+            if cleanup_error is not None:
+                try:
+                    sync_error.add_note(
+                        "CROSS replay temporary cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
+            raise sync_error
+        elif cleanup_error is not None:
+            raise cleanup_error
+    if result is None:
+        raise RuntimeError("CROSS replay publish did not complete")
+    return result
 
 
 def _parse_xsec_days(args=None) -> int:

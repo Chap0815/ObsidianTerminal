@@ -77,7 +77,7 @@ def _emit_supervisor_event(
 ) -> None:
     try:
         sink(message)
-    except Exception:
+    except BaseException:
         pass
 
 
@@ -126,6 +126,56 @@ def _wait_for_child_returncode(
     raise RuntimeError(
         "launcher child state remained unavailable; refusing duplicate spawn"
     ) from last_error
+
+
+def _drain_child_after_fatal_guard_error(
+    process,
+    primary_error: BaseException,
+    *,
+    sleep: Callable[[float], object],
+    event_sink: Callable[[str], object],
+) -> int:
+    """Retain exact child ownership until exit after a fatal guard error."""
+    noted: set[tuple[str, type[BaseException]]] = set()
+    attempt = 0
+    delays = _WAIT_OBSERVATION_RETRY_DELAYS or (0.05,)
+
+    def note_secondary(context: str, exc: BaseException) -> None:
+        key = (context, type(exc))
+        if key in noted:
+            return
+        noted.add(key)
+        try:
+            primary_error.add_note(
+                f"launcher child {context} failed during fatal guard drain: "
+                f"{type(exc).__name__}"
+            )
+        except BaseException:
+            pass
+
+    while True:
+        try:
+            return int(process.wait())
+        except BaseException as exc:
+            note_secondary("wait", exc)
+        try:
+            returncode = process.poll()
+            if returncode is not None:
+                return int(returncode)
+        except BaseException as exc:
+            note_secondary("poll", exc)
+        delay = delays[min(attempt, len(delays) - 1)]
+        attempt += 1
+        _emit_supervisor_event(
+            event_sink,
+            "Launcher-Kind bleibt nach fatalem Startbarrierenfehler "
+            "unter Supervisor-Eigentuemerschaft; erneute Beobachtung in "
+            f"{delay:.2f}s",
+        )
+        try:
+            sleep(delay)
+        except BaseException as exc:
+            note_secondary("retry sleep", exc)
 
 
 def supervise_launcher(
@@ -179,7 +229,8 @@ def supervise_launcher(
         }
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        guard_release_error: Exception | None = None
+        guard_release_error: BaseException | None = None
+        guard_release_traceback = None
         if not spawn_failed:
             try:
                 # Close the check-to-spawn race with the updater. The shared
@@ -194,9 +245,12 @@ def supervise_launcher(
                 if process is None:
                     return last_returncode
                 guard_release_error = exc
-            except Exception as exc:
+            except BaseException as exc:
                 if process is not None:
                     guard_release_error = exc
+                    guard_release_traceback = exc.__traceback__
+                elif not isinstance(exc, Exception):
+                    raise
                 else:
                     spawn_failed = True
                     last_returncode = 1
@@ -215,20 +269,36 @@ def supervise_launcher(
                 f"{type(guard_release_error).__name__}",
             )
         if process is not None:
-            try:
-                last_returncode = _wait_for_child_returncode(
+            if (
+                guard_release_error is not None
+                and not isinstance(guard_release_error, Exception)
+            ):
+                last_returncode = _drain_child_after_fatal_guard_error(
                     process,
+                    guard_release_error,
                     sleep=sleep,
                     event_sink=sink,
                 )
-            except RuntimeError as exc:
-                _emit_supervisor_event(
-                    sink,
-                    "Launcher-Beobachtung dauerhaft fehlgeschlagen; "
-                    "Supervisor endet fail-closed ohne zweiten Start: "
-                    f"{exc}",
-                )
-                return 1
+            else:
+                try:
+                    last_returncode = _wait_for_child_returncode(
+                        process,
+                        sleep=sleep,
+                        event_sink=sink,
+                    )
+                except RuntimeError as exc:
+                    _emit_supervisor_event(
+                        sink,
+                        "Launcher-Beobachtung dauerhaft fehlgeschlagen; "
+                        "Supervisor endet fail-closed ohne zweiten Start: "
+                        f"{exc}",
+                    )
+                    return 1
+        if (
+            guard_release_error is not None
+            and not isinstance(guard_release_error, Exception)
+        ):
+            raise guard_release_error.with_traceback(guard_release_traceback)
         run_seconds = (
             max(0.0, monotonic() - started_at)
             if started_at is not None

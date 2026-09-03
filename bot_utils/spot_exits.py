@@ -286,7 +286,7 @@ def ensure_spot_exit_client_order_id(state, sym: str, row: dict,
         intent_id, f"{bot_name}:{sym}:{leg}", prefix="sx"
     )
     persisted = state.update(sym, key, client_order_id)
-    if persisted is False:
+    if persisted is not None and persisted is not True:
         raise RuntimeError(
             f"cannot persist {key} before live SPOT sell for {sym}"
         )
@@ -1131,22 +1131,40 @@ def _persist_spot_exit_fields(state, sym: str, row: dict,
             persisted = True
             for key, value in updates.items():
                 result = state.update(sym, key, value)
-                if result is False:
+                if result is not None and result is not True:
                     persisted = False
                     break
     except Exception:
         return False
-    if persisted is False:
+    if persisted is not None and persisted is not True:
         return False
     row.update(updates)
     return True
 
 
-def _remove_accounted_state(state, sym: str, restore_fields: dict) -> bool:
+def _remove_accounted_state(
+    state,
+    sym: str,
+    restore_fields: dict,
+    *,
+    expected_row: dict | None = None,
+) -> bool:
     try:
-        from bot_utils.trade_state import remove_with_restore_fields
-        ok = bool(remove_with_restore_fields(state, sym, restore_fields))
+        from bot_utils.trade_state import (
+            remove_with_restore_fields,
+            update_many_if_current,
+        )
+        ok = bool(remove_with_restore_fields(
+            state,
+            sym,
+            restore_fields,
+            expected_row=expected_row,
+        ))
     except Exception:
+        # A generation-guarded production cleanup must never retry through an
+        # unguarded compatibility path: that could delete a replacement row.
+        if expected_row is not None:
+            return False
         if not hasattr(state, "remove"):
             raise
         try:
@@ -1156,7 +1174,15 @@ def _remove_accounted_state(state, sym: str, restore_fields: dict) -> bool:
         ok = True if result is None else bool(result)
     if not ok:
         try:
-            _apply_state_updates(state, sym, restore_fields)
+            if expected_row is not None:
+                update_many_if_current(
+                    state,
+                    sym,
+                    restore_fields,
+                    expected_row,
+                )
+            else:
+                _apply_state_updates(state, sym, restore_fields)
         except Exception:
             pass
     return ok
@@ -1492,7 +1518,7 @@ def emergency_close_all_spot(*,
                         ),
                     }
                     if _remove_accounted_state(
-                        state, sym, restore_fields
+                        state, sym, restore_fields, expected_row=d
                     ):
                         closed_count += 1
                     else:
@@ -1980,7 +2006,7 @@ def emergency_close_all_spot(*,
                     continue
 
                 try:
-                    accounting_ok = bool(save_trade_db(**trade_row))
+                    accounting_ok = save_trade_db(**trade_row) is True
                     if not accounting_ok:
                         raise RuntimeError("save_trade_db returned False")
                 except Exception as e:
@@ -2071,7 +2097,7 @@ def emergency_close_all_spot(*,
                     "accounting_booked_sell_time": sell_time,
                     "accounting_booked_exchange_order_id": exch_oid,
                     "accounting_booked_reason": f"Emergency Close ({reason})",
-                })
+                }, expected_row=d)
                 if not removed:
                     failed.append(f"{sym}: cleanup failed after booked close")
                     log_event(

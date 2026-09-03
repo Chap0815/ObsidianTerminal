@@ -34,7 +34,9 @@ from pathlib import Path
 import customtkinter as ctk
 import requests as _req
 
+from bot_utils.atomic_publish import atomic_write_bytes
 from bot_utils.config import _read_config_json
+from bot_utils.runtime_threads import thread_definitely_never_started
 from bot_utils.subprocess_capture import run_bounded_capture
 
 try:
@@ -104,6 +106,143 @@ from launcher.ui.concurrency import CriticalWorkerRegistry
 _ERROR_LOG_VIEW_MAX_BYTES = 1024 * 1024
 _UPDATE_CHECK_CAPTURE_MAX_BYTES = 256 * 1024
 _UI_DISPATCH_QUEUE_MAX = 4096
+
+
+def _scan_active_bot_processes(
+    *,
+    process_iter=None,
+    current_pid: int | None = None,
+) -> dict[str, dict[str, int]]:
+    """Return bot processes in this runtime root or fail closed.
+
+    Runtime-status files are telemetry, not proof that no process exists. A
+    complete OS process scan is therefore required before lifecycle actions may
+    conclude that the bot set is empty. An unreadable Python process whose
+    identity could be one of ours makes that proof incomplete.
+    """
+    if process_iter is None:
+        try:
+            import psutil  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("bot process scan unavailable") from exc
+        process_iter = psutil.process_iter
+
+    from core.process_identity import cmdline_bot_match_kind
+
+    def canonical_path(path) -> str:
+        return os.path.normcase(
+            os.path.realpath(os.path.abspath(str(path)))
+        )
+
+    try:
+        expected_root = canonical_path(PROJECT_ROOT)
+    except Exception as exc:
+        raise RuntimeError("bot process path canonicalization failed") from exc
+    own_pid = os.getpid() if current_pid is None else int(current_pid)
+    saw_current = False
+    scan_incomplete = False
+    found: dict[str, dict[str, int]] = {}
+    python_name = re.compile(r"python(?:w|[0-9.]*)?(?:\.exe)?$")
+
+    try:
+        processes = process_iter(["pid", "name", "exe", "cmdline", "cwd"])
+        for proc in processes:
+            try:
+                info = proc.info
+                pid = int(info.get("pid") or 0)
+                if pid == own_pid:
+                    saw_current = True
+                    continue
+                if pid <= 0:
+                    if pid < 0:
+                        scan_incomplete = True
+                    continue
+
+                raw_name = info.get("name")
+                raw_exe = info.get("exe")
+                raw_cmdline = info.get("cmdline")
+                executable_names = [raw_name, raw_exe]
+                if isinstance(raw_cmdline, (list, tuple)) and raw_cmdline:
+                    executable_names.append(raw_cmdline[0])
+                python_like = any(
+                    python_name.fullmatch(
+                        os.path.basename(str(value or "")).lower()
+                    )
+                    for value in executable_names
+                )
+                identity_known = any(
+                    str(value or "").strip() for value in executable_names
+                )
+                if not isinstance(raw_cmdline, (list, tuple)) or not raw_cmdline:
+                    if python_like or not identity_known:
+                        scan_incomplete = True
+                    continue
+                if not python_like:
+                    continue
+
+                cmdline = " ".join(str(part) for part in raw_cmdline)
+                raw_cwd = info.get("cwd")
+                process_root = (
+                    canonical_path(raw_cwd)
+                    if raw_cwd
+                    else ""
+                )
+                for bot in BOT_ORDER:
+                    expected_script = canonical_path(
+                        os.path.join(PROJECT_ROOT, BOT_META[bot]["script"])
+                    )
+                    expected_relative = os.path.normcase(
+                        os.path.normpath(BOT_META[bot]["script"])
+                    )
+                    expected_basename = os.path.basename(expected_script)
+                    script_proven = False
+                    relative_script_without_cwd = False
+                    for raw_token in raw_cmdline[1:]:
+                        token = str(raw_token or "").strip('"\'')
+                        if not token:
+                            continue
+                        if os.path.isabs(token):
+                            candidate = canonical_path(token)
+                        elif raw_cwd:
+                            candidate = canonical_path(
+                                os.path.join(str(raw_cwd), token)
+                            )
+                        else:
+                            normalized_token = os.path.normcase(
+                                os.path.normpath(token)
+                            )
+                            if (
+                                normalized_token == expected_relative
+                                or os.path.basename(normalized_token)
+                                == expected_basename
+                            ):
+                                relative_script_without_cwd = True
+                            continue
+                        if candidate == expected_script:
+                            script_proven = True
+                            break
+
+                    module_seen = (
+                        cmdline_bot_match_kind(bot, cmdline) == "module"
+                    )
+                    if script_proven or (
+                        module_seen and process_root == expected_root
+                    ):
+                        found.setdefault(bot, {"pid": pid})
+                    elif relative_script_without_cwd or (
+                        module_seen and not process_root
+                    ):
+                        # A relative script/module invocation without cwd cannot
+                        # be assigned to this or a foreign runtime root.
+                        scan_incomplete = True
+            except Exception:
+                scan_incomplete = True
+    except Exception:
+        scan_incomplete = True
+
+    if scan_incomplete or not saw_current:
+        raise RuntimeError("bot process scan incomplete")
+    return found
 
 
 def _error_log_path() -> str:
@@ -200,6 +339,25 @@ def _runtime_monotonic_age(rs: dict, *, now: float | None = None) -> float | Non
     return (time.monotonic() if now is None else now) - mono
 
 
+def _runtime_card_led_color(
+    status,
+    *,
+    stale_age,
+    simulation: bool,
+):
+    """Return a mode color only for a fresh, explicitly healthy runtime."""
+    age = finite_float_or_none(stale_age)
+    runtime_healthy = (
+        str(status or "").strip().lower()
+        in {"ready", "running", "started"}
+        and age is not None
+        and -5.0 <= age <= 45.0
+    )
+    if not runtime_healthy:
+        return COLORS["warning"]
+    return COLORS["info"] if simulation else COLORS["success"]
+
+
 def _post_ui(app, callback, *, delay_ms: int = 0) -> None:
     post = getattr(app, "post_ui", None)
     if callable(post):
@@ -216,17 +374,30 @@ class ObsidianApp(ctk.CTk):
         self._ui_dispatch_queue: queue.Queue[tuple[int, object]] = (
             queue.Queue(maxsize=_UI_DISPATCH_QUEUE_MAX)
         )
+        # Final lifecycle handoffs must not compete with best-effort status
+        # updates for the bounded worker-to-UI queue.  Only the small set of
+        # stop/restart/shutdown completions uses this reserved lane.
+        self._ui_lifecycle_queue: queue.SimpleQueue[tuple[int, object]] = (
+            queue.SimpleQueue()
+        )
         self._ui_dispatch_retry: tuple[int, object] | None = None
         self._ui_dispatch_closed = False
+        self._ui_dispatch_pump_stopped = True
         self._clean_shutdown_completed = False
         self.critical_workers = CriticalWorkerRegistry()
-        self.after(25, self._drain_posted_ui)
+        self._arm_ui_dispatch_pump()
         self.tool_processes = ToolProcessRegistry()
+        self._dashboard_processes = ToolProcessRegistry()
         self.config = load_config()
         self._ollama_switch_lock = threading.Lock()
         self._ollama_switch_desired: str | None = None
         self._ollama_switch_generation = 0
+        self._ollama_switch_terminal = False
         self._ollama_switch_thread: threading.Thread | None = None
+        self._ollama_switch_state: dict | None = None
+        self._update_check_lock = threading.Lock()
+        self._update_check_started = False
+        self._update_check_state: dict | None = None
 
         self.title("Obsidian Trading Terminal v5.0")
         # Resolution-adaptive scaling: shrink the 2K/4K-baseline layout so it
@@ -324,6 +495,7 @@ class ObsidianApp(ctk.CTk):
         self.bad_hours_rows = {}  # bot_name  BadHoursRow widget
         self._collapsed = {bot: False for bot in BOT_ORDER}
         self._pending_update_data = None
+        self._inflight_update_process = None
         self._update_status_override = ""
         self._update_status_override_until = 0.0
         self._update_notice_shown = False
@@ -361,7 +533,32 @@ class ObsidianApp(ctk.CTk):
                 return False
         return True
 
+    def post_ui_lifecycle(self, callback, *, delay_ms: int = 0) -> bool:
+        """Schedule a bounded-producer lifecycle handoff on a reserved lane."""
+        if not callable(callback) or self._ui_dispatch_closed:
+            return False
+        delay = max(0, int(delay_ms))
+        if threading.get_ident() == self._ui_owner_thread:
+            self.after(delay, callback)
+        else:
+            self._ui_lifecycle_queue.put((delay, callback))
+        return True
+
+    def _arm_ui_dispatch_pump(self) -> bool:
+        """Schedule exactly one owner-thread dispatch pump generation."""
+        if self._ui_dispatch_closed:
+            return False
+        if not getattr(self, "_ui_dispatch_pump_stopped", True):
+            return True
+        try:
+            self.after(25, self._drain_posted_ui)
+        except Exception:
+            return False
+        self._ui_dispatch_pump_stopped = False
+        return True
+
     def _drain_posted_ui(self) -> None:
+        self._ui_dispatch_pump_stopped = True
         if self._ui_dispatch_closed:
             return
         for _index in range(256):
@@ -370,10 +567,20 @@ class ObsidianApp(ctk.CTk):
                 self._ui_dispatch_retry = None
                 delay, callback = pending
             else:
-                try:
-                    delay, callback = self._ui_dispatch_queue.get_nowait()
-                except queue.Empty:
-                    break
+                lifecycle_queue = getattr(self, "_ui_lifecycle_queue", None)
+                lifecycle_item = None
+                if lifecycle_queue is not None:
+                    try:
+                        lifecycle_item = lifecycle_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                if lifecycle_item is not None:
+                    delay, callback = lifecycle_item
+                else:
+                    try:
+                        delay, callback = self._ui_dispatch_queue.get_nowait()
+                    except queue.Empty:
+                        break
             try:
                 self.after(delay, callback)
             except Exception:
@@ -382,12 +589,9 @@ class ObsidianApp(ctk.CTk):
                 # worker-to-UI completion notification.
                 self._ui_dispatch_retry = (delay, callback)
                 break
-        try:
-            self.after(25, self._drain_posted_ui)
-        except Exception:
-            # Expected only while Tcl is being torn down. No worker is allowed
-            # to enter Tcl to revive the pump from outside the owner thread.
-            pass
+        # Expected to fail only while Tcl is being torn down. The stopped flag
+        # lets an aborted teardown re-arm exactly one pump generation later.
+        ObsidianApp._arm_ui_dispatch_pump(self)
 
     def _set_content_minsize(self) -> None:
         """Floor the window at the measured natural content size so dragging it
@@ -1972,7 +2176,7 @@ class ObsidianApp(ctk.CTk):
         """
         try:
             running = [b for b in BOT_ORDER if self.bots[b].is_running()]
-            external = self._externally_active_bots()
+            external = self._externally_active_bots(telemetry=True)
             active = running + [b for b in external if b not in running]
             if not active:
                 self.status_badge_text.set("Ready")
@@ -2613,10 +2817,22 @@ class ObsidianApp(ctk.CTk):
             return _gone(exc)
 
     @staticmethod
-    def _stop_owned_dashboard_process(proc) -> bool:
+    def _stop_owned_dashboard_process(proc, registry=None) -> bool:
         """Boundedly stop an owned Streamlit child and prove it exited."""
         if proc is None:
             return True
+        registry_stop = getattr(registry, "stop", None)
+        if callable(registry_stop):
+            try:
+                stopped = bool(registry_stop(proc))
+            except Exception:
+                # The registry pre-owns a live handle before attempting its
+                # backend. Do not bypass its persistent uncertainty state.
+                return False
+            if not stopped:
+                return False
+            verify = getattr(registry, "resume_after_aborted_shutdown", None)
+            return bool(verify()) if callable(verify) else True
         return stop_tool_processes(
             [proc], terminate_timeout=3.0, kill_timeout=2.0
         )
@@ -2636,10 +2852,10 @@ class ObsidianApp(ctk.CTk):
             }
             path = self._dashboard_status_path()
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = f"{path}.{os.getpid()}.tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(status, fh, ensure_ascii=True, sort_keys=True)
-            os.replace(tmp, path)
+            encoded = json.dumps(
+                status, ensure_ascii=True, sort_keys=True
+            ).encode("utf-8")
+            atomic_write_bytes(path, encoded)
         except Exception:
             pass
 
@@ -2761,12 +2977,25 @@ class ObsidianApp(ctk.CTk):
                          "--server.headless", "true"],
                         env=env, cwd=PROJECT_ROOT, **kw
                     )
+                    dashboard_registry = getattr(
+                        self, "_dashboard_processes", None
+                    )
+                    register_dashboard = getattr(
+                        dashboard_registry, "register", None
+                    )
+                    if not callable(register_dashboard) or not register_dashboard(
+                        spawned_dashboard
+                    ):
+                        raise RuntimeError(
+                            "dashboard process registry rejected the start"
+                        )
                     self.streamlit = spawned_dashboard
                     self._write_dashboard_process_status()
             except Exception as e:
                 if "spawned_dashboard" in locals() and spawned_dashboard is not None:
                     stopped = self._stop_owned_dashboard_process(
-                        spawned_dashboard
+                        spawned_dashboard,
+                        getattr(self, "_dashboard_processes", None),
                     )
                     if stopped and self.streamlit is spawned_dashboard:
                         self.streamlit = None
@@ -2789,42 +3018,90 @@ class ObsidianApp(ctk.CTk):
 
     def _check_for_updates_async(self) -> None:
         """Check private Git updates without blocking the launcher startup."""
-        if getattr(self, "_update_check_started", False):
-            return
-        self._update_check_started = True
+        ownership_lock = self.__dict__.get("_update_check_lock")
+        if ownership_lock is None:
+            ownership_lock = threading.Lock()
+            self._update_check_lock = ownership_lock
 
-        def _worker() -> None:
+        def _worker(owner_state: dict) -> None:
             try:
-                update_python = _get_python_exe()
-                r = run_bounded_capture(
-                    [update_python, "-m", "tools.update_check", "--json"],
-                    cwd=PROJECT_ROOT,
-                    timeout=15,
-                    max_output_bytes=_UPDATE_CHECK_CAPTURE_MAX_BYTES,
-                    wrapper_python=update_python,
-                    **subprocess_no_window_kwargs(),
-                )
-                raw = (r.stdout or "").strip()
-                data = json.loads(raw) if raw else {}
-                if r.returncode != 0 and not data:
+                try:
+                    update_python = _get_python_exe()
+                    r = run_bounded_capture(
+                        [update_python, "-m", "tools.update_check", "--json"],
+                        cwd=PROJECT_ROOT,
+                        timeout=15,
+                        max_output_bytes=_UPDATE_CHECK_CAPTURE_MAX_BYTES,
+                        wrapper_python=update_python,
+                        **subprocess_no_window_kwargs(),
+                    )
+                    raw = (r.stdout or "").strip()
+                    data = json.loads(raw) if raw else {}
+                    if r.returncode != 0 and not data:
+                        data = {
+                            "ok": False,
+                            "reason": "check_failed",
+                            "message": (
+                                r.stderr
+                                or r.stdout
+                                or "Update-Check fehlgeschlagen"
+                            ).strip(),
+                        }
+                except Exception as exc:
                     data = {
                         "ok": False,
                         "reason": "check_failed",
-                        "message": (r.stderr or r.stdout or "Update-Check fehlgeschlagen").strip(),
+                        "message": str(exc),
                     }
-            except Exception as exc:
-                data = {"ok": False, "reason": "check_failed", "message": str(exc)}
-            _post_ui(self, lambda d=data: self._apply_update_check_result(d))
+                _post_ui(self, lambda d=data: self._apply_update_check_result(d))
+            finally:
+                with ownership_lock:
+                    owner_state["done"].set()
+                    if self.__dict__.get("_update_check_state") is owner_state:
+                        self._update_check_state = None
 
-        try:
-            worker = threading.Thread(
-                target=_worker,
-                daemon=True,
-                name="launcher-update-check",
-            )
-            worker.start()
-        except Exception:
-            self._update_check_started = False
+        report_start_failure = False
+        worker = None
+        owner_state = None
+        with ownership_lock:
+            if self.__dict__.get("_update_check_started", False):
+                return
+            self._update_check_started = True
+            owner_state = {"done": threading.Event(), "thread": None}
+            try:
+                worker = threading.Thread(
+                    target=lambda: _worker(owner_state),
+                    daemon=True,
+                    name="launcher-update-check",
+                )
+            except BaseException as exc:
+                self._update_check_started = False
+                if not isinstance(exc, Exception):
+                    raise
+                report_start_failure = True
+            else:
+                owner_state["thread"] = worker
+                self._update_check_state = owner_state
+        if worker is not None and owner_state is not None:
+            try:
+                worker.start()
+            except BaseException as exc:
+                with ownership_lock:
+                    safe_prelaunch = (
+                        isinstance(exc, Exception)
+                        and thread_definitely_never_started(worker)
+                        and self._update_check_state is owner_state
+                    )
+                    if safe_prelaunch:
+                        owner_state["done"].set()
+                        self._update_check_state = None
+                        self._update_check_started = False
+                if not isinstance(exc, Exception):
+                    raise
+                if not safe_prelaunch:
+                    return
+                report_start_failure = True
+        if report_start_failure:
             try:
                 self._apply_update_check_result({
                     "ok": False,
@@ -2968,6 +3245,7 @@ class ObsidianApp(ctk.CTk):
             if not ObsidianApp._stop_registered_tools_for_shutdown(self):
                 return
             registry_prepared = True
+            retained_updater_stopped = False
             retained_updater_stopped = (
                 ObsidianApp._stop_or_retain_failed_update_process(self)
             )
@@ -2993,16 +3271,28 @@ class ObsidianApp(ctk.CTk):
                 cwd=PROJECT_ROOT,
                 **subprocess_no_window_kwargs(),
             )
+            self._inflight_update_process = updater_process
             if not self._shutdown_clean(tools_stopped=True):
                 raise RuntimeError("launcher shutdown did not complete")
-        except Exception as exc:
+        except BaseException as exc:
+            cleanup_errors: list[BaseException] = []
             updater_stopped = updater_process is None
             if updater_process is not None:
-                updater_stopped = (
-                    ObsidianApp._stop_or_retain_failed_update_process(
-                        self, updater_process
+                try:
+                    updater_stopped = (
+                        ObsidianApp._stop_or_retain_failed_update_process(
+                            self, updater_process
+                        )
                     )
-                )
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+                    updater_stopped = False
+                if (
+                    updater_stopped
+                    and getattr(self, "_inflight_update_process", None)
+                    is updater_process
+                ):
+                    self._inflight_update_process = None
             all_updaters_stopped = (
                 retained_updater_stopped and updater_stopped
             )
@@ -3013,19 +3303,57 @@ class ObsidianApp(ctk.CTk):
                 if callable(resume):
                     try:
                         registry_reopened = bool(resume())
-                    except Exception:
-                        pass
+                    except BaseException as cleanup_exc:
+                        cleanup_errors.append(cleanup_exc)
             if registry_reopened:
                 try:
                     self._set_update_cta_visible(True)
                     self.status_text.set("Update nicht gestartet")
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+            cleanup_kinds = ", ".join(
+                sorted({type(error).__name__ for error in cleanup_errors})
+            )
+            for cleanup_error in cleanup_errors:
+                try:
+                    exc.add_note(
+                        "update rollback failure: "
+                        f"{type(cleanup_error).__name__}"
+                    )
                 except Exception:
                     pass
+            if cleanup_kinds:
+                stderr = sys.stderr
+                if stderr is not None:
+                    try:
+                        stderr.write(
+                            "[Launcher] update rollback remained uncertain: "
+                            f"{cleanup_kinds}\n"
+                        )
+                    except BaseException:
+                        pass
             try:
                 from tkinter import messagebox
-                messagebox.showerror("Obsidian Update", f"Update konnte nicht gestartet werden:\n{exc}")
-            except Exception:
-                pass
+                cleanup_note = (
+                    f"\n\nRollback unvollstaendig: {cleanup_kinds}"
+                    if cleanup_kinds
+                    else ""
+                )
+                messagebox.showerror(
+                    "Obsidian Update",
+                    f"Update konnte nicht gestartet werden:\n{exc}"
+                    + cleanup_note,
+                )
+            except BaseException as report_exc:
+                try:
+                    exc.add_note(
+                        "update error reporting failure: "
+                        f"{type(report_exc).__name__}"
+                    )
+                except Exception:
+                    pass
+            if not isinstance(exc, Exception) and all_updaters_stopped:
+                raise
 
     def _clear_card_log(self, name):
         card = self.cards[name]
@@ -3086,71 +3414,97 @@ class ObsidianApp(ctk.CTk):
                 return False
         return True
 
-    def _run_ollama_model_switch_worker(self) -> None:
-        while True:
-            with self._ollama_switch_lock:
-                model = self._ollama_switch_desired
-                generation = self._ollama_switch_generation
-            if not model:
+    def _run_ollama_model_switch_worker(self, owner_state: dict) -> None:
+        try:
+            while True:
                 with self._ollama_switch_lock:
-                    self._ollama_switch_thread = None
-                return
-            try:
-                self._switch_ollama_model_async(model, generation=generation)
-            except Exception as exc:
-                error_text = (
-                    f"Ollama model switch failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-
-                def _log_current_worker_error(
-                    target=model,
-                    target_generation=generation,
-                    message=error_text,
-                ):
-                    if self._ollama_switch_is_current(
-                        target,
-                        target_generation,
-                    ):
-                        self._log_to_card(
-                            self.cards[BOT_ORDER[0]],
-                            "warn",
-                            message,
-                        )
-
-                try:
-                    _post_ui(self, _log_current_worker_error)
-                except Exception:
-                    pass
-            with self._ollama_switch_lock:
-                if (
-                    self._ollama_switch_generation == generation
-                    and self._ollama_switch_desired == model
-                ):
-                    self._ollama_switch_thread = None
+                    model = self._ollama_switch_desired
+                    generation = self._ollama_switch_generation
+                if not model:
                     return
+                try:
+                    self._switch_ollama_model_async(model, generation=generation)
+                except Exception as exc:
+                    error_text = (
+                        f"Ollama model switch failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+                    def _log_current_worker_error(
+                        target=model,
+                        target_generation=generation,
+                        message=error_text,
+                    ):
+                        if self._ollama_switch_is_current(
+                            target,
+                            target_generation,
+                        ):
+                            self._log_to_card(
+                                self.cards[BOT_ORDER[0]],
+                                "warn",
+                                message,
+                            )
+
+                    try:
+                        _post_ui(self, _log_current_worker_error)
+                    except Exception:
+                        pass
+                with self._ollama_switch_lock:
+                    if (
+                        self._ollama_switch_generation == generation
+                        and self._ollama_switch_desired == model
+                    ):
+                        return
+        finally:
+            with self._ollama_switch_lock:
+                owner_state["done"].set()
+                if getattr(self, "_ollama_switch_state", None) is owner_state:
+                    self._ollama_switch_state = None
+                    if self._ollama_switch_thread is owner_state.get("thread"):
+                        self._ollama_switch_thread = None
 
     def _request_ollama_model_switch(self, new_model: str) -> bool:
         model = str(new_model or "").strip()
         if not model:
             return False
         with self._ollama_switch_lock:
+            if getattr(self, "_ollama_switch_terminal", False):
+                return False
             self._ollama_switch_generation += 1
             self._ollama_switch_desired = model
-            worker = self._ollama_switch_thread
-            if worker is not None and worker.is_alive():
+            if getattr(self, "_ollama_switch_state", None) is not None:
                 return True
-            worker = threading.Thread(
-                target=self._run_ollama_model_switch_worker,
-                name="ollama-switch-worker",
-                daemon=True,
-            )
+            owner_state = {
+                "done": threading.Event(),
+                "thread": None,
+            }
+            try:
+                worker = threading.Thread(
+                    target=lambda: self._run_ollama_model_switch_worker(
+                        owner_state
+                    ),
+                    name="ollama-switch-worker",
+                    daemon=True,
+                )
+            except Exception:
+                return False
+            owner_state["thread"] = worker
+            self._ollama_switch_state = owner_state
             self._ollama_switch_thread = worker
             try:
                 worker.start()
-            except Exception:
-                if self._ollama_switch_thread is worker:
-                    self._ollama_switch_thread = None
+            except BaseException as exc:
+                if (
+                    isinstance(exc, Exception)
+                    and thread_definitely_never_started(worker)
+                    and self._ollama_switch_state is owner_state
+                ):
+                    owner_state["done"].set()
+                    self._ollama_switch_state = None
+                    if self._ollama_switch_thread is worker:
+                        self._ollama_switch_thread = None
+                if not isinstance(exc, Exception):
+                    raise
                 return False
         return True
 
@@ -3469,10 +3823,6 @@ class ObsidianApp(ctk.CTk):
             except Exception:
                 pass
 
-        import threading as _threading
-        _threading.Thread(target=_fetch_models_bg, daemon=True,
-                            name="ModelListFetch").start()
-
         selected_var = ctk.StringVar(value=current)
 
         manual_label_ref = {}
@@ -3493,6 +3843,26 @@ class ObsidianApp(ctk.CTk):
                       text_color=COLORS["text_muted"])
         manual_label.pack(side="bottom", padx=24, pady=(12, 4), anchor="w")
         manual_label_ref["widget"] = manual_label
+
+        # Start only after every closure dependency above is bound.  The
+        # registry publishes ownership before Thread.start(), so an ambiguous
+        # launch-then-raise cannot orphan a live fetch generation.  A proven
+        # pre-launch failure leaves the fully built manual selector usable.
+        try:
+            self.critical_workers.start(
+                _fetch_models_bg,
+                name="ModelListFetch",
+                daemon=True,
+            )
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            try:
+                status_lbl.configure(
+                    text="Ollama offline  enter model name manually"
+                )
+            except Exception:
+                pass
 
     #  ERROR LOG VIEWER 
 
@@ -3680,6 +4050,12 @@ class ObsidianApp(ctk.CTk):
         """Guarded driver for the 500ms refresh loop. A widget/data error in
         _refresh must NEVER kill the loop  otherwise the whole UI freezes at
         defaults/0 (which is exactly what happened). Reschedule ALWAYS."""
+        # A transient failure while the dispatch pump schedules its next
+        # generation leaves the stopped flag set.  This independent owner-
+        # thread cadence can safely re-arm it without letting workers enter
+        # Tcl or creating a duplicate generation.
+        if getattr(self, "_ui_dispatch_pump_stopped", False):
+            ObsidianApp._arm_ui_dispatch_pump(self)
         try:
             self._refresh()
         except Exception as e:
@@ -3784,8 +4160,24 @@ class ObsidianApp(ctk.CTk):
         except Exception:
             return None
 
-    def _externally_active_bots(self) -> dict[str, dict]:
-        """Fresh runtime_status rows for bot processes owned elsewhere."""
+    def _externally_active_bots(
+        self,
+        *,
+        telemetry: bool = False,
+    ) -> dict[str, dict]:
+        """Return externally owned bots for telemetry or lifecycle safety.
+
+        UI refreshes may consume best-effort runtime-status rows. Quit and
+        update callers use the default strict OS scan, because an empty or
+        unreadable status file cannot prove that no bot process exists.
+        """
+        if not telemetry:
+            active = _scan_active_bot_processes()
+            return {
+                bot: evidence
+                for bot, evidence in active.items()
+                if not self.bots[bot].is_running()
+            }
         out: dict[str, dict] = {}
         for bot in BOT_ORDER:
             rs = self._external_runtime_status(bot)
@@ -3933,6 +4325,8 @@ class ObsidianApp(ctk.CTk):
             _is_sim = bool(self.config.get(bot, {}).get("SIMULATION", True))
             if running:
                 status_label = "Active"
+                runtime_status_value = "starting"
+                stale_age = None
                 try:
                     statuses = cache.get("runtime_status") or {}
                     rs = (
@@ -3943,7 +4337,10 @@ class ObsidianApp(ctk.CTk):
                     run_id = str(getattr(self.bots[bot], "run_id", "") or "")
                     if str(rs.get("run_id") or "") == run_id:
                         stale_age = _runtime_monotonic_age(rs)
-                        status_label = str(rs.get("status") or "starting").title()
+                        runtime_status_value = str(
+                            rs.get("status") or "starting"
+                        ).strip().lower()
+                        status_label = runtime_status_value.title()
                         build = str(rs.get("build_id") or "")
                         if build and build != "unknown":
                             status_label += f" - {build[:8]}"
@@ -3965,7 +4362,11 @@ class ObsidianApp(ctk.CTk):
                         status_label + " - " + ("SIM" if _is_sim else "LIVE"))
                     self._set_card_led_color(
                         card,
-                        COLORS["info"] if _is_sim else COLORS["success"],
+                        _runtime_card_led_color(
+                            runtime_status_value,
+                            stale_age=stale_age,
+                            simulation=_is_sim,
+                        ),
                     )
                 except Exception:
                     pass
@@ -4598,7 +4999,16 @@ class ObsidianApp(ctk.CTk):
           3. If nothing running  close immediately
         """
         running = [name for name, bot in self.bots.items() if bot.is_running()]
-        external = self._externally_active_bots()
+        try:
+            external = self._externally_active_bots()
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Obsidian Shutdown",
+                "Der Launcher bleibt geoeffnet, weil der Bot-Prozessscan "
+                f"nicht vollstaendig war:\n{exc}",
+            )
+            return
         if not running and not external:
             self._shutdown_clean()
             return
@@ -4701,9 +5111,62 @@ class ObsidianApp(ctk.CTk):
 
     def _shutdown_clean(self, *, tools_stopped: bool = False):
         """Clean shutdown after every registered tool is proven stopped."""
+        switch_lock = getattr(self, "_ollama_switch_lock", None)
+        switch_prepared = False
+        if switch_lock is not None:
+            with switch_lock:
+                if getattr(self, "_ollama_switch_terminal", False):
+                    return False
+                self._ollama_switch_terminal = True
+                switch_prepared = True
+                switch_state = getattr(self, "_ollama_switch_state", None)
+                switch_unresolved = False
+                if switch_state is not None:
+                    done = switch_state.get("done")
+                    switch_unresolved = not (
+                        isinstance(done, threading.Event) and done.is_set()
+                    )
+                    worker = switch_state.get("thread")
+                    if not switch_unresolved and worker is not None:
+                        try:
+                            switch_unresolved = bool(worker.is_alive())
+                        except BaseException:
+                            switch_unresolved = True
+                if switch_unresolved:
+                    self._ollama_switch_terminal = False
+                    switch_prepared = False
+                    return False
+
         worker_registry = getattr(self, "critical_workers", None)
-        active_names = getattr(worker_registry, "active_names", None)
-        active = tuple(active_names()) if callable(active_names) else ()
+        prepare_workers = getattr(worker_registry, "prepare_shutdown", None)
+        worker_registry_prepared = False
+        if callable(prepare_workers):
+            active = tuple(prepare_workers())
+            worker_registry_prepared = not active
+        else:
+            active_names = getattr(worker_registry, "active_names", None)
+            active = tuple(active_names()) if callable(active_names) else ()
+
+        def resume_critical_workers() -> None:
+            nonlocal switch_prepared
+            if switch_prepared and switch_lock is not None:
+                try:
+                    with switch_lock:
+                        self._ollama_switch_terminal = False
+                    switch_prepared = False
+                except Exception:
+                    pass
+            if not worker_registry_prepared:
+                return
+            resume_workers = getattr(
+                worker_registry, "resume_after_aborted_shutdown", None
+            )
+            if callable(resume_workers):
+                try:
+                    resume_workers()
+                except Exception:
+                    pass
+
         if active:
             try:
                 from tkinter import messagebox
@@ -4714,19 +5177,23 @@ class ObsidianApp(ctk.CTk):
                 )
             except Exception:
                 pass
+            resume_critical_workers()
             return False
         if (
             not tools_stopped
             and not ObsidianApp._stop_registered_tools_for_shutdown(self)
         ):
+            resume_critical_workers()
             return False
         if not ObsidianApp._stop_or_retain_failed_update_process(self):
+            resume_critical_workers()
             return False
         dashboard = getattr(self, "streamlit", None)
         if dashboard is not None:
             try:
                 dashboard_stopped = ObsidianApp._stop_owned_dashboard_process(
-                    dashboard
+                    dashboard,
+                    getattr(self, "_dashboard_processes", None),
                 )
             except Exception:
                 dashboard_stopped = False
@@ -4755,6 +5222,7 @@ class ObsidianApp(ctk.CTk):
                     )
                 except Exception:
                     pass
+                resume_critical_workers()
                 return False
             if self.streamlit is dashboard:
                 self.streamlit = None
@@ -4797,6 +5265,7 @@ class ObsidianApp(ctk.CTk):
                 )
             except Exception:
                 pass
+            resume_critical_workers()
             return False
         self._ui_dispatch_closed = True
         self._clean_shutdown_completed = True
@@ -4809,6 +5278,7 @@ class ObsidianApp(ctk.CTk):
             # instead of leaving a live but permanently stale/deaf UI.
             self._ui_dispatch_closed = False
             self._clean_shutdown_completed = False
+            ObsidianApp._arm_ui_dispatch_pump(self)
             resume_poller = getattr(
                 self.poller, "resume_after_aborted_stop", None
             )
@@ -4836,6 +5306,7 @@ class ObsidianApp(ctk.CTk):
                     )
                 except Exception:
                     pass
+            resume_critical_workers()
             return False
         return True
 

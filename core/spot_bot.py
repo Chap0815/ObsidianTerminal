@@ -31,6 +31,7 @@ Subclass contract:
 from __future__ import annotations
 
 import atexit
+import copy
 import importlib
 import math
 import signal
@@ -53,8 +54,10 @@ from bot_utils.api_budget import try_consume_api_call
 from bot_utils.runtime_threads import (finalize_runtime_shutdown,
                                        format_runtime_thread_liveness,
                                        shared_runtime_resource_closers,
-                                       start_threads_or_shutdown)
+                                       start_threads_or_shutdown,
+                                       thread_definitely_never_started)
 from bot_utils.silent_log import silent_log
+from bot_utils.trade_state import state_rows_exposure_count
 
 # Mixins: split across files to keep this module focused on lifecycle.
 from core.spot_bot_exits import ExitsMixin
@@ -92,6 +95,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
     MARKOUT_POLL_INTERVAL_SEC: float = 1.0
     MARKOUT_MAX_OVERDUE_SEC: float = 30.0
     MARKOUT_POLL_STALE_SEC: float = 15.0
+    PRICE_UNAVAILABLE_HEALTH_THRESHOLD: int = 5
     # Hard deadline for emergency_close_all during shutdown, so a hanging
     # exchange API can't block the bot forever (and force a kill -9 that could
     # corrupt trades.json mid-write).
@@ -116,9 +120,16 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         self.cfg = load_runtime_config(self.BOT_NAME, self.DEFAULTS)
         self._shutdown_event = threading.Event()
         self._shutdown_lock = threading.Lock()
+        self._shutdown_handler_lock = threading.Lock()
+        self._shutdown_request_publish_lock = threading.RLock()
+        self._shutdown_close_requested = threading.Event()
+        self._shutdown_close_request_generation = None
         self._cooldown_lock = threading.Lock()
         self._markout_health_lock = threading.Lock()
+        self._price_health_lock = threading.Lock()
         self._position_integrity_health_lock = threading.Lock()
+        self._spot_entry_recovery_generation = 0
+        self._spot_entry_recovery_blocked = False
         # populated in run()
         self.ex = None
         # Spot uses batched ticker fetches instead of FuturesBot's TickerCache.
@@ -130,12 +141,14 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         self.safe_mode: Optional[SafeMode] = None
         # idempotency flag for emergency close
         self._emergency_closed = False
+        self._emergency_close_generation = None
         self._shutdown_positions_preserved = False
         # Threads
         self._monitor_thread: Optional[threading.Thread] = None
         self._scan_thread: Optional[threading.Thread] = None
         self._reconcile_thread: Optional[threading.Thread] = None
         self._markout_thread: Optional[threading.Thread] = None
+        self._price_unavail_counts: dict[str, int] = {}
         self._markout_started_monotonic: float | None = None
         self._sim_evidence_health_cache: dict[str, Any] | None = None
         self._sim_evidence_health_last_monotonic: float | None = None
@@ -219,14 +232,58 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
     def _record_markout_worker_health(self, report: dict) -> None:
         """Receive one bounded health report from the shared queue worker."""
         if not isinstance(report, dict):
+            with self._markout_health_lock:
+                try:
+                    previous_errors = max(
+                        0,
+                        int(
+                            self._markout_health.get("consecutive_errors")
+                            or 0
+                        ),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    previous_errors = 0
+                self._markout_health.update({
+                    "ok": False,
+                    "reason": "invalid_health_payload",
+                    "timestamps_valid": False,
+                    "consecutive_errors": previous_errors + 1,
+                    "last_error": "invalid markout health payload",
+                })
             return
+        payload_contract_valid = True
+
+        def invalidate_payload_contract() -> None:
+            nonlocal payload_contract_valid
+            payload_contract_valid = False
+
+        def bounded_text(value, *, max_chars: int, default: str = "") -> str:
+            if value is None:
+                return default[:max_chars]
+            try:
+                return str(value)[:max_chars]
+            except BaseException:
+                invalidate_payload_contract()
+                return default[:max_chars]
+
+        def optional_bounded_text(value, *, max_chars: int) -> str | None:
+            if value is None:
+                return None
+            try:
+                if not value:
+                    return None
+            except BaseException:
+                invalidate_payload_contract()
+                return None
+            return bounded_text(value, max_chars=max_chars) or None
 
         def nonnegative_int(value) -> int:
             if isinstance(value, bool):
                 return 0
             try:
                 return max(0, int(value or 0))
-            except (TypeError, ValueError, OverflowError):
+            except BaseException:
+                invalidate_payload_contract()
                 return 0
 
         def nonnegative_float(value) -> float:
@@ -234,18 +291,42 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                 return 0.0
             try:
                 parsed = float(value or 0.0)
-            except (TypeError, ValueError, OverflowError):
+            except BaseException:
+                invalidate_payload_contract()
                 return 0.0
-            return max(0.0, parsed) if math.isfinite(parsed) else 0.0
+            if not math.isfinite(parsed):
+                invalidate_payload_contract()
+                return 0.0
+            return max(0.0, parsed)
 
         def optional_nonnegative_float(value) -> float | None:
             if value is None or isinstance(value, bool):
                 return None
             try:
                 parsed = float(value)
-            except (TypeError, ValueError, OverflowError):
+            except BaseException:
+                invalidate_payload_contract()
                 return None
-            return max(0.0, parsed) if math.isfinite(parsed) else None
+            if not math.isfinite(parsed):
+                invalidate_payload_contract()
+                return None
+            return max(0.0, parsed)
+
+        def optional_timestamp(value) -> float | None:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                invalidate_payload_contract()
+                return None
+            try:
+                parsed = float(value)
+            except BaseException:
+                invalidate_payload_contract()
+                return None
+            if not math.isfinite(parsed) or parsed < 0.0:
+                invalidate_payload_contract()
+                return None
+            return parsed
 
         raw_scopes = report.get("scopes")
         raw_scopes = raw_scopes if isinstance(raw_scopes, dict) else {}
@@ -257,12 +338,14 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             next_runnable = raw.get("next_runnable_at")
             scopes[scope] = {
                 "due_count": nonnegative_int(raw.get("due_count")),
-                "oldest_due_at": str(oldest)[:32] if oldest else None,
+                "oldest_due_at": optional_bounded_text(
+                    oldest, max_chars=32
+                ),
                 "oldest_overdue_seconds": nonnegative_float(
                     raw.get("oldest_overdue_seconds")
                 ),
-                "next_runnable_at": (
-                    str(next_runnable)[:32] if next_runnable else None
+                "next_runnable_at": optional_bounded_text(
+                    next_runnable, max_chars=32
                 ),
                 "next_runnable_seconds": optional_nonnegative_float(
                     raw.get("next_runnable_seconds")
@@ -276,47 +359,89 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             "due_queue_time_invalid",
             "worker_error",
             "worker_lock_error",
+            "worker_lock_integrity_error",
+            "worker_lock_lost",
+            "worker_lock_renewal_error",
             "worker_lock_release_failed",
+            "worker_persistence_error",
+            "worker_queue_error",
         }
-        reason = str(report.get("reason") or "")
+        reason = bounded_text(report.get("reason"), max_chars=64)
         if report_ok:
             reason = ""
         elif reason not in allowed_reasons or not reason:
             reason = "worker_error"
-        wake_strategy = str(report.get("wake_strategy") or "fixed_interval")
+        wake_strategy = bounded_text(
+            report.get("wake_strategy"),
+            max_chars=32,
+            default="fixed_interval",
+        )
         if wake_strategy not in {
             "deadline_or_local_commit",
             "fixed_interval",
             "fixed_error_backoff",
         }:
             wake_strategy = "fixed_interval"
+        lock_state = bounded_text(
+            report.get("lock_state"),
+            max_chars=32,
+            default="unknown",
+        )
+        if lock_state not in {
+            "starting",
+            "idle",
+            "unknown",
+            "acquired",
+            "contended",
+            "error",
+            "integrity_error",
+            "lost",
+            "persistence_error",
+            "queue_error",
+            "renewal_error",
+            "release_failed",
+        } or report_ok and lock_state in {
+            "error",
+            "integrity_error",
+            "lost",
+            "persistence_error",
+            "queue_error",
+            "renewal_error",
+            "release_failed",
+        }:
+            invalidate_payload_contract()
         with self._markout_health_lock:
             previous_errors = nonnegative_int(
                 self._markout_health.get("consecutive_errors")
             )
             self._markout_health.update({
                 "ok": report_ok,
-                "last_poll_monotonic": report.get("last_poll_monotonic"),
-                "last_poll_wall_ts": report.get("last_poll_wall_ts"),
+                "last_poll_monotonic": optional_timestamp(
+                    report.get("last_poll_monotonic")
+                ),
+                "last_poll_wall_ts": optional_timestamp(
+                    report.get("last_poll_wall_ts")
+                ),
                 "consecutive_errors": 0 if report_ok else previous_errors + 1,
                 "last_error": (
-                    "" if report_ok else str(
+                    "" if report_ok else bounded_text(
                         report.get("error")
                         or report.get("reason")
-                        or "markout worker unhealthy"
-                    )[:200]
+                        or "markout worker unhealthy",
+                        max_chars=200,
+                    )
                 ),
                 "due_count": nonnegative_int(report.get("due_count")),
-                "oldest_due_at": (
-                    str(report.get("oldest_due_at"))[:32]
-                    if report.get("oldest_due_at") else None
+                "oldest_due_at": optional_bounded_text(
+                    report.get("oldest_due_at"),
+                    max_chars=32,
                 ),
                 "oldest_overdue_seconds": nonnegative_float(
                     report.get("oldest_overdue_seconds")
                 ),
-                "next_runnable_at": (
-                    str(report.get("next_runnable_at"))[:32]
-                    if report.get("next_runnable_at") else None
+                "next_runnable_at": optional_bounded_text(
+                    report.get("next_runnable_at"),
+                    max_chars=32,
                 ),
                 "next_runnable_seconds": optional_nonnegative_float(
                     report.get("next_runnable_seconds")
@@ -337,29 +462,46 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                     report.get("poll_wait_seconds")
                 ),
                 "wake_strategy": wake_strategy,
-                "last_completed_wall_ts": report.get(
-                    "last_completed_wall_ts"
+                "last_completed_wall_ts": optional_timestamp(
+                    report.get("last_completed_wall_ts")
                 ),
-                "lock_state": str(report.get("lock_state") or "unknown")[:32],
+                "lock_state": lock_state,
                 "worker_family": "spot",
                 "producer_bots": ["SPOT", "TREND"],
                 "progress_scope": "worker_market_family",
                 "progress_is_bot_scoped": False,
             })
+            if report_ok and not payload_contract_valid:
+                self._markout_health.update({
+                    "ok": False,
+                    "reason": "invalid_health_payload",
+                    "timestamps_valid": False,
+                    "consecutive_errors": previous_errors + 1,
+                    "last_error": "invalid markout health payload",
+                })
 
     def _markout_runtime_health(self) -> dict[str, Any]:
         with self._markout_health_lock:
-            snapshot = dict(self._markout_health)
+            snapshot = copy.deepcopy(self._markout_health)
         last_poll = snapshot.get("last_poll_monotonic")
         if last_poll is None:
             started = self._markout_started_monotonic
             try:
                 startup_age = (
                     0.0 if started is None
-                    else max(0.0, time.monotonic() - float(started))
+                    else time.monotonic() - float(started)
                 )
-            except (TypeError, ValueError, OverflowError):
-                startup_age = float("inf")
+                if not math.isfinite(startup_age) or startup_age < 0.0:
+                    raise ValueError("markout startup timestamp is invalid")
+            except BaseException:
+                snapshot.update({
+                    "ok": False,
+                    "component": "execution_markout_worker",
+                    "state": "invalid",
+                    "reason": "startup_timestamp_invalid",
+                    "startup_age_seconds": None,
+                })
+                return snapshot
             startup_stale = startup_age > self.MARKOUT_POLL_STALE_SEC
             snapshot.update({
                 "ok": not startup_stale,
@@ -371,9 +513,18 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                 snapshot["reason"] = "startup_poll_stale"
             return snapshot
         try:
-            poll_age = max(0.0, time.monotonic() - float(last_poll))
-        except (TypeError, ValueError, OverflowError):
-            poll_age = float("inf")
+            poll_age = time.monotonic() - float(last_poll)
+            if not math.isfinite(poll_age) or poll_age < 0.0:
+                raise ValueError("markout poll timestamp is invalid")
+        except BaseException:
+            snapshot.update({
+                "ok": False,
+                "component": "execution_markout_worker",
+                "state": "invalid",
+                "reason": "poll_timestamp_invalid",
+                "poll_age_seconds": None,
+            })
+            return snapshot
         if poll_age > self.MARKOUT_POLL_STALE_SEC:
             snapshot["ok"] = False
             snapshot["reason"] = "poll_stale"
@@ -382,6 +533,35 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             "poll_age_seconds": poll_age,
         })
         return snapshot
+
+    def _price_feed_runtime_health(self) -> dict[str, Any]:
+        """Expose sustained blind exit protection without penalizing one gap."""
+        try:
+            threshold = max(
+                1, int(self.PRICE_UNAVAILABLE_HEALTH_THRESHOLD)
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            threshold = 5
+        with self._price_health_guard():
+            counts = dict(getattr(self, "_price_unavail_counts", {}) or {})
+        affected = {
+            str(symbol)[:32]: max(0, int(count))
+            for symbol, count in counts.items()
+            if isinstance(count, int)
+            and not isinstance(count, bool)
+            and count >= threshold
+        }
+        if not affected:
+            return {}
+        return {
+            "ok": False,
+            "component": "spot_price_feed",
+            "state": "blind",
+            "reason": "sustained_price_unavailable",
+            "affected_count": len(affected),
+            "max_consecutive_ticks": max(affected.values()),
+            "symbols": sorted(affected)[:16],
+        }
 
     def _record_position_integrity_health(
         self,
@@ -414,11 +594,17 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             health = dict(
                 getattr(self, "_position_integrity_health", {}) or {}
             )
+            recovery_blocked = bool(
+                getattr(self, "_spot_entry_recovery_blocked", False)
+            )
+            recovery_generation = int(
+                getattr(self, "_spot_entry_recovery_generation", 0)
+            )
         from trading.runtime_observability import (
             position_integrity_runtime_snapshot,
         )
 
-        return position_integrity_runtime_snapshot(
+        snapshot = position_integrity_runtime_snapshot(
             health,
             started_monotonic=getattr(
                 self, "_position_integrity_started_monotonic", None
@@ -426,6 +612,15 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             reconcile_interval_seconds=self.RECONCILE_INTERVAL_SEC,
             now_monotonic=time.monotonic(),
         )
+        if recovery_blocked:
+            snapshot.update({
+                "ok": False,
+                "runtime_ok": False,
+                "state": "degraded",
+                "reason": "entry_outcome_unknown",
+                "entry_recovery_generation": recovery_generation,
+            })
+        return snapshot
 
     @staticmethod
     def _sim_tca_pending_state_health(
@@ -630,6 +825,45 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         log_snapshot: bool,
     ) -> None:
         """Supervise exits before optional observability/status publication."""
+        def read_health(reader, component: str, *args) -> dict[str, Any]:
+            try:
+                health = reader(*args)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "component": component,
+                    "state": "unavailable",
+                    "reason": "health_reader_failed",
+                    "error_type": type(exc).__name__,
+                }
+            if not isinstance(health, dict):
+                return {
+                    "ok": False,
+                    "component": component,
+                    "state": "invalid",
+                    "reason": "invalid_health_payload",
+                    "error_type": "invalid_health_payload",
+                }
+            try:
+                snapshot = copy.deepcopy(health)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "component": component,
+                    "state": "unavailable",
+                    "reason": "health_snapshot_failed",
+                    "error_type": type(exc).__name__,
+                }
+            if not isinstance(snapshot, dict):
+                return {
+                    "ok": False,
+                    "component": component,
+                    "state": "invalid",
+                    "reason": "invalid_health_payload",
+                    "error_type": "invalid_health_payload",
+                }
+            return snapshot
+
         threads = self._runtime_threads()
         if (
             not threads["monitor"]
@@ -640,43 +874,83 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                 "monitor thread stopped - exits not supervised"
             )
         try:
-            state_rows = self.state.get_all()
-            if log_snapshot:
-                from trading.runtime_observability import (
-                    log_runtime_observability,
-                )
+            state_error_type = ""
+            try:
+                state_rows = self.state.get_all()
+                if not isinstance(state_rows, dict):
+                    state_rows = None
+                    state_error_type = "invalid_state_payload"
+            except Exception as exc:
+                state_rows = None
+                state_error_type = type(exc).__name__
+            state_snapshot_health = {}
+            if state_error_type:
+                state_snapshot_health = {
+                    "ok": False,
+                    "component": "state_snapshot",
+                    "state": "unavailable",
+                    "reason": "state_snapshot_unavailable",
+                    "error_type": state_error_type[:64],
+                }
+            from trading.runtime_observability import (
+                guarded_runtime_observability,
+            )
 
-                observability = log_runtime_observability(
+            observability, observability_health, observability_error = (
+                guarded_runtime_observability(
+                    log_snapshot=log_snapshot,
                     bot_name=self.BOT_NAME,
                     mode="SIM" if self.simulation else "LIVE",
                     state_rows=state_rows,
                     ticker_cache=self.ticker_cache,
                 )
-            else:
-                from trading.runtime_observability import (
-                    runtime_observability_snapshot,
+            )
+            if observability_error is not None:
+                phase = "heartbeat" if log_snapshot else "periodic"
+                silent_log(
+                    f"{self.BOT_NAME} {phase} runtime observability",
+                    observability_error,
                 )
-
-                observability = runtime_observability_snapshot(
-                    state_rows=state_rows,
-                    ticker_cache=self.ticker_cache,
+            markout_health = read_health(
+                self._markout_runtime_health, "markout"
+            )
+            price_feed_reader = getattr(
+                self, "_price_feed_runtime_health", None
+            )
+            price_feed_health = (
+                read_health(price_feed_reader, "price_feed")
+                if callable(price_feed_reader) else {}
+            )
+            evidence_health = (
+                {}
+                if state_error_type
+                else read_health(
+                    self._sim_evidence_runtime_health,
+                    "sim_evidence",
+                    state_rows,
                 )
-            markout_health = self._markout_runtime_health()
-            evidence_health = self._sim_evidence_runtime_health(state_rows)
+            )
             integrity_reader = getattr(
                 self, "_position_integrity_runtime_health", None
             )
             position_integrity_health = (
-                integrity_reader() if callable(integrity_reader) else {}
+                read_health(integrity_reader, "position_integrity")
+                if callable(integrity_reader) else {}
             )
-            status_writer(
+            published = status_writer(
                 self.LOG_DIR,
                 self.BOT_NAME,
                 (
                     "ready"
                     if (
                         all(threads.values())
+                        and not state_snapshot_health
+                        and not observability_health
                         and markout_health.get("ok") is True
+                        and (
+                            not price_feed_health
+                            or price_feed_health.get("ok") is True
+                        )
                         and (
                             not evidence_health
                             or evidence_health.get(
@@ -696,9 +970,21 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                 self.simulation,
                 threads=threads,
                 extra={
-                    "open_positions": self.state.count(),
+                    "open_positions": (
+                        None
+                        if state_rows is None
+                        else state_rows_exposure_count(state_rows)
+                    ),
                     "safe_mode": bool(self.safe_mode.is_active()),
+                    **(
+                        {"state_snapshot_health": state_snapshot_health}
+                        if state_snapshot_health else {}
+                    ),
                     "markout_health": markout_health,
+                    **(
+                        {"price_feed_health": price_feed_health}
+                        if price_feed_health else {}
+                    ),
                     "sim_evidence_health": evidence_health,
                     **(
                         {
@@ -709,11 +995,45 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                         if position_integrity_health else {}
                     ),
                     **observability,
+                    **(
+                        {"observability_health": observability_health}
+                        if observability_health else {}
+                    ),
                 },
             )
+            if published is False:
+                raise RuntimeError("runtime status publication failed")
         except Exception as exc:
             phase = "heartbeat" if log_snapshot else "periodic"
             silent_log(f"{self.BOT_NAME} {phase} runtime status", exc)
+
+    def _publish_runtime_heartbeat(self, status_writer, log_event) -> None:
+        """Publish core health even when the human-readable heartbeat fails."""
+        def report_error(context: str, exc: Exception) -> None:
+            try:
+                self._log_error(context, exc)
+            except Exception:
+                pass
+
+        try:
+            self._publish_periodic_runtime_status(
+                status_writer, log_snapshot=True
+            )
+        except Exception as exc:
+            report_error("runtime heartbeat status", exc)
+        try:
+            tc = self.state.count()
+            thread_liveness = format_runtime_thread_liveness(
+                self._runtime_threads()
+            )
+            log_event(
+                f" {self.BOT_NAME} heartbeat  "
+                f"Open: {tc}/{self.C('MAX_OPEN_TRADES')}  "
+                f"Threads: {thread_liveness}",
+                "INFO",
+            )
+        except Exception as exc:
+            report_error("runtime heartbeat display", exc)
 
     #  Run 
 
@@ -947,43 +1267,9 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             "Four threads running (monitor, scan, reconcile, markout).",
             "START",
         )
-        threads = self._runtime_threads()
-        markout_health = self._markout_runtime_health()
-        evidence_health = self._sim_evidence_runtime_health()
-        position_integrity_health = self._position_integrity_runtime_health()
-        write_runtime_status(
-            self.LOG_DIR, self.BOT_NAME,
-            (
-                "ready"
-                if (
-                    all(threads.values())
-                    and markout_health.get("ok") is True
-                    and (
-                        not evidence_health
-                        or evidence_health.get(
-                            "runtime_ok", evidence_health.get("ok")
-                        ) is True
-                    )
-                    and (
-                        not position_integrity_health
-                        or position_integrity_health.get(
-                            "runtime_ok", position_integrity_health.get("ok")
-                        ) is True
-                    )
-                )
-                else "degraded"
-            ),
-            self.simulation,
-            threads=threads,
-            extra={
-                "open_positions": self.state.count(),
-                "markout_health": markout_health,
-                "sim_evidence_health": evidence_health,
-                **(
-                    {"position_integrity_health": position_integrity_health}
-                    if position_integrity_health else {}
-                ),
-            })
+        self._publish_periodic_runtime_status(
+            write_runtime_status, log_snapshot=False
+        )
 
         #  Main thread: heartbeat + shutdown wait 
         try:
@@ -1000,18 +1286,8 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                     # still alive.
                     now = time.monotonic()
                     if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_SEC:
-                        tc = self.state.count()
-                        thread_liveness = format_runtime_thread_liveness(
-                            self._runtime_threads()
-                        )
-                        log_event(
-                            f" {self.BOT_NAME} heartbeat  "
-                            f"Open: {tc}/{self.C('MAX_OPEN_TRADES')}  "
-                            f"Threads: {thread_liveness}",
-                            "INFO"
-                        )
-                        self._publish_periodic_runtime_status(
-                            write_runtime_status, log_snapshot=True
+                        self._publish_runtime_heartbeat(
+                            write_runtime_status, log_event
                         )
                         last_heartbeat = now
                     if now - last_runtime_status >= 5.0:
@@ -1051,11 +1327,26 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         ):
             if t and t.is_alive():
                 t.join(timeout=2)
+        resource_closers = shared_runtime_resource_closers()
+        ws_feed = getattr(self, "_ws_feed", None)
+        if ws_feed is not None:
+            resource_closers["price_feed_resources"] = (
+                lambda feed=ws_feed: feed.stop(timeout=0.0) is True
+            )
+        state_flush = getattr(self.state, "finalize_pending", None)
+        if callable(state_flush):
+            resource_closers["trade_state_persistence"] = state_flush
+        if self.safe_mode is not None:
+            resource_closers["safe_mode_persistence"] = (
+                lambda safe_mode=self.safe_mode: safe_mode.shutdown_alert_state_persistence(
+                    timeout=0.0
+                )
+            )
         finalize_runtime_shutdown(
             self,
             write_runtime_status,
             log_event,
-            resource_closers=shared_runtime_resource_closers(),
+            resource_closers=resource_closers,
         )
 
     #  Connection 
@@ -1209,16 +1500,33 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             return True
         if mode != PRESERVE_POSITIONS:
             return False
-        with self._shutdown_lock:
-            if getattr(self, "_emergency_in_progress", False):
-                log_event(
-                    "Preserve-position shutdown refused while emergency close "
-                    "is already in progress",
-                    "WARN",
-                )
-                return False
-            self._shutdown_positions_preserved = True
-            self._shutdown_event.set()
+        handler_lock = getattr(self, "_shutdown_handler_lock", None)
+        if handler_lock is None:  # compatibility for lightweight test hosts
+            handler_lock = threading.Lock()
+            self._shutdown_handler_lock = handler_lock
+        close_requested = getattr(self, "_shutdown_close_requested", None)
+        if close_requested is None:
+            close_requested = threading.Event()
+            self._shutdown_close_requested = close_requested
+        preserve_refused = False
+        with handler_lock:
+            with self._shutdown_lock:
+                if getattr(self, "_emergency_in_progress", False):
+                    log_event(
+                        "Preserve-position shutdown refused while emergency "
+                        "close is already in progress",
+                        "WARN",
+                    )
+                    preserve_refused = True
+                else:
+                    self._shutdown_positions_preserved = True
+                    self._shutdown_event.set()
+        if close_requested.is_set():
+            self._drain_shutdown_close_requests(
+                signum="Deferred shutdown signal"
+            )
+        if preserve_refused:
+            return False
         log_event(
             "Launcher preserve-position shutdown received; positions remain "
             "open while runtime resources close cleanly",
@@ -1227,6 +1535,194 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         return True
 
     def _shutdown_handler(self, signum=None, frame=None):
+        """Publish one close request and drain it when this caller owns it."""
+        requested = getattr(self, "_shutdown_close_requested", None)
+        if requested is None:  # compatibility for lightweight test hosts
+            requested = threading.Event()
+            self._shutdown_close_requested = requested
+        publish_lock = getattr(self, "_shutdown_request_publish_lock", None)
+        if publish_lock is None:
+            publish_lock = threading.RLock()
+            self._shutdown_request_publish_lock = publish_lock
+        with publish_lock:
+            self._shutdown_close_request_generation = object()
+            requested.set()
+        self._drain_shutdown_close_requests(signum=signum, frame=frame)
+
+    def _drain_shutdown_close_requests(self, signum=None, frame=None):
+        """Drain already-published requests without creating a new one."""
+        requested = getattr(self, "_shutdown_close_requested", None)
+        if requested is None or not requested.is_set():
+            return
+        handler_lock = getattr(self, "_shutdown_handler_lock", None)
+        if handler_lock is None:  # compatibility for lightweight test hosts
+            handler_lock = threading.Lock()
+            self._shutdown_handler_lock = handler_lock
+        if not handler_lock.acquire(blocking=False):
+            self._shutdown_event.set()
+            return
+        publish_lock = getattr(self, "_shutdown_request_publish_lock", None)
+        if publish_lock is None:
+            publish_lock = threading.RLock()
+            self._shutdown_request_publish_lock = publish_lock
+        deferred_request_generation = None
+        defer_same_attempt = False
+        primary_error = None
+        primary_traceback = None
+        try:
+            while True:
+                with publish_lock:
+                    if not requested.is_set():
+                        break
+                    requested.clear()
+                    attempt_generation = getattr(
+                        self,
+                        "_shutdown_close_request_generation",
+                        None,
+                    )
+                with self._shutdown_lock:
+                    active_before_attempt_generation = getattr(
+                        self,
+                        "_emergency_close_generation",
+                        None,
+                    )
+                    active_before_attempt = bool(
+                        getattr(self, "_emergency_in_progress", False)
+                        or (
+                            active_before_attempt_generation is not None
+                            and not active_before_attempt_generation[
+                                "done"
+                            ].is_set()
+                        )
+                    )
+                try:
+                    handled = self._shutdown_handler_once(
+                        signum=signum,
+                        frame=frame,
+                    )
+                except BaseException as exc:
+                    with publish_lock:
+                        requested.set()
+                    with self._shutdown_lock:
+                        generation = getattr(
+                            self,
+                            "_emergency_close_generation",
+                            None,
+                        )
+                        active_generation = bool(
+                            getattr(self, "_emergency_in_progress", False)
+                            or (
+                                generation is not None
+                                and not generation["done"].is_set()
+                            )
+                        )
+                        same_attempt_generation = bool(
+                            generation is not None
+                            and generation.get("request_generation")
+                            is attempt_generation
+                        )
+                    defer_same_attempt = (
+                        same_attempt_generation
+                        or (
+                            not active_generation
+                            and not active_before_attempt
+                        )
+                    )
+                    deferred_request_generation = attempt_generation
+                    primary_error = exc
+                    primary_traceback = exc.__traceback__
+                    break
+                if not handled:
+                    with publish_lock:
+                        requested.set()
+                    with self._shutdown_lock:
+                        generation = getattr(
+                            self,
+                            "_emergency_close_generation",
+                            None,
+                        )
+                        active_generation = bool(
+                            getattr(self, "_emergency_in_progress", False)
+                            or (
+                                generation is not None
+                                and not generation["done"].is_set()
+                            )
+                        )
+                        same_attempt_generation = bool(
+                            generation is not None
+                            and generation.get("request_generation")
+                            is attempt_generation
+                        )
+                    defer_same_attempt = (
+                        same_attempt_generation
+                        or (
+                            not active_generation
+                            and not active_before_attempt
+                        )
+                    )
+                    deferred_request_generation = attempt_generation
+                    break
+        finally:
+            handler_lock.release()
+        # Close the release/check race: a request arriving before release saw
+        # the busy gate; one arriving afterwards can become the next owner.
+        with publish_lock:
+            pending_request = requested.is_set()
+            current_request_generation = getattr(
+                self,
+                "_shutdown_close_request_generation",
+                None,
+            )
+        if pending_request:
+            with self._shutdown_lock:
+                generation = getattr(
+                    self,
+                    "_emergency_close_generation",
+                    None,
+                )
+                emergency_closed = bool(
+                    getattr(self, "_emergency_closed", False)
+                )
+                active_generation = bool(
+                    getattr(self, "_emergency_in_progress", False)
+                    or (
+                        generation is not None
+                        and not generation["done"].is_set()
+                    )
+                )
+            same_failed_attempt = (
+                defer_same_attempt
+                and current_request_generation is deferred_request_generation
+                and not emergency_closed
+            )
+            if (
+                pending_request
+                and not active_generation
+                and not same_failed_attempt
+            ):
+                if primary_error is None:
+                    self._drain_shutdown_close_requests(
+                        signum=signum,
+                        frame=frame,
+                    )
+                else:
+                    try:
+                        self._drain_shutdown_close_requests(
+                            signum=signum,
+                            frame=frame,
+                        )
+                    except BaseException as secondary:
+                        try:
+                            primary_error.add_note(
+                                "newer shutdown request drain failed: "
+                                f"{type(secondary).__name__}: {secondary}"
+                            )
+                        except BaseException:
+                            pass
+        if primary_error is not None:
+            raise primary_error.with_traceback(primary_traceback)
+
+    def _shutdown_handler_once(self, signum=None, frame=None) -> bool:
         """Signal handler  sets shutdown event and triggers emergency close.
 
         The close runs in a side-thread with a SHUTDOWN_DEADLINE_SEC deadline so
@@ -1240,12 +1736,24 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         from core.logger import log_event
         with self._shutdown_lock:
             if getattr(self, "_shutdown_positions_preserved", False):
-                return
+                return True
             if getattr(self, "_emergency_closed", False):
-                return
+                return True
             self._shutdown_event.set()
-            if getattr(self, "_emergency_in_progress", False):
-                return
+            generation = getattr(
+                self,
+                "_emergency_close_generation",
+                None,
+            )
+            if (
+                getattr(self, "_emergency_in_progress", False)
+                or (
+                    generation is not None
+                    and not generation["done"].is_set()
+                )
+            ):
+                self._emergency_in_progress = True
+                return False
             self._emergency_in_progress = True
 
         # FAST-PATH: nothing to close  no emergency close
@@ -1262,7 +1770,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             )
             self._emergency_closed = True   # prevent atexit re-entry
             self._emergency_in_progress = False
-            return
+            return True
 
         log_event(
             f" Shutdown signal {signum if signum else 'atexit'} received  "
@@ -1270,7 +1778,24 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             "WARN"
         )
 
+        publish_lock = getattr(self, "_shutdown_request_publish_lock", None)
+        if publish_lock is None:
+            publish_lock = threading.RLock()
+            self._shutdown_request_publish_lock = publish_lock
+        with publish_lock:
+            close_request_generation = getattr(
+                self,
+                "_shutdown_close_request_generation",
+                None,
+            )
         result = {"done": False, "error": None, "failed_count": 0}
+        generation = {
+            "done": threading.Event(),
+            "runner": None,
+            "start_raised": False,
+            "result": result,
+            "request_generation": close_request_generation,
+        }
 
         def _close_runner():
             try:
@@ -1281,31 +1806,100 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                 result["error"] = e
             finally:
                 with self._shutdown_lock:
-                    if result["done"] and result["failed_count"] == 0:
-                        self._emergency_closed = True
-                    self._emergency_in_progress = False
+                    owns_generation = (
+                        getattr(self, "_emergency_close_generation", None)
+                        is generation
+                    )
+                    if owns_generation:
+                        if result["done"] and result["failed_count"] == 0:
+                            self._emergency_closed = True
+                        self._emergency_in_progress = False
+                    generation["done"].set()
+                with publish_lock:
+                    pending = getattr(
+                        self,
+                        "_shutdown_close_requested",
+                        None,
+                    )
+                    pending_request = bool(
+                        pending is not None and pending.is_set()
+                    )
+                    current_request_generation = getattr(
+                        self,
+                        "_shutdown_close_request_generation",
+                        None,
+                    )
+                close_succeeded = (
+                    result["done"] and result["failed_count"] == 0
+                )
+                if (
+                    owns_generation
+                    and pending_request
+                    and (
+                        close_succeeded
+                        or current_request_generation
+                        is not generation["request_generation"]
+                    )
+                ):
+                    self._drain_shutdown_close_requests(
+                        signum="Deferred repeat shutdown signal"
+                    )
 
         try:
             runner = threading.Thread(target=_close_runner,
                                       daemon=True,
                                       name=f"{self.BOT_NAME}EmergencyClose")
-            runner.start()
-        except Exception as exc:
+        except BaseException as exc:
             with self._shutdown_lock:
                 self._emergency_in_progress = False
-            self._log_error("Emergency close thread start", exc)
-            return
-        runner.join(timeout=self.SHUTDOWN_DEADLINE_SEC)
+            try:
+                self._log_error("Emergency close thread construction", exc)
+            except BaseException:
+                pass
+            if not isinstance(exc, Exception):
+                raise
+            return False
+        generation["runner"] = runner
+        with self._shutdown_lock:
+            self._emergency_close_generation = generation
+        try:
+            runner.start()
+        except BaseException as exc:
+            generation["start_raised"] = True
+            if (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(runner)
+            ):
+                with self._shutdown_lock:
+                    generation["done"].set()
+                    if self._emergency_close_generation is generation:
+                        self._emergency_close_generation = None
+                        self._emergency_in_progress = False
+            try:
+                self._log_error("Emergency close thread start", exc)
+            except BaseException:
+                pass
+            if not isinstance(exc, Exception):
+                raise
+            return False
+        try:
+            runner.join(timeout=self.SHUTDOWN_DEADLINE_SEC)
+        except Exception as exc:
+            self._log_error("Emergency close thread join", exc)
+            return False
 
         # The worker owns the in-progress latch and clears it in ``finally``.
         # Never write a sampled ``True`` back here: the worker can terminate
         # between is_alive() returning and the assignment, which would relatch
         # an already-finished partial close and block every later retry.
-        runner_alive = runner.is_alive()
-        if result["done"] and result["failed_count"] == 0:
-            self._emergency_closed = True
-            self._emergency_in_progress = False
-        else:
+        try:
+            runner_alive = runner.is_alive()
+        except Exception:
+            runner_alive = True
+        generation_done = generation["done"].is_set()
+        if not runner_alive and not generation_done:
+            return False
+        if not (result["done"] and result["failed_count"] == 0):
             if runner_alive:
                 log_event(
                     f" Emergency close exceeded {self.SHUTDOWN_DEADLINE_SEC}s "
@@ -1322,6 +1916,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                     f"them; close MANUALLY if exiting now.",
                     "WARN"
                 )
+        return True
 
     def _emergency_close_all(self, reason: str = "Shutdown") -> None:
         from core.logger import log_event, log_sell, send_telegram, save_trade

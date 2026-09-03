@@ -24,16 +24,22 @@ from typing import Callable
 
 from bot_utils.api_budget import try_consume_api_call
 from bot_utils.order_utils import order_id_text_or_none
+from bot_utils.runtime_threads import thread_definitely_never_started
 from trading.venue_recorder import (
     MAX_PARTITION_CLOCK_AGE_MS,
+    SealedCapturePartitionError,
     SQLitePartitionWriter,
     VenueEvent,
+    _safe_exception_summary,
 )
 
 
 _PUBLIC_ASYNC_CLOSE_TIMEOUT_SECONDS = 5.0
+_PUBLIC_ASYNC_CLOSE_RETRY_SECONDS = 1.0
 _PERSIST_EXECUTOR_MAX_WORKERS = 4
 _TRADE_UPDATE_MAX_ROWS = 20_000
+_TRADE_PERSIST_RETRY_INITIAL_SECONDS = 0.1
+_TRADE_PERSIST_RETRY_MAX_SECONDS = 5.0
 
 
 def _capture_now_ms() -> int:
@@ -105,6 +111,43 @@ class OrderBookValidationError(ValueError):
 
 class TradeValidationError(ValueError):
     """Raised when a public trade update is unsafe to persist."""
+
+
+class TradePersistenceError(RuntimeError):
+    """Raised internally when an accepted public-trade update is not durable."""
+
+
+def _owned_trade_update(trades) -> tuple[tuple | None, str | None]:
+    """Classify the outer contract and own every bounded accepted update."""
+    if not isinstance(trades, (list, tuple)):
+        return None, "EmptyTradeUpdate"
+    try:
+        bounded_slice = slice(0, _TRADE_UPDATE_MAX_ROWS + 1)
+        if isinstance(trades, list):
+            snapshot = tuple(list.__getitem__(trades, bounded_slice))
+        else:
+            snapshot = tuple(tuple.__getitem__(trades, bounded_slice))
+    except Exception:
+        return None, "MalformedTradeUpdate"
+    count = len(snapshot)
+    if count <= 0:
+        return None, "EmptyTradeUpdate"
+    if count > _TRADE_UPDATE_MAX_ROWS:
+        return None, "OversizedTradeUpdate"
+    fields = ("id", "timestamp", "price", "amount", "side")
+    try:
+        owned = tuple(
+            {
+                field: copy.deepcopy(trade.get(field))
+                for field in fields
+            }
+            if isinstance(trade, dict)
+            else trade
+            for trade in snapshot
+        )
+    except Exception:
+        return None, "MalformedTradeUpdate"
+    return owned, None
 
 
 def build_public_async_config(exchange, *, new_updates: bool = False) -> dict:
@@ -235,7 +278,9 @@ class L2ShadowCollector:
         self.exchange_id = str(
             getattr(exchange, "id", None) or type(exchange).__name__
         ).lower()
-        self.writer = writer or SQLitePartitionWriter(root)
+        self.writer = (
+            writer if writer is not None else SQLitePartitionWriter(root)
+        )
         self._owns_writer = writer is None
         self.max_symbols = max(1, min(50, int(max_symbols)))
         self.depth_levels = max(5, min(100, int(depth_levels)))
@@ -285,8 +330,18 @@ class L2ShadowCollector:
         self._health_reconnect_attempts = 0
         self._health_ok_logged = False
         self._thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.Lock()
+        self._worker_state: dict | None = None
+        self._run_generation = 0
         self._shutdown_event: threading.Event | None = None
         self._stop_event = threading.Event()
+        self._async_clients_lock = threading.Lock()
+        self._async_clients: list[object] = []
+        self._persist_work_lock = threading.Lock()
+        self._persist_work_states: dict[object, dict] = {}
+        self._owned_writer_close_lock = threading.Lock()
+        self._owned_writer_terminal = False
+        self._owned_writer_closed = False
 
     @property
     def is_alive(self) -> bool:
@@ -327,9 +382,13 @@ class L2ShadowCollector:
     def health_snapshot(self) -> dict:
         desired = tuple(self._symbol_snapshot())
         now = time.monotonic()
+        with self._state_lock:
+            connection_epoch = self._connection_epoch
         with self._health_lock:
             return {
-                "connection_epoch": self._connection_epoch,
+                "connection_epoch": connection_epoch,
+                "reconnect_attempts": self._health_reconnect_attempts,
+                "connection_error_type": self._health_error_type,
                 "l2_missing_or_stale": sorted(
                     symbol
                     for symbol in desired
@@ -571,7 +630,8 @@ class L2ShadowCollector:
             quality_flags=tuple(flags),
         )
         try:
-            self.writer.write(event)
+            if self.writer.write(event) is False:
+                raise RuntimeError("L2 capture writer rejected event")
         except Exception as exc:
             # A failed write did not satisfy the sampling contract. Roll back
             # only our own reservation (a slower concurrent write may already
@@ -610,6 +670,7 @@ class L2ShadowCollector:
         observed_at_monotonic: float | None = None,
         connection_epoch: int | None = None,
         universe: tuple[str, ...] | None = None,
+        _raise_storage_error: bool = False,
     ) -> bool:
         """Persist one bounded CCXT-Pro public-trade update."""
         if not isinstance(trades, (list, tuple)):
@@ -642,6 +703,8 @@ class L2ShadowCollector:
             with self._state_lock:
                 connection_epoch = self._connection_epoch
         normalized = []
+        duplicate_count = 0
+        stale_trade_count = 0
         seen: dict[str, tuple] = {}
         try:
             for index, trade in enumerate(trades):
@@ -657,12 +720,16 @@ class L2ShadowCollector:
                 )
                 if not timestamp.is_integer() or timestamp > received_ms + 30_000:
                     raise TradeValidationError(f"trade[{index}].timestamp is invalid")
+                if received_ms - timestamp > MAX_PARTITION_CLOCK_AGE_MS:
+                    stale_trade_count += 1
+                    continue
                 side = str(trade.get("side") or "").strip().lower()
                 if trade_id is None or side not in {"buy", "sell"}:
                     raise TradeValidationError(f"trade[{index}] identity is invalid")
                 evidence = (int(timestamp), price, amount, side)
                 previous = seen.get(trade_id)
                 if previous == evidence:
+                    duplicate_count += 1
                     continue
                 if previous is not None:
                     raise TradeValidationError(
@@ -681,7 +748,6 @@ class L2ShadowCollector:
             self._log(f"invalid trade update for {symbol}: {exc}", "WARN")
             return False
         normalized.sort(key=lambda row: (row["timestamp"], row["id"]))
-        duplicate_count = 0
         filtered = []
         conflict = None
         with self._state_lock:
@@ -710,8 +776,17 @@ class L2ShadowCollector:
             return False
         normalized = filtered
         if not normalized:
-            with self._health_lock:
-                self._health_trade_duplicates_suppressed += duplicate_count
+            if duplicate_count:
+                with self._health_lock:
+                    self._health_trade_duplicates_suppressed += duplicate_count
+            if stale_trade_count:
+                self._mark_trade_unhealthy(symbol, "StaleTradeTimestamp")
+                self._log(
+                    f"stale trade backlog rejected for {symbol}: "
+                    f"{stale_trade_count} row(s)",
+                    "WARN",
+                )
+                return False
             self._mark_trade_healthy(
                 symbol,
                 observed_at_monotonic=observed_at_monotonic,
@@ -725,6 +800,7 @@ class L2ShadowCollector:
         for trade in normalized:
             trade_day = self._iso8601(trade["timestamp"])[:10]
             groups.setdefault(trade_day, []).append(trade)
+        sealed_days = []
         try:
             for trade_day, day_trades in sorted(groups.items()):
                 payload = {
@@ -755,8 +831,22 @@ class L2ShadowCollector:
                     exchange_time=self._iso8601(latest_ms),
                     received_time=received_time,
                     payload=payload,
+                    quality_flags=(
+                        ("stale_trade_timestamp",)
+                        if stale_trade_count else ()
+                    ),
                 )
-                self.writer.write(event)
+                try:
+                    if self.writer.write(event) is False:
+                        raise RuntimeError(
+                            "trade capture writer rejected event"
+                        )
+                except SealedCapturePartitionError:
+                    # One reconnect update may contain an immutable old UTC
+                    # group followed by writable current evidence. Preserve
+                    # every later group while keeping this sample unhealthy.
+                    sealed_days.append(trade_day)
+                    continue
                 # Commit identity knowledge only after this partition write
                 # succeeds. If a midnight-split update fails on its later
                 # partition, retrying can suppress the already-durable group
@@ -778,10 +868,32 @@ class L2ShadowCollector:
         except Exception as exc:
             self._mark_trade_unhealthy(symbol, type(exc).__name__)
             self._log(f"trade storage error for {symbol}: {type(exc).__name__}", "WARN")
+            if _raise_storage_error:
+                raise TradePersistenceError(
+                    f"trade storage failed for {symbol}"
+                ) from exc
             return False
         if duplicate_count:
             with self._health_lock:
                 self._health_trade_duplicates_suppressed += duplicate_count
+        if sealed_days:
+            self._mark_trade_unhealthy(
+                symbol, "SealedCapturePartitionError"
+            )
+            self._log(
+                f"sealed trade partition rejected for {symbol}: "
+                + ",".join(sealed_days[:8]),
+                "WARN",
+            )
+            return False
+        if stale_trade_count:
+            self._mark_trade_unhealthy(symbol, "StaleTradeTimestamp")
+            self._log(
+                f"stale trade backlog rejected for {symbol}: "
+                f"{stale_trade_count} row(s)",
+                "WARN",
+            )
+            return False
         self._mark_trade_healthy(
             symbol,
             observed_at_monotonic=observed_at_monotonic,
@@ -845,15 +957,17 @@ class L2ShadowCollector:
         # never compares its nonce with evidence from the previous connection.
         next_epoch = getattr(self.writer, "next_connection_epoch", None)
         epoch = next_epoch() if callable(next_epoch) else self._connection_epoch + 1
-        with self._state_lock:
-            self._last_persist.clear()
-            self._last_nonce.clear()
-            self._updates_since_sample.clear()
-            self._connection_epoch = int(epoch)
+        if type(epoch) is not int or epoch <= 0:
+            raise RuntimeError("connection epoch is invalid")
         self._begin_health_check(
             error_type=error_type,
             reconnect_attempts=reconnect_attempts,
         )
+        with self._state_lock:
+            self._last_persist.clear()
+            self._last_nonce.clear()
+            self._updates_since_sample.clear()
+            self._connection_epoch = epoch
 
     def _mark_l2_healthy(
         self,
@@ -947,31 +1061,200 @@ class L2ShadowCollector:
             raise RuntimeError(f"ccxt.pro has no adapter for {self.exchange_id}")
         return exchange_class(config)
 
+    def _register_async_client(self, exchange) -> None:
+        with self._async_clients_lock:
+            if not any(exchange is client for client in self._async_clients):
+                self._async_clients.append(exchange)
+
+    def _release_async_client(self, exchange) -> None:
+        with self._async_clients_lock:
+            self._async_clients = [
+                client for client in self._async_clients if client is not exchange
+            ]
+
+    def _persist_registry(self) -> tuple[threading.Lock, dict[object, dict]]:
+        """Return the exact accepted-work registry, including legacy probes."""
+        lock = getattr(self, "_persist_work_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._persist_work_lock = lock
+        states = getattr(self, "_persist_work_states", None)
+        if states is None:
+            states = {}
+            self._persist_work_states = states
+        return lock, states
+
+    def _wait_for_persist_work(self, *, deadline: float | None) -> bool:
+        """Wait boundedly until every accepted persistence callback is done."""
+        lock, states = self._persist_registry()
+        while True:
+            if deadline is None:
+                lock.acquire()
+            else:
+                lock_timeout = min(
+                    max(0.0, deadline - time.monotonic()),
+                    threading.TIMEOUT_MAX,
+                )
+                if not lock.acquire(timeout=lock_timeout):
+                    return False
+            try:
+                pending = list(states.values())
+            finally:
+                lock.release()
+            if not pending:
+                return True
+            if deadline is None:
+                pending[0]["done"].wait()
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0.0:
+                return False
+            pending[0]["done"].wait(timeout=remaining)
+
+    async def _close_owned_async_client(self, exchange) -> None:
+        """Keep one exact close owner until the client confirms completion."""
+        failure_logged = False
+        close_task = None
+
+        async def invoke_close() -> bool:
+            close = getattr(exchange, "close", None)
+            if not callable(close):
+                return True
+            result = await close()
+            return result is None or result is True
+
+        while True:
+            closed = False
+            try:
+                if close_task is None:
+                    close_task = asyncio.ensure_future(invoke_close())
+                closed = await asyncio.wait_for(
+                    asyncio.shield(close_task),
+                    timeout=_PUBLIC_ASYNC_CLOSE_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                if not failure_logged:
+                    self._log(
+                        "async exchange close timed out; retaining exact owner",
+                        "WARN",
+                    )
+                    failure_logged = True
+                continue
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+                if close_task is None or not close_task.done():
+                    continue
+                try:
+                    closed = close_task.result()
+                except asyncio.CancelledError:
+                    close_task = None
+                except Exception as exc:
+                    if not failure_logged:
+                        self._log(
+                            f"async exchange close failed ({type(exc).__name__}); "
+                            f"retrying",
+                            "WARN",
+                        )
+                        failure_logged = True
+                    close_task = None
+            except Exception as exc:
+                if not failure_logged:
+                    self._log(
+                        f"async exchange close failed ({type(exc).__name__}); "
+                        f"retrying",
+                        "WARN",
+                    )
+                    failure_logged = True
+                close_task = None
+            if closed is True:
+                self._release_async_client(exchange)
+                return
+            if not failure_logged:
+                self._log(
+                    "async exchange close was not confirmed; retrying",
+                    "WARN",
+                )
+                failure_logged = True
+            close_task = None
+            try:
+                await asyncio.sleep(_PUBLIC_ASYNC_CLOSE_RETRY_SECONDS)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+
     async def _persist_off_loop(self, callback, *args, **kwargs):
         """Keep the loop responsive and drain durable work before cancellation."""
         executor = getattr(self, "_persist_executor", None)
         loop = asyncio.get_running_loop()
-        work = partial(callback, *args, **kwargs)
+        callback_work = partial(callback, *args, **kwargs)
+        lock, states = self._persist_registry()
+        token = object()
+        state = {"done": threading.Event()}
+        with lock:
+            states[token] = state
+
+        def tracked_work():
+            try:
+                return callback_work()
+            finally:
+                with lock:
+                    if states.get(token) is state:
+                        states.pop(token, None)
+                    state["done"].set()
+
         task = (
-            loop.run_in_executor(executor, work)
+            loop.run_in_executor(executor, tracked_work)
             if executor is not None
-            else asyncio.create_task(asyncio.to_thread(work))
+            else asyncio.create_task(asyncio.to_thread(tracked_work))
         )
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
-            await asyncio.gather(task, return_exceptions=True)
-            raise
+            current = asyncio.current_task()
+            if current is not None:
+                while current.cancelling():
+                    current.uncancel()
+            # A second cancellation must not interrupt ownership drain and
+            # admit a parallel retry of the same accepted event. Collapse any
+            # additional requests into the one terminal cancellation that is
+            # re-raised only after this exact persist task has finished.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    if current is not None:
+                        while current.cancelling():
+                            current.uncancel()
+                    continue
+                except BaseException:
+                    break
+            _consume_async_task_result(task)
+            raise asyncio.CancelledError
 
     async def _watch_symbol(self, async_exchange, symbol: str) -> None:
         while not self._should_stop() and symbol in self._symbol_snapshot():
-            book = await async_exchange.watch_order_book(symbol, self.depth_levels)
+            observed_book = await async_exchange.watch_order_book(
+                symbol,
+                self.depth_levels,
+            )
             received_ms = _capture_now_ms()
             observed_at_monotonic = time.monotonic()
+            try:
+                book = normalize_order_book(
+                    observed_book,
+                    depth_levels=self.depth_levels,
+                )
+            except OrderBookValidationError as exc:
+                self._mark_l2_unhealthy(symbol, type(exc).__name__)
+                self._log_invalid_snapshot(symbol, exc)
+                continue
             universe = self._symbol_snapshot()
             with self._state_lock:
                 connection_epoch = self._connection_epoch
-            if self._should_stop() or symbol not in self._symbol_snapshot():
+            if symbol not in universe:
                 return
             await self._persist_off_loop(
                 self.record_order_book,
@@ -983,6 +1266,61 @@ class L2ShadowCollector:
                 universe=universe,
             )
 
+    async def _persist_trade_update(
+        self,
+        symbol: str,
+        trades,
+        *,
+        received_ms: int,
+        observed_at_monotonic: float,
+        connection_epoch: int,
+        universe: tuple[str, ...],
+    ) -> bool:
+        """Keep one accepted trade update owned until terminally handled."""
+        retry_delay = _TRADE_PERSIST_RETRY_INITIAL_SECONDS
+        cancellation_requested = False
+        while True:
+            try:
+                persisted = await self._persist_off_loop(
+                    self.record_trades,
+                    symbol,
+                    trades,
+                    received_ms=received_ms,
+                    observed_at_monotonic=observed_at_monotonic,
+                    connection_epoch=connection_epoch,
+                    universe=universe,
+                    _raise_storage_error=True,
+                )
+            except asyncio.CancelledError:
+                cancellation_requested = True
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+                continue
+            except TradePersistenceError as exc:
+                if isinstance(exc.__cause__, SealedCapturePartitionError):
+                    # A sealed day is intentionally immutable, so replaying
+                    # this exact accepted update can never become durable.
+                    # record_trades already marked the stream unhealthy and
+                    # logged the rejected evidence; release only this terminal
+                    # item so the watcher can observe a newer valid update.
+                    return False
+                try:
+                    await asyncio.sleep(retry_delay)
+                except asyncio.CancelledError:
+                    cancellation_requested = True
+                    current = asyncio.current_task()
+                    if current is not None:
+                        current.uncancel()
+                retry_delay = min(
+                    retry_delay * 2.0,
+                    _TRADE_PERSIST_RETRY_MAX_SECONDS,
+                )
+                continue
+            if cancellation_requested:
+                raise asyncio.CancelledError
+            return persisted
+
     async def _watch_trade_symbol(self, async_exchange, symbol: str) -> None:
         watcher = getattr(async_exchange, "watch_trades", None)
         if not callable(watcher):
@@ -992,16 +1330,18 @@ class L2ShadowCollector:
         self._mark_trade_watcher_active(symbol)
         try:
             while not self._should_stop() and symbol in self._symbol_snapshot():
-                trades = await watcher(symbol)
+                trades, invalid_reason = _owned_trade_update(
+                    await watcher(symbol)
+                )
+                if invalid_reason is not None:
+                    self._mark_trade_unhealthy(symbol, invalid_reason)
+                    continue
                 received_ms = _capture_now_ms()
                 observed_at_monotonic = time.monotonic()
                 universe = self._symbol_snapshot()
                 with self._state_lock:
                     connection_epoch = self._connection_epoch
-                if self._should_stop() or symbol not in self._symbol_snapshot():
-                    return
-                await self._persist_off_loop(
-                    self.record_trades,
+                await self._persist_trade_update(
                     symbol,
                     trades,
                     received_ms=received_ms,
@@ -1162,6 +1502,7 @@ class L2ShadowCollector:
                     exchange = self._make_async_exchange(
                         new_updates=stream_name == "trades"
                     )
+                    self._register_async_client(exchange)
                     if stream_name == "l2":
                         l2_exchange = exchange
                     else:
@@ -1186,33 +1527,34 @@ class L2ShadowCollector:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                error_type = type(exc).__name__
+                error_type, error_detail = _safe_exception_summary(exc)
                 interruption_wall_ts = _capture_now_ms() / 1000.0
                 with self._health_lock:
                     was_healthy = self._health_ok_logged
                     self._health_ok_logged = False
                     if was_healthy:
                         self._health_transport_errors_consecutive = 0
+                        reconnect_attempts = 0
+                        last_error_type = None
+                        backoff = 2.0
+                    reconnect_attempts += 1
                     self._health_transport_errors_total += 1
                     self._health_transport_errors_consecutive += 1
                     self._health_last_transport_error = (
-                        f"{error_type}: {str(exc)[:160]}"
+                        f"{error_type}: {error_detail}"
                     )
                     self._health_last_interruption_wall_ts = (
                         interruption_wall_ts
                     )
-                if was_healthy:
-                    reconnect_attempts = 0
-                    last_error_type = None
-                    backoff = 2.0
-                reconnect_attempts += 1
+                    self._health_reconnect_attempts = reconnect_attempts
+                    self._health_error_type = error_type
                 try:
                     from core.logger import log_struct
                     log_struct(
                         "l2_shadow_interruption",
                         exchange=self.exchange_id,
                         error_type=error_type,
-                        detail=str(exc),
+                        detail=error_detail,
                         reconnect_attempt=reconnect_attempts,
                     )
                 except Exception:
@@ -1244,7 +1586,7 @@ class L2ShadowCollector:
                     ):
                         exchanges.append(exchange)
                 for exchange in exchanges:
-                    await close_public_async_exchange(exchange)
+                    await self._close_owned_async_client(exchange)
             if self._should_stop():
                 break
             wait = min(backoff * random.uniform(0.75, 1.25), self.reconnect_max_seconds)
@@ -1257,45 +1599,148 @@ class L2ShadowCollector:
         except Exception as exc:
             self._log(f"collector stopped: {type(exc).__name__}", "WARN")
         finally:
+            # Executor launch acceptance can be uncertain. The exact registry
+            # remains authoritative even if executor.shutdown() lost sight of
+            # a started worker; never close an owned writer before it drains.
+            self._wait_for_persist_work(deadline=None)
             self.close()
 
-    def start(self, shutdown_event: threading.Event | None = None) -> None:
-        if self.is_alive:
-            return
-        self._shutdown_event = shutdown_event
-        self._stop_event.clear()
-        # A replacement thread must prove its own stream freshness.  Retaining
-        # the previous generation's samples lets the recorder report healthy
-        # for one stale window before the new transport has connected.
-        with self._health_lock:
-            prior_error_type = self._health_error_type
-            prior_reconnect_attempts = self._health_reconnect_attempts
-        self._begin_health_check(
-            error_type=prior_error_type,
-            reconnect_attempts=prior_reconnect_attempts,
-        )
-        candidate = threading.Thread(
-            target=self._thread_main,
-            name=f"L2Shadow-{self.exchange_id}",
-            daemon=True,
-        )
-        candidate.start()
-        self._thread = candidate
+    def start(self, shutdown_event: threading.Event | None = None) -> bool:
+        with self._lifecycle_lock:
+            close_lock = getattr(self, "_owned_writer_close_lock", None)
+            if close_lock is None:
+                close_lock = threading.Lock()
+                self._owned_writer_close_lock = close_lock
+            with close_lock:
+                if (
+                    getattr(self, "_owns_writer", False)
+                    and getattr(self, "_owned_writer_terminal", False)
+                ):
+                    return False
+                persist_lock, persist_states = self._persist_registry()
+                with persist_lock:
+                    persist_pending = bool(persist_states)
+                state = self._worker_state
+                if (
+                    persist_pending
+                    or (state is not None and not state["done"].is_set())
+                ):
+                    return self.is_alive
+                if self.is_alive:
+                    return True
+                self._shutdown_event = shutdown_event
+                self._stop_event.clear()
+                # A replacement thread must prove its own stream freshness.
+                # Retaining the previous generation's samples lets the recorder
+                # report healthy for one stale window before the new transport
+                # has connected.
+                with self._health_lock:
+                    prior_error_type = self._health_error_type
+                    prior_reconnect_attempts = self._health_reconnect_attempts
+                self._begin_health_check(
+                    error_type=prior_error_type,
+                    reconnect_attempts=prior_reconnect_attempts,
+                )
+                generation = self._run_generation + 1
+                state = {
+                    "generation": generation,
+                    "done": threading.Event(),
+                    "thread": None,
+                }
+
+                def run_owned() -> None:
+                    try:
+                        self._thread_main()
+                    finally:
+                        state["done"].set()
+
+                candidate = threading.Thread(
+                    target=run_owned,
+                    name=f"L2Shadow-{self.exchange_id}",
+                    daemon=True,
+                )
+                state["thread"] = candidate
+                self._worker_state = state
+                self._thread = candidate
+                self._run_generation = generation
+                try:
+                    candidate.start()
+                except BaseException as exc:
+                    if (
+                        isinstance(exc, Exception)
+                        and thread_definitely_never_started(candidate)
+                    ):
+                        # A real stdlib thread that never published launch
+                        # ownership is safe to retire and retry later.
+                        state["done"].set()
+                    # Once start() was invoked, launch acceptance is uncertain.
+                    # Keep the exact candidate authoritative until its target
+                    # sets done; a second capture owner must never be admitted.
+                    raise
+                return True
 
     def stop(self, *, timeout: float = 5.0) -> bool:
-        self._stop_event.set()
-        thread = self._thread
-        if thread and thread is not threading.current_thread():
-            thread.join(max(0.0, timeout))
-        if self.is_alive:
-            self._log("shutdown timeout; daemon thread remains isolated", "WARN")
+        if isinstance(timeout, bool):
             return False
-        else:
-            self.close()
-            return True
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(timeout):
+            return False
+        timeout = min(max(0.0, timeout), threading.TIMEOUT_MAX)
+        deadline = time.monotonic() + timeout
+        lock_timeout = min(
+            max(0.0, deadline - time.monotonic()),
+            threading.TIMEOUT_MAX,
+        )
+        if not self._lifecycle_lock.acquire(timeout=lock_timeout):
+            return False
+        try:
+            self._stop_event.set()
+            state = self._worker_state
+            thread = state.get("thread") if state is not None else self._thread
+            if thread and thread is not threading.current_thread():
+                try:
+                    thread.join(max(0.0, deadline - time.monotonic()))
+                except Exception:
+                    return False
+            if thread is threading.current_thread():
+                return False
+            if state is not None and not state["done"].is_set():
+                self._log(
+                    "shutdown timeout; daemon thread remains isolated",
+                    "WARN",
+                )
+                return False
+            try:
+                if thread is not None and thread.is_alive():
+                    return False
+            except Exception:
+                return False
+            with self._async_clients_lock:
+                if self._async_clients:
+                    return False
+            if not self._wait_for_persist_work(deadline=deadline):
+                return False
+            return self.close()
+        finally:
+            self._lifecycle_lock.release()
 
-    def close(self) -> None:
+    def close(self) -> bool:
         if self._owns_writer:
-            close = getattr(self.writer, "close", None)
-            if callable(close):
-                close()
+            close_lock = getattr(self, "_owned_writer_close_lock", None)
+            if close_lock is None:
+                close_lock = threading.Lock()
+                self._owned_writer_close_lock = close_lock
+            with close_lock:
+                if getattr(self, "_owned_writer_closed", False):
+                    return True
+                self._owned_writer_terminal = True
+                close = getattr(self.writer, "close", None)
+                if callable(close):
+                    result = close()
+                    if result is not None and result is not True:
+                        return False
+                self._owned_writer_closed = True
+        return True

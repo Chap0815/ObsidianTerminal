@@ -128,6 +128,18 @@ class FuturesScanMixin:
                 pass
         return not enabled
 
+    def _entry_pre_submit_allowed(self) -> bool:
+        """Revalidate operator and runtime safety gates at venue submit."""
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        if shutdown_event is None or shutdown_event.is_set() is not False:
+            return False
+        if self._entry_admission_disabled_by_config():
+            return False
+        safe_mode = getattr(self, "safe_mode", None)
+        if safe_mode is None:
+            return False
+        return safe_mode.is_active() is False
+
     @staticmethod
     def _finite_float(value, default: float = 0.0) -> float:
         if isinstance(value, bool):
@@ -265,6 +277,8 @@ class FuturesScanMixin:
         self,
         sym: str,
         reason: str,
+        *,
+        entry_id: str = "",
     ) -> bool:
         restore = {
             "provisional": True,
@@ -272,15 +286,38 @@ class FuturesScanMixin:
             "entry_abort_reason": reason,
             "claim_release_pending": True,
         }
+        expected_row = (
+            {"entry_id": entry_id.strip()}
+            if isinstance(entry_id, str) and entry_id.strip()
+            else None
+        )
         try:
-            removed = self.state.remove(sym, restore)
+            from bot_utils.trade_state import remove_with_restore_fields
+
+            removed = remove_with_restore_fields(
+                self.state,
+                sym,
+                restore,
+                expected_row=expected_row,
+            )
         except Exception as exc:
             self._log_error(f"cleanup rolled-back futures entry {sym}", exc)
             removed = False
         if removed:
             return True
         try:
-            return bool(self.state.release_claim_if_absent(sym))
+            if expected_row is None:
+                result = self.state.release_claim_if_absent(sym)
+                return result is None or result is True
+            from bot_utils.trade_state import (
+                release_claim_if_absent_for_generation,
+            )
+
+            return release_claim_if_absent_for_generation(
+                self.state,
+                sym,
+                expected_row,
+            )
         except Exception as exc:
             self._log_error(f"retry rolled-back futures entry cleanup {sym}", exc)
             return False
@@ -294,7 +331,11 @@ class FuturesScanMixin:
         reason: str,
     ) -> bool:
         """Close rollback recovery only after durable state/claim cleanup."""
-        cleaned = self._cleanup_rolled_back_futures_entry_state(sym, reason)
+        cleaned = self._cleanup_rolled_back_futures_entry_state(
+            sym,
+            reason,
+            entry_id=entry_id,
+        )
         if cleaned is not True:
             return False
         try:
@@ -317,11 +358,22 @@ class FuturesScanMixin:
         self,
         sym: str,
         reason: str,
+        *,
+        entry_id: str = "",
     ) -> bool:
         from core.logger import log_event
+        from bot_utils.trade_state import release_claim_if_absent_for_generation
 
         try:
-            released = bool(self.state.release_claim_if_absent(sym))
+            if isinstance(entry_id, str) and entry_id.strip():
+                released = release_claim_if_absent_for_generation(
+                    self.state,
+                    sym,
+                    {"entry_id": entry_id.strip()},
+                )
+            else:
+                result = self.state.release_claim_if_absent(sym)
+                released = result is None or result is True
         except Exception as exc:
             self._log_error(f"release untracked futures entry claim {sym}", exc)
             released = False
@@ -417,6 +469,17 @@ class FuturesScanMixin:
         # Operator admission gate: stop only the entry scan. Monitor,
         # reconcile, recovery, capture and all exit paths keep running.
         if self._entry_admission_disabled_by_config():
+            return
+
+        # Do not spend shared exchange/API capacity on a new-entry-only scan
+        # while durable order recovery is unresolved.  Reconcile and monitor
+        # threads remain active and retain priority for resolving the intent.
+        if not self._entry_recovery_allows_live_open():
+            log_event(
+                f"[{self.BOT_NAME}] entry scan deferred - order recovery "
+                "unresolved",
+                "WAIT",
+            )
             return
 
         # SAFE_MODE: stop opening new entries
@@ -1401,7 +1464,9 @@ class FuturesScanMixin:
                         stage="aborted", mode=entry_mode,
                         reason="set_leverage_failed")
                     released = self._release_untracked_futures_entry_claim(
-                        sym, "set leverage failure"
+                        sym,
+                        "set leverage failure",
+                        entry_id=entry_id,
                     )
                     if released:
                         try:
@@ -1432,9 +1497,7 @@ class FuturesScanMixin:
                     reference_price=entry_price,
                     market_order=_submit_market_entry,
                     maker_order_params=maker_order_params,
-                    pre_submit_guard=lambda: not (
-                        self._entry_admission_disabled_by_config()
-                    ),
+                    pre_submit_guard=self._entry_pre_submit_allowed,
                     config=maker_config,
                 )
                 # Prefer the ACTUAL filled amount. Bitget often returns
@@ -1614,7 +1677,9 @@ class FuturesScanMixin:
                             f"position was found  aborting state write",
                             "WARN")
                         self._release_untracked_futures_entry_claim(
-                            sym, "terminal zero-fill futures entry"
+                            sym,
+                            "terminal zero-fill futures entry",
+                            entry_id=entry_id,
                         )
                         return
                     if amount > 0 and positions_verified:
@@ -1734,12 +1799,28 @@ class FuturesScanMixin:
                         "oversize_real_notional": real_notional,
                     })
                 try:
-                    provisional_ok = self.state.add(sym, provisional_data)
+                    from bot_utils.trade_state import (
+                        promote_position_generation,
+                    )
+
+                    provisional_ok = promote_position_generation(
+                        self.state,
+                        sym,
+                        provisional_data,
+                        {"entry_id": entry_id},
+                    )
                 except Exception as state_error:
                     provisional_ok = False
                     self._log_error(
                         f"durable futures entry state {sym}", state_error
                     )
+                if provisional_ok is None:
+                    log_event(
+                        f"{sym}: provisional futures state was superseded by "
+                        "another entry generation; no rollback was sent",
+                        "ERROR",
+                    )
+                    return
                 if provisional_ok is False:
                     log_event(
                         f"{sym}: provisional state-write returned False; "
@@ -2007,7 +2088,9 @@ class FuturesScanMixin:
                     pass
                 if _not_submitted:
                     cleaned = self._cleanup_rolled_back_futures_entry_state(
-                        sym, "futures entry was not submitted"
+                        sym,
+                        "futures entry was not submitted",
+                        entry_id=entry_id,
                     )
                     if cleaned is not True:
                         self._mark_futures_entry_recovery_pending()
@@ -2019,6 +2102,27 @@ class FuturesScanMixin:
                     return
                 _landed = False
                 _recovery_resolved = False
+                _recovery_cid = _cid
+                if _outcome_unknown:
+                    exception_cid = str(
+                        getattr(e, "client_order_id", "") or ""
+                    ).strip()
+                    if exception_cid and exception_cid != "[invalid]":
+                        _recovery_cid = exception_cid
+                if _outcome_unknown and _recovery_cid != _cid:
+                    # Maker-first execution uses a distinct ID and residual
+                    # amount for its market fallback.  This caller has neither
+                    # the maker fill nor the persisted fallback residual, so it
+                    # must not promote a fallback-only fill or let maker-zero
+                    # evidence release the claim.  Durable intent recovery has
+                    # both generations and performs the exact aggregation.
+                    self._mark_futures_entry_recovery_pending()
+                    log_event(
+                        f"{sym}: fallback entry outcome unknown; claim kept "
+                        "pending durable intent reconciliation",
+                        "ERROR",
+                    )
+                    return
                 # ORPHAN PREVENTION: create_order can RAISE after the order
                 # actually LANDED (lost response on the final retry). Check by
                 # clientOrderId  if it filled, TRACK it (provisional) instead of
@@ -2036,11 +2140,11 @@ class FuturesScanMixin:
                     landed = _find_order_by_client_id(
                         self.ex,
                         symbol_full,
-                        _cid,
+                        _recovery_cid,
                         expected_amount=amount_contracts,
                         expected_side=side,
                         expected_position_side=_requested_position_side(
-                            _entry_order_params(_cid)
+                            _entry_order_params(_recovery_cid)
                         ),
                         exchange_id=_exchange_id(self.ex),
                         expected_reduce_only=False,
@@ -2076,7 +2180,7 @@ class FuturesScanMixin:
                         and _landed_amt > 0
                     ):
                         _amt = _landed_amt or float(amount_contracts)
-                        added = self.state.add(sym, {
+                        landed_state = {
                             "position_type": direction, "buy": entry_price,
                             "highest": entry_price, "buy_time": _utc_now_str(),
                             "invested_usdt": margin_usdt, "leverage": leverage,
@@ -2093,7 +2197,25 @@ class FuturesScanMixin:
                             "fees_paid": 0.0, "partial_sold": False,
                             "break_even": False, "be_active": False,
                             "provisional": True,
-                        })
+                        }
+                        from bot_utils.trade_state import (
+                            promote_position_generation,
+                        )
+
+                        added = promote_position_generation(
+                            self.state,
+                            sym,
+                            landed_state,
+                            {"entry_id": entry_id},
+                        )
+                        if added is None:
+                            log_event(
+                                f" {sym}: landed-order recovery was "
+                                "superseded by another entry generation; "
+                                "no rollback was sent",
+                                "ERROR",
+                            )
+                            return
                         if added is False:
                             try:
                                 from config.exchange_config import reduce_only_params
@@ -2190,7 +2312,9 @@ class FuturesScanMixin:
                     )
                 elif not _landed:
                     cleaned = self._cleanup_rolled_back_futures_entry_state(
-                        sym, "futures entry failed before durable state"
+                        sym,
+                        "futures entry failed before durable state",
+                        entry_id=entry_id,
                     )
                     if cleaned is not True:
                         self._mark_futures_entry_recovery_pending()
@@ -2281,11 +2405,21 @@ class FuturesScanMixin:
         # Merge instead of replace: update_many keeps monitor-set fields that
         # the Monitor-Thread may have written between the provisional add and
         # this point (a plain state.add would wipe them).
-        if self.state.has(sym):
-            state_ok = self.state.update_many(sym, trade_data)
-        else:
-            # First-write path (SIM mode never wrote provisional)
-            state_ok = self.state.add(sym, trade_data)
+        from bot_utils.trade_state import promote_position_generation
+
+        state_ok = promote_position_generation(
+            self.state,
+            sym,
+            trade_data,
+            {"entry_id": entry_id},
+        )
+        if state_ok is None:
+            log_event(
+                f"{sym}: final futures state promotion was superseded by "
+                "another entry generation; no rollback was sent",
+                "ERROR",
+            )
+            return
         if state_ok is False and not self.simulation:
             emit_entry_lifecycle(
                 entry_id, bot=self.BOT_NAME, symbol=sym,

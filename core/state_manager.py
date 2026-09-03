@@ -17,12 +17,15 @@ import threading
 import time
 from typing import Dict, Optional
 
+from bot_utils.atomic_publish import atomic_write_bytes
+from bot_utils.runtime_threads import thread_definitely_never_started
 from core.models import Position
 
 
 # Robust coin-key regex: only A-Z0-9, 2-15 chars
 _COIN_RE = re.compile(r"^[A-Z0-9]{2,15}$")
 _STATE_JSON_MAX_BYTES = 4 * 1024 * 1024
+_STATE_WRITER_TERMINAL = False
 
 # Assets that are NEVER bot positions  the quote currency (USDT cash),
 # stablecoins, and exchange tokens (MEXC's MX) held in the account. Without
@@ -93,13 +96,45 @@ class _SingleWriterJSON:
         canonical_path = _canonical_json_path(path)
         path_key = os.path.normcase(canonical_path)
         with cls._instances_lock:
+            if _STATE_WRITER_TERMINAL:
+                raise RuntimeError(
+                    "state JSON writer admission is terminally closed"
+                )
             inst = cls._instances.get(path_key)
-            if inst is None or not inst._thread.is_alive():
-                inst = cls(canonical_path)
+            if inst is not None:
+                with inst._cv:
+                    if not inst._thread_generation_unresolved_locked():
+                        if inst._shutdown_requested:
+                            raise RuntimeError(
+                                "state JSON writer handoff blocked by terminal "
+                                "shutdown"
+                            )
+                        if not inst._start_worker_locked():
+                            raise RuntimeError(
+                                "state JSON writer recovery start failed"
+                            )
+            if inst is None:
+                inst = cls.__new__(cls)
+                inst._initialize(canonical_path)
                 cls._instances[path_key] = inst
+                with inst._cv:
+                    if not inst._start_worker_locked():
+                        error = inst._last_thread_start_error
+                        if error is not None:
+                            raise error
+                        raise RuntimeError("state JSON writer initial start failed")
             return inst
 
     def __init__(self, path: str):
+        self._initialize(path)
+        with self._cv:
+            if not self._start_worker_locked():
+                error = self._last_thread_start_error
+                if error is not None:
+                    raise error
+                raise RuntimeError("state JSON writer initial start failed")
+
+    def _initialize(self, path: str) -> None:
         self.path = path
         self._latest: Optional[tuple[int, dict]] = None
         self._cv = threading.Condition()
@@ -108,12 +143,77 @@ class _SingleWriterJSON:
         self._floor_rev = 0
         self._stop = False
         self._accepting = True
+        self._shutdown_requested = False
         self._inflight = False
-        self._thread = threading.Thread(
-            target=self._run, daemon=True,
-            name=f"state-json-{os.path.basename(path)}",
-        )
-        self._thread.start()
+        self._sync_inflight = 0
+        self._thread = None
+        self._thread_generation: dict | None = None
+        self._last_thread_start_error: BaseException | None = None
+        self._shutdown_lifecycle_lock = threading.Lock()
+
+    def _thread_generation_unresolved_locked(self) -> bool:
+        generation = self._thread_generation
+        if generation is None:
+            return False
+        if not generation["done"].is_set():
+            return True
+        thread = generation.get("thread")
+        if thread is None:
+            return False
+        try:
+            return bool(thread.is_alive())
+        except BaseException:
+            return True
+
+    def _start_worker_locked(self, *, allow_terminal: bool = False) -> bool:
+        """Restart this path-global worker after abnormal thread death."""
+        if (
+            not allow_terminal
+            and (self._shutdown_requested or not self._accepting)
+        ):
+            return False
+        if self._thread_generation_unresolved_locked():
+            return True
+        self._stop = False
+        generation = {"thread": None, "done": threading.Event()}
+
+        def run_worker_generation() -> None:
+            try:
+                self._run()
+            finally:
+                generation["done"].set()
+
+        self._last_thread_start_error = None
+        try:
+            candidate = threading.Thread(
+                target=run_worker_generation,
+                daemon=True,
+                name=f"state-json-{os.path.basename(self.path)}",
+            )
+        except BaseException as exc:
+            self._last_thread_start_error = exc
+            if not isinstance(exc, Exception):
+                raise
+            return False
+        generation["thread"] = candidate
+        self._thread = candidate
+        self._thread_generation = generation
+        try:
+            candidate.start()
+        except BaseException as exc:
+            self._last_thread_start_error = exc
+            if (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(candidate)
+            ):
+                generation["done"].set()
+                if self._thread_generation is generation:
+                    self._thread_generation = None
+                    self._thread = None
+            if not isinstance(exc, Exception):
+                raise
+            return False
+        return True
 
     def _next_revision_locked(self) -> int:
         highest = max(self._seq, self._floor_rev)
@@ -125,6 +225,11 @@ class _SingleWriterJSON:
     def submit(self, payload: dict, rev: int | None = None) -> bool:
         with self._cv:
             if not self._accepting:
+                return False
+            if (
+                not self._thread_generation_unresolved_locked()
+                and not self._start_worker_locked()
+            ):
                 return False
             if rev is None:
                 rev = self._next_revision_locked()
@@ -148,9 +253,13 @@ class _SingleWriterJSON:
             # Drop queued older snapshots so they cannot overwrite this
             # critical synchronous write after a close/remove.
             self._latest = None
+            self._sync_inflight += 1
         try:
             with self._write_lock:
-                self._write_atomic(payload)
+                with self._cv:
+                    superseded = rev < self._floor_rev
+                if not superseded:
+                    self._write_atomic(payload)
             return True
         except Exception as e:
             try:
@@ -160,6 +269,10 @@ class _SingleWriterJSON:
             except Exception:
                 pass
             return False
+        finally:
+            with self._cv:
+                self._sync_inflight -= 1
+                self._cv.notify_all()
 
     def _run(self) -> None:
         while True:
@@ -221,99 +334,173 @@ class _SingleWriterJSON:
                                 break
                             self._cv.wait(timeout=retry_delay)
                         retry_delay = min(2.0, retry_delay * 2.0)
+            except BaseException:
+                # The dequeued generation has no other owner.  Preserve it for
+                # same-instance worker recovery unless a newer complete
+                # snapshot already superseded it.
+                with self._cv:
+                    pending = self._latest
+                    if pending is None or pending[0] < rev:
+                        self._latest = (rev, payload)
+                raise
             finally:
                 with self._cv:
                     self._inflight = False
                     self._cv.notify_all()
 
-    def shutdown(self, timeout: float = 5.0) -> bool:
+    def _shutdown_owned(self, timeout: float = 5.0) -> bool:
         """Flush the newest accepted generation, stop, join and unregister."""
-        try:
-            timeout = max(0.0, float(timeout))
-        except (TypeError, ValueError, OverflowError):
-            timeout = 0.0
         deadline = time.monotonic() + timeout
-        with self._cv:
+        if not self._cv.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
             self._accepting = False
+            self._shutdown_requested = True
             self._cv.notify_all()
+            if (
+                self._latest is not None
+                and not self._thread_generation_unresolved_locked()
+            ):
+                if deadline - time.monotonic() <= 0.0:
+                    return False
+                if not self._start_worker_locked(allow_terminal=True):
+                    return False
             while (
-                (self._latest is not None or self._inflight)
-                and self._thread.is_alive()
+                (
+                    self._latest is not None
+                    or self._inflight
+                    or self._sync_inflight > 0
+                )
+                and self._thread_generation_unresolved_locked()
             ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
                     return False
                 self._cv.wait(timeout=remaining)
-            if self._latest is not None or self._inflight:
+            if (
+                self._latest is not None
+                or self._inflight
+                or self._sync_inflight > 0
+            ):
                 return False
             self._stop = True
             self._cv.notify_all()
-        if self._thread is not threading.current_thread():
-            self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        if self._thread.is_alive():
+        finally:
+            self._cv.release()
+        thread = self._thread
+        try:
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:
             return False
+        if not self._cv.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
+            if self._thread_generation_unresolved_locked():
+                return False
+        finally:
+            self._cv.release()
         path_key = os.path.normcase(self.path)
-        with self._instances_lock:
+        if not self._instances_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
             if self._instances.get(path_key) is self:
                 self._instances.pop(path_key, None)
+        finally:
+            self._instances_lock.release()
         return True
 
-    def _write_atomic(self, payload: dict) -> None:
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        tmp = (
-            f"{self.path}.tmp.{os.getpid()}."
-            f"{threading.get_ident()}.{time.monotonic_ns()}"
-        )
+    def shutdown(self, timeout: float = 5.0) -> bool:
+        """Validate and serialize one terminal writer shutdown lifecycle."""
+        if isinstance(timeout, bool):
+            return False
         try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(
-                    payload,
-                    fh,
-                    indent=2,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                )
-                fh.flush()
-                try:
-                    os.fsync(fh.fileno())
-                except (AttributeError, OSError):
-                    pass
-            for _ in range(8):
-                try:
-                    os.replace(tmp, self.path)
-                    return
-                except PermissionError:
-                    time.sleep(0.05)
-            # All retries exhausted: surface the error to the single writer,
-            # which keeps the latest complete snapshot queued for bounded,
-            # rate-limited retry until contention clears or a newer revision
-            # supersedes it.
-            raise OSError(
-                f"os.replace failed after 8 retries for {self.path}")
+            requested_timeout = float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(requested_timeout):
+            return False
+        budget = min(max(0.0, requested_timeout), threading.TIMEOUT_MAX)
+        deadline = time.monotonic() + budget
+        if not self._shutdown_lifecycle_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
+            return self._shutdown_owned(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
         finally:
-            # cleanup leftover tmp on any exit path
+            self._shutdown_lifecycle_lock.release()
+
+    def _write_atomic(self, payload: dict) -> None:
+        encoded = json.dumps(
+            payload,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        last_error: PermissionError | None = None
+        for attempt in range(8):
             try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
+                # Every retry owns a fresh exclusive UUID generation. The
+                # shared publisher validates identity before cleanup and also
+                # makes both file contents and the parent entry durable.
+                atomic_write_bytes(self.path, encoded)
+                return
+            except PermissionError as exc:
+                last_error = exc
+                if attempt < 7:
+                    time.sleep(0.05)
+        raise OSError(
+            f"atomic state publish failed after 8 retries for {self.path}"
+        ) from last_error
 
 
 def shutdown_state_json_writers(timeout: float = 2.0) -> bool:
     """Flush and close every process-global state JSON writer."""
+    global _STATE_WRITER_TERMINAL
+    if isinstance(timeout, bool):
+        return False
     try:
-        timeout = max(0.0, float(timeout))
+        requested_timeout = float(timeout)
     except (TypeError, ValueError, OverflowError):
-        timeout = 0.0
+        return False
+    if not math.isfinite(requested_timeout):
+        return False
+    timeout = min(max(0.0, requested_timeout), threading.TIMEOUT_MAX)
     deadline = time.monotonic() + timeout
-    with _SingleWriterJSON._instances_lock:
+    if not _SingleWriterJSON._instances_lock.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    ):
+        return False
+    try:
+        _STATE_WRITER_TERMINAL = True
         writers = tuple(dict.fromkeys(_SingleWriterJSON._instances.values()))
+    finally:
+        _SingleWriterJSON._instances_lock.release()
     all_closed = True
     for writer in writers:
         remaining = max(0.0, deadline - time.monotonic())
         if not writer.shutdown(timeout=remaining):
             all_closed = False
     return all_closed
+
+
+def begin_state_json_writer_runtime() -> bool:
+    """Explicitly reopen writer admission before a new process runtime."""
+    global _STATE_WRITER_TERMINAL
+    with _SingleWriterJSON._instances_lock:
+        if _SingleWriterJSON._instances:
+            return False
+        _STATE_WRITER_TERMINAL = False
+        return True
 
 
 # 
@@ -619,7 +806,9 @@ class StateManager:
             conn = self._get_conn()
             try:
                 rows = conn.execute(
-                    "SELECT * FROM bot_open_positions WHERE bot_name=?",
+                    """SELECT * FROM bot_open_positions WHERE bot_name=?
+                       AND UPPER(TRIM(COALESCE(state, '')))
+                           NOT IN ('CLOSED', 'FLAT')""",
                     (self.bot_name,)
                 ).fetchall()
             except sqlite3.OperationalError as oe:
@@ -631,7 +820,9 @@ class StateManager:
                     self._ensure_schema()
                     conn = self._get_conn()
                     rows = conn.execute(
-                        "SELECT * FROM bot_open_positions WHERE bot_name=?",
+                        """SELECT * FROM bot_open_positions WHERE bot_name=?
+                           AND UPPER(TRIM(COALESCE(state, '')))
+                               NOT IN ('CLOSED', 'FLAT')""",
                         (self.bot_name,)
                     ).fetchall()
                 else:
@@ -698,8 +889,11 @@ class StateManager:
             return False
         is_futures = self._is_futures_type(pos.position_type.value)
         rows = conn.execute(
-            "SELECT bot_name, symbol, position_type FROM bot_open_positions "
-            "WHERE bot_name != ?",
+            """SELECT bot_name, symbol, position_type
+                 FROM bot_open_positions
+                WHERE bot_name != ?
+                  AND UPPER(TRIM(COALESCE(state, '')))
+                      NOT IN ('CLOSED', 'FLAT')""",
             (pos.bot_name,),
         ).fetchall()
         for row in rows:

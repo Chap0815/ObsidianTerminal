@@ -18,8 +18,10 @@ import threading  # tmp filename uses get_ident()
 import time  # retry sleep between os.replace attempts
 from contextlib import contextmanager
 from functools import lru_cache
+from pathlib import Path
 from tkinter import font as tkfont
 
+from bot_utils.atomic_publish import atomic_write_bytes
 from core.constants import CONFIG_AUDIT_BACKUPS, CONFIG_AUDIT_MAX_BYTES
 
 #  Path anchors 
@@ -1241,6 +1243,94 @@ def validate_config_for_save(cfg: dict) -> None:
     except Exception as exc:
         raise ValueError(f"config validation failed: {exc}") from exc
 
+
+def _sync_config_directory(path: Path) -> None:
+    """Durably publish the replaced config directory entry."""
+    directory = path.resolve(strict=True)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        flush_file_buffers = kernel32.FlushFileBuffers
+        flush_file_buffers.argtypes = [wintypes.HANDLE]
+        flush_file_buffers.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = create_file(
+            str(directory),
+            0x40000000,  # GENERIC_WRITE
+            0x00000007,  # FILE_SHARE_READ | WRITE | DELETE
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS
+            None,
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if not handle or int(handle) == invalid_handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        primary_error: BaseException | None = None
+        try:
+            if not flush_file_buffers(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            close_error: BaseException | None = None
+            try:
+                if not close_handle(handle):
+                    close_error = ctypes.WinError(ctypes.get_last_error())
+            except BaseException as exc:
+                close_error = exc
+            if close_error is not None:
+                if primary_error is None:
+                    raise close_error
+                try:
+                    primary_error.add_note(
+                        "close config directory after sync failure: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(str(directory), flags)
+    primary_error = None
+    try:
+        os.fsync(directory_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            os.close(directory_fd)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "close config directory after sync failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
 def _save_config_unlocked(
     cfg: dict,
     *,
@@ -1249,32 +1339,29 @@ def _save_config_unlocked(
 ) -> None:
     previous_cfg = _read_config_for_audit()
     try:
-        tmp = f"{CONFIG_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, allow_nan=False)
-            f.flush()
-            # Modes and entry gates must not be published from a temp file
-            # whose contents the OS could not durably flush. On failure the
-            # outer cleanup removes the temp and preserves the last-good
-            # config instead of reporting a non-durable save as successful.
-            os.fsync(f.fileno())
-        # Windows retries: target may be open by the launcher poller.
-        last_err = None
-        for _ in range(8):
+        encoded = json.dumps(
+            cfg,
+            indent=2,
+            allow_nan=False,
+        ).encode("utf-8")
+        last_err: PermissionError | None = None
+        for attempt in range(8):
             try:
-                os.replace(tmp, CONFIG_FILE)
+                # A retry always receives a fresh exclusive UUID generation;
+                # it can never publish or delete a path reoccupied after the
+                # preceding attempt.
+                atomic_write_bytes(CONFIG_FILE, encoded)
                 last_err = None
                 break
             except PermissionError as pe:
                 last_err = pe
-                time.sleep(0.05)
+                if attempt < 7:
+                    time.sleep(0.05)
         if last_err is not None:
-            # Clean up the leftover tmp before propagating
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
             raise last_err
+        # Retain the config-specific barrier as an explicit contract and as a
+        # retry-healing point if a prior post-replace barrier was interrupted.
+        _sync_config_directory(Path(CONFIG_FILE).parent)
         _write_config_audit(
             cfg,
             previous_cfg=previous_cfg,
@@ -1287,12 +1374,6 @@ def _save_config_unlocked(
             silent_log("save_config", e)
         except Exception:
             sys.stderr.write(f"[save_config] {type(e).__name__}: {e}\n")
-        # Final cleanup attempt for the per-writer tmp
-        try:
-            if 'tmp' in locals() and os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
         raise
 
 

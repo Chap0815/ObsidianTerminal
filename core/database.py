@@ -10,6 +10,7 @@ import sys
 import threading
 import time as _time
 from datetime import datetime, timedelta, timezone
+from time import monotonic as _steady_monotonic
 from typing import Optional
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -31,6 +32,7 @@ from trading.experiment_registry_contract import (
     encode_experiment_params,
     normalize_experiment_metadata,
 )
+from bot_utils.runtime_threads import thread_definitely_never_started
 
 
 MARKET_REGIME_RETENTION_DAYS = 45
@@ -134,12 +136,17 @@ def opened_today_local(buy_time_utc_str) -> bool:
     (BOT_TIMEZONE). A naive ``startswith(local_today)`` on a UTC string mismatches
     by the tz offset at the day boundary (e.g. UTC+8: a local-morning open carries
     yesterday's UTC date and is wrongly excluded). Convert UTClocal, then compare.
+
+    An unparseable persisted timestamp is conservatively assigned to today's
+    risk bucket. This helper is used by the daily-loss kill-switches: treating
+    unknown provenance as an old position would exclude current unrealized loss
+    and could leave the entry gate open past its configured soft limit.
     """
     try:
         dt = datetime.strptime(str(buy_time_utc_str), "%Y-%m-%d %H:%M:%S").replace(
             tzinfo=timezone.utc)
     except (ValueError, TypeError):
-        return False
+        return True
     tz_name = os.getenv("BOT_TIMEZONE", "UTC")
     if tz_name and tz_name != "UTC":
         try:
@@ -177,6 +184,11 @@ def _local_hour_dow(utc_str: str):
 _METRICS_SIM_OVERRIDE = None
 _SIM_TAG = " (SIM)"
 _CANONICAL_BOTS = ("TREND", "SPOT", "FUTURES", "CROSS", "FUTREND")
+_SPOT_PORTFOLIO_BOTS = frozenset(("SPOT", "TREND"))
+_FUTURES_PORTFOLIO_BOTS = frozenset(("FUTURES", "CROSS", "FUTREND"))
+_PORTFOLIO_RESERVATION_STATUSES = frozenset(
+    ("ACTIVE", "CONSUMED", "RELEASED", "EXPIRED")
+)
 # SIM/LIVE namespacing existed before the current production DB reset. Plain
 # bot names after this point are LIVE rows; SIM rows are stored as "<BOT> (SIM)".
 _METRICS_MODE_CUTOVER = "2026-06-18 00:00:00"
@@ -419,6 +431,18 @@ def _canonical_bot_name_db(value) -> str:
     return normalized
 
 
+def _portfolio_account_type_for_bot(value) -> str | None:
+    """Return the authoritative shared wallet for a canonical bot owner."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    if normalized in _SPOT_PORTFOLIO_BOTS:
+        return "spot"
+    if normalized in _FUTURES_PORTFOLIO_BOTS:
+        return "futures"
+    return None
+
+
 def _canonical_or_sim_bot_name_db(value) -> str:
     normalized = _required_text_db(
         value, "bot_name", max_length=38
@@ -522,7 +546,7 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
-def close_thread_local_conn() -> bool:
+def close_thread_local_conn(*, deadline: float | None = None) -> bool:
     """Close the per-thread SQLite connection for the CURRENT thread. Call from
     worker threads' ``finally`` block at shutdown (or a ``Thread`` join-wrapper)
     so the file descriptor and WAL header tracker are released  thread-pool
@@ -537,9 +561,14 @@ def close_thread_local_conn() -> bool:
         conn = getattr(local, "conn", None)
         if conn is None:
             continue
+        if deadline is not None and _time.monotonic() >= deadline:
+            all_closed = False
+            continue
         last_error = None
         closed = False
         for _attempt in range(2):
+            if deadline is not None and _time.monotonic() >= deadline:
+                break
             try:
                 conn.close()
                 closed = True
@@ -574,24 +603,44 @@ def _enable_full_sync_for_venue_boundary(conn) -> int:
     if row is None:
         raise RuntimeError("SQLite synchronous mode is unavailable")
     previous = int(row[0])
-    conn.execute("PRAGMA synchronous=FULL")
-    confirmed = conn.execute("PRAGMA synchronous").fetchone()
-    if confirmed is None or int(confirmed[0]) < 2:
-        raise RuntimeError("SQLite FULL durability could not be confirmed")
+    try:
+        conn.execute("PRAGMA synchronous=FULL")
+        confirmed = conn.execute("PRAGMA synchronous").fetchone()
+        if confirmed is None or int(confirmed[0]) < 2:
+            raise RuntimeError("SQLite FULL durability could not be confirmed")
+    except BaseException as exc:
+        _restore_sync_after_venue_boundary(conn, previous, exc)
+        raise
     return previous
 
 
-def _restore_sync_after_venue_boundary(conn, previous: int) -> None:
+def _restore_sync_after_venue_boundary(
+    conn,
+    previous: int,
+    primary: BaseException | None = None,
+) -> None:
     """Restore the default without masking an already durable commit."""
     try:
         conn.execute(f"PRAGMA synchronous={int(previous)}")
-    except Exception as exc:
+    except BaseException as exc:
         # Remaining at FULL is safe and affects only this connection. Make a
         # failed performance-mode restore observable without downgrading the
         # already committed venue boundary.
-        _log_db_background_failure(
-            "restore SQLite synchronous mode after venue boundary", exc
+        if primary is not None:
+            try:
+                primary.add_note(
+                    "restore SQLite synchronous mode after venue boundary: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            except BaseException:
+                pass
+        _log_db_background_failure_preserving(
+            "restore SQLite synchronous mode after venue boundary",
+            exc,
+            primary=primary or exc,
         )
+        if primary is None and not isinstance(exc, Exception):
+            raise
 
 
 def _tight_connection() -> sqlite3.Connection:
@@ -669,6 +718,10 @@ _ADVISORY_LOCK_MAX_TTL_SEC = 24 * 3600
 _VACUUM_LOCK_TTL_SEC = 7 * 24 * 3600
 
 
+class AdvisoryLockIntegrityError(ValueError):
+    """Persisted lock metadata cannot establish a safe lease boundary."""
+
+
 def _validated_advisory_lock_db(
     lock_name, holder_id, ttl_sec=None, *, validate_ttl: bool = False
 ) -> tuple[str, str, int | float | None]:
@@ -694,6 +747,48 @@ def _validated_advisory_lock_db(
     return validated_lock, validated_holder, ttl_sec
 
 
+def _validated_advisory_expiry_db(value) -> str:
+    if not isinstance(value, str):
+        raise AdvisoryLockIntegrityError("advisory lock expiry is invalid")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AdvisoryLockIntegrityError(
+            "advisory lock expiry is invalid"
+        ) from exc
+    if parsed.strftime("%Y-%m-%d %H:%M:%S") != value:
+        raise AdvisoryLockIntegrityError("advisory lock expiry is invalid")
+    return value
+
+
+def _rollback_transaction_preserving(
+    conn,
+    primary: BaseException,
+    context: str,
+) -> bool:
+    """Attempt one rollback without replacing the authoritative failure."""
+    try:
+        conn.rollback()
+        return True
+    except BaseException as rollback_error:
+        try:
+            primary.add_note(
+                f"rollback {context}: "
+                f"{type(rollback_error).__name__}: {rollback_error}"
+            )
+        except BaseException:
+            pass
+        return False
+
+
+def _rollback_advisory_transaction(
+    conn,
+    primary: BaseException,
+    context: str,
+) -> bool:
+    return _rollback_transaction_preserving(conn, primary, context)
+
+
 def _try_advisory_lock(conn, lock_name: str, holder_id: str,
                         ttl_sec: int = 60,
                         raise_operational: bool = False) -> bool:
@@ -709,14 +804,27 @@ def _try_advisory_lock(conn, lock_name: str, holder_id: str,
     )
     assert validated_ttl is not None
     ttl_sec = validated_ttl
-    now_str = _utcnow_str()
-    expires_at = (_utcnow() + timedelta(seconds=ttl_sec)).strftime(
+    now = _utcnow()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    expires_at = (now + timedelta(seconds=ttl_sec)).strftime(
         "%Y-%m-%d %H:%M:%S")
+    transaction_maybe_active = False
     try:
+        transaction_maybe_active = True
         conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT expires_at FROM advisory_locks WHERE lock_name=?",
+            (lock_name,),
+        ).fetchone()
+        if existing is not None:
+            _validated_advisory_expiry_db(existing[0])
         # Sweep expired holders before contesting
         conn.execute(
-            "DELETE FROM advisory_locks WHERE expires_at < ?", (now_str,))
+            "DELETE FROM advisory_locks WHERE expires_at < ? "
+            "AND strftime('%Y-%m-%d %H:%M:%S', julianday(expires_at))="
+            "expires_at",
+            (now_str,),
+        )
         try:
             conn.execute(
                 "INSERT INTO advisory_locks "
@@ -725,22 +833,25 @@ def _try_advisory_lock(conn, lock_name: str, holder_id: str,
                 (lock_name, holder_id, now_str, expires_at))
             conn.commit()
             return True
-        except sqlite3.IntegrityError:
-            conn.execute("ROLLBACK")
-            return False
-    except sqlite3.OperationalError:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        if raise_operational:
+        except sqlite3.IntegrityError as exc:
+            rollback_ok = _rollback_advisory_transaction(
+                conn,
+                exc,
+                "advisory-lock conflict",
+            )
+            transaction_maybe_active = False
+            if rollback_ok:
+                return False
             raise
-        return False
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
+    except BaseException as exc:
+        if transaction_maybe_active:
+            _rollback_advisory_transaction(
+                conn,
+                exc,
+                "advisory-lock acquisition",
+            )
+        if isinstance(exc, sqlite3.OperationalError) and not raise_operational:
+            return False
         raise
 
 
@@ -769,22 +880,35 @@ def _try_or_renew_advisory_lease(
     expires_at = (now + timedelta(seconds=validated_ttl)).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
-    row = conn.execute(
-        "SELECT holder_id, expires_at FROM advisory_locks WHERE lock_name=?",
-        (lock_name,),
-    ).fetchone()
-    if row is not None and str(row[0]) != holder_id and str(row[1]) >= now_str:
-        return False
+    transaction_maybe_active = False
+    owner_conflict = False
     try:
+        row = conn.execute(
+            "SELECT holder_id, expires_at FROM advisory_locks WHERE lock_name=?",
+            (lock_name,),
+        ).fetchone()
+        if row is not None:
+            _validated_advisory_expiry_db(row[1])
+        if (
+            row is not None
+            and str(row[0]) != holder_id
+            and str(row[1]) >= now_str
+        ):
+            return False
+        transaction_maybe_active = True
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
-            "DELETE FROM advisory_locks WHERE lock_name=? AND expires_at < ?",
+            "DELETE FROM advisory_locks WHERE lock_name=? AND expires_at < ? "
+            "AND strftime('%Y-%m-%d %H:%M:%S', julianday(expires_at))="
+            "expires_at",
             (lock_name, now_str),
         )
         row = conn.execute(
-            "SELECT holder_id FROM advisory_locks WHERE lock_name=?",
+            "SELECT holder_id, expires_at FROM advisory_locks WHERE lock_name=?",
             (lock_name,),
         ).fetchone()
+        if row is not None:
+            _validated_advisory_expiry_db(row[1])
         if row is None:
             conn.execute(
                 "INSERT INTO advisory_locks "
@@ -794,27 +918,31 @@ def _try_or_renew_advisory_lease(
             )
         elif str(row[0]) == holder_id:
             conn.execute(
-                "UPDATE advisory_locks SET expires_at=? "
+                "UPDATE advisory_locks SET expires_at="
+                "CASE WHEN expires_at>? THEN expires_at ELSE ? END "
                 "WHERE lock_name=? AND holder_id=?",
-                (expires_at, lock_name, holder_id),
+                (expires_at, expires_at, lock_name, holder_id),
             )
         else:
-            conn.rollback()
+            owner_conflict = True
+        if not owner_conflict:
+            conn.commit()
+            transaction_maybe_active = False
+            return True
+    except BaseException as exc:
+        if transaction_maybe_active:
+            _rollback_advisory_transaction(
+                conn,
+                exc,
+                "advisory-lease acquisition",
+            )
+        if isinstance(exc, sqlite3.OperationalError):
             return False
-        conn.commit()
-        return True
-    except sqlite3.OperationalError:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return False
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         raise
+    # A raced owner conflict is a normal denial only after the transaction is
+    # demonstrably closed. A rollback failure is its own authoritative error.
+    conn.rollback()
+    return False
 
 
 def _log_db_background_failure(context: str, exc: BaseException) -> None:
@@ -823,6 +951,26 @@ def _log_db_background_failure(context: str, exc: BaseException) -> None:
         silent_log(context, exc)
     except Exception:
         pass
+
+
+def _log_db_background_failure_preserving(
+    context: str,
+    exc: BaseException,
+    *,
+    primary: BaseException | None = None,
+) -> None:
+    """Keep diagnostics strictly secondary to an authoritative failure."""
+    try:
+        _log_db_background_failure(context, exc)
+    except BaseException as log_error:
+        target = primary if primary is not None else exc
+        try:
+            target.add_note(
+                "DB background failure logger failed: "
+                f"{type(log_error).__name__}: {log_error}"
+            )
+        except BaseException:
+            pass
 
 
 def _release_advisory_lock(conn, lock_name: str, holder_id: str) -> bool:
@@ -836,19 +984,78 @@ def _release_advisory_lock(conn, lock_name: str, holder_id: str) -> bool:
             )
             conn.commit()
             return True
-        except Exception as exc:
+        except BaseException as exc:
             last_error = exc
-            try:
-                conn.rollback()
-            except Exception as rollback_exc:
-                _log_db_background_failure(
-                    "rollback internal advisory lock release", rollback_exc
-                )
-    _log_db_background_failure(
+            rollback_ok = _rollback_advisory_transaction(
+                conn,
+                exc,
+                "internal advisory-lock release",
+            )
+            if not isinstance(exc, Exception):
+                raise
+            if not rollback_ok:
+                break
+    _log_db_background_failure_preserving(
         "release internal advisory lock",
         last_error or RuntimeError("advisory lock release failed"),
+        primary=last_error,
     )
     return False
+
+
+def _release_advisory_lock_before_deadline(
+    conn,
+    lock_name: str,
+    holder_id: str,
+    *,
+    deadline: float,
+) -> bool:
+    """Single exact-holder release bounded by one shared monotonic deadline."""
+
+    def apply_remaining_busy_timeout() -> None:
+        remaining = max(0.0, deadline - _steady_monotonic())
+        milliseconds = min(int(remaining * 1000), 2_147_483_647)
+        conn.execute(f"PRAGMA busy_timeout={milliseconds}")
+
+    try:
+        apply_remaining_busy_timeout()
+        conn.execute(
+            "DELETE FROM advisory_locks WHERE lock_name=? AND holder_id=?",
+            (lock_name, holder_id),
+        )
+        apply_remaining_busy_timeout()
+        conn.commit()
+        return True
+    except BaseException as exc:
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        try:
+            apply_remaining_busy_timeout()
+        except BaseException as timeout_exc:
+            cleanup_errors.append(
+                ("set rollback busy timeout", timeout_exc)
+            )
+        try:
+            conn.rollback()
+        except BaseException as rollback_exc:
+            cleanup_errors.append(
+                ("rollback deadline-bounded advisory lock release", rollback_exc)
+            )
+        for context, cleanup_error in cleanup_errors:
+            try:
+                exc.add_note(
+                    f"{context}: {type(cleanup_error).__name__}: "
+                    f"{cleanup_error}"
+                )
+            except BaseException:
+                pass
+        _log_db_background_failure_preserving(
+            "deadline-bounded advisory lock release",
+            exc,
+            primary=exc,
+        )
+        if not isinstance(exc, Exception):
+            raise
+        return False
 
 
 def _try_schema_lock(conn, holder_id: str, ttl_sec: int = 60) -> bool:
@@ -878,15 +1085,35 @@ _AUTO_TRANSIENT_CLAIM_TTL_MINUTES = 30
 # remains the durable/cross-process source of truth; workers retain a bounded
 # fallback poll for producer crashes and rolling upgrades.
 _MARKOUT_QUEUE_WAKEUP_EVENT = threading.Event()
+_MARKOUT_QUEUE_WAKEUP_EVENTS = {
+    "futures": threading.Event(),
+    "spot": threading.Event(),
+}
 
 
-def get_markout_queue_wakeup_event() -> threading.Event:
-    """Return the process-local markout wakeup edge shared with the worker."""
-    return _MARKOUT_QUEUE_WAKEUP_EVENT
+def get_markout_queue_wakeup_event(
+    worker_family: str | None = None,
+) -> threading.Event:
+    """Return an independently consumable process-local markout wakeup edge."""
+    if worker_family is None:
+        return _MARKOUT_QUEUE_WAKEUP_EVENT
+    if not isinstance(worker_family, str):
+        raise ValueError("markout worker family is invalid")
+    family = worker_family.strip().lower()
+    try:
+        return _MARKOUT_QUEUE_WAKEUP_EVENTS[family]
+    except KeyError as exc:
+        raise ValueError("markout worker family is unsupported") from exc
 
 
 def _notify_markout_queue_changed() -> None:
     _MARKOUT_QUEUE_WAKEUP_EVENT.set()
+    # Each family clears only its own edge.  A single shared Event lets (for
+    # example) the SPOT worker consume a FUTURES wakeup before the FUTURES
+    # worker observes it.  SQLite remains authoritative; these independent
+    # edges preserve prompt delivery without changing durable queue semantics.
+    for wakeup_event in _MARKOUT_QUEUE_WAKEUP_EVENTS.values():
+        wakeup_event.set()
 
 _MARKOUT_TIME_VALID_SQL = """(
     strftime('%Y-%m-%d %H:%M:%S', julianday(due_at))=due_at
@@ -986,18 +1213,15 @@ def _purge_junk_claims(conn) -> None:
                     continue
             if entry_id is not None:
                 intent_row = conn.execute(
-                    "SELECT bot_name, mode, symbol FROM order_intents "
+                    "SELECT 1 FROM order_intents "
                     "WHERE intent_id=?",
                     (entry_id,),
                 ).fetchone()
-                if (
-                    intent_row is not None
-                    and str(intent_row[0]).strip() == str(bot_name).strip()
-                    and str(intent_row[1]).strip().upper() == "LIVE"
-                    and _base_symbol(intent_row[2]) == _base_symbol(symbol)
-                ):
-                    # A journal-bound placeholder is durable recovery evidence,
-                    # not transient junk. Terminal-zero cleanup owns deletion.
+                if intent_row is not None:
+                    # Any journal row with this immutable entry id is durable
+                    # recovery evidence. A scope mismatch is contradictory,
+                    # not proof that the claim is disposable; reconciliation
+                    # must keep it visible and fail closed.
                     continue
             conn.execute(
                 "DELETE FROM bot_open_positions "
@@ -1015,14 +1239,143 @@ def _purge_junk_claims(conn) -> None:
                 (bot_name, symbol, cutoff),
             )
         conn.commit()
-    except Exception:
+    except BaseException as exc:
         try:
             conn.rollback()
-        except Exception as rollback_exc:
-            _log_db_background_failure(
-                "rollback junk claim purge", rollback_exc
+        except BaseException as rollback_exc:
+            try:
+                exc.add_note(
+                    "rollback junk claim purge: "
+                    f"{type(rollback_exc).__name__}: {rollback_exc}"
+                )
+            except BaseException:
+                pass
+            _log_db_background_failure_preserving(
+                "rollback junk claim purge",
+                rollback_exc,
+                primary=exc,
             )
         raise
+
+
+def _portfolio_reservation_matches_intent_db(
+    reservation,
+    *,
+    intent_id,
+    bot_name,
+    mode,
+    symbol,
+    allowed_statuses: frozenset[str],
+) -> bool:
+    """Validate one durable reservation against its authoritative intent."""
+    try:
+        expected_intent = _causal_entry_id_db(intent_id, required=True)
+        reservation_intent = _causal_entry_id_db(
+            reservation["intent_id"], required=True
+        )
+        expected_bot = _canonical_bot_name_db(bot_name)
+        reservation_bot = _canonical_bot_name_db(reservation["bot_name"])
+        created_at, created_dt = _trade_timestamp_db(
+            reservation["created_at"], "reservation created_at"
+        )
+        expires_at, expires_dt = _trade_timestamp_db(
+            reservation["expires_at"], "reservation expires_at"
+        )
+        notional = _optional_finite_db(reservation["notional_usdt"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    expected_base = _base_symbol(symbol)
+    reservation_symbol = reservation["symbol"]
+    reservation_status = reservation["status"]
+    return (
+        intent_id == expected_intent
+        and reservation["intent_id"] == reservation_intent == expected_intent
+        and reservation["reservation_id"] == f"res:{expected_intent}"
+        and bot_name == expected_bot
+        and reservation["bot_name"] == reservation_bot == expected_bot
+        and mode == "LIVE"
+        and reservation["mode"] == "LIVE"
+        and isinstance(symbol, str)
+        and bool(expected_base)
+        and isinstance(reservation_symbol, str)
+        and reservation_symbol == _base_symbol(reservation_symbol) == expected_base
+        and isinstance(reservation_status, str)
+        and reservation_status in allowed_statuses
+        and reservation_status in _PORTFOLIO_RESERVATION_STATUSES
+        and reservation["created_at"] == created_at
+        and reservation["expires_at"] == expires_at
+        and expires_dt > created_dt
+        and notional is not None
+        and notional > 0.0
+    )
+
+
+def _portfolio_claim_matches_intent_db(
+    claim,
+    *,
+    intent_id,
+    bot_name,
+    symbol,
+    direction,
+) -> bool:
+    """Validate one surviving claim against its causal LIVE entry intent."""
+    try:
+        expected_intent = _causal_entry_id_db(intent_id, required=True)
+        expected_bot = _canonical_bot_name_db(bot_name)
+        expected_base = _base_symbol(symbol)
+        raw_direction = direction
+        expected_direction = _required_text_db(
+            direction, "order intent direction", max_length=5
+        ).upper()
+        claim_bot = _canonical_bot_name_db(claim["bot_name"])
+        claim_symbol = claim["symbol"]
+        raw_position_type = claim["position_type"]
+        raw_state = claim["state"]
+        claim_extra = _strict_claim_extra_object(claim["extra_json"])
+        raw_claim_intent = (
+            claim_extra.get("entry_id")
+            if claim_extra is not None else None
+        )
+        claim_intent = _causal_entry_id_db(
+            raw_claim_intent,
+            required=True,
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    if not isinstance(raw_position_type, str) or not isinstance(raw_state, str):
+        return False
+    position_type = raw_position_type.strip().upper()
+    claim_state = raw_state.strip().upper()
+    if (
+        not expected_base
+        or expected_direction not in {"LONG", "SHORT"}
+        or raw_direction != expected_direction
+        or claim["bot_name"] != claim_bot
+        or claim_bot != expected_bot
+        or not isinstance(claim_symbol, str)
+        or not claim_symbol
+        or claim_symbol != _base_symbol(claim_symbol)
+        or claim_symbol != expected_base
+        or raw_position_type != position_type
+        or position_type not in {"SPOT", "FUTURES", "LONG", "SHORT"}
+        or raw_state != claim_state
+        or claim_state not in {"CLAIMING", "ADOPTING", "OPEN"}
+        or raw_claim_intent != claim_intent
+        or claim_intent != expected_intent
+    ):
+        return False
+    owner_account = _portfolio_account_type_for_bot(claim_bot)
+    position_account = (
+        "futures" if _is_futures_ptype(position_type) else "spot"
+    )
+    if owner_account is None or owner_account != position_account:
+        return False
+    claim_direction = {
+        "SPOT": "LONG",
+        "LONG": "LONG",
+        "SHORT": "SHORT",
+    }.get(position_type)
+    return claim_direction is None or claim_direction == expected_direction
 
 
 def _reconcile_portfolio_reservations(conn) -> tuple[int, int]:
@@ -1035,38 +1388,126 @@ def _reconcile_portfolio_reservations(conn) -> tuple[int, int]:
     """
     try:
         conn.execute("BEGIN IMMEDIATE")
-        terminal = conn.execute(
-            """UPDATE portfolio_reservations AS reservation
-                  SET status=CASE
-                      WHEN (
-                          SELECT intent.filled_amount
-                            FROM order_intents AS intent
-                           WHERE intent.intent_id=reservation.intent_id
-                             AND intent.status='FINALIZED'
-                      ) > 0
-                      THEN 'CONSUMED'
-                      ELSE 'RELEASED'
-                  END
+        terminal_candidates = conn.execute(
+            """SELECT reservation.reservation_id,
+                      reservation.intent_id,
+                      reservation.bot_name,
+                      reservation.symbol,
+                      reservation.notional_usdt,
+                      reservation.mode,
+                      reservation.status,
+                      reservation.created_at,
+                      reservation.expires_at,
+                      intent.intent_id,
+                      intent.bot_name,
+                      intent.mode,
+                      intent.symbol,
+                      intent.direction,
+                      intent.filled_amount
+                 FROM portfolio_reservations AS reservation
+                 JOIN order_intents AS intent
+                   ON intent.intent_id=reservation.intent_id
                 WHERE reservation.status IN ('ACTIVE', 'CONSUMED')
-                  AND EXISTS (
-                      SELECT 1 FROM order_intents AS intent
-                       WHERE intent.intent_id=reservation.intent_id
-                         AND intent.status='FINALIZED'
-                         AND intent.filled_amount >= 0
-                  )
+                  AND intent.status='FINALIZED'
+                  AND intent.filled_amount >= 0
                   AND (
                       reservation.status='ACTIVE'
-                      OR EXISTS (
-                          SELECT 1 FROM order_intents AS intent
-                           WHERE intent.intent_id=reservation.intent_id
-                             AND intent.status='FINALIZED'
-                             AND intent.filled_amount=0
-                      )
+                      OR intent.filled_amount=0
                   )"""
-        ).rowcount
-        expired = conn.execute(
-            """UPDATE portfolio_reservations AS reservation
-                  SET status='EXPIRED'
+        ).fetchall()
+        terminal = 0
+        for candidate in terminal_candidates:
+            (
+                reservation_id,
+                intent_id,
+                reservation_bot,
+                reservation_symbol,
+                reservation_notional,
+                reservation_mode,
+                reservation_status,
+                reservation_created_at,
+                reservation_expires_at,
+                journal_intent_id,
+                intent_bot,
+                intent_mode,
+                intent_symbol,
+                intent_direction,
+                raw_filled_amount,
+            ) = candidate
+            filled_amount = _optional_finite_db(raw_filled_amount)
+            reservation = {
+                "reservation_id": reservation_id,
+                "intent_id": intent_id,
+                "bot_name": reservation_bot,
+                "symbol": reservation_symbol,
+                "notional_usdt": reservation_notional,
+                "mode": reservation_mode,
+                "status": reservation_status,
+                "created_at": reservation_created_at,
+                "expires_at": reservation_expires_at,
+            }
+            if filled_amount is None or filled_amount < 0.0 or not (
+                _portfolio_reservation_matches_intent_db(
+                    reservation,
+                    intent_id=journal_intent_id,
+                    bot_name=intent_bot,
+                    mode=intent_mode,
+                    symbol=intent_symbol,
+                    allowed_statuses=frozenset(("ACTIVE", "CONSUMED")),
+                )
+            ):
+                continue
+            if filled_amount > 0.0:
+                claim = conn.execute(
+                    """SELECT bot_name, symbol, position_type, state,
+                              extra_json
+                         FROM bot_open_positions
+                        WHERE bot_name=? AND symbol=?""",
+                    (reservation_bot, reservation_symbol),
+                ).fetchone()
+                if claim is not None and not _portfolio_claim_matches_intent_db(
+                    claim,
+                    intent_id=journal_intent_id,
+                    bot_name=intent_bot,
+                    symbol=intent_symbol,
+                    direction=intent_direction,
+                ):
+                    continue
+            next_status = "CONSUMED" if filled_amount > 0.0 else "RELEASED"
+            cursor = conn.execute(
+                """UPDATE portfolio_reservations
+                      SET status=?
+                    WHERE reservation_id=?
+                      AND intent_id=?
+                      AND bot_name=?
+                      AND symbol=?
+                      AND mode=?
+                      AND status=?""",
+                (
+                    next_status,
+                    reservation_id,
+                    intent_id,
+                    reservation_bot,
+                    reservation_symbol,
+                    reservation_mode,
+                    reservation_status,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "terminal reservation reconciliation lost generation"
+                )
+            terminal += 1
+        expiry_candidates = conn.execute(
+            """SELECT reservation.reservation_id,
+                      reservation.intent_id,
+                      reservation.bot_name,
+                      reservation.symbol,
+                      reservation.notional_usdt,
+                      reservation.mode,
+                      reservation.created_at,
+                      reservation.expires_at
+                 FROM portfolio_reservations AS reservation
                 WHERE reservation.status='ACTIVE'
                   AND strftime(
                       '%Y-%m-%d %H:%M:%S', reservation.expires_at
@@ -1080,13 +1521,75 @@ def _reconcile_portfolio_reservations(conn) -> tuple[int, int]:
                       SELECT 1 FROM bot_open_positions AS claim
                        WHERE claim.bot_name=reservation.bot_name
                          AND claim.symbol=reservation.symbol
+                         AND UPPER(TRIM(COALESCE(claim.state, '')))
+                             NOT IN ('CLOSED', 'FLAT')
                   )""",
             (_utcnow_str(),),
-        ).rowcount
+        ).fetchall()
+        expired = 0
+        for candidate in expiry_candidates:
+            (
+                reservation_id,
+                raw_intent_id,
+                raw_bot_name,
+                raw_symbol,
+                raw_notional,
+                raw_mode,
+                raw_created_at,
+                raw_expires_at,
+            ) = candidate
+            try:
+                intent_id = _causal_entry_id_db(raw_intent_id, required=True)
+                bot_name = _canonical_bot_name_db(raw_bot_name)
+                created_at, _created_dt = _trade_timestamp_db(
+                    raw_created_at, "reservation created_at"
+                )
+                expires_at, _expires_dt = _trade_timestamp_db(
+                    raw_expires_at, "reservation expires_at"
+                )
+                notional = _optional_finite_db(raw_notional)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                raw_intent_id != intent_id
+                or reservation_id != f"res:{intent_id}"
+                or raw_bot_name != bot_name
+                or not isinstance(raw_symbol, str)
+                or raw_symbol != _base_symbol(raw_symbol)
+                or not raw_symbol
+                or raw_mode != "LIVE"
+                or raw_created_at != created_at
+                or raw_expires_at != expires_at
+                or notional is None
+                or notional <= 0.0
+            ):
+                continue
+            cursor = conn.execute(
+                """UPDATE portfolio_reservations
+                      SET status='EXPIRED'
+                    WHERE reservation_id=?
+                      AND intent_id=?
+                      AND status='ACTIVE'""",
+                (reservation_id, intent_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "expired reservation reconciliation lost generation"
+                )
+            expired += 1
         conn.commit()
         return terminal, expired
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        try:
+            conn.rollback()
+        except BaseException as rollback_exc:
+            try:
+                exc.add_note(
+                    "rollback portfolio-reservation reconciliation: "
+                    f"{type(rollback_exc).__name__}: {rollback_exc}"
+                )
+            except BaseException:
+                pass
         raise
 
 
@@ -1289,6 +1792,7 @@ def _run_migrations(conn) -> None:
     CREATE TABLE IF NOT EXISTS futures_state (
         symbol             TEXT  NOT NULL,
         bot_name           TEXT  NOT NULL,
+        entry_id           TEXT,
         position_type      TEXT  NOT NULL,
         entry_price        REAL  NOT NULL,
         current_price      REAL  NOT NULL,
@@ -1304,6 +1808,7 @@ def _run_migrations(conn) -> None:
         last_update        TEXT  NOT NULL,
         PRIMARY KEY (symbol, bot_name)
     )""")
+    _add_column_if_missing(conn, "futures_state", "entry_id", "TEXT")
     c.execute("CREATE INDEX IF NOT EXISTS idx_futures_state_opened ON futures_state(opened_at)")
     c.execute("""
     CREATE TABLE IF NOT EXISTS api_rate_global (
@@ -1772,6 +2277,7 @@ def _run_migrations(conn) -> None:
 
 _MAINT_THREAD_STARTED = False
 _MAINT_THREAD: threading.Thread | None = None
+_MAINT_GENERATION = None
 _MAINT_LOCK = threading.Lock()
 _MAINT_STOP_EVENT = threading.Event()
 _MAINT_INTERVAL_SEC = 300.0
@@ -1844,12 +2350,18 @@ def _maintenance_loop() -> None:
 
 def _maintenance_cycle() -> None:
     conn = None
+    primary_error = None
     try:
         try:
             conn = sqlite3.connect(DB_PATH, timeout=10.0)
         except Exception as exc:
-            _log_db_background_failure("open DB maintenance connection", exc)
+            _log_db_background_failure_preserving(
+                "open DB maintenance connection",
+                exc,
+                primary=exc,
+            )
         if conn is not None:
+            connection_usable = True
             for context, operation in (
                 ("purge stale claims", _purge_junk_claims),
                 (
@@ -1857,26 +2369,73 @@ def _maintenance_cycle() -> None:
                     _reconcile_portfolio_reservations,
                 ),
             ):
+                if not connection_usable:
+                    break
                 try:
                     operation(conn)
                 except Exception as exc:
+                    rollback_required = True
                     try:
-                        conn.rollback()
-                    except Exception as rollback_exc:
-                        _log_db_background_failure(
-                            f"rollback DB maintenance {context}", rollback_exc
-                        )
-                    _log_db_background_failure(
-                        f"DB maintenance {context}", exc
+                        rollback_required = bool(conn.in_transaction)
+                    except BaseException as state_error:
+                        try:
+                            exc.add_note(
+                                f"inspect DB maintenance transaction {context}: "
+                                f"{type(state_error).__name__}: {state_error}"
+                            )
+                        except BaseException:
+                            pass
+                    if rollback_required:
+                        try:
+                            conn.rollback()
+                        except BaseException as rollback_exc:
+                            try:
+                                exc.add_note(
+                                    f"rollback DB maintenance {context}: "
+                                    f"{type(rollback_exc).__name__}: {rollback_exc}"
+                                )
+                            except BaseException:
+                                pass
+                            _log_db_background_failure_preserving(
+                                f"rollback DB maintenance {context}",
+                                rollback_exc,
+                                primary=exc,
+                            )
+                            connection_usable = False
+                    _log_db_background_failure_preserving(
+                        f"DB maintenance {context}",
+                        exc,
+                        primary=exc,
                     )
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         if conn is not None:
             try:
                 conn.close()
-            except Exception as exc:
-                _log_db_background_failure(
-                    "close DB maintenance connection", exc
-                )
+            except BaseException as close_error:
+                if primary_error is not None:
+                    try:
+                        primary_error.add_note(
+                            "close DB maintenance connection: "
+                            f"{type(close_error).__name__}: {close_error}"
+                        )
+                    except BaseException:
+                        pass
+                    _log_db_background_failure_preserving(
+                        "close DB maintenance connection",
+                        close_error,
+                        primary=primary_error,
+                    )
+                elif isinstance(close_error, Exception):
+                    _log_db_background_failure_preserving(
+                        "close DB maintenance connection",
+                        close_error,
+                        primary=close_error,
+                    )
+                else:
+                    raise
     for context, operation in (
         ("GC API rate ledger", _gc_api_rate_global),
         ("GC expired blacklist", _gc_expired_blacklist),
@@ -1891,15 +2450,46 @@ def _maintenance_cycle() -> None:
 
 
 def _start_maintenance_thread() -> bool:
-    global _MAINT_THREAD, _MAINT_THREAD_STARTED
+    global _MAINT_GENERATION, _MAINT_THREAD, _MAINT_THREAD_STARTED
     with _MAINT_LOCK:
-        if _MAINT_THREAD is not None and _MAINT_THREAD.is_alive():
+        # Runtime finalization is terminal for process-owned DB workers.  Do
+        # not clear a stop edge racing with shutdown and resurrect maintenance
+        # after the finalizer has snapshotted the old thread.
+        if _MAINT_STOP_EVENT.is_set():
+            return False
+        if _db_thread_generation_unresolved(_MAINT_GENERATION):
             return True
-        _MAINT_STOP_EVENT.clear()
+        if _MAINT_GENERATION is not None:
+            _MAINT_GENERATION = None
+            _MAINT_THREAD = None
+            _MAINT_THREAD_STARTED = False
+        def publish(candidate) -> None:
+            global _MAINT_THREAD
+            _MAINT_THREAD = candidate
+
+        def clear(candidate) -> None:
+            global _MAINT_THREAD, _MAINT_THREAD_STARTED
+            if _MAINT_THREAD is candidate:
+                _MAINT_THREAD = None
+                _MAINT_THREAD_STARTED = False
+
+        def publish_generation(generation) -> None:
+            global _MAINT_GENERATION
+            _MAINT_GENERATION = generation
+
+        def clear_generation(generation) -> None:
+            global _MAINT_GENERATION
+            if _MAINT_GENERATION is generation:
+                _MAINT_GENERATION = None
+
         thread = _start_optional_db_thread(
             target=_maintenance_loop,
             name="db-maintenance",
             failure_context="start DB maintenance worker",
+            publish_candidate=publish,
+            clear_candidate=clear,
+            publish_generation=publish_generation,
+            clear_generation=clear_generation,
         )
         if thread is None:
             _MAINT_THREAD = None
@@ -1917,6 +2507,7 @@ def _gc_api_rate_global() -> None:
         "%Y-%m-%d %H:%M:%S"
     )
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    primary_error: BaseException | None = None
     try:
         conn.execute(
             "DELETE FROM api_rate_global "
@@ -1924,11 +2515,39 @@ def _gc_api_rate_global() -> None:
             (cutoff, latest_plausible),
         )
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        primary_error = exc
         raise
     finally:
-        conn.close()
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        if primary_error is not None:
+            try:
+                conn.rollback()
+            except BaseException as rollback_error:
+                cleanup_errors.append(("rollback API-rate GC", rollback_error))
+        try:
+            conn.close()
+        except BaseException as close_error:
+            cleanup_errors.append(("close API-rate GC connection", close_error))
+        if primary_error is not None:
+            for context, cleanup_error in cleanup_errors:
+                try:
+                    primary_error.add_note(
+                        f"{context}: {type(cleanup_error).__name__}: "
+                        f"{cleanup_error}"
+                    )
+                except BaseException:
+                    pass
+        elif cleanup_errors:
+            _context, cleanup_primary = cleanup_errors[0]
+            for context, secondary in cleanup_errors[1:]:
+                try:
+                    cleanup_primary.add_note(
+                        f"{context}: {type(secondary).__name__}: {secondary}"
+                    )
+                except BaseException:
+                    pass
+            raise cleanup_primary
 
 
 def _gc_expired_blacklist() -> None:
@@ -1939,37 +2558,75 @@ def _gc_expired_blacklist() -> None:
     Now" button)  both are correct, they differ deliberately.
     """
     cutoff = (_utcnow() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
-    try:
-        conn.execute(
-            "DELETE FROM coin_blacklist WHERE blacklisted_until < ?", (cutoff,)
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    _run_maintenance_delete(
+        "DELETE FROM coin_blacklist WHERE blacklisted_until < ?",
+        (cutoff,),
+        context="expired-blacklist GC",
+    )
 
 
 def _gc_learning_log() -> None:
     cutoff = (_utcnow() - timedelta(days=LEARNING_LOG_RETENTION_DAYS)).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
+    _run_maintenance_delete(
+        "DELETE FROM learning_log WHERE timestamp < ?",
+        (cutoff,),
+        context="learning-log GC",
+    )
+
+
+def _run_maintenance_delete(
+    statement: str,
+    params: tuple[object, ...],
+    *,
+    context: str,
+) -> None:
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    primary_error: BaseException | None = None
     try:
-        conn.execute("DELETE FROM learning_log WHERE timestamp < ?", (cutoff,))
+        conn.execute(statement, params)
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        primary_error = exc
         raise
     finally:
-        conn.close()
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        if primary_error is not None:
+            try:
+                conn.rollback()
+            except BaseException as rollback_error:
+                cleanup_errors.append((f"rollback {context}", rollback_error))
+        try:
+            conn.close()
+        except BaseException as close_error:
+            cleanup_errors.append((f"close {context} connection", close_error))
+        if primary_error is not None:
+            for cleanup_context, cleanup_error in cleanup_errors:
+                try:
+                    primary_error.add_note(
+                        f"{cleanup_context}: {type(cleanup_error).__name__}: "
+                        f"{cleanup_error}"
+                    )
+                except BaseException:
+                    pass
+        elif cleanup_errors:
+            _cleanup_context, cleanup_primary = cleanup_errors[0]
+            for cleanup_context, secondary in cleanup_errors[1:]:
+                try:
+                    cleanup_primary.add_note(
+                        f"{cleanup_context}: {type(secondary).__name__}: "
+                        f"{secondary}"
+                    )
+                except BaseException:
+                    pass
+            raise cleanup_primary
 
 
 def _gc_market_regime_top_n() -> None:
     """Effizientes DELETE via id-threshold statt NOT IN."""
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    primary_error: BaseException | None = None
     try:
         row = conn.execute(
             "SELECT id FROM market_regime ORDER BY id DESC LIMIT 1 OFFSET ?",
@@ -1979,34 +2636,208 @@ def _gc_market_regime_top_n() -> None:
             threshold_id = row[0]
             conn.execute("DELETE FROM market_regime WHERE id < ?", (threshold_id,))
             conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        primary_error = exc
         raise
     finally:
-        conn.close()
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        if primary_error is not None:
+            try:
+                conn.rollback()
+            except BaseException as rollback_error:
+                cleanup_errors.append(
+                    ("rollback market-regime row-cap GC", rollback_error)
+                )
+        try:
+            conn.close()
+        except BaseException as close_error:
+            cleanup_errors.append(
+                ("close market-regime row-cap GC connection", close_error)
+            )
+        if primary_error is not None:
+            for context, cleanup_error in cleanup_errors:
+                try:
+                    primary_error.add_note(
+                        f"{context}: {type(cleanup_error).__name__}: "
+                        f"{cleanup_error}"
+                    )
+                except BaseException:
+                    pass
+        elif cleanup_errors:
+            _context, cleanup_primary = cleanup_errors[0]
+            for context, secondary in cleanup_errors[1:]:
+                try:
+                    cleanup_primary.add_note(
+                        f"{context}: {type(secondary).__name__}: {secondary}"
+                    )
+                except BaseException:
+                    pass
+            raise cleanup_primary
 
 
 _VACUUM_LOCK = threading.Lock()
 _VACUUM_STOP_EVENT = threading.Event()
 _VACUUM_THREAD: threading.Thread | None = None
+_VACUUM_GENERATION = None
+_VACUUM_PENDING_RELEASE_HOLDER_ID: str | None = None
 
 
-def _start_optional_db_thread(*, target, name: str, failure_context: str):
+def _db_thread_generation_unresolved(generation) -> bool:
+    if generation is None:
+        return False
+    if not generation["done"].is_set():
+        return True
+    thread = generation.get("thread")
+    if thread is None:
+        return False
+    try:
+        return bool(thread.is_alive())
+    except BaseException:
+        return True
+
+
+def _start_optional_db_thread(
+    *,
+    target,
+    name: str,
+    failure_context: str,
+    publish_candidate=None,
+    clear_candidate=None,
+    publish_generation=None,
+    clear_generation=None,
+):
     """Start non-critical DB maintenance without endangering bot startup."""
+    candidate = None
+    generation = {"thread": None, "done": threading.Event()}
+
+    def run_generation() -> None:
+        try:
+            target()
+        finally:
+            generation["done"].set()
+
     try:
         candidate = threading.Thread(
-            target=target,
+            target=run_generation,
             name=name,
             daemon=True,
         )
+        generation["thread"] = candidate
+        if callable(publish_candidate):
+            publish_candidate(candidate)
+        if callable(publish_generation):
+            publish_generation(generation)
         candidate.start()
         return candidate
-    except Exception as exc:
+    except BaseException as exc:
+        definite_prelaunch = (
+            candidate is None
+            or (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(candidate)
+            )
+        )
+        if definite_prelaunch:
+            generation["done"].set()
+            if callable(clear_candidate):
+                clear_candidate(candidate)
+            if callable(clear_generation):
+                clear_generation(generation)
         _log_db_background_failure(failure_context, exc)
-        return None
+        if not definite_prelaunch:
+            return candidate
+        if isinstance(exc, Exception):
+            return None
+        raise
+
+
+def _drain_pending_vacuum_release(*, timeout: float = 2.0) -> bool:
+    """Best-effort exact-holder drain without forgetting unresolved ownership."""
+    global _VACUUM_PENDING_RELEASE_HOLDER_ID
+    holder_id = _VACUUM_PENDING_RELEASE_HOLDER_ID
+    if holder_id is None:
+        return True
+    conn = None
+    released = False
+    primary_error: BaseException | None = None
+    try:
+        budget = max(0.0, float(timeout))
+        deadline = _steady_monotonic() + budget
+        conn = sqlite3.connect(DB_PATH, timeout=budget)
+        released = _release_advisory_lock_before_deadline(
+            conn,
+            _VACUUM_LOCK_NAME,
+            holder_id,
+            deadline=deadline,
+        )
+    except BaseException as exc:
+        primary_error = exc
+        _log_db_background_failure_preserving(
+            "final release vacuum coordinator lock",
+            exc,
+            primary=exc,
+        )
+        if not isinstance(exc, Exception):
+            raise
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except BaseException as close_error:
+                released = False
+                if primary_error is not None:
+                    try:
+                        primary_error.add_note(
+                            "close final vacuum release connection: "
+                            f"{type(close_error).__name__}: {close_error}"
+                        )
+                    except BaseException:
+                        pass
+                else:
+                    _log_db_background_failure_preserving(
+                        "close final vacuum release connection",
+                        close_error,
+                        primary=close_error,
+                    )
+                    if not isinstance(close_error, Exception):
+                        raise
+    if released and _VACUUM_PENDING_RELEASE_HOLDER_ID == holder_id:
+        _VACUUM_PENDING_RELEASE_HOLDER_ID = None
+    if not released:
+        unresolved = RuntimeError(
+            f"vacuum holder {holder_id!r} remains pending release"
+        )
+        _log_db_background_failure_preserving(
+            "unresolved vacuum coordinator ownership",
+            unresolved,
+            primary=unresolved,
+        )
+    return released
 
 
 def _vacuum_worker() -> None:
+    primary_error: BaseException | None = None
+    try:
+        _vacuum_worker_loop()
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            _drain_pending_vacuum_release()
+        except BaseException as drain_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "final vacuum ownership drain failed: "
+                    f"{type(drain_error).__name__}: {drain_error}"
+                )
+            except BaseException:
+                pass
+
+
+def _vacuum_worker_loop() -> None:
     """Cross-process VACUUM coordination via advisory_locks.
 
     Each bot process calls init_db(), which starts a _vacuum_worker thread.
@@ -2015,6 +2846,7 @@ def _vacuum_worker() -> None:
     holds it, skip. The TTL enforces "no re-vacuum for 7 days" across the whole
     process cluster. Only runs inside the 03:00-05:00 UTC quiet window.
     """
+    global _VACUUM_PENDING_RELEASE_HOLDER_ID
     if _VACUUM_STOP_EVENT.wait(3600):
         return
     QUIET_HOUR_START = 3   # UTC
@@ -2035,59 +2867,106 @@ def _vacuum_worker() -> None:
                 have_lock = False
                 keep_cooldown_lock = False
                 holder_id = ""
+                primary_error: BaseException | None = None
                 try:
-                    # cross-process gate; 7-day TTL enforced across all processes
-                    holder_id = f"vacuum-{os.getpid()}-{_time.time():.3f}"
-                    have_lock = _try_advisory_lock(
-                        conn, _VACUUM_LOCK_NAME, holder_id,
-                        ttl_sec=_VACUUM_LOCK_TTL_SEC)
-                    if not have_lock:
-                        # Another process is the vacuum coordinator for this
-                        # 7-day window. Close the conn and throttle before the
-                        # next attempt  don't hot-loop BEGIN IMMEDIATE through
-                        # the quiet window (it would contend the write lock and
-                        # starve the fail-closed API-budget gate).
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                        if _VACUUM_STOP_EVENT.wait(3600):
-                            return
-                        continue
-                    free = conn.execute("PRAGMA freelist_count").fetchone()
-                    total = conn.execute("PRAGMA page_count").fetchone()
-                    if free and total and total[0] > 0:
-                        free_pct = (free[0] / total[0]) * 100
-                        if free_pct > 20:
-                            try:
-                                from core.logger import log_event
-                                log_event(
-                                    f"[db-vacuum] running VACUUM "
-                                    f"(free_pct={free_pct:.1f}%, "
-                                    f"pages={total[0]})", "INFO"
-                                )
-                            except Exception:
-                                pass
-                            conn.execute("VACUUM")
-                            # A successful VACUUM intentionally keeps the
-                            # advisory row as the cross-process 7-day cooldown.
-                            keep_cooldown_lock = True
-                            conn.commit()
-                            last_run_date = today_str
+                    if _VACUUM_PENDING_RELEASE_HOLDER_ID is not None:
+                        released = _release_advisory_lock(
+                            conn,
+                            _VACUUM_LOCK_NAME,
+                            _VACUUM_PENDING_RELEASE_HOLDER_ID,
+                        )
+                        if released is False:
+                            _log_db_background_failure(
+                                "retry release vacuum coordinator lock",
+                                RuntimeError(
+                                    "vacuum lock remains until retry or TTL expiry"
+                                ),
+                            )
+                        else:
+                            _VACUUM_PENDING_RELEASE_HOLDER_ID = None
+                    if _VACUUM_PENDING_RELEASE_HOLDER_ID is None:
+                        # Cross-process gate; 7-day TTL is enforced across all
+                        # processes. Never abandon an unresolved owned holder
+                        # in favour of a fresh generation.
+                        holder_id = f"vacuum-{os.getpid()}-{_time.time():.3f}"
+                        have_lock = _try_advisory_lock(
+                            conn, _VACUUM_LOCK_NAME, holder_id,
+                            ttl_sec=_VACUUM_LOCK_TTL_SEC)
+                    if have_lock:
+                        free = conn.execute("PRAGMA freelist_count").fetchone()
+                        total = conn.execute("PRAGMA page_count").fetchone()
+                        if free and total and total[0] > 0:
+                            free_pct = (free[0] / total[0]) * 100
+                            if free_pct > 20:
+                                try:
+                                    from core.logger import log_event
+                                    log_event(
+                                        f"[db-vacuum] running VACUUM "
+                                        f"(free_pct={free_pct:.1f}%, "
+                                        f"pages={total[0]})", "INFO"
+                                    )
+                                except Exception:
+                                    pass
+                                conn.execute("VACUUM")
+                                # A successful VACUUM intentionally keeps the
+                                # advisory row as the cross-process 7-day cooldown.
+                                keep_cooldown_lock = True
+                                conn.commit()
+                                last_run_date = today_str
+                except BaseException as exc:
+                    primary_error = exc
+                    raise
                 finally:
+                    cleanup_errors: list[tuple[str, BaseException]] = []
                     if have_lock and not keep_cooldown_lock:
                         # No work or any failure after acquisition must not
                         # suppress every process for the full cooldown.
-                        if _release_advisory_lock(
-                            conn, _VACUUM_LOCK_NAME, holder_id
-                        ) is False:
-                            _log_db_background_failure(
-                                "release vacuum coordinator lock",
-                                RuntimeError(
-                                    "vacuum lock remains until TTL expiry"
-                                ),
+                        try:
+                            _VACUUM_PENDING_RELEASE_HOLDER_ID = holder_id
+                            released = _release_advisory_lock(
+                                conn, _VACUUM_LOCK_NAME, holder_id
                             )
-                    conn.close()
+                            if released is False:
+                                _log_db_background_failure(
+                                    "release vacuum coordinator lock",
+                                    RuntimeError(
+                                        "vacuum lock remains until TTL expiry"
+                                    ),
+                                )
+                            else:
+                                _VACUUM_PENDING_RELEASE_HOLDER_ID = None
+                        except BaseException as release_error:
+                            _VACUUM_PENDING_RELEASE_HOLDER_ID = holder_id
+                            cleanup_errors.append(
+                                ("release vacuum coordinator lock", release_error)
+                            )
+                    try:
+                        conn.close()
+                    except BaseException as close_error:
+                        cleanup_errors.append(
+                            ("close vacuum coordinator connection", close_error)
+                        )
+                    if primary_error is not None:
+                        for context, cleanup_error in cleanup_errors:
+                            try:
+                                primary_error.add_note(
+                                    f"{context}: "
+                                    f"{type(cleanup_error).__name__}: "
+                                    f"{cleanup_error}"
+                                )
+                            except BaseException:
+                                pass
+                    elif cleanup_errors:
+                        _context, cleanup_primary = cleanup_errors[0]
+                        for context, secondary in cleanup_errors[1:]:
+                            try:
+                                cleanup_primary.add_note(
+                                    f"{context}: {type(secondary).__name__}: "
+                                    f"{secondary}"
+                                )
+                            except BaseException:
+                                pass
+                        raise cleanup_primary
             except Exception as exc:
                 _log_db_background_failure("DB vacuum scheduler", exc)
         if _VACUUM_STOP_EVENT.wait(3600):
@@ -2095,15 +2974,41 @@ def _vacuum_worker() -> None:
 
 
 def _start_vacuum_scheduler() -> bool:
-    global _VACUUM_THREAD
+    global _VACUUM_GENERATION, _VACUUM_THREAD
     with _VACUUM_LOCK:
-        if _VACUUM_THREAD is not None and _VACUUM_THREAD.is_alive():
+        if _VACUUM_STOP_EVENT.is_set():
+            return False
+        if _db_thread_generation_unresolved(_VACUUM_GENERATION):
             return True
-        _VACUUM_STOP_EVENT.clear()
+        if _VACUUM_GENERATION is not None:
+            _VACUUM_GENERATION = None
+            _VACUUM_THREAD = None
+        def publish(thread) -> None:
+            global _VACUUM_THREAD
+            _VACUUM_THREAD = thread
+
+        def clear(thread) -> None:
+            global _VACUUM_THREAD
+            if _VACUUM_THREAD is thread:
+                _VACUUM_THREAD = None
+
+        def publish_generation(generation) -> None:
+            global _VACUUM_GENERATION
+            _VACUUM_GENERATION = generation
+
+        def clear_generation(generation) -> None:
+            global _VACUUM_GENERATION
+            if _VACUUM_GENERATION is generation:
+                _VACUUM_GENERATION = None
+
         candidate = _start_optional_db_thread(
             target=_vacuum_worker,
             name="db-vacuum",
             failure_context="start DB vacuum worker",
+            publish_candidate=publish,
+            clear_candidate=clear,
+            publish_generation=publish_generation,
+            clear_generation=clear_generation,
         )
         if candidate is None:
             _VACUUM_THREAD = None
@@ -2119,37 +3024,144 @@ def shutdown_database_background_workers(timeout: float = 2.0) -> bool:
     worker remains alive, allowing the runtime finalizer to retry instead of
     publishing an untruthful clean shutdown.
     """
-    global _MAINT_THREAD, _MAINT_THREAD_STARTED, _VACUUM_THREAD
+    global _MAINT_GENERATION, _MAINT_THREAD, _MAINT_THREAD_STARTED
+    global _VACUUM_GENERATION, _VACUUM_THREAD
+    if isinstance(timeout, bool):
+        return False
     try:
-        timeout = max(0.0, float(timeout))
+        requested_timeout = float(timeout)
     except (TypeError, ValueError, OverflowError):
-        timeout = 0.0
+        return False
+    if not math.isfinite(requested_timeout):
+        return False
+    budget = min(max(0.0, requested_timeout), threading.TIMEOUT_MAX)
+    deadline = _time.monotonic() + budget
     _MAINT_STOP_EVENT.set()
     _VACUUM_STOP_EVENT.set()
-    with _MAINT_LOCK:
-        maint_thread = _MAINT_THREAD
-    with _VACUUM_LOCK:
-        vacuum_thread = _VACUUM_THREAD
-    deadline = _time.monotonic() + timeout
+
+    def _snapshot(lock, thread):
+        remaining = min(
+            max(0.0, deadline - _time.monotonic()),
+            threading.TIMEOUT_MAX,
+        )
+        if not lock.acquire(timeout=remaining):
+            return False, None
+        try:
+            return True, thread()
+        finally:
+            lock.release()
+
+    maint_known, maint_thread = _snapshot(
+        _MAINT_LOCK,
+        lambda: (_MAINT_THREAD, _MAINT_GENERATION),
+    )
+    vacuum_known, vacuum_thread = _snapshot(
+        _VACUUM_LOCK,
+        lambda: (_VACUUM_THREAD, _VACUUM_GENERATION),
+    )
+    if maint_known:
+        maint_thread, maint_generation = maint_thread
+    else:
+        maint_generation = None
+    if vacuum_known:
+        vacuum_thread, vacuum_generation = vacuum_thread
+    else:
+        vacuum_generation = None
     current = threading.current_thread()
-    for thread in (maint_thread, vacuum_thread):
-        if thread is None or thread is current or not thread.is_alive():
-            continue
-        remaining = max(0.0, deadline - _time.monotonic())
-        thread.join(timeout=remaining)
-    maint_alive = bool(maint_thread and maint_thread.is_alive())
-    vacuum_alive = bool(vacuum_thread and vacuum_thread.is_alive())
-    if not maint_alive:
-        with _MAINT_LOCK:
-            if _MAINT_THREAD is maint_thread:
-                _MAINT_THREAD = None
-                _MAINT_THREAD_STARTED = False
-    if not vacuum_alive:
-        with _VACUUM_LOCK:
-            if _VACUUM_THREAD is vacuum_thread:
-                _VACUUM_THREAD = None
-    connection_closed = close_thread_local_conn()
-    return not maint_alive and not vacuum_alive and connection_closed
+
+    def _join_status(thread, generation):
+        if generation is not None:
+            thread = generation.get("thread")
+        if thread is None:
+            return (
+                (True, False)
+                if generation is None or generation["done"].is_set()
+                else (True, True)
+            )
+        try:
+            alive = bool(thread.is_alive())
+        except BaseException:
+            return False, True
+        if alive and thread is not current:
+            remaining = min(
+                max(0.0, deadline - _time.monotonic()),
+                threading.TIMEOUT_MAX,
+            )
+            try:
+                thread.join(timeout=remaining)
+            except BaseException:
+                return False, True
+        try:
+            alive = bool(thread.is_alive())
+        except BaseException:
+            return False, True
+
+        if generation is not None and not generation["done"].is_set():
+            return True, True
+        return True, alive
+
+    maint_liveness_known, maint_alive = _join_status(
+        maint_thread,
+        maint_generation,
+    )
+    vacuum_liveness_known, vacuum_alive = _join_status(
+        vacuum_thread,
+        vacuum_generation,
+    )
+    pending_vacuum_release_ok = True
+    if vacuum_liveness_known and not vacuum_alive:
+        remaining = min(
+            max(0.0, deadline - _time.monotonic()),
+            threading.TIMEOUT_MAX,
+        )
+        pending_vacuum_release_ok = _drain_pending_vacuum_release(
+            timeout=remaining,
+        )
+    cleanup_ok = True
+    if maint_known and maint_liveness_known and not maint_alive:
+        remaining = min(
+            max(0.0, deadline - _time.monotonic()),
+            threading.TIMEOUT_MAX,
+        )
+        if _MAINT_LOCK.acquire(timeout=remaining):
+            try:
+                if _MAINT_THREAD is maint_thread:
+                    _MAINT_THREAD = None
+                    _MAINT_THREAD_STARTED = False
+                if _MAINT_GENERATION is maint_generation:
+                    _MAINT_GENERATION = None
+            finally:
+                _MAINT_LOCK.release()
+        else:
+            cleanup_ok = False
+    if vacuum_known and vacuum_liveness_known and not vacuum_alive:
+        remaining = min(
+            max(0.0, deadline - _time.monotonic()),
+            threading.TIMEOUT_MAX,
+        )
+        if _VACUUM_LOCK.acquire(timeout=remaining):
+            try:
+                if _VACUUM_THREAD is vacuum_thread:
+                    _VACUUM_THREAD = None
+                if _VACUUM_GENERATION is vacuum_generation:
+                    _VACUUM_GENERATION = None
+            finally:
+                _VACUUM_LOCK.release()
+        else:
+            cleanup_ok = False
+    connection_closed = close_thread_local_conn(deadline=deadline)
+    return (
+        maint_known
+        and vacuum_known
+        and maint_liveness_known
+        and vacuum_liveness_known
+        and not maint_alive
+        and not vacuum_alive
+        and pending_vacuum_release_ok
+        and _VACUUM_PENDING_RELEASE_HOLDER_ID is None
+        and cleanup_ok
+        and connection_closed
+    )
 
 
 # 
@@ -3414,7 +4426,9 @@ def finalize_interrupted_futures_candidates(
         ).fetchall()
         claim_rows = conn.execute(
             """SELECT bot_name, symbol, position_type, extra_json
-                 FROM bot_open_positions"""
+                 FROM bot_open_positions
+                WHERE UPPER(TRIM(COALESCE(state, '')))
+                      NOT IN ('CLOSED', 'FLAT')"""
         ).fetchall()
         finalized = []
         for candidate in candidates:
@@ -3679,15 +4693,28 @@ def list_venue_capture_priorities(limit: int = 8) -> list[str]:
     if not _INIT_DB_DONE:
         init_db()
     conn = get_connection()
-    now = _utcnow_str()
+    now_dt = _utcnow()
+    now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    fresh_cutoff = (
+        now_dt - timedelta(minutes=30)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    future_limit = (
+        now_dt + timedelta(minutes=1)
+    ).strftime("%Y-%m-%d %H:%M:%S")
     active_rows = conn.execute(
         """SELECT symbol, 0 AS source_order, opened_at AS priority_time
              FROM bot_open_positions
-            WHERE UPPER(COALESCE(state,'OPEN')) = 'OPEN'
+            WHERE UPPER(TRIM(COALESCE(state, '')))
+                  NOT IN ('CLOSED', 'FLAT')
             UNION ALL
-           SELECT symbol, 0 AS source_order, opened_at AS priority_time
+           SELECT symbol, 1 AS source_order, last_update AS priority_time
              FROM futures_state
-            ORDER BY source_order, priority_time DESC"""
+            WHERE strftime('%Y-%m-%d %H:%M:%S', julianday(last_update))
+                  = last_update
+              AND last_update >= ?
+              AND last_update <= ?
+            ORDER BY source_order, priority_time DESC""",
+        (fresh_cutoff, future_limit),
     ).fetchall()
     requested_rows = conn.execute(
         """SELECT symbol FROM venue_capture_priority
@@ -4192,8 +5219,12 @@ def enforce_research_telemetry_retention(
         deleted["expectancy_cap"] = max(0, cursor.rowcount)
         conn.commit()
         return deleted
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "research telemetry retention",
+        )
         raise
 
 
@@ -4441,9 +5472,9 @@ def _complete_trade_positions(
     terminal_predicate=None,
 ) -> list[dict]:
     owns_read_transaction = not conn.in_transaction
-    if owns_read_transaction:
-        conn.execute("BEGIN")
     try:
+        if owns_read_transaction:
+            conn.execute("BEGIN")
         positions = _complete_trade_positions_from_snapshot(
             conn,
             bot_name,
@@ -4451,12 +5482,16 @@ def _complete_trade_positions(
             strict=strict,
             terminal_predicate=terminal_predicate,
         )
-    except Exception:
         if owns_read_transaction:
-            conn.rollback()
+            conn.commit()
+    except BaseException as exc:
+        if owns_read_transaction:
+            _rollback_transaction_preserving(
+                conn,
+                exc,
+                "complete trade position snapshot",
+            )
         raise
-    if owns_read_transaction:
-        conn.commit()
     return positions
 
 
@@ -4489,13 +5524,49 @@ def _validated_futures_state_bot_db(bot_name, mode_is_sim) -> str:
     return _metric_bot_for_mode(validated_bot, parsed_mode)
 
 
+def _live_futures_claim_owns_entry_db(
+    conn,
+    bot_name: str,
+    symbol: str,
+    entry_id: str,
+) -> bool:
+    """Whether exactly one active futures claim owns this entry generation."""
+    base = _base_symbol(symbol)
+    rows = conn.execute(
+        """SELECT extra_json FROM bot_open_positions
+             WHERE bot_name=?
+               AND UPPER(TRIM(COALESCE(state, '')))
+                   NOT IN ('CLOSED', 'FLAT')
+               AND UPPER(TRIM(COALESCE(position_type, 'SPOT'))) <> 'SPOT'
+               AND (symbol = ?
+                    OR symbol LIKE ? ESCAPE '!'
+                    OR symbol LIKE ? ESCAPE '!')""",
+        (bot_name, *_literal_symbol_match_params(base)),
+    ).fetchall()
+    if len(rows) != 1:
+        return False
+    extra = _strict_claim_extra_object(rows[0]["extra_json"])
+    if extra is None:
+        return False
+    try:
+        claim_entry_id = _causal_entry_id_db(
+            extra.get("entry_id"), required=True
+        )
+    except (TypeError, ValueError):
+        return False
+    return claim_entry_id == entry_id
+
+
 def upsert_futures_state(symbol, bot_name, position_type, entry_price,
                           current_price, leverage, margin_usdt,
                           position_size_usdt, unrealized_pnl, unrealized_pct,
                           liquidation_price, liq_distance_pct, funding_paid,
-                          opened_at, mode_is_sim=None) -> None:
+                          opened_at, mode_is_sim=None, *, entry_id=None) -> bool:
     validated_symbol = _required_text_db(symbol, "symbol", max_length=64)
     namespaced_bot = _validated_futures_state_bot_db(bot_name, mode_is_sim)
+    canonical_bot = _canonical_bot_name_db(bot_name)
+    parsed_mode = _coerce_mode_is_sim(mode_is_sim)
+    normalized_entry_id = _causal_entry_id_db(entry_id, required=False)
     validated_position_type = _required_text_db(
         position_type, "position_type", max_length=5
     ).upper()
@@ -4542,15 +5613,30 @@ def upsert_futures_state(symbol, bot_name, position_type, entry_price,
     conn = get_connection()
     now = _utcnow_str()
     try:
+        if parsed_mode is not True and normalized_entry_id is not None:
+            # Serialize claim validation with claim release/replacement.  A
+            # monitor snapshot may outlive its local position; only the claim
+            # registry can authoritatively prove that its generation remains
+            # LIVE-current at the instant the dashboard row is written.
+            conn.execute("BEGIN IMMEDIATE")
+            if not _live_futures_claim_owns_entry_db(
+                conn,
+                canonical_bot,
+                validated_symbol,
+                normalized_entry_id,
+            ):
+                conn.commit()
+                return False
         conn.execute("""
         INSERT INTO futures_state
-            (symbol, bot_name, position_type, entry_price, current_price,
+            (symbol, bot_name, entry_id, position_type, entry_price, current_price,
              leverage, margin_usdt, position_size_usdt,
              unrealized_pnl, unrealized_pct,
              liquidation_price, liq_distance_pct, funding_paid,
              opened_at, last_update)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(symbol, bot_name) DO UPDATE SET
+            entry_id           = excluded.entry_id,
             position_type      = excluded.position_type,
             entry_price        = excluded.entry_price,
             current_price      = excluded.current_price,
@@ -4564,7 +5650,8 @@ def upsert_futures_state(symbol, bot_name, position_type, entry_price,
             funding_paid       = excluded.funding_paid,
             opened_at          = excluded.opened_at,
             last_update        = excluded.last_update""", (
-            validated_symbol, namespaced_bot, validated_position_type,
+            validated_symbol, namespaced_bot, normalized_entry_id,
+            validated_position_type,
             normalized_entry_price, normalized_current_price,
             normalized_leverage, normalized_margin, normalized_size,
             normalized_unrealized_pnl, normalized_unrealized_pct,
@@ -4572,12 +5659,29 @@ def upsert_futures_state(symbol, bot_name, position_type, entry_price,
             normalized_funding, normalized_opened_at, now,
         ))
         conn.commit()
-    except Exception:
-        conn.rollback()
+        return True
+    except BaseException as exc:
+        try:
+            conn.rollback()
+        except BaseException as rollback_error:
+            try:
+                exc.add_note(
+                    "rollback futures-state upsert: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+            except BaseException:
+                pass
         raise
 
 
-def remove_futures_state(symbol: str, bot_name: str, mode_is_sim=None) -> None:
+def remove_futures_state(
+    symbol: str,
+    bot_name: str,
+    mode_is_sim=None,
+    *,
+    expected_opened_at=None,
+    expected_entry_id=None,
+) -> bool:
     """Delete the live-state row for ONE bot's position.
 
     ``bot_name`` is REQUIRED. FUTURES and CROSS share the futures_state table,
@@ -4590,15 +5694,61 @@ def remove_futures_state(symbol: str, bot_name: str, mode_is_sim=None) -> None:
     """
     validated_symbol = _required_text_db(symbol, "symbol", max_length=64)
     namespaced_bot = _validated_futures_state_bot_db(bot_name, mode_is_sim)
+    normalized_opened_at = None
+    if expected_opened_at is not None:
+        normalized_opened_at, _opened_at_dt = _trade_timestamp_db(
+            expected_opened_at,
+            "expected_opened_at",
+        )
+    normalized_entry_id = None
+    if expected_entry_id is not None:
+        normalized_entry_id = _causal_entry_id_db(
+            expected_entry_id, required=True
+        )
     conn = get_connection()
     try:
-        conn.execute(
-            "DELETE FROM futures_state WHERE symbol=? AND bot_name=?",
-            (validated_symbol, namespaced_bot),
-        )
+        if normalized_entry_id is not None and normalized_opened_at is not None:
+            cursor = conn.execute(
+                "DELETE FROM futures_state "
+                "WHERE symbol=? AND bot_name=? "
+                "AND (entry_id=? OR (entry_id IS NULL AND opened_at=?))",
+                (
+                    validated_symbol,
+                    namespaced_bot,
+                    normalized_entry_id,
+                    normalized_opened_at,
+                ),
+            )
+        elif normalized_entry_id is not None:
+            cursor = conn.execute(
+                "DELETE FROM futures_state "
+                "WHERE symbol=? AND bot_name=? AND entry_id=?",
+                (validated_symbol, namespaced_bot, normalized_entry_id),
+            )
+        elif normalized_opened_at is None:
+            cursor = conn.execute(
+                "DELETE FROM futures_state WHERE symbol=? AND bot_name=?",
+                (validated_symbol, namespaced_bot),
+            )
+        else:
+            cursor = conn.execute(
+                "DELETE FROM futures_state "
+                "WHERE symbol=? AND bot_name=? AND opened_at=?",
+                (validated_symbol, namespaced_bot, normalized_opened_at),
+            )
         conn.commit()
-    except Exception:
-        conn.rollback()
+        return cursor.rowcount > 0
+    except BaseException as exc:
+        try:
+            conn.rollback()
+        except BaseException as rollback_error:
+            try:
+                exc.add_note(
+                    "rollback futures-state removal: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+            except BaseException:
+                pass
         raise
 
 
@@ -4630,6 +5780,87 @@ def get_futures_state(bot_name: str = None, mode_is_sim=None) -> list:
         rows = conn.execute(
             "SELECT * FROM futures_state ORDER BY opened_at DESC").fetchall()
     return [dict(r) for r in rows]
+
+
+def get_claim_bound_live_futures_state() -> list:
+    """Return LIVE dashboard rows matching the sole active claim generation.
+
+    ``futures_state`` is a best-effort monitor mirror and can briefly retain a
+    closed generation.  Money views must never select such a row by symbol
+    alone.  Read dashboard rows and claims from one SQLite snapshot, reject
+    malformed/ambiguous ownership, and require the immutable ``entry_id``.
+    """
+    conn = get_connection()
+    owns_snapshot = not conn.in_transaction
+    try:
+        if owns_snapshot:
+            conn.execute("BEGIN")
+        dashboard_rows = conn.execute(
+            "SELECT * FROM futures_state"
+        ).fetchall()
+        claim_rows = conn.execute(
+            """SELECT bot_name, symbol, extra_json
+                 FROM bot_open_positions
+                WHERE UPPER(TRIM(COALESCE(state, '')))
+                      NOT IN ('CLOSED', 'FLAT')
+                  AND UPPER(TRIM(COALESCE(position_type, 'SPOT'))) <> 'SPOT'"""
+        ).fetchall()
+
+        claims: dict[tuple[str, str], str] = {}
+        owners_by_base: dict[str, set[tuple[str, str]]] = {}
+        ambiguous_bases: set[str] = set()
+        for row in claim_rows:
+            base = _base_symbol(row["symbol"])
+            if not base:
+                continue
+            try:
+                bot = _canonical_bot_name_db(row["bot_name"])
+                extra = _strict_claim_extra_object(row["extra_json"])
+                if extra is None:
+                    raise ValueError("claim extra_json is invalid")
+                entry_id = _causal_entry_id_db(
+                    extra.get("entry_id"), required=True
+                )
+            except (TypeError, ValueError):
+                ambiguous_bases.add(base)
+                continue
+            key = (bot, base)
+            prior = claims.get(key)
+            if prior is not None and prior != entry_id:
+                ambiguous_bases.add(base)
+                continue
+            claims[key] = entry_id
+            owners_by_base.setdefault(base, set()).add(key)
+
+        ambiguous_bases.update(
+            base for base, owners in owners_by_base.items() if len(owners) != 1
+        )
+        result = []
+        for raw_row in dashboard_rows:
+            row = dict(raw_row)
+            base = _base_symbol(row.get("symbol"))
+            if not base or base in ambiguous_bases:
+                continue
+            try:
+                bot = _canonical_bot_name_db(row.get("bot_name"))
+                entry_id = _causal_entry_id_db(
+                    row.get("entry_id"), required=True
+                )
+            except (TypeError, ValueError):
+                continue
+            if claims.get((bot, base)) == entry_id:
+                result.append(row)
+        if owns_snapshot:
+            conn.commit()
+        return result
+    except BaseException as exc:
+        if owns_snapshot:
+            _rollback_transaction_preserving(
+                conn,
+                exc,
+                "claim-bound futures-state snapshot",
+            )
+        raise
 
 
 #  Drawdown 
@@ -4712,8 +5943,17 @@ def pause_bot_today(bot_name: str, reason: str = "", mode_is_sim=None) -> None:
         ON CONFLICT(bot_name, trade_date) DO UPDATE SET is_paused=1
         """, (namespaced_bot, today))
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        try:
+            conn.rollback()
+        except BaseException as rollback_error:
+            try:
+                exc.add_note(
+                    "rollback daily safety pause: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+            except BaseException:
+                pass
         raise
     # The safety pause is committed before its audit row deliberately: a
     # transient logging failure must never roll back the kill switch.
@@ -4726,6 +5966,7 @@ def pause_bot_today(bot_name: str, reason: str = "", mode_is_sim=None) -> None:
 #  Params 
 
 _PARAM_CACHE: dict = {}
+_PARAM_CACHE_EPOCHS: dict[tuple[str, str], int] = {}
 _PARAM_CACHE_TTL  = 60.0
 _PARAM_CACHE_LOCK = threading.Lock()
 
@@ -4765,19 +6006,23 @@ def _get_param_raw(bot_name: str, param_name: str):
         bot_name, param_name
     )
     key = (validated_bot, validated_param)
-    now = _time.monotonic()
-    with _PARAM_CACHE_LOCK:
-        cached = _PARAM_CACHE.get(key)
-        if cached and (now - cached[1]) < _PARAM_CACHE_TTL:
-            return cached[0]
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT param_value FROM bot_params WHERE bot_name=? AND param_name=?",
-        key).fetchone()
-    val = row["param_value"] if row else None
-    with _PARAM_CACHE_LOCK:
-        _PARAM_CACHE[key] = (val, _time.monotonic())
-    return val
+    while True:
+        now = _time.monotonic()
+        with _PARAM_CACHE_LOCK:
+            cached = _PARAM_CACHE.get(key)
+            if cached and (now - cached[1]) < _PARAM_CACHE_TTL:
+                return cached[0]
+            read_epoch = _PARAM_CACHE_EPOCHS.get(key, 0)
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT param_value FROM bot_params WHERE bot_name=? AND param_name=?",
+            key).fetchone()
+        val = row["param_value"] if row else None
+        with _PARAM_CACHE_LOCK:
+            if _PARAM_CACHE_EPOCHS.get(key, 0) != read_epoch:
+                continue
+            _PARAM_CACHE[key] = (val, _time.monotonic())
+            return val
 
 
 def get_param(bot_name: str, param_name: str, default: float) -> float:
@@ -4820,12 +6065,23 @@ def set_param(bot_name: str, param_name: str, value, reason: str = "") -> None:
             reason      = excluded.reason""", (
             validated_bot, validated_param, validated_value,
             _utcnow_str(), validated_reason))
-        conn.commit()
-    except Exception:
-        conn.rollback()
+        with _PARAM_CACHE_LOCK:
+            key = (validated_bot, validated_param)
+            _PARAM_CACHE_EPOCHS[key] = _PARAM_CACHE_EPOCHS.get(key, 0) + 1
+            _PARAM_CACHE.pop(key, None)
+            conn.commit()
+    except BaseException as exc:
+        try:
+            conn.rollback()
+        except BaseException as rollback_error:
+            try:
+                exc.add_note(
+                    "rollback bot parameter update: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+            except BaseException:
+                pass
         raise
-    with _PARAM_CACHE_LOCK:
-        _PARAM_CACHE.pop((validated_bot, validated_param), None)
 
 
 #  Blacklist 
@@ -4866,13 +6122,37 @@ def is_blacklisted(symbol: str, bot_name: str) -> bool:
     return False
 
 
-def cleanup_expired_blacklist() -> int:
+def _execute_thread_local_delete(
+    statement: str,
+    params: tuple[object, ...],
+    *,
+    context: str,
+) -> int:
     conn = get_connection()
-    cur = conn.execute(
+    try:
+        cursor = conn.execute(statement, params)
+        conn.commit()
+        return cursor.rowcount
+    except BaseException as exc:
+        try:
+            conn.rollback()
+        except BaseException as rollback_error:
+            try:
+                exc.add_note(
+                    f"rollback {context}: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+            except BaseException:
+                pass
+        raise
+
+
+def cleanup_expired_blacklist() -> int:
+    return _execute_thread_local_delete(
         "DELETE FROM coin_blacklist WHERE blacklisted_until < ?",
-        (_utcnow_str(),))
-    conn.commit()
-    return cur.rowcount
+        (_utcnow_str(),),
+        context="expired blacklist cleanup",
+    )
 
 
 def add_to_blacklist(symbol: str, bot_name: str, loss_usdt: float,
@@ -4929,8 +6209,17 @@ def add_to_blacklist(symbol: str, bot_name: str, loss_usdt: float,
             """, (validated_symbol, validated_bot, loss_clean, now_s, until,
                   validated_reason))
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        try:
+            conn.rollback()
+        except BaseException as rollback_error:
+            try:
+                exc.add_note(
+                    "rollback blacklist update: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+            except BaseException:
+                pass
         raise
 
 
@@ -4957,8 +6246,17 @@ def log_market_regime(regime: str, btc_24h=None, btc_7d=None,
             _optional_fear_greed_db(fear_greed),
         ))
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        try:
+            conn.rollback()
+        except BaseException as rollback_error:
+            try:
+                exc.add_note(
+                    "rollback market-regime log: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+            except BaseException:
+                pass
         raise
 
 
@@ -4970,13 +6268,11 @@ def cleanup_old_market_regime(
     if not 1 <= days <= 3_650:
         raise ValueError("days must be between 1 and 3650")
     cutoff = (_utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    conn = get_connection()
-    try:
-        conn.execute("DELETE FROM market_regime WHERE timestamp < ?", (cutoff,))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+    _execute_thread_local_delete(
+        "DELETE FROM market_regime WHERE timestamp < ?",
+        (cutoff,),
+        context="old market-regime cleanup",
+    )
 
 
 #  Learning log 
@@ -5020,8 +6316,17 @@ def log_learning(bot_name, action, param_name=None, old_value=None,
             validated_old, validated_new, validated_reason, trades_analyzed,
         ))
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        try:
+            conn.rollback()
+        except BaseException as rollback_error:
+            try:
+                exc.add_note(
+                    "rollback learning-log insert: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+            except BaseException:
+                pass
         raise
 
 
@@ -5261,9 +6566,9 @@ def get_winloss_heatmap(bot_name: str = None, days: int = 30) -> dict:
     conn = get_connection()
     cutoff = (_utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     owns_read_transaction = not conn.in_transaction
-    if owns_read_transaction:
-        conn.execute("BEGIN")
     try:
+        if owns_read_transaction:
+            conn.execute("BEGIN")
         if validated_bot is None:
             bot_names = [
                 str(row["bot_name"])
@@ -5281,12 +6586,16 @@ def get_winloss_heatmap(bot_name: str = None, days: int = 30) -> dict:
             positions.extend(_complete_trade_positions(
                 conn, scoped_bot, cutoff=cutoff, strict=True
             ))
-    except Exception:
         if owns_read_transaction:
-            conn.rollback()
+            conn.commit()
+    except BaseException as exc:
+        if owns_read_transaction:
+            _rollback_transaction_preserving(
+                conn,
+                exc,
+                "win/loss heatmap snapshot",
+            )
         raise
-    if owns_read_transaction:
-        conn.commit()
 
     grouped: dict[tuple[int, int], dict[str, float | int]] = {}
     for position in positions:
@@ -5359,12 +6668,20 @@ def release_advisory_lock(lock_name: str, holder_id: str) -> bool:
             (lock_name, holder_id))
         conn.commit()
         return int(cur.rowcount or 0) > 0
-    except Exception:
-        try:
-            if conn is not None:
+    except BaseException as exc:
+        if conn is not None:
+            try:
                 conn.rollback()
-        except Exception:
-            pass
+            except BaseException as rollback_error:
+                try:
+                    exc.add_note(
+                        "rollback advisory-lock release: "
+                        f"{type(rollback_error).__name__}: {rollback_error}"
+                    )
+                except BaseException:
+                    pass
+        if not isinstance(exc, Exception):
+            raise
         return False
 
 
@@ -5409,12 +6726,20 @@ def release_advisory_locks_for_dead_process(
         )
         conn.commit()
         return int(cur.rowcount or 0)
-    except Exception:
-        try:
-            if conn is not None:
+    except BaseException as exc:
+        if conn is not None:
+            try:
                 conn.rollback()
-        except Exception:
-            pass
+            except BaseException as rollback_error:
+                try:
+                    exc.add_note(
+                        "rollback dead-process advisory-lock release: "
+                        f"{type(rollback_error).__name__}: {rollback_error}"
+                    )
+                except BaseException:
+                    pass
+        if not isinstance(exc, Exception):
+            raise
         return 0
 
 
@@ -5426,6 +6751,7 @@ def renew_advisory_lock(lock_name: str, holder_id: str,
         lock_name, holder_id, ttl_sec, validate_ttl=True
     )
     assert validated_ttl is not None
+    conn = None
     try:
         conn = get_connection()
         now = _utcnow()
@@ -5433,17 +6759,29 @@ def renew_advisory_lock(lock_name: str, holder_id: str,
         expires_at = (now + timedelta(seconds=validated_ttl)).strftime(
             "%Y-%m-%d %H:%M:%S")
         cur = conn.execute(
-            "UPDATE advisory_locks SET expires_at=? "
-            "WHERE lock_name=? AND holder_id=? AND expires_at>=?",
-            (expires_at, lock_name, holder_id, now_str),
+            "UPDATE advisory_locks SET expires_at="
+            "CASE WHEN expires_at>? THEN expires_at ELSE ? END "
+            "WHERE lock_name=? AND holder_id=? AND expires_at>=? "
+            "AND strftime('%Y-%m-%d %H:%M:%S', julianday(expires_at))="
+            "expires_at",
+            (expires_at, expires_at, lock_name, holder_id, now_str),
         )
         conn.commit()
         return cur.rowcount > 0
-    except Exception:
-        try:
-            get_connection().rollback()
-        except Exception:
-            pass
+    except BaseException as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except BaseException as rollback_error:
+                try:
+                    exc.add_note(
+                        "rollback advisory-lock renewal: "
+                        f"{type(rollback_error).__name__}: {rollback_error}"
+                    )
+                except BaseException:
+                    pass
+        if not isinstance(exc, Exception):
+            raise
         return False
 
 
@@ -5679,11 +7017,87 @@ def mark_global_api_call_error(
 
 #  Open positions 
 
+
+def _claim_generation_conflicts_db(
+    rows,
+    *,
+    normalized_symbol: str,
+    incoming_entry_id: str | None,
+) -> bool:
+    """Compare one incoming mirror with active rows already owned by its bot."""
+    if not rows:
+        return False
+    if len(rows) != 1:
+        return True
+    row = dict(rows[0])
+    if str(row.get("symbol") or "").strip() != normalized_symbol:
+        return True
+    extra = _strict_claim_extra_object(row.get("extra_json"))
+    if extra is None:
+        return True
+    try:
+        existing_entry_id = _causal_entry_id_db(
+            extra.get("entry_id"), required=False
+        )
+    except (TypeError, ValueError):
+        return True
+    return (
+        existing_entry_id is not None
+        and existing_entry_id != incoming_entry_id
+    )
+
+
+def open_position_claim_generation_conflicts(
+    bot_name: str,
+    symbol: str,
+    position_type: str,
+    entry_id,
+) -> bool | None:
+    """Read whether an active self-claim contradicts an incoming generation.
+
+    ``None`` means the registry could not be read, so callers can remain
+    fail-closed without confusing unavailability with a proven conflict.
+    """
+    if not isinstance(bot_name, str) or not bot_name.strip():
+        return True
+    if not isinstance(symbol, str) or not symbol.strip():
+        return True
+    if not isinstance(position_type, str):
+        return True
+    normalized_position_type = position_type.strip().upper()
+    if normalized_position_type not in {"SPOT", "FUTURES", "LONG", "SHORT"}:
+        return True
+    normalized_symbol = symbol.strip()
+    base = _base_symbol(normalized_symbol)
+    if not base:
+        return True
+    try:
+        incoming_entry_id = _causal_entry_id_db(entry_id, required=False)
+    except (TypeError, ValueError):
+        return True
+    try:
+        rows = get_connection().execute(
+            """SELECT symbol, extra_json FROM bot_open_positions
+                 WHERE bot_name=?
+                   AND symbol=?
+                   AND UPPER(TRIM(COALESCE(state, '')))
+                       NOT IN ('CLOSED', 'FLAT')""",
+            (bot_name.strip(), normalized_symbol),
+        ).fetchall()
+    except Exception:
+        return None
+    return _claim_generation_conflicts_db(
+        rows,
+        normalized_symbol=normalized_symbol,
+        incoming_entry_id=incoming_entry_id,
+    )
+
 def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
                          invested_usdt, position_type="SPOT", leverage=1.0,
                          state="OPEN", rsi_15m=None, rsi_1h=None, rsi_4h=None,
                          change_pct=None, btc_trend=None, fear_greed=None,
-                         extra: dict = None) -> bool:
+                         extra: dict = None, *,
+                         preserve_existing_generation: bool = False) -> bool:
     """Upsert one open-position mirror row.
 
     Returns True when the row was written or updated. Returns False when a
@@ -5715,6 +7129,8 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
         return False
     if extra is not None and not isinstance(extra, dict):
         return False
+    if not isinstance(preserve_existing_generation, bool):
+        return False
 
     safe_buy = _optional_finite_db(buy_price)
     safe_amount = _optional_finite_db(amount)
@@ -5727,20 +7143,34 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
     if state_norm == "OPEN" and (safe_buy <= 0.0 or safe_amount <= 0.0):
         return False
 
+    safe_extra = dict(extra or {})
+    try:
+        incoming_entry_id = _causal_entry_id_db(
+            safe_extra.get("entry_id"), required=False
+        )
+    except (TypeError, ValueError):
+        return False
+    if incoming_entry_id is None:
+        safe_extra.pop("entry_id", None)
+    else:
+        safe_extra["entry_id"] = incoming_entry_id
+
     safe_metrics = tuple(
         _optional_signed_finite_db(value)
         for value in (rsi_15m, rsi_1h, rsi_4h, change_pct, btc_trend)
     ) + (_optional_fear_greed_db(fear_greed),)
     try:
-        extra_json = json.dumps(extra or {}, allow_nan=False)
+        extra_json = json.dumps(safe_extra, allow_nan=False)
     except (TypeError, ValueError, OverflowError):
         return False
 
     conn = None
+    transaction_maybe_active = False
     try:
         conn = get_connection()
         opened_at = _utcnow_str()
 
+        transaction_maybe_active = True
         conn.execute("BEGIN IMMEDIATE")
         if state_norm not in {"CLOSED", "FLAT"}:
             base = _base_symbol(normalized_symbol)
@@ -5756,10 +7186,14 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
                            OR symbol LIKE ? ESCAPE '!'
                            OR symbol LIKE ? ESCAPE '!')
                       AND {class_clause}
+                      AND UPPER(TRIM(COALESCE(state, '')))
+                          NOT IN ('CLOSED', 'FLAT')
                     LIMIT 1""",
                 (normalized_bot, *_literal_symbol_match_params(base)),
             ).fetchone()
             if conflict is not None:
+                conn.execute("ROLLBACK")
+                transaction_maybe_active = False
                 from core.logger import log_event, log_struct
                 log_event(
                     f"[DB] upsert_open_position blocked: {normalized_symbol} "
@@ -5770,8 +7204,23 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
                     symbol=normalized_symbol,
                     position_type=normalized_position_type,
                 )
-                conn.execute("ROLLBACK")
                 return False
+            if preserve_existing_generation:
+                own_rows = conn.execute(
+                    """SELECT symbol, extra_json FROM bot_open_positions
+                         WHERE bot_name=? AND symbol=?
+                           AND UPPER(TRIM(COALESCE(state, '')))
+                               NOT IN ('CLOSED', 'FLAT')""",
+                    (normalized_bot, normalized_symbol),
+                ).fetchall()
+                if _claim_generation_conflicts_db(
+                    own_rows,
+                    normalized_symbol=normalized_symbol,
+                    incoming_entry_id=incoming_entry_id,
+                ):
+                    conn.execute("ROLLBACK")
+                    transaction_maybe_active = False
+                    return False
         conn.execute("""
         INSERT INTO bot_open_positions
             (bot_name, symbol, buy_price, buy_time, amount, invested_usdt,
@@ -5806,39 +7255,173 @@ def upsert_open_position(bot_name, symbol, buy_price, buy_time, amount,
             *safe_metrics, extra_json, opened_at,
         ))
         conn.commit()
+        transaction_maybe_active = False
         return True
-    except Exception as e:
+    except BaseException as e:
         # This SQLite table is a MIRROR  the live position truth is the JSON
         # store (atomic_save_json), so a failure here does not strand the
         # position. But the launcher dashboard and the risk manager's DB reads
         # (open-position counts, reconcile) consume this table; a swallowed
-        # write makes them diverge from reality. Log loudly + roll back.
+        # write makes them diverge from reality. Release the write lock before
+        # diagnostics so logging cannot prolong a BEGIN IMMEDIATE transaction.
+        if conn is not None and transaction_maybe_active:
+            try:
+                conn.rollback()
+                transaction_maybe_active = False
+            except BaseException as rollback_error:
+                try:
+                    e.add_note(
+                        "rollback open-position upsert: "
+                        f"{type(rollback_error).__name__}: {rollback_error}"
+                    )
+                except BaseException:
+                    pass
         try:
             from core.logger import log_event, log_struct
             log_event(f"[DB] upsert_open_position FAILED for {normalized_symbol}: {e} "
                       f"(SQLite mirror now divergent from JSON truth)", "WARN")
             log_struct("db_upsert_position_error", bot_name=normalized_bot,
                        symbol=normalized_symbol, error=str(e))
-        except Exception:
-            print(
-                f"[DB] upsert_open_position {normalized_symbol}: {e}",
-                flush=True,
-            )
-        try:
-            if conn is not None:
-                conn.rollback()
-        except Exception:
-            pass
+        except BaseException as log_error:
+            try:
+                e.add_note(
+                    "log open-position upsert failure: "
+                    f"{type(log_error).__name__}: {log_error}"
+                )
+            except BaseException:
+                pass
+            try:
+                print(
+                    f"[DB] upsert_open_position {normalized_symbol}: {e}",
+                    flush=True,
+                )
+            except BaseException as print_error:
+                try:
+                    e.add_note(
+                        "print open-position upsert failure: "
+                        f"{type(print_error).__name__}: {print_error}"
+                    )
+                except BaseException:
+                    pass
+        if not isinstance(e, Exception):
+            raise
         return False
 
 
-def remove_open_position(bot_name: str, symbol: str) -> bool:
-    conn = get_connection()
+def _release_active_reservation_for_claim_db(
+    conn,
+    *,
+    bot_name: str,
+    symbol: str,
+    entry_id: str | None,
+) -> bool:
+    """Release an entry reservation inside its owning claim transaction."""
+    if entry_id is None:
+        return True
     try:
+        reservation = conn.execute(
+            "SELECT * FROM portfolio_reservations WHERE intent_id=?",
+            (entry_id,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table: portfolio_reservations" in str(exc).lower():
+            return True
+        raise
+    if reservation is None:
+        return True
+    if not _portfolio_reservation_matches_intent_db(
+        reservation,
+        intent_id=entry_id,
+        bot_name=bot_name,
+        mode="LIVE",
+        symbol=symbol,
+        allowed_statuses=frozenset(("ACTIVE", "CONSUMED", "RELEASED")),
+    ):
+        return False
+    if reservation["status"] != "ACTIVE":
+        return True
+    released = conn.execute(
+        """UPDATE portfolio_reservations SET status='RELEASED'
+             WHERE reservation_id=? AND intent_id=? AND status='ACTIVE'""",
+        (reservation["reservation_id"], entry_id),
+    )
+    return released.rowcount == 1
+
+
+def remove_open_position(
+    bot_name: str,
+    symbol: str,
+    *,
+    expected_entry_id: str | None = None,
+) -> bool:
+    conn = None
+    try:
+        conn = get_connection()
         base = _base_symbol(symbol)
         if not bot_name or not base:
             return False
-        conn.execute(
+        validated_entry_id = None
+        if expected_entry_id is not None:
+            try:
+                validated_entry_id = _causal_entry_id_db(
+                    expected_entry_id, required=True
+                )
+            except (TypeError, ValueError):
+                return False
+            conn.execute("BEGIN IMMEDIATE")
+            if not _release_active_reservation_for_claim_db(
+                conn,
+                bot_name=bot_name,
+                symbol=base,
+                entry_id=validated_entry_id,
+            ):
+                conn.rollback()
+                return False
+            rows = conn.execute(
+                """SELECT rowid, extra_json FROM bot_open_positions
+                   WHERE bot_name=?
+                     AND UPPER(TRIM(COALESCE(state, '')))
+                         NOT IN ('CLOSED', 'FLAT')
+                     AND (symbol = ?
+                          OR symbol LIKE ? ESCAPE '!'
+                          OR symbol LIKE ? ESCAPE '!')""",
+                (bot_name, *_literal_symbol_match_params(base)),
+            ).fetchall()
+            if not rows:
+                conn.commit()
+                return True
+            matching_rowids = []
+            for row in rows:
+                extra = _strict_claim_extra_object(row["extra_json"])
+                if extra is None:
+                    conn.rollback()
+                    return False
+                try:
+                    stored_entry_id = _causal_entry_id_db(
+                        extra.get("entry_id"), required=False
+                    )
+                except (TypeError, ValueError):
+                    conn.rollback()
+                    return False
+                if stored_entry_id == validated_entry_id:
+                    matching_rowids.append(int(row["rowid"]))
+            if not matching_rowids:
+                # The requested generation is already gone and a newer claim
+                # owns this base.  The stale cleanup is an idempotent no-op.
+                conn.commit()
+                return True
+            if len(matching_rowids) != len(rows):
+                # Mixed generations for one bot/base are inconsistent.  Never
+                # partially delete through that ambiguity.
+                conn.rollback()
+                return False
+            placeholders = ",".join("?" for _ in matching_rowids)
+            conn.execute(
+                f"DELETE FROM bot_open_positions WHERE rowid IN ({placeholders})",
+                tuple(matching_rowids),
+            )
+        else:
+            conn.execute(
             """DELETE FROM bot_open_positions
                WHERE bot_name=?
                  AND (symbol = ?
@@ -5848,6 +7431,8 @@ def remove_open_position(bot_name: str, symbol: str) -> bool:
         remaining = conn.execute(
             """SELECT 1 FROM bot_open_positions
                WHERE bot_name=?
+                 AND UPPER(TRIM(COALESCE(state, '')))
+                     NOT IN ('CLOSED', 'FLAT')
                  AND (symbol = ?
                       OR symbol LIKE ? ESCAPE '!'
                       OR symbol LIKE ? ESCAPE '!')
@@ -5855,22 +7440,48 @@ def remove_open_position(bot_name: str, symbol: str) -> bool:
             (bot_name, *_literal_symbol_match_params(base))).fetchone()
         conn.commit()
         return remaining is None
-    except Exception as e:
+    except BaseException as e:
         # A swallowed DELETE leaves a STALE row in the mirror  the
         # dashboard/risk reads would show a position that is actually closed,
-        # potentially blocking re-entry or skewing counts. Log loudly + roll back.
+        # potentially blocking re-entry or skewing counts. Release any write
+        # lock before diagnostics and preserve fatal failures as authoritative.
+        if conn is not None:
+            try:
+                conn.rollback()
+            except BaseException as rollback_error:
+                try:
+                    e.add_note(
+                        "rollback open-position removal: "
+                        f"{type(rollback_error).__name__}: {rollback_error}"
+                    )
+                except BaseException:
+                    pass
         try:
             from core.logger import log_event, log_struct
             log_event(f"[DB] remove_open_position FAILED for {symbol}: {e} "
                       f"(stale mirror row may persist)", "WARN")
             log_struct("db_remove_position_error", bot_name=bot_name,
                        symbol=symbol, error=str(e))
-        except Exception:
-            print(f"[DB] remove_open_position {symbol}: {e}", flush=True)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        except BaseException as log_error:
+            try:
+                e.add_note(
+                    "log open-position removal failure: "
+                    f"{type(log_error).__name__}: {log_error}"
+                )
+            except BaseException:
+                pass
+            try:
+                print(f"[DB] remove_open_position {symbol}: {e}", flush=True)
+            except BaseException as print_error:
+                try:
+                    e.add_note(
+                        "print open-position removal failure: "
+                        f"{type(print_error).__name__}: {print_error}"
+                    )
+                except BaseException:
+                    pass
+        if not isinstance(e, Exception):
+            raise
         return False
 
 
@@ -5893,8 +7504,9 @@ def remove_pending_open_position_claim(bot_name: str, symbol: str) -> bool:
         or not normalized_symbol
     ):
         return False
-    conn = get_connection()
+    conn = None
     try:
+        conn = get_connection()
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT extra_json FROM bot_open_positions "
@@ -5913,6 +7525,23 @@ def remove_pending_open_position_claim(bot_name: str, symbol: str) -> bool:
         ):
             conn.execute("ROLLBACK")
             return False
+        pending_entry_id = None
+        if "entry_id" in extra:
+            try:
+                pending_entry_id = _causal_entry_id_db(
+                    extra.get("entry_id"), required=True
+                )
+            except (TypeError, ValueError):
+                conn.execute("ROLLBACK")
+                return False
+        if not _release_active_reservation_for_claim_db(
+            conn,
+            bot_name=normalized_bot,
+            symbol=normalized_symbol,
+            entry_id=pending_entry_id,
+        ):
+            conn.execute("ROLLBACK")
+            return False
         conn.execute(
             "DELETE FROM bot_open_positions WHERE bot_name=? AND symbol=?",
             (normalized_bot, normalized_symbol),
@@ -5926,11 +7555,18 @@ def remove_pending_open_position_claim(bot_name: str, symbol: str) -> bool:
             return False
         conn.commit()
         return True
-    except Exception as exc:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+    except BaseException as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except BaseException as rollback_error:
+                try:
+                    exc.add_note(
+                        "rollback pending-claim removal: "
+                        f"{type(rollback_error).__name__}: {rollback_error}"
+                    )
+                except BaseException:
+                    pass
         try:
             from core.logger import log_event, log_struct
             log_event(
@@ -5944,11 +7580,29 @@ def remove_pending_open_position_claim(bot_name: str, symbol: str) -> bool:
                 symbol=normalized_symbol,
                 error=str(exc),
             )
-        except Exception:
-            print(
-                f"[DB] pending claim remove {normalized_symbol}: {exc}",
-                flush=True,
-            )
+        except BaseException as log_error:
+            try:
+                exc.add_note(
+                    "log pending-claim removal failure: "
+                    f"{type(log_error).__name__}: {log_error}"
+                )
+            except BaseException:
+                pass
+            try:
+                print(
+                    f"[DB] pending claim remove {normalized_symbol}: {exc}",
+                    flush=True,
+                )
+            except BaseException as print_error:
+                try:
+                    exc.add_note(
+                        "print pending-claim removal failure: "
+                        f"{type(print_error).__name__}: {print_error}"
+                    )
+                except BaseException:
+                    pass
+        if not isinstance(exc, Exception):
+            raise
         return False
 
 
@@ -5956,7 +7610,9 @@ def get_open_positions_db(bot_name: str) -> list:
     conn = get_connection()
     try:
         rows = conn.execute(
-            "SELECT * FROM bot_open_positions WHERE bot_name=?",
+            """SELECT * FROM bot_open_positions WHERE bot_name=?
+               AND UPPER(TRIM(COALESCE(state, '')))
+                   NOT IN ('CLOSED', 'FLAT')""",
             (bot_name,)).fetchall()
         return [dict(r) for r in rows]
     except Exception as e:
@@ -6007,11 +7663,16 @@ def get_all_claimed_bases(exclude_bot: str = None, is_futures=None,
         conn = get_connection()
         if exclude_bot:
             rows = conn.execute(
-                "SELECT symbol, position_type FROM bot_open_positions WHERE bot_name != ?",
+                """SELECT symbol, position_type FROM bot_open_positions
+                   WHERE bot_name != ?
+                     AND UPPER(TRIM(COALESCE(state, '')))
+                         NOT IN ('CLOSED', 'FLAT')""",
                 (exclude_bot,)).fetchall()
         else:
             rows = conn.execute(
-                "SELECT symbol, position_type FROM bot_open_positions").fetchall()
+                """SELECT symbol, position_type FROM bot_open_positions
+                   WHERE UPPER(TRIM(COALESCE(state, '')))
+                         NOT IN ('CLOSED', 'FLAT')""").fetchall()
     except Exception as e:
         if fail_closed:
             try:
@@ -6041,7 +7702,10 @@ def is_claimed_by_other(symbol: str, bot_name: str, is_futures=None) -> bool:
     try:
         conn = get_connection()
         rows = conn.execute(
-            "SELECT symbol, position_type FROM bot_open_positions WHERE bot_name != ?",
+            """SELECT symbol, position_type FROM bot_open_positions
+               WHERE bot_name != ?
+                 AND UPPER(TRIM(COALESCE(state, '')))
+                     NOT IN ('CLOSED', 'FLAT')""",
             (bot_name,)).fetchall()
     except Exception as e:
         try:
@@ -6096,6 +7760,10 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
         return False
     bot_name = bot_name.strip()
     symbol = symbol.strip()
+    canonical_account = _portfolio_account_type_for_bot(bot_name)
+    position_account = (
+        "futures" if _is_futures_ptype(normalized_position_type) else "spot"
+    )
     validated_intent_id = None
     reserved = 0.0
     normalized_reservation_mode = "LIVE"
@@ -6103,9 +7771,14 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
     validated_oversize_ceiling = None
     validated_reservation_ceiling = None
     if intent_id is not None:
-        if not isinstance(intent_id, str) or not intent_id.strip():
+        if canonical_account is not None and canonical_account != position_account:
             return False
-        validated_intent_id = intent_id.strip()
+        try:
+            validated_intent_id = _causal_entry_id_db(
+                intent_id, required=True
+            )
+        except (TypeError, ValueError):
+            return False
         reserved_value = _optional_finite_db(notional_usdt)
         if reserved_value is None or reserved_value <= 0.0:
             return False
@@ -6183,6 +7856,7 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
     # wallets, so a spot claim must not block a futures claim of the same base.
     class_clause = ("position_type != 'SPOT'" if _is_futures_ptype(normalized_position_type)
                     else "position_type = 'SPOT'")
+    conn = None
     try:
         conn = get_connection()
         if validated_intent_id is not None:
@@ -6198,59 +7872,47 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
             conn.commit()
         conn.execute("BEGIN IMMEDIATE")
         now_str = claim_opened_at or _utcnow_str()
-        if validated_reservation_ceiling is not None:
-            active_rows = conn.execute(
-                """SELECT reservation.intent_id, reservation.notional_usdt,
-                          reservation.mode, reservation.status,
-                          claim.position_type, claim.extra_json
-                     FROM portfolio_reservations AS reservation
-                     LEFT JOIN bot_open_positions AS claim
-                       ON claim.bot_name=reservation.bot_name
-                      AND claim.symbol=reservation.symbol
-                    WHERE reservation.status='ACTIVE'
-                       OR (reservation.status='CONSUMED'
-                           AND claim.bot_name IS NOT NULL)"""
+        # Entry callers pre-check their bot-scoped blacklist for observability,
+        # but only this write transaction can close the final check-to-claim
+        # race. Exit paths persist blacklist rows before releasing their
+        # position claim, so this transaction sees either the old claim or the
+        # new blacklist. Malformed risk evidence stays fail-closed.
+        if claim_state == "CLAIMING":
+            blacklist_rows = conn.execute(
+                """SELECT blacklisted_until FROM coin_blacklist
+                     WHERE UPPER(TRIM(symbol))=?
+                       AND UPPER(TRIM(bot_name))=?""",
+                (base.upper(), str(bot_name).strip().upper()),
             ).fetchall()
-            active_notionals = []
-            target_is_futures = _is_futures_ptype(normalized_position_type)
-            reservation_evidence_valid = True
-            for active_row in active_rows:
-                row = dict(active_row)
-                active_position_type = str(
-                    row.get("position_type") or ""
-                ).strip().upper()
-                if active_position_type not in {
-                    "SPOT", "FUTURES", "LONG", "SHORT"
-                }:
-                    reservation_evidence_valid = False
-                    break
-                active_is_futures = _is_futures_ptype(active_position_type)
-                if active_is_futures != target_is_futures:
-                    continue
-                active_mode = str(row.get("mode") or "").strip().upper()
-                if active_mode != "LIVE":
-                    reservation_evidence_valid = False
-                    break
-                if str(row.get("status") or "").strip().upper() == "CONSUMED":
-                    claim_extra = _strict_claim_extra_object(row.get("extra_json"))
-                    claim_entry_id = (
-                        claim_extra.get("entry_id")
-                        if claim_extra is not None
-                        else None
+            blacklist_now = _utcnow()
+            for blacklist_row in blacklist_rows:
+                try:
+                    blacklisted_until = datetime.strptime(
+                        blacklist_row["blacklisted_until"],
+                        "%Y-%m-%d %H:%M:%S",
                     )
-                    if not isinstance(claim_entry_id, str):
-                        reservation_evidence_valid = False
-                        break
-                    if claim_entry_id.strip() != str(row.get("intent_id") or "").strip():
-                        continue
-                active_value = _optional_finite_db(row.get("notional_usdt"))
-                if active_value is None or active_value <= 0.0:
-                    reservation_evidence_valid = False
-                    break
-                active_notionals.append(active_value)
-            if not reservation_evidence_valid:
+                except (TypeError, ValueError, OverflowError):
+                    conn.rollback()
+                    return False
+                if blacklist_now < blacklisted_until:
+                    conn.rollback()
+                    return False
+        if validated_reservation_ceiling is not None:
+            account_type = (
+                "futures"
+                if _is_futures_ptype(normalized_position_type)
+                else "spot"
+            )
+            try:
+                active_rows = _validated_active_portfolio_reservation_rows(
+                    account_type
+                )
+            except Exception:
                 conn.rollback()
                 return False
+            active_notionals = [
+                row["notional_usdt"] for row in active_rows
+            ]
             try:
                 reserved_total = math.fsum(active_notionals)
                 reserved_after = reserved_total + reserved
@@ -6274,7 +7936,9 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
                     WHERE (symbol = ?
                            OR symbol LIKE ? ESCAPE '!'
                            OR symbol LIKE ? ESCAPE '!')
-                      AND {class_clause}""",
+                      AND {class_clause}
+                      AND UPPER(TRIM(COALESCE(state, '')))
+                          NOT IN ('CLOSED', 'FLAT')""",
                 _literal_symbol_match_params(base)).fetchall()
             owners = {dict(r).get("bot_name") for r in rows}
             if owners:
@@ -6301,10 +7965,24 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
                SELECT ?, ?, 0, '', 0, 0, ?, 1, ?, ?, ?
                WHERE NOT EXISTS (
                    SELECT 1 FROM bot_open_positions
-                   WHERE (symbol = ?
-                          OR symbol LIKE ? ESCAPE '!'
-                          OR symbol LIKE ? ESCAPE '!')
-                     AND {class_clause})""",
+                    WHERE (symbol = ?
+                           OR symbol LIKE ? ESCAPE '!'
+                           OR symbol LIKE ? ESCAPE '!')
+                      AND {class_clause}
+                      AND UPPER(TRIM(COALESCE(state, '')))
+                          NOT IN ('CLOSED', 'FLAT'))
+               ON CONFLICT(bot_name, symbol) DO UPDATE SET
+                   buy_price=excluded.buy_price,
+                   buy_time=excluded.buy_time,
+                   amount=excluded.amount,
+                   invested_usdt=excluded.invested_usdt,
+                   position_type=excluded.position_type,
+                   leverage=excluded.leverage,
+                   state=excluded.state,
+                   extra_json=excluded.extra_json,
+                   opened_at=excluded.opened_at
+               WHERE UPPER(TRIM(COALESCE(bot_open_positions.state, '')))
+                     IN ('CLOSED', 'FLAT')""",
             (bot_name, base, normalized_position_type, claim_state,
              claim_extra_json, now_str,
              *_literal_symbol_match_params(base)))
@@ -6325,12 +8003,20 @@ def _try_claim(bot_name, symbol, position_type, claim_state,
             )
         conn.commit()
         return cur.rowcount > 0
-    except Exception:
-        try:
-            if conn is not None:
+    except BaseException as exc:
+        if conn is not None:
+            try:
                 conn.rollback()
-        except Exception:
-            pass
+            except BaseException as rollback_error:
+                try:
+                    exc.add_note(
+                        "rollback atomic position claim: "
+                        f"{type(rollback_error).__name__}: {rollback_error}"
+                    )
+                except BaseException:
+                    pass
+        if not isinstance(exc, Exception):
+            raise
         return False
 
 
@@ -6371,8 +8057,10 @@ def claim_symbol_for_entry(bot_name: str, symbol: str,
     )
 
 
-def active_portfolio_reservations(account_type: str) -> tuple[dict, ...]:
-    """Return validated ACTIVE LIVE reservations for one account wallet."""
+def _validated_active_portfolio_reservation_rows(
+    account_type: str,
+) -> tuple[dict, ...]:
+    """Return validated risk rows plus private freshness metadata."""
     if not isinstance(account_type, str):
         raise ValueError("portfolio reservation account type is invalid")
     normalized_account = account_type.strip().lower()
@@ -6380,39 +8068,106 @@ def active_portfolio_reservations(account_type: str) -> tuple[dict, ...]:
         raise ValueError("portfolio reservation account type is invalid")
     conn = get_connection()
     rows = conn.execute(
-        """SELECT reservation.intent_id, reservation.symbol,
+        """SELECT reservation.reservation_id,
+                  reservation.intent_id, reservation.bot_name,
+                  reservation.symbol,
                   reservation.notional_usdt, reservation.mode,
-                  reservation.status, claim.position_type, claim.extra_json
+                  reservation.status, reservation.created_at,
+                  reservation.expires_at, claim.position_type,
+                  claim.extra_json,
+                  intent.intent_id AS journal_intent_id,
+                  intent.bot_name AS journal_bot_name,
+                  intent.mode AS journal_mode,
+                  intent.symbol AS journal_symbol,
+                  intent.direction AS journal_direction
              FROM portfolio_reservations AS reservation
              LEFT JOIN bot_open_positions AS claim
                ON claim.bot_name=reservation.bot_name
               AND claim.symbol=reservation.symbol
-            WHERE reservation.status='ACTIVE'
-               OR (reservation.status='CONSUMED'
-                   AND claim.bot_name IS NOT NULL)
+             LEFT JOIN order_intents AS intent
+               ON intent.intent_id=reservation.intent_id
+            WHERE (reservation.status='ACTIVE'
+                OR (reservation.status='CONSUMED'
+                    AND claim.bot_name IS NOT NULL
+                    AND UPPER(TRIM(COALESCE(claim.state, '')))
+                        NOT IN ('CLOSED', 'FLAT'))
+                OR reservation.status NOT IN (
+                    'ACTIVE', 'CONSUMED', 'RELEASED', 'EXPIRED'
+                ))
             ORDER BY reservation.created_at, reservation.reservation_id"""
     ).fetchall()
     result = []
     for raw_row in rows:
         row = dict(raw_row)
+        canonical_account = _portfolio_account_type_for_bot(
+            row.get("bot_name")
+        )
+        if (
+            canonical_account is not None
+            and canonical_account != normalized_account
+        ):
+            continue
         position_type = str(row.get("position_type") or "").strip().upper()
         if position_type not in {"SPOT", "FUTURES", "LONG", "SHORT"}:
             raise ValueError("active portfolio reservation is malformed")
         is_futures = _is_futures_ptype(position_type)
-        if is_futures != (normalized_account == "futures"):
+        if canonical_account is not None and (
+            is_futures != (canonical_account == "futures")
+            or (
+                canonical_account == "futures"
+                and position_type not in {"LONG", "SHORT"}
+            )
+        ):
+            raise ValueError(
+                "active portfolio reservation wallet is malformed"
+            )
+        if (
+            canonical_account is None
+            and is_futures != (normalized_account == "futures")
+        ):
             continue
+        raw_status = row.get("status")
+        if (
+            not isinstance(raw_status, str)
+            or raw_status not in _PORTFOLIO_RESERVATION_STATUSES
+        ):
+            raise ValueError("active portfolio reservation status is malformed")
         mode = str(row.get("mode") or "").strip().upper()
         if mode != "LIVE":
             raise ValueError("active portfolio reservation is malformed")
-        if str(row.get("status") or "").strip().upper() == "CONSUMED":
-            claim_extra = _strict_claim_extra_object(row.get("extra_json"))
-            claim_entry_id = (
-                claim_extra.get("entry_id") if claim_extra is not None else None
+        try:
+            created_at, created_dt = _trade_timestamp_db(
+                row.get("created_at"), "reservation created_at"
             )
-            if not isinstance(claim_entry_id, str):
-                raise ValueError("active portfolio reservation is malformed")
-            if claim_entry_id.strip() != str(row.get("intent_id") or "").strip():
+            expires_at, expires_dt = _trade_timestamp_db(
+                row.get("expires_at"), "reservation expires_at"
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "active portfolio reservation timestamp is malformed"
+            ) from exc
+        if (
+            row.get("created_at") != created_at
+            or row.get("expires_at") != expires_at
+            or expires_dt <= created_dt
+        ):
+            raise ValueError(
+                "active portfolio reservation timestamp is malformed"
+            )
+        claim_extra = _strict_claim_extra_object(row.get("extra_json"))
+        claim_entry_id = (
+            claim_extra.get("entry_id") if claim_extra is not None else None
+        )
+        if not isinstance(claim_entry_id, str):
+            raise ValueError(
+                "active portfolio reservation claim generation is malformed"
+            )
+        if claim_entry_id.strip() != str(row.get("intent_id") or "").strip():
+            if raw_status == "CONSUMED":
                 continue
+            raise ValueError(
+                "active portfolio reservation claim generation is malformed"
+            )
         notional = _optional_finite_db(row.get("notional_usdt"))
         symbol = str(row.get("symbol") or "").strip()
         intent = str(row.get("intent_id") or "").strip()
@@ -6424,19 +8179,110 @@ def active_portfolio_reservations(account_type: str) -> tuple[dict, ...]:
             or not intent
         ):
             raise ValueError("active portfolio reservation is malformed")
+        journal_intent = row.get("journal_intent_id")
+        if journal_intent is not None:
+            if not _portfolio_reservation_matches_intent_db(
+                row,
+                intent_id=journal_intent,
+                bot_name=row.get("journal_bot_name"),
+                mode=row.get("journal_mode"),
+                symbol=row.get("journal_symbol"),
+                allowed_statuses=frozenset((raw_status,)),
+            ):
+                raise ValueError(
+                    "active portfolio reservation order intent is malformed"
+                )
+            try:
+                journal_direction = _required_text_db(
+                    row.get("journal_direction"),
+                    "order intent direction",
+                    max_length=5,
+                ).upper()
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "active portfolio reservation order intent is malformed"
+                ) from exc
+            expected_direction = (
+                "LONG" if position_type == "SPOT" else position_type
+            )
+            if (
+                row.get("journal_direction") != journal_direction
+                or journal_direction not in {"LONG", "SHORT"}
+                or journal_direction != expected_direction
+            ):
+                raise ValueError(
+                    "active portfolio reservation order intent is malformed"
+                )
         result.append({
             "intent_id": intent,
             "symbol": symbol,
             "side": position_type if position_type in {"LONG", "SHORT"} else "LONG",
             "notional_usdt": notional,
+            "_status": raw_status,
+            "_expires_dt": expires_dt,
         })
     return tuple(result)
 
 
+def active_portfolio_reservations(account_type: str) -> tuple[dict, ...]:
+    """Return validated ACTIVE LIVE reservations for one account wallet."""
+    rows = _validated_active_portfolio_reservation_rows(account_type)
+    return tuple({
+        "intent_id": row["intent_id"],
+        "symbol": row["symbol"],
+        "side": row["side"],
+        "notional_usdt": row["notional_usdt"],
+    } for row in rows)
+
+
+def portfolio_reservation_health_snapshot(account_type: str) -> dict:
+    """Return bounded LIVE reservation freshness for one shared wallet."""
+    try:
+        rows = _validated_active_portfolio_reservation_rows(account_type)
+        now = _utcnow()
+        if not isinstance(now, datetime):
+            raise ValueError("reservation health clock is invalid")
+        overdue = [
+            row for row in rows
+            if row["_status"] == "ACTIVE" and row["_expires_dt"] <= now
+        ]
+        overdue_seconds = [
+            max(0.0, (now - row["_expires_dt"]).total_seconds())
+            for row in overdue
+        ]
+    except Exception as exc:
+        return {
+            "available": False,
+            "ok": False,
+            "component": "portfolio_reservations",
+            "state": "invalid",
+            "reason": "reservation_evidence_invalid",
+            "error_type": type(exc).__name__,
+        }
+    active_count = sum(row["_status"] == "ACTIVE" for row in rows)
+    consumed_count = sum(row["_status"] == "CONSUMED" for row in rows)
+    return {
+        "available": True,
+        "ok": not overdue,
+        "component": "portfolio_reservations",
+        "state": "degraded" if overdue else "healthy",
+        "reason": "active_reservation_overdue" if overdue else "",
+        "tracked_count": len(rows),
+        "active_count": active_count,
+        "consumed_count": consumed_count,
+        "overdue_active_count": len(overdue),
+        "oldest_overdue_seconds": max(overdue_seconds, default=0.0),
+        "overdue_intent_ids": [
+            row["intent_id"] for row in overdue[:16]
+        ],
+    }
+
+
 def release_portfolio_reservation(intent_id: str, status: str = "RELEASED") -> None:
-    validated_intent_id = _order_id_text_db(intent_id)
-    if validated_intent_id is None:
-        raise ValueError("portfolio reservation intent id is required")
+    try:
+        validated_intent_id = _causal_entry_id_db(intent_id, required=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("portfolio reservation intent id is invalid") from exc
     if not isinstance(status, str):
         raise ValueError("portfolio reservation status is invalid")
     normalized_status = status.strip().upper()
@@ -6444,18 +8290,55 @@ def release_portfolio_reservation(intent_id: str, status: str = "RELEASED") -> N
         raise ValueError("portfolio reservation status must be RELEASED or CONSUMED")
     conn = get_connection()
     try:
-        conn.execute(
+        conn.execute("BEGIN IMMEDIATE")
+        reservation = conn.execute(
+            "SELECT * FROM portfolio_reservations WHERE intent_id=?",
+            (validated_intent_id,),
+        ).fetchone()
+        if reservation is None:
+            conn.commit()
+            return
+        if not _portfolio_reservation_matches_intent_db(
+            reservation,
+            intent_id=validated_intent_id,
+            bot_name=reservation["bot_name"],
+            mode=reservation["mode"],
+            symbol=reservation["symbol"],
+            allowed_statuses=frozenset(("ACTIVE", normalized_status)),
+        ):
+            raise ValueError("portfolio reservation transition is malformed")
+        if reservation["status"] == normalized_status:
+            conn.commit()
+            return
+        updated = conn.execute(
             """UPDATE portfolio_reservations SET status=?
-                 WHERE intent_id=? AND status='ACTIVE'""",
-            (normalized_status, validated_intent_id),
+                 WHERE reservation_id=? AND intent_id=? AND status='ACTIVE'""",
+            (
+                normalized_status,
+                reservation["reservation_id"],
+                validated_intent_id,
+            ),
         )
+        if updated.rowcount != 1:
+            raise ValueError("portfolio reservation transition lost generation")
         conn.commit()
     except sqlite3.OperationalError as exc:
-        conn.rollback()
-        if "no such table: portfolio_reservations" not in str(exc).lower():
+        rollback_ok = _rollback_transaction_preserving(
+            conn,
+            exc,
+            "portfolio reservation release",
+        )
+        missing_table = (
+            "no such table: portfolio_reservations" in str(exc).lower()
+        )
+        if not missing_table or not rollback_ok:
             raise
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "portfolio reservation release",
+        )
         raise
 
 
@@ -6605,8 +8488,12 @@ def persist_portfolio_evaluation(
             ),
         )
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "portfolio evaluation persistence",
+        )
         raise
 
 
@@ -6779,8 +8666,51 @@ def create_order_intent(
 
     def _insert() -> None:
         previous_sync = _enable_full_sync_for_venue_boundary(conn)
+        primary_error = None
         try:
             conn.execute("BEGIN IMMEDIATE")
+            try:
+                reservation = conn.execute(
+                    "SELECT * FROM portfolio_reservations WHERE intent_id=?",
+                    (validated_intent_id,),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                if (
+                    "no such table: portfolio_reservations"
+                    not in str(exc).lower()
+                ):
+                    raise
+                reservation = None
+            if reservation is not None:
+                if not _portfolio_reservation_matches_intent_db(
+                    reservation,
+                    intent_id=validated_intent_id,
+                    bot_name=validated_bot,
+                    mode=normalized_mode,
+                    symbol=validated_symbol,
+                    allowed_statuses=frozenset(("ACTIVE",)),
+                ):
+                    raise ValueError(
+                        "portfolio reservation does not match new order intent"
+                    )
+                claim = conn.execute(
+                    """SELECT bot_name, symbol, position_type, state,
+                              extra_json
+                         FROM bot_open_positions
+                        WHERE bot_name=? AND symbol=?""",
+                    (reservation["bot_name"], reservation["symbol"]),
+                ).fetchone()
+                if claim is None or not _portfolio_claim_matches_intent_db(
+                    claim,
+                    intent_id=validated_intent_id,
+                    bot_name=validated_bot,
+                    symbol=validated_symbol,
+                    direction=validated_direction,
+                ):
+                    raise ValueError(
+                        "portfolio reservation claim does not match "
+                        "new order intent"
+                    )
             collision = conn.execute(
                 """SELECT 1 FROM order_intents
                      WHERE client_order_id=? OR fallback_client_order_id=?
@@ -6809,11 +8739,20 @@ def create_order_intent(
                 ),
             )
             conn.commit()
-        except Exception:
-            conn.rollback()
+        except BaseException as exc:
+            primary_error = exc
+            _rollback_transaction_preserving(
+                conn,
+                exc,
+                "order-intent creation",
+            )
             raise
         finally:
-            _restore_sync_after_venue_boundary(conn, previous_sync)
+            _restore_sync_after_venue_boundary(
+                conn,
+                previous_sync,
+                primary_error,
+            )
     try:
         _insert()
     except sqlite3.OperationalError as exc:
@@ -6845,63 +8784,84 @@ def create_order_intent(
             or missing_fallback_evidence
         ):
             raise
-        conn.rollback()
-        if missing_table:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS order_intents (
-                    intent_id TEXT PRIMARY KEY, bot_name TEXT NOT NULL,
-                    mode TEXT NOT NULL DEFAULT 'UNKNOWN',
-                    symbol TEXT NOT NULL, direction TEXT NOT NULL,
-                    target_amount REAL NOT NULL, target_price REAL,
-                    client_order_id TEXT NOT NULL UNIQUE,
-                    fallback_client_order_id TEXT,
-                    fallback_exchange_order_id TEXT,
-                    exchange_order_id TEXT, status TEXT NOT NULL,
-                    filled_amount REAL NOT NULL DEFAULT 0,
-                    filled_notional REAL NOT NULL DEFAULT 0,
-                    fee_usdt REAL NOT NULL DEFAULT 0,
-                    fallback_filled_amount REAL NOT NULL DEFAULT 0,
-                    fallback_filled_notional REAL NOT NULL DEFAULT 0,
-                    fallback_notional_complete INTEGER NOT NULL DEFAULT 0,
-                    fallback_fee_usdt REAL NOT NULL DEFAULT 0,
-                    last_error TEXT,
-                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-                )""")
-        else:
-            columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(order_intents)")
-            }
-            if "mode" not in columns:
-                conn.execute(
-                    "ALTER TABLE order_intents "
-                    "ADD COLUMN mode TEXT NOT NULL DEFAULT 'UNKNOWN'"
+        try:
+            cleanup_confirmed = not bool(conn.in_transaction)
+        except BaseException as state_error:
+            try:
+                exc.add_note(
+                    "confirm order-intent create cleanup before self-heal: "
+                    f"{type(state_error).__name__}: {state_error}"
                 )
-            if "fallback_client_order_id" not in columns:
-                conn.execute(
-                    "ALTER TABLE order_intents "
-                    "ADD COLUMN fallback_client_order_id TEXT"
-                )
-            fallback_evidence_columns = {
-                "fallback_exchange_order_id": "TEXT",
-                "fallback_filled_amount": "REAL NOT NULL DEFAULT 0",
-                "fallback_filled_notional": "REAL NOT NULL DEFAULT 0",
-                "fallback_notional_complete": "INTEGER NOT NULL DEFAULT 0",
-                "fallback_fee_usdt": "REAL NOT NULL DEFAULT 0",
-            }
-            for column_name, declaration in fallback_evidence_columns.items():
-                if column_name not in columns:
+            except BaseException:
+                pass
+            raise exc.with_traceback(exc.__traceback__)
+        if not cleanup_confirmed:
+            raise
+
+        try:
+            if missing_table:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS order_intents (
+                        intent_id TEXT PRIMARY KEY, bot_name TEXT NOT NULL,
+                        mode TEXT NOT NULL DEFAULT 'UNKNOWN',
+                        symbol TEXT NOT NULL, direction TEXT NOT NULL,
+                        target_amount REAL NOT NULL, target_price REAL,
+                        client_order_id TEXT NOT NULL UNIQUE,
+                        fallback_client_order_id TEXT,
+                        fallback_exchange_order_id TEXT,
+                        exchange_order_id TEXT, status TEXT NOT NULL,
+                        filled_amount REAL NOT NULL DEFAULT 0,
+                        filled_notional REAL NOT NULL DEFAULT 0,
+                        fee_usdt REAL NOT NULL DEFAULT 0,
+                        fallback_filled_amount REAL NOT NULL DEFAULT 0,
+                        fallback_filled_notional REAL NOT NULL DEFAULT 0,
+                        fallback_notional_complete INTEGER NOT NULL DEFAULT 0,
+                        fallback_fee_usdt REAL NOT NULL DEFAULT 0,
+                        last_error TEXT,
+                        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                    )""")
+            else:
+                columns = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(order_intents)")
+                }
+                if "mode" not in columns:
                     conn.execute(
-                        f"ALTER TABLE order_intents ADD COLUMN "
-                        f"{column_name} {declaration}"
+                        "ALTER TABLE order_intents "
+                        "ADD COLUMN mode TEXT NOT NULL DEFAULT 'UNKNOWN'"
                     )
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS "
-            "idx_order_intents_fallback_client_id "
-            "ON order_intents(fallback_client_order_id) "
-            "WHERE fallback_client_order_id IS NOT NULL"
-        )
-        conn.commit()
+                if "fallback_client_order_id" not in columns:
+                    conn.execute(
+                        "ALTER TABLE order_intents "
+                        "ADD COLUMN fallback_client_order_id TEXT"
+                    )
+                fallback_evidence_columns = {
+                    "fallback_exchange_order_id": "TEXT",
+                    "fallback_filled_amount": "REAL NOT NULL DEFAULT 0",
+                    "fallback_filled_notional": "REAL NOT NULL DEFAULT 0",
+                    "fallback_notional_complete": "INTEGER NOT NULL DEFAULT 0",
+                    "fallback_fee_usdt": "REAL NOT NULL DEFAULT 0",
+                }
+                for column_name, declaration in fallback_evidence_columns.items():
+                    if column_name not in columns:
+                        conn.execute(
+                            f"ALTER TABLE order_intents ADD COLUMN "
+                            f"{column_name} {declaration}"
+                        )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_order_intents_fallback_client_id "
+                "ON order_intents(fallback_client_order_id) "
+                "WHERE fallback_client_order_id IS NOT NULL"
+            )
+            conn.commit()
+        except BaseException as repair_error:
+            _rollback_transaction_preserving(
+                conn,
+                repair_error,
+                "order-intent schema self-heal",
+            )
+            raise
         try:
             _insert()
         except sqlite3.IntegrityError as duplicate_exc:
@@ -6982,6 +8942,7 @@ def transition_order_intent(
         if durable_venue_boundary
         else None
     )
+    primary_error = None
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -7195,7 +9156,7 @@ def transition_order_intent(
                 reservation = conn.execute(
                     """SELECT bot_name, symbol, created_at
                          FROM portfolio_reservations
-                        WHERE intent_id=?""",
+                    WHERE intent_id=?""",
                     (validated_intent_id,),
                 ).fetchone()
                 claim_extra = _strict_claim_extra_object(claim["extra_json"])
@@ -7249,7 +9210,53 @@ def transition_order_intent(
             ).fetchone()
             if collision is not None:
                 raise ValueError("fallback client order id already exists")
-        conn.execute(
+        reservation_status = None
+        if target == "FINALIZED":
+            reservation_status = (
+                "RELEASED" if effective_filled_amount == 0.0 else "CONSUMED"
+            )
+            try:
+                reservation = conn.execute(
+                    "SELECT * FROM portfolio_reservations WHERE intent_id=?",
+                    (validated_intent_id,),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                if "no such table: portfolio_reservations" not in str(exc).lower():
+                    raise
+                reservation = None
+            if reservation is not None and not (
+                _portfolio_reservation_matches_intent_db(
+                    reservation,
+                    intent_id=row["intent_id"],
+                    bot_name=row["bot_name"],
+                    mode=row["mode"],
+                    symbol=row["symbol"],
+                    allowed_statuses=frozenset(("ACTIVE", reservation_status)),
+                )
+            ):
+                raise ValueError(
+                    "portfolio reservation does not match finalized intent"
+                )
+            if reservation is not None and effective_filled_amount > 0.0:
+                claim = conn.execute(
+                    """SELECT bot_name, symbol, position_type, state,
+                              extra_json
+                         FROM bot_open_positions
+                        WHERE bot_name=? AND symbol=?""",
+                    (reservation["bot_name"], reservation["symbol"]),
+                ).fetchone()
+                if claim is None or not _portfolio_claim_matches_intent_db(
+                    claim,
+                    intent_id=row["intent_id"],
+                    bot_name=row["bot_name"],
+                    symbol=row["symbol"],
+                    direction=row["direction"],
+                ):
+                    raise ValueError(
+                        "portfolio reservation claim does not match "
+                        "finalized intent"
+                    )
+        intent_updated = conn.execute(
             """UPDATE order_intents
                   SET status=?, exchange_order_id=COALESCE(?, exchange_order_id),
                       fallback_client_order_id=COALESCE(
@@ -7261,7 +9268,7 @@ def transition_order_intent(
                       filled_amount=COALESCE(?, filled_amount),
                       filled_notional=COALESCE(?, filled_notional),
                       fee_usdt=COALESCE(?, fee_usdt), last_error=?, updated_at=?
-                WHERE intent_id=?""",
+                WHERE intent_id=? AND status=?""",
             (
                 target,
                 exchange_id,
@@ -7281,21 +9288,25 @@ def transition_order_intent(
                 ),
                 _utcnow_str(),
                 validated_intent_id,
+                current,
             ),
         )
-        if target == "FINALIZED":
-            reservation_status = (
-                "RELEASED" if effective_filled_amount == 0.0 else "CONSUMED"
+        if intent_updated.rowcount != 1:
+            raise ValueError("order intent transition lost generation")
+        if (
+            reservation_status is not None
+            and reservation is not None
+            and reservation["status"] == "ACTIVE"
+        ):
+            reservation_updated = conn.execute(
+                """UPDATE portfolio_reservations SET status=?
+                     WHERE intent_id=? AND status='ACTIVE'""",
+                (reservation_status, validated_intent_id),
             )
-            try:
-                conn.execute(
-                    """UPDATE portfolio_reservations SET status=?
-                         WHERE intent_id=? AND status='ACTIVE'""",
-                    (reservation_status, validated_intent_id),
+            if reservation_updated.rowcount != 1:
+                raise ValueError(
+                    "portfolio reservation transition lost generation"
                 )
-            except sqlite3.OperationalError as exc:
-                if "no such table: portfolio_reservations" not in str(exc).lower():
-                    raise
         if delete_terminal_zero_claim:
             deleted = conn.execute(
                 """DELETE FROM bot_open_positions
@@ -7306,14 +9317,29 @@ def transition_order_intent(
                 raise ValueError("terminal zero-fill claim release lost generation")
         conn.commit()
     except sqlite3.IntegrityError as exc:
-        conn.rollback()
-        raise ValueError("order intent identifiers conflict") from exc
-    except Exception:
-        conn.rollback()
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "order-intent transition",
+        )
+        translated_error = ValueError("order intent identifiers conflict")
+        primary_error = translated_error
+        raise translated_error from exc
+    except BaseException as exc:
+        primary_error = exc
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "order-intent transition",
+        )
         raise
     finally:
         if previous_sync is not None:
-            _restore_sync_after_venue_boundary(conn, previous_sync)
+            _restore_sync_after_venue_boundary(
+                conn,
+                previous_sync,
+                primary_error,
+            )
 
 
 def record_order_intent_fallback_evidence(
@@ -7479,7 +9505,7 @@ def record_order_intent_fallback_evidence(
             total_notional - prior_fallback_notional + merged_notional
         )
         aggregate_fee = total_fee - prior_fallback_fee + merged_fee
-        conn.execute(
+        evidence_updated = conn.execute(
             """UPDATE order_intents
                   SET status='RECOVERY_REQUIRED',
                       fallback_exchange_order_id=COALESCE(
@@ -7491,7 +9517,7 @@ def record_order_intent_fallback_evidence(
                       fallback_fee_usdt=?,
                       filled_amount=?, filled_notional=?, fee_usdt=?,
                       last_error=?, updated_at=?
-                WHERE intent_id=?""",
+                WHERE intent_id=? AND status=?""",
             (
                 fallback_exchange_id,
                 merged_amount,
@@ -7504,16 +9530,23 @@ def record_order_intent_fallback_evidence(
                 recovery_error_to_set,
                 _utcnow_str(),
                 validated_intent_id,
+                current,
             ),
         )
+        if evidence_updated.rowcount != 1:
+            raise ValueError("fallback evidence update lost generation")
         updated = conn.execute(
             "SELECT * FROM order_intents WHERE intent_id=?",
             (validated_intent_id,),
         ).fetchone()
         conn.commit()
         return dict(updated)
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "order-intent fallback evidence",
+        )
         raise
 
 
@@ -7901,6 +9934,7 @@ def claim_due_order_intent_recoveries(
     conn = get_connection()
     claimed: list[dict] = []
     previous_sync = _enable_full_sync_for_venue_boundary(conn)
+    primary_error = None
     try:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
@@ -7928,7 +9962,7 @@ def claim_due_order_intent_recoveries(
                 isinstance(attempts, bool)
                 or not isinstance(attempts, int)
                 or attempts < 0
-                or attempts > 1_000_000
+                or attempts >= 1_000_000
             ):
                 raise ValueError("persisted recovery attempt count is invalid")
             next_text = row.get("next_attempt_at")
@@ -7967,7 +10001,7 @@ def claim_due_order_intent_recoveries(
             next_attempt = (now_dt + timedelta(seconds=delay)).strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
-            conn.execute(
+            lease_updated = conn.execute(
                 """INSERT INTO order_intent_recovery_state
                        (intent_id, bot_name, attempt_count, last_attempt_at,
                         next_attempt_at, evidence_state, source_status_json,
@@ -7991,15 +10025,46 @@ def claim_due_order_intent_recoveries(
                     now_text,
                 ),
             )
+            if lease_updated.rowcount != 1:
+                raise ValueError("recovery lease update lost generation")
+            lease = conn.execute(
+                """SELECT bot_name, attempt_count, last_attempt_at,
+                          next_attempt_at, evidence_state, source_status_json,
+                          budget_denied, updated_at
+                     FROM order_intent_recovery_state
+                    WHERE intent_id=?""",
+                (row["intent_id"],),
+            ).fetchone()
+            expected_lease = (
+                validated_bot,
+                claimed_attempt,
+                now_text,
+                next_attempt,
+                "attempting",
+                "{}",
+                0,
+                now_text,
+            )
+            if lease is None or tuple(lease) != expected_lease:
+                raise ValueError("recovery lease persistence is inconsistent")
             row["recovery_attempt_count"] = claimed_attempt
             row["recovery_next_attempt_at"] = next_attempt
             claimed.append(row)
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        primary_error = exc
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "order-intent recovery claim",
+        )
         raise
     finally:
-        _restore_sync_after_venue_boundary(conn, previous_sync)
+        _restore_sync_after_venue_boundary(
+            conn,
+            previous_sync,
+            primary_error,
+        )
     return claimed
 
 
@@ -8007,6 +10072,7 @@ def record_order_intent_recovery_evidence(
     intent_id: str,
     *,
     bot_name: str,
+    expected_attempt_count: int,
     evidence_state: str,
     sources: dict | None = None,
     budget_denied: bool = False,
@@ -8018,6 +10084,12 @@ def record_order_intent_recovery_evidence(
         intent_id, "intent_id", max_length=64
     )
     validated_bot = _canonical_bot_name_db(bot_name)
+    if (
+        isinstance(expected_attempt_count, bool)
+        or not isinstance(expected_attempt_count, int)
+        or not 1 <= expected_attempt_count <= 1_000_000
+    ):
+        raise ValueError("expected recovery attempt count is invalid")
     state = _required_text_db(
         evidence_state, "recovery evidence state", max_length=16
     ).lower()
@@ -8040,6 +10112,21 @@ def record_order_intent_recovery_evidence(
     else:
         now_text, now_dt = _trade_timestamp_db(now, "recovery evidence time")
     conn = get_connection()
+
+    def _reset_zero_fill_quorum() -> None:
+        conn.execute(
+            "DELETE FROM order_intent_zero_fill_quorum "
+            "WHERE intent_id=? AND bot_name=? AND resolved_at IS NULL",
+            (validated_intent, validated_bot),
+        )
+        remaining = conn.execute(
+            "SELECT 1 FROM order_intent_zero_fill_quorum "
+            "WHERE intent_id=? AND resolved_at IS NULL",
+            (validated_intent,),
+        ).fetchone()
+        if remaining is not None:
+            raise ValueError("zero-fill quorum reset lost generation")
+
     try:
         conn.execute("BEGIN IMMEDIATE")
         cursor = conn.execute(
@@ -8047,6 +10134,7 @@ def record_order_intent_recovery_evidence(
                   SET evidence_state=?, source_status_json=?,
                       budget_denied=?, updated_at=?
                 WHERE intent_id=? AND bot_name=?
+                  AND attempt_count=?
                   AND EXISTS (
                       SELECT 1 FROM order_intents AS intent
                        WHERE intent.intent_id=order_intent_recovery_state.intent_id
@@ -8060,23 +10148,25 @@ def record_order_intent_recovery_evidence(
                 now_text,
                 validated_intent,
                 validated_bot,
+                expected_attempt_count,
             ),
         )
         if cursor.rowcount == 1:
             if not complete_negative:
-                conn.execute(
-                    "DELETE FROM order_intent_zero_fill_quorum "
-                    "WHERE intent_id=? AND bot_name=? AND resolved_at IS NULL",
-                    (validated_intent, validated_bot),
-                )
+                _reset_zero_fill_quorum()
             else:
                 intent = conn.execute(
                     """SELECT intent.*, recovery.attempt_count
                          FROM order_intents AS intent
                          JOIN order_intent_recovery_state AS recovery
                            ON recovery.intent_id=intent.intent_id
-                        WHERE intent.intent_id=? AND intent.bot_name=?""",
-                    (validated_intent, validated_bot),
+                        WHERE intent.intent_id=? AND intent.bot_name=?
+                          AND recovery.attempt_count=?""",
+                    (
+                        validated_intent,
+                        validated_bot,
+                        expected_attempt_count,
+                    ),
                 ).fetchone()
                 eligible = True
                 if intent is None:
@@ -8087,11 +10177,7 @@ def record_order_intent_recovery_evidence(
                     except ValueError:
                         eligible = False
                 if not eligible:
-                    conn.execute(
-                        "DELETE FROM order_intent_zero_fill_quorum "
-                        "WHERE intent_id=? AND bot_name=? AND resolved_at IS NULL",
-                        (validated_intent, validated_bot),
-                    )
+                    _reset_zero_fill_quorum()
                 else:
                     attempt_count = intent["attempt_count"]
                     if (
@@ -8108,7 +10194,7 @@ def record_order_intent_recovery_evidence(
                     if quorum is None or quorum["resolved_at"] is not None:
                         if quorum is not None:
                             raise ValueError("resolved zero-fill quorum was reused")
-                        conn.execute(
+                        quorum_updated = conn.execute(
                             """INSERT INTO order_intent_zero_fill_quorum
                                (intent_id, bot_name, observation_count,
                                 last_attempt_count,
@@ -8153,7 +10239,7 @@ def record_order_intent_recovery_evidence(
                             "zero-fill last observation",
                         )
                         if now_dt < first_dt or now_dt < last_dt:
-                            conn.execute(
+                            quorum_updated = conn.execute(
                                 """UPDATE order_intent_zero_fill_quorum
                                       SET observation_count=1,
                                           last_attempt_count=?,
@@ -8178,7 +10264,7 @@ def record_order_intent_recovery_evidence(
                             and (now_dt - last_dt).total_seconds()
                             >= _ORDER_ZERO_FILL_QUORUM_INTERVAL_SECONDS
                         ):
-                            conn.execute(
+                            quorum_updated = conn.execute(
                                 """UPDATE order_intent_zero_fill_quorum
                                       SET observation_count=2,
                                           last_attempt_count=?,
@@ -8198,8 +10284,35 @@ def record_order_intent_recovery_evidence(
                                     validated_bot,
                                 ),
                             )
+                        elif (
+                            count == 2
+                            and attempt_count > last_attempt_count
+                            and (now_dt - last_dt).total_seconds()
+                            >= _ORDER_ZERO_FILL_QUORUM_INTERVAL_SECONDS
+                        ):
+                            quorum_updated = conn.execute(
+                                """UPDATE order_intent_zero_fill_quorum
+                                      SET last_attempt_count=?,
+                                          last_observed_at=?,
+                                          source_status_json=?, qualified_at=?,
+                                          updated_at=?
+                                    WHERE intent_id=? AND bot_name=?
+                                      AND observation_count=2
+                                      AND last_attempt_count=?
+                                      AND resolved_at IS NULL""",
+                                (
+                                    attempt_count,
+                                    now_text,
+                                    encoded_sources,
+                                    now_text,
+                                    now_text,
+                                    validated_intent,
+                                    validated_bot,
+                                    last_attempt_count,
+                                ),
+                            )
                         else:
-                            conn.execute(
+                            quorum_updated = conn.execute(
                                 """UPDATE order_intent_zero_fill_quorum
                                       SET source_status_json=?, updated_at=?
                                     WHERE intent_id=? AND bot_name=?
@@ -8211,9 +10324,17 @@ def record_order_intent_recovery_evidence(
                                     validated_bot,
                                 ),
                             )
+                    if quorum_updated.rowcount != 1:
+                        raise ValueError(
+                            "zero-fill quorum persistence lost generation"
+                        )
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "order-intent recovery evidence",
+        )
         raise
     return cursor.rowcount == 1
 
@@ -8228,15 +10349,22 @@ def list_qualified_zero_fill_order_intents(
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 32:
         raise ValueError("zero-fill quorum limit is invalid")
     rows = get_connection().execute(
-        """SELECT intent.intent_id, intent.symbol, intent.direction
+        """SELECT intent.intent_id, intent.symbol, intent.direction,
+                  quorum.last_attempt_count AS recovery_attempt_count
              FROM order_intent_zero_fill_quorum AS quorum
              JOIN order_intents AS intent ON intent.intent_id=quorum.intent_id
-            WHERE quorum.bot_name=?
-              AND quorum.observation_count=2
+             JOIN order_intent_recovery_state AS recovery
+               ON recovery.intent_id=intent.intent_id
+             WHERE quorum.bot_name=?
+               AND intent.bot_name=quorum.bot_name
+               AND quorum.observation_count=2
               AND quorum.qualified_at IS NOT NULL
               AND quorum.resolved_at IS NULL
               AND intent.status='RECOVERY_REQUIRED'
               AND UPPER(TRIM(intent.mode))='LIVE'
+              AND recovery.bot_name=quorum.bot_name
+              AND recovery.attempt_count=quorum.last_attempt_count
+              AND recovery.evidence_state='empty'
          ORDER BY quorum.qualified_at, quorum.intent_id
             LIMIT ?""",
         (validated_bot, limit),
@@ -8248,6 +10376,7 @@ def finalize_qualified_zero_fill_order_intent(
     intent_id: str,
     *,
     bot_name: str,
+    expected_attempt_count: int,
     now: str | None = None,
 ) -> bool:
     """Atomically finalize one proven absent LIVE order and release its generation.
@@ -8261,6 +10390,12 @@ def finalize_qualified_zero_fill_order_intent(
         intent_id, "intent_id", max_length=64
     )
     validated_bot = _canonical_bot_name_db(bot_name)
+    if (
+        isinstance(expected_attempt_count, bool)
+        or not isinstance(expected_attempt_count, int)
+        or not 1 <= expected_attempt_count <= 1_000_000
+    ):
+        raise ValueError("expected recovery attempt count is invalid")
     if now is None:
         now_dt = _utcnow()
         now_text = now_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -8273,19 +10408,36 @@ def finalize_qualified_zero_fill_order_intent(
             """SELECT intent.*, quorum.observation_count,
                       quorum.first_observed_at, quorum.last_observed_at,
                       quorum.qualified_at, quorum.resolved_at,
-                      quorum.source_status_json AS quorum_sources
+                      quorum.source_status_json AS quorum_sources,
+                      quorum.last_attempt_count,
+                      recovery.attempt_count AS recovery_attempt_count,
+                      recovery.evidence_state AS recovery_evidence_state
                  FROM order_intents AS intent
                  JOIN order_intent_zero_fill_quorum AS quorum
                    ON quorum.intent_id=intent.intent_id
+                 JOIN order_intent_recovery_state AS recovery
+                   ON recovery.intent_id=intent.intent_id
                 WHERE intent.intent_id=? AND intent.bot_name=?
-                  AND quorum.bot_name=?""",
-            (validated_intent, validated_bot, validated_bot),
+                  AND quorum.bot_name=? AND recovery.bot_name=?""",
+            (
+                validated_intent,
+                validated_bot,
+                validated_bot,
+                validated_bot,
+            ),
         ).fetchone()
         if row is None:
             raise ValueError("qualified zero-fill intent does not exist")
         if (
             str(row["status"]).strip().upper() == "FINALIZED"
             and row["resolved_at"] is not None
+        ):
+            conn.rollback()
+            return False
+        if (
+            row["last_attempt_count"] != expected_attempt_count
+            or row["recovery_attempt_count"] != expected_attempt_count
+            or str(row["recovery_evidence_state"]).strip().lower() != "empty"
         ):
             conn.rollback()
             return False
@@ -8403,8 +10555,12 @@ def finalize_qualified_zero_fill_order_intent(
             raise ValueError("zero-fill quorum resolution lost generation")
         conn.commit()
         return True
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "qualified zero-fill order-intent finalization",
+        )
         raise
 
 
@@ -8467,16 +10623,22 @@ def order_intent_recovery_health(
         return _order_recovery_overflow_health(unresolved_count)
     rows = connection.execute(
         """SELECT intent.symbol, intent.status, intent.created_at,
-                  recovery.attempt_count, recovery.next_attempt_at,
-                  recovery.evidence_state, recovery.source_status_json,
-                  recovery.budget_denied, quorum.observation_count,
-                  quorum.qualified_at
-             FROM order_intents AS intent
-        LEFT JOIN order_intent_recovery_state AS recovery
-               ON recovery.intent_id=intent.intent_id
-        LEFT JOIN order_intent_zero_fill_quorum AS quorum
-               ON quorum.intent_id=intent.intent_id
-              AND quorum.resolved_at IS NULL
+                   recovery.intent_id AS recovery_state_intent_id,
+                   recovery.attempt_count, recovery.next_attempt_at,
+                   recovery.evidence_state, recovery.source_status_json,
+                   recovery.budget_denied,
+                   quorum.intent_id AS quorum_intent_id,
+                   quorum.observation_count,
+                   quorum.qualified_at,
+                   quorum.last_attempt_count AS quorum_attempt_count
+              FROM order_intents AS intent
+         LEFT JOIN order_intent_recovery_state AS recovery
+                ON recovery.intent_id=intent.intent_id
+               AND recovery.bot_name=intent.bot_name
+         LEFT JOIN order_intent_zero_fill_quorum AS quorum
+                ON quorum.intent_id=intent.intent_id
+               AND quorum.bot_name=intent.bot_name
+               AND quorum.resolved_at IS NULL
             WHERE intent.bot_name=?
               AND intent.status!='FINALIZED'
               AND UPPER(TRIM(intent.mode))!='SIM'
@@ -8515,10 +10677,12 @@ def order_intent_recovery_health(
     retry_due_now = False
     max_attempt_count = 0
     any_budget_denied = False
-    invalid_time = False
+    invalid_state = False
     zero_fill_qualified_count = 0
     for raw_row in rows:
         row = dict(raw_row)
+        has_recovery_state = row.get("recovery_state_intent_id") is not None
+        has_quorum = row.get("quorum_intent_id") is not None
         try:
             _, created_dt = _trade_timestamp_db(
                 row.get("created_at"), "persisted intent creation time"
@@ -8526,27 +10690,55 @@ def order_intent_recovery_health(
             age = max(0.0, (now_dt - created_dt).total_seconds())
         except ValueError:
             age = 0.0
-            invalid_time = True
+            invalid_state = True
         oldest_age = max(oldest_age, age)
         raw_attempts = row.get("attempt_count")
-        attempts = raw_attempts if isinstance(raw_attempts, int) else 0
-        if isinstance(attempts, bool) or attempts < 0:
+        if not has_recovery_state:
             attempts = 0
+        elif (
+            isinstance(raw_attempts, int)
+            and not isinstance(raw_attempts, bool)
+            and 0 <= raw_attempts <= 1_000_000
+        ):
+            attempts = raw_attempts
+        else:
+            attempts = 0
+            invalid_state = True
         max_attempt_count = max(max_attempt_count, attempts)
-        evidence = str(row.get("evidence_state") or "unattempted").lower()
-        if evidence not in _ORDER_RECOVERY_EVIDENCE_STATES:
+        raw_evidence = row.get("evidence_state")
+        if not has_recovery_state:
+            evidence = "unattempted"
+        elif (
+            isinstance(raw_evidence, str)
+            and raw_evidence == raw_evidence.strip().lower()
+            and raw_evidence in _ORDER_RECOVERY_EVIDENCE_STATES
+        ):
+            evidence = raw_evidence
+        else:
             evidence = "attempt_error"
+            invalid_state = True
         try:
             sources = json.loads(row.get("source_status_json") or "{}")
             sources, _ = _order_recovery_sources_db(sources)
         except (TypeError, ValueError):
             sources = {}
             evidence = "attempt_error"
-            invalid_time = True
+            invalid_state = True
         evidence_counts[evidence] = evidence_counts.get(evidence, 0) + 1
         for source_state in sources.values():
             source_counts[source_state] = source_counts.get(source_state, 0) + 1
-        budget_denied = row.get("budget_denied") == 1
+        raw_budget_denied = row.get("budget_denied")
+        if not has_recovery_state:
+            budget_denied = False
+        elif (
+            isinstance(raw_budget_denied, int)
+            and not isinstance(raw_budget_denied, bool)
+            and raw_budget_denied in {0, 1}
+        ):
+            budget_denied = raw_budget_denied == 1
+        else:
+            budget_denied = False
+            invalid_state = True
         any_budget_denied = any_budget_denied or budget_denied
         raw_quorum_count = row.get("observation_count")
         quorum_count = (
@@ -8556,7 +10748,38 @@ def order_intent_recovery_health(
             and raw_quorum_count in {1, 2}
             else 0
         )
-        quorum_qualified = quorum_count == 2 and row.get("qualified_at") is not None
+        if has_quorum and quorum_count == 0:
+            invalid_state = True
+        raw_quorum_attempt = row.get("quorum_attempt_count")
+        quorum_attempt = (
+            raw_quorum_attempt
+            if isinstance(raw_quorum_attempt, int)
+            and not isinstance(raw_quorum_attempt, bool)
+            and raw_quorum_attempt > 0
+            else 0
+        )
+        if has_quorum and quorum_attempt == 0:
+            invalid_state = True
+        raw_qualified_at = row.get("qualified_at")
+        qualified_time_valid = False
+        if raw_qualified_at is not None:
+            try:
+                qualified_at, _ = _trade_timestamp_db(
+                    raw_qualified_at,
+                    "zero-fill quorum qualification time",
+                )
+                qualified_time_valid = qualified_at == raw_qualified_at
+            except ValueError:
+                invalid_state = True
+        if (quorum_count == 2) != qualified_time_valid:
+            invalid_state = True
+        quorum_qualified = (
+            quorum_count == 2
+            and qualified_time_valid
+            and evidence == "empty"
+            and attempts > 0
+            and quorum_attempt == attempts
+        )
         if quorum_qualified:
             zero_fill_qualified_count += 1
         retry_text = row.get("next_attempt_at")
@@ -8580,7 +10803,7 @@ def order_intent_recovery_health(
                     next_retry_at = retry_text
                     next_retry_seconds = retry_seconds
             except ValueError:
-                invalid_time = True
+                invalid_state = True
                 retry_due_now = True
                 retry_text = None
                 next_retry_at = None
@@ -8604,7 +10827,7 @@ def order_intent_recovery_health(
                 "zero_fill_quorum_count": quorum_count,
                 "zero_fill_qualified": quorum_qualified,
             })
-    if invalid_time:
+    if invalid_state:
         reason = "recovery_state_invalid"
     elif evidence_counts.get("conflict", 0):
         reason = "evidence_conflict"
@@ -8656,27 +10879,40 @@ def _persist_execution_tca_stage(
     measured_at: str,
     stage: str,
     encoded: str,
+    *,
+    require_measured_at_match: bool = False,
 ) -> None:
     desired = _canonical_finite_json_object_db(encoded)
     if desired is None:
         raise ValueError("TCA payload must be a finite JSON object")
     existing_rows = conn.execute(
-        """SELECT payload_json FROM execution_tca
+        """SELECT measured_at, payload_json FROM execution_tca
              WHERE intent_id=? AND stage=? ORDER BY id""",
         (intent_id, stage),
     ).fetchall()
+    if require_measured_at_match and len(existing_rows) > 1:
+        raise ValueError("conflicting LIVE TCA evidence already exists")
     for row in existing_rows:
         existing = _canonical_finite_json_object_db(row["payload_json"])
-        if existing is None or existing[1] != desired[1]:
+        if (
+            existing is None
+            or existing[1] != desired[1]
+            or (
+                require_measured_at_match
+                and str(row["measured_at"]) != measured_at
+            )
+        ):
             raise ValueError("conflicting LIVE TCA evidence already exists")
     if existing_rows:
         return
-    conn.execute(
+    inserted = conn.execute(
         """INSERT INTO execution_tca
            (intent_id, measured_at, stage, payload_json)
            VALUES (?, ?, ?, ?)""",
         (intent_id, measured_at, stage, encoded),
     )
+    if inserted.rowcount != 1:
+        raise ValueError("TCA evidence persistence lost generation")
 
 
 def record_execution_tca(intent_id: str, stage: str, payload: dict) -> None:
@@ -8695,6 +10931,12 @@ def record_execution_tca(intent_id: str, stage: str, payload: dict) -> None:
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        intent = conn.execute(
+            "SELECT mode FROM order_intents WHERE intent_id=?",
+            (validated_intent_id,),
+        ).fetchone()
+        if intent is not None and intent["mode"] != "LIVE":
+            raise ValueError("LIVE TCA requires a LIVE order intent")
         _persist_execution_tca_stage(
             conn,
             validated_intent_id,
@@ -8703,8 +10945,12 @@ def record_execution_tca(intent_id: str, stage: str, payload: dict) -> None:
             encoded,
         )
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "LIVE execution TCA persistence",
+        )
         raise
 
 
@@ -8788,6 +11034,38 @@ def schedule_execution_markouts(
     inserted = False
     try:
         conn.execute("BEGIN IMMEDIATE")
+        intent = conn.execute(
+            "SELECT mode, symbol FROM order_intents WHERE intent_id=?",
+            (validated_intent_id,),
+        ).fetchone()
+        if intent is not None and intent["mode"] != "LIVE":
+            raise ValueError("LIVE markout order intent scope is invalid")
+        if intent is not None and not _candidate_symbol_matches_db(
+            intent["symbol"], validated_symbol
+        ):
+            for (
+                row_intent_id,
+                horizon,
+                row_symbol,
+                row_side,
+                row_reference,
+                _due_at,
+            ) in rows:
+                existing = conn.execute(
+                    """SELECT symbol, side, reference_price
+                         FROM execution_markouts
+                        WHERE intent_id=? AND horizon_seconds=?""",
+                    (row_intent_id, horizon),
+                ).fetchone()
+                if existing is not None and tuple(existing) != (
+                    row_symbol,
+                    row_side,
+                    row_reference,
+                ):
+                    raise ValueError(
+                        "conflicting LIVE markout evidence already exists"
+                    )
+            raise ValueError("LIVE markout order intent scope is invalid")
         for row in rows:
             (
                 row_intent_id,
@@ -8805,7 +11083,7 @@ def schedule_execution_markouts(
             ).fetchone()
             expected = (row_symbol, row_side, row_reference)
             if existing is None:
-                conn.execute(
+                queue_inserted = conn.execute(
                     """INSERT INTO execution_markouts
                        (intent_id, horizon_seconds, symbol, side,
                         reference_price, due_at, status)
@@ -8819,12 +11097,20 @@ def schedule_execution_markouts(
                         due_at,
                     ),
                 )
+                if queue_inserted.rowcount != 1:
+                    raise ValueError(
+                        "LIVE markout scheduling lost generation"
+                    )
                 inserted = True
             elif tuple(existing) != expected:
                 raise ValueError("conflicting LIVE markout evidence already exists")
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "LIVE execution markout scheduling",
+        )
         raise
     if inserted:
         _notify_markout_queue_changed()
@@ -8878,6 +11164,23 @@ def _markout_producer_filter_db(
     return sql, producer_bots
 
 
+def _markout_parent_scope_row_db(row, *, expected_mode: str) -> dict:
+    result = dict(row)
+    parent_mode = result.pop("_queue_parent_mode", None)
+    parent_symbol = result.pop("_queue_parent_symbol", None)
+    parent_present = parent_mode is not None or parent_symbol is not None
+    result["queue_parent_invalid"] = bool(
+        parent_present
+        and (
+            parent_mode != expected_mode
+            or not _candidate_symbol_matches_db(
+                parent_symbol, result.get("symbol")
+            )
+        )
+    )
+    return result
+
+
 def list_due_execution_markouts(
     limit: int = 25,
     *,
@@ -8894,10 +11197,21 @@ def list_due_execution_markouts(
         producer_table="order_intents",
     )
     rows = [
-        {**dict(row), "telemetry_scope": "LIVE"}
+        {
+            **_markout_parent_scope_row_db(row, expected_mode="LIVE"),
+            "telemetry_scope": "LIVE",
+        }
         for row in conn.execute(
             f"""SELECT * FROM (
                     SELECT rowid AS queue_rowid, *,
+                           (SELECT mode FROM order_intents AS parent
+                             WHERE parent.intent_id=
+                                   execution_markouts.intent_id)
+                               AS _queue_parent_mode,
+                           (SELECT symbol FROM order_intents AS parent
+                             WHERE parent.intent_id=
+                                   execution_markouts.intent_id)
+                               AS _queue_parent_symbol,
                            0 AS queue_time_invalid
                       FROM execution_markouts
                      WHERE status='PENDING' AND due_at <= ?
@@ -8906,6 +11220,14 @@ def list_due_execution_markouts(
                        {live_filter}
                     UNION ALL
                     SELECT rowid AS queue_rowid, *,
+                           (SELECT mode FROM order_intents AS parent
+                             WHERE parent.intent_id=
+                                   execution_markouts.intent_id)
+                               AS _queue_parent_mode,
+                           (SELECT symbol FROM order_intents AS parent
+                             WHERE parent.intent_id=
+                                   execution_markouts.intent_id)
+                               AS _queue_parent_symbol,
                            1 AS queue_time_invalid
                       FROM execution_markouts
                      WHERE status='PENDING'
@@ -9127,13 +11449,14 @@ def execution_markout_due_summary(*, producer_bots=None) -> dict:
     }
 
 
-def simulated_execution_evidence_health(
+def _simulated_execution_evidence_health_snapshot(
     bot_name: str,
     *,
     now: str | None = None,
     overdue_grace_seconds: int = 60,
+    _snapshot_connection,
 ) -> dict:
-    """Return restart-reconstructed SIM evidence coverage for one origin bot."""
+    """Read SIM evidence through a transaction owned by the public wrapper."""
     normalized_bot = _required_text_db(
         bot_name, "bot_name", max_length=32
     ).upper()
@@ -9155,20 +11478,20 @@ def simulated_execution_evidence_health(
     grace_text = (now_dt - timedelta(seconds=overdue_grace_seconds)).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
-    conn = get_connection()
-    owns_read_transaction = not conn.in_transaction
-    if owns_read_transaction:
-        conn.execute("BEGIN")
-    evidence_cte = """
+    if _snapshot_connection is None:
+        raise ValueError("SIM evidence snapshot connection is required")
+    conn = _snapshot_connection
+    owns_read_transaction = False
+    evidence_cte = f"""
         WITH scoped_candidates AS (
             SELECT candidate.entry_id, candidate.candidate_time,
-                   candidate.bot_name
+                   candidate.bot_name, candidate.symbol AS candidate_symbol
               FROM expectancy_candidates AS candidate
              WHERE candidate.bot_name=? AND candidate.mode='SIM'
         ),
         evidence_entries AS (
             SELECT candidate.entry_id, candidate.candidate_time,
-                   candidate.bot_name
+                   candidate.bot_name, candidate.candidate_symbol
               FROM scoped_candidates AS candidate
              WHERE (
                     EXISTS (
@@ -9218,7 +11541,53 @@ def simulated_execution_evidence_health(
                    MIN(CASE WHEN tca.stage='arrival'
                             THEN tca.measured_at END) AS arrival_at,
                    MIN(CASE WHEN tca.stage='fill'
-                            THEN tca.measured_at END) AS fill_at
+                            THEN tca.measured_at END) AS fill_at,
+                   MIN(CASE WHEN tca.stage='arrival' THEN
+                     CASE WHEN json_valid(tca.payload_json)=1 THEN
+                       CASE WHEN json_type(tca.payload_json, '$')='object'
+                            THEN json(tca.payload_json) END
+                     END
+                   END) AS arrival_payload_canonical,
+                   COALESCE(SUM(CASE WHEN tca.stage='fill' THEN
+                     CASE WHEN json_valid(tca.payload_json)=1 THEN
+                       CASE
+                         WHEN json_type(tca.payload_json, '$')='object'
+                          AND (
+                              json_type(
+                                  tca.payload_json, '$.bot_name'
+                              ) IS NULL
+                              OR (
+                                  json_type(
+                                      tca.payload_json, '$.bot_name'
+                                  )='text'
+                                  AND upper(trim(json_extract(
+                                      tca.payload_json, '$.bot_name'
+                                  )))=evidence_entries.bot_name
+                              )
+                          )
+                          AND (
+                              json_type(tca.payload_json, '$.mode') IS NULL
+                              OR (
+                                  json_type(
+                                      tca.payload_json, '$.mode'
+                                  )='text'
+                                  AND upper(trim(json_extract(
+                                      tca.payload_json, '$.mode'
+                                  )))='SIM'
+                              )
+                          )
+                          AND (
+                              json_type(
+                                  tca.payload_json, '$.research_simulated'
+                              ) IS NULL
+                              OR json_type(
+                                  tca.payload_json, '$.research_simulated'
+                              )='true'
+                          )
+                         THEN 1 ELSE 0
+                       END
+                     ELSE 0 END
+                   ELSE 0 END), 0) AS fill_payload_contract_count
               FROM evidence_entries
               LEFT JOIN sim_execution_tca AS tca
                 ON tca.entry_id=evidence_entries.entry_id
@@ -9227,7 +11596,65 @@ def simulated_execution_evidence_health(
         unavailable_counts AS (
             SELECT evidence_entries.entry_id,
                    COUNT(micro.entry_id) AS unavailable_count,
-                   MIN(micro.measured_at) AS unavailable_at
+                   COALESCE(SUM(CASE
+                     WHEN micro.entry_id IS NULL THEN 0
+                     WHEN micro.source!='sim_tca_capture'
+                       OR micro.sequence_status!='capture_failed'
+                       OR json_valid(micro.payload_json)!=1
+                     THEN 0
+                     ELSE CASE
+                       WHEN json_type(micro.payload_json, '$')='object'
+                        AND (SELECT COUNT(*)
+                               FROM json_each(micro.payload_json))=8
+                        AND json_type(
+                                micro.payload_json, '$.bot_name'
+                            )='text'
+                        AND json_extract(
+                                micro.payload_json, '$.bot_name'
+                            )=evidence_entries.bot_name
+                        AND json_type(
+                                micro.payload_json, '$.mode'
+                            )='text'
+                        AND json_extract(
+                                micro.payload_json, '$.mode'
+                            )='SIM'
+                        AND json_type(
+                                micro.payload_json, '$.research_simulated'
+                            )='true'
+                        AND json_type(
+                                micro.payload_json, '$.markouts_scheduled'
+                            )='true'
+                        AND json_type(
+                                micro.payload_json,
+                                '$.capture_contract_schema'
+                            )='integer'
+                        AND json_extract(
+                                micro.payload_json,
+                                '$.capture_contract_schema'
+                            )={int(SIM_CAPTURE_CONTRACT_SCHEMA)}
+                        AND json_type(
+                                micro.payload_json, '$.capture_anchor_utc'
+                            )='text'
+                        AND json_extract(
+                                micro.payload_json, '$.capture_anchor_utc'
+                            )=micro.measured_at
+                        AND json_type(
+                                micro.payload_json, '$.reason'
+                            )='text'
+                        AND length(trim(json_extract(
+                                micro.payload_json, '$.reason'
+                            ))) BETWEEN 1 AND 100
+                        AND json_type(
+                                micro.payload_json, '$.error_type'
+                            )='text'
+                        AND length(trim(json_extract(
+                                micro.payload_json, '$.error_type'
+                            ))) BETWEEN 1 AND 100
+                       THEN 1 ELSE 0
+                     END
+                   END), 0) AS unavailable_contract_count,
+                   MIN(micro.measured_at) AS unavailable_at,
+                   MIN(micro.symbol) AS unavailable_symbol
               FROM evidence_entries
               LEFT JOIN candidate_microstructure AS micro
                 ON micro.entry_id=evidence_entries.entry_id
@@ -9236,20 +11663,170 @@ def simulated_execution_evidence_health(
                AND micro.stage='arrival_book_unavailable'
              GROUP BY evidence_entries.entry_id
         ),
+        available_book_counts AS (
+            SELECT evidence_entries.entry_id,
+                   COUNT(micro.entry_id) AS available_book_count,
+                   COALESCE(SUM(CASE
+                     WHEN micro.entry_id IS NULL
+                       OR json_valid(micro.payload_json)!=1
+                     THEN 0
+                     ELSE CASE
+                       WHEN json_type(micro.payload_json, '$')='object'
+                        AND (
+                            json_type(micro.payload_json, '$.bot_name') IS NULL
+                            OR (
+                                json_type(
+                                    micro.payload_json, '$.bot_name'
+                                )='text'
+                                AND upper(trim(json_extract(
+                                    micro.payload_json, '$.bot_name'
+                                )))=evidence_entries.bot_name
+                            )
+                        )
+                        AND (
+                            json_type(micro.payload_json, '$.mode') IS NULL
+                            OR (
+                                json_type(micro.payload_json, '$.mode')='text'
+                                AND upper(trim(json_extract(
+                                    micro.payload_json, '$.mode'
+                                )))='SIM'
+                            )
+                        )
+                        AND (
+                            json_type(
+                                micro.payload_json, '$.research_simulated'
+                            ) IS NULL
+                            OR json_type(
+                                micro.payload_json, '$.research_simulated'
+                            )='true'
+                        )
+                       THEN 1 ELSE 0
+                     END
+                   END), 0) AS available_book_contract_count,
+                   MIN(micro.measured_at) AS available_book_at,
+                   MIN(micro.symbol) AS available_book_symbol,
+                   MIN(CASE WHEN json_valid(micro.payload_json)=1 THEN
+                     CASE WHEN json_type(micro.payload_json, '$')='object'
+                          THEN json(micro.payload_json) END
+                   END) AS available_book_payload_canonical
+              FROM evidence_entries
+              LEFT JOIN candidate_microstructure AS micro
+                ON micro.entry_id=evidence_entries.entry_id
+               AND micro.bot_name=evidence_entries.bot_name
+               AND micro.mode='SIM'
+               AND micro.stage='arrival_book'
+               AND micro.source='sim_tca_rest_orderbook'
+               AND micro.sequence_status='unverified_unified_orderbook'
+             GROUP BY evidence_entries.entry_id
+        ),
+        markout_symbols AS (
+            SELECT evidence_entries.entry_id,
+                   COUNT(markout.entry_id) AS markout_count,
+                   COUNT(DISTINCT markout.symbol) AS markout_symbol_count,
+                   COALESCE(SUM(CASE
+                     WHEN typeof(markout.symbol)='text'
+                      AND length(trim(markout.symbol)) BETWEEN 1 AND 64
+                     THEN 1 ELSE 0 END), 0) AS valid_markout_symbol_count,
+                   MIN(markout.symbol) AS markout_symbol
+              FROM evidence_entries
+              LEFT JOIN sim_execution_markouts AS markout
+                ON markout.entry_id=evidence_entries.entry_id
+             GROUP BY evidence_entries.entry_id
+        ),
+        recovery_counts AS (
+            SELECT evidence_entries.entry_id,
+                   COUNT(micro.entry_id) AS recovery_count,
+                   COALESCE(SUM(CASE
+                     WHEN micro.entry_id IS NULL THEN 0
+                     WHEN micro.source!='sim_tca_capture'
+                       OR micro.sequence_status!='capture_recovered'
+                       OR json_valid(micro.payload_json)!=1
+                     THEN 0
+                     ELSE CASE
+                       WHEN json_type(micro.payload_json, '$')='object'
+                        AND (SELECT COUNT(*)
+                               FROM json_each(micro.payload_json))=6
+                        AND json_type(
+                                micro.payload_json, '$.bot_name'
+                            )='text'
+                        AND json_extract(
+                                micro.payload_json, '$.bot_name'
+                            )=evidence_entries.bot_name
+                        AND json_type(
+                                micro.payload_json, '$.mode'
+                            )='text'
+                        AND json_extract(
+                                micro.payload_json, '$.mode'
+                            )='SIM'
+                        AND json_type(
+                                micro.payload_json, '$.research_simulated'
+                            )='true'
+                        AND json_type(
+                                micro.payload_json, '$.reason'
+                            )='text'
+                        AND json_extract(
+                                micro.payload_json, '$.reason'
+                            )='arrival_book_available'
+                        AND json_type(
+                                micro.payload_json,
+                                '$.capture_contract_schema'
+                            )='integer'
+                        AND json_extract(
+                                micro.payload_json,
+                                '$.capture_contract_schema'
+                            )={int(SIM_CAPTURE_CONTRACT_SCHEMA)}
+                        AND json_type(
+                                micro.payload_json, '$.capture_anchor_utc'
+                            )='text'
+                        AND json_extract(
+                                micro.payload_json, '$.capture_anchor_utc'
+                            )=micro.measured_at
+                       THEN 1 ELSE 0
+                     END
+                   END), 0) AS recovery_contract_count,
+                   MIN(micro.measured_at) AS recovery_at,
+                   MIN(micro.symbol) AS recovery_symbol
+              FROM evidence_entries
+              LEFT JOIN candidate_microstructure AS micro
+                ON micro.entry_id=evidence_entries.entry_id
+               AND micro.bot_name=evidence_entries.bot_name
+               AND micro.mode='SIM'
+               AND micro.stage='arrival_book_recovered'
+             GROUP BY evidence_entries.entry_id
+        ),
         tca_shape_base AS (
             SELECT evidence_entries.entry_id,
                    evidence_entries.candidate_time,
+                   evidence_entries.candidate_symbol,
                    tca_counts.arrival_count,
                    tca_counts.fill_count,
                    tca_counts.unexpected_stage_count,
                    tca_counts.arrival_at,
                    tca_counts.fill_at,
+                   tca_counts.arrival_payload_canonical,
+                   tca_counts.fill_payload_contract_count,
                    unavailable_counts.unavailable_count,
+                   unavailable_counts.unavailable_contract_count,
                    unavailable_counts.unavailable_at,
+                   unavailable_counts.unavailable_symbol,
+                   available_book_counts.available_book_count,
+                   available_book_counts.available_book_contract_count,
+                   available_book_counts.available_book_at,
+                   available_book_counts.available_book_symbol,
+                   available_book_counts.available_book_payload_canonical,
+                   markout_symbols.markout_count,
+                   markout_symbols.markout_symbol_count,
+                   markout_symbols.valid_markout_symbol_count,
+                   markout_symbols.markout_symbol,
+                   recovery_counts.recovery_count,
+                   recovery_counts.recovery_contract_count,
+                   recovery_counts.recovery_at,
+                   recovery_counts.recovery_symbol,
                    CASE
                      WHEN tca_counts.arrival_count=1
                       AND tca_counts.fill_count=1
                       AND unavailable_counts.unavailable_count=0
+                      AND recovery_counts.recovery_count=0
                       AND tca_counts.unexpected_stage_count=0
                       AND strftime('%Y-%m-%d %H:%M:%S',
                                    julianday(tca_counts.arrival_at))
@@ -9258,23 +11835,176 @@ def simulated_execution_evidence_health(
                                    julianday(tca_counts.fill_at))
                           =tca_counts.fill_at
                       AND tca_counts.arrival_at<=tca_counts.fill_at
-                     THEN tca_counts.fill_at
+                     THEN 'AVAILABLE'
+                     WHEN tca_counts.arrival_count=1
+                      AND tca_counts.fill_count=1
+                      AND unavailable_counts.unavailable_count=1
+                      AND unavailable_counts.unavailable_contract_count=1
+                      AND available_book_counts.available_book_count=1
+                      AND available_book_counts.available_book_contract_count=1
+                      AND recovery_counts.recovery_count=1
+                      AND recovery_counts.recovery_contract_count=1
+                      AND tca_counts.fill_payload_contract_count=1
+                      AND tca_counts.unexpected_stage_count=0
+                      AND strftime('%Y-%m-%d %H:%M:%S',
+                                   julianday(tca_counts.arrival_at))
+                          =tca_counts.arrival_at
+                      AND strftime('%Y-%m-%d %H:%M:%S',
+                                   julianday(tca_counts.fill_at))
+                          =tca_counts.fill_at
+                      AND strftime('%Y-%m-%d %H:%M:%S',
+                                   julianday(unavailable_counts.unavailable_at))
+                          =unavailable_counts.unavailable_at
+                      AND strftime('%Y-%m-%d %H:%M:%S',
+                                   julianday(recovery_counts.recovery_at))
+                          =recovery_counts.recovery_at
+                      AND tca_counts.arrival_at=tca_counts.fill_at
+                      AND tca_counts.fill_at=unavailable_counts.unavailable_at
+                      AND unavailable_counts.unavailable_at=
+                          recovery_counts.recovery_at
+                      AND recovery_counts.recovery_at=
+                          available_book_counts.available_book_at
+                      AND tca_counts.arrival_payload_canonical=
+                          available_book_counts.available_book_payload_canonical
+                      AND unavailable_counts.unavailable_symbol=
+                          recovery_counts.recovery_symbol
+                      AND recovery_counts.recovery_symbol=
+                          available_book_counts.available_book_symbol
+                      AND markout_symbols.markout_symbol_count=1
+                      AND markout_symbols.valid_markout_symbol_count=
+                          markout_symbols.markout_count
+                      AND recovery_counts.recovery_symbol=
+                          markout_symbols.markout_symbol
+                      AND (
+                          lower(trim(evidence_entries.candidate_symbol))=
+                              lower(trim(markout_symbols.markout_symbol))
+                          OR (
+                              (instr(evidence_entries.candidate_symbol, '/')=0
+                               OR instr(markout_symbols.markout_symbol, '/')=0)
+                              AND lower(CASE
+                                  WHEN instr(
+                                      evidence_entries.candidate_symbol, '/'
+                                  )>0
+                                  THEN substr(
+                                      evidence_entries.candidate_symbol,
+                                      1,
+                                      instr(
+                                          evidence_entries.candidate_symbol, '/'
+                                      )-1
+                                  )
+                                  ELSE evidence_entries.candidate_symbol
+                              END)=lower(CASE
+                                  WHEN instr(
+                                      markout_symbols.markout_symbol, '/'
+                                  )>0
+                                  THEN substr(
+                                      markout_symbols.markout_symbol,
+                                      1,
+                                      instr(
+                                          markout_symbols.markout_symbol, '/'
+                                      )-1
+                                  )
+                                  ELSE markout_symbols.markout_symbol
+                              END)
+                          )
+                      )
+                     THEN 'RECOVERED'
                      WHEN tca_counts.arrival_count=0
                       AND tca_counts.fill_count=0
                       AND unavailable_counts.unavailable_count=1
+                      AND recovery_counts.recovery_count=0
                       AND tca_counts.unexpected_stage_count=0
                       AND strftime('%Y-%m-%d %H:%M:%S',
                                    julianday(unavailable_counts.unavailable_at))
                           =unavailable_counts.unavailable_at
-                     THEN unavailable_counts.unavailable_at
-                     ELSE NULL
-                   END AS raw_causal_anchor_at
+                     THEN 'UNAVAILABLE'
+                     ELSE 'INVALID'
+                   END AS shape_kind,
+                   CASE
+                     WHEN tca_counts.arrival_count=1
+                      AND tca_counts.fill_count=1
+                      AND unavailable_counts.unavailable_count=0
+                      AND recovery_counts.recovery_count=0
+                      AND tca_counts.unexpected_stage_count=0
+                     THEN 'AVAILABLE'
+                     WHEN tca_counts.arrival_count=1
+                      AND tca_counts.fill_count=1
+                      AND unavailable_counts.unavailable_count=1
+                      AND unavailable_counts.unavailable_contract_count=1
+                      AND available_book_counts.available_book_count=1
+                      AND available_book_counts.available_book_contract_count=1
+                      AND recovery_counts.recovery_count=1
+                      AND recovery_counts.recovery_contract_count=1
+                      AND tca_counts.fill_payload_contract_count=1
+                      AND tca_counts.unexpected_stage_count=0
+                      AND tca_counts.arrival_payload_canonical=
+                          available_book_counts.available_book_payload_canonical
+                      AND markout_symbols.markout_symbol_count=1
+                      AND markout_symbols.valid_markout_symbol_count=
+                          markout_symbols.markout_count
+                      AND recovery_counts.recovery_symbol=
+                          markout_symbols.markout_symbol
+                      AND (
+                          lower(trim(evidence_entries.candidate_symbol))=
+                              lower(trim(markout_symbols.markout_symbol))
+                          OR (
+                              (instr(evidence_entries.candidate_symbol, '/')=0
+                               OR instr(markout_symbols.markout_symbol, '/')=0)
+                              AND lower(CASE
+                                  WHEN instr(
+                                      evidence_entries.candidate_symbol, '/'
+                                  )>0
+                                  THEN substr(
+                                      evidence_entries.candidate_symbol,
+                                      1,
+                                      instr(
+                                          evidence_entries.candidate_symbol, '/'
+                                      )-1
+                                  )
+                                  ELSE evidence_entries.candidate_symbol
+                              END)=lower(CASE
+                                  WHEN instr(
+                                      markout_symbols.markout_symbol, '/'
+                                  )>0
+                                  THEN substr(
+                                      markout_symbols.markout_symbol,
+                                      1,
+                                      instr(
+                                          markout_symbols.markout_symbol, '/'
+                                      )-1
+                                  )
+                                  ELSE markout_symbols.markout_symbol
+                              END)
+                          )
+                      )
+                     THEN 'RECOVERED'
+                     WHEN tca_counts.arrival_count=0
+                      AND tca_counts.fill_count=0
+                      AND unavailable_counts.unavailable_count=1
+                      AND recovery_counts.recovery_count=0
+                      AND tca_counts.unexpected_stage_count=0
+                     THEN 'UNAVAILABLE'
+                     ELSE 'INVALID'
+                   END AS structural_kind
               FROM evidence_entries
               JOIN tca_counts USING (entry_id)
               JOIN unavailable_counts USING (entry_id)
+              JOIN available_book_counts USING (entry_id)
+              JOIN markout_symbols USING (entry_id)
+              JOIN recovery_counts USING (entry_id)
+        ),
+        tca_shape_anchor AS (
+            SELECT tca_shape_base.*,
+                   CASE
+                     WHEN shape_kind IN ('AVAILABLE','RECOVERED')
+                     THEN fill_at
+                     WHEN shape_kind='UNAVAILABLE' THEN unavailable_at
+                     ELSE NULL
+                   END AS raw_causal_anchor_at
+              FROM tca_shape_base
         ),
         tca_shape AS (
-            SELECT tca_shape_base.*,
+            SELECT tca_shape_anchor.*,
                    CASE
                      WHEN raw_causal_anchor_at IS NOT NULL
                       AND strftime('%Y-%m-%d %H:%M:%S',
@@ -9290,10 +12020,12 @@ def simulated_execution_evidence_health(
                       AND candidate_time>raw_causal_anchor_at
                      THEN 1 ELSE 0
                    END AS candidate_after_anchor
-              FROM tca_shape_base
+              FROM tca_shape_anchor
         )
     """
     try:
+        if owns_read_transaction:
+            conn.execute("BEGIN")
         entry = conn.execute(
             evidence_cte
             + """
@@ -9301,19 +12033,17 @@ def simulated_execution_evidence_health(
                (SELECT COUNT(*) FROM tca_only_entries) AS tca_only_entry_count,
                MAX(candidate_time) AS latest_entry_at,
                COALESCE(SUM(CASE WHEN causal_anchor_at IS NOT NULL
-                                       AND arrival_count=1 AND fill_count=1
-                                       AND unavailable_count=0
-                                       AND unexpected_stage_count=0
+                                       AND shape_kind IN
+                                           ('AVAILABLE','RECOVERED')
                                  THEN 1 ELSE 0 END), 0)
                    AS complete_tca_count,
                COALESCE(SUM(CASE WHEN causal_anchor_at IS NOT NULL
-                                       AND arrival_count=0 AND fill_count=0
-                                       AND unavailable_count=1
-                                       AND unexpected_stage_count=0
+                                       AND shape_kind='UNAVAILABLE'
                                  THEN 1 ELSE 0 END), 0)
                    AS unavailable_tca_count,
                COALESCE(SUM(CASE WHEN unavailable_count>0
                                       AND (arrival_count>0 OR fill_count>0)
+                                      AND shape_kind!='RECOVERED'
                                  THEN 1 ELSE 0 END), 0)
                    AS conflicting_tca_count,
                 COALESCE(SUM(CASE WHEN arrival_count>1 OR fill_count>1
@@ -9324,13 +12054,8 @@ def simulated_execution_evidence_health(
                     AS unexpected_tca_stage_count,
                 COALESCE(SUM(candidate_after_anchor), 0)
                     AS candidate_after_anchor_count,
-                COALESCE(SUM(CASE WHEN
-                    ((arrival_count=1 AND fill_count=1 AND unavailable_count=0
-                      AND unexpected_stage_count=0)
-                     OR (arrival_count=0 AND fill_count=0
-                         AND unavailable_count=1
-                         AND unexpected_stage_count=0))
-                    AND causal_anchor_at IS NULL
+                COALESCE(SUM(CASE WHEN structural_kind!='INVALID'
+                                       AND causal_anchor_at IS NULL
                     THEN 1 ELSE 0 END), 0) AS invalid_tca_time_count,
                 COALESCE(SUM(CASE WHEN causal_anchor_at IS NULL
                                       AND NOT (arrival_count>1 OR fill_count>1)
@@ -9340,12 +12065,7 @@ def simulated_execution_evidence_health(
                                           AND (arrival_count>0 OR fill_count>0)
                                       )
                                       AND NOT (
-                                          ((arrival_count=1 AND fill_count=1
-                                            AND unavailable_count=0
-                                            AND unexpected_stage_count=0)
-                                           OR (arrival_count=0 AND fill_count=0
-                                               AND unavailable_count=1
-                                               AND unexpected_stage_count=0))
+                                          structural_kind!='INVALID'
                                           AND causal_anchor_at IS NULL
                                       )
                                   THEN 1 ELSE 0 END), 0)
@@ -9365,29 +12085,34 @@ def simulated_execution_evidence_health(
             """,
             (normalized_bot,),
         ).fetchone()
-    except Exception:
+    except BaseException as exc:
         if owns_read_transaction:
-            conn.rollback()
+            _rollback_transaction_preserving(
+                conn,
+                exc,
+                "SIM execution evidence health entry snapshot",
+            )
         raise
-    entry_count = max(0, int(entry["entry_count"] or 0))
-    tca_only_entry_count = max(0, int(entry["tca_only_entry_count"] or 0))
-    complete_tca = max(0, int(entry["complete_tca_count"] or 0))
-    unavailable_tca = max(0, int(entry["unavailable_tca_count"] or 0))
-    conflicting_tca = max(0, int(entry["conflicting_tca_count"] or 0))
-    duplicate_tca = max(0, int(entry["duplicate_tca_count"] or 0))
-    unexpected_tca_stage = max(
-        0, int(entry["unexpected_tca_stage_count"] or 0)
-    )
-    candidate_after_anchor = max(
-        0, int(entry["candidate_after_anchor_count"] or 0)
-    )
-    invalid_tca_time = max(0, int(entry["invalid_tca_time_count"] or 0))
-    incomplete_tca = max(0, int(entry["incomplete_tca_count"] or 0))
-    invalid_tca = max(0, int(entry["invalid_tca_count"] or 0))
-    active_invalid_tca = max(0, int(entry["active_invalid_tca_count"] or 0))
-    expected_horizons = (1, 10, 60, 300, 900)
-    horizon_sql = ",".join("?" for _ in expected_horizons)
-    markout_mirror_cte = evidence_cte + """
+    try:
+        entry_count = max(0, int(entry["entry_count"] or 0))
+        tca_only_entry_count = max(0, int(entry["tca_only_entry_count"] or 0))
+        complete_tca = max(0, int(entry["complete_tca_count"] or 0))
+        unavailable_tca = max(0, int(entry["unavailable_tca_count"] or 0))
+        conflicting_tca = max(0, int(entry["conflicting_tca_count"] or 0))
+        duplicate_tca = max(0, int(entry["duplicate_tca_count"] or 0))
+        unexpected_tca_stage = max(
+            0, int(entry["unexpected_tca_stage_count"] or 0)
+        )
+        candidate_after_anchor = max(
+            0, int(entry["candidate_after_anchor_count"] or 0)
+        )
+        invalid_tca_time = max(0, int(entry["invalid_tca_time_count"] or 0))
+        incomplete_tca = max(0, int(entry["incomplete_tca_count"] or 0))
+        invalid_tca = max(0, int(entry["invalid_tca_count"] or 0))
+        active_invalid_tca = max(0, int(entry["active_invalid_tca_count"] or 0))
+        expected_horizons = (1, 10, 60, 300, 900)
+        horizon_sql = ",".join("?" for _ in expected_horizons)
+        markout_mirror_cte = evidence_cte + """
         , markout_mirrors AS (
             SELECT markout.entry_id, markout.horizon_seconds,
                    COUNT(tca.id) AS mirror_count,
@@ -9402,7 +12127,15 @@ def simulated_execution_evidence_health(
                )
              GROUP BY markout.entry_id, markout.horizon_seconds
         )
-    """
+        """
+    except BaseException as exc:
+        if owns_read_transaction:
+            _rollback_transaction_preserving(
+                conn,
+                exc,
+                "SIM execution evidence health entry validation",
+            )
+        raise
     try:
         markouts = conn.execute(
             markout_mirror_cte
@@ -9546,12 +12279,16 @@ def simulated_execution_evidence_health(
                 grace_text,
             ),
         ).fetchone()
-    except Exception:
         if owns_read_transaction:
-            conn.rollback()
+            conn.commit()
+    except BaseException as exc:
+        if owns_read_transaction:
+            _rollback_transaction_preserving(
+                conn,
+                exc,
+                "SIM execution evidence health markout snapshot",
+            )
         raise
-    if owns_read_transaction:
-        conn.commit()
     observed = max(0, int(markouts["observed_count"] or 0))
     expected_rows = max(0, int(markouts["expected_rows"] or 0))
     unexpected = max(0, int(markouts["unexpected_rows"] or 0))
@@ -9675,6 +12412,51 @@ def simulated_execution_evidence_health(
     }
 
 
+def simulated_execution_evidence_health(
+    bot_name: str,
+    *,
+    now: str | None = None,
+    overdue_grace_seconds: int = 60,
+) -> dict:
+    """Return one transactionally consistent SIM evidence-health snapshot."""
+    normalized_bot = _required_text_db(
+        bot_name, "bot_name", max_length=32
+    ).upper()
+    if normalized_bot not in _SIM_TCA_BOTS:
+        raise ValueError("simulated evidence health bot is unsupported")
+    if (
+        isinstance(overdue_grace_seconds, bool)
+        or not isinstance(overdue_grace_seconds, int)
+        or not 5 <= overdue_grace_seconds <= 3_600
+    ):
+        raise ValueError("simulated evidence overdue grace is invalid")
+    if now is not None:
+        _trade_timestamp_db(now, "simulated evidence health time")
+
+    conn = get_connection()
+    owns_read_transaction = not conn.in_transaction
+    try:
+        if owns_read_transaction:
+            conn.execute("BEGIN")
+        result = _simulated_execution_evidence_health_snapshot(
+            normalized_bot,
+            now=now,
+            overdue_grace_seconds=overdue_grace_seconds,
+            _snapshot_connection=conn,
+        )
+        if owns_read_transaction:
+            conn.commit()
+        return result
+    except BaseException as exc:
+        if owns_read_transaction:
+            _rollback_transaction_preserving(
+                conn,
+                exc,
+                "SIM execution evidence health snapshot",
+            )
+        raise
+
+
 def quarantine_execution_markout(
     telemetry_scope: str,
     queue_rowid: int,
@@ -9695,15 +12477,23 @@ def quarantine_execution_markout(
         conn.execute("BEGIN IMMEDIATE")
         cursor = conn.execute(
             f"""UPDATE {table}
-                    SET status='FAILED', attempts=attempts+1,
+                    SET status='FAILED', attempts=CASE
+                            WHEN typeof(attempts)='integer'
+                             AND attempts>=0
+                             AND attempts<9223372036854775807
+                            THEN attempts+1 ELSE 1 END,
                         last_error=?, next_attempt_at=NULL, failed_at=?
                   WHERE rowid=? AND status='PENDING'""",
             (error.strip()[:500], _utcnow_str(), rowid),
         )
         conn.commit()
         return cursor.rowcount == 1
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "execution markout quarantine",
+        )
         raise
 
 
@@ -9757,13 +12547,32 @@ def complete_execution_markout(
     try:
         conn.execute("BEGIN IMMEDIATE")
         pending = conn.execute(
-            """SELECT due_at, side, reference_price, attempts
-                 FROM execution_markouts
-                 WHERE intent_id=? AND horizon_seconds=?
-                   AND status='PENDING'""",
+            """SELECT markout.due_at, markout.side,
+                      markout.reference_price, markout.attempts,
+                      markout.symbol, intent.mode AS parent_mode,
+                      intent.symbol AS parent_symbol
+                 FROM execution_markouts AS markout
+            LEFT JOIN order_intents AS intent
+                   ON intent.intent_id=markout.intent_id
+                WHERE markout.intent_id=? AND markout.horizon_seconds=?
+                  AND markout.status='PENDING'""",
             (str(intent_id), horizon),
         ).fetchone()
         if pending is not None:
+            parent_present = (
+                pending["parent_mode"] is not None
+                or pending["parent_symbol"] is not None
+            )
+            if (
+                parent_present
+                and (
+                    pending["parent_mode"] != "LIVE"
+                    or not _candidate_symbol_matches_db(
+                        pending["parent_symbol"], pending["symbol"]
+                    )
+                )
+            ):
+                raise ValueError("LIVE markout queue parent scope is invalid")
             _validate_markout_completion_time_db(
                 pending,
                 observed_at=observed_at,
@@ -9798,11 +12607,16 @@ def complete_execution_markout(
                 observed_at,
                 stage,
                 encoded,
+                require_measured_at_match=True,
             )
         conn.commit()
         return cur.rowcount == 1
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "LIVE execution markout completion",
+        )
         raise
 
 
@@ -9871,7 +12685,7 @@ def _record_markout_failure(
             else None
         )
 
-        conn.execute(
+        updated = conn.execute(
             f"""UPDATE {table}
                    SET attempts=?, status=?, last_error=?, next_attempt_at=?,
                        failed_at=?
@@ -9887,9 +12701,15 @@ def _record_markout_failure(
                 horizon,
             ),
         )
+        if updated.rowcount != 1:
+            raise ValueError("markout failure update lost generation")
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "execution markout failure persistence",
+        )
         raise
 
 
@@ -9928,27 +12748,40 @@ def _persist_simulated_execution_tca_stage(
     measured_at: str,
     stage: str,
     encoded: str,
+    *,
+    require_measured_at_match: bool = False,
 ) -> None:
     desired = _canonical_finite_json_object_db(encoded)
     if desired is None:
         raise ValueError("SIM TCA payload must be a finite JSON object")
     existing_rows = conn.execute(
-        """SELECT payload_json FROM sim_execution_tca
+        """SELECT measured_at, payload_json FROM sim_execution_tca
              WHERE entry_id=? AND stage=? ORDER BY id""",
         (entry_id, stage),
     ).fetchall()
+    if require_measured_at_match and len(existing_rows) > 1:
+        raise ValueError("conflicting SIM TCA evidence already exists")
     for row in existing_rows:
         existing = _canonical_finite_json_object_db(row["payload_json"])
-        if existing is None or existing[1] != desired[1]:
+        if (
+            existing is None
+            or existing[1] != desired[1]
+            or (
+                require_measured_at_match
+                and str(row["measured_at"]) != measured_at
+            )
+        ):
             raise ValueError("conflicting SIM TCA evidence already exists")
     if existing_rows:
         return
-    conn.execute(
+    inserted = conn.execute(
         """INSERT INTO sim_execution_tca
            (entry_id, measured_at, stage, payload_json)
            VALUES (?, ?, ?, ?)""",
         (entry_id, measured_at, stage, encoded),
     )
+    if inserted.rowcount != 1:
+        raise ValueError("SIM TCA evidence persistence lost generation")
 
 
 def _validate_sim_tca_payload_scope_db(payload: dict, bot_name: str) -> None:
@@ -10002,8 +12835,12 @@ def record_simulated_execution_tca(
             encoded,
         )
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "SIM execution TCA persistence",
+        )
         raise
 
 
@@ -10132,10 +12969,12 @@ def persist_simulated_entry_tca_bundle(
                 normalized_time,
                 stage,
                 encoded,
+                require_measured_at_match=True,
             )
 
         snapshot_existing = conn.execute(
-            """SELECT bot_name, mode, symbol, source, sequence_status,
+            """SELECT bot_name, mode, symbol, measured_at,
+                      source, sequence_status,
                       payload_json
                  FROM candidate_microstructure
                 WHERE entry_id=? AND stage='arrival_book'""",
@@ -10145,12 +12984,13 @@ def persist_simulated_entry_tca_bundle(
             normalized_bot,
             "SIM",
             normalized_symbol,
+            normalized_time,
             "sim_tca_rest_orderbook",
             "unverified_unified_orderbook",
             encoded_snapshot,
         )
         if snapshot_existing is None:
-            conn.execute(
+            snapshot_inserted = conn.execute(
                 """INSERT INTO candidate_microstructure
                    (entry_id, stage, bot_name, mode, symbol, measured_at,
                     source, sequence_status, payload_json)
@@ -10165,6 +13005,10 @@ def persist_simulated_entry_tca_bundle(
                     encoded_snapshot,
                 ),
             )
+            if snapshot_inserted.rowcount != 1:
+                raise ValueError(
+                    "SIM entry bundle persistence lost generation"
+                )
         elif tuple(snapshot_existing) != snapshot_values:
             raise ValueError("conflicting SIM microstructure evidence already exists")
 
@@ -10175,7 +13019,8 @@ def persist_simulated_entry_tca_bundle(
         ).fetchone()
         if prior_capture_failure is not None:
             recovery_existing = conn.execute(
-                """SELECT bot_name, mode, symbol, source, sequence_status,
+                """SELECT bot_name, mode, symbol, measured_at,
+                          source, sequence_status,
                           payload_json
                      FROM candidate_microstructure
                     WHERE entry_id=? AND stage='arrival_book_recovered'""",
@@ -10185,12 +13030,13 @@ def persist_simulated_entry_tca_bundle(
                 normalized_bot,
                 "SIM",
                 normalized_symbol,
+                normalized_time,
                 "sim_tca_capture",
                 "capture_recovered",
                 encoded_recovery,
             )
             if recovery_existing is None:
-                conn.execute(
+                recovery_inserted = conn.execute(
                     """INSERT INTO candidate_microstructure
                        (entry_id, stage, bot_name, mode, symbol, measured_at,
                         source, sequence_status, payload_json)
@@ -10204,6 +13050,10 @@ def persist_simulated_entry_tca_bundle(
                         encoded_recovery,
                     ),
                 )
+                if recovery_inserted.rowcount != 1:
+                    raise ValueError(
+                        "SIM entry bundle persistence lost generation"
+                    )
             elif tuple(recovery_existing) != recovery_values:
                 raise ValueError("conflicting SIM capture recovery already exists")
 
@@ -10216,7 +13066,7 @@ def persist_simulated_entry_tca_bundle(
             ).fetchone()
             expected = (normalized_symbol, normalized_side, reference, due_at)
             if existing is None:
-                conn.execute(
+                markout_inserted = conn.execute(
                     """INSERT INTO sim_execution_markouts
                        (entry_id, horizon_seconds, symbol, side,
                         reference_price, due_at, status)
@@ -10230,12 +13080,20 @@ def persist_simulated_entry_tca_bundle(
                         due_at,
                     ),
                 )
+                if markout_inserted.rowcount != 1:
+                    raise ValueError(
+                        "SIM entry bundle persistence lost generation"
+                    )
                 inserted_markout = True
             elif tuple(existing) != expected:
                 raise ValueError("conflicting SIM markout evidence already exists")
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "SIM entry TCA bundle persistence",
+        )
         raise
     if inserted_markout:
         _notify_markout_queue_changed()
@@ -10317,7 +13175,7 @@ def schedule_simulated_execution_markouts(
             ).fetchone()
             expected = (symbol_value, side_value, price_value, due_at)
             if existing is None:
-                conn.execute(
+                queue_inserted = conn.execute(
                     """INSERT INTO sim_execution_markouts
                        (entry_id, horizon_seconds, symbol, side,
                         reference_price, due_at, status)
@@ -10331,12 +13189,20 @@ def schedule_simulated_execution_markouts(
                         due_at,
                     ),
                 )
+                if queue_inserted.rowcount != 1:
+                    raise ValueError(
+                        "SIM markout scheduling lost generation"
+                    )
                 inserted = True
             elif tuple(existing) != expected:
                 raise ValueError("conflicting SIM markout evidence already exists")
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "SIM execution markout scheduling",
+        )
         raise
     if inserted:
         _notify_markout_queue_changed()
@@ -10432,7 +13298,8 @@ def persist_simulated_entry_tca_unavailable_bundle(
             )
 
         existing_snapshot = conn.execute(
-            """SELECT bot_name, mode, symbol, source, sequence_status,
+            """SELECT bot_name, mode, symbol, measured_at,
+                      source, sequence_status,
                       payload_json
                  FROM candidate_microstructure
                 WHERE entry_id=? AND stage='arrival_book_unavailable'""",
@@ -10442,6 +13309,7 @@ def persist_simulated_entry_tca_unavailable_bundle(
             normalized_bot,
             "SIM",
             normalized_symbol,
+            normalized_time,
             "sim_tca_capture",
             "capture_failed",
             encoded_snapshot,
@@ -10491,8 +13359,12 @@ def persist_simulated_entry_tca_unavailable_bundle(
             elif tuple(existing) != expected:
                 raise ValueError("conflicting SIM markout evidence already exists")
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "SIM unavailable TCA bundle persistence",
+        )
         raise
     if inserted_markout:
         _notify_markout_queue_changed()
@@ -10576,6 +13448,7 @@ def has_durable_simulated_entry_tca(
     conn = get_connection()
     if conn.in_transaction:
         return False
+    primary_error = None
     try:
         conn.execute("BEGIN")
         candidate = conn.execute(
@@ -10615,8 +13488,17 @@ def has_durable_simulated_entry_tca(
             and scheduled[horizon] >= anchor + timedelta(seconds=horizon)
             for horizon in expected_horizons
         )
-    finally:
+    except BaseException as exc:
+        primary_error = exc
         if conn.in_transaction:
+            _rollback_transaction_preserving(
+                conn,
+                exc,
+                "SIM TCA durability snapshot",
+            )
+        raise
+    finally:
+        if primary_error is None and conn.in_transaction:
             conn.rollback()
 
 
@@ -10635,7 +13517,7 @@ def list_due_simulated_execution_markouts(
         producer_table="expectancy_candidates",
     )
     return [
-        dict(row)
+        _markout_parent_scope_row_db(row, expected_mode="SIM")
         for row in conn.execute(
             f"""SELECT * FROM (
                     SELECT rowid AS queue_rowid, entry_id AS intent_id,
@@ -10643,6 +13525,14 @@ def list_due_simulated_execution_markouts(
                            due_at, status, attempts, last_error,
                            next_attempt_at, measured_at, mark_price,
                            markout_bps, 'SIM' AS telemetry_scope,
+                           (SELECT mode FROM expectancy_candidates AS parent
+                             WHERE parent.entry_id=
+                                   sim_execution_markouts.entry_id)
+                               AS _queue_parent_mode,
+                           (SELECT symbol FROM expectancy_candidates AS parent
+                             WHERE parent.entry_id=
+                                   sim_execution_markouts.entry_id)
+                               AS _queue_parent_symbol,
                            0 AS queue_time_invalid
                       FROM sim_execution_markouts
                      WHERE status='PENDING' AND due_at <= ?
@@ -10655,6 +13545,14 @@ def list_due_simulated_execution_markouts(
                            due_at, status, attempts, last_error,
                            next_attempt_at, measured_at, mark_price,
                            markout_bps, 'SIM' AS telemetry_scope,
+                           (SELECT mode FROM expectancy_candidates AS parent
+                             WHERE parent.entry_id=
+                                   sim_execution_markouts.entry_id)
+                               AS _queue_parent_mode,
+                           (SELECT symbol FROM expectancy_candidates AS parent
+                             WHERE parent.entry_id=
+                                   sim_execution_markouts.entry_id)
+                               AS _queue_parent_symbol,
                            1 AS queue_time_invalid
                       FROM sim_execution_markouts
                      WHERE status='PENDING'
@@ -10713,13 +13611,32 @@ def complete_simulated_execution_markout(
     try:
         conn.execute("BEGIN IMMEDIATE")
         pending = conn.execute(
-            """SELECT due_at, side, reference_price, attempts
-                 FROM sim_execution_markouts
-                 WHERE entry_id=? AND horizon_seconds=?
-                   AND status='PENDING'""",
+            """SELECT markout.due_at, markout.side,
+                      markout.reference_price, markout.attempts,
+                      markout.symbol, candidate.mode AS parent_mode,
+                      candidate.symbol AS parent_symbol
+                 FROM sim_execution_markouts AS markout
+            LEFT JOIN expectancy_candidates AS candidate
+                   ON candidate.entry_id=markout.entry_id
+                WHERE markout.entry_id=? AND markout.horizon_seconds=?
+                  AND markout.status='PENDING'""",
             (str(entry_id), horizon),
         ).fetchone()
         if pending is not None:
+            parent_present = (
+                pending["parent_mode"] is not None
+                or pending["parent_symbol"] is not None
+            )
+            if (
+                parent_present
+                and (
+                    pending["parent_mode"] != "SIM"
+                    or not _candidate_symbol_matches_db(
+                        pending["parent_symbol"], pending["symbol"]
+                    )
+                )
+            ):
+                raise ValueError("SIM markout queue parent scope is invalid")
             capture_anchor = _simulated_execution_capture_anchor_db(
                 conn, str(entry_id)
             )
@@ -10763,11 +13680,16 @@ def complete_simulated_execution_markout(
                 observed_at,
                 stage,
                 encoded,
+                require_measured_at_match=True,
             )
         conn.commit()
         return cursor.rowcount == 1
-    except Exception:
-        conn.rollback()
+    except BaseException as exc:
+        _rollback_transaction_preserving(
+            conn,
+            exc,
+            "SIM execution markout completion",
+        )
         raise
 
 

@@ -2356,18 +2356,50 @@ def _encode_research_report(payload: dict) -> bytes:
 
 def _sync_directory(path: Path) -> None:
     try:
-        directory_fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(str(path), flags)
+    except AttributeError:
         return
+    except OSError as exc:
+        if os.name == "nt":
+            if isinstance(exc, PermissionError):
+                return
+            if (
+                isinstance(exc, FileNotFoundError)
+                and path == Path(path.anchor)
+                and path.is_dir()
+            ):
+                return
+        raise
+    primary_error: BaseException | None = None
     try:
         os.fsync(directory_fd)
-    except OSError:
-        pass
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         try:
             os.close(directory_fd)
-        except OSError:
-            pass
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "research directory close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
+def _mkdir_with_parent_fsync(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    parent = path.parent
+    while True:
+        _sync_directory(parent)
+        if parent == parent.parent:
+            break
+        parent = parent.parent
 
 
 def _publish_immutable_research_report(path: Path, encoded: bytes) -> Path:
@@ -2376,42 +2408,99 @@ def _publish_immutable_research_report(path: Path, encoded: bytes) -> Path:
     path = _absolute_without_links(path, label="research report path")
     if not path.parent.is_dir():
         raise ValueError("research report parent must be a real directory")
+    def existing_matches() -> bool:
+        if _is_linklike(path) or not path.is_file():
+            return False
+        try:
+            if path.stat().st_size != len(encoded):
+                return False
+            with path.open("rb") as existing:
+                return existing.read(len(encoded) + 1) == encoded
+        except OSError:
+            return False
+
     if path.exists() or _is_linklike(path):
+        if existing_matches():
+            _sync_directory(path.parent)
+            return path
         raise FileExistsError("immutable research report conflict")
-    temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    )
-    temp_created = False
-    published = False
+    temporary: Path | None = None
+    temporary_owned = False
+    primary_error: BaseException | None = None
+    handle = None
     try:
-        _absolute_without_links(temporary, label="research report path")
-        with temporary.open("xb") as handle:
-            temp_created = True
+        for attempt in range(3):
+            candidate = path.with_name(
+                f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            _absolute_without_links(candidate, label="research report path")
+            try:
+                handle = candidate.open("xb")
+            except FileExistsError:
+                if attempt == 2:
+                    raise
+                continue
+            temporary = candidate
+            temporary_owned = True
+            break
+        if handle is None or temporary is None:
+            raise RuntimeError("research report temporary allocation failed")
+        try:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if primary_error is None:
+                    primary_error = close_error
+                    raise
+                try:
+                    primary_error.add_note(
+                        "research report temporary close failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
         path = _absolute_without_links(path, label="research report path")
         try:
             os.link(temporary, path)
         except FileExistsError as exc:
-            raise FileExistsError(
-                "immutable research report conflict"
-            ) from exc
-        published = True
+            if not existing_matches():
+                raise FileExistsError(
+                    "immutable research report conflict"
+                ) from exc
         try:
             temporary.unlink()
-            temp_created = False
-        except OSError:
+        except FileNotFoundError:
             pass
+        else:
+            temporary_owned = False
+        _sync_directory(path.parent)
+    except BaseException as exc:
+        if primary_error is None:
+            primary_error = exc
+        raise
     finally:
-        if temp_created:
+        if temporary_owned and temporary is not None:
             try:
                 temporary.unlink()
-                temp_created = False
-            except OSError:
+            except FileNotFoundError:
                 pass
-        if published:
-            _sync_directory(path.parent)
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                try:
+                    primary_error.add_note(
+                        "research report temporary cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
     return path
 
 
@@ -2434,7 +2523,7 @@ def write_immutable_research_report(
         project / "data" / "research" / subdirectory,
         label="research report directory",
     )
-    folder.mkdir(parents=True, exist_ok=True)
+    _mkdir_with_parent_fsync(folder)
     folder = _absolute_without_links(folder, label="research report directory")
     if not folder.is_dir():
         raise ValueError("research report directory must be a real directory")
@@ -2909,6 +2998,7 @@ def _publish_experiment_bundle(path: Path, temporary: Path) -> bool:
         label="temporary experiment bundle",
     )
     path = _absolute_without_links(path, label="experiment bundle destination")
+    published = False
     if path.exists() or _is_linklike(path):
         actual_digest, actual_bytes = _stable_file_sha256(
             path,
@@ -2919,22 +3009,23 @@ def _publish_experiment_bundle(path: Path, temporary: Path) -> bool:
             raise ValueError(
                 "experiment bundle destination conflicts with existing evidence"
             )
-        return False
-    try:
-        os.link(temporary, path)
-    except FileExistsError:
-        actual_digest, actual_bytes = _stable_file_sha256(
-            path,
-            maximum_bytes=RESEARCH_EXPERIMENT_BUNDLE_MAX_BYTES,
-            label="experiment bundle destination",
-        )
-        if (actual_digest, actual_bytes) != (expected_digest, expected_bytes):
-            raise ValueError(
-                "experiment bundle destination conflicts with concurrently written evidence"
+    else:
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            actual_digest, actual_bytes = _stable_file_sha256(
+                path,
+                maximum_bytes=RESEARCH_EXPERIMENT_BUNDLE_MAX_BYTES,
+                label="experiment bundle destination",
             )
-        return False
+            if (actual_digest, actual_bytes) != (expected_digest, expected_bytes):
+                raise ValueError(
+                    "experiment bundle destination conflicts with concurrently written evidence"
+                )
+        else:
+            published = True
     _sync_directory(path.parent)
-    return True
+    return published
 
 
 def export_immutable_experiment_bundle(
@@ -2968,19 +3059,35 @@ def export_immutable_experiment_bundle(
     references_by_digest = {}
     for artifact, blob in zip(artifacts, archive["blobs"], strict=True):
         references_by_digest.setdefault(blob["sha256"], []).append((artifact, blob))
-    output.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_with_parent_fsync(output.parent)
     output = _absolute_without_links(
         output, label="experiment bundle destination"
     )
     if not output.parent.is_dir():
         raise ValueError("experiment bundle parent must be a real directory")
-    temporary = output.with_name(
-        f".{output.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    )
+    temporary: Path | None = None
     published = False
+    temporary_owned = False
+    primary_error: BaseException | None = None
+    raw_handle = None
     try:
-        _absolute_without_links(temporary, label="temporary experiment bundle")
-        with temporary.open("xb") as raw_handle:
+        for attempt in range(3):
+            candidate = output.with_name(
+                f".{output.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            _absolute_without_links(candidate, label="temporary experiment bundle")
+            try:
+                raw_handle = candidate.open("xb")
+            except FileExistsError:
+                if attempt == 2:
+                    raise
+                continue
+            temporary = candidate
+            temporary_owned = True
+            break
+        if raw_handle is None or temporary is None:
+            raise RuntimeError("experiment bundle temporary allocation failed")
+        try:
             with zipfile.ZipFile(
                 raw_handle, "w", compression=zipfile.ZIP_STORED, allowZip64=True
             ) as bundle:
@@ -3017,12 +3124,47 @@ def export_immutable_experiment_bundle(
                     )
             raw_handle.flush()
             os.fsync(raw_handle.fileno())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                raw_handle.close()
+            except BaseException as close_error:
+                if primary_error is None:
+                    primary_error = close_error
+                    raise
+                try:
+                    primary_error.add_note(
+                        "experiment bundle temporary close failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
         published = _publish_experiment_bundle(output, temporary)
+        temporary.unlink()
+        temporary_owned = False
+        _sync_directory(output.parent)
+    except BaseException as exc:
+        if primary_error is None:
+            primary_error = exc
+        raise
     finally:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
+        if temporary_owned and temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                try:
+                    primary_error.add_note(
+                        "experiment bundle temporary cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
     verified = verify_immutable_experiment_bundle(output)
     return {**verified, "changes_files": published}
 
@@ -3532,9 +3674,12 @@ def _recover_abandoned_bundle_staging_temps(batch: Path) -> int:
     details = _inspect_bundle_staging_batch_scope(batch)
     for temporary in details["temporary_files"]:
         temporary.unlink()
-    if details["temporary_files"]:
-        for folder in {path.parent for path in details["temporary_files"]}:
-            _sync_directory(folder)
+    for folder in sorted(
+        details["directories"],
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        _sync_directory(folder)
     return len(details["temporary_files"])
 
 
@@ -3603,30 +3748,118 @@ def _publish_bundle_staging_file(path: Path, raw: bytes) -> bool:
 
     if path.exists() or _is_linklike(path):
         validate_existing()
+        _sync_directory(path.parent)
         return False
     if not path.parent.is_dir():
         raise ValueError("experiment bundle staging directory is unavailable")
-    temporary = path.parent / f".s.{uuid.uuid4().hex}.tmp"
+    temporary: Path | None = None
+    temporary_owned = False
+    primary_error: BaseException | None = None
+    result: bool | None = None
+    handle = None
     try:
-        temporary = _absolute_without_links(
-            temporary, label="temporary experiment bundle staging file"
-        )
-        with temporary.open("xb") as handle:
+        for attempt in range(3):
+            candidate = path.parent / f".s.{uuid.uuid4().hex}.tmp"
+            candidate = _absolute_without_links(
+                candidate, label="temporary experiment bundle staging file"
+            )
+            try:
+                handle = candidate.open("xb")
+            except FileExistsError:
+                if attempt == 2:
+                    raise
+                continue
+            temporary = candidate
+            temporary_owned = True
+            break
+        if handle is None or temporary is None:
+            raise RuntimeError("experiment bundle staging allocation failed")
+        try:
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if primary_error is None:
+                    primary_error = close_error
+                    raise
+                try:
+                    primary_error.add_note(
+                        "experiment bundle staging close failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
         try:
             os.link(temporary, path)
         except FileExistsError:
             validate_existing()
-            return False
-        _sync_directory(path.parent)
-        return True
+            result = False
+        else:
+            result = True
+    except BaseException as exc:
+        if primary_error is None:
+            primary_error = exc
+        raise
     finally:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
+        cleanup_error: BaseException | None = None
+        if temporary_owned and temporary is not None:
+            for _attempt in range(2):
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    temporary_owned = False
+                    break
+                except OSError as exc:
+                    cleanup_error = exc
+                except BaseException as exc:
+                    cleanup_error = exc
+                    break
+                else:
+                    temporary_owned = False
+                    break
+            if not temporary_owned:
+                cleanup_error = None
+        sync_error: BaseException | None = None
+        if temporary is not None:
+            try:
+                _sync_directory(path.parent)
+            except BaseException as exc:
+                sync_error = exc
+        if primary_error is not None:
+            for label, secondary_error in (
+                ("temporary cleanup", cleanup_error),
+                ("directory sync", sync_error),
+            ):
+                if secondary_error is None:
+                    continue
+                try:
+                    primary_error.add_note(
+                        f"experiment bundle staging {label} failed: "
+                        f"{type(secondary_error).__name__}: {secondary_error}"
+                    )
+                except BaseException:
+                    pass
+        elif sync_error is not None:
+            if cleanup_error is not None:
+                try:
+                    sync_error.add_note(
+                        "experiment bundle staging temporary cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
+            raise sync_error
+        elif cleanup_error is not None:
+            raise cleanup_error
+    if result is None:
+        raise RuntimeError("experiment bundle staging publish did not complete")
+    return result
 
 
 def _validate_bundle_staging_scope(batch: Path, manifest: dict) -> int:

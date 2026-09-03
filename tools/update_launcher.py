@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +28,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bot_utils.subprocess_capture import run_bounded_capture  # noqa: E402
+from bot_utils.runtime_threads import (  # noqa: E402
+    thread_definitely_never_started,
+)
 
 from update_barrier import (  # noqa: E402 - root bootstrap above
     process_start_guard,
@@ -51,6 +55,7 @@ _CIM_SCAN_ATTEMPTS = 2
 _TASKLIST_SCAN_TIMEOUT_SEC = 5
 _TASKLIST_SCAN_MAX_OUTPUT_BYTES = 64 * 1024
 _UPDATE_LOG_LOCK = threading.Lock()
+_STDLIB_THREAD_TYPE = threading.Thread
 
 
 def _now() -> str:
@@ -135,6 +140,92 @@ def _append_log(message: str) -> None:
         return
 
 
+def _sync_status_directory(path: Path) -> None:
+    directory = path.resolve(strict=True)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        flush_file_buffers = kernel32.FlushFileBuffers
+        flush_file_buffers.argtypes = [wintypes.HANDLE]
+        flush_file_buffers.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = create_file(
+            str(directory),
+            0x40000000,  # GENERIC_WRITE
+            0x00000007,  # FILE_SHARE_READ | WRITE | DELETE
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS
+            None,
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if not handle or int(handle) == invalid_handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        primary_error: BaseException | None = None
+        try:
+            if not flush_file_buffers(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            close_error: BaseException | None = None
+            try:
+                if not close_handle(handle):
+                    close_error = ctypes.WinError(ctypes.get_last_error())
+            except BaseException as exc:
+                close_error = exc
+            if close_error is not None:
+                if primary_error is None:
+                    raise close_error
+                try:
+                    primary_error.add_note(
+                        "close update-status directory after sync failure: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(str(directory), flags)
+    primary_error: BaseException | None = None
+    try:
+        os.fsync(directory_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            os.close(directory_fd)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "update-status directory close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
 def _write_status(
     status: str,
     message: str = "",
@@ -163,27 +254,116 @@ def _write_status(
         payload["finished_at"] = _now()
     if returncode is not None:
         payload["returncode"] = returncode
-    tmp = STATUS_PATH.with_name(f"{STATUS_PATH.name}.{os.getpid()}.tmp")
-    published = False
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    ).encode("utf-8")
+    tmp = STATUS_PATH.with_name(
+        f".{STATUS_PATH.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    tmp_owned = False
+    tmp_identity: tuple[int, int] | None = None
+    primary_error: BaseException | None = None
     try:
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        handle = tmp.open("xb")
+        tmp_owned = True
+        write_primary: BaseException | None = None
+        try:
+            tmp_stat = os.fstat(handle.fileno())
+            if not stat.S_ISREG(tmp_stat.st_mode):
+                raise ValueError("update-status temporary must be regular")
+            tmp_identity = (tmp_stat.st_dev, tmp_stat.st_ino)
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException as exc:
+            write_primary = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if write_primary is None:
+                    raise
+                try:
+                    write_primary.add_note(
+                        "close update-status temporary after write failure: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
         for attempt in range(8):
             try:
                 os.replace(tmp, STATUS_PATH)
-                published = True
+                tmp_owned = False
+                break
+            except PermissionError as replace_error:
+                if attempt >= 7:
+                    raise
+                time.sleep(0.05)
+                try:
+                    current = tmp.stat(follow_symlinks=False)
+                    same_generation = (
+                        stat.S_ISREG(current.st_mode)
+                        and not tmp.is_symlink()
+                        and tmp_identity is not None
+                        and (current.st_dev, current.st_ino) == tmp_identity
+                    )
+                except FileNotFoundError:
+                    raise replace_error
+                except BaseException as validation_error:
+                    try:
+                        replace_error.add_note(
+                            "update-status temp revalidation failed: "
+                            f"{type(validation_error).__name__}: "
+                            f"{validation_error}"
+                        )
+                    except BaseException:
+                        pass
+                    raise replace_error
+                if not same_generation:
+                    raise replace_error
+        for attempt in range(8):
+            try:
+                _sync_status_directory(STATUS_PATH.parent)
                 break
             except PermissionError:
                 if attempt >= 7:
                     raise
                 time.sleep(0.05)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        if not published:
+        cleanup_error: BaseException | None = None
+        same_generation = False
+        if tmp_owned and tmp_identity is not None:
             try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
+                current = tmp.stat(follow_symlinks=False)
+                same_generation = (
+                    stat.S_ISREG(current.st_mode)
+                    and not tmp.is_symlink()
+                    and (current.st_dev, current.st_ino) == tmp_identity
+                )
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = exc
+        if same_generation:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            if primary_error is None:
+                raise cleanup_error
+            try:
+                primary_error.add_note(
+                    "update-status owned temporary cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            except BaseException:
                 pass
 
 
@@ -920,6 +1100,55 @@ def _run_with_progress_window(args: argparse.Namespace) -> int:
 
     done: "queue.Queue[int]" = queue.Queue(maxsize=1)
     completed_result: dict[str, int | None] = {"value": None}
+    generation = {
+        "thread": None,
+        "entered": globals()["threading"].Event(),
+        "done": globals()["threading"].Event(),
+        "result": None,
+        "worker_error": None,
+        "start_error": None,
+    }
+
+    def drain_generation(primary_error: BaseException | None = None):
+        """Wait through secondary interruptions until worker ownership ends."""
+        first_secondary = None
+        noted: set[tuple[str, str, str]] = set()
+
+        def record(context: str, error: BaseException) -> None:
+            nonlocal first_secondary
+            if first_secondary is None:
+                first_secondary = error
+            signature = (context, type(error).__name__, str(error)[:240])
+            if primary_error is None or signature in noted or len(noted) >= 8:
+                return
+            noted.add(signature)
+            try:
+                primary_error.add_note(
+                    f"{context}: {type(error).__name__}: {error}"
+                )
+            except BaseException:
+                pass
+
+        while not generation["done"].is_set():
+            try:
+                generation["done"].wait(timeout=0.25)
+            except BaseException as exc:
+                record("progress worker completion wait", exc)
+
+        owned_thread = generation.get("thread")
+        if type(owned_thread) is _STDLIB_THREAD_TYPE:
+            while True:
+                try:
+                    owned_thread.join(timeout=0.25)
+                except BaseException as exc:
+                    record("progress worker final join", exc)
+                    continue
+                try:
+                    if not owned_thread.is_alive():
+                        break
+                except BaseException as exc:
+                    record("progress worker liveness check", exc)
+        return first_secondary
     win = None
     try:
         win = tk.Tk()
@@ -987,17 +1216,22 @@ def _run_with_progress_window(args: argparse.Namespace) -> int:
 
     def worker() -> None:
         rc = 1
+        generation["entered"].set()
         try:
             rc = _main_impl(args)
+        except BaseException as exc:
+            generation["worker_error"] = exc
         finally:
             # Keep the authoritative result outside the notification queue as
             # well. Queue delivery is only a wakeup mechanism and must not be
             # the sole copy of a completed update outcome.
             completed_result["value"] = int(rc)
+            generation["result"] = int(rc)
             try:
                 done.put_nowait(rc)
             except Exception:
                 pass
+            generation["done"].set()
 
     def tick() -> None:
         try:
@@ -1042,15 +1276,60 @@ def _run_with_progress_window(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
 
-    worker_thread = threading.Thread(target=worker, daemon=False)
-    worker_thread.start()
+    try:
+        worker_thread = threading.Thread(target=worker, daemon=False)
+    except BaseException as constructor_error:
+        generation["start_error"] = constructor_error
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        if generation["done"].is_set():
+            if not isinstance(constructor_error, Exception):
+                raise
+            return int(generation["result"])
+        if (
+            isinstance(constructor_error, Exception)
+            and threading.Thread is _STDLIB_THREAD_TYPE
+        ):
+            return _main_impl(args)
+        drain_generation(constructor_error)
+        if isinstance(constructor_error, Exception):
+            return int(generation["result"])
+        raise
+    generation["thread"] = worker_thread
+    try:
+        worker_thread.start()
+    except BaseException as start_error:
+        generation["start_error"] = start_error
+        if thread_definitely_never_started(worker_thread):
+            generation["done"].set()
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            if isinstance(start_error, Exception):
+                return _main_impl(args)
+            raise
+        if not isinstance(start_error, Exception):
+            drain_generation(start_error)
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            raise
+        _append_log(
+            "Updateworker-Start meldete einen ambigen Fehler; "
+            "warte auf das autoritative Worker-Ergebnis: "
+            f"{type(start_error).__name__}"
+        )
     win.after(200, tick)
     try:
         win.mainloop()
     except Exception:
         pass
-    if completed_result["value"] is not None:
-        return int(completed_result["value"])
+    if generation["result"] is not None:
+        return int(generation["result"])
     try:
         return int(done.get_nowait())
     except Exception:
@@ -1061,12 +1340,24 @@ def _run_with_progress_window(args: argparse.Namespace) -> int:
             "Progress-Fenster vor Updateende beendet; warte ohne UI auf "
             "den laufenden Updateprozess."
         )
+        join_error = None
         try:
             worker_thread.join()
-            return int(done.get_nowait())
-        except Exception:
-            data = _read_status()
-            return 0 if data.get("status") == "success" else 1
+        except BaseException as exc:
+            join_error = exc
+        secondary = drain_generation(join_error)
+        if join_error is not None and not isinstance(join_error, Exception):
+            raise join_error
+        if (
+            join_error is None
+            and secondary is not None
+            and not isinstance(secondary, Exception)
+        ):
+            raise secondary
+        if generation["result"] is not None:
+            return int(generation["result"])
+        data = _read_status()
+        return 0 if data.get("status") == "success" else 1
 
 
 if __name__ == "__main__":

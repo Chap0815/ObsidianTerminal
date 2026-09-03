@@ -43,6 +43,56 @@ _SHADOW_POSITION_KEYS = {
     "outcome",
 }
 _CAPACITY_KEYS = {"sample_id", "measured_at", "participation_rate", "capacity_allowed"}
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(str(path), flags)
+    except AttributeError:
+        return
+    except OSError as exc:
+        if os.name == "nt":
+            if isinstance(exc, PermissionError):
+                return
+            if (
+                isinstance(exc, FileNotFoundError)
+                and path == Path(path.anchor)
+                and path.is_dir()
+            ):
+                return
+        raise
+    primary_error: BaseException | None = None
+    try:
+        os.fsync(directory_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            os.close(directory_fd)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "promotion directory close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
+def _mkdir_with_parent_fsync(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    parent = path.parent
+    while True:
+        _fsync_directory(parent)
+        if parent == parent.parent:
+            break
+        parent = parent.parent
+
+
 _FORWARD_REPORT_KEYS = {
     "strategy", "run_id", "dataset_fingerprint", "candidate_fingerprint",
     "period_start", "period_end", "positions", "capacity_samples",
@@ -589,44 +639,73 @@ def write_forward_shadow_promotion_artifact(
     path = _absolute_without_links(
         Path(destination), label="forward shadow artifact destination"
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_with_parent_fsync(path.parent)
     path = _absolute_without_links(
         path, label="forward shadow artifact destination"
     )
     if path.exists():
         if _read_existing_forward_artifact(path, encoded):
+            _fsync_directory(path.parent)
             return artifact
         raise ValueError("forward shadow artifact destination conflict")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    primary_error: BaseException | None = None
+    temporary_owned = False
+    handle = None
     try:
-        with temporary.open("xb") as handle:
+        handle = temporary.open("xb")
+        temporary_owned = True
+        try:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if primary_error is None:
+                    primary_error = close_error
+                    raise
+                try:
+                    primary_error.add_note(
+                        "promotion temporary close failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
         try:
             os.link(temporary, path)
         except FileExistsError as exc:
             if _read_existing_forward_artifact(path, encoded):
+                _fsync_directory(path.parent)
                 return artifact
             raise ValueError(
                 "forward shadow artifact destination conflict"
             ) from exc
-        try:
-            directory_fd = os.open(str(path.parent), os.O_RDONLY)
-        except OSError:
-            directory_fd = None
-        if directory_fd is not None:
-            try:
-                os.fsync(directory_fd)
-            except OSError:
-                pass
-            finally:
-                os.close(directory_fd)
+        _fsync_directory(path.parent)
+    except BaseException as exc:
+        if primary_error is None:
+            primary_error = exc
+        raise
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if temporary_owned:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                try:
+                    primary_error.add_note(
+                        "promotion temporary cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
     return artifact
 
 

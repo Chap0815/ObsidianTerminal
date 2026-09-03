@@ -14,6 +14,7 @@ from contextlib import ExitStack
 
 import customtkinter as ctk
 
+from bot_utils.runtime_threads import thread_definitely_never_started
 from launcher.config.settings import BOT_META, BOT_ORDER, COLORS, FONT_BODY
 from launcher.core.positions import (
     normalize_futures_position_view_row,
@@ -58,6 +59,13 @@ def _post_ui(app, callback, *, delay_ms: int = 0) -> bool:
     return True
 
 
+def _post_ui_lifecycle(app, callback, *, delay_ms: int = 0) -> bool:
+    post = getattr(app, "post_ui_lifecycle", None)
+    if callable(post):
+        return post(callback, delay_ms=delay_ms) is not False
+    return _post_ui(app, callback, delay_ms=delay_ms)
+
+
 def _start_critical_worker(app, target, *, name: str):
     registry = getattr(app, "critical_workers", None)
     start = getattr(registry, "start", None)
@@ -66,6 +74,137 @@ def _start_critical_worker(app, target, *, name: str):
     thread = threading.Thread(target=target, name=name, daemon=True)
     thread.start()
     return thread
+
+
+def _launch_owned_dialog_worker(target, *, name: str):
+    """Publish one mutation worker generation before invoking start()."""
+    state = {
+        "done": threading.Event(),
+        "thread": None,
+        "never_started": False,
+        "fatal": None,
+    }
+
+    def owned_target() -> None:
+        try:
+            target()
+        except BaseException as exc:
+            state["fatal"] = exc
+        finally:
+            state["done"].set()
+
+    try:
+        worker = threading.Thread(
+            target=owned_target,
+            daemon=True,
+            name=name,
+        )
+    except BaseException as exc:
+        return None, exc
+    state["thread"] = worker
+    try:
+        worker.start()
+    except BaseException as exc:
+        if (
+            isinstance(exc, Exception)
+            and thread_definitely_never_started(worker)
+        ):
+            state["never_started"] = True
+            state["done"].set()
+        return state, exc
+    return state, None
+
+
+def _drain_owned_dialog_workers(states) -> BaseException | None:
+    """Wait for every possibly launched generation before barriers release."""
+    primary: BaseException | None = None
+    for state in states:
+        done = state["done"]
+        while not done.is_set():
+            try:
+                done.wait()
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+        worker_error = state.get("fatal")
+        if primary is None and isinstance(worker_error, BaseException):
+            primary = worker_error
+        if state.get("never_started"):
+            continue
+        worker = state["thread"]
+        while True:
+            try:
+                worker.join()
+                break
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                try:
+                    if not worker.is_alive():
+                        break
+                except BaseException:
+                    continue
+    return primary
+
+
+def _start_dialog_refresh_worker(
+    target,
+    *,
+    name: str,
+    on_target_abort,
+) -> bool:
+    """Launch one refresh generation without releasing an uncertain owner."""
+
+    def guarded_target() -> None:
+        try:
+            target()
+        except BaseException as primary_error:
+            try:
+                on_target_abort()
+            except BaseException as abort_error:
+                try:
+                    primary_error.add_note(
+                        "release aborted dialog refresh generation failed: "
+                        f"{type(abort_error).__name__}: {abort_error}"
+                    )
+                except BaseException:
+                    pass
+            raise
+
+    state, start_error = _launch_owned_dialog_worker(
+        guarded_target,
+        name=name,
+    )
+    if start_error is None:
+        return True
+    if state is None:
+        if not isinstance(start_error, Exception):
+            try:
+                on_target_abort()
+            except BaseException as abort_error:
+                try:
+                    start_error.add_note(
+                        "release unconstructed dialog refresh failed: "
+                        f"{type(abort_error).__name__}: {abort_error}"
+                    )
+                except BaseException:
+                    pass
+            raise start_error
+        return False
+    if not isinstance(start_error, Exception):
+        raise start_error
+    # Only a constructor failure or an exact stdlib definite-prelaunch failure
+    # proves that no generation can still perform API work or post a callback.
+    return not (
+        bool(state.get("never_started"))
+    )
+
+
+def _dialog_exception_text(exc: BaseException) -> str:
+    try:
+        return str(exc)
+    except BaseException:
+        return type(exc).__name__
 
 
 def show_state_read_error_dialog(app, title: str, detail: str) -> None:
@@ -174,7 +313,7 @@ def show_busy_dialog(app, title: str, intro: str, worker, **worker_kwargs) -> No
             update_fn(f"Failed: {e}")
         finally:
             # Clean up on the main thread
-            _post_ui(
+            _post_ui_lifecycle(
                 app,
                 lambda: (prog.stop(), dlg.destroy()),
                 delay_ms=400,
@@ -484,10 +623,12 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
             except Exception:
                 refresh_gate.finish(generation)
 
-        try:
-            threading.Thread(target=_bg, daemon=True,
-                              name=f"refresh-spot-{name}").start()
-        except Exception:
+        started_or_owned = _start_dialog_refresh_worker(
+            _bg,
+            name=f"refresh-spot-{name}",
+            on_target_abort=lambda: refresh_gate.finish(generation),
+        )
+        if not started_or_owned:
             refresh_gate.finish(generation)
             price_note.configure(text=" Refresh could not start")
 
@@ -868,10 +1009,12 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
             except Exception:
                 refresh_gate.finish(generation)
 
-        try:
-            threading.Thread(target=_bg, daemon=True,
-                              name="refresh-futures-stop").start()
-        except Exception:
+        started_or_owned = _start_dialog_refresh_worker(
+            _bg,
+            name="refresh-futures-stop",
+            on_target_abort=lambda: refresh_gate.finish(generation),
+        )
+        if not started_or_owned:
             refresh_gate.finish(generation)
             price_note_fut.configure(text=" Refresh could not start")
 
@@ -1251,12 +1394,11 @@ def async_stop_all_and_quit(app, update, close_positions: bool) -> None:
             finally:
                 barriers.close()
 
-        _post_ui(
+        transferred_to_shutdown = _post_ui_lifecycle(
             app,
             _shutdown_with_barrier_release,
             delay_ms=shutdown_delay_ms,
         )
-        transferred_to_shutdown = True
     finally:
         if not transferred_to_shutdown:
             barriers.close()
@@ -1292,9 +1434,10 @@ def _async_stop_all_and_quit_owned(
     else:
         update("Hard-stopping bots  positions will stay OPEN on exchange")
 
-    stop_threads: list[threading.Thread] = []
+    stop_workers: list[dict] = []
     stop_errors: list[str] = []
     stop_errors_lock = threading.Lock()
+    stop_fatal: BaseException | None = None
 
     def _stop_worker(bot_name: str, graceful: bool):
         try:
@@ -1317,29 +1460,27 @@ def _async_stop_all_and_quit_owned(
                     pass
 
     for bot in running_bots:
-        t = threading.Thread(target=_stop_worker,
-                              args=(bot, close_positions), daemon=True)
-        try:
-            t.start()
-        except Exception as exc:
-            # Earlier stop workers already own live process mutations. Keep
-            # every restart barrier until those workers have been joined; a
-            # later Thread.start failure must never unwind the outer ExitStack
-            # while an earlier stop is still in progress.
+        state, start_error = _launch_owned_dialog_worker(
+            lambda bot_name=bot: _stop_worker(bot_name, close_positions),
+            name=f"quit-stop-{bot.lower()}",
+        )
+        if state is not None:
+            stop_workers.append(state)
+        if start_error is not None:
             with stop_errors_lock:
                 stop_errors.append(
-                    f"{bot}: stop worker start failed: {exc}"
+                    f"{bot}: stop worker start failed: "
+                    f"{_dialog_exception_text(start_error)}"
                 )
-            try:
-                if t.is_alive():
-                    stop_threads.append(t)
-            except Exception:
-                pass
-        else:
-            stop_threads.append(t)
+            if not isinstance(start_error, Exception):
+                stop_fatal = start_error
+                break
 
-    for t in stop_threads:
-        t.join()
+    drain_error = _drain_owned_dialog_workers(stop_workers)
+    if stop_fatal is not None:
+        raise stop_fatal
+    if drain_error is not None:
+        raise drain_error
 
     if stop_errors:
         update("Stop failed - bot is still running; application left open")
@@ -1350,9 +1491,10 @@ def _async_stop_all_and_quit_owned(
     #  direct_close_remaining_* is the second-chance net.
     if close_positions:
         update("Verifying and closing remaining positions")
-        close_threads: list[threading.Thread] = []
+        close_workers: list[dict] = []
         close_errors: list[str] = []
         close_errors_lock = threading.Lock()
+        close_fatal: BaseException | None = None
 
         def _close_worker(bot_name: str):
             try:
@@ -1393,27 +1535,27 @@ def _async_stop_all_and_quit_owned(
                         pass
 
         for bot in BOT_ORDER:
-            t = threading.Thread(target=_close_worker, args=(bot,), daemon=True)
-            try:
-                t.start()
-            except Exception as exc:
-                # Preserve the same barrier-ownership contract during the
-                # fallback-close phase. Join any worker that did start before
-                # reporting failure and leaving the application open.
+            state, start_error = _launch_owned_dialog_worker(
+                lambda bot_name=bot: _close_worker(bot_name),
+                name=f"quit-close-{bot.lower()}",
+            )
+            if state is not None:
+                close_workers.append(state)
+            if start_error is not None:
                 with close_errors_lock:
                     close_errors.append(
-                        f"{bot}: close worker start failed: {exc}"
+                        f"{bot}: close worker start failed: "
+                        f"{_dialog_exception_text(start_error)}"
                     )
-                try:
-                    if t.is_alive():
-                        close_threads.append(t)
-                except Exception:
-                    pass
-            else:
-                close_threads.append(t)
+                if not isinstance(start_error, Exception):
+                    close_fatal = start_error
+                    break
 
-        for t in close_threads:
-            t.join()
+        drain_error = _drain_owned_dialog_workers(close_workers)
+        if close_fatal is not None:
+            raise close_fatal
+        if drain_error is not None:
+            raise drain_error
         if close_errors:
             update("Close verification failed  application left open")
             try:

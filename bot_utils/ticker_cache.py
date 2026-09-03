@@ -13,6 +13,7 @@ Public API:
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections import OrderedDict
@@ -63,9 +64,13 @@ class TickerCache:
             thread_name_prefix=thread_name_prefix,
         )
         self._shutdown_lock = threading.Lock()
+        self._shutdown_started = False
         self._shutdown_complete = False
         self._futures_lock = threading.Lock()
         self._futures = set()
+        self._ownership_tokens: set[object] = set()
+        self._ambiguous_execution_tokens: set[object] = set()
+        self._finalizing_execution_tokens: set[object] = set()
         self._inflight_sem = threading.Semaphore(in_flight_max)
         self._in_flight_max = in_flight_max
         self._symbol_locks_lock = threading.Lock()
@@ -117,6 +122,23 @@ class TickerCache:
             error_started = self._consecutive_error_started_monotonic
             last_ticker_success = self._last_ticker_success_monotonic
             unavailable_started = self._unavailable_request_started_monotonic
+
+        timestamps_valid = True
+
+        def age_seconds(anchor) -> float | None:
+            nonlocal timestamps_valid
+            if anchor is None:
+                return None
+            try:
+                age = now - float(anchor)
+            except BaseException:
+                timestamps_valid = False
+                return None
+            if not math.isfinite(age) or age < 0.0:
+                timestamps_valid = False
+                return None
+            return age
+
         attempts = int(data.get("fetch_attempts") or 0)
         total_ms = float(data.pop("fetch_latency_ms_total", 0.0) or 0.0)
         data["fetch_latency_ms_avg"] = (
@@ -126,22 +148,13 @@ class TickerCache:
              + float(data.get("stale_hits") or 0))
             / float(data.get("requests") or 1)
         )
-        data["fetch_success_age_seconds"] = (
-            max(0.0, now - last_success) if last_success is not None else None
+        data["fetch_success_age_seconds"] = age_seconds(last_success)
+        data["consecutive_error_age_seconds"] = age_seconds(error_started)
+        data["ticker_success_age_seconds"] = age_seconds(last_ticker_success)
+        data["unavailable_request_age_seconds"] = age_seconds(
+            unavailable_started
         )
-        data["consecutive_error_age_seconds"] = (
-            max(0.0, now - error_started) if error_started is not None else None
-        )
-        data["ticker_success_age_seconds"] = (
-            max(0.0, now - last_ticker_success)
-            if last_ticker_success is not None
-            else None
-        )
-        data["unavailable_request_age_seconds"] = (
-            max(0.0, now - unavailable_started)
-            if unavailable_started is not None
-            else None
-        )
+        data["monotonic_timestamps_valid"] = timestamps_valid
         return data
 
     def health(
@@ -170,6 +183,7 @@ class TickerCache:
         unavailable_age = snapshot.get("unavailable_request_age_seconds")
         fetch_success_age = snapshot.get("fetch_success_age_seconds")
         fetch_error_age = snapshot.get("consecutive_error_age_seconds")
+        timestamps_valid = snapshot.get("monotonic_timestamps_valid") is True
         delivery_outage_age = (
             ticker_success_age
             if ticker_success_age is not None
@@ -192,8 +206,10 @@ class TickerCache:
             and fetch_outage_age is not None
             and float(fetch_outage_age) >= stale_after
         )
-        unhealthy = delivery_outage or fetch_outage
-        if requests <= 0 and attempts <= 0:
+        unhealthy = not timestamps_valid or delivery_outage or fetch_outage
+        if not timestamps_valid:
+            state = "invalid"
+        elif requests <= 0 and attempts <= 0:
             state = "idle"
         elif unhealthy:
             state = "outage"
@@ -203,7 +219,9 @@ class TickerCache:
             state = "fetch_error_streak"
         else:
             state = "healthy"
-        if delivery_outage and fetch_outage:
+        if not timestamps_valid:
+            reason = "ticker_timestamp_invalid"
+        elif delivery_outage and fetch_outage:
             reason = "fetch_and_delivery_outage"
         elif delivery_outage:
             reason = "ticker_delivery_outage"
@@ -220,6 +238,7 @@ class TickerCache:
             "consecutive_fetch_errors": fetch_errors,
             "failure_threshold": threshold,
             "success_stale_after_seconds": stale_after,
+            "monotonic_timestamps_valid": timestamps_valid,
             "ticker_success_age_seconds": ticker_success_age,
             "unavailable_request_age_seconds": unavailable_age,
             "fetch_success_age_seconds": fetch_success_age,
@@ -374,6 +393,9 @@ class TickerCache:
           TimeoutError  fetch timed out AND no fresh-enough stale cache
           TickerOverloaded  pool saturated; stale cache also missing
         """
+        with self._shutdown_lock:
+            if self._shutdown_started:
+                raise RuntimeError("ticker cache is shut down")
         self._note("requests")
         fetch_key = (id(ex), symbol_full)
         with self._symbol_locks_lock:
@@ -459,6 +481,9 @@ class TickerCache:
             )
 
         permit_owned_by_caller = True
+        submission_token: object | None = None
+        execution_token: object | None = None
+        submission_owned_by_caller = False
         api_reservation = None
 
         def _record_fetch_api_error() -> None:
@@ -505,32 +530,160 @@ class TickerCache:
             self._note("fetch_attempts")
             fetch_started_at = time.monotonic()
             with self._shutdown_lock:
-                future = self._pool.submit(ex.fetch_ticker, symbol_full)
+                if self._shutdown_started:
+                    raise RuntimeError("ticker cache is shut down")
+                submission_token = object()
+                execution_token = object()
+                with self._futures_lock:
+                    self._ownership_tokens.update(
+                        (submission_token, execution_token)
+                    )
+                submission_owned_by_caller = True
+                permit_owned_by_caller = False
+
+                def _finalize_execution() -> None:
+                    with self._futures_lock:
+                        if (
+                            execution_token not in self._ownership_tokens
+                            or execution_token
+                            in self._finalizing_execution_tokens
+                        ):
+                            return
+                        self._finalizing_execution_tokens.add(execution_token)
+                    try:
+                        self._inflight_sem.release()
+                    except BaseException:
+                        with self._futures_lock:
+                            self._finalizing_execution_tokens.discard(
+                                execution_token
+                            )
+                        raise
+                    with self._futures_lock:
+                        self._ownership_tokens.discard(execution_token)
+                        self._ambiguous_execution_tokens.discard(
+                            execution_token
+                        )
+                        self._finalizing_execution_tokens.discard(
+                            execution_token
+                        )
+
+                def _owned_fetch():
+                    try:
+                        return ex.fetch_ticker(symbol_full)
+                    finally:
+                        _finalize_execution()
+
+                try:
+                    future = self._pool.submit(_owned_fetch)
+                except BaseException:
+                    with self._futures_lock:
+                        if execution_token in self._ownership_tokens:
+                            self._ambiguous_execution_tokens.add(
+                                execution_token
+                            )
+                    raise
                 with self._futures_lock:
                     self._futures.add(future)
+                completion_lock = threading.Lock()
+                completion_state = {
+                    "decision": None,
+                    "completed": False,
+                    "late_claimed": False,
+                }
+
+                def _run_late_completion(completed) -> None:
+                    try:
+                        self._cache_late_ticker(
+                            symbol_full,
+                            completed,
+                            fetch_started_at,
+                        )
+                    finally:
+                        with self._futures_lock:
+                            self._ownership_tokens.discard(submission_token)
+
+                def _publish_completion_decision(*, late: bool) -> None:
+                    run_late = False
+                    with completion_lock:
+                        completion_state["decision"] = late
+                        if (
+                            late
+                            and completion_state["completed"]
+                            and not completion_state["late_claimed"]
+                        ):
+                            completion_state["late_claimed"] = True
+                            run_late = True
+                    if run_late:
+                        _run_late_completion(future)
 
                 def _release_future(completed) -> None:
-                    with self._futures_lock:
-                        self._futures.discard(completed)
-                    self._inflight_sem.release()
+                    run_late = False
+                    try:
+                        with completion_lock:
+                            completion_state["completed"] = True
+                            if (
+                                completion_state["decision"] is True
+                                and not completion_state["late_claimed"]
+                            ):
+                                completion_state["late_claimed"] = True
+                                run_late = True
+                        if run_late:
+                            _run_late_completion(completed)
+                    finally:
+                        if completed.cancelled():
+                            _finalize_execution()
+                        with self._futures_lock:
+                            self._futures.discard(completed)
 
             # A timed-out Future may already be running, in which case
             # cancel() cannot stop it. Keep the backpressure permit attached
             # to the actual work item until it really finishes.
             try:
                 future.add_done_callback(_release_future)
-            except Exception:
+            except BaseException as registration_error:
+                _publish_completion_decision(late=False)
                 with self._futures_lock:
                     self._futures.discard(future)
+                    self._ownership_tokens.discard(submission_token)
+                submission_owned_by_caller = False
+                cancelled = False
+                cancel_error: BaseException | None = None
                 try:
-                    future.cancel()
-                except Exception:
-                    pass
+                    cancelled = future.cancel()
+                except BaseException as exc:
+                    cancel_error = exc
+                    try:
+                        cancelled = future.cancelled() is True
+                    except BaseException as probe_error:
+                        try:
+                            registration_error.add_note(
+                                "ticker cancel state probe failed: "
+                                f"{type(probe_error).__name__}: {probe_error}"
+                            )
+                        except BaseException:
+                            pass
+                if cancel_error is not None:
+                    try:
+                        registration_error.add_note(
+                            "ticker cancel failed after callback registration "
+                            f"error: {type(cancel_error).__name__}: {cancel_error}"
+                        )
+                    except BaseException:
+                        pass
+                if cancelled:
+                    _finalize_execution()
+                elif cancel_error is not None:
+                    with self._futures_lock:
+                        if execution_token in self._ownership_tokens:
+                            self._ambiguous_execution_tokens.add(
+                                execution_token
+                            )
                 raise
-            permit_owned_by_caller = False
             try:
                 ticker = future.result(timeout=timeout) or {}
             except _FutTimeout:
+                submission_owned_by_caller = False
+                _publish_completion_decision(late=True)
                 _record_fetch_api_error()
                 self._note_fetch_result(fetch_started_at, ok=False)
                 cancelled = False
@@ -538,12 +691,6 @@ class TickerCache:
                     cancelled = future.cancel()
                 except Exception:
                     pass
-                if not cancelled:
-                    future.add_done_callback(
-                        lambda completed, symbol=symbol_full,
-                        started=fetch_started_at:
-                        self._cache_late_ticker(symbol, completed, started)
-                    )
                 stale = self._stale(
                     symbol_full, time.monotonic(), self.stale_max
                 )
@@ -555,6 +702,7 @@ class TickerCache:
                     f"and no fresh cache (<{self.stale_max}s) available"
                 )
             except Exception as e:
+                _publish_completion_decision(late=False)
                 _record_fetch_api_error()
                 self._note_fetch_result(fetch_started_at, ok=False)
                 if self._is_rate_limited(e):
@@ -573,6 +721,11 @@ class TickerCache:
                         self._note_stale_hit()
                         return stale
                 raise
+            except BaseException:
+                _publish_completion_decision(late=False)
+                raise
+            else:
+                _publish_completion_decision(late=False)
 
             # Timestamp AFTER fetch completes (so cache TTL reflects
             # actual data freshness, not when we submitted the job).
@@ -596,6 +749,9 @@ class TickerCache:
             )
             return ticker
         finally:
+            if submission_owned_by_caller:
+                with self._futures_lock:
+                    self._ownership_tokens.discard(submission_token)
             if permit_owned_by_caller:
                 self._inflight_sem.release()
 
@@ -608,10 +764,18 @@ class TickerCache:
         retry after their core-thread join.
         """
         with self._shutdown_lock:
+            self._shutdown_started = True
             if self._shutdown_complete:
                 return True
+            with self._futures_lock:
+                preserve_ambiguous = bool(
+                    self._ambiguous_execution_tokens
+                )
             try:
-                self._pool.shutdown(wait=False, cancel_futures=True)
+                self._pool.shutdown(
+                    wait=False,
+                    cancel_futures=not preserve_ambiguous,
+                )
             except Exception as exc:
                 try:
                     from bot_utils.silent_log import silent_log
@@ -620,14 +784,14 @@ class TickerCache:
                     pass
                 return False
             with self._futures_lock:
-                pending = [future for future in self._futures if not future.done()]
-            if pending:
+                pending_count = len(self._ownership_tokens)
+            if pending_count:
                 try:
                     from bot_utils.silent_log import silent_log
                     silent_log(
                         "ticker cache shutdown",
                         RuntimeError(
-                            f"{len(pending)} ticker fetch(es) still running"
+                            f"{pending_count} ticker task owner(s) still active"
                         ),
                     )
                 except Exception:

@@ -258,6 +258,9 @@ def record_api_error(
         reservation, ApiCallReservation
     ):
         raise ValueError("reservation must be an ApiCallReservation or None")
+    ledger_endpoint = endpoint
+    if reservation is not None and reservation.ledger_endpoint is not None:
+        ledger_endpoint = _validated_endpoint(reservation.ledger_endpoint)
     now_mono = time.monotonic()
     already_counted = bool(reservation and reservation.allowed)
 
@@ -272,7 +275,7 @@ def record_api_error(
             marked = mark_global_api_call_error(
                 reservation.row_id,
                 _resolve_bot_name(),
-                endpoint=reservation.ledger_endpoint or endpoint,
+                endpoint=ledger_endpoint,
             )
             if marked is None:
                 _mark_db_failed()
@@ -297,7 +300,7 @@ def record_api_error(
         from core.database import check_and_consume_global_api
         result = check_and_consume_global_api(
             _resolve_bot_name(),
-            endpoint=endpoint,
+            endpoint=ledger_endpoint,
             max_per_minute=10_000_000,
             ok=0,
         )

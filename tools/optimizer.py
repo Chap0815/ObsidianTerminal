@@ -3141,35 +3141,97 @@ def _absolute_without_links(path: str | os.PathLike, *, label: str) -> Path:
 
 def _sync_directory(path: Path) -> None:
     try:
-        directory_fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(str(path), flags)
+    except AttributeError:
         return
+    except OSError as exc:
+        if os.name == "nt":
+            if isinstance(exc, PermissionError):
+                return
+            if (
+                isinstance(exc, FileNotFoundError)
+                and path == Path(path.anchor)
+                and path.is_dir()
+            ):
+                return
+        raise
+    primary_error: BaseException | None = None
     try:
         os.fsync(directory_fd)
-    except OSError:
-        pass
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         try:
             os.close(directory_fd)
-        except OSError:
-            pass
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "optimizer directory close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
+def _sync_parent_chain(path: Path) -> None:
+    parent = path.parent
+    while True:
+        _sync_directory(parent)
+        if parent == parent.parent:
+            break
+        parent = parent.parent
 
 
 @contextmanager
 def _atomic_csv_writer(filename: str | os.PathLike):
     target = _absolute_without_links(filename, label="optimizer report path")
+    _sync_parent_chain(target.parent)
     if target.exists() or _is_linklike(target):
         raise FileExistsError("immutable optimizer report conflict")
-    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
-    temp_created = False
-    published = False
+    temporary: Path | None = None
+    temporary_owned = False
+    primary_error: BaseException | None = None
+    handle = None
     try:
-        _absolute_without_links(temporary, label="optimizer report path")
-        with temporary.open("x", newline="", encoding="utf-8") as handle:
-            temp_created = True
+        for attempt in range(3):
+            candidate = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+            _absolute_without_links(candidate, label="optimizer report path")
+            try:
+                handle = candidate.open("x", newline="", encoding="utf-8")
+            except FileExistsError:
+                if attempt == 2:
+                    raise
+                continue
+            temporary = candidate
+            temporary_owned = True
+            break
+        if handle is None or temporary is None:
+            raise RuntimeError("optimizer report temporary allocation failed")
+        try:
             yield handle
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if primary_error is None:
+                    primary_error = close_error
+                    raise
+                try:
+                    primary_error.add_note(
+                        "optimizer report temporary close failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
         target = _absolute_without_links(target, label="optimizer report path")
         try:
             os.link(temporary, target)
@@ -3177,21 +3239,61 @@ def _atomic_csv_writer(filename: str | os.PathLike):
             raise FileExistsError(
                 "immutable optimizer report conflict"
             ) from exc
-        published = True
-        try:
-            temporary.unlink()
-            temp_created = False
-        except OSError:
-            pass
+    except BaseException as exc:
+        if primary_error is None:
+            primary_error = exc
+        raise
     finally:
-        if temp_created:
+        cleanup_error: BaseException | None = None
+        if temporary_owned and temporary is not None:
+            for _attempt in range(2):
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    temporary_owned = False
+                    break
+                except OSError as exc:
+                    cleanup_error = exc
+                except BaseException as exc:
+                    cleanup_error = exc
+                    break
+                else:
+                    temporary_owned = False
+                    break
+            if not temporary_owned:
+                cleanup_error = None
+        sync_error: BaseException | None = None
+        if temporary is not None:
             try:
-                temporary.unlink()
-                temp_created = False
-            except OSError:
-                pass
-        if published:
-            _sync_directory(target.parent)
+                _sync_directory(target.parent)
+            except BaseException as exc:
+                sync_error = exc
+        if primary_error is not None:
+            for label, secondary_error in (
+                ("temporary cleanup", cleanup_error),
+                ("directory sync", sync_error),
+            ):
+                if secondary_error is None:
+                    continue
+                try:
+                    primary_error.add_note(
+                        f"optimizer report {label} failed: "
+                        f"{type(secondary_error).__name__}: {secondary_error}"
+                    )
+                except BaseException:
+                    pass
+        elif sync_error is not None:
+            if cleanup_error is not None:
+                try:
+                    sync_error.add_note(
+                        "optimizer report temporary cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
+            raise sync_error
+        elif cleanup_error is not None:
+            raise cleanup_error
 
 
 def export_csv(results, strategy, days, k_folds):

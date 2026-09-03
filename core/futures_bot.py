@@ -33,6 +33,7 @@ Subclass contract:
 from __future__ import annotations
 
 import atexit
+import copy
 import importlib
 import math
 import signal
@@ -56,14 +57,21 @@ from bot_utils.api_budget import try_consume_api_call
 from bot_utils.runtime_threads import (finalize_runtime_shutdown,
                                        format_runtime_thread_liveness,
                                        shared_runtime_resource_closers,
-                                       start_threads_or_shutdown)
+                                       start_threads_or_shutdown,
+                                       thread_definitely_never_started)
 from bot_utils.silent_log import silent_log
-from bot_utils.trade_state import state_exposure_count
+from bot_utils.trade_state import state_exposure_count, state_rows_exposure_count
 from core.clock import now_utc
 
-from core.futures_bot_exits import FuturesExitsMixin
+from core.futures_bot_exits import (
+    FuturesExitsMixin,
+    _futures_exit_intent_schema_status,
+)
 from core.futures_bot_scan import FuturesScanMixin
 from core.futures_bot_reconcile import FuturesReconcileMixin
+
+
+_STATE_ROWS_UNSET = object()
 
 
 class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
@@ -131,6 +139,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         self._entry_recovery_lock = threading.Lock()
         self._entry_recovery_generation = 0
         self._shutdown_lock = threading.Lock()
+        self._shutdown_handler_lock = threading.Lock()
+        self._shutdown_request_publish_lock = threading.RLock()
+        self._shutdown_close_requested = threading.Event()
+        self._shutdown_close_request_generation = None
         self._cooldown_lock = threading.Lock()
         self._markout_health_lock = threading.Lock()
         self._venue_health_lock = threading.Lock()
@@ -145,6 +157,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         # Idempotency flag for emergency close (prevents double-run when both
         # SIGINT and atexit fire)
         self._emergency_closed = False
+        self._emergency_close_generation = None
         self._shutdown_positions_preserved = False
 
         # Threads
@@ -153,6 +166,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         self._reconcile_thread: Optional[threading.Thread] = None
         self._markout_thread: Optional[threading.Thread] = None
         self._venue_recorder_thread: Optional[threading.Thread] = None
+        self._venue_recorder = None
         self._markout_started_monotonic: float | None = None
         self._sim_evidence_health_cache: dict[str, Any] | None = None
         self._sim_evidence_health_last_monotonic: float | None = None
@@ -228,6 +242,8 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             return get_live_value(self.BOT_NAME, key, default,
                                    fallback_cfg=self.cfg)
         except Exception:
+            if key == "NEW_ENTRIES_ENABLED":
+                return False
             return self.cfg.get(key, default)
 
     def _new_simulated_entry_tca_pending(
@@ -355,9 +371,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 or latest.get(self._SIM_TCA_PENDING_FIELD) != pending
             ):
                 raise RuntimeError("SIM TCA state changed before WAL clear")
-            if not self.state.update_many(
+            cleared = self.state.update_many(
                 base, {self._SIM_TCA_PENDING_FIELD: None}
-            ):
+            )
+            if cleared is not None and cleared is not True:
                 raise RuntimeError("SIM TCA WAL clear was not durable")
             return True
         except Exception as exc:
@@ -434,21 +451,45 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
 
     def _entry_recovery_runtime_health(self) -> dict[str, Any]:
         """Expose a blocked entry journal as degraded runtime health."""
+        missing_health = object()
         lock = getattr(self, "_entry_recovery_lock", None)
         if lock is None:
             blocked = bool(getattr(self, "_entry_recovery_blocked", False))
-            health = getattr(self, "_entry_recovery_health", None)
+            value = getattr(self, "_entry_recovery_health", missing_health)
+            health = (
+                missing_health
+                if value is missing_health
+                else copy.deepcopy(value)
+            )
         else:
             with lock:
                 blocked = bool(
                     getattr(self, "_entry_recovery_blocked", False)
                 )
-                health = getattr(self, "_entry_recovery_health", None)
-        if isinstance(health, dict):
-            result = dict(health)
-        else:
-            result = {}
-        if not blocked and (not result or result.get("ok") is True):
+                value = getattr(
+                    self, "_entry_recovery_health", missing_health
+                )
+                health = (
+                    missing_health
+                    if value is missing_health
+                    else copy.deepcopy(value)
+                )
+        if health is missing_health:
+            # Support lifecycle-light diagnostic hosts. Fully initialized bots
+            # always own this field before any worker or status publication.
+            if not blocked:
+                return {}
+            health = {}
+        if not isinstance(health, dict) or not health:
+            return {
+                "ok": False,
+                "component": "entry_recovery",
+                "state": "unavailable",
+                "reason": "invalid_health_payload",
+                "unresolved_count": 1,
+            }
+        result = health
+        if not blocked and result.get("ok") is True:
             return {}
         if blocked and result.get("ok") is not False:
             try:
@@ -474,24 +515,57 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             }
         return result
 
-    def _exit_recovery_runtime_health(self) -> dict[str, Any]:
+    def _entry_recovery_allows_live_open(self) -> bool:
+        """Fail closed when the shared futures entry barrier is unavailable."""
+        if bool(getattr(self, "simulation", True)):
+            return True
+        try:
+            health = self._entry_recovery_runtime_health()
+        except Exception:
+            return False
+        return isinstance(health, dict) and (
+            not health or health.get("ok") is True
+        )
+
+    def _exit_recovery_runtime_health(
+        self,
+        *,
+        state_rows: Any = _STATE_ROWS_UNSET,
+        state_error_type: str = "",
+    ) -> dict[str, Any]:
         """Expose durable LIVE exit-order intents as degraded health."""
         if bool(getattr(self, "simulation", True)):
             return {}
-        state = getattr(self, "state", None)
-        get_all = getattr(state, "get_all", None)
-        if not callable(get_all):
-            return {}
-        try:
-            rows = get_all()
-        except Exception as exc:
+        if state_error_type:
             return {
                 "ok": False,
                 "component": "exit_recovery",
                 "state": "unavailable",
                 "reason": "exit_state_unavailable",
-                "error_type": type(exc).__name__,
+                "error_type": state_error_type[:64],
             }
+        if state_rows is _STATE_ROWS_UNSET:
+            state = getattr(self, "state", None)
+            get_all = getattr(state, "get_all", None)
+            if not callable(get_all):
+                return {
+                    "ok": False,
+                    "component": "exit_recovery",
+                    "state": "unavailable",
+                    "reason": "exit_state_unavailable",
+                }
+            try:
+                rows = get_all()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "component": "exit_recovery",
+                    "state": "unavailable",
+                    "reason": "exit_state_unavailable",
+                    "error_type": type(exc).__name__,
+                }
+        else:
+            rows = state_rows
         if not isinstance(rows, dict):
             return {
                 "ok": False,
@@ -501,14 +575,43 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             }
         partial_symbols = []
         full_symbols = []
+        invalid_row_count = 0
         for symbol, row in rows.items():
             if not isinstance(row, dict):
+                invalid_row_count += 1
                 continue
-            safe_symbol = str(symbol)[:32]
-            if row.get("partial_exit_client_order_id") not in (None, ""):
-                partial_symbols.append(safe_symbol)
-            if row.get("full_exit_client_order_id") not in (None, ""):
-                full_symbols.append(safe_symbol)
+            try:
+                safe_symbol = str(symbol)[:32]
+            except BaseException:
+                invalid_row_count += 1
+                continue
+            partial_present, partial_valid = (
+                _futures_exit_intent_schema_status(row, "partial")
+            )
+            full_present, full_valid = _futures_exit_intent_schema_status(
+                row, "full"
+            )
+            row_invalid = False
+            if partial_present:
+                if partial_valid:
+                    partial_symbols.append(safe_symbol)
+                else:
+                    row_invalid = True
+            if full_present:
+                if full_valid:
+                    full_symbols.append(safe_symbol)
+                else:
+                    row_invalid = True
+            if row_invalid:
+                invalid_row_count += 1
+        if invalid_row_count:
+            return {
+                "ok": False,
+                "component": "exit_recovery",
+                "state": "unavailable",
+                "reason": "invalid_exit_state_payload",
+                "invalid_row_count": invalid_row_count,
+            }
         unresolved_count = len(partial_symbols) + len(full_symbols)
         if unresolved_count == 0:
             return {}
@@ -575,12 +678,34 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         error_type: str = "",
     ) -> bool:
         """Store authentication health and report whether its state changed."""
+        valid_ok = type(ok) is bool
+        healthy = ok is True
+
+        def bounded_text(value, default: str) -> str:
+            if value is None:
+                return default
+            try:
+                rendered = str(value)[:80]
+            except BaseException:
+                return "unrenderable_health_detail"
+            return rendered or default
+
+        if not valid_ok:
+            health_reason = "invalid_health_payload"
+            health_error_type = "invalid_ok_type"
+        elif healthy:
+            health_reason = ""
+            health_error_type = ""
+        else:
+            health_reason = bounded_text(reason, "authentication_failed")
+            health_error_type = bounded_text(error_type, "unknown")
         snapshot = {
-            "ok": bool(ok),
+            "ok": healthy,
             "component": "private_api",
-            "state": "authenticated" if ok else "authentication_failed",
-            "reason": "" if ok else str(reason or "authentication_failed")[:80],
-            "error_type": "" if ok else str(error_type or "unknown")[:80],
+            "state": "authenticated" if healthy else "authentication_failed",
+            "reason": health_reason,
+            "error_type": health_error_type,
+            "checked_monotonic": time.monotonic(),
             "checked_wall_ts": time.time(),
         }
         lock = getattr(self, "_private_api_health_lock", None)
@@ -609,11 +734,48 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         if lock is None:
             return {}
         with lock:
-            return dict(getattr(self, "_private_api_health", {}) or {})
+            snapshot = dict(getattr(self, "_private_api_health", {}) or {})
+        if snapshot.get("ok") is not True:
+            return snapshot
+        try:
+            interval = float(self.RECONCILE_INTERVAL_SEC)
+            if not math.isfinite(interval) or interval < 0.0:
+                raise ValueError("invalid reconcile interval")
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            interval = 300.0
+        stale_after = max(30.0, 2.0 * interval + 15.0)
+        checked = snapshot.get("checked_monotonic")
+        try:
+            check_age = time.monotonic() - float(checked)
+            if not math.isfinite(check_age) or check_age < 0.0:
+                raise ValueError("private API check timestamp is invalid")
+        except (TypeError, ValueError, OverflowError):
+            snapshot.update({
+                "ok": False,
+                "state": "invalid",
+                "reason": "private_api_timestamp_invalid",
+                "check_age_seconds": None,
+                "stale_after_seconds": stale_after,
+            })
+            return snapshot
+        snapshot.update({
+            "check_age_seconds": check_age,
+            "stale_after_seconds": stale_after,
+        })
+        if check_age > stale_after:
+            snapshot.update({
+                "ok": False,
+                "state": "stale",
+                "reason": "private_api_check_stale",
+            })
+        return snapshot
 
     def _runtime_status_health(
         self,
         threads: dict[str, bool],
+        *,
+        state_rows: Any = _STATE_ROWS_UNSET,
+        state_error_type: str = "",
     ) -> tuple[str, dict[str, Any]]:
         """Combine worker liveness with reported component health."""
         def read_health(reader) -> dict[str, Any]:
@@ -629,7 +791,72 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     "ok": False,
                     "error_type": "invalid_health_payload",
                 }
-            return health
+            try:
+                snapshot = copy.deepcopy(health)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                }
+            if not isinstance(snapshot, dict):
+                return {
+                    "ok": False,
+                    "error_type": "invalid_health_payload",
+                }
+            return snapshot
+
+        required_threads = ("monitor", "reconcile", "scan")
+        thread_payload_valid = isinstance(threads, dict)
+        missing_threads = (
+            sorted(name for name in required_threads if name not in threads)
+            if thread_payload_valid
+            else list(required_threads)
+        )
+        invalid_threads = (
+            sorted(
+                name
+                for name, value in threads.items()
+                if isinstance(name, str) and not isinstance(value, bool)
+            )
+            if thread_payload_valid
+            else []
+        )
+        invalid_thread_keys = bool(
+            thread_payload_valid
+            and any(not isinstance(name, str) for name in threads)
+        )
+        thread_payload_valid = bool(
+            thread_payload_valid
+            and not missing_threads
+            and not invalid_threads
+            and not invalid_thread_keys
+        )
+        threads_ok = bool(
+            thread_payload_valid and all(value is True for value in threads.values())
+        )
+        thread_health = {}
+        if not thread_payload_valid:
+            thread_health = {
+                "ok": False,
+                "component": "runtime_threads",
+                "state": "invalid",
+                "reason": "invalid_thread_liveness",
+                "missing_threads": missing_threads,
+                "invalid_threads": invalid_threads,
+            }
+            if invalid_thread_keys:
+                thread_health["invalid_key_count"] = sum(
+                    1 for name in threads if not isinstance(name, str)
+                )
+        state_snapshot_health = {}
+        if state_error_type:
+            state_snapshot_health = {
+                "ok": False,
+                "component": "state_snapshot",
+                "state": "unavailable",
+                "reason": "state_snapshot_unavailable",
+                "error_type": state_error_type[:64],
+            }
 
         strategy_health = read_health(self._strategy_runtime_health)
         if strategy_health.get("error_type") == "invalid_health_payload":
@@ -663,7 +890,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             not entry_recovery_health
             or entry_recovery_health.get("ok") is True
         )
-        exit_recovery_health = read_health(self._exit_recovery_runtime_health)
+        exit_recovery_health = read_health(
+            lambda: self._exit_recovery_runtime_health(
+                state_rows=state_rows,
+                state_error_type=state_error_type,
+            )
+        )
         exit_recovery_ok = (
             not exit_recovery_health
             or exit_recovery_health.get("ok") is True
@@ -680,7 +912,8 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         status = (
             "ready"
             if (
-                all(threads.values())
+                threads_ok
+                and not state_snapshot_health
                 and strategy_ok
                 and ticker_ok
                 and markout_ok
@@ -694,6 +927,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             else "degraded"
         )
         extra = {}
+        if thread_health:
+            extra["thread_health"] = thread_health
+        if state_snapshot_health:
+            extra["state_snapshot_health"] = state_snapshot_health
         if strategy_health:
             extra["strategy_health"] = strategy_health
         if ticker_health:
@@ -721,15 +958,59 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
     def _record_markout_worker_health(self, report: dict) -> None:
         """Receive one sanitized progress report from the markout thread."""
         if not isinstance(report, dict):
+            with self._markout_health_lock:
+                try:
+                    previous_errors = max(
+                        0,
+                        int(
+                            self._markout_health.get("consecutive_errors")
+                            or 0
+                        ),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    previous_errors = 0
+                self._markout_health.update({
+                    "ok": False,
+                    "reason": "invalid_health_payload",
+                    "timestamps_valid": False,
+                    "consecutive_errors": previous_errors + 1,
+                    "last_error": "invalid markout health payload",
+                })
             return
         report_ok = report.get("ok") is True
+        payload_contract_valid = True
+
+        def invalidate_payload_contract() -> None:
+            nonlocal payload_contract_valid
+            payload_contract_valid = False
+
+        def bounded_text(value, *, max_chars: int, default: str = "") -> str:
+            if value is None:
+                return default[:max_chars]
+            try:
+                return str(value)[:max_chars]
+            except BaseException:
+                invalidate_payload_contract()
+                return default[:max_chars]
+
+        def optional_bounded_text(value, *, max_chars: int) -> str | None:
+            if value is None:
+                return None
+            try:
+                if not value:
+                    return None
+            except BaseException:
+                invalidate_payload_contract()
+                return None
+            return bounded_text(value, max_chars=max_chars) or None
 
         def nonnegative_int(value) -> int:
             if isinstance(value, bool):
                 return 0
             try:
                 return max(0, int(value or 0))
-            except (TypeError, ValueError, OverflowError):
+            except BaseException:
+                invalidate_payload_contract()
                 return 0
 
         def nonnegative_float(value) -> float:
@@ -737,18 +1018,42 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 return 0.0
             try:
                 parsed = float(value or 0.0)
-            except (TypeError, ValueError, OverflowError):
+            except BaseException:
+                invalidate_payload_contract()
                 return 0.0
-            return max(0.0, parsed) if math.isfinite(parsed) else 0.0
+            if not math.isfinite(parsed):
+                invalidate_payload_contract()
+                return 0.0
+            return max(0.0, parsed)
 
         def optional_nonnegative_float(value) -> float | None:
             if value is None or isinstance(value, bool):
                 return None
             try:
                 parsed = float(value)
-            except (TypeError, ValueError, OverflowError):
+            except BaseException:
+                invalidate_payload_contract()
                 return None
-            return max(0.0, parsed) if math.isfinite(parsed) else None
+            if not math.isfinite(parsed):
+                invalidate_payload_contract()
+                return None
+            return max(0.0, parsed)
+
+        def optional_timestamp(value) -> float | None:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                invalidate_payload_contract()
+                return None
+            try:
+                parsed = float(value)
+            except BaseException:
+                invalidate_payload_contract()
+                return None
+            if not math.isfinite(parsed) or parsed < 0.0:
+                invalidate_payload_contract()
+                return None
+            return parsed
 
         raw_scopes = report.get("scopes")
         raw_scopes = raw_scopes if isinstance(raw_scopes, dict) else {}
@@ -762,10 +1067,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             next_runnable = raw.get("next_runnable_at")
             scopes[scope] = {
                 "due_count": due_count,
-                "oldest_due_at": str(oldest)[:32] if oldest else None,
+                "oldest_due_at": optional_bounded_text(
+                    oldest, max_chars=32
+                ),
                 "oldest_overdue_seconds": overdue,
-                "next_runnable_at": (
-                    str(next_runnable)[:32] if next_runnable else None
+                "next_runnable_at": optional_bounded_text(
+                    next_runnable, max_chars=32
                 ),
                 "next_runnable_seconds": optional_nonnegative_float(
                     raw.get("next_runnable_seconds")
@@ -778,51 +1085,93 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "due_queue_time_invalid",
             "worker_error",
             "worker_lock_error",
+            "worker_lock_integrity_error",
+            "worker_lock_lost",
+            "worker_lock_renewal_error",
             "worker_lock_release_failed",
+            "worker_persistence_error",
+            "worker_queue_error",
         }
-        reason = str(report.get("reason") or "")
+        reason = bounded_text(report.get("reason"), max_chars=64)
         if report_ok:
             reason = ""
         elif reason not in allowed_reasons or not reason:
             reason = "worker_error"
-        wake_strategy = str(report.get("wake_strategy") or "fixed_interval")
+        wake_strategy = bounded_text(
+            report.get("wake_strategy"),
+            max_chars=32,
+            default="fixed_interval",
+        )
         if wake_strategy not in {
             "deadline_or_local_commit",
             "fixed_interval",
             "fixed_error_backoff",
         }:
             wake_strategy = "fixed_interval"
+        lock_state = bounded_text(
+            report.get("lock_state"),
+            max_chars=32,
+            default="unknown",
+        )
+        if lock_state not in {
+            "starting",
+            "idle",
+            "unknown",
+            "acquired",
+            "contended",
+            "error",
+            "integrity_error",
+            "lost",
+            "persistence_error",
+            "queue_error",
+            "renewal_error",
+            "release_failed",
+        } or report_ok and lock_state in {
+            "error",
+            "integrity_error",
+            "lost",
+            "persistence_error",
+            "queue_error",
+            "renewal_error",
+            "release_failed",
+        }:
+            invalidate_payload_contract()
         with self._markout_health_lock:
-            previous_errors = int(
-                self._markout_health.get("consecutive_errors") or 0
+            previous_errors = nonnegative_int(
+                self._markout_health.get("consecutive_errors")
             )
             self._markout_health.update({
                 "ok": report_ok,
-                "last_poll_monotonic": report.get("last_poll_monotonic"),
-                "last_poll_wall_ts": report.get("last_poll_wall_ts"),
+                "last_poll_monotonic": optional_timestamp(
+                    report.get("last_poll_monotonic")
+                ),
+                "last_poll_wall_ts": optional_timestamp(
+                    report.get("last_poll_wall_ts")
+                ),
                 "consecutive_errors": (
                     0 if report_ok else previous_errors + 1
                 ),
                 "last_error": (
                     ""
                     if report_ok
-                    else str(
+                    else bounded_text(
                         report.get("error")
                         or report.get("reason")
-                        or "markout worker unhealthy"
-                    )[:200]
+                        or "markout worker unhealthy",
+                        max_chars=200,
+                    )
                 ),
                 "due_count": nonnegative_int(report.get("due_count")),
-                "oldest_due_at": (
-                    str(report.get("oldest_due_at"))[:32]
-                    if report.get("oldest_due_at") else None
+                "oldest_due_at": optional_bounded_text(
+                    report.get("oldest_due_at"),
+                    max_chars=32,
                 ),
                 "oldest_overdue_seconds": nonnegative_float(
                     report.get("oldest_overdue_seconds")
                 ),
-                "next_runnable_at": (
-                    str(report.get("next_runnable_at"))[:32]
-                    if report.get("next_runnable_at") else None
+                "next_runnable_at": optional_bounded_text(
+                    report.get("next_runnable_at"),
+                    max_chars=32,
                 ),
                 "next_runnable_seconds": optional_nonnegative_float(
                     report.get("next_runnable_seconds")
@@ -843,15 +1192,23 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     report.get("poll_wait_seconds")
                 ),
                 "wake_strategy": wake_strategy,
-                "last_completed_wall_ts": report.get(
-                    "last_completed_wall_ts"
+                "last_completed_wall_ts": optional_timestamp(
+                    report.get("last_completed_wall_ts")
                 ),
-                "lock_state": str(report.get("lock_state") or "unknown")[:32],
+                "lock_state": lock_state,
                 "worker_family": "futures",
                 "producer_bots": ["CROSS", "FUTREND", "FUTURES"],
                 "progress_scope": "worker_market_family",
                 "progress_is_bot_scoped": False,
             })
+            if report_ok and not payload_contract_valid:
+                self._markout_health.update({
+                    "ok": False,
+                    "reason": "invalid_health_payload",
+                    "timestamps_valid": False,
+                    "consecutive_errors": previous_errors + 1,
+                    "last_error": "invalid markout health payload",
+                })
 
     def _markout_runtime_health(self) -> dict[str, Any]:
         if not self._owns_markout_worker() or not hasattr(
@@ -859,7 +1216,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         ):
             return {}
         with self._markout_health_lock:
-            snapshot = dict(self._markout_health)
+            snapshot = copy.deepcopy(self._markout_health)
         last_poll = snapshot.get("last_poll_monotonic")
         if last_poll is None:
             started = getattr(self, "_markout_started_monotonic", None)
@@ -867,11 +1224,18 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 startup_age = 0.0
             else:
                 try:
-                    startup_age = max(
-                        0.0, time.monotonic() - float(started)
-                    )
-                except (TypeError, ValueError, OverflowError):
-                    startup_age = float("inf")
+                    startup_age = time.monotonic() - float(started)
+                    if not math.isfinite(startup_age) or startup_age < 0.0:
+                        raise ValueError("markout startup timestamp is invalid")
+                except BaseException:
+                    snapshot.update({
+                        "ok": False,
+                        "component": "execution_markout_worker",
+                        "state": "invalid",
+                        "reason": "startup_timestamp_invalid",
+                        "startup_age_seconds": None,
+                    })
+                    return snapshot
             startup_stale = startup_age > self.MARKOUT_POLL_STALE_SEC
             snapshot.update({
                 "ok": not startup_stale,
@@ -883,9 +1247,18 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 snapshot["reason"] = "startup_poll_stale"
             return snapshot
         try:
-            poll_age = max(0.0, time.monotonic() - float(last_poll))
-        except (TypeError, ValueError, OverflowError):
-            poll_age = float("inf")
+            poll_age = time.monotonic() - float(last_poll)
+            if not math.isfinite(poll_age) or poll_age < 0.0:
+                raise ValueError("markout poll timestamp is invalid")
+        except BaseException:
+            snapshot.update({
+                "ok": False,
+                "component": "execution_markout_worker",
+                "state": "invalid",
+                "reason": "poll_timestamp_invalid",
+                "poll_age_seconds": None,
+            })
+            return snapshot
         if poll_age > self.MARKOUT_POLL_STALE_SEC:
             snapshot["ok"] = False
             snapshot["reason"] = "poll_stale"
@@ -1080,16 +1453,59 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         if not isinstance(report, dict):
             return
 
+        payload_contract_valid = True
+
+        def invalidate_payload_contract() -> None:
+            nonlocal payload_contract_valid
+            payload_contract_valid = False
+
+        def bounded_text(value, *, max_chars: int) -> str:
+            if value is None:
+                return ""
+            try:
+                return str(value)[:max_chars]
+            except BaseException:
+                invalidate_payload_contract()
+                return "[UNRENDERABLE]"[:max_chars]
+
         def nonnegative_int(key: str) -> int:
             try:
                 return max(0, int(report.get(key) or 0))
-            except (TypeError, ValueError, OverflowError):
+            except BaseException:
+                invalidate_payload_contract()
                 return 0
 
         def bounded_strings(value, *, limit: int = 32) -> list[str]:
             if not isinstance(value, (list, tuple)):
                 return []
-            return [str(item)[:100] for item in value[:limit]]
+            try:
+                items = value[:limit]
+            except BaseException:
+                invalidate_payload_contract()
+                return []
+            return [bounded_text(item, max_chars=100) for item in items]
+
+        def bounded_invalid_day_issues(value) -> list[dict[str, object]]:
+            if not isinstance(value, (list, tuple)):
+                return []
+            bounded = []
+            for row in value[-8:]:
+                if not isinstance(row, dict):
+                    continue
+                raw_issues = row.get("issues")
+                issues = (
+                    [
+                        bounded_text(issue, max_chars=240)
+                        for issue in raw_issues[:4]
+                    ]
+                    if isinstance(raw_issues, (list, tuple))
+                    else []
+                )
+                bounded.append({
+                    "day": bounded_text(row.get("day"), max_chars=16),
+                    "issues": issues,
+                })
+            return bounded
 
         raw_rest = report.get("rest_data_health")
         raw_rest = raw_rest if isinstance(raw_rest, dict) else {}
@@ -1104,12 +1520,34 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         raw_storage = report.get("storage_health")
         raw_storage = raw_storage if isinstance(raw_storage, dict) else {}
 
+        def strict_connection_number(key: str) -> int | None:
+            if key not in raw_stream:
+                return None
+            value = raw_stream.get(key)
+            if type(value) is not int or value < 0:
+                invalidate_payload_contract()
+                return None
+            return value
+
+        connection_epoch = strict_connection_number("connection_epoch")
+        reconnect_attempts = strict_connection_number("reconnect_attempts")
+        connection_error_type = ""
+        if "connection_error_type" in raw_stream:
+            raw_connection_error = raw_stream.get("connection_error_type")
+            if raw_connection_error is None:
+                pass
+            elif isinstance(raw_connection_error, str):
+                connection_error_type = raw_connection_error[:100]
+            else:
+                invalidate_payload_contract()
+
         def bounded_nonnegative(value) -> int | None:
             if value is None or isinstance(value, bool):
                 return None
             try:
                 return max(0, int(value))
-            except (TypeError, ValueError, OverflowError):
+            except BaseException:
+                invalidate_payload_contract()
                 return None
 
         def bounded_float(value) -> float | None:
@@ -1117,25 +1555,94 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 return None
             try:
                 parsed = float(value)
-            except (TypeError, ValueError, OverflowError):
+            except BaseException:
+                invalidate_payload_contract()
                 return None
-            return parsed if math.isfinite(parsed) else None
+            if not math.isfinite(parsed):
+                invalidate_payload_contract()
+                return None
+            return parsed
+
+        def bounded_monotonic(value) -> float | None:
+            parsed = bounded_float(value)
+            return parsed if parsed is not None and parsed >= 0.0 else None
+
+        last_poll_monotonic = bounded_monotonic(
+            report.get("last_poll_monotonic")
+        )
+        last_poll_wall_ts = bounded_float(report.get("last_poll_wall_ts"))
+        rest_ok = report.get("rest_ok") is True
+        l2_enabled = report.get("l2_enabled") is True
+        l2_ok = report.get("l2_ok") is True
+        l2_data_healthy = report.get("l2_data_healthy") is True
+        trade_stream_healthy = report.get("trade_stream_healthy") is True
+        retention_ok = report.get("retention_ok") is True
+        integrity_ok = raw_integrity.get("ok") is True
+        for missing_key, healthy_marker in (
+            ("l2_missing_or_stale", l2_data_healthy),
+            ("trade_missing_or_stale", trade_stream_healthy),
+        ):
+            if missing_key not in raw_stream:
+                continue
+            missing_value = raw_stream.get(missing_key)
+            if (
+                not isinstance(missing_value, (list, tuple))
+                or (healthy_marker and bool(missing_value))
+            ):
+                invalidate_payload_contract()
+        capacity_value = raw_storage.get("capacity_ok")
+        capacity_ok = (
+            capacity_value if isinstance(capacity_value, bool) else None
+        )
+        reported_ok = report.get("ok") is True
+        boolean_contract_complete = all(
+            type(report.get(key)) is bool
+            for key in (
+                "ok",
+                "rest_ok",
+                "l2_enabled",
+                "l2_ok",
+                "l2_data_healthy",
+                "trade_stream_healthy",
+                "retention_ok",
+            )
+        )
+        capacity_contract_complete = (
+            "capacity_ok" in raw_storage
+            and (
+                capacity_value is None
+                or type(capacity_value) is bool
+            )
+        )
+        healthy_contract_complete = (
+            boolean_contract_complete
+            and capacity_contract_complete
+            and last_poll_monotonic is not None
+            and last_poll_wall_ts is not None
+            and rest_ok
+            and l2_ok
+            and l2_data_healthy
+            and trade_stream_healthy
+            and retention_ok
+            and integrity_ok
+            and capacity_ok is not False
+        )
+        health_ok = reported_ok and healthy_contract_complete
+        reason = bounded_text(report.get("reason"), max_chars=64)
+        if reported_ok and not healthy_contract_complete:
+            reason = "invalid_health_payload"
 
         with self._venue_health_lock:
             self._venue_health = {
-                "ok": report.get("ok") is True,
-                "reason": str(report.get("reason") or "")[:64],
-                "last_poll_monotonic": report.get("last_poll_monotonic"),
-                "last_poll_wall_ts": report.get("last_poll_wall_ts"),
-                "rest_ok": report.get("rest_ok") is True,
-                "l2_enabled": report.get("l2_enabled") is True,
-                "l2_ok": report.get("l2_ok") is True,
-                "l2_data_healthy": report.get(
-                    "l2_data_healthy", True
-                ) is True,
-                "trade_stream_healthy": report.get(
-                    "trade_stream_healthy", True
-                ) is True,
+                "ok": health_ok,
+                "reason": reason,
+                "last_poll_monotonic": last_poll_monotonic,
+                "last_poll_wall_ts": last_poll_wall_ts,
+                "rest_ok": rest_ok,
+                "l2_enabled": l2_enabled,
+                "l2_ok": l2_ok,
+                "l2_data_healthy": l2_data_healthy,
+                "trade_stream_healthy": trade_stream_healthy,
                 "rest_data_health": {
                     "ok": raw_rest.get("ok") is True,
                     "stale_after_seconds": bounded_float(
@@ -1149,8 +1656,18 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     ),
                 },
                 "stream_health": {
-                    "connection_epoch": bounded_nonnegative(
-                        raw_stream.get("connection_epoch")
+                    "connection_epoch": connection_epoch,
+                    **(
+                        {
+                            "reconnect_attempts": reconnect_attempts or 0,
+                        }
+                        if "reconnect_attempts" in raw_stream else {}
+                    ),
+                    **(
+                        {
+                            "connection_error_type": connection_error_type,
+                        }
+                        if "connection_error_type" in raw_stream else {}
                     ),
                     "l2_missing_or_stale": bounded_strings(
                         raw_stream.get("l2_missing_or_stale")
@@ -1167,9 +1684,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     "transport_errors_consecutive": bounded_nonnegative(
                         raw_stream.get("transport_errors_consecutive")
                     ) or 0,
-                    "last_transport_error": str(
-                        raw_stream.get("last_transport_error") or ""
-                    )[:200],
+                    "last_transport_error": bounded_text(
+                        raw_stream.get("last_transport_error"),
+                        max_chars=200,
+                    ),
                     "last_interruption_wall_ts": bounded_float(
                         raw_stream.get("last_interruption_wall_ts")
                     ),
@@ -1191,9 +1709,13 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     "invalid_days": bounded_strings(
                         raw_integrity.get("invalid_days")
                     ),
-                    "latest_day": str(
-                        raw_integrity.get("latest_day") or ""
-                    )[:16],
+                    "invalid_day_issues": bounded_invalid_day_issues(
+                        raw_integrity.get("invalid_day_issues")
+                    ),
+                    "latest_day": bounded_text(
+                        raw_integrity.get("latest_day"),
+                        max_chars=16,
+                    ),
                     "continuity": {
                         "window_days": bounded_nonnegative(
                             raw_continuity.get("window_days")
@@ -1216,29 +1738,29 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                             if isinstance(raw_continuity.get("ok"), bool)
                             else None
                         ),
-                        "reason": str(
-                            raw_continuity.get("reason") or ""
-                        )[:64],
-                        "start_day": str(
-                            raw_continuity.get("start_day") or ""
-                        )[:16],
-                        "end_day": str(
-                            raw_continuity.get("end_day") or ""
-                        )[:16],
+                        "reason": bounded_text(
+                            raw_continuity.get("reason"),
+                            max_chars=64,
+                        ),
+                        "start_day": bounded_text(
+                            raw_continuity.get("start_day"),
+                            max_chars=16,
+                        ),
+                        "end_day": bounded_text(
+                            raw_continuity.get("end_day"),
+                            max_chars=16,
+                        ),
                     },
                 },
                 "integrity_errors_total": nonnegative_int(
                     "integrity_errors_total"
                 ),
-                "last_integrity_error": str(
-                    report.get("last_integrity_error") or ""
-                )[:200],
+                "last_integrity_error": bounded_text(
+                    report.get("last_integrity_error"),
+                    max_chars=200,
+                ),
                 "storage_health": {
-                    "capacity_ok": (
-                        raw_storage.get("capacity_ok")
-                        if isinstance(raw_storage.get("capacity_ok"), bool)
-                        else None
-                    ),
+                    "capacity_ok": capacity_ok,
                     "total_bytes": bounded_nonnegative(
                         raw_storage.get("total_bytes")
                     ),
@@ -1269,9 +1791,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     "operational_reserve_ratio": bounded_float(
                         raw_storage.get("operational_reserve_ratio")
                     ),
-                    "capacity_state": str(
-                        raw_storage.get("capacity_state") or ""
-                    )[:32],
+                    "capacity_state": bounded_text(
+                        raw_storage.get("capacity_state"),
+                        max_chars=32,
+                    ),
                 },
                 "consecutive_capture_errors": nonnegative_int(
                     "consecutive_capture_errors"
@@ -1292,33 +1815,41 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 "microstructure_errors_total": nonnegative_int(
                     "microstructure_errors_total"
                 ),
-                "last_capture_success_wall_ts": report.get(
-                    "last_capture_success_wall_ts"
+                "last_capture_success_wall_ts": bounded_float(
+                    report.get("last_capture_success_wall_ts")
                 ),
-                "last_capture_error": str(
-                    report.get("last_capture_error") or ""
-                )[:200],
-                "last_overview_error": str(
-                    report.get("last_overview_error") or ""
-                )[:200],
-                "last_microstructure_error": str(
-                    report.get("last_microstructure_error") or ""
-                )[:200],
-                "retention_ok": report.get("retention_ok", True) is True,
+                "last_capture_error": bounded_text(
+                    report.get("last_capture_error"),
+                    max_chars=200,
+                ),
+                "last_overview_error": bounded_text(
+                    report.get("last_overview_error"),
+                    max_chars=200,
+                ),
+                "last_microstructure_error": bounded_text(
+                    report.get("last_microstructure_error"),
+                    max_chars=200,
+                ),
+                "retention_ok": retention_ok,
                 "retention_errors_total": nonnegative_int(
                     "retention_errors_total"
                 ),
-                "last_retention_error": str(
-                    report.get("last_retention_error") or ""
-                )[:200],
+                "last_retention_error": bounded_text(
+                    report.get("last_retention_error"),
+                    max_chars=200,
+                ),
                 "l2_consecutive_errors": nonnegative_int(
                     "l2_consecutive_errors"
                 ),
                 "l2_errors_total": nonnegative_int("l2_errors_total"),
-                "last_l2_error": str(
-                    report.get("last_l2_error") or ""
-                )[:200],
+                "last_l2_error": bounded_text(
+                    report.get("last_l2_error"),
+                    max_chars=200,
+                ),
             }
+            if reported_ok and not payload_contract_valid:
+                self._venue_health["ok"] = False
+                self._venue_health["reason"] = "invalid_health_payload"
 
     def _venue_runtime_health(self) -> dict[str, Any]:
         recorder_thread = getattr(self, "_venue_recorder_thread", None)
@@ -1327,22 +1858,40 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         ):
             return {}
         with self._venue_health_lock:
-            snapshot = dict(self._venue_health)
+            snapshot = copy.deepcopy(self._venue_health)
         stale_sec = max(
             self.VENUE_HEALTH_MIN_STALE_SEC,
             float(getattr(self, "_venue_health_stale_sec", 0.0) or 0.0),
         )
         last_poll = snapshot.get("last_poll_monotonic")
         if last_poll is None:
+            if snapshot:
+                snapshot.update({
+                    "ok": False,
+                    "component": "venue_recorder",
+                    "state": "invalid",
+                    "reason": "poll_timestamp_invalid",
+                    "poll_age_seconds": None,
+                })
+                return snapshot
             started = getattr(self, "_venue_started_monotonic", None)
             try:
                 startup_age = (
                     0.0
                     if started is None
-                    else max(0.0, time.monotonic() - float(started))
+                    else time.monotonic() - float(started)
                 )
-            except (TypeError, ValueError, OverflowError):
-                startup_age = float("inf")
+                if not math.isfinite(startup_age) or startup_age < 0.0:
+                    raise ValueError("venue startup timestamp is invalid")
+            except BaseException:
+                snapshot.update({
+                    "ok": False,
+                    "component": "venue_recorder",
+                    "state": "invalid",
+                    "reason": "startup_timestamp_invalid",
+                    "startup_age_seconds": None,
+                })
+                return snapshot
             startup_stale = startup_age > stale_sec
             snapshot.update({
                 "ok": not startup_stale,
@@ -1354,9 +1903,18 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 snapshot["reason"] = "startup_poll_stale"
             return snapshot
         try:
-            poll_age = max(0.0, time.monotonic() - float(last_poll))
+            poll_age = time.monotonic() - float(last_poll)
+            if not math.isfinite(poll_age) or poll_age < 0.0:
+                raise ValueError("venue poll timestamp is invalid")
         except (TypeError, ValueError, OverflowError):
-            poll_age = float("inf")
+            snapshot.update({
+                "ok": False,
+                "component": "venue_recorder",
+                "state": "invalid",
+                "reason": "poll_timestamp_invalid",
+                "poll_age_seconds": None,
+            })
+            return snapshot
         if poll_age > stale_sec:
             snapshot["ok"] = False
             snapshot["reason"] = "poll_stale"
@@ -1405,45 +1963,169 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 "monitor thread stopped - exits not supervised"
             )
         try:
-            status, strategy_health = self._runtime_status_health(threads)
-            state_rows = self.state.get_all()
-            if log_snapshot:
-                from trading.runtime_observability import (
-                    log_runtime_observability,
+            state_error_type = ""
+            try:
+                state_rows = self.state.get_all()
+                if not isinstance(state_rows, dict):
+                    state_rows = None
+                    state_error_type = "invalid_state_payload"
+            except Exception as exc:
+                state_rows = None
+                state_error_type = type(exc).__name__
+            runtime_health_reader = self._runtime_status_health
+            if (
+                getattr(runtime_health_reader, "__func__", None)
+                is FuturesBot._runtime_status_health
+            ):
+                status, strategy_health = runtime_health_reader(
+                    threads,
+                    state_rows=state_rows,
+                    state_error_type=state_error_type,
                 )
+            else:
+                # Preserve the long-standing subclass/test-double contract.
+                status, strategy_health = runtime_health_reader(threads)
+            from trading.runtime_observability import (
+                guarded_runtime_observability,
+            )
 
-                observability = log_runtime_observability(
+            observability, observability_health, observability_error = (
+                guarded_runtime_observability(
+                    log_snapshot=log_snapshot,
                     bot_name=self.BOT_NAME,
                     mode="SIM" if self.simulation else "LIVE",
                     state_rows=state_rows,
                     ticker_cache=self.ticker_cache,
                 )
-            else:
-                from trading.runtime_observability import (
-                    runtime_observability_snapshot,
+            )
+            if observability_error is not None:
+                phase = "heartbeat" if log_snapshot else "periodic"
+                silent_log(
+                    f"{self.BOT_NAME} {phase} runtime observability",
+                    observability_error,
                 )
-
-                observability = runtime_observability_snapshot(
-                    state_rows=state_rows,
-                    ticker_cache=self.ticker_cache,
-                )
-            status_writer(
+            if observability_health:
+                status = "degraded"
+            published = status_writer(
                 self.LOG_DIR,
                 self.BOT_NAME,
                 status,
                 self.simulation,
                 threads=threads,
                 extra={
-                    "open_positions": state_exposure_count(self.state),
+                    "open_positions": (
+                        None
+                        if state_rows is None
+                        else state_rows_exposure_count(state_rows)
+                    ),
                     "safe_mode": bool(self.safe_mode.is_active()),
                     **self._entry_admission_runtime_fields(),
                     **observability,
                     **strategy_health,
+                    **(
+                        {"observability_health": observability_health}
+                        if observability_health else {}
+                    ),
                 },
             )
+            if published is False:
+                raise RuntimeError("runtime status publication failed")
         except Exception as exc:
             phase = "heartbeat" if log_snapshot else "periodic"
             silent_log(f"{self.BOT_NAME} {phase} runtime status", exc)
+
+    def _publish_runtime_heartbeat(self, status_writer, log_event) -> None:
+        """Publish core health even when the human-readable heartbeat fails."""
+        def report_error(context: str, exc: Exception) -> None:
+            try:
+                self._log_error(context, exc)
+            except Exception:
+                pass
+
+        try:
+            self._publish_periodic_runtime_status(
+                status_writer, log_snapshot=True
+            )
+        except Exception as exc:
+            report_error("runtime heartbeat status", exc)
+        try:
+            tc = state_exposure_count(self.state)
+            thread_liveness = format_runtime_thread_liveness(
+                self._runtime_threads()
+            )
+            sm_marker = (
+                "  SAFE_MODE" if self.safe_mode.is_active() else ""
+            )
+            log_event(
+                f" {self.BOT_NAME} heartbeat  "
+                f"Open: {tc}/{self.C('MAX_OPEN_TRADES')}  "
+                f"Threads: {thread_liveness}"
+                f"{sm_marker}",
+                "INFO",
+            )
+        except Exception as exc:
+            report_error("runtime heartbeat display", exc)
+
+    def _cleanup_stale_futures_dashboard_state(
+        self,
+        get_futures_state,
+        remove_futures_state,
+        log_event,
+    ) -> None:
+        """Remove only dashboard rows absent from or older than local state."""
+
+        def _entry_id(value):
+            if not isinstance(value, str):
+                return None
+            entry_id = value.strip()
+            if (
+                not entry_id
+                or len(entry_id) > 64
+                or any(ord(char) < 32 or ord(char) == 127 for char in entry_id)
+            ):
+                return None
+            return entry_id
+
+        actual = set(self.state.keys())
+        for entry in get_futures_state(
+                self.BOT_NAME, mode_is_sim=self.simulation):
+            sym = entry.get("symbol")
+            if not sym:
+                continue
+            current = self.state.get(sym) if sym in actual else None
+            current_entry_id = _entry_id(
+                current.get("entry_id") if isinstance(current, dict) else None
+            )
+            dashboard_entry_id = _entry_id(entry.get("entry_id"))
+            generation_stale = (
+                current_entry_id is not None
+                and dashboard_entry_id != current_entry_id
+            )
+            if current is not None and not generation_stale:
+                continue
+            if dashboard_entry_id is not None:
+                removed = remove_futures_state(
+                    sym,
+                    self.BOT_NAME,
+                    mode_is_sim=self.simulation,
+                    expected_opened_at=entry.get("opened_at"),
+                    expected_entry_id=dashboard_entry_id,
+                )
+            else:
+                removed = remove_futures_state(
+                    sym, self.BOT_NAME, mode_is_sim=self.simulation
+                )
+            if removed is True:
+                detail = " generation" if generation_stale else " entry"
+                log_event(
+                    f"Stale futures_state{detail} cleaned: {sym}", "INFO"
+                )
+            else:
+                log_event(
+                    f"Stale futures_state cleanup skipped after concurrent "
+                    f"change: {sym}",
+                    "WARN",
+                )
 
     #  Run 
 
@@ -1677,14 +2359,11 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         # live dashboard rows (and vice versa)  they look "stale" because the
         # other bot's symbols aren't in this bot's state. Only clean our own.
         try:
-            actual = set(self.state.keys())
-            for entry in get_futures_state(
-                    self.BOT_NAME, mode_is_sim=self.simulation):
-                sym = entry.get("symbol")
-                if sym and sym not in actual:
-                    remove_futures_state(
-                        sym, self.BOT_NAME, mode_is_sim=self.simulation)
-                    log_event(f"Stale futures_state entry cleaned: {sym}", "INFO")
+            self._cleanup_stale_futures_dashboard_state(
+                get_futures_state,
+                remove_futures_state,
+                log_event,
+            )
         except Exception as e:
             self._log_error("startup-cleanup", e)
 
@@ -1784,6 +2463,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 ),
                 health_callback=self._record_venue_recorder_health,
             )
+            self._venue_recorder = recorder
             self._venue_health_stale_sec = max(
                 self.VENUE_HEALTH_MIN_STALE_SEC,
                 recorder.micro_interval * 3.0,
@@ -1820,18 +2500,9 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         if self._venue_recorder_thread is not None:
             thread_names += ", venue recorder"
         log_event(f"Core threads running ({thread_names}).", "START")
-        threads = self._runtime_threads()
-        status, strategy_health = self._runtime_status_health(threads)
-        write_runtime_status(
-            self.LOG_DIR, self.BOT_NAME,
-            status,
-            self.simulation,
-            threads=threads,
-            extra={
-                "open_positions": state_exposure_count(self.state),
-                **self._entry_admission_runtime_fields(),
-                **strategy_health,
-            })
+        self._publish_periodic_runtime_status(
+            write_runtime_status, log_snapshot=False
+        )
 
         #  Main thread: heartbeat + shutdown wait 
         try:
@@ -1848,22 +2519,8 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     # still alive.
                     now = time.monotonic()
                     if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_SEC:
-                        tc = state_exposure_count(self.state)
-                        thread_liveness = format_runtime_thread_liveness(
-                            self._runtime_threads()
-                        )
-                        sm_marker = (
-                            "  SAFE_MODE" if self.safe_mode.is_active() else ""
-                        )
-                        log_event(
-                            f" {self.BOT_NAME} heartbeat  "
-                            f"Open: {tc}/{self.C('MAX_OPEN_TRADES')}  "
-                            f"Threads: {thread_liveness}"
-                            f"{sm_marker}",
-                            "INFO"
-                        )
-                        self._publish_periodic_runtime_status(
-                            write_runtime_status, log_snapshot=True
+                        self._publish_runtime_heartbeat(
+                            write_runtime_status, log_event
                         )
                         last_heartbeat = now
                     if now - last_runtime_status >= 5.0:
@@ -1907,6 +2564,27 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         # so a non-daemon executor worker cannot be reported as cleanly closed.
         resource_closers = shared_runtime_resource_closers()
         resource_closers["ticker_cache"] = self._shutdown_ticker_cache_if_flat
+        ws_feed = getattr(self, "_ws_feed", None)
+        if ws_feed is not None:
+            resource_closers["price_feed_resources"] = (
+                lambda feed=ws_feed: feed.stop(timeout=0.0) is True
+            )
+        state_flush = getattr(self.state, "finalize_pending", None)
+        if callable(state_flush):
+            resource_closers["trade_state_persistence"] = state_flush
+        venue_recorder = getattr(self, "_venue_recorder", None)
+        if venue_recorder is not None:
+            resource_closers["venue_recorder_resources"] = (
+                lambda recorder=venue_recorder: recorder.shutdown_resources(
+                    timeout=0.0
+                )
+            )
+        if self.safe_mode is not None:
+            resource_closers["safe_mode_persistence"] = (
+                lambda safe_mode=self.safe_mode: safe_mode.shutdown_alert_state_persistence(
+                    timeout=0.0
+                )
+            )
         finalize_runtime_shutdown(
             self,
             write_runtime_status,
@@ -1953,7 +2631,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             if callable(closer):
                 try:
                     result = closer()
-                    if result is False:
+                    if result is not None and result is not True:
                         raise RuntimeError(
                             "failed startup exchange cleanup remained incomplete"
                         )
@@ -2131,17 +2809,34 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             return True
         if mode != PRESERVE_POSITIONS:
             return False
-        with self._shutdown_lock:
-            if getattr(self, "_emergency_in_progress", False):
-                log_event(
-                    "Preserve-position shutdown refused while emergency close "
-                    "is already in progress",
-                    "WARN",
-                )
-                return False
-            self._shutdown_positions_preserved = True
-            self._shutdown_event.set()
-            self._reconcile_wakeup_event.set()
+        handler_lock = getattr(self, "_shutdown_handler_lock", None)
+        if handler_lock is None:  # compatibility for lightweight test hosts
+            handler_lock = threading.Lock()
+            self._shutdown_handler_lock = handler_lock
+        close_requested = getattr(self, "_shutdown_close_requested", None)
+        if close_requested is None:
+            close_requested = threading.Event()
+            self._shutdown_close_requested = close_requested
+        preserve_refused = False
+        with handler_lock:
+            with self._shutdown_lock:
+                if getattr(self, "_emergency_in_progress", False):
+                    log_event(
+                        "Preserve-position shutdown refused while emergency "
+                        "close is already in progress",
+                        "WARN",
+                    )
+                    preserve_refused = True
+                else:
+                    self._shutdown_positions_preserved = True
+                    self._shutdown_event.set()
+                    self._reconcile_wakeup_event.set()
+        if close_requested.is_set():
+            self._drain_shutdown_close_requests(
+                signum="Deferred shutdown signal"
+            )
+        if preserve_refused:
+            return False
         log_event(
             "Launcher preserve-position shutdown received; positions remain "
             "open while runtime resources close cleanly",
@@ -2161,7 +2856,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             return True
         try:
             shutdown_result = cache.shutdown()
-            if shutdown_result is False:
+            if shutdown_result is not None and shutdown_result is not True:
                 raise RuntimeError("ticker pool still has running work")
             return True
         except Exception as exc:
@@ -2169,6 +2864,195 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             return False
 
     def _shutdown_handler(self, signum=None, frame=None):
+        """Publish one close request and drain it when this caller owns it."""
+        requested = getattr(self, "_shutdown_close_requested", None)
+        if requested is None:  # compatibility for lightweight test hosts
+            requested = threading.Event()
+            self._shutdown_close_requested = requested
+        publish_lock = getattr(self, "_shutdown_request_publish_lock", None)
+        if publish_lock is None:
+            publish_lock = threading.RLock()
+            self._shutdown_request_publish_lock = publish_lock
+        with publish_lock:
+            self._shutdown_close_request_generation = object()
+            requested.set()
+        self._drain_shutdown_close_requests(signum=signum, frame=frame)
+
+    def _drain_shutdown_close_requests(self, signum=None, frame=None):
+        """Drain already-published requests without creating a new one."""
+        requested = getattr(self, "_shutdown_close_requested", None)
+        if requested is None or not requested.is_set():
+            return
+        handler_lock = getattr(self, "_shutdown_handler_lock", None)
+        if handler_lock is None:  # compatibility for lightweight test hosts
+            handler_lock = threading.Lock()
+            self._shutdown_handler_lock = handler_lock
+        if not handler_lock.acquire(blocking=False):
+            self._shutdown_event.set()
+            self._reconcile_wakeup_event.set()
+            return
+        publish_lock = getattr(self, "_shutdown_request_publish_lock", None)
+        if publish_lock is None:
+            publish_lock = threading.RLock()
+            self._shutdown_request_publish_lock = publish_lock
+        deferred_request_generation = None
+        defer_same_attempt = False
+        primary_error = None
+        primary_traceback = None
+        try:
+            while True:
+                with publish_lock:
+                    if not requested.is_set():
+                        break
+                    requested.clear()
+                    attempt_generation = getattr(
+                        self,
+                        "_shutdown_close_request_generation",
+                        None,
+                    )
+                with self._shutdown_lock:
+                    active_before_attempt_generation = getattr(
+                        self,
+                        "_emergency_close_generation",
+                        None,
+                    )
+                    active_before_attempt = bool(
+                        getattr(self, "_emergency_in_progress", False)
+                        or (
+                            active_before_attempt_generation is not None
+                            and not active_before_attempt_generation[
+                                "done"
+                            ].is_set()
+                        )
+                    )
+                try:
+                    handled = self._shutdown_handler_once(
+                        signum=signum,
+                        frame=frame,
+                    )
+                except BaseException as exc:
+                    with publish_lock:
+                        requested.set()
+                    with self._shutdown_lock:
+                        generation = getattr(
+                            self,
+                            "_emergency_close_generation",
+                            None,
+                        )
+                        active_generation = bool(
+                            getattr(self, "_emergency_in_progress", False)
+                            or (
+                                generation is not None
+                                and not generation["done"].is_set()
+                            )
+                        )
+                        same_attempt_generation = bool(
+                            generation is not None
+                            and generation.get("request_generation")
+                            is attempt_generation
+                        )
+                    defer_same_attempt = (
+                        same_attempt_generation
+                        or (
+                            not active_generation
+                            and not active_before_attempt
+                        )
+                    )
+                    deferred_request_generation = attempt_generation
+                    primary_error = exc
+                    primary_traceback = exc.__traceback__
+                    break
+                if not handled:
+                    with publish_lock:
+                        requested.set()
+                    with self._shutdown_lock:
+                        generation = getattr(
+                            self,
+                            "_emergency_close_generation",
+                            None,
+                        )
+                        active_generation = bool(
+                            getattr(self, "_emergency_in_progress", False)
+                            or (
+                                generation is not None
+                                and not generation["done"].is_set()
+                            )
+                        )
+                        same_attempt_generation = bool(
+                            generation is not None
+                            and generation.get("request_generation")
+                            is attempt_generation
+                        )
+                    defer_same_attempt = (
+                        same_attempt_generation
+                        or (
+                            not active_generation
+                            and not active_before_attempt
+                        )
+                    )
+                    deferred_request_generation = attempt_generation
+                    break
+        finally:
+            handler_lock.release()
+        # Close the release/check race: a request arriving before release saw
+        # the busy gate; one arriving afterwards can become the next owner.
+        with publish_lock:
+            pending_request = requested.is_set()
+            current_request_generation = getattr(
+                self,
+                "_shutdown_close_request_generation",
+                None,
+            )
+        if pending_request:
+            with self._shutdown_lock:
+                generation = getattr(
+                    self,
+                    "_emergency_close_generation",
+                    None,
+                )
+                emergency_closed = bool(
+                    getattr(self, "_emergency_closed", False)
+                )
+                active_generation = bool(
+                    getattr(self, "_emergency_in_progress", False)
+                    or (
+                        generation is not None
+                        and not generation["done"].is_set()
+                    )
+                )
+            same_failed_attempt = (
+                defer_same_attempt
+                and current_request_generation is deferred_request_generation
+                and not emergency_closed
+            )
+            if (
+                pending_request
+                and not active_generation
+                and not same_failed_attempt
+            ):
+                if primary_error is None:
+                    self._drain_shutdown_close_requests(
+                        signum=signum,
+                        frame=frame,
+                    )
+                else:
+                    try:
+                        self._drain_shutdown_close_requests(
+                            signum=signum,
+                            frame=frame,
+                        )
+                    except BaseException as secondary:
+                        try:
+                            primary_error.add_note(
+                                "newer shutdown request drain failed: "
+                                f"{type(secondary).__name__}: {secondary}"
+                            )
+                        except BaseException:
+                            pass
+        if primary_error is not None:
+            raise primary_error.with_traceback(primary_traceback)
+
+    def _shutdown_handler_once(self, signum=None, frame=None) -> bool:
         """Signal handler  sets shutdown event and triggers emergency close.
 
         Emergency close runs in a side-thread with a hard deadline so a hanging
@@ -2187,13 +3071,25 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         # second run; _shutdown_event is still set so the rest of the bot winds down.
         with self._shutdown_lock:
             if getattr(self, "_shutdown_positions_preserved", False):
-                return
+                return True
             if getattr(self, "_emergency_closed", False):
-                return
+                return True
             self._shutdown_event.set()
             self._reconcile_wakeup_event.set()
-            if getattr(self, "_emergency_in_progress", False):
-                return
+            generation = getattr(
+                self,
+                "_emergency_close_generation",
+                None,
+            )
+            if (
+                getattr(self, "_emergency_in_progress", False)
+                or (
+                    generation is not None
+                    and not generation["done"].is_set()
+                )
+            ):
+                self._emergency_in_progress = True
+                return False
             self._emergency_in_progress = True
 
         # FAST-PATH: nothing to close
@@ -2211,7 +3107,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             self._emergency_closed = True
             self._emergency_in_progress = False
             self._shutdown_ticker_cache_if_flat()
-            return
+            return True
 
         log_event(
             f" Shutdown signal {signum if signum else 'atexit'} received  "
@@ -2219,7 +3115,24 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "WARN"
         )
 
+        publish_lock = getattr(self, "_shutdown_request_publish_lock", None)
+        if publish_lock is None:
+            publish_lock = threading.RLock()
+            self._shutdown_request_publish_lock = publish_lock
+        with publish_lock:
+            close_request_generation = getattr(
+                self,
+                "_shutdown_close_request_generation",
+                None,
+            )
         result = {"done": False, "error": None, "failed_count": 0}
+        generation = {
+            "done": threading.Event(),
+            "runner": None,
+            "start_raised": False,
+            "result": result,
+            "request_generation": close_request_generation,
+        }
 
         def _close_runner():
             try:
@@ -2230,31 +3143,99 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 result["error"] = e
             finally:
                 with self._shutdown_lock:
-                    if result["done"] and result["failed_count"] == 0:
-                        self._emergency_closed = True
-                    self._emergency_in_progress = False
+                    owns_generation = (
+                        getattr(self, "_emergency_close_generation", None)
+                        is generation
+                    )
+                    if owns_generation:
+                        if result["done"] and result["failed_count"] == 0:
+                            self._emergency_closed = True
+                        self._emergency_in_progress = False
+                    generation["done"].set()
+                with publish_lock:
+                    pending = getattr(
+                        self,
+                        "_shutdown_close_requested",
+                        None,
+                    )
+                    pending_request = bool(
+                        pending is not None and pending.is_set()
+                    )
+                    current_request_generation = getattr(
+                        self,
+                        "_shutdown_close_request_generation",
+                        None,
+                    )
+                close_succeeded = (
+                    result["done"] and result["failed_count"] == 0
+                )
+                if (
+                    owns_generation
+                    and pending_request
+                    and (
+                        close_succeeded
+                        or current_request_generation
+                        is not generation["request_generation"]
+                    )
+                ):
+                    self._drain_shutdown_close_requests(
+                        signum="Deferred repeat shutdown signal"
+                    )
 
         try:
             runner = threading.Thread(target=_close_runner,
                                       daemon=True,
                                       name=f"{self.BOT_NAME}EmergencyClose")
-            runner.start()
-        except Exception as exc:
+        except BaseException as exc:
             with self._shutdown_lock:
                 self._emergency_in_progress = False
-            self._log_error("Emergency close thread start", exc)
-            return
-        runner.join(timeout=self.SHUTDOWN_DEADLINE_SEC)
+            try:
+                self._log_error("Emergency close thread construction", exc)
+            except BaseException:
+                pass
+            if not isinstance(exc, Exception):
+                raise
+            return False
+        generation["runner"] = runner
+        with self._shutdown_lock:
+            self._emergency_close_generation = generation
+        try:
+            runner.start()
+        except BaseException as exc:
+            generation["start_raised"] = True
+            if (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(runner)
+            ):
+                with self._shutdown_lock:
+                    generation["done"].set()
+                    if self._emergency_close_generation is generation:
+                        self._emergency_close_generation = None
+                        self._emergency_in_progress = False
+            try:
+                self._log_error("Emergency close thread start", exc)
+            except BaseException:
+                pass
+            if not isinstance(exc, Exception):
+                raise
+            return False
+        try:
+            runner.join(timeout=self.SHUTDOWN_DEADLINE_SEC)
+        except Exception as exc:
+            self._log_error("Emergency close thread join", exc)
+            return False
         # The worker owns the in-progress latch and clears it in ``finally``.
         # Never write a sampled ``True`` back here: the worker can terminate
         # between is_alive() returning and the assignment, which would relatch
         # an already-finished partial close and block every later retry.
-        runner_alive = runner.is_alive()
-        if result["done"] and result["failed_count"] == 0:
-            # Fully flat  latch so atexit/repeat-signal won't redo the work.
-            self._emergency_closed = True
-            self._emergency_in_progress = False
-        else:
+        try:
+            runner_alive = runner.is_alive()
+        except Exception:
+            runner_alive = True
+        generation_done = generation["done"].is_set()
+        if not runner_alive and not generation_done:
+            return False
+        if not (result["done"] and result["failed_count"] == 0):
             # Leave UN-latched so a repeat SIGTERM / atexit retries the rest.
             if runner_alive:
                 log_event(
@@ -2274,6 +3255,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 )
 
         self._shutdown_ticker_cache_if_flat()
+        return True
 
     def _emergency_close_all(self, reason: str = "Shutdown") -> None:
         from core.logger import log_event, log_sell, send_telegram, save_trade, log_struct

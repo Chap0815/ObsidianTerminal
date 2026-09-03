@@ -10,7 +10,8 @@ import sqlite3
 import stat
 import threading
 import time
-from contextlib import contextmanager
+import uuid
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,11 +24,14 @@ from bot_utils.api_budget import (
     try_consume_api_call,
 )
 from bot_utils.order_utils import order_id_text_or_none
+from bot_utils.runtime_threads import thread_definitely_never_started
 from core.constants import NONCRYPTO_BASES
 
 
 MAX_PARTITION_CLOCK_AGE_MS = 86_400_000
+MAX_EXCHANGE_FUTURE_SKEW_MS = 30_000
 _CAPTURE_CONTROL_JSON_MAX_BYTES = 64 * 1024
+_CAPTURE_CONTROL_TEMP_ATTEMPTS = 3
 _CAPACITY_OPERATIONAL_RESERVE_RATIO = 1.05
 
 
@@ -44,6 +48,86 @@ def _capture_now_utc() -> datetime:
     return now_utc()
 
 
+def _safe_exception_summary(
+    exc: BaseException,
+    *,
+    max_chars: int = 160,
+) -> tuple[str, str]:
+    """Return a bounded, redacted single-line exception identity."""
+    try:
+        error_type = type(exc).__name__[:40] or "BaseException"
+    except BaseException:
+        error_type = "BaseException"
+    try:
+        raw_detail = str(exc)
+    except BaseException:
+        raw_detail = "[UNRENDERABLE]"
+    try:
+        from core.logger import clean_user_text, redact
+
+        detail = clean_user_text(
+            redact(raw_detail),
+            max_chars=max_chars,
+        )
+    except BaseException:
+        # An error status must never fall back to publishing an unredacted
+        # exception if the sanitizer itself is unavailable.
+        detail = "[REDACTION_FAILED]"
+    try:
+        detail = " ".join(detail.split()).strip()[:max_chars]
+    except BaseException:
+        detail = "[UNRENDERABLE]"
+    return error_type, detail
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(str(path), flags)
+    except AttributeError:
+        return
+    except OSError as exc:
+        if os.name == "nt":
+            if isinstance(exc, PermissionError):
+                return
+            if (
+                isinstance(exc, FileNotFoundError)
+                and path == Path(path.anchor)
+                and path.is_dir()
+            ):
+                return
+        raise
+    primary_error: BaseException | None = None
+    try:
+        os.fsync(directory_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            os.close(directory_fd)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "capture directory close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
+def _mkdir_with_parent_fsync(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    parent = path.parent
+    while True:
+        _fsync_directory(parent)
+        if parent == parent.parent:
+            break
+        parent = parent.parent
+
+
 @dataclass(frozen=True)
 class VenueEvent:
     event_id: str
@@ -54,6 +138,10 @@ class VenueEvent:
     payload: dict
     schema_version: int = 1
     quality_flags: tuple[str, ...] = ()
+
+
+class SealedCapturePartitionError(RuntimeError):
+    """Raised when a write targets an intentionally immutable UTC day."""
 
 
 class SQLitePartitionWriter:
@@ -70,7 +158,10 @@ class SQLitePartitionWriter:
         self.retention_days = max(1, int(retention_days))
         self.max_storage_bytes = max(0, int(float(max_storage_gib) * 1024**3))
         self._connections: dict[Path, sqlite3.Connection] = {}
+        self._setup_connections: list[sqlite3.Connection] = []
+        self._setup_connection_candidate: sqlite3.Connection | None = None
         self._lock = threading.Lock()
+        self._write_terminal = False
         # Epoch allocation only protects capture_state.json.  It may wait up
         # to 15 seconds on the cross-process lock after a reconnect, so it
         # must not occupy the data-plane lock used by every REST/L2 write.
@@ -89,11 +180,107 @@ class SQLitePartitionWriter:
         with guard:
             yield
 
+    @contextmanager
+    def seal_partition_guard(self, day) -> object:
+        """Checkpoint a closed UTC day and exclude every later write."""
+        day_text = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        with self.partition_guard(day_text):
+            with self._lock:
+                for path in list(self._connections):
+                    if path.stem == day_text:
+                        self._close_path(path)
+                # Failed connection setup/rollback can leave an unindexed
+                # SQLite handle quarantined for close retry. Its path is no
+                # longer knowable here, so every such handle must close before
+                # any day can be immutably sealed.
+                for connection in list(
+                    getattr(self, "_setup_connections", ())
+                ):
+                    connection.close()
+                    self._discard_setup_connection(connection)
+                candidate = getattr(
+                    self, "_setup_connection_candidate", None
+                )
+                if candidate is not None:
+                    candidate.close()
+                    if self._setup_connection_candidate is candidate:
+                        self._setup_connection_candidate = None
+            yield
+
+    @contextmanager
+    def _partition_guards(self, days) -> object:
+        """Acquire multiple day guards in deterministic deadlock-safe order."""
+        with ExitStack() as stack:
+            for day in sorted(set(days)):
+                stack.enter_context(self.partition_guard(day))
+            yield
+
+    def _storage_artifacts(self):
+        """Yield one-level storage files without traversing linked parents."""
+        try:
+            parents = tuple(self.root.iterdir())
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise RuntimeError(
+                "venue capture storage tree unavailable"
+            ) from exc
+        for parent in parents:
+            try:
+                parent_stat = parent.lstat()
+            except OSError as exc:
+                raise RuntimeError(
+                    "venue capture storage parent unavailable"
+                ) from exc
+            if self._stat_is_linklike(parent_stat):
+                raise RuntimeError(
+                    "venue capture storage parent is linked"
+                )
+            if not stat.S_ISDIR(parent_stat.st_mode):
+                continue
+            self._assert_scoped_path(parent)
+            try:
+                children = tuple(parent.iterdir())
+            except OSError as exc:
+                raise RuntimeError(
+                    "venue capture storage directory unavailable"
+                ) from exc
+            for item in children:
+                # ``iterdir`` produced this direct child of an already scoped,
+                # non-link parent.  Its one authoritative lstat belongs to the
+                # caller so size and link identity come from the same sample.
+                yield item
+
+    def _retention_guard_days(self, *, current: datetime) -> set:
+        """Snapshot old UTC days retention is allowed to mutate this pass."""
+        with self._lock:
+            paths = list(self._connections)
+        paths.extend(
+            item
+            for item in self._storage_artifacts()
+            if ".sqlite3" in item.name
+            or (item.parent.name == "integrity" and item.suffix == ".json")
+        )
+        days = set()
+        for path in paths:
+            name = (
+                path.name.split(".sqlite3", 1)[0]
+                if ".sqlite3" in path.name
+                else path.stem
+            )
+            try:
+                day = datetime.strptime(name, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if day < current.date():
+                days.add(day)
+        return days
+
     def _assert_partition_writable(self, path: Path) -> None:
         seal = self.root / "integrity" / f"{path.stem}.json"
         self._assert_scoped_path(seal)
         if seal.exists():
-            raise RuntimeError(
+            raise SealedCapturePartitionError(
                 f"sealed capture partition is immutable: {path.stem}"
             )
 
@@ -165,31 +352,101 @@ class SQLitePartitionWriter:
             separators=(",", ":"),
             allow_nan=False,
         ).encode("utf-8")
-        temporary = self.root / (
-            f".{self._control_path.name}.{os.getpid()}."
-            f"{threading.get_ident()}.tmp"
-        )
-        self._assert_scoped_path(temporary)
+        temporary: Path | None = None
+        primary_error: BaseException | None = None
+        temporary_owned = False
+        temporary_identity: tuple[int, int] | None = None
+        handle = None
         try:
-            with temporary.open("xb") as handle:
+            for attempt in range(_CAPTURE_CONTROL_TEMP_ATTEMPTS):
+                candidate = self.root / (
+                    f".{self._control_path.name}.{os.getpid()}."
+                    f"{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+                )
+                self._assert_scoped_path(candidate)
+                try:
+                    handle = candidate.open("xb")
+                except FileExistsError:
+                    if attempt + 1 == _CAPTURE_CONTROL_TEMP_ATTEMPTS:
+                        raise
+                    continue
+                temporary = candidate
+                temporary_owned = True
+                break
+            if handle is None or temporary is None:
+                raise RuntimeError("capture control temporary allocation failed")
+            try:
+                temporary_stat = os.fstat(handle.fileno())
+                temporary_identity = (
+                    temporary_stat.st_dev,
+                    temporary_stat.st_ino,
+                )
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                try:
+                    handle.close()
+                except BaseException as close_error:
+                    if primary_error is None:
+                        primary_error = close_error
+                        raise
+                    try:
+                        primary_error.add_note(
+                            "capture control temporary close failed: "
+                            f"{type(close_error).__name__}: {close_error}"
+                        )
+                    except BaseException:
+                        pass
             os.replace(temporary, self._control_path)
+            temporary_owned = False
+            _fsync_directory(self.root)
+        except BaseException as exc:
+            if primary_error is None:
+                primary_error = exc
+            raise
         finally:
-            temporary.unlink(missing_ok=True)
-        try:
-            directory_fd = os.open(self.root, os.O_RDONLY)
-        except (AttributeError, OSError):
-            return
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            cleanup_error: BaseException | None = None
+            same_generation = False
+            if temporary_owned and temporary_identity is not None:
+                assert temporary is not None
+                try:
+                    current = temporary.stat(follow_symlinks=False)
+                    same_generation = (
+                        stat.S_ISREG(current.st_mode)
+                        and not self._stat_is_linklike(current)
+                        and (current.st_dev, current.st_ino)
+                        == temporary_identity
+                    )
+                except FileNotFoundError:
+                    pass
+                except BaseException as identity_error:
+                    cleanup_error = identity_error
+            if same_generation:
+                assert temporary is not None
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+                except BaseException as unlink_error:
+                    cleanup_error = unlink_error
+            if cleanup_error is not None:
+                if primary_error is None:
+                    raise cleanup_error
+                try:
+                    primary_error.add_note(
+                        "capture control temporary cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
 
     def next_connection_epoch(self) -> int:
         """Return a process-independent monotonic transport epoch."""
-        self.root.mkdir(parents=True, exist_ok=True)
+        _mkdir_with_parent_fsync(self.root)
         lock_path = self.root / ".capture_state.lock"
         self._assert_scoped_path(self._control_path)
         self._assert_scoped_path(lock_path)
@@ -317,31 +574,76 @@ class SQLitePartitionWriter:
         # Writes are serialized by ``_lock`` but the recorder's REST and L2
         # workers legitimately share this connection across two threads.
         connection = sqlite3.connect(path, timeout=15.0, check_same_thread=False)
-        connection.execute("PRAGMA journal_mode=WAL")
-        # Capture evidence favours durability over peak insert throughput.  In
-        # WAL mode FULL syncs the WAL before a commit is acknowledged, so an
-        # abrupt host/power loss cannot silently discard an already reported
-        # successful sample.
-        connection.execute("PRAGMA synchronous=FULL")
-        connection.execute("PRAGMA busy_timeout=15000")
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS venue_events (
-                   event_id TEXT PRIMARY KEY,
-                   market_id TEXT NOT NULL,
-                   exchange_time TEXT NOT NULL,
-                   received_time TEXT NOT NULL,
-                   schema_version INTEGER NOT NULL,
-                   quality_flags_json TEXT NOT NULL,
-                   payload_json TEXT NOT NULL
-               ) WITHOUT ROWID"""
-        )
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_venue_events_time "
-            "ON venue_events(exchange_time, market_id)"
-        )
-        connection.commit()
-        self._connections[path] = connection
+        self._setup_connection_candidate = connection
+        try:
+            self._setup_connections.append(connection)
+        except BaseException as primary_exc:
+            try:
+                connection.close()
+            except BaseException as cleanup_exc:
+                try:
+                    primary_exc.add_note(
+                        "SQLite candidate cleanup failed: "
+                        f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                    )
+                except BaseException:
+                    pass
+            else:
+                self._discard_setup_connection(connection)
+            raise
+        self._setup_connection_candidate = None
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            # Capture evidence favours durability over peak insert throughput.
+            # In WAL mode FULL syncs the WAL before a commit is acknowledged,
+            # so abrupt host/power loss cannot silently discard an already
+            # reported successful sample.
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("PRAGMA busy_timeout=15000")
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS venue_events (
+                       event_id TEXT PRIMARY KEY,
+                       market_id TEXT NOT NULL,
+                       exchange_time TEXT NOT NULL,
+                       received_time TEXT NOT NULL,
+                       schema_version INTEGER NOT NULL,
+                       quality_flags_json TEXT NOT NULL,
+                       payload_json TEXT NOT NULL
+                   ) WITHOUT ROWID"""
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_venue_events_time "
+                "ON venue_events(exchange_time, market_id)"
+            )
+            connection.commit()
+            self._connections[path] = connection
+        except BaseException as primary_exc:
+            if self._connections.get(path) is connection:
+                self._connections.pop(path, None)
+            try:
+                connection.close()
+            except BaseException as cleanup_exc:
+                try:
+                    primary_exc.add_note(
+                        "SQLite candidate cleanup failed: "
+                        f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                    )
+                except BaseException:
+                    pass
+            else:
+                self._discard_setup_connection(connection)
+            raise
+        self._discard_setup_connection(connection)
         return connection
+
+    def _discard_setup_connection(self, connection) -> None:
+        pending = getattr(self, "_setup_connections", None)
+        if pending is not None:
+            for index in range(len(pending) - 1, -1, -1):
+                if pending[index] is connection:
+                    pending.pop(index)
+        if getattr(self, "_setup_connection_candidate", None) is connection:
+            self._setup_connection_candidate = None
 
     @classmethod
     def _persisted_values_match(cls, existing: tuple, values: tuple) -> bool:
@@ -383,6 +685,8 @@ class SQLitePartitionWriter:
         )
         with self.partition_guard(path.stem):
             with self._lock:
+                if self._write_terminal:
+                    raise RuntimeError("partition writer is closed")
                 self._assert_partition_writable(path)
                 connection = self._connection(path)
                 try:
@@ -409,21 +713,54 @@ class SQLitePartitionWriter:
                             )
                     self._assert_partition_writable(path)
                     connection.commit()
-                except Exception:
+                except Exception as primary_exc:
                     try:
                         connection.rollback()
-                    except Exception:
+                    except BaseException as rollback_exc:
                         # A failed rollback proves that this handle is not a
                         # safe transaction boundary anymore. Never mask the
                         # original write error and never reuse the handle on
                         # the next capture event.
                         try:
-                            connection.close()
-                        except Exception:
+                            primary_exc.add_note(
+                                "SQLite rollback failed: "
+                                f"{type(rollback_exc).__name__}: {rollback_exc}"
+                            )
+                        except BaseException:
                             pass
-                        finally:
-                            if self._connections.get(path) is connection:
-                                self._connections.pop(path, None)
+                        self._setup_connection_candidate = connection
+                        try:
+                            if not any(
+                                candidate is connection
+                                for candidate in self._setup_connections
+                            ):
+                                self._setup_connections.append(connection)
+                        except BaseException as quarantine_exc:
+                            try:
+                                primary_exc.add_note(
+                                    "SQLite quarantine publication failed: "
+                                    f"{type(quarantine_exc).__name__}: "
+                                    f"{quarantine_exc}"
+                                )
+                            except BaseException:
+                                pass
+                        else:
+                            self._setup_connection_candidate = None
+                        if self._connections.get(path) is connection:
+                            self._connections.pop(path, None)
+                        try:
+                            connection.close()
+                        except BaseException as cleanup_exc:
+                            try:
+                                primary_exc.add_note(
+                                    "SQLite write cleanup failed: "
+                                    f"{type(cleanup_exc).__name__}: "
+                                    f"{cleanup_exc}"
+                                )
+                            except BaseException:
+                                pass
+                        else:
+                            self._discard_setup_connection(connection)
                     raise
         return path
 
@@ -463,6 +800,91 @@ class SQLitePartitionWriter:
         if first_error is not None:
             raise first_error
 
+    def _retention_staging_dirs(self) -> dict[object, Path]:
+        """Discover canonical crash-recovery staging directories."""
+        prefix = ".retention_trash-"
+        try:
+            entries = tuple(self.root.iterdir())
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            raise RuntimeError(
+                "capture retention staging discovery failed"
+            ) from exc
+        staging_by_day = {}
+        for path in entries:
+            if not path.name.startswith(prefix):
+                continue
+            self._assert_scoped_path(path)
+            try:
+                value = path.lstat()
+            except OSError as exc:
+                raise RuntimeError(
+                    "capture retention staging cannot be inspected"
+                ) from exc
+            if self._stat_is_linklike(value) or not stat.S_ISDIR(value.st_mode):
+                raise RuntimeError(
+                    "capture retention staging is not a plain directory"
+                )
+            day_text = path.name[len(prefix):]
+            try:
+                day = datetime.strptime(day_text, "%Y-%m-%d").date()
+            except ValueError as exc:
+                raise RuntimeError(
+                    "capture retention staging day is invalid"
+                ) from exc
+            if day in staging_by_day:
+                raise RuntimeError(
+                    "duplicate capture retention staging day"
+                )
+            staging_by_day[day] = path
+        return staging_by_day
+
+    def _cleanup_retention_staging(self, day, staging: Path) -> None:
+        """Finish deletion of one previously staged expired UTC day."""
+        self._assert_scoped_path(staging)
+        allowed = {f"integrity__{day.isoformat()}.json"}
+        for stream in ("overview", "depth", "trades", "l2_stream"):
+            base = f"{stream}__{day.isoformat()}.sqlite3"
+            allowed.update((base, f"{base}-wal", f"{base}-shm"))
+        try:
+            items = tuple(sorted(staging.iterdir()))
+        except OSError as exc:
+            raise RuntimeError(
+                "capture retention staging cannot be enumerated"
+            ) from exc
+        # Validate the complete generation before deleting any part of it.
+        for item in items:
+            self._assert_scoped_path(item)
+            try:
+                item_stat = item.lstat()
+            except OSError as exc:
+                raise RuntimeError(
+                    "capture retention staged artifact unavailable"
+                ) from exc
+            if (
+                item.name not in allowed
+                or self._stat_is_linklike(item_stat)
+                or not stat.S_ISREG(item_stat.st_mode)
+            ):
+                raise RuntimeError(
+                    "capture retention staging contains an unexpected artifact"
+                )
+        first_error = None
+        for item in items:
+            try:
+                item.unlink()
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        try:
+            staging.rmdir()
+        except OSError as exc:
+            if first_error is None:
+                first_error = exc
+        if first_error is not None:
+            raise first_error
+
     def _stage_delete_day(self, day, paths: list[Path]) -> None:
         """Remove one expired UTC dataset without leaving active fragments."""
         staging = self.root / f".retention_trash-{day.isoformat()}"
@@ -470,16 +892,7 @@ class SQLitePartitionWriter:
         for path in paths:
             self._assert_scoped_path(path)
         if staging.exists():
-            first_error = None
-            for item in sorted(staging.iterdir()):
-                try:
-                    item.unlink()
-                except OSError as exc:
-                    if first_error is None:
-                        first_error = exc
-            if first_error is not None:
-                raise first_error
-            staging.rmdir()
+            self._cleanup_retention_staging(day, staging)
         staging.mkdir(parents=False, exist_ok=False)
         moved: list[tuple[Path, Path]] = []
         try:
@@ -536,9 +949,34 @@ class SQLitePartitionWriter:
         current = (now or _capture_now_utc()).astimezone(timezone.utc)
         cutoff = (current - timedelta(days=self.retention_days)).date()
         self._assert_scoped_path(self._control_path)
-        with self._lock:
-            first_cleanup_error: OSError | sqlite3.Error | None = None
+        staging_by_day = self._retention_staging_dirs()
+        guard_days = (
+            self._retention_guard_days(current=current)
+            | set(staging_by_day)
+        )
+        with self._partition_guards(guard_days), self._lock:
+            first_cleanup_error: OSError | sqlite3.Error | RuntimeError | None = None
             failed_cleanup_paths: set[Path] = set()
+            failed_staging_days = set()
+
+            # A crash or locked-file failure can leave a fully moved day only
+            # in private staging.  Resume that generation even when no active
+            # partition remains from which the normal scan could rediscover it.
+            for day, staging in sorted(staging_by_day.items()):
+                if day >= cutoff:
+                    failed_staging_days.add(day)
+                    if first_cleanup_error is None:
+                        first_cleanup_error = RuntimeError(
+                            "capture retention staging is inside the required "
+                            "retention window"
+                        )
+                    continue
+                try:
+                    self._cleanup_retention_staging(day, staging)
+                except (OSError, RuntimeError) as exc:
+                    failed_staging_days.add(day)
+                    if first_cleanup_error is None:
+                        first_cleanup_error = exc
 
             # A daily partition is immutable after its UTC day in the normal
             # recorder flow. Close past-day handles even while the partition
@@ -551,6 +989,7 @@ class SQLitePartitionWriter:
                 if (
                     partition_date is None
                     or partition_date.date() >= current.date()
+                    or partition_date.date() not in guard_days
                 ):
                     continue
                 try:
@@ -574,6 +1013,13 @@ class SQLitePartitionWriter:
                 base_path = Path(str(sidecar)[:-4])
                 if base_path.exists():
                     continue
+                sidecar_date = self._partition_date(base_path)
+                if (
+                    sidecar_date is not None
+                    and sidecar_date.date() < current.date()
+                    and sidecar_date.date() not in guard_days
+                ):
+                    continue
                 try:
                     sidecar.unlink()
                 except FileNotFoundError:
@@ -587,14 +1033,21 @@ class SQLitePartitionWriter:
             expired_by_day: dict[object, list[Path]] = {}
             for path in (*partitions, *sealed_reports):
                 partition_date = self._partition_date(path)
-                if partition_date is not None and partition_date.date() < cutoff:
+                if (
+                    partition_date is not None
+                    and partition_date.date() < cutoff
+                    and partition_date.date() in guard_days
+                ):
                     expired_by_day.setdefault(partition_date.date(), []).append(path)
             # Retention is a dataset operation, not a file operation.  Remove
             # every available stream of an expired UTC day together; never
             # trim one stream from a still-required day merely to meet quota.
             for day in sorted(expired_by_day):
                 paths = sorted(expired_by_day[day])
-                if any(path in failed_cleanup_paths for path in paths):
+                if (
+                    day in failed_staging_days
+                    or any(path in failed_cleanup_paths for path in paths)
+                ):
                     continue
                 try:
                     self._stage_delete_day(day, paths)
@@ -608,7 +1061,7 @@ class SQLitePartitionWriter:
                 return
             def _storage_bytes() -> int:
                 total = 0
-                for item in self.root.glob("*/*"):
+                for item in self._storage_artifacts():
                     try:
                         item_stat = item.lstat()
                     except OSError as exc:
@@ -632,11 +1085,23 @@ class SQLitePartitionWriter:
                 raise first_cleanup_error
 
     def storage_health(self, *, now: datetime | None = None) -> dict:
+        # Serialize the advisory snapshot with commits and retention so a
+        # borderline capacity result cannot combine pre- and post-write file
+        # sizes into a false-green projection.
+        with self._lock:
+            return self._storage_health_locked(now=now)
+
+    def _storage_health_locked(self, *, now: datetime | None = None) -> dict:
         current = (now or _capture_now_utc()).astimezone(timezone.utc)
         daily_bytes: dict[str, int] = {}
         total = 0
         measurement_errors = 0
-        for item in self.root.glob("*/*"):
+        try:
+            artifacts = tuple(self._storage_artifacts())
+        except RuntimeError:
+            artifacts = ()
+            measurement_errors += 1
+        for item in artifacts:
             try:
                 item_stat = item.lstat()
             except OSError:
@@ -738,6 +1203,10 @@ class SQLitePartitionWriter:
 
     def close(self) -> bool:
         with self._lock:
+            # Close is a terminal write-admission boundary even when an OS
+            # handle needs a later close retry. Otherwise a delayed producer
+            # can reopen a partition between teardown attempts.
+            self._write_terminal = True
             for attempt in range(2):
                 failed = False
                 for path in list(self._connections):
@@ -745,6 +1214,29 @@ class SQLitePartitionWriter:
                         self._close_path(path)
                     except Exception:
                         failed = True
+                for connection in list(
+                    getattr(self, "_setup_connections", ())
+                ):
+                    try:
+                        connection.close()
+                    except BaseException:
+                        failed = True
+                    else:
+                        self._discard_setup_connection(connection)
+                candidate = getattr(
+                    self, "_setup_connection_candidate", None
+                )
+                if candidate is not None and not any(
+                    pending is candidate
+                    for pending in getattr(self, "_setup_connections", ())
+                ):
+                    try:
+                        candidate.close()
+                    except BaseException:
+                        failed = True
+                    else:
+                        if self._setup_connection_candidate is candidate:
+                            self._setup_connection_candidate = None
                 if not failed:
                     return True
                 if attempt == 0:
@@ -757,6 +1249,8 @@ class VenueRecorder:
 
     CAPTURE_FAILURE_THRESHOLD = 3
     _INTEGRITY_STOP_TIMEOUT_SEC = 15.0
+    _INTEGRITY_RETRY_SECONDS = 300.0
+    _INTEGRITY_FRESHNESS_SECONDS = 7_200.0
     GAP_WARNING_INTERVAL_SEC = 60.0
     GAP_WARNING_KEYS_MAX = 64
 
@@ -781,10 +1275,14 @@ class VenueRecorder:
         health_callback=None,
     ) -> None:
         self.exchange = exchange
-        self.writer = writer or SQLitePartitionWriter(
-            root,
-            retention_days=retention_days,
-            max_storage_gib=max_storage_gib,
+        self.writer = (
+            writer
+            if writer is not None
+            else SQLitePartitionWriter(
+                root,
+                retention_days=retention_days,
+                max_storage_gib=max_storage_gib,
+            )
         )
         self.max_symbols = max(1, int(max_symbols))
         self.depth_levels = max(5, min(100, int(depth_levels)))
@@ -802,8 +1300,29 @@ class VenueRecorder:
         self._rest_health: dict[tuple[str, str], dict] = {}
         self._integrity_lock = threading.Lock()
         self._integrity_thread: threading.Thread | None = None
+        self._integrity_worker_state: dict | None = None
+        self._integrity_shutdown_event = threading.Event()
+        self._integrity_retry_at = 0.0
+        self._integrity_last_success_monotonic: float | None = None
+        self._resource_shutdown_lock = threading.Lock()
+        self._run_state_lock = threading.Lock()
+        self._run_state: dict | None = None
+        self._run_admission_closed = False
+        self._l2_stopped = False
+        self._integrity_stopped = False
+        self._writer_closed = False
+        self._writer_close_state: dict | None = None
+        try:
+            writer_root = getattr(self.writer, "root", None)
+        except Exception:
+            # Optional/extension writers may expose a temporarily unavailable
+            # root.  Construction must stay available, while integrity remains
+            # fail-closed until a real scan can complete.
+            writer_root = object()
+        self._integrity_verified_once = writer_root is None
         self._integrity_health = {
-            "ok": True,
+            "ok": self._integrity_verified_once,
+            "verified_once": self._integrity_verified_once,
             "sealed_days": 0,
             "valid_days": 0,
             "usable_days": 0,
@@ -842,6 +1361,7 @@ class VenueRecorder:
                 stale_after_ms=l2_stale_after_ms,
                 log_event=log_event,
             )
+        self._l2_stopped = self._l2_collector is None
 
     @staticmethod
     def _iso_now() -> str:
@@ -867,7 +1387,7 @@ class VenueRecorder:
         base = str(market.get("base") or str(symbol).split("/", 1)[0])
         return base.strip().upper() in NONCRYPTO_BASES
 
-    def _priority_symbols(self) -> list[str]:
+    def _priority_symbols(self, *, commit: bool = True) -> list[str]:
         try:
             if self._priority_loader is None:
                 from core.database import list_venue_capture_priorities
@@ -909,15 +1429,28 @@ class VenueRecorder:
             resolved.append(symbol)
             if len(resolved) >= self.max_symbols:
                 break
-        self._last_priority_symbols = list(resolved)
+        if commit:
+            self._last_priority_symbols = list(resolved)
         return resolved
 
-    def _log_gap(self, context: str, exc: Exception) -> None:
+    @staticmethod
+    def _exception_summary(
+        exc: BaseException,
+        *,
+        max_chars: int = 160,
+    ) -> tuple[str, str]:
+        return _safe_exception_summary(exc, max_chars=max_chars)
+
+    def _log_gap(self, context: str, exc: BaseException) -> None:
+        try:
+            context_key = str(context or "capture gap")[:120]
+        except Exception:
+            context_key = "capture gap"
         if not self.log_event:
+            self._silent_gap_fallback(context_key, exc)
             return
         try:
             current = time.monotonic()
-            context_key = str(context or "capture gap")[:120]
             error_key = type(exc).__name__[:40]
             key = f"{context_key}|{error_key}"
             seen = getattr(self, "_gap_warning_seen_at", None)
@@ -942,20 +1475,23 @@ class VenueRecorder:
             # Throttling is display hygiene only. If its own bookkeeping is
             # unavailable, retain the original immediate warning behavior.
             pass
-        detail = ""
-        try:
-            from core.logger import clean_user_text, redact
-
-            detail = clean_user_text(redact(str(exc)), max_chars=240)
-            detail = " ".join(detail.splitlines()).strip()
-        except Exception:
-            detail = ""
+        error_type, detail = self._exception_summary(exc, max_chars=240)
         try:
             self.log_event(
-                f"Venue recorder {context}: {type(exc).__name__}"
+                f"Venue recorder {context_key}: {error_type}"
                 + (f": {detail}" if detail else ""),
                 "WARN",
             )
+        except Exception:
+            self._silent_gap_fallback(context_key, exc)
+
+    @staticmethod
+    def _silent_gap_fallback(context: str, exc: BaseException) -> None:
+        """Persist the root failure when the visible logger is unavailable."""
+        try:
+            from bot_utils.silent_log import silent_log
+
+            silent_log(f"Venue recorder {context}", exc)
         except Exception:
             pass
 
@@ -998,6 +1534,7 @@ class VenueRecorder:
         market_id: str | None = None,
         health_symbol: str | None = None,
         health_stream: str | None = None,
+        event_universe: list[str] | None = None,
     ) -> Path:
         market_id = market_id or self._market_id(self.exchange, symbol)
         if ended_ms < started_ms and "wallclock_non_monotonic" not in flags:
@@ -1005,6 +1542,10 @@ class VenueRecorder:
         raw_event_clock = exchange_ms if exchange_ms is not None else ended_ms
         invalid_exchange_clock = False
         stale_exchange_clock = False
+        future_exchange_clock = False
+        received_time = datetime.fromtimestamp(
+            int(ended_ms) / 1000, tz=timezone.utc
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         try:
             event_clock_value = self._finite_number_or_none(raw_event_clock)
             if (
@@ -1018,6 +1559,13 @@ class VenueRecorder:
             if (
                 exchange_ms is not None
                 and event_clock_value
+                > int(ended_ms) + MAX_EXCHANGE_FUTURE_SKEW_MS
+            ):
+                future_exchange_clock = True
+                raise ValueError("event clock is in the future")
+            if (
+                exchange_ms is not None
+                and event_clock_value
                 < int(ended_ms) - MAX_PARTITION_CLOCK_AGE_MS
             ):
                 stale_exchange_clock = True
@@ -1028,15 +1576,22 @@ class VenueRecorder:
             ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         except (TypeError, ValueError, OverflowError, OSError):
             event_clock = int(ended_ms)
-            exchange_time = datetime.fromtimestamp(
-                event_clock / 1000, tz=timezone.utc
-            ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-            invalid_exchange_clock = exchange_ms is not None
+            exchange_time = received_time
+            invalid_exchange_clock = bool(
+                exchange_ms is not None
+                and not stale_exchange_clock
+                and not future_exchange_clock
+            )
         if (
             stale_exchange_clock
             and "stale_exchange_timestamp" not in flags
         ):
             flags = (*flags, "stale_exchange_timestamp")
+        elif (
+            future_exchange_clock
+            and "future_exchange_timestamp" not in flags
+        ):
+            flags = (*flags, "future_exchange_timestamp")
         elif invalid_exchange_clock and "invalid_exchange_timestamp" not in flags:
             flags = (*flags, "invalid_exchange_timestamp")
         digest_input = json.dumps(payload, sort_keys=True, default=str)
@@ -1050,17 +1605,23 @@ class VenueRecorder:
                 kind=kind,
                 market_id=market_id,
                 exchange_time=exchange_time,
-                received_time=self._iso_now(),
+                received_time=received_time,
                 payload={
                     **payload,
                     "request_started_ms": started_ms,
                     "request_ended_ms": ended_ms,
                     "latency_ms": max(0, ended_ms - started_ms),
-                    "universe": list(self._universe),
+                    "universe": list(
+                        self._universe
+                        if event_universe is None
+                        else event_universe
+                    ),
                 },
                 quality_flags=flags,
             )
         )
+        if path is False:
+            raise RuntimeError(f"{kind} capture writer rejected event")
         if health_stream is not None:
             self._record_rest_observation(
                 health_symbol or market_id,
@@ -1142,8 +1703,8 @@ class VenueRecorder:
                 is not False
             )
         ]
-        priority_universe = self._priority_symbols()
-        self._universe = list(
+        priority_universe = self._priority_symbols(commit=False)
+        next_universe = list(
             dict.fromkeys((*priority_universe, *volume_universe))
         )[: self.max_symbols]
         markets_payload = {}
@@ -1182,7 +1743,7 @@ class VenueRecorder:
                 ),
                 "funding_rate": _number(info.get("fundingRate")),
                 "next_settle_time": _number(info.get("nextSettleTime")),
-                "universe_member": symbol in self._universe,
+                "universe_member": symbol in next_universe,
                 "capture_priority": symbol in priority_universe,
             }
         overview_flags = []
@@ -1206,7 +1767,10 @@ class VenueRecorder:
             market_id="ALL_USDT_SWAPS",
             health_symbol="ALL_USDT_SWAPS",
             health_stream="overview",
+            event_universe=next_universe,
         )
+        self._last_priority_symbols = list(priority_universe)
+        self._universe = next_universe
         return len(candidates)
 
     @classmethod
@@ -1485,9 +2049,38 @@ class VenueRecorder:
             "markets": markets,
         }
 
+    def _record_integrity_failure(self, exc: BaseException) -> None:
+        error_type, detail = self._exception_summary(exc)
+        incident_key = (
+            "exception",
+            error_type,
+            detail,
+        )
+        with self._integrity_lock:
+            if incident_key != self._integrity_incident_key:
+                self._integrity_errors_total += 1
+                self._integrity_incident_key = incident_key
+            self._last_integrity_error = f"{error_type}: {detail}"
+            self._integrity_health = {
+                **self._integrity_health,
+                "ok": False,
+            }
+            self._integrity_retry_at = (
+                time.monotonic() + self._INTEGRITY_RETRY_SECONDS
+            )
+        self._log_gap("capture integrity gap", exc)
+
     def _run_integrity_check(self, writer_root: Path) -> None:
         try:
             from trading.capture_integrity import seal_closed_capture_days
+
+            partition_guard = getattr(
+                self.writer, "seal_partition_guard", None
+            )
+            if not callable(partition_guard):
+                partition_guard = getattr(
+                    self.writer, "partition_guard", None
+                )
 
             health = seal_closed_capture_days(
                 writer_root,
@@ -1498,32 +2091,20 @@ class VenueRecorder:
                     if self._l2_collector is not None
                     else 1.0
                 ),
-                partition_guard=getattr(
-                    self.writer, "partition_guard", None
-                ),
+                partition_guard=partition_guard,
                 verification_cache=self._integrity_verification_cache,
             )
         except Exception as exc:
-            incident_key = (
-                "exception",
-                type(exc).__name__,
-                str(exc)[:160],
-            )
-            with self._integrity_lock:
-                if incident_key != self._integrity_incident_key:
-                    self._integrity_errors_total += 1
-                    self._integrity_incident_key = incident_key
-                self._last_integrity_error = (
-                    f"{type(exc).__name__}: {str(exc)[:160]}"
-                )
-                self._integrity_health = {
-                    **self._integrity_health,
-                    "ok": False,
-                }
-            self._log_gap("capture integrity gap", exc)
+            self._record_integrity_failure(exc)
             return
         with self._integrity_lock:
-            self._integrity_health = dict(health)
+            self._integrity_verified_once = True
+            self._integrity_retry_at = 0.0
+            self._integrity_last_success_monotonic = time.monotonic()
+            self._integrity_health = {
+                **dict(health),
+                "verified_once": True,
+            }
             if health.get("ok") is True:
                 self._last_integrity_error = ""
                 self._integrity_incident_key = None
@@ -1546,43 +2127,410 @@ class VenueRecorder:
 
     def _schedule_integrity_check(self, writer_root) -> None:
         with self._integrity_lock:
+            shutdown_event = getattr(
+                self,
+                "_integrity_shutdown_event",
+                None,
+            )
+            if shutdown_event is None:
+                shutdown_event = threading.Event()
+                self._integrity_shutdown_event = shutdown_event
+            if shutdown_event.is_set():
+                return
+            state = getattr(self, "_integrity_worker_state", None)
+            if state is not None and not state["done"].is_set():
+                return
             if self._integrity_thread and self._integrity_thread.is_alive():
                 return
+            state = {
+                "done": threading.Event(),
+                "thread": None,
+                "started_monotonic": time.monotonic(),
+            }
+
+            def run_owned() -> None:
+                try:
+                    self._run_integrity_check(Path(writer_root))
+                except BaseException as exc:
+                    # Fatal target exits must not disappear behind the daemon
+                    # thread boundary with the previous health still green.
+                    self._record_integrity_failure(exc)
+                finally:
+                    state["done"].set()
+
             thread = threading.Thread(
-                target=self._run_integrity_check,
-                args=(Path(writer_root),),
+                target=run_owned,
                 daemon=True,
                 name="VenueCaptureIntegrity",
             )
+            state["thread"] = thread
+            self._integrity_worker_state = state
             self._integrity_thread = thread
-        thread.start()
+            try:
+                thread.start()
+            except BaseException as exc:
+                if (
+                    isinstance(exc, Exception)
+                    and thread_definitely_never_started(thread)
+                ):
+                    # Exact stdlib pre-launch failure: no worker can ever own
+                    # this generation, so a later integrity pass may retry.
+                    state["done"].set()
+                # Launch acceptance is uncertain after start() was invoked.
+                # Keep the exact state authoritative until the target confirms
+                # completion; shutdown must not close the shared writer early.
+                raise
+
+    def _schedule_integrity_retry_if_due(
+        self,
+        writer_root,
+        *,
+        now: float,
+    ) -> bool:
+        with self._integrity_lock:
+            retry_at = getattr(self, "_integrity_retry_at", 0.0)
+            if retry_at <= 0.0 or now < retry_at:
+                return False
+        try:
+            self._schedule_integrity_check(writer_root)
+        except BaseException:
+            with self._integrity_lock:
+                if self._integrity_retry_at <= now:
+                    self._integrity_retry_at = (
+                        now + self._INTEGRITY_RETRY_SECONDS
+                    )
+            raise
+        with self._integrity_lock:
+            # A quickly failing replacement may already have installed a newer
+            # future deadline. Only consume the due generation we observed.
+            if self._integrity_retry_at <= now:
+                self._integrity_retry_at = 0.0
+        return True
 
     def _integrity_status(self) -> tuple[dict, int, str]:
         with self._integrity_lock:
             health = dict(self._integrity_health)
+            verified_once = getattr(self, "_integrity_verified_once", True)
+            health["verified_once"] = verified_once
+            if not verified_once:
+                health["ok"] = False
+                health["initial_pending"] = True
             thread = self._integrity_thread
-            if thread is not None and thread.is_alive():
+            state = getattr(self, "_integrity_worker_state", None)
+            worker_running = (
+                (state is not None and not state["done"].is_set())
+                or (thread is not None and thread.is_alive())
+            )
+            now = time.monotonic()
+            worker_age = None
+            if state is not None:
+                started = state.get("started_monotonic")
+                if (
+                    isinstance(started, (int, float))
+                    and not isinstance(started, bool)
+                    and math.isfinite(float(started))
+                ):
+                    worker_age = max(0.0, now - float(started))
+                    health["worker_age_seconds"] = round(worker_age, 3)
+            last_success = getattr(
+                self,
+                "_integrity_last_success_monotonic",
+                None,
+            )
+            verified_age = None
+            if (
+                isinstance(last_success, (int, float))
+                and not isinstance(last_success, bool)
+                and math.isfinite(float(last_success))
+            ):
+                verified_age = max(0.0, now - float(last_success))
+                health["last_verified_age_seconds"] = round(
+                    verified_age,
+                    3,
+                )
+            last_error = self._last_integrity_error
+            if worker_running:
                 health["worker_running"] = True
+                if (
+                    worker_age is not None
+                    and worker_age > self._INTEGRITY_FRESHNESS_SECONDS
+                ):
+                    health["ok"] = False
+                    health["worker_stalled"] = True
+                    last_error = (
+                        "integrity worker stalled for "
+                        f"{worker_age:.3f} seconds"
+                    )
+            elif (
+                health.get("ok") is True
+                and verified_age is not None
+                and verified_age > self._INTEGRITY_FRESHNESS_SECONDS
+            ):
+                health["ok"] = False
+                health["stale"] = True
+                last_error = (
+                    "integrity verification stale for "
+                    f"{verified_age:.3f} seconds"
+                )
             return (
                 health,
                 self._integrity_errors_total,
-                self._last_integrity_error,
+                last_error,
             )
 
     def _wait_for_integrity_worker(self, *, timeout: float) -> bool:
         """Return only after the seal worker is quiescent or timeout expires."""
-        with self._integrity_lock:
-            thread = self._integrity_thread
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        lock_timeout = min(
+            max(0.0, deadline - time.monotonic()),
+            threading.TIMEOUT_MAX,
+        )
+        if not self._integrity_lock.acquire(timeout=lock_timeout):
+            return False
+        try:
+            state = getattr(self, "_integrity_worker_state", None)
+            thread = (
+                state.get("thread")
+                if state is not None
+                else self._integrity_thread
+            )
+        finally:
+            self._integrity_lock.release()
         if thread is None:
             return True
         try:
             if thread.is_alive():
-                thread.join(timeout=max(0.0, float(timeout)))
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if state is not None and not state["done"].is_set():
+                return False
             return not thread.is_alive()
         except Exception:
             return False
 
+    def _wait_for_writer_close(self, *, deadline: float) -> bool:
+        """Own exactly one close attempt and observe it within the deadline."""
+        state = getattr(self, "_writer_close_state", None)
+        if state is None:
+            close = getattr(self.writer, "close", None)
+            if not callable(close):
+                self._writer_closed = True
+                return True
+            state = {
+                "done": threading.Event(),
+                "thread": None,
+                "outcome": False,
+                "error": None,
+            }
+
+            def close_writer() -> None:
+                try:
+                    closed = close()
+                    if closed is True:
+                        state["outcome"] = True
+                    elif closed is False:
+                        state["error"] = RuntimeError(
+                            "partition writer connections remain open"
+                        )
+                    else:
+                        state["error"] = RuntimeError(
+                            "partition writer close was not confirmed"
+                        )
+                except BaseException as exc:
+                    state["error"] = (
+                        exc
+                        if isinstance(exc, Exception)
+                        else RuntimeError(
+                            f"partition writer close aborted: "
+                            f"{type(exc).__name__}"
+                        )
+                    )
+                finally:
+                    state["done"].set()
+
+            try:
+                thread = threading.Thread(
+                    target=close_writer,
+                    name="venue-writer-close",
+                    daemon=True,
+                )
+            except BaseException as exc:
+                error = (
+                    exc
+                    if isinstance(exc, Exception)
+                    else RuntimeError(
+                        f"writer close worker construction aborted: "
+                        f"{type(exc).__name__}"
+                    )
+                )
+                self._log_gap("writer close gap", error)
+                return False
+            state["thread"] = thread
+            self._writer_close_state = state
+            try:
+                thread.start()
+            except BaseException as exc:
+                # Once start() was invoked, launch acceptance is uncertain.
+                # Keep this exact state authoritative until its target proves
+                # completion; a successor could otherwise close concurrently.
+                state["launch_error"] = (
+                    exc
+                    if isinstance(exc, Exception)
+                    else RuntimeError(
+                        f"writer close worker launch aborted: "
+                        f"{type(exc).__name__}"
+                    )
+                )
+                if (
+                    isinstance(exc, Exception)
+                    and thread_definitely_never_started(thread)
+                ):
+                    # No close callback owns the writer. Mark this generation
+                    # terminally failed so the next shutdown call can retry.
+                    state["error"] = state["launch_error"]
+                    state["done"].set()
+
+        if not state["done"].is_set():
+            state["done"].wait(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+        if not state["done"].is_set():
+            return False
+        if state.get("outcome") is True:
+            self._writer_closed = True
+            return True
+        error = state.get("error") or state.get("launch_error")
+        if error is None:
+            error = RuntimeError("partition writer close outcome is unknown")
+        self._log_gap("writer close gap", error)
+        if getattr(self, "_writer_close_state", None) is state:
+            self._writer_close_state = None
+        return False
+
+    def shutdown_resources(self, *, timeout: float = 0.0) -> bool:
+        """Retry child-producer and writer teardown after the run loop exits."""
+        if isinstance(timeout, bool):
+            return False
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(timeout):
+            return False
+        timeout = min(max(0.0, timeout), threading.TIMEOUT_MAX)
+        deadline = time.monotonic() + timeout
+        shutdown_lock = getattr(self, "_resource_shutdown_lock", None)
+        if shutdown_lock is None:
+            shutdown_lock = threading.Lock()
+            self._resource_shutdown_lock = shutdown_lock
+        lock_timeout = min(
+            max(0.0, deadline - time.monotonic()),
+            threading.TIMEOUT_MAX,
+        )
+        if not shutdown_lock.acquire(timeout=lock_timeout):
+            return False
+        try:
+            integrity_shutdown = getattr(
+                self,
+                "_integrity_shutdown_event",
+                None,
+            )
+            if integrity_shutdown is None:
+                integrity_shutdown = threading.Event()
+                self._integrity_shutdown_event = integrity_shutdown
+            integrity_shutdown.set()
+            run_state_lock = getattr(self, "_run_state_lock", None)
+            if run_state_lock is None:
+                run_state_lock = threading.Lock()
+                self._run_state_lock = run_state_lock
+            run_lock_timeout = min(
+                max(0.0, deadline - time.monotonic()),
+                threading.TIMEOUT_MAX,
+            )
+            if not run_state_lock.acquire(timeout=run_lock_timeout):
+                return False
+            try:
+                self._run_admission_closed = True
+                run_state = getattr(self, "_run_state", None)
+            finally:
+                run_state_lock.release()
+            if (
+                run_state is not None
+                and not run_state["done"].is_set()
+            ):
+                if run_state.get("thread") is threading.current_thread():
+                    return False
+                run_state["done"].wait(
+                    timeout=max(0.0, deadline - time.monotonic())
+                )
+                if not run_state["done"].is_set():
+                    return False
+            producers_quiescent = True
+            l2_stopped = getattr(
+                self, "_l2_stopped", self._l2_collector is None
+            )
+            if not l2_stopped and self._l2_collector is not None:
+                try:
+                    stopped = self._l2_collector.stop(
+                        timeout=max(0.0, deadline - time.monotonic())
+                    )
+                    producers_quiescent = stopped is True
+                    if producers_quiescent:
+                        missing = object()
+                        alive = getattr(
+                            self._l2_collector, "is_alive", missing
+                        )
+                        if alive is not missing:
+                            if callable(alive):
+                                alive = alive()
+                            producers_quiescent = alive is False
+                    if producers_quiescent:
+                        self._l2_stopped = True
+                    if not producers_quiescent:
+                        raise RuntimeError(
+                            "capture producer remains alive after shutdown timeout"
+                        )
+                except Exception as exc:
+                    producers_quiescent = False
+                    self._log_gap("L2 stop gap", exc)
+            integrity_quiescent = getattr(self, "_integrity_stopped", False)
+            if not integrity_quiescent:
+                integrity_quiescent = self._wait_for_integrity_worker(
+                    timeout=max(0.0, deadline - time.monotonic()),
+                )
+                if integrity_quiescent:
+                    self._integrity_stopped = True
+            if not integrity_quiescent:
+                producers_quiescent = False
+                self._log_gap(
+                    "capture integrity stop gap",
+                    RuntimeError(
+                        "integrity worker remains alive after shutdown timeout"
+                    ),
+                )
+            if not producers_quiescent:
+                return False
+            if getattr(self, "_writer_closed", False):
+                return True
+            return self._wait_for_writer_close(deadline=deadline)
+        finally:
+            shutdown_lock.release()
+
     def run(self, shutdown_event: threading.Event) -> None:
+        run_state = {
+            "done": threading.Event(),
+            "thread": threading.current_thread(),
+        }
+        run_state_lock = getattr(self, "_run_state_lock", None)
+        if run_state_lock is None:
+            run_state_lock = threading.Lock()
+            self._run_state_lock = run_state_lock
+        with run_state_lock:
+            if getattr(self, "_run_admission_closed", False):
+                return
+            current = getattr(self, "_run_state", None)
+            if current is not None and not current["done"].is_set():
+                raise RuntimeError("venue recorder run owner already active")
+            self._run_state = run_state
         next_overview = 0.0
         l2_started = False
         next_l2_start_attempt = 0.0
@@ -1615,7 +2563,8 @@ class VenueRecorder:
             nonlocal l2_errors_consecutive, l2_errors_total, last_l2_error
             l2_errors_consecutive += 1
             l2_errors_total += 1
-            last_l2_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+            error_type, detail = self._exception_summary(exc)
+            last_l2_error = f"{error_type}: {detail}"
 
         def note_l2_success() -> None:
             nonlocal l2_errors_consecutive, last_l2_error
@@ -1628,19 +2577,45 @@ class VenueRecorder:
             nonlocal last_l2_probe_error
             l2_probe_errors_consecutive += 1
             l2_probe_errors_total += 1
-            last_l2_probe_error = (
-                f"{type(exc).__name__}: {str(exc)[:160]}"
-            )
+            error_type, detail = self._exception_summary(exc)
+            last_l2_probe_error = f"{error_type}: {detail}"
 
         def note_l2_probe_success() -> None:
             nonlocal l2_probe_errors_consecutive, last_l2_probe_error
             l2_probe_errors_consecutive = 0
             last_l2_probe_error = ""
 
+        def read_l2_health_bool(attribute: str, *, default: bool) -> bool:
+            marker_missing = object()
+            marker = getattr(
+                self._l2_collector,
+                attribute,
+                marker_missing,
+            )
+            if marker is marker_missing:
+                return default
+            value = marker() if callable(marker) else marker
+            if type(value) is not bool:
+                raise TypeError(f"collector {attribute} must return bool")
+            return value
+
+        def start_l2_confirmed() -> bool:
+            result = self._l2_collector.start(shutdown_event)
+            if result is False:
+                return False
+            missing = object()
+            alive = getattr(self._l2_collector, "is_alive", missing)
+            if alive is missing:
+                return result is None or result is True
+            if callable(alive):
+                alive = alive()
+            return alive is True
+
         try:
             if self._l2_collector is not None:
                 try:
-                    self._l2_collector.start(shutdown_event)
+                    if not start_l2_confirmed():
+                        raise RuntimeError("collector start was not confirmed")
                     l2_started = True
                     note_l2_success()
                 except Exception as exc:
@@ -1650,17 +2625,34 @@ class VenueRecorder:
             while not shutdown_event.is_set():
                 now = time.monotonic()
                 if self._l2_collector is not None:
-                    alive_marker = getattr(
-                        self._l2_collector, "is_alive", None
-                    )
-                    if l2_started and alive_marker is not None:
-                        alive_error = None
+                    alive_missing = object()
+                    alive_error = None
+                    try:
+                        alive_marker = getattr(
+                            self._l2_collector,
+                            "is_alive",
+                            alive_missing,
+                        )
+                    except Exception as exc:
+                        alive_marker = alive_missing
+                        alive_error = exc
+                    if l2_started and (
+                        alive_marker is not alive_missing
+                        or alive_error is not None
+                    ):
                         try:
-                            collector_alive = bool(
+                            if alive_error is not None:
+                                raise alive_error
+                            alive_value = (
                                 alive_marker()
                                 if callable(alive_marker)
                                 else alive_marker
                             )
+                            if type(alive_value) is not bool:
+                                raise TypeError(
+                                    "collector is_alive must return bool"
+                                )
+                            collector_alive = alive_value
                         except Exception as exc:
                             collector_alive = False
                             alive_error = exc
@@ -1680,7 +2672,10 @@ class VenueRecorder:
                         and not shutdown_event.is_set()
                     ):
                         try:
-                            self._l2_collector.start(shutdown_event)
+                            if not start_l2_confirmed():
+                                raise RuntimeError(
+                                    "collector restart was not confirmed"
+                                )
                         except Exception as exc:
                             l2_started = False
                             note_l2_failure(exc)
@@ -1694,9 +2689,13 @@ class VenueRecorder:
                             next_l2_start_attempt = now + 30.0
                             if self._universe:
                                 try:
-                                    self._l2_collector.update_symbols(
+                                    updated = self._l2_collector.update_symbols(
                                         self._universe
                                     )
+                                    if updated is False:
+                                        raise RuntimeError(
+                                            "collector symbol update was not confirmed"
+                                        )
                                 except Exception as exc:
                                     note_l2_failure(exc)
                                     self._log_gap(
@@ -1724,12 +2723,20 @@ class VenueRecorder:
                         retry_seconds = 300.0
                         retention_ok = False
                         retention_errors_total += 1
-                        last_retention_error = (
-                            f"{type(exc).__name__}: {str(exc)[:160]}"
-                        )
+                        error_type, detail = self._exception_summary(exc)
+                        last_retention_error = f"{error_type}: {detail}"
                         self._log_gap("retention gap", exc)
                     finally:
                         self._next_retention_check = now + retry_seconds
+                try:
+                    retry_root = getattr(self.writer, "root", None)
+                    if retry_root is not None:
+                        self._schedule_integrity_retry_if_due(
+                            retry_root,
+                            now=now,
+                        )
+                except Exception as exc:
+                    self._log_gap("capture integrity retry gap", exc)
                 try:
                     overview_error = None
                     if now >= next_overview or not self._universe:
@@ -1738,9 +2745,8 @@ class VenueRecorder:
                         except Exception as exc:
                             overview_error = exc
                             overview_errors_total += 1
-                            last_overview_error = (
-                                f"{type(exc).__name__}: {str(exc)[:160]}"
-                            )
+                            error_type, detail = self._exception_summary(exc)
+                            last_overview_error = f"{error_type}: {detail}"
                             if self._universe:
                                 # Keep sampling the last validated universe,
                                 # but do not hammer the overview endpoint once
@@ -1758,7 +2764,13 @@ class VenueRecorder:
                             next_overview = now + self.overview_interval
                             if l2_started:
                                 try:
-                                    self._l2_collector.update_symbols(self._universe)
+                                    updated = self._l2_collector.update_symbols(
+                                        self._universe
+                                    )
+                                    if updated is False:
+                                        raise RuntimeError(
+                                            "collector symbol update was not confirmed"
+                                        )
                                 except Exception as exc:
                                     note_l2_failure(exc)
                                     self._log_gap("L2 symbol update gap", exc)
@@ -1773,9 +2785,8 @@ class VenueRecorder:
                         except Exception as exc:
                             micro_error = exc
                             microstructure_errors_total += 1
-                            last_microstructure_error = (
-                                f"{type(exc).__name__}: {str(exc)[:160]}"
-                            )
+                            error_type, detail = self._exception_summary(exc)
+                            last_microstructure_error = f"{error_type}: {detail}"
                         else:
                             microstructure_captures_total += 1
                             last_microstructure_error = ""
@@ -1795,9 +2806,8 @@ class VenueRecorder:
                 except Exception as exc:
                     capture_errors_consecutive += 1
                     capture_errors_total += 1
-                    last_capture_error = (
-                        f"{type(exc).__name__}: {str(exc)[:160]}"
-                    )
+                    error_type, detail = self._exception_summary(exc)
+                    last_capture_error = f"{error_type}: {detail}"
                     self._log_gap("capture gap", exc)
                 else:
                     capture_errors_consecutive = 0
@@ -1840,68 +2850,195 @@ class VenueRecorder:
                 collector_last_l2_error = ""
                 l2_probe_failed = False
                 if l2_enabled:
-                    healthy_marker = getattr(
-                        self._l2_collector, "is_healthy", None
-                    )
-                    if healthy_marker is None:
-                        l2_data_healthy = l2_started
-                    else:
-                        try:
-                            l2_data_healthy = bool(
-                                healthy_marker()
-                                if callable(healthy_marker)
-                                else healthy_marker
-                            )
-                        except Exception as exc:
-                            l2_data_healthy = False
-                            l2_probe_failed = True
-                            note_l2_probe_failure(exc)
-                            self._log_gap("L2 health read gap", exc)
-                    trade_marker = getattr(
-                        self._l2_collector, "trades_healthy", False
-                    )
                     try:
-                        trade_stream_healthy = bool(
-                            trade_marker()
-                            if callable(trade_marker)
-                            else trade_marker
+                        l2_data_healthy = read_l2_health_bool(
+                            "is_healthy",
+                            default=l2_started,
+                        )
+                    except Exception as exc:
+                        l2_data_healthy = False
+                        l2_probe_failed = True
+                        note_l2_probe_failure(exc)
+                        self._log_gap("L2 health read gap", exc)
+                    try:
+                        trade_stream_healthy = read_l2_health_bool(
+                            "trades_healthy",
+                            default=False,
                         )
                     except Exception as exc:
                         trade_stream_healthy = False
                         l2_probe_failed = True
                         note_l2_probe_failure(exc)
                         self._log_gap("trade stream health read gap", exc)
-                    snapshot_marker = getattr(
-                        self._l2_collector, "health_snapshot", None
-                    )
-                    if callable(snapshot_marker):
+                    snapshot_missing = object()
+                    try:
+                        snapshot_marker = getattr(
+                            self._l2_collector,
+                            "health_snapshot",
+                            snapshot_missing,
+                        )
+                    except Exception as exc:
+                        snapshot_marker = snapshot_missing
+                        l2_probe_failed = True
+                        note_l2_probe_failure(exc)
+                        self._log_gap("stream health snapshot gap", exc)
+                    if snapshot_marker is not snapshot_missing:
                         try:
+                            if not callable(snapshot_marker):
+                                raise TypeError(
+                                    "collector health_snapshot must be callable"
+                                )
                             stream_health = dict(snapshot_marker())
+                            for connection_key in (
+                                "connection_epoch",
+                                "reconnect_attempts",
+                            ):
+                                if connection_key not in stream_health:
+                                    continue
+                                connection_value = stream_health.get(
+                                    connection_key
+                                )
+                                if (
+                                    type(connection_value) is not int
+                                    or connection_value < 0
+                                ):
+                                    raise ValueError(
+                                        f"invalid {connection_key} health marker"
+                                    )
+                            if "connection_error_type" in stream_health:
+                                connection_error = stream_health.get(
+                                    "connection_error_type"
+                                )
+                                if connection_error is not None and not isinstance(
+                                    connection_error,
+                                    str,
+                                ):
+                                    raise ValueError(
+                                        "invalid connection_error_type health marker"
+                                    )
+                            if "trade_duplicates_suppressed" in stream_health:
+                                duplicates_marker = stream_health.get(
+                                    "trade_duplicates_suppressed"
+                                )
+                                if (
+                                    type(duplicates_marker) is not int
+                                    or duplicates_marker < 0
+                                ):
+                                    raise ValueError(
+                                        "invalid trade_duplicates_suppressed "
+                                        "health marker"
+                                    )
+                            if "last_transport_error" in stream_health:
+                                last_transport_marker = stream_health.get(
+                                    "last_transport_error"
+                                )
+                                if last_transport_marker is not None and not isinstance(
+                                    last_transport_marker,
+                                    str,
+                                ):
+                                    raise ValueError(
+                                        "invalid last_transport_error health marker"
+                                    )
+                                if isinstance(last_transport_marker, str):
+                                    stream_health["last_transport_error"] = (
+                                        last_transport_marker[:256]
+                                    )
+                            if "last_interruption_wall_ts" in stream_health:
+                                interruption_marker = stream_health.get(
+                                    "last_interruption_wall_ts"
+                                )
+                                valid_interruption = (
+                                    interruption_marker is None
+                                    or (
+                                        type(interruption_marker) is int
+                                        and interruption_marker >= 0
+                                    )
+                                    or (
+                                        type(interruption_marker) is float
+                                        and math.isfinite(interruption_marker)
+                                        and interruption_marker >= 0.0
+                                    )
+                                )
+                                if not valid_interruption:
+                                    raise ValueError(
+                                        "invalid last_interruption_wall_ts "
+                                        "health marker"
+                                    )
                             total_marker = stream_health.get(
                                 "transport_errors_total", 0
                             )
                             consecutive_marker = stream_health.get(
                                 "transport_errors_consecutive", 0
                             )
-                            if (
-                                isinstance(total_marker, int)
-                                and not isinstance(total_marker, bool)
-                                and total_marker >= 0
+                            for counter_key, counter_value in (
+                                ("transport_errors_total", total_marker),
+                                (
+                                    "transport_errors_consecutive",
+                                    consecutive_marker,
+                                ),
                             ):
-                                collector_l2_errors_total = total_marker
-                            if (
-                                isinstance(consecutive_marker, int)
-                                and not isinstance(consecutive_marker, bool)
-                                and consecutive_marker >= 0
-                            ):
-                                collector_l2_errors_consecutive = (
-                                    consecutive_marker
-                                )
+                                if (
+                                    type(counter_value) is not int
+                                    or counter_value < 0
+                                ):
+                                    raise ValueError(
+                                        f"invalid {counter_key} health marker"
+                                    )
+                            collector_l2_errors_total = total_marker
+                            collector_l2_errors_consecutive = (
+                                consecutive_marker
+                            )
                             last_marker = stream_health.get(
                                 "last_transport_error", ""
                             )
                             if isinstance(last_marker, str):
                                 collector_last_l2_error = last_marker[:256]
+                            for gap_key, stream_name in (
+                                ("l2_missing_or_stale", "l2"),
+                                ("trade_missing_or_stale", "trade"),
+                            ):
+                                if gap_key not in stream_health:
+                                    continue
+                                gap_marker = stream_health.get(gap_key)
+                                gap_valid = isinstance(
+                                    gap_marker,
+                                    (list, tuple),
+                                )
+                                normalized_gap = (
+                                    list(gap_marker) if gap_valid else []
+                                )
+                                gap_valid = bool(
+                                    gap_valid
+                                    and len(normalized_gap) <= self.max_symbols
+                                    and all(
+                                        isinstance(item, str)
+                                        and bool(item)
+                                        and item == item.strip()
+                                        and len(item) <= 100
+                                        for item in normalized_gap
+                                    )
+                                    and len(normalized_gap)
+                                    == len(set(normalized_gap))
+                                )
+                                if not gap_valid:
+                                    stream_health[gap_key] = []
+                                    gap_error = ValueError(
+                                        f"invalid {gap_key} health marker"
+                                    )
+                                    l2_probe_failed = True
+                                    note_l2_probe_failure(gap_error)
+                                    self._log_gap(
+                                        "stream health snapshot gap",
+                                        gap_error,
+                                    )
+                                    gap_active = True
+                                else:
+                                    stream_health[gap_key] = normalized_gap
+                                    gap_active = bool(normalized_gap)
+                                if stream_name == "l2" and gap_active:
+                                    l2_data_healthy = False
+                                elif stream_name == "trade" and gap_active:
+                                    trade_stream_healthy = False
                         except Exception as exc:
                             l2_probe_failed = True
                             note_l2_probe_failure(exc)
@@ -1994,39 +3131,14 @@ class VenueRecorder:
                 })
                 shutdown_event.wait(self.micro_interval)
         finally:
-            producers_quiescent = True
-            if self._l2_collector is not None:
-                try:
-                    stopped = self._l2_collector.stop(timeout=15.0)
-                    producers_quiescent = stopped is not False
-                    if not producers_quiescent:
-                        raise RuntimeError(
-                            "capture producer remains alive after shutdown timeout"
-                        )
-                except Exception as exc:
-                    producers_quiescent = False
-                    self._log_gap("L2 stop gap", exc)
-            integrity_quiescent = self._wait_for_integrity_worker(
-                timeout=self._INTEGRITY_STOP_TIMEOUT_SEC,
+            # No producer work occurs after this publication. External runtime
+            # finalization may now close the shared writer without a reopen.
+            with run_state_lock:
+                self._run_admission_closed = True
+                run_state["done"].set()
+            self.shutdown_resources(
+                timeout=max(15.0, self._INTEGRITY_STOP_TIMEOUT_SEC)
             )
-            if not integrity_quiescent:
-                producers_quiescent = False
-                self._log_gap(
-                    "capture integrity stop gap",
-                    RuntimeError(
-                        "integrity worker remains alive after shutdown timeout"
-                    ),
-                )
-            close = getattr(self.writer, "close", None)
-            if producers_quiescent and callable(close):
-                try:
-                    closed = close()
-                    if closed is False:
-                        raise RuntimeError(
-                            "partition writer connections remain open"
-                        )
-                except Exception as exc:
-                    self._log_gap("writer close gap", exc)
 
 
 # Compatibility for older imports and third-party extensions.

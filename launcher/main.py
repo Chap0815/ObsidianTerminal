@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections import deque
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -371,6 +372,94 @@ def _initialize_database_for_launcher() -> None:
     cleanup_runtime_status_temps()
 
 
+def _setup_wizard_is_running(wizard_path: str, *, process_iter=None) -> bool:
+    """Prove whether this runtime root already owns a setup wizard."""
+    if process_iter is None:
+        try:
+            import psutil  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("setup wizard process scan unavailable") from exc
+        process_iter = psutil.process_iter
+
+    expected_script = os.path.normcase(os.path.abspath(wizard_path))
+    expected_root = os.path.normcase(os.path.dirname(expected_script))
+    current_pid = os.getpid()
+    saw_current = False
+    scan_incomplete = False
+    found = False
+
+    try:
+        processes = process_iter(["pid", "name", "exe", "cmdline", "cwd"])
+        for proc in processes:
+            try:
+                info = proc.info
+                pid = int(info.get("pid") or 0)
+                if pid == current_pid:
+                    saw_current = True
+                    continue
+                if pid <= 0:
+                    if pid < 0:
+                        scan_incomplete = True
+                    continue
+                raw_cmdline = info.get("cmdline")
+                executable_names = [info.get("name"), info.get("exe")]
+                if isinstance(raw_cmdline, (list, tuple)) and raw_cmdline:
+                    executable_names.append(raw_cmdline[0])
+                python_like = any(
+                    re.fullmatch(
+                        r"python(?:w|[0-9.]*)?(?:\.exe)?",
+                        os.path.basename(str(value or "")).lower(),
+                    )
+                    for value in executable_names
+                )
+                if not isinstance(raw_cmdline, (list, tuple)) or not raw_cmdline:
+                    identity_known = any(
+                        str(value or "").strip()
+                        for value in executable_names
+                    )
+                    if python_like or not identity_known:
+                        scan_incomplete = True
+                    continue
+                if not python_like:
+                    continue
+                raw_cwd = info.get("cwd")
+                for raw_token in raw_cmdline[1:]:
+                    token = str(raw_token or "")
+                    if not token:
+                        continue
+                    absolute_script_token = os.path.isabs(token)
+                    if absolute_script_token:
+                        candidate = os.path.normcase(os.path.abspath(token))
+                    elif os.path.basename(token).lower() == "setup_wizard.pyw":
+                        if not raw_cwd:
+                            scan_incomplete = True
+                            continue
+                        candidate = os.path.normcase(
+                            os.path.abspath(os.path.join(str(raw_cwd), token))
+                        )
+                    else:
+                        continue
+                    if candidate == expected_script:
+                        # An exact absolute script token proves the root on its
+                        # own. Relative invocation additionally requires an
+                        # observed, exact working directory above.
+                        if absolute_script_token or os.path.normcase(
+                            os.path.abspath(str(raw_cwd))
+                        ) == expected_root:
+                            found = True
+                            break
+            except Exception:
+                scan_incomplete = True
+    except Exception:
+        scan_incomplete = True
+
+    if found:
+        return True
+    if scan_incomplete or not saw_current:
+        raise RuntimeError("setup wizard process scan incomplete")
+    return False
+
+
 def main() -> None:
     # No console window, however we were launched (relaunch under pythonw).
     if _relaunch_windowless():
@@ -398,11 +487,24 @@ def main() -> None:
         kw = {}
         if sys.platform == "win32":
             kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-        with process_start_guard(PROJECT_ROOT):
-            subprocess.Popen(
-                [_get_python_exe(), wizard_path],
-                cwd=PROJECT_ROOT,
-                **kw,
+        setup_process = None
+        try:
+            with process_start_guard(PROJECT_ROOT):
+                if (
+                    not os.path.lexists(env_path)
+                    and not _setup_wizard_is_running(wizard_path)
+                ):
+                    setup_process = subprocess.Popen(
+                        [_get_python_exe(), wizard_path],
+                        cwd=PROJECT_ROOT,
+                        **kw,
+                    )
+        except BaseException:
+            if setup_process is None:
+                raise
+            print(
+                "[launcher] setup wizard spawned; lifecycle guard release "
+                "failed; parent exits"
             )
         sys.exit(0)
 

@@ -18,6 +18,11 @@ from typing import Any, Iterable, Sequence
 
 import psutil
 
+from bot_utils.subprocess_capture import (
+    _new_process_job,
+    _prepare_windows_gated_spawn,
+)
+
 
 KNOWN_TOOL_MODULES = (
     "tools.backtester",
@@ -30,6 +35,23 @@ KNOWN_TOOL_MODULES = (
 )
 _KNOWN_TOOL_MODULE_SET = frozenset(KNOWN_TOOL_MODULES)
 _OPTIONS_WITH_SEPARATE_VALUE = frozenset({"-W", "-X"})
+_ORIGINAL_POPEN = subprocess.Popen
+_TOOL_JOB_ATTRIBUTE = "_obsidian_tool_process_job"
+
+
+class _StopDiagnostics:
+    def __init__(self) -> None:
+        self.discovery_uncertain = False
+        self.uncertain_descendants: list[Any] = []
+
+
+def _log_tool_stop_failure(context: str, exc: BaseException) -> None:
+    try:
+        from bot_utils.silent_log import silent_log
+
+        silent_log(context, exc)
+    except BaseException:
+        pass
 
 
 def tool_root_xoption(root: str | os.PathLike[str]) -> str:
@@ -218,6 +240,88 @@ def _alive(proc: Any) -> bool:
         return True
 
 
+def _tool_process_job(proc: Any) -> Any | None:
+    try:
+        return getattr(proc, _TOOL_JOB_ATTRIBUTE, None)
+    except Exception:
+        return None
+
+
+def _owned_tree_alive(proc: Any) -> bool:
+    """Return fail-closed liveness for a registered root and its job tree."""
+    job = _tool_process_job(proc)
+    if job is None:
+        return _alive(proc)
+    try:
+        return bool(job.has_live_processes())
+    except Exception as exc:
+        _log_tool_stop_failure("registered tool job liveness", exc)
+        return True
+
+
+def _release_quiescent_tool_job(proc: Any) -> bool:
+    """Close and detach a Windows job only after exact tree quiescence."""
+    job = _tool_process_job(proc)
+    if job is None:
+        if not _alive(proc):
+            try:
+                proc.wait(timeout=0)
+            except Exception:
+                pass
+            _close_process_streams(proc)
+        return not _alive(proc)
+    try:
+        if job.has_live_processes():
+            return False
+        job.close()
+        delattr(proc, _TOOL_JOB_ATTRIBUTE)
+    except Exception as exc:
+        _log_tool_stop_failure("registered tool job release", exc)
+        return False
+    try:
+        proc.wait(timeout=0)
+    except Exception:
+        pass
+    _close_process_streams(proc)
+    return True
+
+
+def _stop_job_owned_tree(
+    proc: Any,
+    *,
+    terminate_timeout: float,
+    kill_timeout: float,
+) -> bool:
+    """Terminate one durable Windows job and retain it until it is empty."""
+    job = _tool_process_job(proc)
+    if job is None:
+        return False
+    try:
+        if not job.has_live_processes():
+            return _release_quiescent_tool_job(proc)
+        job.terminate()
+    except Exception as exc:
+        _log_tool_stop_failure("registered tool job termination", exc)
+        return False
+
+    deadline = time.monotonic() + max(
+        0.0,
+        float(terminate_timeout) + float(kill_timeout),
+    )
+    while True:
+        try:
+            live = bool(job.has_live_processes())
+        except Exception as exc:
+            _log_tool_stop_failure("registered tool job drain", exc)
+            return False
+        if not live:
+            return _release_quiescent_tool_job(proc)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        time.sleep(min(0.01, remaining))
+
+
 def _spawned_descendants(proc: Any) -> tuple[list[Any], bool]:
     """Snapshot descendants while their registered parent is still alive."""
     pid = getattr(proc, "pid", None)
@@ -230,7 +334,14 @@ def _spawned_descendants(proc: Any) -> tuple[list[Any], bool]:
         return [], True
     try:
         parent = psutil.Process(pid)
-        return parent.children(recursive=True), True
+        children = parent.children(recursive=True)
+        # ``proc`` is the original Popen handle, whereas ``parent`` was
+        # reconstructed from a numeric PID. If the original exited during
+        # discovery, that PID may already identify an unrelated process.
+        # Never act on descendants whose ownership is no longer provable.
+        if not _alive(proc):
+            return children, False
+        return children, True
     except psutil.NoSuchProcess:
         return [], True
     except (psutil.AccessDenied, OSError):
@@ -264,15 +375,36 @@ def stop_tool_processes(
     *,
     terminate_timeout: float = 3.0,
     kill_timeout: float = 2.0,
+    _diagnostics: _StopDiagnostics | None = None,
 ) -> bool:
     """Terminate, kill if needed, and reap process trees within two bounds."""
     unique = {id(proc): proc for proc in processes if proc is not None}
-    roots = [proc for proc in unique.values() if _alive(proc)]
+    job_roots = [
+        proc for proc in unique.values() if _tool_process_job(proc) is not None
+    ]
+    jobs_ok = True
+    for proc in job_roots:
+        if not _stop_job_owned_tree(
+            proc,
+            terminate_timeout=terminate_timeout,
+            kill_timeout=kill_timeout,
+        ):
+            jobs_ok = False
+    roots = [
+        proc
+        for proc in unique.values()
+        if _tool_process_job(proc) is None and _alive(proc)
+    ]
     discovery_ok = True
     descendants: dict[int, Any] = {}
     for root in roots:
         children, discovered = _spawned_descendants(root)
         discovery_ok = discovery_ok and discovered
+        if not discovered:
+            if _diagnostics is not None:
+                _diagnostics.discovery_uncertain = True
+                _diagnostics.uncertain_descendants.extend(children)
+            continue
         for child in children:
             try:
                 descendants.setdefault(int(child.pid), child)
@@ -300,7 +432,7 @@ def stop_tool_processes(
             except Exception:
                 pass
             _close_process_streams(proc)
-    return discovery_ok and not survivors
+    return jobs_ok and discovery_ok and not survivors
 
 
 def start_registered_tool_process(
@@ -314,26 +446,91 @@ def start_registered_tool_process(
     if registry is None:
         raise RuntimeError("tool process registry unavailable")
     spawned = None
+    job = None
+    start_gate = None
+    use_windows_containment = (
+        os.name == "nt" and subprocess.Popen is _ORIGINAL_POPEN
+    )
     try:
         from update_barrier import process_start_guard
 
+        spawn_command = list(command)
+        prepared_kwargs = dict(popen_kwargs)
+        if use_windows_containment:
+            job = _new_process_job()
+            if job is None:
+                raise RuntimeError("Windows tool process job unavailable")
+            spawn_command, prepared_kwargs, start_gate = (
+                _prepare_windows_gated_spawn(
+                    command,
+                    prepared_kwargs,
+                    wrapper_python=None,
+                )
+            )
         with process_start_guard(root):
-            spawned = subprocess.Popen(command, **popen_kwargs)
+            spawned = subprocess.Popen(spawn_command, **prepared_kwargs)
+            if start_gate is not None:
+                start_gate.disable_inheritance()
+            if job is not None:
+                job.assign(spawned)
+                setattr(spawned, _TOOL_JOB_ATTRIBUTE, job)
         if not registry.register(spawned):
             raise RuntimeError("launcher shutdown is already in progress")
+        if start_gate is not None:
+            start_gate.signal()
+            start_gate.close()
+            start_gate = None
         return spawned
-    except BaseException:
+    except BaseException as original_error:
+        cleanup_errors: list[BaseException] = []
+        if start_gate is not None:
+            try:
+                start_gate.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
         if spawned is not None:
             stopped = False
             try:
                 stopped = bool(registry.stop(spawned))
-            except Exception:
-                pass
-            if not stopped and stop_tool_processes([spawned]):
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            fallback_stopped = False
+            if not stopped:
+                try:
+                    fallback_stopped = stop_tool_processes([spawned])
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            if fallback_stopped:
                 try:
                     registry.unregister(spawned)
-                except Exception:
-                    pass
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+        if job is not None and (
+            spawned is None or _tool_process_job(spawned) is None
+        ):
+            try:
+                job.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        for cleanup_error in cleanup_errors:
+            try:
+                _log_tool_stop_failure(
+                    "registered tool spawn rollback",
+                    cleanup_error,
+                )
+            except BaseException:
+                pass
+        if cleanup_errors:
+            try:
+                details = "; ".join(
+                    f"{type(exc).__name__}: {exc}"
+                    for exc in cleanup_errors
+                )
+                original_error.add_note(
+                    f"tool process rollback failures: {details}"
+                )
+            except BaseException:
+                pass
         raise
 
 
@@ -343,39 +540,83 @@ class ToolProcessRegistry:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._processes: dict[int, Any] = {}
+        self._uncertain_processes: dict[int, Any] = {}
+        self._unresolved_tree = False
+        self._active_stops = 0
         self._closing = False
+
+    def _prune_uncertain_locked(self) -> None:
+        for key, proc in list(self._uncertain_processes.items()):
+            if not _owned_tree_alive(proc):
+                self._uncertain_processes.pop(key, None)
+
+    def _record_diagnostics_locked(self, diagnostics: _StopDiagnostics) -> None:
+        for proc in diagnostics.uncertain_descendants:
+            if _owned_tree_alive(proc):
+                self._uncertain_processes[id(proc)] = proc
+        if diagnostics.discovery_uncertain:
+            self._unresolved_tree = True
 
     def register(self, proc: Any) -> bool:
         if proc is None:
             raise ValueError("tool process is required")
         with self._lock:
-            if not self._closing:
-                if _alive(proc):
+            self._prune_uncertain_locked()
+            if (
+                not self._closing
+                and self._active_stops == 0
+                and not self._uncertain_processes
+                and not self._unresolved_tree
+            ):
+                if _owned_tree_alive(proc):
                     self._processes[id(proc)] = proc
                 return True
-        stop_tool_processes([proc])
+            if _owned_tree_alive(proc):
+                self._processes[id(proc)] = proc
+        self.stop(proc)
         return False
 
     def unregister(self, proc: Any) -> None:
         if proc is None:
             return
         with self._lock:
+            if (
+                _tool_process_job(proc) is not None
+                and not _release_quiescent_tool_job(proc)
+            ):
+                self._processes[id(proc)] = proc
+                return
             self._processes.pop(id(proc), None)
 
     def snapshot(self) -> list[Any]:
         with self._lock:
-            exited = [key for key, proc in self._processes.items() if not _alive(proc)]
+            exited = [
+                key
+                for key, proc in self._processes.items()
+                if not _owned_tree_alive(proc)
+                and _release_quiescent_tool_job(proc)
+            ]
             for key in exited:
                 self._processes.pop(key, None)
+            self._prune_uncertain_locked()
             return list(self._processes.values())
 
     def resume_after_aborted_shutdown(self) -> bool:
         """Reopen registrations only when shutdown left no owned survivor."""
         with self._lock:
             for key, proc in list(self._processes.items()):
-                if not _alive(proc):
+                if (
+                    not _owned_tree_alive(proc)
+                    and _release_quiescent_tool_job(proc)
+                ):
                     self._processes.pop(key, None)
-            if self._processes:
+            self._prune_uncertain_locked()
+            if (
+                self._processes
+                or self._uncertain_processes
+                or self._unresolved_tree
+                or self._active_stops
+            ):
                 return False
             self._closing = False
             return True
@@ -387,18 +628,46 @@ class ToolProcessRegistry:
         terminate_timeout: float = 3.0,
         kill_timeout: float = 2.0,
     ) -> bool:
-        stopped = stop_tool_processes(
-            [proc],
-            terminate_timeout=terminate_timeout,
-            kill_timeout=kill_timeout,
-        )
         with self._lock:
-            if stopped or not _alive(proc):
-                self._processes.pop(id(proc), None)
-            else:
-                # Preserve ownership of an unkillable child so a later
-                # shutdown/retry cannot mistake an empty registry for safety.
+            initially_alive = _owned_tree_alive(proc)
+            if initially_alive:
                 self._processes[id(proc)] = proc
+            self._active_stops += 1
+        diagnostics = _StopDiagnostics()
+        backend_failed = True
+        stopped = False
+        try:
+            try:
+                stopped = stop_tool_processes(
+                    [proc],
+                    terminate_timeout=terminate_timeout,
+                    kill_timeout=kill_timeout,
+                    _diagnostics=diagnostics,
+                )
+            except Exception as exc:
+                _log_tool_stop_failure("registered tool process stop", exc)
+            else:
+                backend_failed = False
+        finally:
+            with self._lock:
+                self._record_diagnostics_locked(diagnostics)
+                if (
+                    backend_failed
+                    and initially_alive
+                    and _tool_process_job(proc) is None
+                    and not _alive(proc)
+                ):
+                    self._unresolved_tree = True
+                if stopped or (
+                    not _owned_tree_alive(proc)
+                    and _release_quiescent_tool_job(proc)
+                ):
+                    self._processes.pop(id(proc), None)
+                else:
+                    # Preserve ownership of an unkillable child so a later
+                    # shutdown/retry cannot mistake an empty registry for safety.
+                    self._processes[id(proc)] = proc
+                self._active_stops -= 1
         return stopped
 
     def stop_all(
@@ -410,13 +679,44 @@ class ToolProcessRegistry:
         with self._lock:
             self._closing = True
             processes = list(self._processes.values())
-        stopped = stop_tool_processes(
-            processes,
-            terminate_timeout=terminate_timeout,
-            kill_timeout=kill_timeout,
-        )
+            initially_alive = [proc for proc in processes if _owned_tree_alive(proc)]
+            self._active_stops += 1
+        diagnostics = _StopDiagnostics()
+        backend_failed = True
+        stopped = False
+        try:
+            try:
+                stopped = stop_tool_processes(
+                    processes,
+                    terminate_timeout=terminate_timeout,
+                    kill_timeout=kill_timeout,
+                    _diagnostics=diagnostics,
+                )
+            except Exception as exc:
+                _log_tool_stop_failure("registered tool process stop all", exc)
+            else:
+                backend_failed = False
+        finally:
+            with self._lock:
+                self._record_diagnostics_locked(diagnostics)
+                if backend_failed and any(
+                    _tool_process_job(proc) is None and not _alive(proc)
+                    for proc in initially_alive
+                ):
+                    self._unresolved_tree = True
+                for key, proc in list(self._processes.items()):
+                    if (
+                        not _owned_tree_alive(proc)
+                        and _release_quiescent_tool_job(proc)
+                    ):
+                        self._processes.pop(key, None)
+                self._prune_uncertain_locked()
+                self._active_stops -= 1
         with self._lock:
-            for key, proc in list(self._processes.items()):
-                if not _alive(proc):
-                    self._processes.pop(key, None)
-            return stopped and not self._processes
+            return bool(
+                stopped
+                and not self._processes
+                and not self._uncertain_processes
+                and not self._unresolved_tree
+                and self._active_stops == 0
+            )

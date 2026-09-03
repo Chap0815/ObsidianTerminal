@@ -333,6 +333,9 @@ def _finalize_not_submitted_intent(
     error: Exception | str,
     *,
     current_status: str = "SUBMITTING",
+    filled_amount: float = 0.0,
+    filled_notional: float = 0.0,
+    fee_usdt: float = 0.0,
 ) -> None:
     reason = f"entry order not submitted: {error}"
     transition = (
@@ -345,15 +348,17 @@ def _finalize_not_submitted_intent(
     transition(
         intent_id,
         "CANCELED",
-        filled_amount=0.0,
-        filled_notional=0.0,
-        fee_usdt=0.0,
+        filled_amount=filled_amount,
+        filled_notional=filled_notional,
+        fee_usdt=fee_usdt,
         error=reason,
     )
     transition(
         intent_id,
         "FINALIZED",
-        release_terminal_zero_claim=True,
+        release_terminal_zero_claim=(
+            filled_amount == 0.0 and filled_notional == 0.0
+        ),
         error=reason,
     )
 
@@ -364,6 +369,9 @@ def _finalize_pre_submit_rejection(
     blocked: FuturesOrderNotSubmitted,
     *,
     current_status: str = "PREPARED",
+    filled_amount: float = 0.0,
+    filled_notional: float = 0.0,
+    fee_usdt: float = 0.0,
 ) -> None:
     """Preserve the proven no-submit outcome if journal cleanup fails."""
     try:
@@ -372,6 +380,9 @@ def _finalize_pre_submit_rejection(
             intent_id,
             blocked,
             current_status=current_status,
+            filled_amount=filled_amount,
+            filled_notional=filled_notional,
+            fee_usdt=fee_usdt,
         )
     except Exception as cleanup_error:
         try:
@@ -664,21 +675,25 @@ def execute_entry_order(
         target_price=reference_price,
         client_order_id=client_order_id,
     )
-    if pre_submit_guard is not None:
+    def _require_pre_submit_guard() -> None:
+        if pre_submit_guard is None:
+            return
         try:
             admission_allowed = pre_submit_guard()
         except Exception as exc:
-            blocked = FuturesOrderNotSubmitted(
+            raise FuturesOrderNotSubmitted(
                 "entry admission guard unavailable"
-            )
-            _finalize_pre_submit_rejection(journal, intent_id, blocked)
-            raise blocked from exc
+            ) from exc
         if admission_allowed is not True:
-            blocked = FuturesOrderNotSubmitted(
-                "new entries disabled by config"
+            raise FuturesOrderNotSubmitted(
+                "entry blocked by pre-submit runtime safety gate"
             )
-            _finalize_pre_submit_rejection(journal, intent_id, blocked)
-            raise blocked
+
+    try:
+        _require_pre_submit_guard()
+    except FuturesOrderNotSubmitted as blocked:
+        _finalize_pre_submit_rejection(journal, intent_id, blocked)
+        raise
     journal.transition(intent_id, "SUBMITTING")
 
     arrival = None
@@ -729,6 +744,7 @@ def execute_entry_order(
 
     if config.mode != "enforce":
         try:
+            _require_pre_submit_guard()
             order = market_order()
             if not isinstance(order, dict):
                 raise RuntimeError("market order returned no order object")
@@ -813,12 +829,19 @@ def execute_entry_order(
             )
             return order
         except FuturesOrderNotSubmitted as exc:
-            _finalize_not_submitted_intent(journal, intent_id, exc)
+            _finalize_pre_submit_rejection(
+                journal,
+                intent_id,
+                exc,
+                current_status="SUBMITTING",
+            )
             raise
         except Exception as exc:
             _mark_recovery_required_after_error(journal, intent_id, exc)
             raise
 
+    fallback_not_submitted_fields = None
+    fallback_not_submitted_order = None
     try:
         if not book:
             if book_budget_denied or not try_consume_api_call(
@@ -864,6 +887,7 @@ def execute_entry_order(
             raise FuturesOrderNotSubmitted(
                 "API budget denied: entry_executor_create_maker"
             )
+        _require_pre_submit_guard()
         maker_order = exchange.create_order(
             symbol,
             "limit",
@@ -1148,6 +1172,8 @@ def execute_entry_order(
             "FALLBACK_SUBMITTING",
             fallback_client_order_id=fallback_client_order_id,
         )
+        fallback_not_submitted_fields = dict(canceled_fields)
+        fallback_not_submitted_order = canceled
         fallback = market_order(residual, fallback_client_order_id)
         if not isinstance(fallback, dict):
             raise RuntimeError("market fallback returned no order object")
@@ -1220,7 +1246,31 @@ def execute_entry_order(
         )
         return result
     except FuturesOrderNotSubmitted as exc:
-        _finalize_not_submitted_intent(journal, intent_id, exc)
+        resolution_fields = fallback_not_submitted_fields or {}
+        _finalize_pre_submit_rejection(
+            journal,
+            intent_id,
+            exc,
+            current_status=(
+                "FALLBACK_SUBMITTING"
+                if fallback_not_submitted_fields is not None
+                else "SUBMITTING"
+            ),
+            **resolution_fields,
+        )
+        if (
+            resolution_fields.get("filled_amount", 0.0) > 0.0
+            and fallback_not_submitted_order is not None
+        ):
+            _record_fill_tca(
+                journal,
+                intent_id,
+                arrival,
+                fallback_not_submitted_order,
+                symbol=symbol,
+                side=side,
+            )
+            return fallback_not_submitted_order
         raise
     except Exception as exc:
         _mark_recovery_required_after_error(journal, intent_id, exc)
@@ -1427,10 +1477,38 @@ def recover_nonterminal_order_intents(
                 intent["status"] = "RECOVERY_REQUIRED"
             unresolved.append(intent)
             continue
-        target_amount = _positive_finite_float(
-            intent["target_amount"],
-            "persisted target amount",
-        )
+        try:
+            target_amount = _positive_finite_float(
+                intent["target_amount"],
+                "persisted target amount",
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            error = "persisted order intent target amount is invalid"
+            if recovery_report is not None and intent_id in recovery_report:
+                recovery_report[intent_id]["evidence_state"] = "conflict"
+            try:
+                if current != "RECOVERY_REQUIRED":
+                    transition_order_intent(
+                        intent_id,
+                        "RECOVERY_REQUIRED",
+                        error=error,
+                    )
+            except (TypeError, ValueError):
+                pass
+            if log_event:
+                try:
+                    log_event(
+                        f"Entry recovery blocked for {intent_id}: {error}",
+                        "ERROR",
+                    )
+                except Exception:
+                    pass
+            try:
+                silent_log("entry recovery target amount", exc)
+            except Exception:
+                pass
+            unresolved.append(persisted_snapshot(intent_id, intent))
+            continue
         expected_snapshot_amount = target_amount
         if fallback_client_order_id:
             persisted_fallback_amount = _number(

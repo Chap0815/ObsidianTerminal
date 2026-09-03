@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -95,7 +96,7 @@ def _mark_spot_exit_outcome_uncertain(bot, sym: str, row: dict,
         sym, key, True
     )
     row[key] = True
-    return persisted is not False
+    return persisted is None or persisted is True
 
 
 def _reset_spot_exit_intent(bot, sym: str, row: dict, leg: str) -> bool:
@@ -105,7 +106,7 @@ def _reset_spot_exit_intent(bot, sym: str, row: dict, leg: str) -> bool:
         f"{leg}_exit_requested_amount": None,
     }
     persisted = bot.state.update_many(sym, updates)
-    if persisted is not False:
+    if persisted is None or persisted is True:
         row.update(updates)
         return True
     return False
@@ -250,10 +251,12 @@ class ExitsMixin:
                 )
                 seen.add(str(trigger["rule"]))
             persisted = sorted(seen)
-            self.state.update_many(
+            persist_result = self.state.update_many(
                 sym, {"spot_exit_shadow_triggered_rules": persisted}
             )
             d["spot_exit_shadow_triggered_rules"] = persisted
+            if persist_result is not None and persist_result is not True:
+                raise RuntimeError("state update returned non-success")
         except Exception as exc:
             if not getattr(self, "_spot_exit_shadow_error_logged", False):
                 self._spot_exit_shadow_error_logged = True
@@ -263,7 +266,14 @@ class ExitsMixin:
                     pass
 
     def _retry_pending_partial_accounting(self, sym: str, d: dict) -> None:
-        from bot_utils.trade_state import normalize_pending_accounting_items
+        from bot_utils.trade_state import (
+            normalize_pending_accounting_items,
+            validated_pending_partial_accounting_item,
+        )
+        from core.spot_bot_reconcile import (
+            _defer_spot_accounting_retry,
+            _spot_accounting_retry_due,
+        )
         if not normalize_pending_accounting_items(
             d.get("accounting_pending_partials")
         ):
@@ -286,6 +296,8 @@ class ExitsMixin:
                 live.get("accounting_pending_partials"))
             if not pending:
                 return
+            if not _spot_accounting_retry_due(live):
+                return
             try:
                 durable = self.state.update_many(
                     sym, {"accounting_pending_partials": pending}
@@ -294,20 +306,27 @@ class ExitsMixin:
                 self._log_error(
                     f"spot partial accounting write-ahead {sym}", exc
                 )
+                _defer_spot_accounting_retry(self, sym, live)
                 return
-            if durable is False:
+            if durable is not None and durable is not True:
+                retry_delay = _defer_spot_accounting_retry(self, sym, live)
                 log_event(
                     f" {sym}: partial accounting state is not durable - "
-                    f"DB retry deferred",
+                    f"DB retry deferred for {retry_delay:.0f}s",
                     "ERROR",
                 )
                 return
             remaining = []
             for item in pending:
                 try:
-                    retry_item = dict(item)
-                    retry_item.setdefault("mode_is_sim", self.simulation)
-                    saved = bool(save_trade_db(**retry_item))
+                    retry_item = validated_pending_partial_accounting_item(
+                        item,
+                        symbol=sym,
+                        bot_name=self.BOT_NAME,
+                        mode_is_sim=self.simulation,
+                        is_futures=False,
+                    )
+                    saved = save_trade_db(**retry_item) is True
                 except Exception as exc:
                     saved = False
                     self._log_error(f"spot partial accounting retry {sym}", exc)
@@ -322,25 +341,53 @@ class ExitsMixin:
                 self._log_error(
                     f"spot partial accounting clear {sym}", exc
                 )
-            if cleared is False:
+            if cleared is not None and cleared is not True:
+                retry_delay = _defer_spot_accounting_retry(self, sym, live)
                 log_event(
                     f" {sym}: partial accounting was booked but its durable "
                     f"pending marker could not be updated; idempotent retry "
-                    f"retained",
+                    f"retained for {retry_delay:.0f}s",
                     "ERROR",
                 )
                 return
             if remaining:
+                retry_delay = _defer_spot_accounting_retry(self, sym, live)
                 log_event(
                     f" {sym}: {len(remaining)} partial accounting event(s) "
-                    f"still pending", "WARN")
+                    f"still pending; retry in {retry_delay:.0f}s",
+                    "WARN",
+                )
             else:
+                if (
+                    "accounting_retry_attempts" in live
+                    or "accounting_retry_next_at" in live
+                ):
+                    try:
+                        self.state.update_many(
+                            sym,
+                            {
+                                "accounting_retry_attempts": 0,
+                                "accounting_retry_next_at": 0.0,
+                            },
+                        )
+                    except Exception as exc:
+                        self._log_error(
+                            f"spot partial accounting backoff reset {sym}",
+                            exc,
+                        )
                 log_event(f"{sym}: pending partial accounting flushed", "INFO")
 
     def _cleanup_accounted_close_state(self, sym: str, d: dict) -> bool:
         """Remove local/claim state after realized PnL was already booked."""
         from core.logger import log_event
         from bot_utils.trade_state import remove_with_restore_fields
+        from core.spot_bot_reconcile import (
+            _defer_spot_accounting_retry,
+            _spot_accounting_retry_due,
+        )
+
+        if not _spot_accounting_retry_due(d):
+            return False
 
         restore = {
             "accounting_already_booked": True,
@@ -357,11 +404,18 @@ class ExitsMixin:
                 or "Close"
             ),
         }
-        ok = remove_with_restore_fields(self.state, sym, restore)
+        try:
+            ok = remove_with_restore_fields(
+                self.state, sym, restore, expected_row=d
+            )
+        except Exception as exc:
+            ok = False
+            self._log_error(f"spot accounted state cleanup {sym}", exc)
         if not ok:
+            retry_delay = _defer_spot_accounting_retry(self, sym, d)
             log_event(
                 f" {sym}: close already booked, but claim/state cleanup "
-                f"failed; state kept for retry",
+                f"failed; state kept for retry in {retry_delay:.0f}s",
                 "WARN",
             )
             return False
@@ -398,6 +452,11 @@ class ExitsMixin:
         while not self._shutdown_event.is_set():
             try:
                 trades = self.state.get_all()
+                price_health_pruner = getattr(
+                    self, "_prune_spot_price_unavailable", None
+                )
+                if callable(price_health_pruner):
+                    price_health_pruner(trades)
                 now = time.time()
                 now_monotonic = time.monotonic()
 
@@ -665,14 +724,36 @@ class ExitsMixin:
         return time.monotonic() < float(
             getattr(self, "_ticker_backoff_until", 0.0) or 0.0)
 
+    def _price_health_guard(self):
+        lock = getattr(self, "_price_health_lock", None)
+        return lock if hasattr(lock, "__enter__") else nullcontext()
+
+    def _prune_spot_price_unavailable(self, active_rows) -> None:
+        active = set(active_rows) if isinstance(active_rows, dict) else set()
+        with self._price_health_guard():
+            counts = getattr(self, "_price_unavail_counts", None)
+            if not isinstance(counts, dict):
+                self._price_unavail_counts = {}
+                return
+            for symbol in tuple(counts):
+                if symbol not in active:
+                    counts.pop(symbol, None)
+
     def _note_spot_price_unavailable(self, sym: str, log_event) -> None:
-        counts = getattr(self, "_price_unavail_counts", None)
-        if counts is None:
-            counts = {}
-            self._price_unavail_counts = counts
-        counts[sym] = counts.get(sym, 0) + 1
-        count = counts[sym]
-        if count == 5 or count % 10 == 0:
+        with self._price_health_guard():
+            counts = getattr(self, "_price_unavail_counts", None)
+            if not isinstance(counts, dict):
+                counts = {}
+                self._price_unavail_counts = counts
+            counts[sym] = counts.get(sym, 0) + 1
+            count = counts[sym]
+        try:
+            threshold = max(
+                1, int(self.PRICE_UNAVAILABLE_HEALTH_THRESHOLD)
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            threshold = 5
+        if count == threshold or count % (threshold * 2) == 0:
             log_event(
                 f"{sym}: price unavailable for {count} consecutive ticks - "
                 f"exit protection is blind; monitoring continues",
@@ -680,15 +761,21 @@ class ExitsMixin:
             )
 
     def _clear_spot_price_unavailable(self, sym: str, log_event=None) -> None:
-        counts = getattr(self, "_price_unavail_counts", None)
-        if counts:
-            previous = counts.pop(sym, 0)
-            if previous >= 5 and callable(log_event):
-                log_event(
-                    f"{sym}: price feed recovered after {previous} "
-                    f"unavailable ticks; exit protection restored",
-                    "OK",
-                )
+        with self._price_health_guard():
+            counts = getattr(self, "_price_unavail_counts", None)
+            previous = counts.pop(sym, 0) if isinstance(counts, dict) else 0
+        try:
+            threshold = max(
+                1, int(self.PRICE_UNAVAILABLE_HEALTH_THRESHOLD)
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            threshold = 5
+        if previous >= threshold and callable(log_event):
+            log_event(
+                f"{sym}: price feed recovered after {previous} "
+                f"unavailable ticks; exit protection restored",
+                "OK",
+            )
 
     def _maybe_persist_last_price(self, sym: str, curr: float) -> None:
         """Persist last_price only every LAST_PRICE_PERSIST_INTERVAL_SEC, not
@@ -893,7 +980,7 @@ class ExitsMixin:
                         or key.startswith("accounting_pending_")
                     }
                     durable = self.state.update_many(sym, pending_fields)
-                    if durable is False:
+                    if durable is not None and durable is not True:
                         log_event(
                             f" {sym}: pending full accounting retry deferred; "
                             f"recovery marker is not durable",
@@ -1138,7 +1225,7 @@ class ExitsMixin:
                 persisted = self.state.update(
                     sym, "partial_exit_requested_amount", durable_request
                 )
-                if persisted is False:
+                if persisted is not None and persisted is not True:
                     log_event(
                         f" {sym}: legacy partial-TP amount backfill is not "
                         "durable; recovery deferred",
@@ -1330,7 +1417,7 @@ class ExitsMixin:
                     persisted = self.state.update(
                         sym, request_key, requested_sell
                     )
-                    if persisted is False:
+                    if persisted is not None and persisted is not True:
                         log_event(
                             f" {sym}: cannot persist partial-TP amount before "
                             "live sell",
@@ -1545,7 +1632,7 @@ class ExitsMixin:
         except Exception as e:
             state_persisted = False
             self._log_error(f"spot partial state write-ahead {sym}", e)
-        if state_persisted is False:
+        if state_persisted is not None and state_persisted is not True:
             log_event(
                 f" {sym}: partial-TP state write-ahead failed - DB booking "
                 f"deferred fail-closed",
@@ -1557,7 +1644,7 @@ class ExitsMixin:
             return True
 
         try:
-            accounting_ok = bool(save_trade_db(**partial_trade))
+            accounting_ok = save_trade_db(**partial_trade) is True
         except Exception as e:
             accounting_ok = False
             self._log_error(f"spot partial save_trade_db {sym}", e)
@@ -1569,7 +1656,7 @@ class ExitsMixin:
             except Exception as e:
                 cleared = False
                 self._log_error(f"spot partial pending clear {sym}", e)
-            if cleared is False:
+            if cleared is not None and cleared is not True:
                 log_event(
                     f" {sym}: partial-TP booked but durable pending clear "
                     f"failed; idempotent retry retained",
@@ -1864,7 +1951,11 @@ class ExitsMixin:
                         self._log_error(
                             f"spot orphan combined accounting {sym}", state_err
                         )
-                    level = "WARN" if flat_persisted is not False else "ERROR"
+                    level = (
+                        "WARN"
+                        if flat_persisted is None or flat_persisted is True
+                        else "ERROR"
+                    )
                     log_event(
                         f"{sym}: base balance is zero with unpriced earlier "
                         f"partials; direct accounting deferred to combined "
@@ -1965,15 +2056,28 @@ class ExitsMixin:
                 self._log_error(
                     f"spot verified-flat combined accounting {sym}", state_err
                 )
-            level = "WARN" if flat_persisted is not False else "ERROR"
+            level = (
+                "WARN"
+                if flat_persisted is None or flat_persisted is True
+                else "ERROR"
+            )
             log_event(
                 f" {sym}: final sell filled with unpriced earlier partials; "
                 f"direct accounting deferred to combined offline reconcile",
                 level,
             )
             return
-        accounting_mode_is_sim = d.get("accounting_pending_mode_is_sim",
-                                       self.simulation)
+        from bot_utils.trade_state import validated_close_accounting_mode_or_none
+        accounting_mode_is_sim = validated_close_accounting_mode_or_none(
+            d, self.simulation
+        )
+        if accounting_mode_is_sim is None:
+            log_event(
+                f" {sym}: filled close accounting mode conflicts with runtime; "
+                "state kept for recovery",
+                "ERROR",
+            )
+            return
         mfe_pct, mae_pct, giveback_pct = _spot_excursion_metrics(d, fill_price)
         trade_row = dict(
             bot_name=self.BOT_NAME,
@@ -2030,7 +2134,7 @@ class ExitsMixin:
                 self._log_error(
                     f"spot partial full-exit write-ahead {sym}", state_err
                 )
-            if pending_persisted is False:
+            if pending_persisted is not None and pending_persisted is not True:
                 log_event(
                     f" {sym}: partial full-exit fill was not booked because "
                     f"its residual accounting state was not durable",
@@ -2062,7 +2166,7 @@ class ExitsMixin:
                 self._log_error(
                     f"spot full accounting write-ahead {sym}", state_err
                 )
-            if pending_persisted is False:
+            if pending_persisted is not None and pending_persisted is not True:
                 log_event(
                     f" {sym}: filled full exit was not booked because its "
                     f"accounting recovery marker was not durable",
@@ -2070,7 +2174,7 @@ class ExitsMixin:
                 )
                 return
         try:
-            accounting_ok = bool(save_trade_db(**trade_row))
+            accounting_ok = save_trade_db(**trade_row) is True
         except Exception as e:
             accounting_ok = False
             self._log_error(f"spot full save_trade_db {sym}", e)
@@ -2096,7 +2200,7 @@ class ExitsMixin:
                 self._log_error(
                     f"spot partial full-exit pending clear {sym}", state_err
                 )
-            if cleared is False:
+            if cleared is not None and cleared is not True:
                 log_event(
                     f" {sym}: partial full-exit was booked but its durable "
                     f"pending marker could not be cleared; idempotent retry kept",
@@ -2107,6 +2211,25 @@ class ExitsMixin:
                 f"({remaining_amount:.8f}/{requested_amount:.8f}); "
                 f"residual kept in state", "WARN")
             return
+
+        # Arm the re-entry barrier before removing state and releasing the
+        # shared claim.  The scanner does not hold this close lock while it
+        # evaluates a candidate, so cleanup-first creates a real window in
+        # which the just-stopped symbol can be claimed again.
+        from trading.cooldown_utils import should_cooldown_after_exit
+        if should_cooldown_after_exit(reason, profit_usdt):
+            try:
+                from trading.cooldown_utils import set_cooldown as _scd
+                with self._cooldown_lock:
+                    _scd(
+                        self.cool,
+                        sym,
+                        int(self.C("COOLDOWN_AFTER_SL", 120)),
+                        self.COOLDOWN_FILE,
+                    )
+            except Exception as exc:
+                self._log_error(f"spot post-exit cooldown {sym}", exc)
+
         cleanup_row = dict(d)
         cleanup_row.update({
             "accounting_already_booked": True,
@@ -2137,17 +2260,6 @@ class ExitsMixin:
                 )
         except Exception as e:
             log_event(f"Telegram failed: {e}", "WARN")
-
-        # cooldown via canonical helper (UTC, not local time). Arm on ANY
-        # losing protective stop (SL / trailing / break-even), not only an exact
-        # "Stop-Loss", so a coin chopping through the trailing/BE stop can't be
-        # re-bought next tick (outcome-gated, shared classifier).
-        from trading.cooldown_utils import should_cooldown_after_exit
-        if should_cooldown_after_exit(reason, profit_usdt):
-            from trading.cooldown_utils import set_cooldown as _scd
-            with self._cooldown_lock:
-                _scd(self.cool, sym, int(self.C("COOLDOWN_AFTER_SL", 120)),
-                     self.COOLDOWN_FILE)
 
         try:
             analyze_and_adapt(self.BOT_NAME)

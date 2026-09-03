@@ -188,12 +188,14 @@ def _open_metrics_snapshot() -> sqlite3.Connection | None:
         conn.execute("BEGIN")
         return conn
     except Exception as exc:
-        try:
-            if conn is not None:
-                conn.close()
-        except Exception:
-            pass
-        raise MetricsDbReadError(str(exc)) from exc
+        converted = MetricsDbReadError(str(exc))
+        if conn is not None:
+            _close_metrics_snapshot(conn, converted)
+        raise converted from exc
+    except BaseException as exc:
+        if conn is not None:
+            _close_metrics_snapshot(conn, exc)
+        raise
 
 
 def _metrics_day_bounds() -> tuple[str, str, str]:
@@ -260,6 +262,25 @@ def _stats_from_positions(
     }
 
 
+def _close_metrics_snapshot(
+    connection,
+    primary_error: BaseException | None,
+) -> None:
+    """Close exactly once without replacing the authoritative read failure."""
+    try:
+        connection.close()
+    except BaseException as close_error:
+        if primary_error is None:
+            raise
+        try:
+            primary_error.add_note(
+                "close launcher metrics snapshot after read failure: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        except BaseException:
+            pass
+
+
 def _read_trade_metrics(
     bot_modes: dict[str, bool | None],
     *,
@@ -282,6 +303,7 @@ def _read_trade_metrics(
     conn = _open_metrics_snapshot()
     if conn is None:
         return {bot: _empty_bot_stats() for bot in resolved}, 0
+    primary_error: BaseException | None = None
     try:
         from core.database import _complete_trade_positions_from_snapshot
 
@@ -340,10 +362,16 @@ def _read_trade_metrics(
         return result, trades_total
     except Exception as exc:
         if isinstance(exc, MetricsDbReadError):
+            primary_error = exc
             raise
-        raise MetricsDbReadError(str(exc)) from exc
+        converted = MetricsDbReadError(str(exc))
+        primary_error = converted
+        raise converted from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        conn.close()
+        _close_metrics_snapshot(conn, primary_error)
 
 
 def get_trade_metrics_snapshot(
@@ -373,6 +401,7 @@ def get_trade_metrics_signature(
     conn = _open_metrics_snapshot()
     if conn is None:
         return mode_signature, today, 0, ()
+    primary_error: BaseException | None = None
     try:
         row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM trades").fetchone()
         high_water = int(row[0] if row else 0)
@@ -395,10 +424,16 @@ def get_trade_metrics_signature(
         return mode_signature, today, high_water, daily_rows
     except Exception as exc:
         if isinstance(exc, MetricsDbReadError):
+            primary_error = exc
             raise
-        raise MetricsDbReadError(str(exc)) from exc
+        converted = MetricsDbReadError(str(exc))
+        primary_error = converted
+        raise converted from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        conn.close()
+        _close_metrics_snapshot(conn, primary_error)
 
 
 def get_bot_stats_batch(
@@ -436,6 +471,7 @@ def get_pnl_sparklines(
     conn = _open_metrics_snapshot()
     if conn is None:
         return {bot: [] for bot in resolved}
+    primary_error: BaseException | None = None
     try:
         from core.database import _complete_trade_positions_from_snapshot
 
@@ -462,10 +498,16 @@ def get_pnl_sparklines(
         return result
     except Exception as exc:
         if isinstance(exc, MetricsDbReadError):
+            primary_error = exc
             raise
-        raise MetricsDbReadError(str(exc)) from exc
+        converted = MetricsDbReadError(str(exc))
+        primary_error = converted
+        raise converted from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        conn.close()
+        _close_metrics_snapshot(conn, primary_error)
 
 
 def get_pnl_sparkline(bot: str, limit: int = 30,
@@ -848,13 +890,17 @@ def get_market_dashboard_snapshot() -> tuple[dict | None, dict]:
         except Exception as exc:
             raise MetricsDbReadError(str(exc)) from exc
 
+    primary_error: BaseException | None = None
     try:
         return (
             _get_market_info_with_query(query),
             _get_exchange_status_with_query(query),
         )
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        conn.close()
+        _close_metrics_snapshot(conn, primary_error)
 
 
 #  Unrealized PnL 

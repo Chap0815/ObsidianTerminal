@@ -47,8 +47,12 @@ _PERSIST_LOCK = threading.Lock()
 def _safe_text(value, max_chars: int) -> str:
     try:
         rendered = str(value)
-    except Exception:
-        rendered = f"[UNRENDERABLE:{type(value).__name__}]"
+    except BaseException:
+        try:
+            type_name = type(value).__name__
+        except BaseException:
+            type_name = "unknown"
+        rendered = f"[UNRENDERABLE:{type_name}]"
     return rendered[:max_chars]
 
 

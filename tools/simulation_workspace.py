@@ -254,25 +254,57 @@ def _read_json(path: Path) -> dict:
 
 def _fsync_directory(path: Path) -> None:
     try:
-        directory_fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(str(path), flags)
+    except AttributeError:
         return
+    except OSError as exc:
+        if os.name == "nt":
+            if isinstance(exc, PermissionError):
+                return
+            if (
+                isinstance(exc, FileNotFoundError)
+                and path == Path(path.anchor)
+                and path.is_dir()
+            ):
+                return
+        raise
+    primary_error: BaseException | None = None
     try:
         os.fsync(directory_fd)
-    except OSError:
-        pass
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         try:
             os.close(directory_fd)
-        except OSError:
-            pass
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "simulation directory close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
+def _mkdir_with_parent_fsync(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    parent = path.parent
+    while True:
+        _fsync_directory(parent)
+        if parent == parent.parent:
+            break
+        parent = parent.parent
 
 
 def _atomic_write(path: Path, raw: bytes) -> None:
     if len(raw) > MANIFEST_MAX_BYTES:
         raise ValueError(f"manifest exceeds {MANIFEST_MAX_BYTES} bytes")
     path = _absolute_without_links(path, label="immutable evidence path")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_with_parent_fsync(path.parent)
     path = _absolute_without_links(path, label="immutable evidence path")
     if _is_linklike(path):
         raise ValueError("immutable evidence conflict")
@@ -290,26 +322,84 @@ def _atomic_write(path: Path, raw: bytes) -> None:
 
     if path.exists():
         if existing_matches():
+            _fsync_directory(path.parent)
             return
         raise ValueError("immutable evidence conflict")
-    temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    temp: Path | None = None
+    temporary_owned = False
+    primary_error: BaseException | None = None
+    handle = None
     try:
-        with temp.open("xb") as handle:
+        for attempt in range(3):
+            candidate = path.with_name(
+                f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                handle = candidate.open("xb")
+            except FileExistsError:
+                if attempt == 2:
+                    raise
+                continue
+            temp = candidate
+            temporary_owned = True
+            break
+        if handle is None or temp is None:
+            raise RuntimeError("simulation temporary allocation failed")
+        try:
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if primary_error is None:
+                    primary_error = close_error
+                    raise
+                try:
+                    primary_error.add_note(
+                        "simulation temporary close failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
         try:
             os.link(temp, path)
         except FileExistsError as exc:
             if existing_matches():
-                return
-            raise ValueError("immutable evidence conflict") from exc
-        _fsync_directory(path.parent)
-    finally:
+                pass
+            else:
+                raise ValueError("immutable evidence conflict") from exc
         try:
             temp.unlink()
         except FileNotFoundError:
             pass
+        else:
+            temporary_owned = False
+        _fsync_directory(path.parent)
+    except BaseException as exc:
+        if primary_error is None:
+            primary_error = exc
+        raise
+    finally:
+        if temporary_owned and temp is not None:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                try:
+                    primary_error.add_note(
+                        "simulation temporary cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
 
 
 def _utc_cutoff(value: str | datetime) -> datetime:
@@ -423,10 +513,12 @@ def freeze_history_dataset(
     except ValueError as exc:
         raise ValueError("dataset workspace must be a real path") from exc
     datasets = workspace / "datasets"
-    datasets.mkdir(parents=True, exist_ok=True)
+    _mkdir_with_parent_fsync(datasets)
     datasets = _absolute_without_links(datasets, label="dataset workspace")
     staging = datasets / f".staging-{os.getpid()}-{uuid.uuid4().hex}"
     staging.mkdir()
+    primary_error: BaseException | None = None
+    result: Path | None = None
     try:
         series = []
         for symbol in sorted(history):
@@ -470,27 +562,66 @@ def freeze_history_dataset(
         final = datasets / fingerprint
         if final.exists():
             verify_history_dataset(final)
-            return final
-        try:
-            os.rename(staging, final)
-        except OSError:
-            # Another local worker may have published the identical immutable
-            # dataset between the existence check and the atomic rename.
-            if final.is_dir():
-                verify_history_dataset(final)
-                return final
-            raise
+            result = final
+        else:
+            _fsync_directory(staging / "series")
+            _fsync_directory(staging)
+            try:
+                os.rename(staging, final)
+            except OSError:
+                # Another local worker may have published the identical immutable
+                # dataset between the existence check and the atomic rename.
+                if final.is_dir():
+                    verify_history_dataset(final)
+                    result = final
+                else:
+                    raise
+            else:
+                result = final
+        if result is None:
+            raise RuntimeError("history dataset publish did not select a result")
         _fsync_directory(datasets)
-        for path in final.rglob("*"):
+        for path in result.rglob("*"):
             if path.is_file():
                 try:
                     path.chmod(stat.S_IREAD)
                 except OSError:
                     pass
-        return final
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
+        staging_removed = False
+        try:
+            shutil.rmtree(staging)
+        except FileNotFoundError:
+            pass
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "history dataset staging cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            except BaseException:
+                pass
+        else:
+            staging_removed = True
+        if staging_removed:
+            try:
+                _fsync_directory(datasets)
+            except BaseException as cleanup_sync_error:
+                if primary_error is None:
+                    raise
+                try:
+                    primary_error.add_note(
+                        "history dataset staging parent sync failed: "
+                        f"{type(cleanup_sync_error).__name__}: {cleanup_sync_error}"
+                    )
+                except BaseException:
+                    pass
+    return result
 
 
 def verify_history_dataset(dataset_root: str | os.PathLike) -> dict:
@@ -788,10 +919,11 @@ class ReproducibleRun:
                 raise ValueError("existing run manifest conflicts with requested run")
             if not resume:
                 raise FileExistsError("run already exists; pass resume=True to continue")
+            _fsync_directory(runs_root)
         else:
             if resume:
                 raise FileNotFoundError("resume requested but reproducible run does not exist")
-            runs_root.mkdir(parents=True, exist_ok=True)
+            _mkdir_with_parent_fsync(runs_root)
             staging = runs_root / f".staging-{os.getpid()}-{uuid.uuid4().hex}"
             try:
                 staging.mkdir()
@@ -799,6 +931,8 @@ class ReproducibleRun:
                     staging / "run_manifest.json", _canonical_bytes(manifest)
                 )
                 (staging / "checkpoints").mkdir()
+                _fsync_directory(staging / "checkpoints")
+                _fsync_directory(staging)
                 try:
                     os.rename(staging, self.root)
                 except OSError as exc:
@@ -942,15 +1076,17 @@ class ReproducibleRun:
             "params_hash": self._params_hash(params),
             "record": _jsonable(record),
         })
+        raw = _canonical_bytes(value)
         path = self._checkpoint_path(index)
         with self._lock:
             self._revalidate_sources()
             if path.exists():
                 existing = _read_json(path)
-                if _canonical_bytes(existing) != _canonical_bytes(value):
-                    raise ValueError(f"checkpoint {index} already contains other evidence")
-                return
-            _atomic_write(path, _canonical_bytes(value))
+                if _canonical_bytes(existing) != raw:
+                    raise ValueError(
+                        f"checkpoint {index} conflicts with existing evidence"
+                    )
+            _atomic_write(path, raw)
 
     def _checkpoint_path(self, index: int) -> Path:
         if isinstance(index, bool) or not isinstance(index, int) or index < 0:

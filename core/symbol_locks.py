@@ -16,11 +16,17 @@ Public API:
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Dict
+
+import portalocker
+
+from bot_utils.runtime_threads import thread_definitely_never_started
 
 
 # Single mutex protects ALL of: _LOCKS, _REFCOUNTS, _CREATED_AT
@@ -30,6 +36,92 @@ _REFCOUNTS: Dict[str, int]            = {}
 
 _ADVISORY_TTL_SEC   = 120
 _ADVISORY_TIMEOUT   = 2.0
+_RENEWAL_MUTEX = threading.Lock()
+_RENEWAL_GENERATIONS: dict[int, dict] = {}
+_RENEWAL_BY_LOCK: dict[str, dict] = {}
+
+
+def _retire_renewal_generation(state: dict) -> None:
+    with _RENEWAL_MUTEX:
+        if _RENEWAL_GENERATIONS.get(id(state)) is state:
+            _RENEWAL_GENERATIONS.pop(id(state), None)
+        lock_name = state.get("lock_name")
+        if _RENEWAL_BY_LOCK.get(lock_name) is state:
+            _RENEWAL_BY_LOCK.pop(lock_name, None)
+
+
+def _renewal_admission_blocked(lock_name: str) -> bool:
+    with _RENEWAL_MUTEX:
+        state = _RENEWAL_BY_LOCK.get(lock_name)
+        if state is None:
+            return False
+        if not state["done"].is_set():
+            return True
+        if _RENEWAL_GENERATIONS.get(id(state)) is state:
+            _RENEWAL_GENERATIONS.pop(id(state), None)
+        if _RENEWAL_BY_LOCK.get(lock_name) is state:
+            _RENEWAL_BY_LOCK.pop(lock_name, None)
+        return False
+
+
+def _publish_renewal_generation(state: dict) -> bool:
+    lock_name = state["lock_name"]
+    with _RENEWAL_MUTEX:
+        current = _RENEWAL_BY_LOCK.get(lock_name)
+        if current is not None and not current["done"].is_set():
+            return False
+        if current is not None:
+            if _RENEWAL_GENERATIONS.get(id(current)) is current:
+                _RENEWAL_GENERATIONS.pop(id(current), None)
+            if _RENEWAL_BY_LOCK.get(lock_name) is current:
+                _RENEWAL_BY_LOCK.pop(lock_name, None)
+        _RENEWAL_GENERATIONS[id(state)] = state
+        _RENEWAL_BY_LOCK[lock_name] = state
+        return True
+
+
+def _close_os_lock_relative(lock_name: str) -> Path:
+    """Return a fixed-length, path-safe key for one close namespace."""
+    digest = hashlib.sha256(lock_name.encode("utf-8")).hexdigest()
+    return Path("logs") / ".close_locks" / f"{digest}.lock"
+
+
+def _acquire_close_os_lock(lock_name: str):
+    """Acquire the root-bound kernel lock that owns close exclusivity."""
+    from core.paths import PROJECT_ROOT
+    from update_barrier import (
+        assert_root_bound_lock_handle,
+        prepare_root_bound_lock_path,
+    )
+
+    relative = _close_os_lock_relative(lock_name)
+    path = prepare_root_bound_lock_path(PROJECT_ROOT, relative)
+    lease = portalocker.Lock(
+        str(path),
+        mode="a+b",
+        timeout=_ADVISORY_TIMEOUT,
+        check_interval=0.05,
+        fail_when_locked=False,
+    )
+    handle = lease.acquire()
+    try:
+        assert_root_bound_lock_handle(PROJECT_ROOT, relative, handle)
+    except BaseException:
+        try:
+            lease.release()
+        except Exception:
+            pass
+        raise
+    return lease
+
+
+def _log_close_lock_failure(context: str, message: str) -> None:
+    try:
+        from bot_utils.silent_log import silent_log
+
+        silent_log(context, RuntimeError(message))
+    except Exception:
+        pass
 
 
 def _process_run_id() -> str:
@@ -78,12 +170,16 @@ def _decref(sym: str) -> None:
 def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
                fail_open: bool = False):
     """
-    Acquire the per-symbol close lock (in-process) AND a cross-process
-    advisory lock backed by the advisory_locks SQLite table.
+    Acquire the per-symbol close lock (in-process), a root-bound OS file lock,
+    and the diagnostic advisory lease backed by the SQLite table.  The OS lock
+    owns mutual exclusion for the whole context even if the renewable DB lease
+    expires temporarily.
 
-    Routine accounting paths fail closed when the cross-process advisory lock
-    cannot be acquired. Emergency flatten paths may opt into fail_open=True and
-    must avoid double-booking accounting.
+    Routine accounting paths fail closed when either cross-process barrier
+    cannot be acquired. Emergency paths may opt into ``fail_open=True`` only
+    for a missing diagnostic DB lease while the OS lock is held. OS-lock
+    contention always yields ``False`` so the caller can choose an explicit
+    flatten-without-accounting path without claiming ownership.
 
         with close_lock("BTC/USDT") as got:
             if not got:
@@ -98,6 +194,9 @@ def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
     _adv_acquired  = False
     _renew_stop = None
     _renew_thread = None
+    _renew_state = None
+    _os_lease = None
+    _renewal_blocked = False
 
     try:
         got = lock.acquire(timeout=timeout)
@@ -108,28 +207,86 @@ def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
                 _adv_lock_name = _advisory_lock_name(_bn, _base)
                 _adv_holder_id = f"v2:{os.getpid()}:{_PROCESS_RUN_ID}"
                 import time as _time
-                _deadline = _time.monotonic() + _ADVISORY_TIMEOUT
-                while _time.monotonic() < _deadline:
+                if _renewal_admission_blocked(_adv_lock_name):
+                    _renewal_blocked = True
+                    _log_close_lock_failure(
+                        f"close_lock renewal admission({_adv_lock_name})",
+                        "prior renewal generation is unresolved",
+                    )
+                else:
                     try:
-                        from core.database import acquire_advisory_lock
-                        if acquire_advisory_lock(_adv_lock_name, _adv_holder_id,
-                                                 ttl_sec=_ADVISORY_TTL_SEC):
-                            _adv_acquired = True
-                            break
+                        _os_lease = _acquire_close_os_lock(_adv_lock_name)
                     except Exception:
+                        _log_close_lock_failure(
+                            f"close_lock OS acquire({_adv_lock_name})",
+                            "root-bound close lock unavailable",
+                        )
+                if (
+                    _os_lease is not None
+                    and _renewal_admission_blocked(_adv_lock_name)
+                ):
+                    _renewal_blocked = True
+                    _log_close_lock_failure(
+                        f"close_lock renewal handoff({_adv_lock_name})",
+                        "prior renewal generation is unresolved",
+                    )
+                    try:
+                        _os_lease.release()
+                    except Exception:
+                        _log_close_lock_failure(
+                            f"close_lock OS release({_adv_lock_name})",
+                            "root-bound close lock release failed",
+                        )
+                    else:
+                        _os_lease = None
+                if _os_lease is not None and not _renewal_blocked:
+                    _deadline = _time.monotonic() + _ADVISORY_TIMEOUT
+                    while _time.monotonic() < _deadline:
                         try:
-                            from bot_utils.silent_log import silent_log
-                            silent_log(
-                                f"close_lock advisory acquire({_adv_lock_name})",
-                                RuntimeError("advisory lock backend unavailable"),
-                            )
+                            from core.database import acquire_advisory_lock
+                            if acquire_advisory_lock(
+                                _adv_lock_name,
+                                _adv_holder_id,
+                                ttl_sec=_ADVISORY_TTL_SEC,
+                            ):
+                                _adv_acquired = True
+                                break
                         except Exception:
-                            pass
-                        break
-                    _time.sleep(0.05)
+                            _log_close_lock_failure(
+                                f"close_lock advisory acquire({_adv_lock_name})",
+                                "advisory lock backend unavailable",
+                            )
+                            break
+                        _time.sleep(0.05)
                 if _adv_acquired:
                     _renew_stop = threading.Event()
                     _interval = max(0.05, min(30.0, _ADVISORY_TTL_SEC / 3.0))
+                    _renew_state = {
+                        "stop": _renew_stop,
+                        "done": threading.Event(),
+                        "thread": None,
+                        "lock_name": _adv_lock_name,
+                        "holder_id": _adv_holder_id,
+                    }
+
+                    def _release_late_lease() -> None:
+                        try:
+                            from core.database import release_advisory_lock
+                            if not release_advisory_lock(
+                                _adv_lock_name,
+                                _adv_holder_id,
+                            ):
+                                _log_close_lock_failure(
+                                    "close_lock late advisory release"
+                                    f"({_adv_lock_name})",
+                                    "late advisory release was not confirmed",
+                                )
+                        except Exception:
+                            _log_close_lock_failure(
+                                "close_lock late advisory release"
+                                f"({_adv_lock_name})",
+                                "late advisory release raised",
+                            )
 
                     def _renew_loop():
                         warned = False
@@ -139,9 +296,13 @@ def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
                                     acquire_advisory_lock,
                                     renew_advisory_lock,
                                 )
-                                if not renew_advisory_lock(
+                                renewed = renew_advisory_lock(
                                         _adv_lock_name, _adv_holder_id,
-                                        ttl_sec=_ADVISORY_TTL_SEC):
+                                        ttl_sec=_ADVISORY_TTL_SEC)
+                                if renewed and _renew_stop.is_set():
+                                    _release_late_lease()
+                                    break
+                                if not renewed:
                                     reacquired = False
                                     if not _renew_stop.is_set():
                                         try:
@@ -151,13 +312,9 @@ def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
                                         except Exception:
                                             reacquired = False
                                     if reacquired and _renew_stop.is_set():
-                                        try:
-                                            from core.database import release_advisory_lock
-                                            release_advisory_lock(
-                                                _adv_lock_name, _adv_holder_id)
-                                        except Exception:
-                                            pass
+                                        _release_late_lease()
                                         reacquired = False
+                                        break
                                     if reacquired:
                                         warned = False
                                         continue
@@ -186,11 +343,47 @@ def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
                                         pass
                                 continue
 
+                    def _owned_renew_loop():
+                        try:
+                            _renew_loop()
+                        finally:
+                            _renew_state["done"].set()
+                            _retire_renewal_generation(_renew_state)
+
                     _renew_thread = threading.Thread(
-                        target=_renew_loop, name=f"renew-{_adv_lock_name}",
+                        target=_owned_renew_loop,
+                        name=f"renew-{_adv_lock_name}",
                         daemon=True)
-                    _renew_thread.start()
-        if got and _adv_lock_name and not _adv_acquired and not fail_open:
+                    _renew_state["thread"] = _renew_thread
+                    if not _publish_renewal_generation(_renew_state):
+                        _renew_state["stop"].set()
+                        _renew_state["done"].set()
+                        try:
+                            from core.database import release_advisory_lock
+                            release_advisory_lock(
+                                _adv_lock_name,
+                                _adv_holder_id,
+                            )
+                        finally:
+                            _adv_acquired = False
+                            _renew_thread = None
+                            _renew_state = None
+                    else:
+                        try:
+                            _renew_thread.start()
+                        except BaseException:
+                            if thread_definitely_never_started(_renew_thread):
+                                _renew_state["done"].set()
+                                _retire_renewal_generation(_renew_state)
+                            raise
+        if (
+            got
+            and _adv_lock_name
+            and (
+                _os_lease is None
+                or (not _adv_acquired and not fail_open)
+            )
+        ):
             try:
                 lock.release()
             except RuntimeError:
@@ -198,12 +391,12 @@ def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
             got = False
         yield got
     finally:
-        if _renew_stop is not None:
+        if _renew_state is not None:
             try:
-                _renew_stop.set()
+                _renew_state["stop"].set()
             except Exception:
                 pass
-        if _renew_thread is not None:
+        if _renew_state is not None and _renew_thread is not None:
             try:
                 _renew_thread.join(
                     timeout=max(1.0, min(5.0, float(_ADVISORY_TIMEOUT) + 0.5)))
@@ -230,6 +423,14 @@ def close_lock(sym: str, timeout: float = 5.0, bot_name: str = None,
                     )
                 except Exception:
                     pass
+        if _os_lease is not None:
+            try:
+                _os_lease.release()
+            except Exception:
+                _log_close_lock_failure(
+                    f"close_lock OS release({_adv_lock_name})",
+                    "root-bound close lock release failed",
+                )
         if got:
             try:
                 lock.release()

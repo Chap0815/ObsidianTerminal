@@ -11,17 +11,57 @@ keyword analysis.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import sys
 import tempfile
 
 import customtkinter as ctk
 import tkinter as tk
 
-from bot_utils.silent_log import silent_log
 from launcher.config.settings import BOT_META, COLORS, FONT_BODY, PROJECT_ROOT
 from launcher.ui.components.widgets import safe_geometry
 from launcher.ui.theme import force_dark_titlebar
 from shared_limits import PROMPT_TEXT_MAX_BYTES, read_bounded_text_file
+
+
+def _note_prompt_cleanup_error(
+    primary: BaseException,
+    cleanup_error: BaseException,
+) -> None:
+    try:
+        primary.add_note(
+            "prompt temporary cleanup failed: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+    except BaseException:
+        pass
+
+
+def _fsync_prompt_directory(path: Path) -> None:
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(str(path), flags)
+    except AttributeError:
+        return
+    except OSError as exc:
+        # CPython on Windows cannot open directories through os.open.  An
+        # actual I/O error on a supported directory handle remains fatal.
+        if os.name == "nt" and isinstance(exc, PermissionError):
+            return
+        raise
+    primary_error: BaseException | None = None
+    try:
+        os.fsync(directory_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            os.close(directory_fd)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            _note_prompt_cleanup_error(primary_error, close_error)
 
 
 def _atomic_write_prompt(path: str, content: str) -> None:
@@ -29,25 +69,79 @@ def _atomic_write_prompt(path: str, content: str) -> None:
         raise ValueError("prompt text exceeds size limit")
     prompt_dir = os.path.dirname(path) or "."
     os.makedirs(prompt_dir, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
+    fd, tmp_name = tempfile.mkstemp(
         prefix=os.path.basename(path) + ".tmp.",
         dir=prompt_dir,
     )
+    tmp = Path(tmp_name)
+    fd_owned = True
+    temp_owned = True
+    temp_identity: tuple[int, int] | None = None
+    primary_error: BaseException | None = None
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        temp_stat = os.fstat(fd)
+        temp_identity = (temp_stat.st_dev, temp_stat.st_ino)
+        handle = None
+        handle_error: BaseException | None = None
+        try:
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+            fd_owned = False
             handle.write(content)
             handle.flush()
-            try:
-                os.fsync(handle.fileno())
-            except Exception as exc:
-                silent_log(f"prompt_editor fsync({path})", exc)
+            os.fsync(handle.fileno())
+        except BaseException as exc:
+            handle_error = exc
+            raise
+        finally:
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException as close_error:
+                    if handle_error is None:
+                        raise
+                    _note_prompt_cleanup_error(handle_error, close_error)
         os.replace(tmp, path)
+        temp_owned = False
+        _fsync_prompt_directory(Path(prompt_dir))
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
+        cleanup_error: BaseException | None = None
+        if fd_owned:
+            try:
+                os.close(fd)
+            except BaseException as exc:
+                cleanup_error = exc
+        same_generation = False
+        if temp_owned and temp_identity is not None:
+            try:
+                current = tmp.stat(follow_symlinks=False)
+                same_generation = (
+                    current.st_dev,
+                    current.st_ino,
+                ) == temp_identity
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                else:
+                    _note_prompt_cleanup_error(cleanup_error, exc)
+        if same_generation:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                else:
+                    _note_prompt_cleanup_error(cleanup_error, exc)
+        if cleanup_error is not None:
+            if primary_error is None:
+                raise cleanup_error
+            _note_prompt_cleanup_error(primary_error, cleanup_error)
 
 
 class PromptEditor(ctk.CTkToplevel):

@@ -29,6 +29,10 @@ import os
 from datetime import datetime, timezone
 
 from bot_utils.api_budget import try_consume_api_call
+from bot_utils.state_persist import (
+    is_canonical_position_symbol,
+    position_boolean_rejection_field,
+)
 from launcher.config.settings import BOT_META, PROJECT_ROOT
 
 
@@ -246,15 +250,19 @@ def _launcher_spot_exit_client_order_id(row: dict, sym: str,
     )
 
 
+def _atomic_save_json_confirmed(path: str, payload: dict) -> bool:
+    from bot_utils.state_persist import atomic_save_json
+
+    return atomic_save_json(path, payload) is True
+
+
 def _persist_launcher_spot_exit_fields(trades_file: str, all_rows: dict,
                                        sym: str, row: dict,
                                        updates: dict) -> dict | None:
-    from bot_utils.state_persist import atomic_save_json
-
     updated = dict(row)
     updated.update(updates)
     all_rows[sym] = updated
-    if not atomic_save_json(trades_file, all_rows):
+    if not _atomic_save_json_confirmed(trades_file, all_rows):
         return None
     return updated
 
@@ -281,12 +289,39 @@ def _state_value_prefer_key(row: dict, preferred: str, legacy: str):
     return row.get(preferred) if preferred in row else row.get(legacy)
 
 
+def _causal_entry_id_or_none(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    entry_id = value.strip()
+    if (
+        not entry_id
+        or len(entry_id) > 64
+        or any(ord(char) < 32 or ord(char) == 127 for char in entry_id)
+    ):
+        return None
+    return entry_id
+
+
+def _futures_dashboard_matches_json_generation(
+    dashboard_row: dict,
+    json_row: dict,
+) -> bool:
+    """Never combine dashboard prices/side with another local generation."""
+    raw_local_id = json_row.get("entry_id")
+    if raw_local_id is None:
+        return True
+    local_id = _causal_entry_id_or_none(raw_local_id)
+    dashboard_id = _causal_entry_id_or_none(dashboard_row.get("entry_id"))
+    return local_id is not None and dashboard_id == local_id
+
+
 def _invalid_json_position_rows(state: dict) -> list:
     return [
         symbol
         for symbol, row in state.items()
-        if not isinstance(symbol, str) or not symbol.strip()
+        if not is_canonical_position_symbol(symbol)
         or not isinstance(row, dict)
+        or position_boolean_rejection_field(row) is not None
     ]
 
 
@@ -495,9 +530,12 @@ def _json_state_has_open_position(path: str) -> bool:
     for row in data.values():
         if not isinstance(row, dict):
             return True
-        if str(row.get("state", "OPEN")).upper() == "CLOSED":
+        if str(row.get("state", "OPEN")).strip().upper() in {
+            "CLOSED",
+            "FLAT",
+        }:
             continue
-        # Fail closed: a non-CLOSED state row is an open artifact even if
+        # Fail closed: a non-terminal state row is an open artifact even if
         # its amount is missing, zero, negative or malformed.
         return True
     return False
@@ -514,7 +552,10 @@ def mode_switch_blockers(bot_name: str) -> list[str]:
         from core.database import get_connection
         conn = get_connection()
         rows = conn.execute(
-            "SELECT COUNT(*) AS n FROM bot_open_positions WHERE bot_name=?",
+            """SELECT COUNT(*) AS n FROM bot_open_positions
+               WHERE bot_name=?
+                 AND UPPER(TRIM(COALESCE(state, '')))
+                     NOT IN ('CLOSED', 'FLAT')""",
             (bot_name,),
         ).fetchone()
         if rows and int(rows["n"] if hasattr(rows, "keys") else rows[0]) > 0:
@@ -592,9 +633,12 @@ def get_open_spot_positions(bot_name: str,
             positions.append(_invalid_spot_position_row(
                 sym, {}, detail, bool(effective_sim)))
             continue
-        # Skip entries explicitly marked CLOSED (StateManager schema)
+        # Skip entries explicitly marked terminal (StateManager schema)
         # so we don't show partial-TP residue or stale closed positions.
-        if str(d.get("state", "OPEN")).upper() == "CLOSED":
+        if str(d.get("state", "OPEN")).strip().upper() in {
+            "CLOSED",
+            "FLAT",
+        }:
             continue
         # Prefer the new key, fall back to the old. Entries may have only
         # one or the other depending on which writer ran last.
@@ -1038,6 +1082,13 @@ def _direct_close_remaining_futures(
         if not sym:
             continue
         jt = json_trades.get(sym) or {}  # fee keys come from JSON, not from futures_state
+        if jt and not _futures_dashboard_matches_json_generation(p, jt):
+            log(
+                "warn",
+                f"{sym}: stale futures_state generation ignored; "
+                "using authoritative JSON position",
+            )
+            continue
         jt_amount = _finite_float(jt.get("amount", 0))
         jt_original = _finite_float(jt.get("original_amount", jt.get("amount", 0)))
         symbols_to_close[sym] = {
@@ -1066,7 +1117,7 @@ def _direct_close_remaining_futures(
             ),
             "initial_entry_fee": jt.get("initial_entry_fee"),
             "fees_paid":         jt.get("fees_paid"),
-            "entry_id":          jt.get("entry_id"),
+            "entry_id":          jt.get("entry_id") or p.get("entry_id"),
             "claim_release_pending": bool(jt.get("claim_release_pending")),
             "accounting_already_booked": bool(jt.get("accounting_already_booked")),
             "accounting_pending": bool(jt.get("accounting_pending")),
@@ -1275,8 +1326,7 @@ def _direct_close_remaining_futures(
             durable_retry["claim_release_pending"] = True
             if json_trades.get(sym) != durable_retry:
                 json_trades[sym] = durable_retry
-                from bot_utils.state_persist import atomic_save_json
-                if not atomic_save_json(trades_file, json_trades):
+                if not _atomic_save_json_confirmed(trades_file, json_trades):
                     failed_syms.append(sym)
                     failed_position_updates[sym] = durable_retry
                     log(
@@ -1286,8 +1336,19 @@ def _direct_close_remaining_futures(
                     )
                     return False
 
+        entry_id = _causal_entry_id_or_none(row.get("entry_id"))
+        opened_at = row.get("opened_at") or row.get("buy_time")
         try:
-            remove_futures_state(sym, bot_name, sim_only)
+            if entry_id is None:
+                remove_futures_state(sym, bot_name, sim_only)
+            else:
+                remove_futures_state(
+                    sym,
+                    bot_name,
+                    sim_only,
+                    expected_opened_at=opened_at,
+                    expected_entry_id=entry_id,
+                )
         except Exception as e:
             keep = _retry_copy()
             keep["accounting_already_booked"] = True
@@ -1300,10 +1361,26 @@ def _direct_close_remaining_futures(
             return False
 
         if sim_only:
+            if entry_id is None:
+                return True
+            try:
+                remove_futures_state(
+                    sym,
+                    bot_name,
+                    sim_only,
+                    expected_opened_at=opened_at,
+                    expected_entry_id=entry_id,
+                )
+            except Exception as e:
+                log("error", f"{sym}: final futures_state cleanup failed: {e}")
             return True
 
         try:
-            claim_released = remove_open_position(bot_name, sym)
+            claim_released = remove_open_position(
+                bot_name,
+                sym,
+                expected_entry_id=entry_id,
+            )
         except Exception as e:
             keep = _retry_copy()
             keep["accounting_already_booked"] = True
@@ -1313,7 +1390,7 @@ def _direct_close_remaining_futures(
             failed_position_updates[sym] = keep
             log("error", f"{sym}: claim release raised: {e}")
             return False
-        if claim_released is False:
+        if claim_released is not True:
             keep = _retry_copy()
             keep["accounting_already_booked"] = True
             keep["claim_release_pending"] = True
@@ -1322,6 +1399,18 @@ def _direct_close_remaining_futures(
             failed_position_updates[sym] = keep
             log("error", f"{sym}: claim release failed - state kept for review")
             return False
+        if entry_id is None:
+            return True
+        try:
+            remove_futures_state(
+                sym,
+                bot_name,
+                sim_only,
+                expected_opened_at=opened_at,
+                expected_entry_id=entry_id,
+            )
+        except Exception as e:
+            log("error", f"{sym}: final futures_state cleanup failed: {e}")
         return True
 
     try:
@@ -1529,7 +1618,7 @@ def _direct_close_remaining_futures(
                     mode_is_sim=sim_only,
                 )
                 try:
-                    saved_ok = bool(save_trade_db(**pending_kwargs))
+                    saved_ok = save_trade_db(**pending_kwargs) is True
                 except Exception as e:
                     saved_ok = False
                     log("error", f"{sym}: pending futures DB retry raised: {e}")
@@ -1589,7 +1678,7 @@ def _direct_close_remaining_futures(
                     retry_item.setdefault("mode_is_sim", sim_only)
                     retry_item.setdefault("is_futures", True)
                     try:
-                        ok = bool(save_trade_db(**retry_item))
+                        ok = save_trade_db(**retry_item) is True
                     except Exception as e:
                         ok = False
                         log("error", f"{sym}: pending futures partial DB retry raised: {e}")
@@ -1984,9 +2073,7 @@ def _direct_close_remaining_futures(
                     })
                     json_trades[sym] = retry_state
                     try:
-                        from bot_utils.state_persist import atomic_save_json
-
-                        pending_durable = atomic_save_json(
+                        pending_durable = _atomic_save_json_confirmed(
                             trades_file, json_trades
                         )
                     except Exception:
@@ -2054,7 +2141,7 @@ def _direct_close_remaining_futures(
                 entry_id=p.get("entry_id"),
                 mode_is_sim=sim_only,
             )
-            if saved_ok is False:
+            if saved_ok is not True:
                 log("error",
                     f"{sym}: DB trade save failed - state/claim KEPT for review")
                 failed_syms.append(sym)
@@ -2081,8 +2168,7 @@ def _direct_close_remaining_futures(
                     "accounting_booked_exchange_order_id": exchange_order_id,
                 })
                 json_trades[sym] = booked_state
-                from bot_utils.state_persist import atomic_save_json
-                if not atomic_save_json(trades_file, json_trades):
+                if not _atomic_save_json_confirmed(trades_file, json_trades):
                     failed_syms.append(sym)
                     failed_position_updates[sym] = booked_state
                     log("error",
@@ -2132,8 +2218,7 @@ def _direct_close_remaining_futures(
                 elif sym in symbols_to_close:
                     remaining[sym] = _json_state_from_futures_row(
                         symbols_to_close[sym])
-        from bot_utils.state_persist import atomic_save_json
-        if not atomic_save_json(trades_file, remaining):
+        if not _atomic_save_json_confirmed(trades_file, remaining):
             state_cleanup_failed = True
             log("error", "State cleanup write failed - stale positions may remain")
         if failed_syms:
@@ -2261,7 +2346,7 @@ def _direct_close_remaining_spot(
                     and d.get("claim_release_pending")
                     and d.get("accounting_already_booked")):
                 try:
-                    if remove_open_position(bot_name, sym) is False:
+                    if remove_open_position(bot_name, sym) is not True:
                         failed_syms.append(sym)
                         failed_position_updates[sym] = dict(d)
                         log("error",
@@ -2312,7 +2397,7 @@ def _direct_close_remaining_spot(
                         continue
                     retry_item.setdefault("mode_is_sim", sim_only)
                     try:
-                        ok = bool(save_trade_db(**retry_item))
+                        ok = save_trade_db(**retry_item) is True
                     except Exception as e:
                         ok = False
                         log("error", f"{sym}: pending partial DB retry raised: {e}")
@@ -2371,7 +2456,7 @@ def _direct_close_remaining_spot(
                     mode_is_sim=sim_only,
                 )
                 try:
-                    saved_ok = bool(save_trade_db(**pending_kwargs))
+                    saved_ok = save_trade_db(**pending_kwargs) is True
                 except Exception as e:
                     saved_ok = False
                     log("error", f"{sym}: pending full DB retry raised: {e}")
@@ -2380,7 +2465,7 @@ def _direct_close_remaining_spot(
                     failed_position_updates[sym] = dict(d)
                     continue
                 try:
-                    if not sim_only and remove_open_position(bot_name, sym) is False:
+                    if not sim_only and remove_open_position(bot_name, sym) is not True:
                         failed_syms.append(sym)
                         failed_position_updates[sym] = dict(d)
                         log("error",
@@ -2765,7 +2850,7 @@ def _direct_close_remaining_spot(
             except Exception as e:
                 saved_ok = False
                 log("error", f"{sym}: DB trade save raised after sell: {e}")
-            if saved_ok is False:
+            if saved_ok is not True:
                 log("error",
                     f"{sym}: DB trade save failed - state/claim KEPT for review")
                 if partial_live_fill:
@@ -2826,8 +2911,7 @@ def _direct_close_remaining_spot(
                 booked_state["accounting_already_booked"] = True
                 booked_state["claim_release_pending"] = True
                 json_trades[sym] = booked_state
-                from bot_utils.state_persist import atomic_save_json
-                if not atomic_save_json(trades_file, json_trades):
+                if not _atomic_save_json_confirmed(trades_file, json_trades):
                     log("error",
                         f"{sym}: booked-close marker persistence failed - "
                         f"claim/state KEPT for review")
@@ -2837,7 +2921,7 @@ def _direct_close_remaining_spot(
             try:
                 # Release the shared multi-bot claim (launcher closes outside
                 # TradeState  must clear bot_open_positions itself).
-                if not sim_only and remove_open_position(bot_name, sym) is False:
+                if not sim_only and remove_open_position(bot_name, sym) is not True:
                     log("error",
                         f"{sym}: claim release failed - state kept for review")
                     failed_syms.append(sym)
@@ -2879,8 +2963,7 @@ def _direct_close_remaining_spot(
                     remaining[sym] = failed_position_updates[sym]
                 elif sym in cur:
                     remaining[sym] = cur[sym]
-        from bot_utils.state_persist import atomic_save_json
-        if not atomic_save_json(trades_file, remaining):
+        if not _atomic_save_json_confirmed(trades_file, remaining):
             state_cleanup_failed = True
             log("error", "State cleanup write failed - stale positions may remain")
         if failed_syms:

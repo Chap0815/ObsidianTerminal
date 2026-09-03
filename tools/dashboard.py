@@ -38,6 +38,7 @@ except UpdateInProgressError as exc:
 
 import streamlit as st
 
+from bot_utils.atomic_publish import atomic_write_bytes
 from bot_utils.config import parse_explicit_bool
 from bot_utils.pnl_view import (
     futures_state_age_sec,
@@ -161,10 +162,10 @@ def _write_dashboard_status() -> None:
         }
         os.makedirs(str(LOGS_DIR), exist_ok=True)
         path = os.path.join(str(LOGS_DIR), "dashboard_status.json")
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(status, fh, ensure_ascii=True, sort_keys=True)
-        os.replace(tmp, path)
+        encoded = json.dumps(
+            status, ensure_ascii=True, sort_keys=True
+        ).encode("utf-8")
+        atomic_write_bytes(path, encoded)
     except Exception:
         pass
 

@@ -26,22 +26,16 @@ from __future__ import annotations
 import os
 import queue
 import re
-from collections import OrderedDict
-from collections.abc import Mapping
-from contextlib import contextmanager
 import signal
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
+from collections.abc import Mapping
+from contextlib import contextmanager
 
-from launcher.config.settings import PROJECT_ROOT, _get_python_exe, subprocess_no_window_kwargs
-from launcher.core.runtime_status_values import (
-    nonnegative_int_or_zero,
-    positive_int_or_zero,
-    strict_bool_or_none,
-)
 from bot_utils.shutdown_control import (
     CLOSE_POSITIONS,
     PRESERVE_POSITIONS,
@@ -50,8 +44,19 @@ from bot_utils.shutdown_control import (
     prepare_shutdown_control,
     publish_shutdown_request,
 )
+from bot_utils.runtime_threads import thread_definitely_never_started
+from launcher.config.settings import (
+    PROJECT_ROOT,
+    _get_python_exe,
+    subprocess_no_window_kwargs,
+)
+from launcher.core.runtime_status_values import (
+    finite_float_or_none,
+    nonnegative_int_or_zero,
+    positive_int_or_zero,
+    strict_bool_or_none,
+)
 from update_barrier import process_start_guard
-
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 _TIMESTAMP_THEN_LEVEL_RE = re.compile(
@@ -67,6 +72,10 @@ _LEVEL_THEN_TIMESTAMP_RE = re.compile(
 )
 _UI_LOG_LINE_MAX_CHARS = 16 * 1024
 _UI_LOG_LINE_TRUNCATED = " [launcher line truncated]"
+_RUNTIME_SHUTDOWN_STATUS_MAX_AGE_SEC = 180.0
+_PROCESS_EXIT_POLL_INTERVAL_SEC = 0.25
+_TERMINAL_STATUS_PUBLISH_ATTEMPTS = 3
+_TERMINAL_STATUS_RETRY_INTERVAL_SEC = 0.05
 
 
 class _BoundedStdoutLineReader:
@@ -142,6 +151,58 @@ def _launcher_shutdown_payload(shutdown: object) -> tuple[str, dict]:
     if reported_complete is not None:
         payload["reported_complete"] = reported_complete
     return "degraded", payload
+
+
+def _fresh_runtime_status_requires_close_retention(
+    runtime_status: object,
+    *,
+    expected_run_id: str,
+    expected_pid: int,
+    now_mono: float | None = None,
+    now_wall: float | None = None,
+) -> bool | None:
+    """Return close retention verdict; ``None`` means evidence is untrusted."""
+    if not isinstance(runtime_status, Mapping):
+        return None
+    expected_pid = positive_int_or_zero(expected_pid)
+    if (
+        not expected_run_id
+        or not expected_pid
+        or str(runtime_status.get("run_id") or "") != expected_run_id
+        or positive_int_or_zero(runtime_status.get("pid")) != expected_pid
+    ):
+        return None
+
+    mono = finite_float_or_none(runtime_status.get("monotonic_ts")) or 0.0
+    if mono > 0.0:
+        current = time.monotonic() if now_mono is None else now_mono
+        age = current - mono
+    else:
+        wall = finite_float_or_none(runtime_status.get("wall_ts"))
+        if wall is None or wall <= 0.0:
+            wall = finite_float_or_none(runtime_status.get("epoch_ts")) or 0.0
+        if wall <= 0.0:
+            return None
+        current = time.time() if now_wall is None else now_wall
+        age = current - wall
+    if not -5.0 <= age <= _RUNTIME_SHUTDOWN_STATUS_MAX_AGE_SEC:
+        return None
+
+    status = str(runtime_status.get("status") or "").lower()
+    shutdown = runtime_status.get("shutdown")
+    if not isinstance(shutdown, Mapping):
+        return None
+    if shutdown.get("complete") is True:
+        return False if _clean_shutdown_proven(shutdown) else None
+    if status != "degraded":
+        return None
+    if shutdown.get("complete") is not False:
+        return None
+    return (
+        shutdown.get("emergency_closed") is not True
+        or shutdown.get("emergency_in_progress") is True
+        or shutdown.get("positions_preserved") is True
+    )
 
 
 def _redact_ui_log_line(line: str) -> str:
@@ -421,11 +482,14 @@ class BotProcess:
         self.start_config: dict | None = None
         self.run_id: str | None = None
         self._failed_start_owned_proc: subprocess.Popen | None = None
+        self._reader_state: dict | None = None
         self._shutdown_control_path: str | None = None
         self.supports_graceful = supports_graceful
         self._lifecycle_lock = threading.Lock()
+        self._shutdown_request_publish_lock = threading.Lock()
         self._stop_close_operation_active = False
         self._stop_requested_run_id: str | None = None
+        self._stop_requested_mode: str | None = None
 
     #  Lifecycle 
 
@@ -433,7 +497,37 @@ class BotProcess:
         with self._lifecycle_lock:
             if self._stop_close_operation_active:
                 raise RuntimeError("bot stop/close operation is still in progress")
-            if self.is_running():
+            if (
+                self._stop_requested_run_id
+                and self._stop_requested_run_id == self.run_id
+            ):
+                raise RuntimeError("bot shutdown completion is still pending")
+            process_running = self.is_running()
+            reader_state = getattr(self, "_reader_state", None)
+            if reader_state is not None and not process_running:
+                if not reader_state["done"].is_set():
+                    raise RuntimeError("bot stdout reader handoff is unresolved")
+                # The exact reader is done and its child is proven dead. Retire
+                # even a recorded reader failure now; while the child was live
+                # the fatal state blocked duplicate starts, and its error was
+                # already published by ``reader_target``.
+                if self._reader_state is reader_state:
+                    self._close_process_stdout(reader_state["proc"])
+                    self._reader_state = None
+                    reader_state = None
+            if process_running:
+                if (
+                    reader_state is not None
+                    and not reader_state["entered"].is_set()
+                ):
+                    raise RuntimeError("bot stdout reader handoff is unresolved")
+                if (
+                    reader_state is not None
+                    and isinstance(reader_state.get("fatal"), BaseException)
+                ):
+                    raise RuntimeError("bot stdout reader failed") from (
+                        reader_state["fatal"]
+                    )
                 return
 
             failed_start_proc = self._failed_start_owned_proc
@@ -452,6 +546,14 @@ class BotProcess:
                 if self.proc is failed_start_proc:
                     self.proc = None
                 self._failed_start_owned_proc = None
+
+            if (
+                self._shutdown_control_path
+                and not self._cleanup_shutdown_control()
+            ):
+                raise RuntimeError(
+                    "previous shutdown control cleanup is still pending"
+                )
 
             kw: dict = subprocess_no_window_kwargs()
             if sys.platform == "win32":
@@ -473,6 +575,7 @@ class BotProcess:
                 env["BOT_NAME"] = self.bot_name
                 env["OBSIDIAN_LAUNCHER_PRESTART_OK"] = "1"
             self._stop_requested_run_id = None
+            self._stop_requested_mode = None
             self.run_id = uuid.uuid4().hex
             env["BOT_RUN_ID"] = self.run_id
 
@@ -502,40 +605,102 @@ class BotProcess:
                         text=True, bufsize=-1, encoding="utf-8", errors="replace",
                         env=env, cwd=PROJECT_ROOT, **kw
                     )
-            except Exception:
-                if spawned_proc is not None:
-                    rollback_complete = self._rollback_failed_start(
-                        spawned_proc
+                    # Publish ownership before the guard's exit boundary. Its
+                    # __exit__ may fail after Popen already created the child.
+                    self.proc = spawned_proc
+                    self.start_config = current_config_snapshot
+            except BaseException as primary_error:
+                self._settle_failed_start(
+                    spawned_proc,
+                    current_config_snapshot,
+                    primary_error,
+                )
+                raise
+            reader_run_id = self.run_id
+            reader_state = {
+                "proc": spawned_proc,
+                "run_id": reader_run_id,
+                "thread": None,
+                "entered": threading.Event(),
+                "done": threading.Event(),
+                "fatal": None,
+            }
+
+            def reader_target() -> None:
+                reader_state["entered"].set()
+                try:
+                    self._reader(
+                        spawned_proc,
+                        reader_run_id,
+                        control_path,
+                        True,
                     )
-                    if not rollback_complete:
-                        self.proc = spawned_proc
-                        self.start_config = current_config_snapshot
-                        self._failed_start_owned_proc = spawned_proc
-                else:
-                    rollback_complete = True
-                if rollback_complete:
-                    self.run_id = None
-                    self._cleanup_shutdown_control()
-                raise
-            self.proc = spawned_proc
-            self.start_config = current_config_snapshot
+                except BaseException as exc:
+                    reader_state["fatal"] = exc
+                    try:
+                        self._enqueue_log_line(
+                            "ERROR [launcher] "
+                            f"{self.bot_name or 'bot'} stdout reader failed "
+                            f"({type(exc).__name__})",
+                            expected_run_id=reader_run_id,
+                        )
+                    except BaseException:
+                        pass
+                finally:
+                    reader_state["done"].set()
+                    with self._lifecycle_lock:
+                        if (
+                            self._reader_state is reader_state
+                            and reader_state["fatal"] is None
+                        ):
+                            self._reader_state = None
+
             try:
-                reader_run_id = self.run_id
-                threading.Thread(
-                    target=self._reader,
-                    args=(spawned_proc, reader_run_id, control_path),
+                reader_thread = threading.Thread(
+                    target=reader_target,
                     daemon=True,
-                ).start()
-            except Exception:
-                rollback_complete = self._rollback_failed_start(spawned_proc)
-                if rollback_complete:
-                    if self.proc is spawned_proc:
-                        self.proc = None
-                    self.run_id = None
-                    self._cleanup_shutdown_control()
-                else:
-                    self._failed_start_owned_proc = spawned_proc
+                )
+            except BaseException as primary_error:
+                self._settle_failed_start(
+                    spawned_proc,
+                    current_config_snapshot,
+                    primary_error,
+                )
                 raise
+            reader_state["thread"] = reader_thread
+            self._reader_state = reader_state
+
+        try:
+            reader_thread.start()
+        except BaseException as primary_error:
+            safe_prelaunch = False
+            if (
+                isinstance(primary_error, Exception)
+                and thread_definitely_never_started(reader_thread)
+            ):
+                with self._lifecycle_lock:
+                    safe_prelaunch = self._reader_state is reader_state
+                    if safe_prelaunch:
+                        reader_state["done"].set()
+                        self._reader_state = None
+                        self._settle_failed_start(
+                            spawned_proc,
+                            current_config_snapshot,
+                            primary_error,
+                        )
+            if safe_prelaunch:
+                raise
+            if (
+                isinstance(primary_error, Exception)
+                and reader_state["entered"].is_set()
+                and not reader_state["done"].is_set()
+                and reader_state["fatal"] is None
+            ):
+                # The exact reader generation demonstrably owns stdout.  A
+                # post-launch error must not turn a valid bot start into an
+                # active child rollback.
+                return
+            raise
 
     # Graceful-close budget breakdown (must exceed bot.SHUTDOWN_DEADLINE_SEC):
     #  45s  bot's emergency-close deadline (closing positions)
@@ -589,17 +754,78 @@ class BotProcess:
             self._close_process_stdout(proc)
         return reaped
 
-    def _cleanup_shutdown_control(self, expected_path: str | None = None) -> None:
+    @staticmethod
+    def _note_start_cleanup_failure(
+        primary_error: BaseException,
+        context: str,
+        cleanup_error: BaseException,
+    ) -> None:
+        try:
+            primary_error.add_note(
+                f"bot start {context} failed: {type(cleanup_error).__name__}"
+            )
+        except BaseException:
+            pass
+
+    def _settle_failed_start(
+        self,
+        proc: subprocess.Popen | None,
+        current_config_snapshot: dict | None,
+        primary_error: BaseException,
+    ) -> None:
+        """Reap or retain exact ownership without masking a start failure."""
+        rollback_complete = proc is None
+        if proc is not None:
+            try:
+                rollback_complete = self._rollback_failed_start(proc)
+            except BaseException as cleanup_error:
+                rollback_complete = False
+                self._note_start_cleanup_failure(
+                    primary_error,
+                    "child rollback",
+                    cleanup_error,
+                )
+            if not rollback_complete:
+                self.proc = proc
+                self.start_config = current_config_snapshot
+                self._failed_start_owned_proc = proc
+                return
+            if self.proc is proc:
+                self.proc = None
+            if self._failed_start_owned_proc is proc:
+                self._failed_start_owned_proc = None
+
+        self.run_id = None
+        try:
+            self._cleanup_shutdown_control()
+        except BaseException as cleanup_error:
+            self._note_start_cleanup_failure(
+                primary_error,
+                "shutdown-control cleanup",
+                cleanup_error,
+            )
+
+    def _cleanup_shutdown_control(self, expected_path: str | None = None) -> bool:
         current_path = getattr(self, "_shutdown_control_path", None)
         path = expected_path or current_path
         if not path:
-            return
+            return True
         try:
             cleanup_shutdown_control(path, project_root=PROJECT_ROOT)
-        except Exception:
-            pass
+        except Exception as exc:
+            stderr = sys.stderr
+            if stderr is not None:
+                try:
+                    stderr.write(
+                        "[BotProcess] shutdown control cleanup failed: "
+                        f"{type(exc).__name__}: {exc}\n"
+                    )
+                except Exception:
+                    pass
+            return False
         if getattr(self, "_shutdown_control_path", None) == path:
             self._shutdown_control_path = None
+        return True
 
     def _request_shutdown_control(
         self,
@@ -607,16 +833,33 @@ class BotProcess:
         run_id: str,
         mode: str,
     ) -> bool:
-        path = self._shutdown_control_path
-        if not path:
-            return False
-        publish_shutdown_request(
-            path,
-            run_id=run_id,
-            pid=int(proc.pid),
-            mode=mode,
-            project_root=PROJECT_ROOT,
-        )
+        # Keep request publication linear per manager. A delayed preserve
+        # publisher must never overwrite a concurrently upgraded close request.
+        with self._shutdown_request_publish_lock:
+            with self._lifecycle_lock:
+                if (
+                    self.proc is not proc
+                    or self.run_id != run_id
+                    or self._stop_requested_run_id != run_id
+                ):
+                    return False
+                requested_mode = self._stop_requested_mode
+                if requested_mode not in {CLOSE_POSITIONS, PRESERVE_POSITIONS}:
+                    return False
+                if mode == CLOSE_POSITIONS or requested_mode == CLOSE_POSITIONS:
+                    publish_mode = CLOSE_POSITIONS
+                else:
+                    publish_mode = PRESERVE_POSITIONS
+                path = self._shutdown_control_path
+                if not path:
+                    return False
+            publish_shutdown_request(
+                path,
+                run_id=run_id,
+                pid=int(proc.pid),
+                mode=publish_mode,
+                project_root=PROJECT_ROOT,
+            )
         return True
 
     def _mark_runtime_stopped(self, returncode=None, *,
@@ -626,8 +869,8 @@ class BotProcess:
         if not self.bot_name:
             return
         try:
-            from launcher.config.settings import BOT_META
             from core.runtime_status import read_runtime_status, write_runtime_status
+            from launcher.config.settings import BOT_META
             with self._lifecycle_lock:
                 expected_run_id = expected_run_id or ""
                 expected_pid = positive_int_or_zero(expected_pid)
@@ -652,6 +895,25 @@ class BotProcess:
                 last_run_id = str(last.get("run_id") or "")
                 last_pid = positive_int_or_zero(last.get("pid"))
                 last_simulation = strict_bool_or_none(last.get("simulation"))
+                start_config = (
+                    self.start_config
+                    if isinstance(self.start_config, Mapping)
+                    else {}
+                )
+                start_simulation = strict_bool_or_none(
+                    start_config.get("SIMULATION")
+                )
+                raw_open_positions = last.get("open_positions")
+                open_positions = nonnegative_int_or_zero(raw_open_positions)
+                open_positions_known = (
+                    not isinstance(raw_open_positions, bool)
+                    and isinstance(raw_open_positions, int)
+                    and raw_open_positions >= 0
+                    and strict_bool_or_none(
+                        last.get("open_positions_known")
+                    )
+                    is not False
+                )
                 if (
                     expected_run_id
                     and last_run_id
@@ -660,14 +922,27 @@ class BotProcess:
                     return
                 if expected_pid and last_pid and last_pid != expected_pid:
                     return
+                if (
+                    expected_run_id
+                    and expected_pid
+                    and last_run_id == expected_run_id
+                    and last_pid == expected_pid
+                    and last.get("launcher_terminal_marker") is True
+                    and str(last.get("status") or "").lower()
+                    in {"stopped", "degraded"}
+                    and str(last.get("stopped_by") or "")
+                    in {"launcher", "process_exit"}
+                    and last.get("returncode") == returncode
+                ):
+                    return
 
                 status, shutdown = _launcher_shutdown_payload(
                     last.get("shutdown")
                 )
                 extra = {
-                    "open_positions": nonnegative_int_or_zero(
-                        last.get("open_positions")
-                    ),
+                    "open_positions": open_positions,
+                    "open_positions_known": open_positions_known,
+                    "launcher_terminal_marker": True,
                     "previous_status": str(last.get("status") or ""),
                     "stopped_by": (
                         stopped_by
@@ -677,21 +952,40 @@ class BotProcess:
                     "returncode": returncode,
                     "shutdown": shutdown,
                 }
-                published = write_runtime_status(
-                    log_dir,
-                    self.bot_name,
-                    status,
-                    True if last_simulation is None else last_simulation,
-                    threads={
-                        "monitor": False,
-                        "scan": False,
-                        "reconcile": False,
-                    },
-                    process_pid=expected_pid or last_pid or 0,
-                    process_run_id=expected_run_id or last_run_id,
-                    extra=extra,
-                )
-                if published is False:
+                attempts = max(1, int(_TERMINAL_STATUS_PUBLISH_ATTEMPTS))
+                published = False
+                for attempt in range(attempts):
+                    write_result = write_runtime_status(
+                        log_dir,
+                        self.bot_name,
+                        status,
+                        (
+                            last_simulation
+                            if last_simulation is not None
+                            else start_simulation
+                            if start_simulation is not None
+                            else True
+                        ),
+                        threads={
+                            "monitor": False,
+                            "scan": False,
+                            "reconcile": False,
+                        },
+                        process_pid=expected_pid or last_pid or 0,
+                        process_run_id=expected_run_id or last_run_id,
+                        extra=extra,
+                    )
+                    if write_result is not False:
+                        published = True
+                        break
+                    if attempt + 1 < attempts:
+                        time.sleep(
+                            max(
+                                0.0,
+                                float(_TERMINAL_STATUS_RETRY_INTERVAL_SEC),
+                            )
+                        )
+                if not published:
                     raise RuntimeError(
                         "runtime status writer reported publish failure"
                     )
@@ -715,9 +1009,11 @@ class BotProcess:
 
         The graceful path allows 75s total (see ``_GRACEFUL_TIMEOUT_SEC``) so
         there is headroom past the bot's own SHUTDOWN_DEADLINE_SEC for the
-        thread-join cleanup and interpreter shutdown; the force-kill kicks in
-        after that. ``self.proc`` is cleared the moment the OS-level process
-        exits  before the teardown finishes  so the launcher's
+        thread-join cleanup and interpreter shutdown. Escalation after that is
+        withheld while a fresh PID-/run-ID-bound status proves that the
+        position action remains incomplete. ``self.proc`` is cleared the
+        moment the OS-level process exits  before the teardown finishes  so
+        the launcher's
         ``is_running()`` poll sees the death immediately.
         """
         # Snapshot proc under the lock, then release the lock for the
@@ -725,6 +1021,7 @@ class BotProcess:
         # block ``is_running()`` if it ever needed the same lock  and
         # also block any concurrent start() call from happening once
         # the process is genuinely dead.
+        control_mode = CLOSE_POSITIONS if graceful_close else PRESERVE_POSITIONS
         already_exited: tuple[int | None, str, int, str | None] | None = None
         with self._lifecycle_lock:
             if self.proc is None:
@@ -740,6 +1037,9 @@ class BotProcess:
                 )
                 if close_failed_start_stdout:
                     self._failed_start_owned_proc = None
+                if self._stop_requested_run_id == run_id_to_mark:
+                    self._stop_requested_run_id = None
+                    self._stop_requested_mode = None
                 already_exited = (
                     returncode_to_mark,
                     run_id_to_mark,
@@ -753,7 +1053,17 @@ class BotProcess:
                 control_path_to_stop = getattr(
                     self, "_shutdown_control_path", None
                 )
+                if (
+                    self._stop_requested_run_id == run_id_to_stop
+                    and self._stop_requested_mode == CLOSE_POSITIONS
+                    and control_mode != CLOSE_POSITIONS
+                ):
+                    raise RuntimeError(
+                        "close-position shutdown is already pending; "
+                        "preserve-position stop rejected"
+                    )
                 self._stop_requested_run_id = run_id_to_stop
+                self._stop_requested_mode = control_mode
         if already_exited is not None:
             (
                 returncode_to_mark,
@@ -776,7 +1086,6 @@ class BotProcess:
         # CTRL_BREAK without ever receiving it; the control record is the
         # reliable path and is consumed by the bot's main thread.
         control_ok = False
-        control_mode = CLOSE_POSITIONS if graceful_close else PRESERVE_POSITIONS
         if self.supports_graceful:
             try:
                 control_ok = self._request_shutdown_control(
@@ -829,6 +1138,7 @@ class BotProcess:
             with self._lifecycle_lock:
                 if self._stop_requested_run_id == run_id_to_stop:
                     self._stop_requested_run_id = None
+                    self._stop_requested_mode = None
             raise RuntimeError(
                 "preserve-position shutdown control unavailable; "
                 "bot process left running"
@@ -842,6 +1152,29 @@ class BotProcess:
                 if not graceful_close and control_ok:
                     raise RuntimeError(
                         "preserve-position shutdown did not finish; "
+                        "bot process left running"
+                    ) from exc
+                retention_decision: bool | None = False
+                if graceful_close and self.bot_name:
+                    retention_decision = None
+                    try:
+                        from core.runtime_status import read_runtime_status
+                        from launcher.config.settings import BOT_META
+
+                        log_dir = BOT_META.get(self.bot_name, {}).get("log_dir")
+                        if log_dir:
+                            retention_decision = (
+                                _fresh_runtime_status_requires_close_retention(
+                                    read_runtime_status(log_dir),
+                                    expected_run_id=run_id_to_stop,
+                                    expected_pid=pid_to_stop,
+                                )
+                            )
+                    except Exception:
+                        retention_decision = None
+                if retention_decision is not False and proc_to_stop.poll() is None:
+                    raise RuntimeError(
+                        "close-position shutdown remains incomplete; "
                         "bot process left running"
                     ) from exc
                 stderr = sys.stderr
@@ -899,6 +1232,9 @@ class BotProcess:
             #  a concurrent start() shouldn't be clobbered.
             if self.proc is proc_to_stop:
                 self.proc = None
+            if self._stop_requested_run_id == run_id_to_stop:
+                self._stop_requested_run_id = None
+                self._stop_requested_mode = None
             close_failed_start_stdout = (
                 self._failed_start_owned_proc is proc_to_stop
             )
@@ -930,6 +1266,15 @@ class BotProcess:
             # block duplicate start/stop decisions until a later probe can
             # determine the real state.
             return True
+
+    def close_shutdown_pending(self) -> bool:
+        """Return whether the current run owns an unresolved close request."""
+        with self._lifecycle_lock:
+            return bool(
+                self.run_id
+                and self._stop_requested_run_id == self.run_id
+                and self._stop_requested_mode == CLOSE_POSITIONS
+            )
 
     #  Stdout reader 
 
@@ -968,6 +1313,7 @@ class BotProcess:
         proc: subprocess.Popen,
         expected_run_id: str | None = None,
         expected_control_path: str | None = None,
+        require_owned_exit: bool = False,
     ) -> None:
         if not proc or not proc.stdout:
             return
@@ -1038,36 +1384,73 @@ class BotProcess:
             # are still current; concurrent stop/restart paths retain authority
             # over every other generation.
             returncode = None
-            try:
-                returncode = proc.poll()
-                if returncode is None:
-                    try:
-                        returncode = proc.wait(timeout=1.0)
-                    except subprocess.TimeoutExpired:
-                        returncode = None
-            except Exception:
-                returncode = None
+            with self._lifecycle_lock:
+                retain_exit_watch = (
+                    self.proc is proc
+                    and self.run_id == expected_run_id
+                    and getattr(self, "_stop_requested_run_id", None)
+                    == expected_run_id
+                )
+            while retain_exit_watch and (
+                self.proc is proc and self.run_id == expected_run_id
+            ):
+                try:
+                    returncode = proc.poll()
+                except Exception:
+                    returncode = None
+                if returncode is not None:
+                    break
+                time.sleep(max(0.01, float(_PROCESS_EXIT_POLL_INTERVAL_SEC)))
+            if not retain_exit_watch:
+                try:
+                    returncode = proc.poll()
+                    if returncode is None:
+                        try:
+                            returncode = proc.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            returncode = None
+                except Exception:
+                    returncode = None
             if returncode is not None:
                 owned_exit = False
                 expected_stop = False
+                expected_stop_mode = None
                 with self._lifecycle_lock:
                     if self.proc is proc and self.run_id == expected_run_id:
                         expected_stop = (
                             getattr(self, "_stop_requested_run_id", None)
                             == expected_run_id
                         )
+                        if expected_stop:
+                            expected_stop_mode = getattr(
+                                self,
+                                "_stop_requested_mode",
+                                None,
+                            )
                         self.proc = None
                         if expected_stop:
                             self._stop_requested_run_id = None
+                            self._stop_requested_mode = None
                         if self._failed_start_owned_proc is proc:
                             self._failed_start_owned_proc = None
                         owned_exit = True
                 if owned_exit:
                     self._cleanup_shutdown_control(expected_control_path)
-                    if not expected_stop:
+                    report_exit = not expected_stop or (
+                        self.supports_graceful
+                        and returncode != 0
+                        and expected_stop_mode
+                        in {CLOSE_POSITIONS, PRESERVE_POSITIONS}
+                    )
+                    if report_exit:
+                        context = (
+                            "during launcher stop"
+                            if expected_stop
+                            else "unexpectedly"
+                        )
                         self._enqueue_log_line(
                             "ERROR [launcher] "
-                            f"{self.bot_name or 'bot'} process exited unexpectedly "
+                            f"{self.bot_name or 'bot'} process exited {context} "
                             f"(returncode={returncode})",
                             expected_run_id=expected_run_id,
                         )
@@ -1078,4 +1461,14 @@ class BotProcess:
                         stopped_by=(
                             "launcher" if expected_stop else "process_exit"
                         ),
+                    )
+            elif require_owned_exit:
+                with self._lifecycle_lock:
+                    owned_live_process = (
+                        self.proc is proc and self.run_id == expected_run_id
+                    )
+                if owned_live_process:
+                    raise RuntimeError(
+                        "stdout reader reached EOF while its owned child "
+                        "process is still running"
                     )

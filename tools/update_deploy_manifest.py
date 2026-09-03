@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import uuid
@@ -115,19 +116,89 @@ def _manifest_root(path: str | os.PathLike) -> Path:
 
 
 def _sync_directory(path: Path) -> None:
-    try:
-        directory_fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
+    directory = path.resolve(strict=True)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        flush_file_buffers = kernel32.FlushFileBuffers
+        flush_file_buffers.argtypes = [wintypes.HANDLE]
+        flush_file_buffers.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = create_file(
+            str(directory),
+            0x40000000,  # GENERIC_WRITE
+            0x00000007,  # FILE_SHARE_READ | WRITE | DELETE
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS
+            None,
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if not handle or int(handle) == invalid_handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        primary_error: BaseException | None = None
+        try:
+            if not flush_file_buffers(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            close_error: BaseException | None = None
+            try:
+                if not close_handle(handle):
+                    close_error = ctypes.WinError(ctypes.get_last_error())
+            except BaseException as exc:
+                close_error = exc
+            if close_error is not None:
+                if primary_error is None:
+                    raise close_error
+                try:
+                    primary_error.add_note(
+                        "close manifest directory after sync failure: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
         return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(str(directory), flags)
+    primary_error: BaseException | None = None
     try:
         os.fsync(directory_fd)
-    except OSError:
-        pass
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         try:
             os.close(directory_fd)
-        except OSError:
-            pass
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "manifest directory close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
 
 
 def _publish_manifest(path: Path, encoded: bytes) -> None:
@@ -139,25 +210,81 @@ def _publish_manifest(path: Path, encoded: bytes) -> None:
     temporary = path.with_name(
         f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
-    temp_created = False
+    temporary_owned = False
+    temporary_identity: tuple[int, int] | None = None
+    primary_error: BaseException | None = None
     try:
         _absolute_without_links(temporary, label="manifest target")
-        with temporary.open("xb") as handle:
-            temp_created = True
+        handle = temporary.open("xb")
+        temporary_owned = True
+        write_primary: BaseException | None = None
+        try:
+            temporary_stat = os.fstat(handle.fileno())
+            if not stat.S_ISREG(temporary_stat.st_mode):
+                raise ValueError("manifest temporary must be a regular file")
+            temporary_identity = (
+                temporary_stat.st_dev,
+                temporary_stat.st_ino,
+            )
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            write_primary = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if write_primary is None:
+                    raise
+                try:
+                    write_primary.add_note(
+                        "close manifest temporary after write failure: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
         path = _absolute_without_links(path, label="manifest target")
         if path.exists() and not path.is_file():
             raise ValueError("manifest target must be a regular file")
         os.replace(temporary, path)
-        temp_created = False
+        temporary_owned = False
         _sync_directory(path.parent)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        if temp_created:
+        cleanup_error: BaseException | None = None
+        same_generation = False
+        if temporary_owned and temporary_identity is not None:
+            try:
+                current = temporary.stat(follow_symlinks=False)
+                same_generation = (
+                    stat.S_ISREG(current.st_mode)
+                    and not _is_linklike(temporary)
+                    and (current.st_dev, current.st_ino) == temporary_identity
+                )
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = exc
+        if same_generation:
             try:
                 temporary.unlink()
-            except OSError:
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            if primary_error is None:
+                raise cleanup_error
+            try:
+                primary_error.add_note(
+                    "manifest owned temporary cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            except BaseException:
                 pass
 
 

@@ -26,14 +26,86 @@ from typing import Callable, Optional
 
 _SAFE_MODE_STATE_JSON_MAX_BYTES = 64 * 1024
 _SAFE_MODE_ALERT_PERSIST_RETRY_SEC = 30.0
+_THREADING_TIMER_TYPE = threading.Timer
+_THREADING_THREAD_TYPE = threading.Thread
 
 
-def _log_safe_mode_error(context: str, exc: Exception) -> None:
+class _AlertPersistGeneration:
+    __slots__ = ("done", "start_raised", "timer")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.start_raised = False
+        self.timer: Optional[threading.Timer] = None
+
+
+class _AlertFlushGeneration:
+    __slots__ = ("done", "result", "start_raised", "worker")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result = False
+        self.start_raised = False
+        self.worker: Optional[threading.Thread] = None
+
+
+class _AlertDirectPersistGeneration:
+    __slots__ = ("done", "result")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result = False
+
+
+def _timer_definitely_never_started(timer: object) -> bool:
+    """Recognize only an exact stdlib Timer with no launch identity."""
+    if type(timer) is not _THREADING_TIMER_TYPE:
+        return False
+    try:
+        return timer.ident is None and not timer.is_alive()
+    except BaseException:
+        return False
+
+
+def _thread_definitely_never_started(worker: object) -> bool:
+    """Recognize only an exact stdlib Thread with no launch identity."""
+    if type(worker) is not _THREADING_THREAD_TYPE:
+        return False
+    try:
+        return worker.ident is None and not worker.is_alive()
+    except BaseException:
+        return False
+
+
+def _alert_flush_generation_unresolved(
+    generation: Optional[_AlertFlushGeneration],
+) -> bool:
+    if generation is None:
+        return False
+    if not generation.done.is_set():
+        return True
+    worker = generation.worker
+    if worker is None:
+        return False
+    try:
+        return bool(worker.is_alive())
+    except BaseException:
+        return True
+
+
+def _acquire_before(lock: threading.Lock, deadline: float) -> bool:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.0:
+        return lock.acquire(blocking=False)
+    return lock.acquire(timeout=remaining)
+
+
+def _log_safe_mode_error(context: str, exc: BaseException) -> None:
     try:
         from bot_utils.silent_log import silent_log
 
         silent_log(context, exc)
-    except Exception:
+    except BaseException:
         pass
 
 
@@ -338,6 +410,15 @@ class SafeMode:
         self._lock = threading.Lock()
         self._alert_persist_pending = False
         self._alert_persist_timer: Optional[threading.Timer] = None
+        self._alert_persist_generation: Optional[
+            _AlertPersistGeneration
+        ] = None
+        self._alert_flush_generation: Optional[_AlertFlushGeneration] = None
+        self._alert_persist_active: set[threading.Thread] = set()
+        self._alert_persist_retiring: set[threading.Thread] = set()
+        self._alert_direct_persist_active: set[
+            _AlertDirectPersistGeneration
+        ] = set()
         self._alert_persist_shutdown = False
         self.bot_name = bot_name
         self._telegram_send = telegram_send
@@ -409,7 +490,7 @@ class SafeMode:
                 self._alert_state_file,
                 {"alert_sent_day": today, "reason": self._reason},
             )
-            if not persisted:
+            if persisted is not True:
                 raise OSError("safe-mode alert state persistence failed")
             return True
         except Exception as exc:
@@ -418,56 +499,273 @@ class SafeMode:
 
     def _schedule_alert_state_retry(self) -> None:
         with self._lock:
-            self._alert_persist_pending = True
             if self._alert_persist_shutdown:
+                return
+            self._alert_persist_pending = True
+            generation = self._alert_persist_generation
+            if generation is not None and not generation.done.is_set():
                 return
             timer = self._alert_persist_timer
             if timer is not None and timer.is_alive():
                 return
-            timer = threading.Timer(
-                _SAFE_MODE_ALERT_PERSIST_RETRY_SEC,
-                self._retry_alert_state_persist,
-            )
+            generation = _AlertPersistGeneration()
+            try:
+                timer = threading.Timer(
+                    _SAFE_MODE_ALERT_PERSIST_RETRY_SEC,
+                    lambda: self._retry_alert_state_persist(generation),
+                )
+            except Exception as exc:
+                _log_safe_mode_error(
+                    "construct safe-mode alert state persistence retry", exc
+                )
+                return
             timer.daemon = True
+            generation.timer = timer
+            self._alert_persist_generation = generation
             self._alert_persist_timer = timer
             try:
                 timer.start()
-            except Exception as exc:
-                self._alert_persist_timer = None
+            except BaseException as exc:
+                # start() is an ownership boundary: it may raise after the
+                # worker was launched.  Retain the exact generation so
+                # shutdown cannot report success while that worker is live.
+                generation.start_raised = True
                 _log_safe_mode_error(
                     "schedule safe-mode alert state persistence retry", exc
                 )
+                if (
+                    isinstance(exc, Exception)
+                    and _timer_definitely_never_started(timer)
+                ):
+                    generation.done.set()
+                    if self._alert_persist_generation is generation:
+                        self._alert_persist_generation = None
+                        self._alert_persist_timer = None
+                if not isinstance(exc, Exception):
+                    raise
 
-    def _retry_alert_state_persist(self) -> None:
+    def _retry_alert_state_persist(
+        self,
+        generation: _AlertPersistGeneration,
+    ) -> None:
+        current = threading.current_thread()
         with self._lock:
-            self._alert_persist_timer = None
-            pending = self._alert_persist_pending
-        if not pending:
-            return
-        if self._save_alert_state():
+            self._alert_persist_active.add(current)
+            if self._alert_persist_generation is generation:
+                self._alert_persist_timer = None
+            pending = (
+                self._alert_persist_pending
+                and not self._alert_persist_shutdown
+            )
+        reschedule = False
+        try:
+            if not pending:
+                return
+            if self._save_alert_state():
+                with self._lock:
+                    self._alert_persist_pending = False
+                return
+            reschedule = True
+        finally:
             with self._lock:
-                self._alert_persist_pending = False
-            return
-        self._schedule_alert_state_retry()
+                self._alert_persist_active.discard(current)
+                generation.done.set()
+                if self._alert_persist_generation is generation:
+                    self._alert_persist_generation = None
+                    self._alert_persist_timer = None
+            if reschedule:
+                self._schedule_alert_state_retry()
 
-    def flush_alert_state_pending(self) -> bool:
-        """Make one final synchronous attempt without scheduling a new retry."""
-        with self._lock:
+    def _run_shutdown_alert_flush(
+        self,
+        generation: _AlertFlushGeneration,
+    ) -> None:
+        persisted = False
+        try:
+            persisted = self._save_alert_state()
+        except BaseException as exc:
+            _log_safe_mode_error("shutdown safe-mode alert state flush", exc)
+        finally:
+            with self._lock:
+                generation.result = bool(persisted)
+                if persisted:
+                    self._alert_persist_pending = False
+                generation.done.set()
+
+    def _start_shutdown_alert_flush_locked(
+        self,
+    ) -> Optional[_AlertFlushGeneration]:
+        generation = self._alert_flush_generation
+        if _alert_flush_generation_unresolved(generation):
+            return generation
+        if generation is not None and generation.result:
+            return generation
+        self._alert_flush_generation = None
+        generation = _AlertFlushGeneration()
+        try:
+            worker = threading.Thread(
+                target=self._run_shutdown_alert_flush,
+                args=(generation,),
+                name=f"safe-mode-flush-{self.bot_name.lower()}",
+                daemon=True,
+            )
+        except Exception as exc:
+            _log_safe_mode_error("construct shutdown safe-mode flush", exc)
+            return None
+        generation.worker = worker
+        self._alert_flush_generation = generation
+        try:
+            worker.start()
+        except BaseException as exc:
+            generation.start_raised = True
+            _log_safe_mode_error("start shutdown safe-mode flush", exc)
+            if (
+                isinstance(exc, Exception)
+                and _thread_definitely_never_started(worker)
+            ):
+                generation.done.set()
+                if self._alert_flush_generation is generation:
+                    self._alert_flush_generation = None
+            if not isinstance(exc, Exception):
+                raise
+        return generation
+
+    def shutdown_alert_state_persistence(self, timeout: float = 0.0) -> bool:
+        """Terminally stop retry timers and flush the safety marker."""
+        if isinstance(timeout, bool):
+            return False
+        try:
+            requested_timeout = float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(requested_timeout):
+            return False
+        bounded_timeout = min(
+            max(0.0, requested_timeout),
+            float(threading.TIMEOUT_MAX),
+        )
+        deadline = time.monotonic() + bounded_timeout
+        if not _acquire_before(self._lock, deadline):
+            return False
+        try:
             self._alert_persist_shutdown = True
-            if not self._alert_persist_pending:
-                return True
-            timer = self._alert_persist_timer
+            generation = self._alert_persist_generation
+            timer = (
+                generation.timer
+                if generation is not None
+                else self._alert_persist_timer
+            )
             self._alert_persist_timer = None
+            workers = list(self._alert_persist_active)
+            workers.extend(self._alert_persist_retiring)
+            direct_generations = list(self._alert_direct_persist_active)
+            if timer is not None:
+                workers.append(timer)
+            self._alert_persist_retiring.update(workers)
+        finally:
+            self._lock.release()
         if timer is not None:
+            cancel_succeeded = False
             try:
                 timer.cancel()
+                cancel_succeeded = True
             except Exception:
                 pass
-        persisted = self._save_alert_state()
-        if persisted:
-            with self._lock:
-                self._alert_persist_pending = False
-        return persisted
+        else:
+            cancel_succeeded = False
+        still_alive = []
+        for worker in dict.fromkeys(workers):
+            join = getattr(worker, "join", None)
+            if callable(join) and worker is not threading.current_thread():
+                try:
+                    join(timeout=max(0.0, deadline - time.monotonic()))
+                except Exception:
+                    pass
+            try:
+                if worker.is_alive():
+                    still_alive.append(worker)
+            except Exception:
+                still_alive.append(worker)
+        if not _acquire_before(self._lock, deadline):
+            return False
+        try:
+            self._alert_persist_retiring.intersection_update(still_alive)
+            if (
+                generation is not None
+                and not generation.done.is_set()
+                and not generation.start_raised
+                and cancel_succeeded
+                and timer not in still_alive
+            ):
+                # A successfully cancelled generation whose timer is no
+                # longer alive will never enter the callback; shutdown owns
+                # its terminal transition.
+                generation.done.set()
+            generation_done = (
+                generation is None or generation.done.is_set()
+            )
+            if (
+                generation_done
+                and self._alert_persist_generation is generation
+            ):
+                self._alert_persist_generation = None
+        finally:
+            self._lock.release()
+        if still_alive:
+            return False
+        if not generation_done:
+            return False
+        for direct_generation in direct_generations:
+            if not direct_generation.done.wait(
+                timeout=max(0.0, deadline - time.monotonic())
+            ):
+                return False
+        if not _acquire_before(self._lock, deadline):
+            return False
+        try:
+            if self._alert_direct_persist_active:
+                return False
+            if not self._alert_persist_pending:
+                flush_generation = self._alert_flush_generation
+                if flush_generation is None:
+                    return True
+                if _alert_flush_generation_unresolved(flush_generation):
+                    return False
+                return flush_generation.result
+            flush_generation = self._start_shutdown_alert_flush_locked()
+        finally:
+            self._lock.release()
+        if flush_generation is None:
+            return False
+        worker = flush_generation.worker
+        if worker is not None and worker is not threading.current_thread():
+            try:
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            except BaseException:
+                return False
+        elif not flush_generation.done.wait(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        if not _acquire_before(self._lock, deadline):
+            return False
+        try:
+            completed = (
+                self._alert_flush_generation is flush_generation
+                and not _alert_flush_generation_unresolved(flush_generation)
+            )
+            persisted = (
+                completed
+                and flush_generation.result
+                and not self._alert_persist_pending
+            )
+            return persisted
+        finally:
+            self._lock.release()
+
+    def flush_alert_state_pending(self) -> bool:
+        """Interpreter-exit fallback for the managed runtime closer."""
+        return self.shutdown_alert_state_persistence(timeout=1.0)
 
     def record_slippage(
         self,
@@ -576,9 +874,27 @@ class SafeMode:
             except Exception as exc:
                 _log_safe_mode_error("safe-mode Telegram alert", exc)
             else:
+                direct_generation = None
                 with self._lock:
                     self._alert_sent = True
-                if not self._save_alert_state():
+                    if not self._alert_persist_shutdown:
+                        direct_generation = _AlertDirectPersistGeneration()
+                        self._alert_direct_persist_active.add(direct_generation)
+                        self._alert_persist_pending = True
+                persisted = False
+                if direct_generation is not None:
+                    try:
+                        persisted = self._save_alert_state()
+                    finally:
+                        with self._lock:
+                            direct_generation.result = bool(persisted)
+                            if persisted:
+                                self._alert_persist_pending = False
+                            direct_generation.done.set()
+                            self._alert_direct_persist_active.discard(
+                                direct_generation
+                            )
+                if direct_generation is not None and not persisted:
                     self._schedule_alert_state_retry()
             finally:
                 with self._lock:

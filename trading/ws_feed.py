@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import math
 import random
 import threading
 import time
@@ -22,7 +23,6 @@ from bot_utils.silent_log import silent_log
 from core.constants import TICKER_STALE_MAX_SEC
 from trading.l2_stream import (
     build_public_async_config,
-    close_public_async_exchange,
 )
 
 CACHE_STALE_SEC    = TICKER_STALE_MAX_SEC
@@ -31,6 +31,8 @@ _MAX_REST_WORKERS  = 8
 _WS_BASE_BACKOFF   = 2.0
 _WS_MAX_BACKOFF    = 120.0
 _WS_STABLE_RESET_SEC = 30.0
+_WS_CLOSE_ATTEMPT_TIMEOUT_SEC = 5.0
+_WS_CLOSE_RETRY_SEC = 1.0
 _REST_RESTART_BACKOFF_SEC = 2.0
 _REST_RESTART_MAX_BACKOFF_SEC = 30.0
 
@@ -48,9 +50,13 @@ def _ws_session_is_stable(
     return elapsed >= _WS_STABLE_RESET_SEC
 
 
-async def _close_async_exchange(exchange) -> None:
-    """Close one async client under the shared bounded transport contract."""
-    await close_public_async_exchange(exchange)
+async def _close_async_exchange(exchange) -> bool:
+    """Run one exact async-client close invocation."""
+    close = getattr(exchange, "close", None)
+    if not callable(close):
+        return True
+    result = await close()
+    return result is None or result is True
 
 
 def _clone_exchange(exchange):
@@ -100,7 +106,13 @@ class WebSocketFeed:
         self._seq_lock  = threading.Lock()
 
         self._rest_thread_started = False
+        self._run_generation = 0
+        self._rest_worker_state: Optional[dict] = None
+        self._rest_retiring_workers: List[dict] = []
+        self._rest_submission_tokens: List[dict] = []
         self._ws_thread_started  = False
+        self._ws_worker_state: Optional[dict] = None
+        self._ws_retiring_workers: List[dict] = []
         self._start_lock         = threading.Lock()
         # Dedicated lock for the REST-poller test-and-set. NOT _start_lock:
         # start() already holds _start_lock when it calls _ensure_rest_poller,
@@ -112,10 +124,14 @@ class WebSocketFeed:
         self._ws_main_task: Optional[asyncio.Task] = None
         self._ws_main_task_lock = threading.Lock()
         self._rest_clones: List = []
+        self._rest_clone_owners: List[tuple[object, int | None]] = []
         self._rest_clones_lock = threading.Lock()
+        self._rest_close_state_lock = threading.Lock()
+        self._rest_close_state: Optional[dict] = None
         self._async_ex = None
         self._async_ex_lock = threading.Lock()
-        self._ws_mode = self._detect_ws_mode()
+        self._ws_capable = self._detect_ws_mode()
+        self._ws_mode = self._ws_capable
 
     def _detect_ws_mode(self) -> bool:
         try:
@@ -129,94 +145,353 @@ class WebSocketFeed:
             self._threads = [r for r in self._threads if r() is not None]
             with self._symbols_lock:
                 new_syms = [s for s in symbols if s not in self._symbols]
+                ws_available = self._ws_capable or self._ws_mode
                 worker_started = (
                     self._ws_thread_started
-                    if self._ws_mode
+                    if ws_available
                     else self._rest_thread_started
                 )
                 if not new_syms and self._running and worker_started:
                     return
                 self._symbols.update(new_syms)
                 current = list(self._symbols)
+            if not self._running:
+                self._run_generation += 1
             self._running = True
-            if self._ws_mode:
+            generation = self._run_generation
+            if ws_available:
                 if not self._ws_thread_started:
-                    self._ws_thread_started = True
                     try:
-                        self._start_ws(current)
+                        self._start_ws(current, generation, True)
                     except Exception as exc:
-                        self._ws_thread_started = False
                         self._ws_mode = False
                         silent_log("start WebSocket ticker worker", exc)
-                        self._ensure_rest_poller()
+                if not self._ws_mode:
+                    self._ensure_rest_poller(generation, True)
             else:
-                self._ensure_rest_poller()
+                self._ensure_rest_poller(generation, True)
 
-    def stop(self) -> None:
-        self._running = False
-        loop = self._loop
+    def stop(self, timeout: float = 1.0) -> bool:
+        """Stop the current feed generation within one end-to-end deadline."""
+        if isinstance(timeout, bool):
+            return False
         try:
-            if loop and loop.is_running():
-                # The owned main coroutine closes the active ccxt.pro client
-                # in its ``finally`` block. Cancel that task instead of
-                # launching a detached second close and force-stopping its
-                # loop mid-cleanup.
-                def _shutdown() -> None:
-                    with self._ws_main_task_lock:
-                        task = self._ws_main_task
-                    if task is not None and not task.done():
-                        task.cancel()
-                try:
-                    loop.call_soon_threadsafe(_shutdown)
-                except Exception as dispatch_exc:
-                    try:
-                        stop = getattr(loop, "stop", None)
-                        if callable(stop):
-                            loop.call_soon_threadsafe(stop)
-                    except Exception as stop_exc:
-                        silent_log("stop WebSocket event loop", stop_exc)
-                    else:
-                        silent_log(
-                            "cancel WebSocket event loop task",
-                            dispatch_exc,
-                        )
-        except Exception as exc:
-            silent_log("inspect WebSocket event loop during stop", exc)
+            budget = float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(budget):
+            return False
+        budget = min(max(0.0, budget), threading.TIMEOUT_MAX)
+        deadline = time.monotonic() + budget
+
+        if not self._start_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
+            self._running = False
+            stopped_generation = self._run_generation
+            thread_refs = list(self._threads)
+            ws_states = list(self._ws_retiring_workers)
+            if self._ws_worker_state is not None:
+                ws_states.append(self._ws_worker_state)
+            ws_states = [
+                state
+                for state in ws_states
+                if state.get("generation") is None
+                or state.get("generation") <= stopped_generation
+            ]
         finally:
-            # Loop dispatch is best-effort, but owned REST clients must always
-            # reach their close path even when the asyncio handle is broken.
-            self._close_rest_clones()
+            self._start_lock.release()
+
+        cancel_targets = [
+            (state.get("loop"), state.get("task"))
+            for state in ws_states
+        ]
+        if not cancel_targets and self._loop is not None:
+            # Compatibility for callers that supplied a legacy/manual loop.
+            cancel_targets.append((self._loop, self._ws_main_task))
+        for loop, task in cancel_targets:
+            try:
+                if loop and loop.is_running():
+                    # The owned main coroutine closes the active ccxt.pro
+                    # client in its finally block. Never launch a detached
+                    # second close owner or force-stop its loop mid-cleanup.
+                    def _shutdown(owned_task=task) -> None:
+                        if owned_task is not None and not owned_task.done():
+                            owned_task.cancel()
+
+                    loop.call_soon_threadsafe(_shutdown)
+            except Exception as exc:
+                silent_log("cancel WebSocket event loop task", exc)
+
+        if not self._rest_poller_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
+            states = list(self._rest_retiring_workers)
+            current = self._rest_worker_state
+            if current is not None:
+                states.append(current)
+            rest_threads = [
+                state.get("thread")
+                for state in states
+                if state.get("generation") is None
+                or state.get("generation") <= stopped_generation
+            ]
+        finally:
+            self._rest_poller_lock.release()
+
+        threads = [ref() for ref in thread_refs]
+        threads.extend(state.get("thread") for state in ws_states)
+        threads.extend(rest_threads)
+        current_thread = threading.current_thread()
+        owns_current_thread = False
+        for thread in dict.fromkeys(t for t in threads if t is not None):
+            if thread is current_thread:
+                owns_current_thread = True
+                continue
+            join = getattr(thread, "join", None)
+            if callable(join):
+                try:
+                    join(timeout=max(0.0, deadline - time.monotonic()))
+                except Exception:
+                    pass
+
+        if self._running or owns_current_thread:
+            return False
+        for thread in dict.fromkeys(t for t in threads if t is not None):
+            if thread is current_thread:
+                continue
+            try:
+                if thread.is_alive():
+                    return False
+            except Exception:
+                return False
+
+        if not self._start_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
+            final_ws_states = list(self._ws_retiring_workers)
+            if self._ws_worker_state is not None:
+                final_ws_states.append(self._ws_worker_state)
+            if any(
+                (
+                    state.get("generation") is None
+                    or state.get("generation") <= stopped_generation
+                )
+                and (
+                    not state["done"].is_set()
+                    or bool(state.get("clients"))
+                )
+                for state in final_ws_states
+            ):
+                return False
+        finally:
+            self._start_lock.release()
+
+        if not self._rest_poller_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
+            owned_states = list(self._rest_retiring_workers)
+            if self._rest_worker_state is not None:
+                owned_states.append(self._rest_worker_state)
+            if any(
+                (
+                    state.get("generation") is None
+                    or state.get("generation") <= stopped_generation
+                )
+                and not state["done"].is_set()
+                for state in owned_states
+            ):
+                return False
+            if any(
+                (
+                    token.get("generation") is None
+                    or token.get("generation") <= stopped_generation
+                )
+                and not token["done"].is_set()
+                for token in self._rest_submission_tokens
+            ):
+                return False
+        finally:
+            self._rest_poller_lock.release()
+
+        if not self._start_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
+            if self._running:
+                return False
+            state = self._ensure_rest_close_generation(
+                deadline,
+                stopped_generation,
+            )
+        finally:
+            self._start_lock.release()
+        if state is not None:
+            done = state.get("done")
+            if isinstance(done, threading.Event):
+                done.wait(timeout=max(0.0, deadline - time.monotonic()))
+                if not done.is_set() or state.get("result") is not True:
+                    return False
+
+        if not self._rest_clones_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
+            clones_closed = not self._rest_clones
+        finally:
+            self._rest_clones_lock.release()
+        return clones_closed and not self._running
+
+    def _run_rest_close_generation(
+        self,
+        state: dict,
+        clones: List,
+    ) -> None:
+        result = False
+        try:
+            result = self._close_rest_clone_batch(clones)
+        finally:
+            state["result"] = result
+            state["done"].set()
+
+    def _ensure_rest_close_generation(
+        self,
+        deadline: float,
+        generation: int,
+    ) -> dict | None:
+        """Start/reuse one owned clone-close generation without blocking."""
+        if not self._rest_close_state_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return {"done": threading.Event(), "result": False}
+        try:
+            state = self._rest_close_state
+            if state is not None and state["done"].is_set():
+                self._rest_close_state = None
+                state = None
+            if state is not None:
+                return state
+
+            if not self._rest_clones_lock.acquire(
+                timeout=max(0.0, deadline - time.monotonic())
+            ):
+                return {"done": threading.Event(), "result": False}
+            try:
+                owned = [
+                    clone
+                    for clone, owner in self._rest_clone_owners
+                    if owner is None or owner <= generation
+                ]
+                unowned = [
+                    clone
+                    for clone in self._rest_clones
+                    if not any(
+                        clone is registered
+                        for registered, _owner in self._rest_clone_owners
+                    )
+                ]
+                clones = owned + unowned
+            finally:
+                self._rest_clones_lock.release()
+            if not clones:
+                return None
+
+            state = {"done": threading.Event(), "result": False}
+            try:
+                worker = threading.Thread(
+                    target=self._run_rest_close_generation,
+                    args=(state, clones),
+                    name="ws-feed-rest-close",
+                    daemon=True,
+                )
+            except BaseException:
+                return {"done": threading.Event(), "result": False}
+            state["thread"] = worker
+            self._rest_close_state = state
+            try:
+                worker.start()
+            except BaseException:
+                # Post-start ownership is uncertain even with ident=None.
+                return state
+            return state
+        finally:
+            self._rest_close_state_lock.release()
 
     def _close_rest_clones(self) -> bool:
         with self._rest_clones_lock:
             clones = list(self._rest_clones)
-        successful_ids: set[int] = set()
-        failed_ids: set[int] = set()
+        return self._close_rest_clone_batch(clones)
+
+    def _register_rest_clones(
+        self,
+        clones: List,
+        generation: int | None,
+    ) -> None:
+        with self._rest_clones_lock:
+            self._rest_clones.extend(clones)
+            owners = getattr(self, "_rest_clone_owners", None)
+            if owners is None:
+                owners = []
+                self._rest_clone_owners = owners
+            owners.extend(
+                (clone, generation) for clone in clones
+            )
+
+    def _close_rest_clone_batch(self, clones: List) -> bool:
+        """Close only one exact generation, preserving failed clients."""
+        successful = []
+        failed = []
         for c in clones:
-            clone_id = id(c)
-            if clone_id in successful_ids or clone_id in failed_ids:
+            if any(c is prior for prior in successful) or any(
+                c is prior for prior in failed
+            ):
                 continue
             if c is self._exchange:
-                successful_ids.add(clone_id)
+                successful.append(c)
                 continue
             close = getattr(c, "close", None)
             if not callable(close):
-                successful_ids.add(clone_id)
+                successful.append(c)
                 continue
             try:
-                close()
+                closed = close()
             except Exception as exc:
-                failed_ids.add(clone_id)
+                failed.append(c)
                 silent_log("close WebSocket REST clone", exc)
             else:
-                successful_ids.add(clone_id)
+                if closed is not None and closed is not True:
+                    failed.append(c)
+                else:
+                    successful.append(c)
         with self._rest_clones_lock:
             self._rest_clones = [
                 clone
                 for clone in self._rest_clones
-                if id(clone) not in successful_ids
+                if not any(clone is closed for closed in successful)
             ]
-        return not failed_ids
+            for clone in failed:
+                if not any(clone is prior for prior in self._rest_clones):
+                    self._rest_clones.append(clone)
+            self._rest_clone_owners = [
+                (clone, owner)
+                for clone, owner in getattr(
+                    self,
+                    "_rest_clone_owners",
+                    (),
+                )
+                if not any(clone is closed for closed in successful)
+            ]
+        return not failed
 
     def get_ticker(self, symbol: str) -> Optional[dict]:
         with self._cache_lock:
@@ -277,6 +552,19 @@ class WebSocketFeed:
             pass
         return True
 
+    def _commit_rest_ticker(
+        self,
+        generation: int | None,
+        symbol: str,
+        ticker: dict,
+    ) -> bool:
+        if generation is None:
+            return self._update_cache(symbol, ticker)
+        with self._start_lock:
+            if not self._rest_generation_active(generation):
+                return False
+            return self._update_cache(symbol, ticker)
+
     @staticmethod
     def _handle_loop_exception(loop, context: dict) -> None:
         """Suppress only the known ccxt callback cancellation artifact."""
@@ -288,129 +576,311 @@ class WebSocketFeed:
             return
         loop.default_exception_handler(context)
 
-    def _start_ws(self, symbols: List[str]) -> None:
+    def _start_ws(
+        self,
+        symbols: List[str],
+        generation: int | None = None,
+        admitted: bool = False,
+    ) -> None:
+        """Publish exact WS ownership before invoking ``Thread.start``."""
+        if generation is None:
+            generation = self._run_generation
+        if not admitted:
+            with self._start_lock:
+                return self._start_ws(symbols, generation, True)
+        if (
+            not self._ws_generation_active(generation)
+            or not (self._ws_capable or self._ws_mode)
+        ):
+            return
+
+        current = self._ws_worker_state
+        if current is not None and not current["done"].is_set():
+            return
+        if current is not None:
+            self._ws_worker_state = None
+
+        state = {
+            "generation": generation,
+            "done": threading.Event(),
+            "thread": None,
+            "loop": None,
+            "task": None,
+            "clients": [],
+        }
+
         def _run() -> None:
             completed_normally = False
+            fatal_error = None
             loop = None
             previous_handler = None
             main_coro = None
             main_task = None
             try:
                 loop = asyncio.new_event_loop()
-                self._loop = loop
                 asyncio.set_event_loop(loop)
                 previous_handler = loop.get_exception_handler()
                 loop.set_exception_handler(self._handle_loop_exception)
-                main_coro = self._ws_main(symbols)
+                main_coro = self._ws_main(symbols, generation, state)
                 main_task = loop.create_task(main_coro)
                 main_coro = None
-            except Exception as exc:
-                if main_coro is not None:
-                    try:
-                        main_coro.close()
-                    except Exception:
-                        pass
-                if loop is not None:
-                    try:
-                        loop.set_exception_handler(previous_handler)
-                    except Exception:
-                        pass
-                    try:
-                        loop.close()
-                    except Exception:
-                        pass
-                if self._loop is loop:
-                    self._loop = None
                 with self._start_lock:
-                    self._ws_thread_started = False
-                    self._ws_mode = False
-                with self._cache_lock:
-                    self._cache.clear()
-                silent_log("bootstrap WebSocket ticker worker", exc)
-                try:
-                    self._ensure_rest_poller()
-                except Exception as fallback_exc:
-                    silent_log(
-                        "start WebSocket bootstrap REST fallback",
-                        fallback_exc,
-                    )
-                return
-            with self._ws_main_task_lock:
-                self._ws_main_task = main_task
-            try:
+                    state["loop"] = loop
+                    state["task"] = main_task
+                    if self._ws_worker_state is state:
+                        self._loop = loop
+                with self._ws_main_task_lock:
+                    if self._ws_worker_state is state:
+                        self._ws_main_task = main_task
                 loop.run_until_complete(main_task)
                 completed_normally = True
             except asyncio.CancelledError:
-                # stop() requested cancellation; _ws_main's per-client finally
-                # has already awaited the client close before this propagates.
+                # The generation-owned coroutine confirms client close before
+                # propagating/finishing cancellation.
                 completed_normally = True
-            except Exception as e:
+            except BaseException as exc:
+                fatal_error = exc
+                if main_coro is not None:
+                    try:
+                        main_coro.close()
+                    except BaseException:
+                        pass
                 try:
                     from core.logger import log_event
                     log_event(
                         f"[WSFeed] Live price stream unavailable "
-                        f"({type(e).__name__}); REST fallback active; "
+                        f"({type(exc).__name__}); REST fallback active; "
                         f"trading continues with polled prices",
                         "WARN",
                     )
-                except Exception:
-                    print(
-                        f"[WSFeed] Live price stream unavailable "
-                        f"({type(e).__name__}); REST fallback active"
-                    )
-                # Clear cache on fallback to avoid trading on stale data
-                with self._cache_lock:
-                    self._cache.clear()
-                self._ws_mode = False
+                except BaseException:
+                    try:
+                        print(
+                            f"[WSFeed] Live price stream unavailable "
+                            f"({type(exc).__name__}); REST fallback active"
+                        )
+                    except BaseException:
+                        pass
                 try:
-                    self._ensure_rest_poller()
-                except Exception as fallback_exc:
-                    silent_log("start WebSocket REST fallback", fallback_exc)
+                    silent_log("WebSocket ticker worker", exc)
+                except BaseException:
+                    pass
             finally:
                 with self._ws_main_task_lock:
                     if self._ws_main_task is main_task:
                         self._ws_main_task = None
-                try:
-                    loop.set_exception_handler(previous_handler)
-                except Exception:
-                    pass
-                try:
-                    loop.close()
-                except Exception:
-                    pass
-                if self._loop is loop:
-                    self._loop = None
-                restart_symbols = None
-                with self._start_lock:
-                    self._ws_thread_started = False
-                    # A stop/start can race with the old thread's final exit.
-                    # In that case start() observed the old latch; hand the
-                    # newly active generation a replacement thread here.
-                    if completed_normally and self._running and self._ws_mode:
-                        with self._symbols_lock:
-                            restart_symbols = list(self._symbols)
-                        self._ws_thread_started = True
-                if restart_symbols is not None:
+                if loop is not None:
                     try:
-                        self._start_ws(restart_symbols)
-                    except Exception as restart_exc:
-                        with self._start_lock:
-                            self._ws_thread_started = False
-                            self._ws_mode = False
-                        silent_log("restart WebSocket ticker worker", restart_exc)
-                        try:
-                            self._ensure_rest_poller()
-                        except Exception as fallback_exc:
-                            silent_log(
-                                "start WebSocket restart REST fallback",
-                                fallback_exc,
-                            )
+                        loop.set_exception_handler(previous_handler)
+                    except BaseException:
+                        pass
+                    try:
+                        loop.close()
+                    except BaseException:
+                        pass
+                with self._start_lock:
+                    if self._loop is loop:
+                        self._loop = None
+                self._finish_ws_worker(
+                    state,
+                    completed_normally=completed_normally,
+                    fatal_error=fatal_error,
+                )
 
         t = threading.Thread(target=_run, name="ws-feed-main", daemon=True)
-        t.start()
+        state["thread"] = t
+        self._ws_worker_state = state
+        self._ws_thread_started = True
         self._threads.append(weakref.ref(t))
+        try:
+            t.start()
+        except BaseException:
+            # Post-start ownership is uncertain; only the exact target's
+            # identity-checked finalizer may clear this state.
+            raise
 
-    async def _ws_main(self, symbols: List[str]) -> None:
+    def _finish_ws_worker(
+        self,
+        state: dict,
+        *,
+        completed_normally: bool,
+        fatal_error,
+    ) -> None:
+        fallback_generation = None
+        with self._start_lock:
+            state["done"].set()
+            self._ws_retiring_workers = [
+                prior
+                for prior in self._ws_retiring_workers
+                if prior is not state and not prior["done"].is_set()
+            ]
+            if self._ws_worker_state is not state:
+                return
+            self._ws_worker_state = None
+            self._ws_thread_started = False
+            if not self._running:
+                return
+
+            active_generation = self._run_generation
+            should_restart = (
+                (self._ws_capable or self._ws_mode)
+                and (
+                    completed_normally
+                    or state.get("generation") != active_generation
+                )
+            )
+            if should_restart:
+                with self._symbols_lock:
+                    restart_symbols = list(self._symbols)
+                try:
+                    self._start_ws(
+                        restart_symbols,
+                        active_generation,
+                        True,
+                    )
+                except Exception as restart_exc:
+                    self._ws_mode = False
+                    fallback_generation = active_generation
+                    silent_log("restart WebSocket ticker worker", restart_exc)
+            elif fatal_error is not None:
+                self._ws_mode = False
+                with self._cache_lock:
+                    self._cache.clear()
+                fallback_generation = active_generation
+
+        if fallback_generation is not None:
+            try:
+                self._ensure_rest_poller(fallback_generation)
+            except Exception as fallback_exc:
+                silent_log("start WebSocket REST fallback", fallback_exc)
+
+    def _ws_generation_active(self, generation: int | None) -> bool:
+        return self._running and (
+            generation is None or generation == self._run_generation
+        )
+
+    def _set_ws_mode_for_generation(
+        self,
+        generation: int | None,
+        enabled: bool,
+    ) -> bool:
+        if generation is None:
+            self._ws_mode = enabled
+            return True
+        with self._start_lock:
+            if not self._ws_generation_active(generation):
+                return False
+            self._ws_mode = enabled
+            return True
+
+    def _clear_ws_cache(self, generation: int | None) -> bool:
+        if generation is None:
+            with self._cache_lock:
+                self._cache.clear()
+            return True
+        with self._start_lock:
+            if not self._ws_generation_active(generation):
+                return False
+            with self._cache_lock:
+                self._cache.clear()
+            return True
+
+    def _commit_ws_ticker(
+        self,
+        generation: int | None,
+        symbol: str,
+        ticker: dict,
+    ) -> bool:
+        if generation is None:
+            return self._update_cache(symbol, ticker)
+        with self._start_lock:
+            if not self._ws_generation_active(generation):
+                return False
+            return self._update_cache(symbol, ticker)
+
+    async def _close_owned_ws_client(
+        self,
+        state: dict | None,
+        async_ex,
+    ) -> None:
+        """Retry close in the owning loop; never publish unconfirmed success."""
+        failure_logged = False
+        close_task = None
+        while True:
+            closed = False
+            try:
+                if close_task is None:
+                    close_task = asyncio.ensure_future(
+                        _close_async_exchange(async_ex)
+                    )
+                closed = await asyncio.wait_for(
+                    asyncio.shield(close_task),
+                    timeout=_WS_CLOSE_ATTEMPT_TIMEOUT_SEC,
+                )
+            except TimeoutError:
+                # Keep awaiting this exact accepted close task. Starting a
+                # second close while the first is still pending would lose
+                # ownership and can accumulate detached transport work.
+                if not failure_logged:
+                    silent_log(
+                        "close WebSocket async exchange",
+                        TimeoutError("async exchange close timed out"),
+                    )
+                    failure_logged = True
+                continue
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+                if close_task is None or not close_task.done():
+                    # Cancellation targeted this owner; the shielded close task
+                    # is still live and remains the sole accepted close owner.
+                    continue
+                try:
+                    closed = close_task.result()
+                except asyncio.CancelledError:
+                    close_task = None
+                except Exception as exc:
+                    if not failure_logged:
+                        silent_log("close WebSocket async exchange", exc)
+                        failure_logged = True
+                    close_task = None
+            except Exception as exc:
+                if not failure_logged:
+                    silent_log("close WebSocket async exchange", exc)
+                    failure_logged = True
+                close_task = None
+            if closed is True:
+                with self._async_ex_lock:
+                    if self._async_ex is async_ex:
+                        self._async_ex = None
+                    if state is not None:
+                        state["clients"] = [
+                            client
+                            for client in state["clients"]
+                            if client is not async_ex
+                        ]
+                return
+            if not failure_logged:
+                silent_log(
+                    "close WebSocket async exchange",
+                    RuntimeError("async exchange close was not confirmed"),
+                )
+                failure_logged = True
+            close_task = None
+            try:
+                await asyncio.sleep(_WS_CLOSE_RETRY_SEC)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+
+    async def _ws_main(
+        self,
+        symbols: List[str],
+        generation: int | None = None,
+        state: dict | None = None,
+    ) -> None:
         import ccxt.pro as ccxt_pro
         ex_name  = type(self._exchange).__name__.lower()
         ex_class = getattr(ccxt_pro, ex_name)
@@ -424,15 +894,17 @@ class WebSocketFeed:
         reconnect_attempts = 0
         last_warning_at = 0.0
         initial_health_reported = False
-        while self._running:
+        while self._ws_generation_active(generation):
             async_ex = ex_class(config)
             healthy_symbols: set[str] = set()
             healthy_since: float | None = None
             restoration_reported = False
             with self._async_ex_lock:
                 self._async_ex = async_ex
+                if state is not None:
+                    state["clients"].append(async_ex)
             try:
-                while self._running:
+                while self._ws_generation_active(generation):
                     # Re-read the live subscription set every iteration (the WS
                     # thread is started ONCE, guarded by _ws_thread_started).
                     # Symbols added by later start() calls land in self._symbols;
@@ -445,7 +917,7 @@ class WebSocketFeed:
                         continue
                     tickers = await async_ex.watch_tickers(current_syms)
                     for sym, t in tickers.items():
-                        if self._update_cache(sym, t):
+                        if self._commit_ws_ticker(generation, sym, t):
                             healthy_symbols.add(sym)
                     all_current_symbols_healthy = (
                         bool(current_syms)
@@ -457,7 +929,11 @@ class WebSocketFeed:
                         # WS coverage hands ownership back from the temporary
                         # REST pool.  The REST session observes this flag and
                         # exits without remaining as a duplicate price source.
-                        self._ws_mode = True
+                        if not self._set_ws_mode_for_generation(
+                            generation,
+                            True,
+                        ):
+                            break
                         healthy_now = time.monotonic()
                         if healthy_since is None:
                             healthy_since = healthy_now
@@ -497,17 +973,21 @@ class WebSocketFeed:
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                if not self._ws_generation_active(generation):
+                    continue
                 error_type = type(e).__name__
                 reconnect_attempts += 1
                 # Normal transport exceptions are handled inside this retry
                 # loop and therefore never reach the outer thread wrapper.
                 # Activate the documented REST fallback here, clear the WS
                 # generation's cache, and keep reconnecting in parallel.
-                with self._cache_lock:
-                    self._cache.clear()
-                self._ws_mode = False
+                self._clear_ws_cache(generation)
+                self._set_ws_mode_for_generation(generation, False)
                 try:
-                    self._ensure_rest_poller()
+                    if generation is None:
+                        self._ensure_rest_poller()
+                    else:
+                        self._ensure_rest_poller(generation)
                 except Exception as fallback_exc:
                     silent_log(
                         "start interrupted WebSocket REST fallback",
@@ -547,78 +1027,211 @@ class WebSocketFeed:
                     last_warning_at = now
                 interruption_type = error_type
             finally:
-                with self._async_ex_lock:
-                    if self._async_ex is async_ex:
-                        self._async_ex = None
-                try:
-                    await _close_async_exchange(async_ex)
-                except Exception:
-                    pass
+                await self._close_owned_ws_client(state, async_ex)
 
-            if not self._running:
+            if not self._ws_generation_active(generation):
                 break
             jitter = random.uniform(-0.25, 0.25) * backoff
             wait   = min(backoff + jitter, _WS_MAX_BACKOFF)
             await asyncio.sleep(max(1.0, wait))
             backoff = min(backoff * 2, _WS_MAX_BACKOFF)
 
-    def _ensure_rest_poller(self) -> None:
+    def _rest_generation_active(self, generation: int | None) -> bool:
+        return (
+            self._running
+            and not self._ws_mode
+            and (generation is None or generation == self._run_generation)
+        )
+
+    def _ensure_rest_poller(
+        self,
+        generation: int | None = None,
+        admitted: bool = False,
+    ) -> None:
+        if generation is None:
+            generation = self._run_generation
+        if not admitted:
+            with self._start_lock:
+                if not self._rest_generation_active(generation):
+                    return
+                return self._ensure_rest_poller(generation, True)
+        if not self._rest_generation_active(generation):
+            return
         with self._rest_poller_lock:
-            if self._rest_thread_started:
+            if not self._rest_generation_active(generation):
                 return
-            self._rest_thread_started = True
+            if any(
+                token.get("generation") == generation
+                and not token["done"].is_set()
+                for token in self._rest_submission_tokens
+            ):
+                return
+            current = self._rest_worker_state
+            if (
+                current is not None
+                and current.get("generation") == generation
+                and not current["done"].is_set()
+            ):
+                return
+            if current is not None and not current["done"].is_set():
+                if not any(current is prior for prior in self._rest_retiring_workers):
+                    self._rest_retiring_workers.append(current)
+
+            state = {
+                "generation": generation,
+                "done": threading.Event(),
+            }
+
+            def _run_owned() -> None:
+                try:
+                    state["restart_when_clear"] = (
+                        self._rest_pool_loop(generation) is True
+                    )
+                finally:
+                    self._finish_rest_worker(state)
+
             try:
                 t = threading.Thread(
-                    target=self._rest_pool_loop,
+                    target=_run_owned,
                     name="ws-feed-rest-pool",
                     daemon=True,
                 )
-                t.start()
-            except Exception:
-                self._rest_thread_started = False
+            except BaseException:
                 raise
+            state["thread"] = t
+            self._rest_worker_state = state
+            self._rest_thread_started = True
             self._threads.append(weakref.ref(t))
+            try:
+                t.start()
+            except BaseException:
+                # Once start() was invoked, retain the exact state even when
+                # Python has not yet published ident/liveness. The target's
+                # identity-checked finally is the only safe successor handoff.
+                raise
 
-    def _wait_for_rest_restart(self, delay_seconds: float) -> bool:
+    def _finish_rest_worker(self, state: dict) -> None:
+        state["done"].set()
+        restart_generation = None
+        with self._rest_poller_lock:
+            self._rest_retiring_workers = [
+                prior
+                for prior in self._rest_retiring_workers
+                if prior is not state
+            ]
+            if self._rest_worker_state is state:
+                self._rest_worker_state = None
+                self._rest_thread_started = False
+                generation = state.get("generation")
+                if (
+                    state.get("restart_when_clear") is True
+                    and
+                    self._rest_generation_active(generation)
+                    and not any(
+                        token.get("generation") == generation
+                        and not token["done"].is_set()
+                        for token in self._rest_submission_tokens
+                    )
+                ):
+                    restart_generation = generation
+        if restart_generation is not None:
+            self._ensure_rest_poller(restart_generation)
+
+    def _wait_for_rest_restart(
+        self,
+        delay_seconds: float,
+        generation: int | None = None,
+    ) -> bool:
         remaining = max(0.0, float(delay_seconds))
-        while remaining > 0.0 and self._running and not self._ws_mode:
+        while remaining > 0.0 and self._rest_generation_active(generation):
             step = min(0.25, remaining)
             time.sleep(step)
             remaining -= step
-        return self._running and not self._ws_mode
+        return self._rest_generation_active(generation)
 
-    def _rest_pool_loop(self) -> None:
+    def _begin_rest_submission(
+        self,
+        generation: int | None,
+    ) -> dict:
+        token = {
+            "generation": generation,
+            "done": threading.Event(),
+        }
+        with self._rest_poller_lock:
+            self._rest_submission_tokens.append(token)
+        return token
+
+    def _finish_rest_submission(self, token: dict) -> None:
+        token["done"].set()
+        restart_generation = None
+        with self._rest_poller_lock:
+            self._rest_submission_tokens = [
+                prior
+                for prior in self._rest_submission_tokens
+                if prior is not token
+            ]
+            generation = token.get("generation")
+            if (
+                self._rest_worker_state is None
+                and self._rest_generation_active(generation)
+                and not any(
+                    prior.get("generation") == generation
+                    and not prior["done"].is_set()
+                    for prior in self._rest_submission_tokens
+                )
+            ):
+                restart_generation = generation
+        if restart_generation is not None:
+            self._ensure_rest_poller(restart_generation)
+
+    def _rest_pool_loop(
+        self,
+        generation: int | None = None,
+    ) -> bool:
         restart_backoff = _REST_RESTART_BACKOFF_SEC
         try:
-            while True:
+            while self._rest_generation_active(generation):
                 session_error = None
                 try:
-                    self._rest_pool_session()
+                    if generation is None:
+                        self._rest_pool_session()
+                    else:
+                        self._rest_pool_session(generation)
                 except Exception as exc:
                     session_error = exc
                     silent_log("WebSocket REST poller session", exc)
-                finally:
-                    self._close_rest_clones()
 
                 if session_error is not None:
-                    if self._running and not self._ws_mode:
-                        self._wait_for_rest_restart(restart_backoff)
+                    with self._rest_poller_lock:
+                        ownership_uncertain = any(
+                            token.get("generation") == generation
+                            and not token["done"].is_set()
+                            for token in self._rest_submission_tokens
+                        )
+                    if ownership_uncertain:
+                        return True
+                    if self._rest_generation_active(generation):
+                        if generation is None:
+                            self._wait_for_rest_restart(restart_backoff)
+                        else:
+                            self._wait_for_rest_restart(
+                                restart_backoff,
+                                generation,
+                            )
                     restart_backoff = min(
                         restart_backoff * 2.0,
                         _REST_RESTART_MAX_BACKOFF_SEC,
                     )
                 else:
                     restart_backoff = _REST_RESTART_BACKOFF_SEC
-
-                with self._rest_poller_lock:
-                    if not self._running or self._ws_mode:
-                        self._rest_thread_started = False
-                        return
         finally:
-            with self._rest_poller_lock:
-                self._rest_thread_started = False
+            if generation is None:
+                with self._rest_poller_lock:
+                    if self._rest_worker_state is None:
+                        self._rest_thread_started = False
+        return False
 
-    def _rest_pool_session(self) -> None:
+    def _rest_pool_session(self, generation: int | None = None) -> None:
         clones = []
         try:
             for _ in range(_MAX_REST_WORKERS):
@@ -627,13 +1240,12 @@ class WebSocketFeed:
             # A later constructor can fail after earlier CCXT clients already
             # opened their own HTTP sessions. Register the partial generation
             # before cleanup so failed close attempts remain retryable.
-            with self._rest_clones_lock:
-                self._rest_clones.extend(clones)
-            self._close_rest_clones()
+            self._register_rest_clones(clones, generation)
+            self._close_rest_clone_batch(clones)
             raise
-        with self._rest_clones_lock:
-            # Keep unresolved clients from an earlier generation retryable.
-            self._rest_clones.extend(clones)
+        # Keep unresolved clients from an earlier generation retryable while
+        # preserving exact generation ownership for stop/restart handoff.
+        self._register_rest_clones(clones, generation)
 
         # Bind each worker thread to one clone via thread-local
         _tls = threading.local()
@@ -661,10 +1273,14 @@ class WebSocketFeed:
                 return {}
             return _my_clone().fetch_ticker(sym)
 
-        pool = ThreadPoolExecutor(
-            max_workers=_MAX_REST_WORKERS,
-            thread_name_prefix="ws-rest",
-        )
+        try:
+            pool = ThreadPoolExecutor(
+                max_workers=_MAX_REST_WORKERS,
+                thread_name_prefix="ws-rest",
+            )
+        except BaseException:
+            self._close_rest_clone_batch(clones)
+            raise
         try:
             # Keep the executor's physical work queue bounded across timeout
             # cycles. ``Future.cancel()`` cannot stop a request that already
@@ -682,7 +1298,7 @@ class WebSocketFeed:
                 inflight_slots.release()
 
             symbol_cursor = 0
-            while self._running and not self._ws_mode:
+            while self._rest_generation_active(generation):
                 cycle_start = time.monotonic()
                 with self._symbols_lock:
                     symbols = sorted(self._symbols)
@@ -707,18 +1323,31 @@ class WebSocketFeed:
                             inflight_slots.release()
                             continue
                         inflight_symbols.add(sym)
+                    submission = self._begin_rest_submission(generation)
+
+                    def _fetch_owned(symbol: str, token=submission) -> dict:
+                        try:
+                            return _fetch(symbol)
+                        finally:
+                            self._finish_rest_submission(token)
+
                     try:
-                        future = pool.submit(_fetch, sym)
-                        future.add_done_callback(
-                            lambda completed, symbol=sym: _release_inflight(
-                                completed, symbol
-                            )
-                        )
+                        future = pool.submit(_fetch_owned, sym)
                     except Exception:
                         with inflight_lock:
                             inflight_symbols.discard(sym)
                         inflight_slots.release()
                         raise
+                    future.add_done_callback(
+                        lambda completed, symbol=sym: _release_inflight(
+                            completed, symbol
+                        )
+                    )
+                    future.add_done_callback(
+                        lambda _completed, token=submission: (
+                            self._finish_rest_submission(token)
+                        )
+                    )
                     future_map[future] = sym
                 symbol_cursor = (symbol_cursor + examined) % len(symbols)
 
@@ -729,7 +1358,11 @@ class WebSocketFeed:
                         try:
                             ticker = fut.result()
                             if ticker:
-                                self._update_cache(sym, ticker)
+                                self._commit_rest_ticker(
+                                    generation,
+                                    sym,
+                                    ticker,
+                                )
                         except Exception as e:
                             try:
                                 from core.logger import log_event
@@ -765,6 +1398,9 @@ class WebSocketFeed:
             # into an unbounded join. stop() closes the owned clients to wake
             # their I/O; completion callbacks release the bounded permits.
             pool.shutdown(wait=False, cancel_futures=True)
+            # This generation owns these exact clients. Never let an older
+            # poller close a concurrently started successor's clone registry.
+            self._close_rest_clone_batch(clones)
 
     def __repr__(self) -> str:
         return (

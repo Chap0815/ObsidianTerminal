@@ -73,7 +73,7 @@ def _persist_emergency_fragment(
                 error_logger(f"emergency close fragment {sym}", exc)
             except Exception:
                 pass
-    if persisted is False:
+    if persisted is not None and persisted is not True:
         _block_emergency_fragment(bot_name, sym)
         log_event(
             f"  {sym}: close fragment recovery marker was not durable; "
@@ -1160,7 +1160,7 @@ def _close_single_position_impl(*,
                     )
                 except Exception:
                     pass
-        if pending_persisted is False:
+        if pending_persisted is not None and pending_persisted is not True:
             log_event(
                 f"  {sym}: verified emergency close was not booked because "
                 f"its accounting recovery marker was not durable",
@@ -1187,7 +1187,7 @@ def _close_single_position_impl(*,
         accounting_ok = False
         accounting_error = None
         try:
-            accounting_ok = bool(save_trade_db(
+            accounting_ok = save_trade_db(
                 bot_name=bot_name,
                 mode_is_sim=simulation,
                 symbol=sym,
@@ -1213,7 +1213,7 @@ def _close_single_position_impl(*,
                 entry_quality_label=d.get("entry_quality_label"),
                 entry_quality_reasons=d.get("entry_quality_reasons"),
                 entry_id=d.get("entry_id"),
-            ))
+            ) is True
             if not accounting_ok:
                 raise RuntimeError("save_trade_db returned False")
         except Exception as e:
@@ -1252,7 +1252,13 @@ def _close_single_position_impl(*,
         try:
             # Scope by bot: FUTURES + CROSS share futures_state; unscoped would
             # delete the other bot's dashboard row for the same base coin.
-            remove_futures_state(sym, bot_name, mode_is_sim=simulation)
+            remove_futures_state(
+                sym,
+                bot_name,
+                mode_is_sim=simulation,
+                expected_opened_at=d.get("buy_time"),
+                expected_entry_id=d.get("entry_id"),
+            )
         except Exception as cleanup_error:
             if error_logger:
                 try:
@@ -1262,9 +1268,11 @@ def _close_single_position_impl(*,
                 except Exception:
                     pass
             try:
+                from bot_utils.trade_state import update_many_if_current
+
                 keep = dict(restore_fields)
                 keep["futures_state_cleanup_pending"] = True
-                state.update_many(sym, keep)
+                update_many_if_current(state, sym, keep, d)
             except Exception as state_error:
                 if error_logger:
                     try:
@@ -1289,12 +1297,19 @@ def _close_single_position_impl(*,
         try:
             from bot_utils.trade_state import remove_with_restore_fields
             removed_state = remove_with_restore_fields(
-                state, sym, restore_fields
+                state, sym, restore_fields, expected_row=d
             )
         except Exception as cleanup_error:
             removed_state = False
             try:
-                state.update_many(sym, restore_fields)
+                from bot_utils.trade_state import update_many_if_current
+
+                update_many_if_current(
+                    state,
+                    sym,
+                    restore_fields,
+                    d,
+                )
             except Exception as state_error:
                 if error_logger:
                     try:
@@ -1324,6 +1339,26 @@ def _close_single_position_impl(*,
                 0.0,
                 "closed but claim/state cleanup failed",
             )
+
+        entry_id = d.get("entry_id")
+        if isinstance(entry_id, str) and entry_id.strip():
+            try:
+                remove_futures_state(
+                    sym,
+                    bot_name,
+                    mode_is_sim=simulation,
+                    expected_opened_at=d.get("buy_time"),
+                    expected_entry_id=entry_id,
+                )
+            except Exception as cleanup_error:
+                if error_logger:
+                    try:
+                        error_logger(
+                            f"emergency finalize futures_state cleanup {sym}",
+                            cleanup_error,
+                        )
+                    except Exception:
+                        pass
 
         return (sym, "closed", profit_usdt, None)
 

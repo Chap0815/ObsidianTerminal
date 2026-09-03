@@ -58,6 +58,8 @@ import threading
 import weakref
 from typing import Any
 
+from bot_utils.runtime_threads import thread_definitely_never_started
+
 
 _ASYNC_CLOSE_TIMEOUT_SECONDS = 1.0
 _ASYNC_CLOSE_STATES_LOCK = threading.Lock()
@@ -85,13 +87,13 @@ def _discard_unstarted_awaitable(awaitable) -> None:
         try:
             close()
             return
-        except Exception:
+        except BaseException:
             pass
     cancel = getattr(awaitable, "cancel", None)
     if callable(cancel):
         try:
             cancel()
-        except Exception:
+        except BaseException:
             pass
 
 
@@ -185,11 +187,26 @@ def _run_async_close_bounded(
         try:
             state["thread"].start()
         except BaseException as exc:
-            with _ASYNC_CLOSE_STATES_LOCK:
-                if _ASYNC_CLOSE_STATES.get(key) is state:
-                    _ASYNC_CLOSE_STATES.pop(key, None)
-            _discard_unstarted_awaitable(awaitable)
-            return True, False, exc
+            if (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(state["thread"])
+            ):
+                # Exact stdlib Thread + ordinary pre-launch failure proves
+                # that this generation can never consume its coroutine.
+                # Retire it identity-safely so a later shutdown retry may
+                # create one fresh generation.
+                state["error"] = exc
+                state["done"].set()
+                with _ASYNC_CLOSE_STATES_LOCK:
+                    if _ASYNC_CLOSE_STATES.get(key) is state:
+                        _ASYNC_CLOSE_STATES.pop(key, None)
+                _discard_unstarted_awaitable(awaitable)
+                return True, False, exc
+            # Once start() was invoked, failure does not prove the close
+            # generation was never queued. Keep this exact state authoritative
+            # and never dispose its awaitable while a delayed worker may use it.
+            state["start_error"] = exc
+            return False, False, exc
     else:
         # A previous close for this exact client is still authoritative.
         # Dispose the newly returned, never-awaited object without starting a
@@ -272,8 +289,8 @@ def _run_close_call_bounded(
                     result = closer()
                     if inspect.isawaitable(result):
                         result = asyncio.run(_await_close_result(result))
-                    state["succeeded"] = result is not False
-                    if result is False:
+                    state["succeeded"] = result is None or result is True
+                    if not state["succeeded"]:
                         state["error"] = RuntimeError(
                             "exchange close reported incomplete"
                         )
@@ -307,10 +324,22 @@ def _run_close_call_bounded(
         try:
             state["thread"].start()
         except BaseException as exc:
-            with _CLOSE_CALL_STATES_LOCK:
-                if _CLOSE_CALL_STATES.get(key) is state:
-                    _CLOSE_CALL_STATES.pop(key, None)
-            return True, False, exc
+            if (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(state["thread"])
+            ):
+                # Only the exact stdlib pre-launch state is safe to retire;
+                # subclasses and fatal/post-launch failures stay sticky.
+                state["error"] = exc
+                state["done"].set()
+                with _CLOSE_CALL_STATES_LOCK:
+                    if _CLOSE_CALL_STATES.get(key) is state:
+                        _CLOSE_CALL_STATES.pop(key, None)
+                return True, False, exc
+            # A start() exception may follow a real launch. Preserve the exact
+            # generation so no successor can close the same session in parallel.
+            state["start_error"] = exc
+            return False, False, exc
 
     done = state["done"]
     if not done.wait(timeout=timeout):
@@ -482,6 +511,7 @@ class ThreadLocalExchange:
         # A process-wide generation invalidates TLS slots owned by every
         # thread.  Deleting ``self._tls.clone`` only affects the caller.
         self._clone_generation = 0
+        self._clone_builds = 0
         self._markets_refresh_lock = threading.Lock()
         self._closed = False
         self._base_closed = False
@@ -500,6 +530,7 @@ class ThreadLocalExchange:
         with self._close_lock:
             with self._clones_lock:
                 self._clone_generation += 1
+                builds_active = self._clone_builds
                 clones = list(self._clones)
                 self._clones.clear()
             # Drop the TLS slot so the next call rebuilds a clone.
@@ -515,7 +546,7 @@ class ThreadLocalExchange:
             if failed:
                 with self._clones_lock:
                     self._clones.extend(failed)
-            return not failed
+            return not failed and builds_active == 0
 
     def shutdown(self) -> bool:
         """Terminally close base + clones and reject future network clones."""
@@ -527,6 +558,7 @@ class ThreadLocalExchange:
                     self._closed = True
                     self._clone_generation += 1
                 clones = list(self._clones)
+                builds_active = self._clone_builds
                 self._clones.clear()
             try:
                 del self._tls.clone
@@ -542,7 +574,7 @@ class ThreadLocalExchange:
             if failed:
                 with self._clones_lock:
                     self._clones.extend(failed)
-            return not failed and self._base_closed
+            return not failed and self._base_closed and builds_active == 0
 
     def close_current_thread_clone(self) -> bool:
         """Close + drop THIS thread's clone. Call from a transient
@@ -707,9 +739,10 @@ class ThreadLocalExchange:
 
     def _get_clone(self):
         while True:
-            if self._closed:
-                raise RuntimeError("exchange wrapper is shut down")
-            generation = self._clone_generation
+            with self._clones_lock:
+                if self._closed:
+                    raise RuntimeError("exchange wrapper is shut down")
+                generation = self._clone_generation
             clone = getattr(self._tls, "clone", None)
             if (
                 clone is not None
@@ -718,7 +751,18 @@ class ThreadLocalExchange:
                 return clone
             # Construction can enter CCXT/SSL code.  Keep it outside the clone
             # index mutex so shutdown can invalidate the generation promptly.
-            clone = _build_clone(self._base)
+            with self._clones_lock:
+                if self._closed:
+                    raise RuntimeError("exchange wrapper is shut down")
+                if self._clone_generation != generation:
+                    continue
+                self._clone_builds += 1
+            try:
+                clone = _build_clone(self._base)
+            except BaseException:
+                with self._clones_lock:
+                    self._clone_builds -= 1
+                raise
             retry = False
             with self._clones_lock:
                 if self._closed:
@@ -729,10 +773,17 @@ class ThreadLocalExchange:
                     self._tls.clone = clone
                     self._tls.clone_generation = generation
                     self._clones.append((threading.current_thread(), clone))
+                    self._clone_builds -= 1
                     return clone
             # A concurrent close_all()/shutdown won the race.  The freshly
-            # built clone never became visible, so close it outside the mutex.
-            self._close_one(clone)
+            # built clone never became visible. Keep the build counted until
+            # its close has completed, and retain explicit failures for the
+            # next close_all()/shutdown retry.
+            close_succeeded = self._close_one(clone)
+            with self._clones_lock:
+                if not close_succeeded:
+                    self._clones.append((threading.current_thread(), clone))
+                self._clone_builds -= 1
             if not retry:
                 raise RuntimeError("exchange wrapper is shut down")
 

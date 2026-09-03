@@ -546,6 +546,7 @@ def process_due_tca_markouts(
 ) -> int:
     """Measure persisted post-fill markouts; failed reads remain retryable."""
     from core.database import (
+        AdvisoryLockIntegrityError,
         acquire_advisory_lock,
         complete_execution_markout,
         complete_simulated_execution_markout,
@@ -591,9 +592,11 @@ def process_due_tca_markouts(
                 ttl_sec=lock_ttl_seconds,
             )
         except Exception as exc:
+            _report_lock_state("renewal_error")
             silent_log(f"renew TCA markout worker lock ({stage})", exc)
             return False
         if not renewed:
+            _report_lock_state("lost")
             silent_log(
                 f"renew TCA markout worker lock ({stage})",
                 RuntimeError("worker lease lost"),
@@ -610,11 +613,16 @@ def process_due_tca_markouts(
             _report_lock_state("contended")
             return 0
     except Exception as exc:
-        _report_lock_state("error")
+        _report_lock_state(
+            "integrity_error"
+            if isinstance(exc, AdvisoryLockIntegrityError)
+            else "error"
+        )
         silent_log("acquire TCA markout worker lock", exc)
         return 0
     _report_lock_state("acquired")
 
+    primary_error: BaseException | None = None
     try:
         try:
             list_kwargs = {"limit": row_limit}
@@ -622,6 +630,7 @@ def process_due_tca_markouts(
                 list_kwargs["producer_bots"] = producer_bots
             due_rows = list(list_due_execution_markouts(**list_kwargs))
         except Exception as exc:
+            _report_lock_state("queue_error")
             silent_log("read due TCA markouts", exc)
             return 0
 
@@ -652,6 +661,13 @@ def process_due_tca_markouts(
                     and telemetry_scope not in {"LIVE", "SIM"}
                 ):
                     raise ValueError("markout telemetry scope is invalid")
+                raw_parent_invalid = row.get("queue_parent_invalid")
+                if raw_parent_invalid is not None and not isinstance(
+                    raw_parent_invalid, bool
+                ):
+                    raise ValueError("markout queue parent flag is invalid")
+                if raw_parent_invalid is True:
+                    raise ValueError("markout queue parent scope is invalid")
                 raw_intent_id = row.get("intent_id")
                 if raw_intent_id is None or isinstance(raw_intent_id, bool):
                     raise ValueError("markout intent id is invalid")
@@ -667,6 +683,18 @@ def process_due_tca_markouts(
                     raise ValueError("markout attempts is invalid")
                 prior_attempts = prior_attempts or 0
                 if queue_rowid is not None:
+                    persisted_symbol = row.get("symbol")
+                    if (
+                        not isinstance(persisted_symbol, str)
+                        or not persisted_symbol.strip()
+                    ):
+                        raise ValueError("markout symbol is invalid")
+                    if _positive_finite_or_none(
+                        row.get("reference_price")
+                    ) is None:
+                        raise ValueError("markout reference price unavailable")
+                    if _normalized_side_or_none(row.get("side")) is None:
+                        raise ValueError("markout side is invalid")
                     for field_name, optional in (
                         ("due_at", False),
                         ("next_attempt_at", True),
@@ -708,6 +736,7 @@ def process_due_tca_markouts(
                             f"{type(exc).__name__}: {exc}",
                         )
                     except Exception as persist_exc:
+                        _report_lock_state("persistence_error")
                         silent_log(
                             "quarantine invalid TCA markout row", persist_exc
                         )
@@ -825,6 +854,7 @@ def process_due_tca_markouts(
                     )
                     failure_persisted = True
                 except Exception as persist_exc:
+                    _report_lock_state("persistence_error")
                     silent_log("persist failed TCA markout", persist_exc)
                 if failure_persisted and _is_network_markout_exception(exc):
                     break
@@ -848,6 +878,7 @@ def process_due_tca_markouts(
                 ):
                     completed += 1
             except Exception as persist_exc:
+                _report_lock_state("persistence_error")
                 silent_log("persist completed TCA markout", persist_exc)
                 if not _renew_worker_lease("before_completion_failure_persist"):
                     break
@@ -870,17 +901,50 @@ def process_due_tca_markouts(
                 if not failure_persisted:
                     break
         return completed
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
+        fatal_cleanup_errors: list[tuple[str, BaseException]] = []
         try:
             released = release_advisory_lock(lock_name, holder_id)
-        except Exception as exc:
+        except BaseException as exc:
             released = False
             release_error = exc
+            if not isinstance(exc, Exception):
+                fatal_cleanup_errors.append(("release worker lease", exc))
         else:
             release_error = RuntimeError("worker lease release returned false")
         if not released:
-            _report_lock_state("release_failed")
-            silent_log("release TCA markout worker lock", release_error)
+            try:
+                _report_lock_state("release_failed")
+            except BaseException as exc:
+                fatal_cleanup_errors.append(("report failed worker lease", exc))
+            try:
+                silent_log("release TCA markout worker lock", release_error)
+            except BaseException as exc:
+                fatal_cleanup_errors.append(("log failed worker lease", exc))
+        if fatal_cleanup_errors:
+            if primary_error is not None:
+                for context, cleanup_error in fatal_cleanup_errors:
+                    try:
+                        primary_error.add_note(
+                            f"{context}: {type(cleanup_error).__name__}: "
+                            f"{cleanup_error}"
+                        )
+                    except BaseException:
+                        pass
+            else:
+                context, cleanup_primary = fatal_cleanup_errors[0]
+                for secondary_context, secondary in fatal_cleanup_errors[1:]:
+                    try:
+                        cleanup_primary.add_note(
+                            f"{secondary_context}: {type(secondary).__name__}: "
+                            f"{secondary}"
+                        )
+                    except BaseException:
+                        pass
+                raise cleanup_primary
 
 
 def run_tca_markout_worker(
@@ -922,7 +986,7 @@ def run_tca_markout_worker(
         get_markout_queue_wakeup_event,
     )
 
-    queue_wakeup_event = get_markout_queue_wakeup_event()
+    queue_wakeup_event = get_markout_queue_wakeup_event(family)
 
     def _report_health(payload: dict) -> None:
         if health_callback is None:
@@ -1048,12 +1112,27 @@ def run_tca_markout_worker(
                 )
                 lock_unhealthy = batch_lock_state in {
                     "error",
+                    "integrity_error",
+                    "lost",
+                    "persistence_error",
+                    "queue_error",
+                    "renewal_error",
                     "release_failed",
                 }
                 if lock_unhealthy:
                     errors_total += 1
                 if batch_lock_state == "release_failed":
                     health_reason = "worker_lock_release_failed"
+                elif batch_lock_state == "renewal_error":
+                    health_reason = "worker_lock_renewal_error"
+                elif batch_lock_state == "lost":
+                    health_reason = "worker_lock_lost"
+                elif batch_lock_state == "queue_error":
+                    health_reason = "worker_queue_error"
+                elif batch_lock_state == "persistence_error":
+                    health_reason = "worker_persistence_error"
+                elif batch_lock_state == "integrity_error":
+                    health_reason = "worker_lock_integrity_error"
                 elif batch_lock_state == "error":
                     health_reason = "worker_lock_error"
                 elif overdue_queue and not timestamps_valid:

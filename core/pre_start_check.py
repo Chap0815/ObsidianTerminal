@@ -134,6 +134,19 @@ def _finite_float(value) -> float:
     return parsed
 
 
+def _causal_entry_id_or_none(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    entry_id = value.strip()
+    if (
+        not entry_id
+        or len(entry_id) > 64
+        or any(ord(char) < 32 or ord(char) == 127 for char in entry_id)
+    ):
+        return None
+    return entry_id
+
+
 def _pid_cmdline(pid: int) -> str:
     try:
         import psutil  # type: ignore
@@ -795,7 +808,12 @@ def _check_state_and_claims(bot_name: str | None,
 
         bases = {str(s).split("/")[0].split(":")[0].upper()
                  for s in raw.keys()}
-        claims = [r for r in all_claims if r.get("bot_name") == name]
+        claims = [
+            r for r in all_claims
+            if r.get("bot_name") == name
+            and str(r.get("state") or "").strip().upper()
+            not in {"CLOSED", "FLAT"}
+        ]
         claim_bases = {str(r.get("symbol") or "").split("/")[0].split(":")[0].upper()
                        for r in claims}
         if sim and claims:
@@ -850,12 +868,65 @@ def _check_state_and_claims(bot_name: str | None,
                                      f"{name}: claims without state rows: {sorted(set(missing))}"))
 
         if meta.get("is_futures"):
-            f_rows = [r for r in all_fstate if r.get("bot_name") == name]
+            current_fstate_bot = f"{name} (SIM)" if sim else name
+            inactive_fstate_bot = name if sim else f"{name} (SIM)"
+            f_rows = [
+                r for r in all_fstate
+                if r.get("bot_name") == current_fstate_bot
+            ]
+            inactive_f_rows = [
+                r for r in all_fstate
+                if r.get("bot_name") == inactive_fstate_bot
+            ]
+            if inactive_f_rows:
+                inactive_bases = {
+                    str(r.get("symbol") or "").split("/")[0]
+                    .split(":")[0].upper()
+                    for r in inactive_f_rows
+                }
+                inactive_mode = "LIVE" if sim else "SIM"
+                issues.append(_issue(
+                    "error",
+                    "inactive_futures_state_present",
+                    f"{name}: inactive {inactive_mode} futures_state rows "
+                    f"exist while configured for {'SIM' if sim else 'LIVE'}: "
+                    f"{sorted(inactive_bases)}",
+                ))
             f_bases = {str(r.get("symbol") or "").split("/")[0].split(":")[0].upper()
                        for r in f_rows}
             if f_bases - bases:
                 issues.append(_issue("warn", "stale_futures_state",
                                      f"{name}: futures_state rows not in JSON state: {sorted(f_bases - bases)}"))
+            raw_by_base = {
+                str(symbol).split("/")[0].split(":")[0].upper(): row
+                for symbol, row in raw.items()
+                if isinstance(row, dict)
+            }
+            mismatched_generations = set()
+            for row in f_rows:
+                base = str(row.get("symbol") or "").split("/")[0].split(":")[0].upper()
+                local_row = raw_by_base.get(base)
+                if local_row is None:
+                    continue
+                local_entry_id = _causal_entry_id_or_none(
+                    local_row.get("entry_id")
+                )
+                dashboard_entry_id = _causal_entry_id_or_none(
+                    row.get("entry_id")
+                )
+                if (
+                    local_entry_id is not None
+                    and dashboard_entry_id != local_entry_id
+                ):
+                    mismatched_generations.add(base)
+            if mismatched_generations:
+                issues.append(_issue(
+                    "warn",
+                    "stale_futures_state_generation",
+                    f"{name}: futures_state generation differs from JSON "
+                    f"state: {sorted(mismatched_generations)}; startup will "
+                    "remove the stale dashboard generation",
+                ))
     return issues
 
 

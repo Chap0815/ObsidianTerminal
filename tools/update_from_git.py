@@ -237,17 +237,168 @@ def _print(msg: str) -> None:
     print(_redact_text(msg), flush=True)
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+def _sync_directory(path: Path) -> None:
+    """Durably publish a replaced updater file in its parent directory."""
+    directory = path.resolve(strict=True)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        flush_file_buffers = kernel32.FlushFileBuffers
+        flush_file_buffers.argtypes = [wintypes.HANDLE]
+        flush_file_buffers.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = create_file(
+            str(directory),
+            0x40000000,  # GENERIC_WRITE
+            0x00000007,  # FILE_SHARE_READ | WRITE | DELETE
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS
+            None,
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if not handle or int(handle) == invalid_handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        primary_error: BaseException | None = None
+        try:
+            if not flush_file_buffers(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            close_error: BaseException | None = None
+            try:
+                if not close_handle(handle):
+                    close_error = ctypes.WinError(ctypes.get_last_error())
+            except BaseException as exc:
+                close_error = exc
+            if close_error is not None:
+                if primary_error is None:
+                    raise close_error
+                try:
+                    primary_error.add_note(
+                        "close updater directory after sync failure: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(str(directory), flags)
+    primary_error: BaseException | None = None
     try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
+        os.fsync(directory_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
+            os.close(directory_fd)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "updater directory close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = text.encode("utf-8")
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    tmp_owned = False
+    tmp_identity: tuple[int, int] | None = None
+    primary_error: BaseException | None = None
+    try:
+        handle = tmp.open("xb")
+        tmp_owned = True
+        write_primary: BaseException | None = None
+        try:
+            tmp_stat = os.fstat(handle.fileno())
+            if not stat.S_ISREG(tmp_stat.st_mode):
+                raise ValueError("updater temporary must be a regular file")
+            tmp_identity = (tmp_stat.st_dev, tmp_stat.st_ino)
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException as exc:
+            write_primary = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if write_primary is None:
+                    raise
+                try:
+                    write_primary.add_note(
+                        "close updater temporary after write failure: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
+        os.replace(tmp, path)
+        tmp_owned = False
+        _sync_directory(path.parent)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        cleanup_error: BaseException | None = None
+        same_generation = False
+        if tmp_owned and tmp_identity is not None:
+            try:
+                current = tmp.stat(follow_symlinks=False)
+                same_generation = (
+                    stat.S_ISREG(current.st_mode)
+                    and not tmp.is_symlink()
+                    and (current.st_dev, current.st_ino) == tmp_identity
+                )
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = exc
+        if same_generation:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            if primary_error is None:
+                raise cleanup_error
+            try:
+                primary_error.add_note(
+                    "updater owned temporary cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            except BaseException:
+                pass
 
 
 def _write_update_status(
@@ -2223,6 +2374,93 @@ def _read_update_marker_bytes() -> bytes:
     )
 
 
+def _sync_update_marker_directory(path: Path) -> None:
+    """Durably publish the marker directory entry on Windows and POSIX."""
+    directory = path.resolve(strict=True)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        flush_file_buffers = kernel32.FlushFileBuffers
+        flush_file_buffers.argtypes = [wintypes.HANDLE]
+        flush_file_buffers.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = create_file(
+            str(directory),
+            0x40000000,  # GENERIC_WRITE
+            0x00000007,  # FILE_SHARE_READ | WRITE | DELETE
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS
+            None,
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if not handle or int(handle) == invalid_handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        primary_error: BaseException | None = None
+        try:
+            if not flush_file_buffers(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            close_error: BaseException | None = None
+            try:
+                if not close_handle(handle):
+                    close_error = ctypes.WinError(ctypes.get_last_error())
+            except BaseException as exc:
+                close_error = exc
+            if close_error is not None:
+                if primary_error is None:
+                    raise close_error
+                try:
+                    primary_error.add_note(
+                        "close update marker directory after sync failure: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(str(directory), flags)
+    primary_error = None
+    try:
+        os.fsync(directory_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            os.close(directory_fd)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "close update marker directory after sync failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
 def _claim_update_marker(*, force: bool) -> _UpdateMarkerClaim:
     owner = uuid.uuid4().hex
     if update_marker_exists(UPDATE_MARKER.parent):
@@ -2236,6 +2474,10 @@ def _claim_update_marker(*, force: bool) -> _UpdateMarkerClaim:
             original = _read_update_marker_bytes()
         except (OSError, ValueError) as exc:
             raise RuntimeError("Vorhandener Update-Marker ist nicht sicher lesbar.") from exc
+        # A previous creator may have failed after file fsync but before the
+        # directory barrier. Force recovery must heal that exact uncertainty
+        # before it is allowed to mutate the product tree.
+        _sync_update_marker_directory(UPDATE_MARKER.parent)
         return _UpdateMarkerClaim(owner=owner, created=False, original=original)
 
     UPDATE_MARKER.parent.mkdir(parents=True, exist_ok=True)
@@ -2253,6 +2495,9 @@ def _claim_update_marker(*, force: bool) -> _UpdateMarkerClaim:
         except OSError:
             pass
         raise
+    # Keep the marker if this barrier fails: its visible presence is the only
+    # safe recovery state until an explicit force retry confirms durability.
+    _sync_update_marker_directory(UPDATE_MARKER.parent)
     return _UpdateMarkerClaim(owner=owner, created=True)
 
 

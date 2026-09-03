@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import queue
 import threading
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
+
+from bot_utils.runtime_threads import thread_definitely_never_started
 
 Handler = Callable[[str, Dict[str, Any]], None]
 
@@ -33,6 +36,30 @@ _CRITICAL_PUT_TIMEOUT = 2.0
 # cap stored payload size in history (chars in JSON-dumped form)
 _HISTORY_PAYLOAD_MAX_CHARS = 2048
 _WORKER_STOP = object()
+_START_QUARANTINE_LOCK = threading.Lock()
+_START_QUARANTINE: list[dict] = []
+
+
+def _quarantine_start_generations(generations) -> None:
+    with _START_QUARANTINE_LOCK:
+        for generation in generations:
+            if not any(
+                existing is generation for existing in _START_QUARANTINE
+            ):
+                _START_QUARANTINE.append(generation)
+
+
+def _note_start_cleanup_error(
+    primary: BaseException,
+    cleanup: BaseException,
+) -> None:
+    try:
+        primary.add_note(
+            "event bus startup cleanup failed: "
+            f"{type(cleanup).__name__}: {cleanup}"
+        )
+    except BaseException:
+        pass
 
 
 def _log_handler_error(context: str, exc: Exception) -> None:
@@ -136,8 +163,10 @@ class EventBus:
         self._stopped      = False
         self._n_workers    = worker_threads
         self._worker_threads: List[threading.Thread] = []
+        self._worker_generations: dict[object, dict] = {}
         self._startup_lock = threading.Lock()
         self._watchdog: threading.Thread | None = None
+        self._watchdog_generation: dict | None = None
         if not lazy_workers:
             self._ensure_consumers_started()
 
@@ -146,37 +175,97 @@ class EventBus:
         with self._startup_lock:
             if self._stopped or self._shutdown_event.is_set():
                 return
-            if self._watchdog is not None and self._watchdog.is_alive():
+            if self._generation_unresolved(self._watchdog_generation):
                 return
-            self._worker_threads = [
-                thread for thread in self._worker_threads if thread.is_alive()
-            ]
+            self._worker_threads = self._retain_unresolved_workers()
             for _ in range(self._n_workers - len(self._worker_threads)):
                 self._spawn_worker(len(self._worker_threads))
-            candidate = threading.Thread(
-                target=self._watchdog_loop,
-                name="event-bus-watchdog",
-                daemon=True,
-            )
-            self._watchdog = candidate
+            generation = {"thread": None, "done": threading.Event()}
+
+            def run_watchdog_generation() -> None:
+                try:
+                    self._watchdog_loop()
+                finally:
+                    generation["done"].set()
+
             try:
-                candidate.start()
-            except Exception as exc:
-                # Constructor/lazy-start failure must not strand consumers.
+                candidate = threading.Thread(
+                    target=run_watchdog_generation,
+                    name="event-bus-watchdog",
+                    daemon=True,
+                )
+            except BaseException as exc:
                 self._accepting = False
                 self._stopped = True
                 self._shutdown_event.set()
+                _quarantine_start_generations(
+                    tuple(self._worker_generations.values())
+                )
                 for _ in self._worker_threads:
                     try:
                         self._work_queue.put_nowait(_WORKER_STOP)
                     except queue.Full:
                         break
+                    except BaseException as cleanup_error:
+                        _note_start_cleanup_error(exc, cleanup_error)
+                        break
                 for worker in self._worker_threads:
                     try:
                         worker.join(timeout=1.0)
-                    except (RuntimeError, AttributeError):
-                        pass
-                _log_handler_error("event_bus watchdog start", exc)
+                    except BaseException as cleanup_error:
+                        _note_start_cleanup_error(exc, cleanup_error)
+                _quarantine_start_generations(
+                    tuple(self._worker_generations.values())
+                )
+                try:
+                    _log_handler_error("event_bus watchdog construction", exc)
+                except BaseException as cleanup_error:
+                    _note_start_cleanup_error(exc, cleanup_error)
+                raise
+            generation["thread"] = candidate
+            self._watchdog = candidate
+            self._watchdog_generation = generation
+            try:
+                candidate.start()
+            except BaseException as exc:
+                definite_prelaunch = (
+                    isinstance(exc, Exception)
+                    and thread_definitely_never_started(candidate)
+                )
+                if definite_prelaunch:
+                    generation["done"].set()
+                    if self._watchdog_generation is generation:
+                        self._watchdog_generation = None
+                        self._watchdog = None
+                else:
+                    _quarantine_start_generations((generation,))
+                # Constructor/lazy-start failure must not strand consumers.
+                self._accepting = False
+                self._stopped = True
+                self._shutdown_event.set()
+                _quarantine_start_generations(
+                    tuple(self._worker_generations.values())
+                )
+                for _ in self._worker_threads:
+                    try:
+                        self._work_queue.put_nowait(_WORKER_STOP)
+                    except queue.Full:
+                        break
+                    except BaseException as cleanup_error:
+                        _note_start_cleanup_error(exc, cleanup_error)
+                        break
+                for worker in self._worker_threads:
+                    try:
+                        worker.join(timeout=1.0)
+                    except BaseException as cleanup_error:
+                        _note_start_cleanup_error(exc, cleanup_error)
+                self._quarantine_unresolved_worker_generations()
+                try:
+                    _log_handler_error("event_bus watchdog start", exc)
+                except BaseException as cleanup_error:
+                    _note_start_cleanup_error(exc, cleanup_error)
+                if not isinstance(exc, Exception):
+                    raise
                 raise
 
     def subscribe(self, event_type: str, handler: Handler,
@@ -359,18 +448,141 @@ class EventBus:
         return [e.to_dict() for e in reversed(events[-limit:])]
 
     def _spawn_worker(self, idx: int) -> bool:
+        generation = {"thread": None, "done": threading.Event()}
+
+        def run_worker_generation() -> None:
+            try:
+                self._worker()
+            finally:
+                generation["done"].set()
+
+        candidate = None
         try:
             candidate = threading.Thread(
-                target=self._worker,
+                target=run_worker_generation,
                 name=f"event-bus-worker-{idx}",
                 daemon=True,
             )
-            candidate.start()
-        except Exception as exc:
-            _log_handler_error("event_bus worker start", exc)
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                self._abort_worker_startup(exc)
+                raise
+            self._log_recoverable_worker_start_error(
+                "event_bus worker construction",
+                exc,
+            )
             return False
+        generation["thread"] = candidate
         self._worker_threads.append(candidate)
+        self._worker_generations[candidate] = generation
+        try:
+            candidate.start()
+        except BaseException as exc:
+            if (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(candidate)
+            ):
+                generation["done"].set()
+                if self._worker_generations.get(candidate) is generation:
+                    self._worker_generations.pop(candidate, None)
+                    self._worker_threads = [
+                        thread
+                        for thread in self._worker_threads
+                        if thread is not candidate
+                    ]
+            if not isinstance(exc, Exception):
+                self._abort_worker_startup(exc)
+                try:
+                    _log_handler_error("event_bus worker start", exc)
+                except BaseException as cleanup_error:
+                    _note_start_cleanup_error(exc, cleanup_error)
+                raise
+            self._log_recoverable_worker_start_error(
+                "event_bus worker start",
+                exc,
+            )
+            return False
         return True
+
+    def _log_recoverable_worker_start_error(
+        self,
+        context: str,
+        primary: Exception,
+    ) -> None:
+        """Report a recoverable start error without losing worker ownership."""
+        try:
+            _log_handler_error(context, primary)
+        except BaseException as reporting_error:
+            _note_start_cleanup_error(primary, reporting_error)
+            try:
+                self._abort_worker_startup(primary)
+            except BaseException as cleanup_error:
+                _note_start_cleanup_error(primary, cleanup_error)
+            raise primary
+
+    @staticmethod
+    def _generation_unresolved(generation: dict | None) -> bool:
+        if generation is None or not generation["done"].is_set():
+            return generation is not None
+        thread = generation.get("thread")
+        if thread is None:
+            return False
+        try:
+            return bool(thread.is_alive())
+        except BaseException:
+            return True
+
+    def _worker_generation_unresolved(self, thread: object) -> bool:
+        generation = self._worker_generations.get(thread)
+        if generation is not None:
+            return self._generation_unresolved(generation)
+        try:
+            return bool(thread.is_alive())
+        except BaseException:
+            return True
+
+    def _retain_unresolved_workers(self) -> list:
+        retained = []
+        for thread in self._worker_threads:
+            if self._worker_generation_unresolved(thread):
+                retained.append(thread)
+            else:
+                self._worker_generations.pop(thread, None)
+        return retained
+
+    def _quarantine_unresolved_worker_generations(self) -> None:
+        generations = []
+        for thread in self._worker_threads:
+            generation = self._worker_generations.get(thread)
+            if (
+                generation is not None
+                and self._generation_unresolved(generation)
+            ):
+                generations.append(generation)
+        _quarantine_start_generations(generations)
+
+    def _abort_worker_startup(self, primary: BaseException) -> None:
+        """Terminally retain every worker before propagating a fatal start."""
+        self._accepting = False
+        self._stopped = True
+        self._shutdown_event.set()
+        _quarantine_start_generations(
+            tuple(self._worker_generations.values())
+        )
+        for _ in self._worker_threads:
+            try:
+                self._work_queue.put_nowait(_WORKER_STOP)
+            except queue.Full:
+                break
+            except BaseException as cleanup_error:
+                _note_start_cleanup_error(primary, cleanup_error)
+                break
+        for worker in self._worker_threads:
+            try:
+                worker.join(timeout=1.0)
+            except BaseException as cleanup_error:
+                _note_start_cleanup_error(primary, cleanup_error)
+        self._quarantine_unresolved_worker_generations()
 
     def _worker(self) -> None:
         while True:
@@ -402,15 +614,23 @@ class EventBus:
                 time.sleep(0.1)
 
     def _watchdog_loop(self) -> None:
+        startup_lock = getattr(self, "_startup_lock", None)
+        if startup_lock is None:
+            startup_lock = threading.Lock()
+            self._startup_lock = startup_lock
         while not self._shutdown_event.wait(5.0):
             try:
-                alive = [t for t in self._worker_threads if t.is_alive()]
-                missing = self._n_workers - len(alive)
-                if (missing > 0 and not self._stopped
-                        and not self._shutdown_event.is_set()):
-                    self._worker_threads = alive
-                    for _ in range(missing):
-                        self._spawn_worker(len(self._worker_threads))
+                with startup_lock:
+                    alive = self._retain_unresolved_workers()
+                    missing = self._n_workers - len(alive)
+                    if (
+                        missing > 0
+                        and not self._stopped
+                        and not self._shutdown_event.is_set()
+                    ):
+                        self._worker_threads = alive
+                        for _ in range(missing):
+                            self._spawn_worker(len(self._worker_threads))
             except Exception as exc:
                 # Thread creation and liveness probes can fail transiently.
                 # Keep the sole recovery owner alive for the next cycle.
@@ -432,38 +652,74 @@ class EventBus:
             pass
 
     def shutdown(self, timeout: float = 5.0) -> bool:
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        with self._shutdown_lock:
-            workers = list(self._worker_threads)
-            if not self._stopped:
-                # Close admission first, then wait for already-admitted
-                # publishers without holding the admission lock. This preserves
-                # FIFO sentinel ordering while avoiding a global emitter stall.
+        if isinstance(timeout, bool):
+            return False
+        try:
+            requested_timeout = float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(requested_timeout):
+            return False
+        budget = min(max(0.0, requested_timeout), threading.TIMEOUT_MAX)
+        deadline = time.monotonic() + budget
+        lock_timeout = min(
+            max(0.0, deadline - time.monotonic()),
+            threading.TIMEOUT_MAX,
+        )
+        if not self._shutdown_lock.acquire(timeout=lock_timeout):
+            return False
+        try:
+            startup_timeout = min(
+                max(0.0, deadline - time.monotonic()),
+                threading.TIMEOUT_MAX,
+            )
+            if not self._startup_lock.acquire(timeout=startup_timeout):
                 with self._publish_condition:
                     self._accepting = False
                     self._shutdown_event.set()
-                    sync_depth = int(
-                        getattr(self._sync_publish_local, "depth", 0)
-                    )
-                    while self._publish_inflight > sync_depth:
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0.0:
-                            break
-                        self._publish_condition.wait(timeout=remaining)
-                    publications_drained = self._publish_inflight <= sync_depth
+                    self._publish_condition.notify_all()
+                return False
+            try:
+                workers = list(self._worker_threads)
+                if not self._stopped:
+                    # Close admission first, then wait for already-admitted
+                    # publishers. The startup lock makes the final worker
+                    # snapshot authoritative against watchdog repair.
+                    with self._publish_condition:
+                        self._accepting = False
+                        self._shutdown_event.set()
+                        sync_depth = int(
+                            getattr(self._sync_publish_local, "depth", 0)
+                        )
+                        while self._publish_inflight > sync_depth:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0.0:
+                                break
+                            self._publish_condition.wait(timeout=remaining)
+                        publications_drained = (
+                            self._publish_inflight <= sync_depth
+                        )
 
-                if publications_drained:
-                    workers = [thread for thread in self._worker_threads
-                               if thread.is_alive()]
-                    for _ in workers:
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0.0:
-                            break
-                        try:
-                            self._work_queue.put(_WORKER_STOP, timeout=remaining)
-                        except queue.Full:
-                            break
-                    self._stopped = True
+                    if publications_drained:
+                        workers = [
+                            thread
+                            for thread in self._worker_threads
+                            if self._worker_generation_unresolved(thread)
+                        ]
+                        for _ in workers:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0.0:
+                                break
+                            try:
+                                self._work_queue.put(
+                                    _WORKER_STOP,
+                                    timeout=remaining,
+                                )
+                            except queue.Full:
+                                break
+                        self._stopped = True
+            finally:
+                self._startup_lock.release()
 
             # Workers keep consuming already accepted work until the queue is
             # drained or the caller's shutdown budget is exhausted.
@@ -481,7 +737,7 @@ class EventBus:
             self._shutdown_event.set()
 
             lifecycle_threads = list(workers)
-            if self._watchdog is not None:
+            if self._watchdog_generation is not None:
                 lifecycle_threads.append(self._watchdog)
             for thread in lifecycle_threads:
                 if thread is current:
@@ -499,8 +755,17 @@ class EventBus:
             return (
                 inflight == 0
                 and unfinished == 0
-                and not any(thread.is_alive() for thread in lifecycle_threads)
+                and not any(
+                    self._generation_unresolved(
+                        self._watchdog_generation
+                    )
+                    if thread is self._watchdog
+                    else self._worker_generation_unresolved(thread)
+                    for thread in lifecycle_threads
+                )
             )
+        finally:
+            self._shutdown_lock.release()
 
     def __repr__(self) -> str:
         with self._lock:
@@ -512,34 +777,104 @@ class EventBus:
 
 _BUS_LOCK: threading.Lock         = threading.Lock()
 _BUS:      Optional[EventBus]     = None
+_BUS_TERMINAL = False
 
 
 def get_bus() -> EventBus:
     global _BUS
-    if _BUS is None:
-        with _BUS_LOCK:
-            if _BUS is None:
-                _BUS = EventBus(
-                    worker_threads=2,
-                    history_size=500,
-                    lazy_workers=True,
-                )
-    return _BUS
+    with _BUS_LOCK:
+        if _BUS_TERMINAL:
+            raise RuntimeError("global event bus admission is terminally closed")
+        if _BUS is None:
+            _BUS = EventBus(
+                worker_threads=2,
+                history_size=500,
+                lazy_workers=True,
+            )
+        return _BUS
+
+
+def begin_global_bus_runtime() -> bool:
+    """Explicitly reopen global admission before a new process runtime."""
+    global _BUS_TERMINAL
+    with _BUS_LOCK:
+        if _BUS is not None:
+            return False
+        with _START_QUARANTINE_LOCK:
+            if _START_QUARANTINE:
+                return False
+        _BUS_TERMINAL = False
+        return True
 
 
 def shutdown_global_bus(timeout: float = 2.0) -> bool:
     """Close and reset the process-global bus for truthful bot shutdown."""
-    global _BUS
-    with _BUS_LOCK:
-        bus = _BUS
-    if bus is None:
-        return True
-    if not bus.shutdown(timeout=timeout):
+    global _BUS, _BUS_TERMINAL
+    if isinstance(timeout, bool):
         return False
-    with _BUS_LOCK:
-        if _BUS is bus:
-            _BUS = None
-    return True
+    try:
+        requested_timeout = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(requested_timeout):
+        return False
+    budget = min(max(0.0, requested_timeout), threading.TIMEOUT_MAX)
+    deadline = time.monotonic() + budget
+    if not _BUS_LOCK.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    ):
+        return False
+    try:
+        _BUS_TERMINAL = True
+        bus = _BUS
+    finally:
+        _BUS_LOCK.release()
+    if bus is not None and not bus.shutdown(
+        timeout=max(0.0, deadline - time.monotonic())
+    ):
+        return False
+    if bus is not None:
+        if not _BUS_LOCK.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
+            if _BUS is bus:
+                _BUS = None
+        finally:
+            _BUS_LOCK.release()
+    if not _START_QUARANTINE_LOCK.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    ):
+        return False
+    try:
+        generations = tuple(_START_QUARANTINE)
+    finally:
+        _START_QUARANTINE_LOCK.release()
+    unresolved = []
+    for generation in generations:
+        thread = generation.get("thread")
+        if thread is not None and thread is not threading.current_thread():
+            try:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            except Exception:
+                unresolved.append(generation)
+                continue
+        if EventBus._generation_unresolved(generation):
+            unresolved.append(generation)
+    if not _START_QUARANTINE_LOCK.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    ):
+        return False
+    try:
+        _START_QUARANTINE[:] = [
+            generation
+            for generation in _START_QUARANTINE
+            if generation not in generations or generation in unresolved
+        ]
+    finally:
+        _START_QUARANTINE_LOCK.release()
+    return not unresolved
 
 
 def _console_log_handler(event_type: str, payload: dict) -> None:
@@ -558,18 +893,12 @@ def _struct_log_handler(event_type: str, payload: dict) -> None:
         pass
 
 
-_CONSOLE_REGISTERED = False
-_STRUCT_REGISTERED  = False
 _REGISTER_LOCK      = threading.Lock()
 
 
 def register_console_logger(bus: EventBus = None) -> None:
-    """Idempotent. Multiple calls per process (e.g. bot restart in the
-    same process) won't double-subscribe the handler."""
-    global _CONSOLE_REGISTERED
+    """Idempotently register the console handler on this bus instance."""
     with _REGISTER_LOCK:
-        if _CONSOLE_REGISTERED:
-            return
         if bus is None:
             bus = get_bus()
         for et in ("POSITION_OPENED", "POSITION_CLOSED", "STOP_LOSS_TRIGGERED",
@@ -577,16 +906,11 @@ def register_console_logger(bus: EventBus = None) -> None:
                    "API_RATE_LIMITED", "LLM_ONLINE", "LLM_OFFLINE",
                    "POSITION_FAILED"):
             bus.subscribe(et, _console_log_handler)
-        _CONSOLE_REGISTERED = True
 
 
 def register_structured_logger(bus: EventBus = None) -> None:
-    """Idempotent."""
-    global _STRUCT_REGISTERED
+    """Idempotently register the structured handler on this bus instance."""
     with _REGISTER_LOCK:
-        if _STRUCT_REGISTERED:
-            return
         if bus is None:
             bus = get_bus()
         bus.subscribe("*", _struct_log_handler)
-        _STRUCT_REGISTERED = True

@@ -358,9 +358,11 @@ def get_latest_news(symbol: str) -> str:
     except ImportError:
         pass
 
+    # The managed aggregator already includes RSS.  Do not start the legacy
+    # per-call RSS executor here: this fallback can run after the managed news
+    # pools have completed terminal shutdown and would create new non-daemon
+    # workers outside ``shutdown_news_resources`` ownership.
     headlines = fetch_cryptopanic(symbol)
-    if not headlines:
-        headlines = fetch_rss(symbol)
     if not headlines:
         return "No specific news found."
     return sanitize_news_text(" | ".join(headlines[:5]))

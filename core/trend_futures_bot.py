@@ -466,8 +466,29 @@ class TrendFuturesBot(FuturesBot):
     def _handle_exit_recovery_gate(self, base: str, d: dict) -> bool:
         """Handle recovery/conflict state before any FUTREND exit action."""
         if d.get("accounting_already_booked"):
-            TrendFuturesBot._cleanup_accounted_close_state(self, base, d)
-            return True
+            from core.symbol_locks import close_lock
+            try:
+                with close_lock(
+                    base,
+                    timeout=2.0,
+                    bot_name=self.BOT_NAME,
+                ) as acquired:
+                    if not acquired:
+                        return True
+                    live = self.state.get(base)
+                    if not isinstance(live, dict):
+                        return True
+                    if live.get("accounting_already_booked") is True:
+                        TrendFuturesBot._cleanup_accounted_close_state(
+                            self, base, live
+                        )
+                        return True
+                # The snapshot belonged to an older generation.  Let the
+                # caller re-read/close the current active row normally.
+                return False
+            except Exception as exc:
+                self._log_error(f"trend accounted cleanup lock {base}", exc)
+                return True
         if d.get("accounting_pending"):
             from core.logger import log_event
             from core.symbol_locks import close_lock
@@ -496,7 +517,7 @@ class TrendFuturesBot(FuturesBot):
                         or key.startswith("accounting_pending_")
                     }
                     durable = self.state.update_many(base, pending_fields)
-                    if durable is False:
+                    if durable is not None and durable is not True:
                         log_event(
                             f"[{self.BOT_NAME}] {base}: pending full "
                             f"accounting retry deferred; recovery marker is "
@@ -927,7 +948,18 @@ class TrendFuturesBot(FuturesBot):
     def _open_position(self, base: str, full: str, size_mult: float = 1.0,
                        entry_meta: Optional[dict] = None) -> None:
         from core.logger import log_event, log_struct, send_telegram
-        from core.database import is_claimed_by_other, claim_symbol_for_entry
+        if not TrendFuturesBot._entry_recovery_allows_live_open(self):
+            log_event(
+                f"[{self.BOT_NAME}] {base}: entry recovery unresolved - "
+                "new trend position blocked",
+                "WAIT",
+            )
+            return
+        from core.database import (
+            claim_symbol_for_entry,
+            is_blacklisted,
+            is_claimed_by_other,
+        )
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
         from bot_utils import (FuturesOrderNotSubmitted,
                                FuturesOrderOutcomeUnknown,
@@ -1198,6 +1230,50 @@ class TrendFuturesBot(FuturesBot):
                 leverage=lev_cap,
                 client_order_id=_cid,
             )
+            # The admission, balance and precision stages above may overlap a
+            # concurrent safety close.  Its cooldown/blacklist must be allowed
+            # to veto this stale candidate at the final claim boundary.
+            try:
+                freshly_blacklisted = is_blacklisted(base, self.BOT_NAME)
+            except Exception as exc:
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: final blacklist check "
+                    f"unavailable ({type(exc).__name__}) - entry blocked",
+                    "WARN",
+                )
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="blocked", mode=entry_mode,
+                    reason="blacklist_recheck_unavailable", direction="LONG",
+                )
+                return
+            if freshly_blacklisted:
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: entry blocked by fresh "
+                    "blacklist",
+                    "WAIT",
+                )
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="blocked", mode=entry_mode,
+                    reason="blacklist_recheck", direction="LONG",
+                )
+                return
+            # Keep the in-memory cooldown check last: unlike the blacklist DB
+            # read it is non-blocking, so no slow operation remains between the
+            # final re-entry barrier and the atomic claim.
+            if self._is_in_cooldown(base):
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: entry blocked by fresh "
+                    "cooldown",
+                    "WAIT",
+                )
+                emit_entry_lifecycle(
+                    entry_id, bot=self.BOT_NAME, symbol=base,
+                    stage="blocked", mode=entry_mode,
+                    reason="cooldown_recheck", direction="LONG",
+                )
+                return
             if not claim_symbol_for_entry(
                 self.BOT_NAME,
                 full,
@@ -1231,7 +1307,9 @@ class TrendFuturesBot(FuturesBot):
                     stage="aborted", mode=entry_mode,
                     reason="set_leverage_failed", direction="LONG")
                 cleaned = self._cleanup_untracked_entry_state(
-                    base, "set leverage failed before entry"
+                    base,
+                    "set leverage failed before entry",
+                    entry_id=entry_id,
                 )
                 if cleaned:
                     try:
@@ -1252,6 +1330,7 @@ class TrendFuturesBot(FuturesBot):
                 margin_mode=margin_mode,
                 entry_inflight=True,
                 entry_shadow=shadow,
+                entry_id=entry_id,
                 contract_size=cs,
             ):
                 emit_entry_lifecycle(
@@ -1264,7 +1343,10 @@ class TrendFuturesBot(FuturesBot):
                     "ERROR",
                 )
                 cleaned = self._cleanup_untracked_entry_state(
-                    base, "state write failed before entry")
+                    base,
+                    "state write failed before entry",
+                    entry_id=entry_id,
+                )
                 if cleaned is not True:
                     log_event(
                         f"[{self.BOT_NAME}] {base}: pre-order entry "
@@ -1297,6 +1379,7 @@ class TrendFuturesBot(FuturesBot):
                         action_label=f"trend open {base}",
                         log_event=log_event, log_struct=log_struct,
                     ),
+                    pre_submit_guard=self._entry_pre_submit_allowed,
                     config=MakerFirstConfig(mode="disabled"),
                 )
             except Exception as e:
@@ -1315,7 +1398,10 @@ class TrendFuturesBot(FuturesBot):
                     pass
                 if _not_submitted:
                     cleaned = self._cleanup_untracked_entry_state(
-                        base, "trend entry was not submitted")
+                        base,
+                        "trend entry was not submitted",
+                        entry_id=entry_id,
+                    )
                     if cleaned is not True:
                         log_event(
                             f"[{self.BOT_NAME}] {base}: not-submitted entry "
@@ -1392,13 +1478,23 @@ class TrendFuturesBot(FuturesBot):
                             0.0, provisional=False,
                             lev_cap=lev_cap, mm_rate=mm,
                             entry_shadow=shadow,
+                            entry_id=entry_id,
                             contract_size=cs,
                             margin_mode=margin_mode,
                         )
-                        if not tracked:
+                        if tracked is None:
+                            log_event(
+                                f"[{self.BOT_NAME}] {base}: landed-order "
+                                "recovery was superseded by another entry "
+                                "generation; no rollback was sent",
+                                "ERROR",
+                            )
+                            return
+                        if tracked is False:
                             self._rollback_untracked_live_entry(
                                 base, full, amount, eff_lev, margin_mode,
                                 "landed order after open error",
+                                entry_id=entry_id,
                             )
                             return
                         _landed = True
@@ -1432,7 +1528,9 @@ class TrendFuturesBot(FuturesBot):
                     )
                 elif not _landed:
                     cleaned = self._cleanup_untracked_entry_state(
-                        base, "terminal-zero entry after trend open error"
+                        base,
+                        "terminal-zero entry after trend open error",
+                        entry_id=entry_id,
                     )
                     if cleaned is not True:
                         log_event(
@@ -1461,7 +1559,9 @@ class TrendFuturesBot(FuturesBot):
                     f"no exchange position was found - aborting state write",
                     "WARN")
                 cleaned = self._cleanup_untracked_entry_state(
-                    base, "verified zero-fill entry after trend open"
+                    base,
+                    "verified zero-fill entry after trend open",
+                    entry_id=entry_id,
                 )
                 if cleaned is not True:
                     log_event(
@@ -1518,10 +1618,18 @@ class TrendFuturesBot(FuturesBot):
             base, fill, actual_margin, eff_lev, amount, fees,
             provisional=provisional, lev_cap=lev_cap, mm_rate=mm,
             entry_shadow=shadow, margin_mode=margin_mode,
+            entry_id=entry_id,
             sim_tca_pending=sim_tca_pending,
             contract_size=cs,
         )
-        if not tracked:
+        if tracked is None:
+            log_event(
+                f"[{self.BOT_NAME}] {base}: final state promotion was "
+                "superseded by another entry generation; no rollback was sent",
+                "ERROR",
+            )
+            return
+        if tracked is False:
             emit_entry_lifecycle(
                 entry_id, bot=self.BOT_NAME, symbol=base,
                 stage="state_failed", mode=entry_mode,
@@ -1673,7 +1781,24 @@ class TrendFuturesBot(FuturesBot):
             expected_position_side=expected_position_side,
         )
 
-    def _cleanup_untracked_entry_state(self, base: str, reason: str) -> bool:
+    def _cleanup_untracked_entry_state(
+        self,
+        base: str,
+        reason: str,
+        *,
+        entry_id: str = "",
+    ) -> bool:
+        from bot_utils.trade_state import (
+            release_claim_if_absent_for_generation,
+            remove_with_restore_fields,
+            update_many_if_current,
+        )
+
+        expected_row = (
+            {"entry_id": entry_id.strip()}
+            if isinstance(entry_id, str) and entry_id.strip()
+            else None
+        )
         restore = {
             "provisional": True,
             "entry_inflight_until": 0.0,
@@ -1683,7 +1808,12 @@ class TrendFuturesBot(FuturesBot):
         }
         remove_raised = False
         try:
-            removed = self.state.remove(base, restore)
+            removed = remove_with_restore_fields(
+                self.state,
+                base,
+                restore,
+                expected_row=expected_row,
+            )
         except Exception as exc:
             self._log_error(f"trend cleanup untracked state {base}", exc)
             removed = False
@@ -1697,7 +1827,15 @@ class TrendFuturesBot(FuturesBot):
             return False
         if state_exists:
             try:
-                self.state.update_many(base, restore)
+                if expected_row is None:
+                    self.state.update_many(base, restore)
+                else:
+                    update_many_if_current(
+                        self.state,
+                        base,
+                        restore,
+                        expected_row,
+                    )
             except Exception as exc:
                 self._log_error(
                     f"trend mark untracked cleanup pending {base}", exc
@@ -1706,7 +1844,14 @@ class TrendFuturesBot(FuturesBot):
         if remove_raised:
             return False
         try:
-            return bool(self.state.release_claim_if_absent(base))
+            if expected_row is None:
+                result = self.state.release_claim_if_absent(base)
+                return result is None or result is True
+            return release_claim_if_absent_for_generation(
+                self.state,
+                base,
+                expected_row,
+            )
         except Exception as exc:
             self._log_error(f"trend retry untracked claim cleanup {base}", exc)
             return False
@@ -1715,10 +1860,11 @@ class TrendFuturesBot(FuturesBot):
                       provisional: bool = False, lev_cap=None,
                       mm_rate: float = 0.01,
                       entry_shadow: Optional[dict] = None,
+                      entry_id: str = "",
                       margin_mode: str = "isolated",
                       entry_inflight: bool = False,
                       sim_tca_pending: Optional[dict] = None,
-                      contract_size: Optional[float] = None) -> bool:
+                      contract_size: Optional[float] = None) -> Optional[bool]:
         from core.logger import _date as _utc
         from bot_utils import calc_liquidation_price, distance_to_liquidation_pct
         # Liquidation uses the INTEGER leverage the exchange runs (ceil) + real
@@ -1761,8 +1907,24 @@ class TrendFuturesBot(FuturesBot):
                 "entry_quality_label": entry_shadow.get("entry_quality_label"),
                 "entry_quality_reasons": entry_shadow.get("entry_quality_reasons"),
             })
-        stored = self.state.add(base, row) is not False
-        if stored and getattr(self, "simulation", None) is False:
+        if isinstance(entry_id, str) and entry_id.strip():
+            # The execution intent is authoritative even if optional shadow
+            # telemetry is absent or malformed.
+            row["entry_id"] = entry_id.strip()
+        expected_entry_id = row.get("entry_id")
+        if not isinstance(expected_entry_id, str) or not expected_entry_id.strip():
+            result = self.state.add(base, row)
+            stored = result is None or result is True
+        else:
+            from bot_utils.trade_state import promote_position_generation
+
+            stored = promote_position_generation(
+                self.state,
+                base,
+                row,
+                {"entry_id": expected_entry_id.strip()},
+            )
+        if stored is True and getattr(self, "simulation", None) is False:
             wakeup = getattr(self, "_reconcile_wakeup_event", None)
             if wakeup is not None:
                 try:
@@ -1841,7 +2003,11 @@ class TrendFuturesBot(FuturesBot):
                 expected_position_side="LONG",
             )
             if closed:
-                cleaned = self._cleanup_untracked_entry_state(base, reason)
+                cleaned = self._cleanup_untracked_entry_state(
+                    base,
+                    reason,
+                    entry_id=entry_id,
+                )
                 if cleaned is not True:
                     log_event(
                         f"[{self.BOT_NAME}] {base}: rollback verified flat "
@@ -1899,6 +2065,10 @@ class TrendFuturesBot(FuturesBot):
             d_live = self.state.get(base)
             if d_live is None:
                 return
+            from bot_utils.trade_state import same_position_generation
+
+            if not same_position_generation(d_live, d) and d_live != d:
+                return
             if _has_futures_partial_exit_intent(d_live):
                 log_event(
                     f"[{self.BOT_NAME}] {base}: full close deferred while "
@@ -1918,7 +2088,17 @@ class TrendFuturesBot(FuturesBot):
             from core.logger import log_event as _log_event
             log_event = _log_event
         from core.database import remove_futures_state
-        from bot_utils.trade_state import remove_with_restore_fields
+        from bot_utils.trade_state import (
+            remove_with_restore_fields,
+            update_many_if_current,
+        )
+        from core.futures_bot_reconcile import (
+            _defer_offline_accounting_retry,
+            _offline_accounting_retry_due,
+        )
+
+        if not _offline_accounting_retry_due(d):
+            return False
 
         restore = {
             "accounting_already_booked": True,
@@ -1938,30 +2118,56 @@ class TrendFuturesBot(FuturesBot):
         try:
             remove_futures_state(
                 base, self.BOT_NAME,
-                mode_is_sim=getattr(self, "simulation", None))
+                mode_is_sim=getattr(self, "simulation", None),
+                expected_opened_at=d.get("buy_time"),
+                expected_entry_id=d.get("entry_id"),
+            )
         except Exception as exc:
             self._log_error(f"trend remove_futures_state accounted {base}", exc)
             try:
                 keep = dict(restore)
                 keep["futures_state_cleanup_pending"] = True
-                self.state.update_many(base, keep)
+                update_many_if_current(self.state, base, keep, d)
             except Exception as state_exc:
                 self._log_error(f"trend mark cleanup pending {base}", state_exc)
+            retry_delay = _defer_offline_accounting_retry(self, base, d)
             log_event(
                 f"[{self.BOT_NAME}] {base}: close already booked, but "
-                f"futures_state cleanup failed; state kept for retry",
+                f"futures_state cleanup failed; state kept for retry in "
+                f"{retry_delay:.0f}s",
                 "WARN",
             )
             return False
 
-        ok = remove_with_restore_fields(self.state, base, restore)
+        try:
+            ok = remove_with_restore_fields(
+                self.state, base, restore, expected_row=d
+            )
+        except Exception as exc:
+            ok = False
+            self._log_error(f"trend remove accounted state {base}", exc)
         if not ok:
+            retry_delay = _defer_offline_accounting_retry(self, base, d)
             log_event(
                 f"[{self.BOT_NAME}] {base}: close already booked, but "
-                f"claim/state cleanup failed; state kept for retry",
+                f"claim/state cleanup failed; state kept for retry in "
+                f"{retry_delay:.0f}s",
                 "WARN",
             )
             return False
+        entry_id = d.get("entry_id")
+        if isinstance(entry_id, str) and entry_id.strip():
+            try:
+                remove_futures_state(
+                    base, self.BOT_NAME,
+                    mode_is_sim=getattr(self, "simulation", None),
+                    expected_opened_at=d.get("buy_time"),
+                    expected_entry_id=entry_id,
+                )
+            except Exception as exc:
+                self._log_error(
+                    f"trend finalize futures_state cleanup {base}", exc
+                )
         return True
 
     def _close_inner(self, base, d, reason, calc_unrealized_pnl, price_move_pct,
@@ -2177,15 +2383,25 @@ class TrendFuturesBot(FuturesBot):
                     if _closed:
                         if not d.get("pending_close_order_id"):
                             try:
-                                self.state.update_many(base, {
+                                marker_persisted = self.state.update_many(base, {
                                     "verified_flat_pending_accounting": True,
                                     "verified_flat_reason": reason,
                                     "verified_flat_at": _utc(),
                                 })
                             except Exception as state_err:
+                                marker_persisted = False
                                 self._log_error(
                                     f"trend mark verified-flat {base}",
                                     state_err)
+                            if (
+                                marker_persisted is not None
+                                and marker_persisted is not True
+                            ):
+                                log_event(
+                                    f"[{self.BOT_NAME}] {base}: verified-flat "
+                                    "recovery marker was not durable",
+                                    "ERROR",
+                                )
                             log_event(
                                 f"[{self.BOT_NAME}] {base}: position already "
                                 f"flat on exchange ({str(e)[:80]}) - keeping "
@@ -2468,8 +2684,19 @@ class TrendFuturesBot(FuturesBot):
             except Exception:
                 pass
             sell_time = _utc()
-            accounting_mode_is_sim = d.get(
-                "accounting_pending_mode_is_sim", self.simulation)
+            from bot_utils.trade_state import (
+                validated_close_accounting_mode_or_none,
+            )
+            accounting_mode_is_sim = validated_close_accounting_mode_or_none(
+                d, self.simulation
+            )
+            if accounting_mode_is_sim is None:
+                log_event(
+                    f"[{self.BOT_NAME}] {base}: close accounting mode "
+                    "conflicts with runtime; state kept for recovery",
+                    "ERROR",
+                )
+                return
             pending_close = {
                 "accounting_pending": True,
                 "accounting_pending_reason": f"Trend {reason}",
@@ -2505,7 +2732,7 @@ class TrendFuturesBot(FuturesBot):
                 pending_persisted = False
                 self._log_error(
                     f"trend full accounting write-ahead {base}", state_err)
-            if pending_persisted is False:
+            if pending_persisted is not None and pending_persisted is not True:
                 log_event(
                     f"[{self.BOT_NAME}] {base}: verified flat close was not "
                     f"booked because its accounting recovery marker was not "
@@ -2523,7 +2750,7 @@ class TrendFuturesBot(FuturesBot):
                 return
             accounting_ok = False
             try:
-                accounting_ok = bool(save_trade_db(
+                accounting_ok = save_trade_db(
                     bot_name=self.BOT_NAME, mode_is_sim=accounting_mode_is_sim, symbol=base, buy_price=entry,
                     sell_price=close_price, buy_time=d.get("buy_time", ""),
                     sell_time=sell_time, profit_pct=move, profit_usdt=profit_usdt,
@@ -2536,9 +2763,9 @@ class TrendFuturesBot(FuturesBot):
                     entry_quality_score=d.get("entry_quality_score"),
                     entry_quality_label=d.get("entry_quality_label"),
                     entry_quality_reasons=d.get("entry_quality_reasons"),
-                    entry_id=d.get("entry_id")))
+                    entry_id=d.get("entry_id")) is True
                 if not accounting_ok:
-                    raise RuntimeError("save_trade_db returned False")
+                    raise RuntimeError("save_trade_db did not return True")
             except Exception as e:
                 self._log_error(f"trend save_trade {base}", e)
                 log_event(
@@ -2551,6 +2778,12 @@ class TrendFuturesBot(FuturesBot):
                 f"invalid state - state kept for review", "WARN")
             return
 
+        # Persist every re-entry barrier before state/claim cleanup exposes the
+        # symbol to the concurrent scanner again.
+        self._set_stop_cooldown(base, reason, profit_usdt, log_event=log_event)
+        self._maybe_blacklist_bad_symbol(base, reason, profit_usdt, move,
+                                         log_event=log_event)
+
         cleanup_row = dict(d)
         cleanup_row.update({
             "accounting_already_booked": True,
@@ -2560,9 +2793,6 @@ class TrendFuturesBot(FuturesBot):
         })
         TrendFuturesBot._cleanup_accounted_close_state(
             self, base, cleanup_row, log_event=log_event)
-        self._set_stop_cooldown(base, reason, profit_usdt, log_event=log_event)
-        self._maybe_blacklist_bad_symbol(base, reason, profit_usdt, move,
-                                         log_event=log_event)
         log_event(f"[{self.BOT_NAME}] CLOSE {pos_type} {base} @ {close_price:.6f} "
                   f"({reason}, PnL {profit_usdt:+.2f})", "INFO")
         try:
@@ -2635,7 +2865,14 @@ class TrendFuturesBot(FuturesBot):
             log_event(f"[{self.BOT_NAME}] {base}: provisional state had no "
                       f"exchange position - removing stale claim", "WARN")
             try:
-                self.state.remove(base)
+                from bot_utils.trade_state import remove_with_restore_fields
+
+                remove_with_restore_fields(
+                    self.state,
+                    base,
+                    {},
+                    expected_row=d,
+                )
             except Exception:
                 pass
             return False
@@ -2671,7 +2908,12 @@ class TrendFuturesBot(FuturesBot):
             "liquidation_price": liq,
             "initial_liq_distance": distance_to_liquidation_pct(entry, liq, "LONG"),
         }
-        persisted = self.state.update_many(base, fields)
+        from bot_utils.trade_state import (
+            _same_position_generation,
+            update_many_if_current,
+        )
+
+        persisted = update_many_if_current(self.state, base, fields, d)
         if persisted is not True:
             log_event(
                 f"[{self.BOT_NAME}] {base}: exchange position verified, but "
@@ -2679,6 +2921,11 @@ class TrendFuturesBot(FuturesBot):
                 "ERROR",
             )
             return False
+        getter = getattr(self.state, "get", None)
+        if callable(getter):
+            current = getter(base)
+            if not _same_position_generation(current, d):
+                return False
         log_event(f"[{self.BOT_NAME}] {base}: provisional entry verified "
                   f"from exchange position ({contracts:g} contracts)", "WARN")
         return True
@@ -2751,6 +2998,10 @@ class TrendFuturesBot(FuturesBot):
 
     def _check_safety(self, base: str, d: dict) -> None:
         from core.database import upsert_futures_state
+        from bot_utils.trade_state import (
+            same_position_generation,
+            update_many_if_current,
+        )
         from bot_utils import (price_move_pct, calc_unrealized_pnl,
                                calc_liquidation_price, distance_to_liquidation_pct,
                                liq_buffer_consumed_pct, get_exchange_liq_price,
@@ -2759,7 +3010,12 @@ class TrendFuturesBot(FuturesBot):
             return
         if self._handle_exit_recovery_gate(base, d):
             return
-        d = self.state.get(base) or d
+        live = self.state.get(base)
+        if not isinstance(live, dict):
+            return
+        if not same_position_generation(live, d) and live != d:
+            return
+        d = live
         full = f"{base}/USDT:USDT"
         try:
             tk = self.ticker_cache.get(self.ex, full, timeout=5.0, critical=True)
@@ -2807,13 +3063,17 @@ class TrendFuturesBot(FuturesBot):
         if self._safe_float(d.get("invested_usdt"), 0.0) != margin:
             d["invested_usdt"] = margin
             try:
-                self.state.update(base, "invested_usdt", margin)
+                update_many_if_current(
+                    self.state, base, {"invested_usdt": margin}, d
+                )
             except Exception as e:
                 self._log_error(f"trend margin repair {base}", e)
         pos_type = d.get("position_type", "LONG")
         d["last_price"] = curr
         try:
-            self.state.update(base, "last_price", curr)
+            update_many_if_current(
+                self.state, base, {"last_price": curr}, d
+            )
         except Exception as e:
             self._log_error(f"trend last_price update {base}", e)
 
@@ -2848,7 +3108,7 @@ class TrendFuturesBot(FuturesBot):
         if telemetry:
             d.update(telemetry)
             try:
-                self.state.update_many(base, telemetry)
+                update_many_if_current(self.state, base, telemetry, d)
             except Exception as e:
                 self._log_error(f"trend telemetry update {base}", e)
 
@@ -2857,7 +3117,9 @@ class TrendFuturesBot(FuturesBot):
             highest = curr
             d["highest"] = highest
             try:
-                self.state.update(base, "highest", highest)
+                update_many_if_current(
+                    self.state, base, {"highest": highest}, d
+                )
             except Exception as e:
                 self._log_error(f"trend highest update {base}", e)
         lowest = self._safe_float(d.get("lowest"), entry)
@@ -2865,7 +3127,9 @@ class TrendFuturesBot(FuturesBot):
             lowest = curr
             d["lowest"] = lowest
             try:
-                self.state.update(base, "lowest", lowest)
+                update_many_if_current(
+                    self.state, base, {"lowest": lowest}, d
+                )
             except Exception as e:
                 self._log_error(f"trend lowest update {base}", e)
 
@@ -2908,7 +3172,7 @@ class TrendFuturesBot(FuturesBot):
                     liq = exch_liq
                     upd["liquidation_price"] = exch_liq
                 try:
-                    self.state.update_many(base, upd)
+                    update_many_if_current(self.state, base, upd, d)
                 except Exception:
                     pass
         cur_dist = distance_to_liquidation_pct(curr, liq, pos_type)
@@ -2934,7 +3198,12 @@ class TrendFuturesBot(FuturesBot):
                 d["be_active"] = True
                 d["be_price"] = be_price
                 try:
-                    self.state.update_many(base, {"be_active": True, "be_price": be_price})
+                    update_many_if_current(
+                        self.state,
+                        base,
+                        {"be_active": True, "be_price": be_price},
+                        d,
+                    )
                 except Exception as e:
                     self._log_error(f"trend breakeven audit update {base}", e)
 
@@ -2999,7 +3268,9 @@ class TrendFuturesBot(FuturesBot):
                 }
                 d.update(trail_audit)
                 try:
-                    self.state.update_many(base, trail_audit)
+                    update_many_if_current(
+                        self.state, base, trail_audit, d
+                    )
                 except Exception as e:
                     self._log_error(f"trend trailing audit update {base}", e)
                 audit_decision = self._trailing_audit_log_decision(
@@ -3058,7 +3329,12 @@ class TrendFuturesBot(FuturesBot):
                         should_exit=decay.should_exit,
                     )
                     d["time_decay_shadow_seen"] = True
-                    self.state.update(base, "time_decay_shadow_seen", True)
+                    update_many_if_current(
+                        self.state,
+                        base,
+                        {"time_decay_shadow_seen": True},
+                        d,
+                    )
                 if decay.should_exit:
                     self._close_position(base, d, reason="Time-Decay Exit")
                     return
@@ -3074,6 +3350,6 @@ class TrendFuturesBot(FuturesBot):
                 unrealized_pnl=pnl_now, unrealized_pct=_pct_margin_now,
                 liquidation_price=liq,
                 liq_distance_pct=cur_dist, funding_paid=d.get("funding_paid", 0.0),
-                opened_at=d.get("buy_time", ""))
+                opened_at=d.get("buy_time", ""), entry_id=d.get("entry_id"))
         except Exception:
             pass

@@ -1,15 +1,32 @@
 """Small lifecycle helpers for bot-owned runtime threads."""
 from __future__ import annotations
 
+import sys
 import threading
 import time
-from collections.abc import Iterable
-from collections.abc import Mapping
-
+from contextlib import contextmanager
+from collections.abc import Iterable, Mapping
 
 _SHUTDOWN_RETRY_INTERVAL_SEC = 0.25
 _SHUTDOWN_RETRY_TIMEOUT_SEC = 15.0
+_SHUTDOWN_STATUS_REFRESH_SEC = 30.0
 _FINALIZATION_STATE_CREATION_LOCK = threading.Lock()
+_THREADING_THREAD_TYPE = threading.Thread
+
+
+def thread_definitely_never_started(worker: object) -> bool:
+    """Recognize only an exact stdlib Thread with no published launch."""
+    if type(worker) is not _THREADING_THREAD_TYPE:
+        return False
+    try:
+        started = worker._started  # type: ignore[attr-defined]
+        return (
+            worker.ident is None
+            and not worker.is_alive()
+            and not started.is_set()
+        )
+    except BaseException:
+        return False
 
 
 def _shutdown_event_bus_resource() -> bool:
@@ -30,11 +47,102 @@ def _shutdown_database_resource() -> bool:
     return shutdown_database_background_workers(timeout=2.0)
 
 
+def _shutdown_expectancy_telemetry_resource() -> bool:
+    module = sys.modules.get("trading.expectancy_telemetry")
+    if module is None:
+        return True
+    closer = getattr(module, "shutdown_expectancy_telemetry_resources", None)
+    if not callable(closer):
+        return False
+    return closer(timeout=0.0) is True
+
+
+def _shutdown_cooldown_resource() -> bool:
+    module = sys.modules.get("trading.cooldown_utils")
+    if module is None:
+        return True
+    closer = getattr(module, "shutdown_cooldown_persistence", None)
+    if not callable(closer):
+        return False
+    return closer(timeout=0.0) is True
+
+
+def _shutdown_logger_resource() -> bool:
+    from core.logger import (
+        flush_structured_logs,
+        flush_telegram,
+        shutdown_legacy_rebuild,
+    )
+
+    # Evaluate every owned logger resource independently, but share one
+    # end-to-end budget so retries cannot multiply process-exit latency.
+    deadline = time.monotonic() + 2.0
+    structured = flush_structured_logs(timeout=2.0) is True
+    telegram = flush_telegram(
+        timeout=max(0.0, deadline - time.monotonic())
+    ) is True
+    legacy = shutdown_legacy_rebuild(
+        timeout=max(0.0, deadline - time.monotonic())
+    ) is True
+    return structured and telegram and legacy
+
+
+def _shutdown_news_resource() -> bool:
+    # Importing news_sources here would create two executors during shutdown in
+    # bot modes that never used news.  Only close an already-owned module.
+    module = sys.modules.get("news.news_sources")
+    if module is None:
+        return True
+    closer = getattr(module, "shutdown_news_resources", None)
+    if not callable(closer):
+        return False
+    return closer(timeout=0.0) is True
+
+
+def _shutdown_llm_resource() -> bool:
+    # Avoid importing llm_utils during shutdown: imports initialize config and
+    # callers that never used the LLM do not own these resources.
+    module = sys.modules.get("news.llm_utils")
+    if module is None:
+        return True
+    closer = getattr(module, "shutdown_llm_resources", None)
+    if not callable(closer):
+        return False
+    return closer(timeout=0.0) is True
+
+
+def _shutdown_screener_resource() -> bool:
+    module = sys.modules.get("trading.screener")
+    if module is None:
+        return True
+    closer = getattr(module, "shutdown_screener_resources", None)
+    if not callable(closer):
+        return False
+    return closer(timeout=0.0) is True
+
+
+def _shutdown_symbol_tracker_resource() -> bool:
+    module = sys.modules.get("trading.symbol_tracker")
+    if module is None:
+        return True
+    closer = getattr(module, "shutdown_symbol_tracker_resources", None)
+    if not callable(closer):
+        return False
+    return closer(timeout=0.0) is True
+
+
 def shared_runtime_resource_closers() -> dict[str, object]:
     """Return process-global resources owned by every current bot process."""
     return {
+        "cooldown_persistence": _shutdown_cooldown_resource,
         "event_bus": _shutdown_event_bus_resource,
+        "expectancy_telemetry": _shutdown_expectancy_telemetry_resource,
+        "logger_queues": _shutdown_logger_resource,
+        "llm_resources": _shutdown_llm_resource,
+        "news_resources": _shutdown_news_resource,
+        "screener_resources": _shutdown_screener_resource,
         "state_json_writers": _shutdown_state_json_resource,
+        "symbol_tracker_persistence": _shutdown_symbol_tracker_resource,
         "database_background_workers": _shutdown_database_resource,
     }
 
@@ -53,12 +161,14 @@ class _RuntimeShutdownFinalizationState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.retry_thread: threading.Thread | None = None
+        self.retry_start_uncertain = False
         self.complete = False
         self.closed_resources: set[str] = set()
         self.resource_closers: dict[str, object] = {}
         self.required_resources: set[str] = set()
         self.exchange_closed = False
         self.last_status_signature: tuple[object, ...] | None = None
+        self.last_status_written_at = 0.0
 
 
 def _shutdown_finalization_state(owner) -> _RuntimeShutdownFinalizationState:
@@ -81,6 +191,42 @@ def _report_shutdown_error(owner, context: str, exc: Exception) -> None:
             reporter(context, exc)
         except Exception:
             pass
+        else:
+            return
+    try:
+        from bot_utils.silent_log import silent_log
+
+        silent_log(context, exc)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _shutdown_transition_gate(owner):
+    """Serialize signal-sensitive finalizer decisions with close requests."""
+    gate = getattr(owner, "_shutdown_handler_lock", None)
+    if gate is None:
+        yield
+        return
+    gate.acquire()
+    try:
+        yield
+    finally:
+        gate.release()
+        pending = getattr(owner, "_shutdown_close_requested", None)
+        drain = getattr(owner, "_drain_shutdown_close_requests", None)
+        handler = getattr(owner, "_shutdown_handler", None)
+        callback = drain if callable(drain) else handler
+        if pending is not None and pending.is_set() and callable(callback):
+            try:
+                callback(signum="Deferred shutdown signal")
+            except Exception as exc:
+                pending.set()
+                _report_shutdown_error(
+                    owner,
+                    "Deferred shutdown signal",
+                    exc,
+                )
 
 
 def _close_exchange_for_shutdown(
@@ -125,7 +271,7 @@ def _close_exchange_for_shutdown(
         if report_errors:
             _report_shutdown_error(owner, "Exchange shutdown", exc)
         return False
-    if result is False:
+    if result is not None and result is not True:
         if report_errors:
             _report_shutdown_error(
                 owner,
@@ -150,8 +296,20 @@ def _schedule_shutdown_finalization_retry(
         if state.complete:
             return
         retry = state.retry_thread
-        if retry is not None and retry.is_alive():
-            return
+        if retry is not None:
+            try:
+                retry_alive = retry.is_alive()
+            except BaseException:
+                return
+            if retry_alive:
+                return
+            if state.retry_start_uncertain:
+                try:
+                    if retry.ident is None:
+                        return
+                except BaseException:
+                    return
+                state.retry_start_uncertain = False
         interval = max(0.01, float(_SHUTDOWN_RETRY_INTERVAL_SEC))
         timeout = max(interval, float(_SHUTDOWN_RETRY_TIMEOUT_SEC))
 
@@ -189,11 +347,43 @@ def _schedule_shutdown_finalization_retry(
                                 f"{timeout:.2f}s"
                             ),
                         )
-                    if getattr(
+                    emergency_closed = (
+                        getattr(owner, "_emergency_closed", False) is True
+                    )
+                    positions_preserved = (
+                        getattr(
+                            owner,
+                            "_shutdown_positions_preserved",
+                            False,
+                        )
+                        is True
+                    )
+                    preserved_workers_quiesced = False
+                    if positions_preserved and not getattr(
                         owner,
-                        "_shutdown_positions_preserved",
+                        "_emergency_in_progress",
                         False,
-                    ) is not True:
+                    ):
+                        try:
+                            raw_threads = owner._runtime_threads()
+                            preserved_workers_quiesced = (
+                                isinstance(raw_threads, Mapping)
+                                and bool(raw_threads)
+                                and not any(bool(alive) for alive in raw_threads.values())
+                            )
+                        except Exception:
+                            preserved_workers_quiesced = False
+                    # The emergency runner is daemonized so a hung or partial
+                    # close cannot by itself retain the process.  Keep this
+                    # non-daemon finalizer alive until the position action is
+                    # terminal; a later signal can then retry the remaining
+                    # close with the still-live exchange resources. Preserved
+                    # positions are terminal only after every runtime worker
+                    # is known quiescent; otherwise a late entry/state publish
+                    # can still occur after the shutdown snapshot.
+                    if (
+                        emergency_closed and not positions_preserved
+                    ) or preserved_workers_quiesced:
                         return
             except Exception as exc:
                 _report_shutdown_error(owner, "Runtime shutdown retry", exc)
@@ -201,18 +391,35 @@ def _schedule_shutdown_finalization_retry(
                 with state.lock:
                     if state.retry_thread is threading.current_thread():
                         state.retry_thread = None
+                        state.retry_start_uncertain = False
 
-        retry = threading.Thread(
-            target=retry_until_terminal,
-            name=f"{getattr(owner, 'BOT_NAME', 'bot')}-shutdown-finalizer",
-            daemon=False,
-        )
+        try:
+            retry = threading.Thread(
+                target=retry_until_terminal,
+                name=f"{getattr(owner, 'BOT_NAME', 'bot')}-shutdown-finalizer",
+                daemon=False,
+            )
+        except Exception as exc:
+            _report_shutdown_error(owner, "Runtime shutdown retry", exc)
+            return
         state.retry_thread = retry
+        state.retry_start_uncertain = False
         try:
             retry.start()
-        except Exception as exc:
-            state.retry_thread = None
-            _report_shutdown_error(owner, "Runtime shutdown retry", exc)
+        except BaseException as exc:
+            if (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(retry)
+                and state.retry_thread is retry
+            ):
+                state.retry_thread = None
+                state.retry_start_uncertain = False
+            elif state.retry_thread is retry:
+                state.retry_start_uncertain = True
+            if isinstance(exc, Exception):
+                _report_shutdown_error(owner, "Runtime shutdown retry", exc)
+                return
+            raise
 
 
 def finalize_runtime_shutdown(
@@ -227,15 +434,17 @@ def finalize_runtime_shutdown(
 ) -> bool:
     """Publish a truthful terminal state after serialized bot teardown."""
     state = _shutdown_finalization_state(owner)
-    with state.lock:
+    with _shutdown_transition_gate(owner), state.lock:
         if state.complete:
             return True
 
         threads_known = True
         try:
             raw_threads = owner._runtime_threads()
-            if not isinstance(raw_threads, Mapping):
-                raise TypeError("runtime thread status must be a mapping")
+            if not isinstance(raw_threads, Mapping) or not raw_threads:
+                raise TypeError(
+                    "runtime thread status must be a non-empty mapping"
+                )
             threads = {
                 str(name): bool(alive) for name, alive in raw_threads.items()
             }
@@ -257,6 +466,68 @@ def finalize_runtime_shutdown(
             and not any(threads.values())
             and not emergency_in_progress
         )
+        observed_open_positions: int | None = None
+        position_count_error: Exception | None = None
+        count_positions = None
+        if teardown_allowed:
+            state_owner = getattr(owner, "state", None)
+            count_positions = getattr(state_owner, "count", None)
+            if callable(count_positions):
+                try:
+                    candidate_count = count_positions()
+                    if (
+                        isinstance(candidate_count, bool)
+                        or not isinstance(candidate_count, int)
+                        or candidate_count < 0
+                    ):
+                        raise ValueError(
+                            "open-position count must be a non-negative integer"
+                        )
+                    observed_open_positions = candidate_count
+                except Exception as exc:
+                    position_count_error = exc
+        position_action_reason = None
+        if teardown_allowed and emergency_closed and not positions_preserved:
+            if callable(count_positions):
+                if position_count_error is not None:
+                    emergency_closed = False
+                    position_action_reason = "position_state_unavailable"
+                    if not _quiet:
+                        _report_shutdown_error(
+                            owner,
+                            "Runtime shutdown position state",
+                            position_count_error,
+                        )
+                elif observed_open_positions is not None:
+                    if observed_open_positions > 0:
+                        emergency_closed = False
+                        position_action_reason = (
+                            "emergency_close_state_remaining"
+                        )
+                if not emergency_closed:
+                    # A scan/entry worker can finish publishing an already
+                    # landed order after the emergency helper took its state
+                    # snapshot. Re-open the latch after all workers quiesce so
+                    # a repeat signal can close that late generation. Keep the
+                    # same owner lock used by the signal handler when present.
+                    shutdown_lock = getattr(owner, "_shutdown_lock", None)
+                    if shutdown_lock is None:
+                        owner._emergency_closed = False
+                    else:
+                        def _reopen_close_latch() -> None:
+                            with shutdown_lock:
+                                if not getattr(
+                                    owner,
+                                    "_shutdown_positions_preserved",
+                                    False,
+                                ) and not getattr(
+                                    owner,
+                                    "_emergency_in_progress",
+                                    False,
+                                ):
+                                    owner._emergency_closed = False
+
+                        _reopen_close_latch()
 
         for raw_name, result in (resource_results or {}).items():
             name = str(raw_name)
@@ -269,15 +540,39 @@ def finalize_runtime_shutdown(
             state.resource_closers[name] = closer
 
         resources: dict[str, bool] = {}
-        for name in sorted(state.required_resources):
+        deferred_resources = {
+            name for name in state.required_resources if name == "logger_queues"
+        }
+        llm_resources = {
+            name for name in state.required_resources if name == "llm_resources"
+        }
+        expectancy_resources = {
+            name
+            for name in state.required_resources
+            if name == "expectancy_telemetry"
+        }
+        trade_state_resources = {
+            name
+            for name in state.required_resources
+            if name == "trade_state_persistence"
+        }
+        regular_resources = sorted(
+            state.required_resources
+            - deferred_resources
+            - llm_resources
+            - expectancy_resources
+            - trade_state_resources
+        )
+
+        def _close_registered_resource(name: str) -> None:
             if name in state.closed_resources:
                 resources[name] = True
-                continue
+                return
             closer_registered = name in state.resource_closers
             closer = state.resource_closers.get(name)
             if not teardown_allowed:
                 resources[name] = False
-                continue
+                return
             if not callable(closer):
                 resources[name] = False
                 if closer_registered and not _quiet:
@@ -286,7 +581,7 @@ def finalize_runtime_shutdown(
                         f"{name} shutdown",
                         TypeError("resource closer must be callable"),
                     )
-                continue
+                return
             try:
                 result = closer()
             except Exception as exc:
@@ -294,8 +589,9 @@ def finalize_runtime_shutdown(
                 if not _quiet:
                     _report_shutdown_error(owner, f"{name} shutdown", exc)
             else:
-                resources[name] = result is not False
-                if result is False:
+                confirmed = result is None or result is True
+                resources[name] = confirmed
+                if not confirmed:
                     if not _quiet:
                         _report_shutdown_error(
                             owner,
@@ -303,10 +599,47 @@ def finalize_runtime_shutdown(
                             RuntimeError(f"{name} resources remain open"),
                         )
                 else:
-                    state.closed_resources.add(name)
+                    # A status-publish failure below can itself emit a final
+                    # structured diagnostic. Keep the logger flush retryable
+                    # until the whole finalizer reaches its terminal state.
+                    if name != "logger_queues":
+                        state.closed_resources.add(name)
 
+        for name in sorted(expectancy_resources):
+            _close_registered_resource(name)
+        for name in sorted(trade_state_resources):
+            _close_registered_resource(name)
+
+        for name in regular_resources:
+            if (
+                name == "database_background_workers"
+                and any(
+                    resources.get(producer) is not True
+                    for producer in (
+                        expectancy_resources | trade_state_resources
+                    )
+                )
+            ):
+                resources[name] = False
+            else:
+                _close_registered_resource(name)
+
+        # News executor tasks can be inside LLM inference. Do not close their
+        # shared Ollama/httpx clients until those producers have converged.
+        for name in sorted(llm_resources):
+            if resources.get("news_resources", True) is True:
+                _close_registered_resource(name)
+            else:
+                resources[name] = False
+
+        position_action_terminal = emergency_closed or positions_preserved
         if state.exchange_closed:
             resources["exchange"] = True
+        elif not position_action_terminal:
+            # ``ThreadLocalExchange.close_all`` is deliberately reusable.  A
+            # partial emergency close may need that wrapper again on a repeat
+            # signal, so neither close nor cache it as terminal prematurely.
+            resources["exchange"] = False
         else:
             exchange_closed = _close_exchange_for_shutdown(
                 owner,
@@ -316,6 +649,29 @@ def finalize_runtime_shutdown(
             resources["exchange"] = exchange_closed
             if exchange_closed:
                 state.exchange_closed = True
+
+        # Logger queues are the terminal sink for errors emitted by every
+        # other closer and by exchange teardown. Flush them only after those
+        # producers converge; otherwise an early successful flush would be
+        # cached while retry diagnostics remain unflushed.
+        for name in sorted(deferred_resources):
+            prerequisites_closed = (
+                teardown_allowed
+                and resources.get("exchange") is True
+                and all(
+                    resources.get(other) is True
+                    for other in (
+                        regular_resources
+                        + sorted(llm_resources)
+                        + sorted(expectancy_resources)
+                        + sorted(trade_state_resources)
+                    )
+                )
+            )
+            if name not in state.closed_resources and not prerequisites_closed:
+                resources[name] = False
+                continue
+            _close_registered_resource(name)
 
         reasons = [
             f"thread_alive:{name}" for name, alive in threads.items() if alive
@@ -327,7 +683,9 @@ def finalize_runtime_shutdown(
         elif emergency_closed and positions_preserved:
             reasons.append("shutdown_position_action_inconsistent")
         elif not emergency_closed and not positions_preserved:
-            reasons.append("emergency_close_incomplete")
+            reasons.append(
+                position_action_reason or "emergency_close_incomplete"
+            )
         reasons.extend(
             f"{name}_close_failed"
             for name, succeeded in resources.items()
@@ -350,10 +708,25 @@ def finalize_runtime_shutdown(
             emergency_closed,
             emergency_in_progress,
             positions_preserved,
+            observed_open_positions,
             tuple(sorted(resources.items())),
         )
-        status_written = state.last_status_signature == status_signature
+        now_mono = time.monotonic()
+        same_status = state.last_status_signature == status_signature
+        refresh_due = (
+            same_status
+            and bool(reasons)
+            and now_mono - state.last_status_written_at
+            >= max(0.0, float(_SHUTDOWN_STATUS_REFRESH_SEC))
+        )
+        status_written = same_status and not refresh_due
         if not status_written:
+            status_extra = {
+                "shutdown": shutdown_payload,
+                "open_positions_known": observed_open_positions is not None,
+            }
+            if observed_open_positions is not None:
+                status_extra["open_positions"] = observed_open_positions
             try:
                 write_result = status_writer(
                     owner.LOG_DIR,
@@ -361,9 +734,9 @@ def finalize_runtime_shutdown(
                     status,
                     owner.simulation,
                     threads=threads,
-                    extra={"shutdown": shutdown_payload},
+                    extra=status_extra,
                 )
-                if write_result is False:
+                if write_result is not None and write_result is not True:
                     raise RuntimeError(
                         "runtime status writer reported publish failure"
                     )
@@ -373,6 +746,7 @@ def finalize_runtime_shutdown(
             else:
                 status_written = True
                 state.last_status_signature = status_signature
+                state.last_status_written_at = time.monotonic()
 
         clean = not reasons and status_written
         if clean:
@@ -418,34 +792,132 @@ def start_threads_or_shutdown(
         for candidate in threads:
             candidate.start()
             started.append(candidate)
-    except BaseException:
-        shutdown_event.set()
-        for event in wakeup_events:
+    except BaseException as exc:
+        noted_cleanup_failures: set[tuple[str, str]] = set()
+
+        def note_cleanup_failure(
+            context: str,
+            cleanup_error: BaseException,
+            primary_error: BaseException = exc,
+        ) -> None:
+            key = (context, type(cleanup_error).__name__)
+            if key in noted_cleanup_failures:
+                return
+            noted_cleanup_failures.add(key)
+            try:
+                primary_error.add_note(
+                    f"{context}: {type(cleanup_error).__name__}: "
+                    f"{cleanup_error}"
+                )
+            except BaseException:
+                pass
+
+        pending_signals: list[tuple[object, str]] = []
+
+        def publish_signal(event: object, context: str) -> None:
             try:
                 event.set()
-            except Exception:
-                pass
+            except BaseException as cleanup_error:
+                note_cleanup_failure(context, cleanup_error)
+                pending_signals.append((event, context))
 
-        # A non-standard Thread implementation could raise after launching.
-        # Include that candidate when it reports itself alive.
-        if candidate is not None and candidate not in started:
-            try:
-                if candidate.is_alive():
-                    started.append(candidate)
-            except Exception:
-                pass
+        def retry_pending_signals() -> None:
+            if not pending_signals:
+                return
+            retry = list(pending_signals)
+            pending_signals.clear()
+            for event, context in retry:
+                publish_signal(event, context)
 
-        retry_interval = max(0.01, float(join_timeout))
+        publish_signal(
+            shutdown_event,
+            "runtime rollback shutdown signal failed",
+        )
+        for event in wakeup_events:
+            publish_signal(event, "runtime rollback wakeup failed")
+
+        uncertain: set[int] = set()
+        if (
+            candidate is not None
+            and all(candidate is not thread for thread in started)
+            and not (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(candidate)
+            )
+        ):
+            # After start() was invoked, a custom/fatal failure can still own
+            # a delayed OS launch. Keep the exact candidate in rollback until
+            # it has both published a start identity and terminated.
+            started.append(candidate)
+            uncertain.add(id(candidate))
+
+        try:
+            retry_interval = max(0.01, float(join_timeout))
+        except BaseException as cleanup_error:
+            note_cleanup_failure(
+                "runtime rollback join interval invalid",
+                cleanup_error,
+            )
+            retry_interval = 0.25
         for thread in reversed(started):
             while True:
+                retry_pending_signals()
                 try:
                     alive = thread.is_alive()
-                except Exception:
+                except BaseException as cleanup_error:
+                    note_cleanup_failure(
+                        "runtime rollback liveness probe failed",
+                        cleanup_error,
+                    )
                     alive = True
                 if not alive:
+                    if id(thread) in uncertain:
+                        try:
+                            if thread.ident is None:
+                                try:
+                                    time.sleep(min(retry_interval, 0.25))
+                                except BaseException as cleanup_error:
+                                    note_cleanup_failure(
+                                        "runtime rollback wait interrupted",
+                                        cleanup_error,
+                                    )
+                                continue
+                        except BaseException as cleanup_error:
+                            note_cleanup_failure(
+                                "runtime rollback identity probe failed",
+                                cleanup_error,
+                            )
+                            try:
+                                time.sleep(min(retry_interval, 0.25))
+                            except BaseException as wait_error:
+                                note_cleanup_failure(
+                                    "runtime rollback wait interrupted",
+                                    wait_error,
+                                )
+                            continue
                     break
                 try:
                     thread.join(timeout=retry_interval)
-                except Exception:
+                except BaseException as cleanup_error:
+                    note_cleanup_failure(
+                        "runtime rollback join failed",
+                        cleanup_error,
+                    )
+                    try:
+                        time.sleep(min(retry_interval, 0.25))
+                    except BaseException as wait_error:
+                        note_cleanup_failure(
+                            "runtime rollback wait interrupted",
+                            wait_error,
+                        )
+        while pending_signals:
+            retry_pending_signals()
+            if pending_signals:
+                try:
                     time.sleep(min(retry_interval, 0.25))
+                except BaseException as wait_error:
+                    note_cleanup_failure(
+                        "runtime rollback signal retry interrupted",
+                        wait_error,
+                    )
         raise

@@ -20,6 +20,7 @@ import threading
 import time
 
 from bot_utils.config import _read_config_json, parse_explicit_bool
+from bot_utils.runtime_threads import thread_definitely_never_started
 from launcher.config.settings import BOT_META, BOT_ORDER, CONFIG_FILE
 from launcher.core.runtime_status_values import (
     finite_float_or_none,
@@ -368,6 +369,7 @@ class DataPoller:
         self.lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._recovery_thread: threading.Thread | None = None
+        self._recovery_state: dict | None = None
         self.running = True
         # Cancellable sleep  Event.wait() instead of time.sleep()
         self._stop_event = threading.Event()
@@ -393,12 +395,109 @@ class DataPoller:
         self._equity_spot_exchange = None
         self._equity_futures_exchange = None
         self._error_counter   = _ErrorLogCounter("error_log.txt")
+        initial_state = {
+            "done": threading.Event(),
+            "start_gate": threading.Event(),
+            "cancelled": False,
+        }
         self._thread = threading.Thread(
-            target=self._loop,
+            target=lambda: self._run_owned_replacement(initial_state),
             daemon=True,
             name="launcher-data-poller",
         )
-        self._thread.start()
+        initial_state["thread"] = self._thread
+        self._thread_state: dict | None = initial_state
+        candidate = self._thread
+        start_returned = False
+        try:
+            candidate.start()
+            start_returned = True
+            initial_state["start_gate"].set()
+        except BaseException as primary_error:
+            self.running = False
+            initial_state["cancelled"] = True
+            noted: set[tuple[str, type[BaseException]]] = set()
+            rollback_error = primary_error
+
+            def note_cleanup(context: str, exc: BaseException) -> None:
+                key = (context, type(exc))
+                if key in noted:
+                    return
+                noted.add(key)
+                try:
+                    rollback_error.add_note(
+                        f"DataPoller initial-start {context} failed: "
+                        f"{type(exc).__name__}"
+                    )
+                except BaseException:
+                    pass
+
+            try:
+                self._stop_event.set()
+            except BaseException as exc:
+                note_cleanup("stop publication", exc)
+
+            gate_pending = True
+
+            def publish_gate() -> None:
+                nonlocal gate_pending
+                try:
+                    initial_state["start_gate"].set()
+                except BaseException as exc:
+                    note_cleanup("start-gate publication", exc)
+                else:
+                    gate_pending = False
+
+            publish_gate()
+            if (
+                not start_returned
+                and
+                isinstance(primary_error, Exception)
+                and thread_definitely_never_started(candidate)
+            ):
+                initial_state["done"].set()
+                with self._lifecycle_lock:
+                    if self._thread is candidate:
+                        self._thread = None
+                        self._thread_state = None
+            else:
+                while True:
+                    if gate_pending:
+                        publish_gate()
+                    try:
+                        alive = candidate.is_alive()
+                    except BaseException as exc:
+                        note_cleanup("liveness probe", exc)
+                        alive = True
+                    try:
+                        ident_published = candidate.ident is not None
+                    except BaseException as exc:
+                        note_cleanup("identity probe", exc)
+                        ident_published = False
+                    if (
+                        initial_state["done"].is_set()
+                        and ident_published
+                        and not alive
+                    ):
+                        break
+                    try:
+                        candidate.join(timeout=0.05)
+                    except BaseException as exc:
+                        note_cleanup("join", exc)
+                        try:
+                            time.sleep(0.01)
+                        except BaseException as sleep_exc:
+                            note_cleanup("retry sleep", sleep_exc)
+            for attr in (
+                "_spot_exchange",
+                "_equity_spot_exchange",
+                "_equity_futures_exchange",
+            ):
+                try:
+                    self._discard_exchange(attr)
+                except BaseException as exc:
+                    note_cleanup(f"{attr} cleanup", exc)
+            raise
 
     def _log_diag(self, msg: str) -> None:
         """Print a one-line diagnostic to stderr, throttled to once/60s
@@ -1017,20 +1116,74 @@ class DataPoller:
             }
 
     def stop(self, *, timeout: float = 2.0) -> bool:
+        if isinstance(timeout, bool):
+            return False
+        try:
+            budget = float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(budget):
+            return False
+        budget = min(max(0.0, budget), threading.TIMEOUT_MAX)
+        deadline = time.monotonic() + budget
+
         self.running = False
         self._stop_event.set()
-        thread = getattr(self, "_thread", None)
-        if thread is not None and thread is not threading.current_thread():
+        lifecycle_lock = getattr(self, "_lifecycle_lock", None)
+        if lifecycle_lock is None:
+            candidates = (
+                (
+                    getattr(self, "_thread", None),
+                    getattr(self, "_thread_state", None),
+                ),
+                (
+                    getattr(self, "_recovery_thread", None),
+                    getattr(self, "_recovery_state", None),
+                ),
+            )
+        else:
+            lock_timeout = min(
+                max(0.0, deadline - time.monotonic()),
+                threading.TIMEOUT_MAX,
+            )
+            if not lifecycle_lock.acquire(timeout=lock_timeout):
+                return False
+            try:
+                candidates = (
+                    (
+                        getattr(self, "_thread", None),
+                        getattr(self, "_thread_state", None),
+                    ),
+                    (
+                        getattr(self, "_recovery_thread", None),
+                        getattr(self, "_recovery_state", None),
+                    ),
+                )
+            finally:
+                lifecycle_lock.release()
+        threads = []
+        for candidate, state in candidates:
+            if candidate is not None and not any(
+                candidate is known[0] for known in threads
+            ):
+                threads.append((candidate, state))
+        for thread, _state in threads:
+            if thread is threading.current_thread():
+                continue
             try:
                 if thread.is_alive():
-                    thread.join(timeout=max(0.0, float(timeout)))
-            except Exception:
+                    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            except BaseException:
                 return False
-        try:
-            if thread is not None and thread.is_alive():
+        for thread, state in threads:
+            done = state.get("done") if isinstance(state, dict) else None
+            if done is not None and not done.is_set():
                 return False
-        except Exception:
-            return False
+            try:
+                if thread.is_alive():
+                    return False
+            except BaseException:
+                return False
         for attr in (
             "_spot_exchange",
             "_equity_spot_exchange",
@@ -1039,30 +1192,87 @@ class DataPoller:
             self._discard_exchange(attr)
         return True
 
+    def _run_owned_replacement(self, state: dict) -> None:
+        try:
+            start_gate = state.get("start_gate")
+            if start_gate is not None:
+                start_gate.wait()
+                if state.get("cancelled"):
+                    return
+            self._loop()
+        finally:
+            with self._lifecycle_lock:
+                state["done"].set()
+                if self._thread is state.get("thread"):
+                    self._thread = None
+                    self._thread_state = None
+
     def _recover_after_aborted_stop(
         self,
         observed_thread: threading.Thread,
+        recovery_state: dict | None = None,
     ) -> None:
         """Replace the old worker if it consumed the cancelled stop signal."""
         try:
-            observed_thread.join()
-        except Exception:
-            return
-        with self._lifecycle_lock:
-            self._recovery_thread = None
-            if not self.running or self._thread is not observed_thread:
-                return
-            replacement = threading.Thread(
-                target=self._loop,
-                daemon=True,
-                name="launcher-data-poller",
-            )
-            self._thread = replacement
             try:
-                replacement.start()
+                observed_thread.join()
             except Exception:
-                self.running = False
-                self._thread = None
+                return
+            with self._lifecycle_lock:
+                if (
+                    recovery_state is not None
+                    and self._recovery_thread
+                    is not recovery_state.get("thread")
+                ):
+                    return
+                if recovery_state is None:
+                    self._recovery_thread = None
+                current_thread = self._thread
+                if (
+                    not self.running
+                    or (
+                        current_thread is not None
+                        and current_thread is not observed_thread
+                    )
+                ):
+                    return
+                replacement_state = {"done": threading.Event()}
+                try:
+                    replacement = threading.Thread(
+                        target=self._run_owned_replacement,
+                        args=(replacement_state,),
+                        daemon=True,
+                        name="launcher-data-poller",
+                    )
+                except BaseException:
+                    return
+                replacement_state["thread"] = replacement
+                self._thread = replacement
+                self._thread_state = replacement_state
+                try:
+                    replacement.start()
+                except BaseException as exc:
+                    if (
+                        isinstance(exc, Exception)
+                        and thread_definitely_never_started(replacement)
+                    ):
+                        replacement_state["done"].set()
+                        if self._thread is replacement:
+                            self._thread = None
+                            self._thread_state = None
+                            self.running = False
+                    else:
+                        replacement_state["start_uncertain"] = True
+                    # Once start() was invoked, only the exact target finalizer
+                    # may release this possibly running replacement generation.
+                    return
+        finally:
+            if recovery_state is not None:
+                with self._lifecycle_lock:
+                    recovery_state["done"].set()
+                    if self._recovery_thread is recovery_state.get("thread"):
+                        self._recovery_thread = None
+                        self._recovery_state = None
 
     def resume_after_aborted_stop(self) -> bool:
         """Keep UI polling alive after a timed-out, fail-closed shutdown."""
@@ -1070,33 +1280,83 @@ class DataPoller:
             self.running = True
             self._stop_event.clear()
             observed_thread = self._thread
-            try:
-                alive = bool(
-                    observed_thread is not None
-                    and observed_thread.is_alive()
-                )
-            except Exception:
-                # Unknown liveness is not proof that the old poller exited.
-                # Route it through the single recovery join below instead of
-                # starting a concurrent replacement immediately.
-                alive = observed_thread is not None
+            observed_state = getattr(self, "_thread_state", None)
+            observed_done = (
+                observed_state.get("done")
+                if isinstance(observed_state, dict)
+                else None
+            )
+            ownership_unresolved = (
+                observed_done is not None and not observed_done.is_set()
+            )
+            if ownership_unresolved:
+                if observed_thread is None:
+                    return False
+                if observed_state.get("start_uncertain"):
+                    # A prior start() may still publish this exact generation.
+                    # Do not create a recovery owner that could race it.
+                    return False
+                # The exact finalizer may still be running even if is_alive()
+                # has already turned false.  Let the single recovery join
+                # prove completion and perform the successor handoff.
+                alive = True
+            else:
+                try:
+                    alive = bool(
+                        observed_thread is not None
+                        and observed_thread.is_alive()
+                    )
+                except Exception:
+                    # Unknown liveness is not proof that the old poller exited.
+                    # Route it through the single recovery join below instead
+                    # of starting a concurrent replacement immediately.
+                    alive = observed_thread is not None
 
             if not alive:
-                replacement = threading.Thread(
-                    target=self._loop,
-                    daemon=True,
-                    name="launcher-data-poller",
-                )
+                replacement_state = {"done": threading.Event()}
+                try:
+                    replacement = threading.Thread(
+                        target=self._run_owned_replacement,
+                        args=(replacement_state,),
+                        daemon=True,
+                        name="launcher-data-poller",
+                    )
+                except BaseException:
+                    self.running = False
+                    self._thread = None
+                    self._thread_state = None
+                    return False
+                replacement_state["thread"] = replacement
                 self._thread = replacement
+                self._thread_state = replacement_state
                 try:
                     replacement.start()
                     return bool(replacement.is_alive())
-                except Exception:
-                    self.running = False
-                    self._thread = None
+                except BaseException as exc:
+                    if (
+                        isinstance(exc, Exception)
+                        and thread_definitely_never_started(replacement)
+                    ):
+                        replacement_state["done"].set()
+                        if self._thread is replacement:
+                            self._thread = None
+                            self._thread_state = None
+                            self.running = False
+                    else:
+                        replacement_state["start_uncertain"] = True
+                    # Post-start ownership is uncertain even with no visible
+                    # ident/liveness. Keep the exact candidate fail-closed.
                     return False
 
             recovery = self._recovery_thread
+            recovery_state = getattr(self, "_recovery_state", None)
+            recovery_done = (
+                recovery_state.get("done")
+                if isinstance(recovery_state, dict)
+                else None
+            )
+            if recovery_done is not None and not recovery_done.is_set():
+                return False
             try:
                 recovery_alive = bool(
                     recovery is not None and recovery.is_alive()
@@ -1108,16 +1368,31 @@ class DataPoller:
             if recovery_alive:
                 return True
 
-            recovery = threading.Thread(
-                target=self._recover_after_aborted_stop,
-                args=(observed_thread,),
-                daemon=True,
-                name="launcher-data-poller-recovery",
-            )
+            recovery_state = {"done": threading.Event()}
+            try:
+                recovery = threading.Thread(
+                    target=self._recover_after_aborted_stop,
+                    args=(observed_thread, recovery_state),
+                    daemon=True,
+                    name="launcher-data-poller-recovery",
+                )
+            except BaseException:
+                return False
+            recovery_state["thread"] = recovery
             self._recovery_thread = recovery
+            self._recovery_state = recovery_state
             try:
                 recovery.start()
-            except Exception:
-                self._recovery_thread = None
+            except BaseException as exc:
+                if (
+                    isinstance(exc, Exception)
+                    and thread_definitely_never_started(recovery)
+                ):
+                    recovery_state["done"].set()
+                    if self._recovery_thread is recovery:
+                        self._recovery_thread = None
+                        self._recovery_state = None
+                # The exact recovery generation may already own a live OS
+                # thread; its identity guard must perform successor handoff.
                 return False
             return True

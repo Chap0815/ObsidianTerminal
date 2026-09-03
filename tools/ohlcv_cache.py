@@ -21,12 +21,13 @@ import json
 import math
 import os
 import time as _time
-import uuid
 from contextlib import nullcontext
 from pathlib import Path
 
 import ccxt
 import portalocker
+
+from bot_utils.atomic_publish import atomic_write_bytes
 
 _CACHE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "ohlcv_cache")
@@ -271,7 +272,6 @@ def _save(
     bars: list,
     cache_namespace: str | None = None,
 ) -> None:
-    tmp = None
     try:
         tf_ms = _TF_MS.get(timeframe)
         if tf_ms is None or not isinstance(bars, list) or not bars:
@@ -342,28 +342,11 @@ def _save(
             if len(encoded) > _CACHE_JSON_MAX_BYTES:
                 return
             p = _cache_path_without_links(str(p))
-            tmp = _cache_path_without_links(
-                f"{p}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-            )
-            with tmp.open("xb") as f:
-                f.write(encoded)
-                f.flush()
-                os.fsync(f.fileno())
             p = _cache_path_without_links(str(p))
-            _cache_path_without_links(str(tmp))
-            os.replace(tmp, p)
-            tmp = None
+            atomic_write_bytes(p, encoded)
     # A cache write is best-effort and must never break an offline research run.
     except Exception:  # noqa: BLE001, S110
         pass
-    finally:
-        if tmp is not None:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
 
 
 def _fetch_ohlcv_backoff(exchange, symbol, timeframe, since, limit, retries=6):

@@ -1,6 +1,7 @@
 """Fail-soft runtime consistency and observability helpers."""
 from __future__ import annotations
 
+import copy
 import math
 import threading
 import time
@@ -69,7 +70,9 @@ def _structured_state_decision(
 
 
 def _base_symbol(value: Any) -> str:
-    text = str(value or "").upper().strip()
+    if not isinstance(value, str):
+        return ""
+    text = value.upper().strip()
     return text.split("/")[0].split(":")[0]
 
 
@@ -126,7 +129,53 @@ def _safe_entry_id(value: Any, *, max_length: int = 64) -> str | None:
     return text
 
 
-def _valid_utc_timestamp(value: Any) -> str | None:
+def _entry_quality_score_or_none(value: Any) -> float | None:
+    score = _strict_nonnegative_float(value)
+    return score if score is not None and score <= 100.0 else None
+
+
+def _entry_quality_text_or_none(
+    value: Any,
+    *,
+    max_length: int,
+    uppercase: bool = False,
+    allowed: frozenset[str] | None = None,
+    allow_empty: bool = False,
+) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if (
+        (not text and not allow_empty)
+        or len(text) > max_length
+        or any(ord(char) < 32 or ord(char) == 127 for char in text)
+    ):
+        return None
+    if uppercase:
+        text = text.upper()
+    if allowed is not None and text not in allowed:
+        return None
+    return text
+
+
+def _entry_quality_label_or_none(value: Any) -> str | None:
+    return _entry_quality_text_or_none(
+        value,
+        max_length=16,
+        uppercase=True,
+        allowed=frozenset({"LOW", "MID", "HIGH", "UNKNOWN"}),
+    )
+
+
+def _entry_quality_reasons_or_none(value: Any) -> str | None:
+    return _entry_quality_text_or_none(
+        value,
+        max_length=512,
+        allow_empty=True,
+    )
+
+
+def _utc_datetime_or_none(value: Any) -> datetime | None:
     if not isinstance(value, str):
         return None
     text = value.strip()
@@ -139,8 +188,16 @@ def _valid_utc_timestamp(value: Any) -> str | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     try:
-        parsed.astimezone(timezone.utc)
+        return parsed.astimezone(timezone.utc)
     except (OverflowError, ValueError):
+        return None
+
+
+def _valid_utc_timestamp(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if _utc_datetime_or_none(text) is None:
         return None
     return text
 
@@ -167,14 +224,27 @@ def _direction(value: Any) -> str:
     return text
 
 
-def _claim_extra(row: Mapping[str, Any]) -> dict[str, Any]:
+def _owned_direction(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip().upper()
+    return text if text in {"LONG", "SHORT", "SPOT"} else ""
+
+
+def _claim_extra_with_validity(
+    row: Mapping[str, Any],
+) -> tuple[dict[str, Any], bool]:
     try:
         from core.database import _strict_claim_extra_object
 
         value = _strict_claim_extra_object(row.get("extra_json"))
     except (ImportError, TypeError, ValueError):
-        return {}
-    return value if value is not None else {}
+        return {}, False
+    return (value, True) if value is not None else ({}, False)
+
+
+def _claim_extra(row: Mapping[str, Any]) -> dict[str, Any]:
+    return _claim_extra_with_validity(row)[0]
 
 
 def _has_raw_partial_evidence(extra: Mapping[str, Any]) -> bool:
@@ -201,9 +271,12 @@ def _has_raw_partial_evidence(extra: Mapping[str, Any]) -> bool:
 def _claim_dict_items(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, dict):
         return [dict(value)]
-    if not isinstance(value, list):
+    if (
+        not isinstance(value, list)
+        or not all(isinstance(item, dict) for item in value)
+    ):
         return []
-    return [dict(item) for item in value if isinstance(item, dict)]
+    return [dict(item) for item in value]
 
 
 _TRADE_ACCOUNTING_FIELDS = frozenset({
@@ -235,10 +308,14 @@ def _validated_pending_partials(
         return [], False
     expected_bot = bot_name.strip() if isinstance(bot_name, str) else ""
     validated = []
+    seen_order_ids: set[str] = set()
     for raw in items:
         item_bot = raw.get("bot_name")
         item_symbol = raw.get("symbol")
         reason = raw.get("reason")
+        exchange_order_id = _safe_entry_id(
+            raw.get("exchange_order_id"), max_length=128
+        )
         if (
             not isinstance(item_bot, str)
             or not item_bot.strip()
@@ -261,11 +338,12 @@ def _validated_pending_partials(
             or _strict_positive_float(raw.get("leverage")) is None
             or _strict_finite_float(raw.get("funding_paid")) is None
             or _strict_nonnegative_float(raw.get("fees_usdt")) is None
-            or _safe_entry_id(
-                raw.get("exchange_order_id"), max_length=128
-            ) is None
+            or exchange_order_id is None
         ):
             return [], False
+        if exchange_order_id in seen_order_ids:
+            return [], False
+        seen_order_ids.add(exchange_order_id)
         candidate = {
             key: raw[key] for key in _TRADE_ACCOUNTING_FIELDS if key in raw
         }
@@ -282,38 +360,94 @@ def _validated_unpriced_partials(
     position_type: str,
     buy_price: float,
     buy_time: str,
+    original_amount: float | None = None,
+    current_amount: float | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     items = _claim_dict_items(value)
     if value in (None, [], {}):
         return [], True
     if not items:
         return [], False
+    original = (
+        _strict_positive_float(original_amount)
+        if original_amount is not None
+        else None
+    )
+    current = (
+        _strict_positive_float(current_amount)
+        if current_amount is not None
+        else None
+    )
+    if (
+        (original_amount is not None and original is None)
+        or (current_amount is not None and current is None)
+    ):
+        return [], False
+    buy_datetime = _utc_datetime_or_none(buy_time)
+    if buy_datetime is None:
+        return [], False
     validated = []
+    seen_events: set[tuple[Any, ...]] = set()
+    previous_remaining = original
     for raw in items:
         reason = raw.get("reason")
         item_buy = _strict_positive_float(raw.get("buy_price"))
+        sold_contracts = _strict_positive_float(raw.get("sold_contracts"))
+        remaining_contracts = _strict_nonnegative_float(
+            raw.get("remaining_contracts")
+        )
+        invested = _strict_positive_float(raw.get("invested_usdt"))
+        leverage = _strict_positive_float(raw.get("leverage"))
+        detected_at = _valid_utc_timestamp(raw.get("detected_at"))
+        detected_datetime = _utc_datetime_or_none(detected_at)
         if (
             _base_symbol(raw.get("symbol")) != symbol
-            or _strict_positive_float(raw.get("sold_contracts")) is None
-            or _strict_nonnegative_float(
-                raw.get("remaining_contracts")
-            ) is None
+            or sold_contracts is None
+            or remaining_contracts is None
             or raw.get("position_type") != position_type
             or item_buy is None
             or not math.isclose(
                 item_buy, buy_price, rel_tol=1e-6, abs_tol=1e-9
             )
             or _valid_utc_timestamp(raw.get("buy_time")) != buy_time
-            or _strict_positive_float(raw.get("invested_usdt")) is None
-            or _strict_positive_float(raw.get("leverage")) is None
-            or _valid_utc_timestamp(raw.get("detected_at")) is None
+            or invested is None
+            or leverage is None
+            or detected_at is None
+            or detected_datetime is None
+            or detected_datetime < buy_datetime
             or not isinstance(reason, str)
             or not reason.strip()
             or len(reason) > 256
             or any(ord(char) < 32 or ord(char) == 127 for char in reason)
         ):
             return [], False
+        if previous_remaining is not None:
+            tolerance = max(1e-12, previous_remaining * 1e-9)
+            if sold_contracts + remaining_contracts > (
+                previous_remaining + tolerance
+            ):
+                return [], False
+        previous_remaining = remaining_contracts
+        event_key = (
+            symbol,
+            sold_contracts,
+            remaining_contracts,
+            position_type,
+            item_buy,
+            buy_time,
+            invested,
+            leverage,
+            detected_at,
+            reason.strip(),
+        )
+        if event_key in seen_events:
+            return [], False
+        seen_events.add(event_key)
         validated.append(dict(raw))
+    if current is not None and previous_remaining is not None:
+        tolerance = max(1e-12, previous_remaining * 1e-9)
+        if current > previous_remaining + tolerance:
+            return [], False
     return validated, True
 
 
@@ -321,20 +455,40 @@ def claim_recovery_metadata(
     claim_rows: list[Mapping[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     """Return only observational/recovery fields safe to restore to state."""
-    allowed = {
-        "entry_quality_score", "entry_quality_label",
-        "entry_quality_reasons", "provisional", "adopted",
-    }
     grouped: dict[str, list[Mapping[str, Any]]] = {}
-    for row in claim_rows:
+    for index, row in enumerate(claim_rows):
         if not isinstance(row, Mapping):
-            continue
+            raise ValueError(
+                f"claim recovery row {index} is not an object"
+            )
         symbol = _base_symbol(row.get("symbol"))
-        if symbol:
-            grouped.setdefault(symbol, []).append(row)
+        if not symbol:
+            raise ValueError(
+                f"claim recovery row {index} has no valid symbol"
+            )
+        grouped.setdefault(symbol, []).append(row)
+
+    entry_id_symbols: dict[str, set[str]] = {}
+    for symbol, rows in grouped.items():
+        for row in rows:
+            extra, extra_valid = _claim_extra_with_validity(row)
+            if not extra_valid:
+                continue
+            entry_id = _safe_entry_id(extra.get("entry_id"))
+            if entry_id is not None:
+                entry_id_symbols.setdefault(entry_id, set()).add(symbol)
+    reused_entry_id_symbols = {
+        symbol
+        for symbols in entry_id_symbols.values()
+        if len(symbols) > 1
+        for symbol in symbols
+    }
 
     recovered: dict[str, dict[str, Any]] = {}
     for symbol, rows in grouped.items():
+        if symbol in reused_entry_id_symbols:
+            recovered[symbol] = {"claim_recovery_invalid": True}
+            continue
         # Same-base aliases must never be resolved by database row order.  A
         # duplicate is observationally ambiguous and therefore close-incapable.
         if len(rows) != 1:
@@ -344,33 +498,93 @@ def claim_recovery_metadata(
                     _has_raw_partial_evidence(_claim_extra(item))
                     for item in rows
                 )
-                else {}
+                else {"claim_recovery_invalid": True}
             )
             continue
         row = rows[0]
-        extra = _claim_extra(row)
+        extra, extra_valid = _claim_extra_with_validity(row)
+        if not extra_valid:
+            recovered[symbol] = {"claim_recovery_invalid": True}
+            continue
+        ownership_flags = ("provisional", "adopted")
+        recovery_control_flags = (
+            "claim_release_pending",
+            "partial_sold",
+            "funding_booked_on_partials_known",
+            "entry_sizing_recovery_pending",
+            "entry_sizing_recovery_unverified",
+            "entry_funding_window_unverified",
+            "oversize_rollback_pending",
+        )
+        if any(
+            key in extra and not isinstance(extra[key], bool)
+            for key in ownership_flags + recovery_control_flags
+        ):
+            recovered[symbol] = {"claim_recovery_invalid": True}
+            continue
         metadata = {
-            key: extra[key] for key in allowed if key in extra
+            key: extra[key] for key in ownership_flags if key in extra
         }
+        quality_score = _entry_quality_score_or_none(
+            extra.get("entry_quality_score")
+        )
+        if quality_score is not None:
+            metadata["entry_quality_score"] = quality_score
+        quality_label = _entry_quality_label_or_none(
+            extra.get("entry_quality_label")
+        )
+        if quality_label is not None:
+            metadata["entry_quality_label"] = quality_label
+        quality_reasons = _entry_quality_reasons_or_none(
+            extra.get("entry_quality_reasons")
+        )
+        if quality_reasons is not None:
+            metadata["entry_quality_reasons"] = quality_reasons
         entry_id = _safe_entry_id(extra.get("entry_id"))
         if entry_id is not None:
             metadata["entry_id"] = entry_id
         if _has_raw_partial_evidence(extra):
             metadata["partial_claim_recovery_invalid"] = True
 
+        raw_state = row.get("state")
         state = (
-            row.get("state").strip().upper()
-            if isinstance(row.get("state"), str)
+            raw_state.strip().upper()
+            if isinstance(raw_state, str)
             else ""
         )
-        amount = _strict_nonnegative_float(row.get("amount"))
-        invested = _strict_nonnegative_float(row.get("invested_usdt"))
+        raw_amount = row.get("amount")
+        raw_invested = row.get("invested_usdt")
+        amount = _strict_nonnegative_float(raw_amount)
+        invested = _strict_nonnegative_float(raw_invested)
+        raw_claim_side = row.get("position_type")
         claim_side = (
-            row.get("position_type").strip().upper()
-            if isinstance(row.get("position_type"), str)
+            raw_claim_side.strip().upper()
+            if isinstance(raw_claim_side, str)
             else ""
         )
+        if (
+            "state" in row
+            and state not in {"OPEN", "CLAIMING", "ADOPTING"}
+        ) or (
+            "position_type" in row
+            and claim_side not in {"FUTURES", "LONG", "SHORT"}
+        ):
+            recovered[symbol] = {"claim_recovery_invalid": True}
+            continue
         release_pending = extra.get("claim_release_pending") is True
+        if (
+            raw_amount is not None
+            and amount is None
+        ) or (
+            raw_invested is not None
+            and invested is None
+        ):
+            recovered[symbol] = {"claim_recovery_invalid": True}
+            continue
+        if release_pending:
+            metadata["claim_release_pending"] = True
+            recovered[symbol] = metadata
+            continue
 
         # A claim mirrored from a durable partial update is the only remaining
         # restart source when the local JSON state is lost.  Restore the
@@ -429,6 +643,8 @@ def claim_recovery_metadata(
                         position_type=claim_side,
                         buy_price=partial_buy_price,
                         buy_time=partial_buy_time,
+                        original_amount=original_amount,
+                        current_amount=amount,
                     )
                 )
             if partial_bundle_valid and pending_valid and unpriced_valid:
@@ -559,33 +775,65 @@ def compare_position_layers(
     amount_tolerance: float = 0.05,
 ) -> dict[str, Any]:
     """Compare already-fetched position layers without making API calls."""
-    states = {_base_symbol(key): dict(value)
-              for key, value in state_rows.items() if _base_symbol(key)}
+    identity_issues: list[str] = []
+    states: dict[str, dict[str, Any]] = {}
+    duplicate_state_symbols: set[str] = set()
+    for index, (raw_symbol, value) in enumerate(state_rows.items()):
+        base = _base_symbol(raw_symbol)
+        if not base:
+            identity_issues.append(f"state_symbol_invalid:{index}")
+            continue
+        if not isinstance(value, Mapping):
+            identity_issues.append(f"state_row_invalid:{base}")
+            continue
+        if base in states:
+            duplicate_state_symbols.add(base)
+            continue
+        states[base] = dict(value)
     claims = None
     claim_count = 0
     duplicate_claim_symbols: set[str] = set()
     if claim_rows is not None:
         claim_count = len(claim_rows)
         claim_groups: dict[str, list[Mapping[str, Any]]] = {}
-        for row in claim_rows:
+        for index, row in enumerate(claim_rows):
+            if not isinstance(row, Mapping):
+                identity_issues.append(f"claim_row_invalid:{index}")
+                continue
             base = _base_symbol(row.get("symbol"))
             if base:
                 claim_groups.setdefault(base, []).append(row)
+            else:
+                identity_issues.append(f"claim_symbol_invalid:{index}")
         duplicate_claim_symbols = {
             base for base, rows in claim_groups.items() if len(rows) > 1
         }
         claims = {
             base: dict(rows[0]) for base, rows in claim_groups.items()
         }
-    exchange = {_base_symbol(key): dict(value)
-                for key, value in exchange_rows.items() if _base_symbol(key)}
+    exchange: dict[str, dict[str, Any]] = {}
+    duplicate_exchange_symbols: set[str] = set()
+    for index, (raw_symbol, value) in enumerate(exchange_rows.items()):
+        base = _base_symbol(raw_symbol)
+        if not base:
+            identity_issues.append(f"exchange_symbol_invalid:{index}")
+            continue
+        if not isinstance(value, Mapping):
+            identity_issues.append(f"exchange_row_invalid:{base}")
+            continue
+        if base in exchange:
+            duplicate_exchange_symbols.add(base)
+            continue
+        exchange[base] = dict(value)
 
     state_symbols = set(states)
     claim_symbols = set(claims or {})
     exchange_symbols = set(exchange)
-    money_issues: list[str] = []
+    money_issues: list[str] = list(identity_issues)
     metadata_issues: list[str] = []
 
+    for symbol in sorted(duplicate_state_symbols):
+        money_issues.append(f"duplicate_state_identity:{symbol}")
     if claims is not None:
         for symbol in sorted(duplicate_claim_symbols):
             money_issues.append(f"duplicate_claim_identity:{symbol}")
@@ -593,10 +841,21 @@ def compare_position_layers(
             money_issues.append(f"state_without_claim:{symbol}")
         for symbol in sorted(claim_symbols - state_symbols):
             money_issues.append(f"claim_without_state:{symbol}")
+    for symbol in sorted(duplicate_exchange_symbols):
+        money_issues.append(f"duplicate_exchange_identity:{symbol}")
     for symbol in sorted(state_symbols - exchange_symbols):
         money_issues.append(f"state_without_exchange:{symbol}")
     for symbol in sorted(exchange_symbols - state_symbols):
         money_issues.append(f"exchange_without_state:{symbol}")
+
+    state_directions: dict[str, str] = {}
+    for symbol in sorted(state_symbols):
+        raw_state_direction = states[symbol].get("position_type")
+        state_direction = _owned_direction(raw_state_direction)
+        if state_direction:
+            state_directions[symbol] = state_direction
+        elif "position_type" in states[symbol]:
+            money_issues.append(f"state_direction_invalid:{symbol}")
 
     for symbol in sorted(state_symbols & exchange_symbols):
         # Local state is canonical ownership evidence and must store an
@@ -613,15 +872,29 @@ def compare_position_layers(
                 state_amount, exchange_amount)
             if drift > max(0.0, amount_tolerance):
                 money_issues.append(f"amount_mismatch:{symbol}:{drift:.3f}")
-        state_direction = _direction(states[symbol].get("position_type"))
-        exchange_direction = _direction(exchange[symbol].get("direction"))
-        if state_direction and not exchange_direction:
+        state_direction = state_directions.get(symbol, "")
+        raw_exchange_direction = exchange[symbol].get("direction")
+        exchange_direction = _direction(raw_exchange_direction)
+        exchange_direction_invalid = bool(
+            exchange_direction
+            and exchange_direction not in {"LONG", "SHORT", "SPOT"}
+        )
+        if exchange_direction_invalid:
+            money_issues.append(f"exchange_direction_invalid:{symbol}")
+        if (
+            state_direction
+            and not exchange_direction
+            and not exchange_direction_invalid
+        ):
             money_issues.append(
                 f"exchange_direction_unavailable:{symbol}"
             )
-        elif (state_direction and exchange_direction
-                and state_direction != exchange_direction
-                and state_direction != "SPOT"):
+        elif (
+            state_direction
+            and exchange_direction
+            and not exchange_direction_invalid
+            and state_direction != exchange_direction
+        ):
             money_issues.append(
                 f"direction_mismatch:{symbol}:{state_direction}:"
                 f"{exchange_direction}")
@@ -630,21 +903,44 @@ def compare_position_layers(
         for symbol in sorted(state_symbols & claim_symbols):
             # Narrow synthetic/legacy callers may omit the projection entirely;
             # a present SQL amount column must always be valid evidence.
-            if "amount" not in claims[symbol]:
-                continue
-            raw_claim_amount = claims[symbol].get("amount")
-            state_amount = _strict_positive_float(states[symbol].get("amount"))
-            claim_amount = _strict_positive_float(raw_claim_amount)
-            if claim_amount is None:
-                money_issues.append(f"claim_amount_invalid:{symbol}")
-            elif state_amount is not None:
-                drift = abs(state_amount - claim_amount) / max(
-                    state_amount, claim_amount
+            if "state" in claims[symbol]:
+                raw_claim_state = claims[symbol].get("state")
+                claim_state = (
+                    raw_claim_state.strip().upper()
+                    if isinstance(raw_claim_state, str)
+                    else ""
                 )
-                if drift > max(0.0, amount_tolerance):
-                    money_issues.append(
-                        f"claim_amount_mismatch:{symbol}:{drift:.3f}"
+                if claim_state not in {"OPEN", "CLAIMING", "ADOPTING"}:
+                    money_issues.append(f"claim_state_invalid:{symbol}")
+            if "amount" in claims[symbol]:
+                raw_claim_amount = claims[symbol].get("amount")
+                state_amount = _strict_positive_float(
+                    states[symbol].get("amount")
+                )
+                claim_amount = _strict_positive_float(raw_claim_amount)
+                if claim_amount is None:
+                    money_issues.append(f"claim_amount_invalid:{symbol}")
+                elif state_amount is not None:
+                    drift = abs(state_amount - claim_amount) / max(
+                        state_amount, claim_amount
                     )
+                    if drift > max(0.0, amount_tolerance):
+                        money_issues.append(
+                            f"claim_amount_mismatch:{symbol}:{drift:.3f}"
+                        )
+            if "position_type" not in claims[symbol]:
+                continue
+            raw_claim_direction = claims[symbol].get("position_type")
+            claim_direction = _owned_direction(raw_claim_direction)
+            if not claim_direction:
+                money_issues.append(f"claim_direction_invalid:{symbol}")
+                continue
+            state_direction = state_directions.get(symbol)
+            if state_direction and claim_direction != state_direction:
+                money_issues.append(
+                    f"claim_direction_mismatch:{symbol}:{state_direction}:"
+                    f"{claim_direction}"
+                )
 
     state_entry_ids: dict[str, str] = {}
     entry_id_symbols: dict[str, set[str]] = {}
@@ -662,8 +958,25 @@ def compare_position_layers(
         else:
             state_entry_ids[symbol] = entry_id
             entry_id_symbols.setdefault(entry_id, set()).add(symbol)
-        if row.get("entry_quality_score") is None:
+        raw_quality_score = row.get("entry_quality_score")
+        if raw_quality_score is None:
             metadata_issues.append(f"state_missing_quality:{symbol}")
+        elif _entry_quality_score_or_none(raw_quality_score) is None:
+            metadata_issues.append(f"state_invalid_quality_score:{symbol}")
+        if (
+            "entry_quality_label" in row
+            and row.get("entry_quality_label") is not None
+            and _entry_quality_label_or_none(row.get("entry_quality_label"))
+            is None
+        ):
+            metadata_issues.append(f"state_invalid_quality_label:{symbol}")
+        if (
+            "entry_quality_reasons" in row
+            and row.get("entry_quality_reasons") is not None
+            and _entry_quality_reasons_or_none(row.get("entry_quality_reasons"))
+            is None
+        ):
+            metadata_issues.append(f"state_invalid_quality_reasons:{symbol}")
     if claims is not None:
         claim_entry_ids: dict[str, str] = {}
         for symbol, row in sorted(claims.items()):
@@ -684,8 +997,31 @@ def compare_position_layers(
             else:
                 claim_entry_ids[symbol] = entry_id
                 entry_id_symbols.setdefault(entry_id, set()).add(symbol)
-            if extra.get("entry_quality_score") is None:
+            raw_quality_score = extra.get("entry_quality_score")
+            if raw_quality_score is None:
                 metadata_issues.append(f"claim_missing_quality:{symbol}")
+            elif _entry_quality_score_or_none(raw_quality_score) is None:
+                metadata_issues.append(f"claim_invalid_quality_score:{symbol}")
+            if (
+                "entry_quality_label" in extra
+                and extra.get("entry_quality_label") is not None
+                and _entry_quality_label_or_none(
+                    extra.get("entry_quality_label")
+                ) is None
+            ):
+                metadata_issues.append(
+                    f"claim_invalid_quality_label:{symbol}"
+                )
+            if (
+                "entry_quality_reasons" in extra
+                and extra.get("entry_quality_reasons") is not None
+                and _entry_quality_reasons_or_none(
+                    extra.get("entry_quality_reasons")
+                ) is None
+            ):
+                metadata_issues.append(
+                    f"claim_invalid_quality_reasons:{symbol}"
+                )
         for symbol in sorted(state_symbols & claim_symbols):
             state_entry_id = state_entry_ids.get(symbol)
             claim_entry_id = claim_entry_ids.get(symbol)
@@ -843,6 +1179,8 @@ def _state_entry_ids_or_none(
 def runtime_observability_snapshot(
     *, state_rows: Mapping[str, Mapping[str, Any]] | None = None,
     ticker_cache: Any = None,
+    bot_name: str | None = None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     state_entry_ids = _state_entry_ids_or_none(state_rows)
     try:
@@ -854,7 +1192,102 @@ def runtime_observability_snapshot(
         ticker = ticker_cache.stats() if ticker_cache is not None else {}
     except Exception:
         ticker = {}
-    return {"entry_lifecycle_health": lifecycle, "ticker_cache": ticker}
+    snapshot = {
+        "entry_lifecycle_health": lifecycle,
+        "ticker_cache": ticker,
+    }
+    normalized_bot = (
+        bot_name.strip().upper() if isinstance(bot_name, str) else ""
+    )
+    normalized_mode = mode.strip().upper() if isinstance(mode, str) else ""
+    if normalized_mode == "LIVE" and normalized_bot in {
+        "SPOT", "TREND", "FUTURES", "CROSS", "FUTREND",
+    }:
+        from core.database import portfolio_reservation_health_snapshot
+
+        account_type = (
+            "spot" if normalized_bot in {"SPOT", "TREND"} else "futures"
+        )
+        snapshot["portfolio_reservation_health"] = (
+            portfolio_reservation_health_snapshot(account_type)
+        )
+    return snapshot
+
+
+def guarded_runtime_observability(
+    *,
+    log_snapshot: bool,
+    bot_name: str,
+    mode: str,
+    state_rows: Mapping[str, Mapping[str, Any]] | None = None,
+    ticker_cache: Any = None,
+) -> tuple[dict[str, Any], dict[str, Any], Exception | None]:
+    """Return an owned snapshot plus fail-closed health for optional telemetry."""
+    try:
+        if log_snapshot:
+            snapshot = log_runtime_observability(
+                bot_name=bot_name,
+                mode=mode,
+                state_rows=state_rows,
+                ticker_cache=ticker_cache,
+            )
+        else:
+            snapshot = runtime_observability_snapshot(
+                state_rows=state_rows,
+                ticker_cache=ticker_cache,
+                bot_name=bot_name,
+                mode=mode,
+            )
+    except Exception as exc:
+        return {}, {
+            "ok": False,
+            "component": "runtime_observability",
+            "state": "unavailable",
+            "reason": "observability_collection_failed",
+            "error_type": type(exc).__name__,
+        }, exc
+    if not isinstance(snapshot, dict):
+        exc = ValueError("invalid_observability_payload")
+        return {}, {
+            "ok": False,
+            "component": "runtime_observability",
+            "state": "invalid",
+            "reason": "invalid_observability_payload",
+            "error_type": "invalid_observability_payload",
+        }, exc
+    try:
+        owned = copy.deepcopy(snapshot)
+    except Exception as exc:
+        return {}, {
+            "ok": False,
+            "component": "runtime_observability",
+            "state": "unavailable",
+            "reason": "observability_snapshot_failed",
+            "error_type": type(exc).__name__,
+        }, exc
+    if not isinstance(owned, dict):
+        exc = ValueError("invalid_observability_payload")
+        return {}, {
+            "ok": False,
+            "component": "runtime_observability",
+            "state": "invalid",
+            "reason": "invalid_observability_payload",
+            "error_type": "invalid_observability_payload",
+        }, exc
+    reservation_health = owned.get("portfolio_reservation_health")
+    if reservation_health is not None:
+        if not isinstance(reservation_health, dict):
+            exc = ValueError("invalid_portfolio_reservation_health")
+            return owned, {
+                "ok": False,
+                "component": "portfolio_reservations",
+                "state": "invalid",
+                "reason": "invalid_health_payload",
+                "error_type": "invalid_health_payload",
+            }, exc
+        if reservation_health.get("ok") is not True:
+            return owned, copy.deepcopy(reservation_health), None
+    return owned, {}, None
 
 
 def _bounded_nonnegative_int(value: Any) -> int:
@@ -945,13 +1378,23 @@ def position_integrity_runtime_snapshot(
     )
     interval = _strict_nonnegative_float(reconcile_interval_seconds)
     stale_after = max(30.0, 2.0 * (interval or 0.0) + 15.0)
-    snapshot = dict(health) if isinstance(health, Mapping) else {}
+    snapshot = copy.deepcopy(dict(health)) if isinstance(health, Mapping) else {}
     last_check = _strict_nonnegative_float(snapshot.get("last_check_monotonic"))
     if not snapshot or last_check is None:
         started = _strict_nonnegative_float(started_monotonic)
         if started is None or now is None:
             return {}
-        startup_age = max(0.0, now - started)
+        startup_age = now - started
+        if startup_age < 0.0:
+            return {
+                "ok": False,
+                "runtime_ok": False,
+                "component": "position_integrity",
+                "state": "invalid",
+                "reason": "position_integrity_timestamp_invalid",
+                "startup_age_seconds": None,
+                "stale_after_seconds": stale_after,
+            }
         return {
             "ok": False,
             "runtime_ok": False,
@@ -961,7 +1404,17 @@ def position_integrity_runtime_snapshot(
             "startup_age_seconds": startup_age,
             "stale_after_seconds": stale_after,
         }
-    check_age = 0.0 if now is None else max(0.0, now - last_check)
+    if now is not None and last_check > now:
+        snapshot.update({
+            "ok": False,
+            "runtime_ok": False,
+            "state": "invalid",
+            "reason": "position_integrity_timestamp_invalid",
+            "check_age_seconds": None,
+            "stale_after_seconds": stale_after,
+        })
+        return snapshot
+    check_age = 0.0 if now is None else now - last_check
     stale = now is None or check_age > stale_after
     snapshot.update({
         "check_age_seconds": check_age,
@@ -1020,6 +1473,21 @@ def _runtime_observability_fingerprint(
             )
             > 0,
         )
+    reservation_health = snapshot.get("portfolio_reservation_health")
+    if not isinstance(reservation_health, Mapping):
+        reservation_state: tuple[Any, ...] = ()
+    else:
+        reservation_state = (
+            reservation_health.get("ok") is True,
+            str(reservation_health.get("state") or "")[:64],
+            str(reservation_health.get("reason") or "")[:96],
+            _bounded_nonnegative_int(
+                reservation_health.get("tracked_count")
+            ),
+            _bounded_nonnegative_int(
+                reservation_health.get("overdue_active_count")
+            ),
+        )
     return (
         lifecycle.get("available") is True,
         anomalies,
@@ -1027,6 +1495,7 @@ def _runtime_observability_fingerprint(
         _bounded_nonnegative_int(lifecycle.get("pending_candidates")),
         _bounded_nonnegative_int(lifecycle.get("tracked_entries")),
         ticker_state,
+        reservation_state,
     )
 
 
@@ -1039,7 +1508,11 @@ def log_runtime_observability(
     """Emit aggregate telemetry and rate-limited lifecycle warnings."""
     global _last_watchdog_fingerprint, _last_watchdog_log_at
     snapshot = runtime_observability_snapshot(
-        state_rows=state_rows, ticker_cache=ticker_cache)
+        state_rows=state_rows,
+        ticker_cache=ticker_cache,
+        bot_name=bot_name,
+        mode=mode,
+    )
     lifecycle = snapshot.get("entry_lifecycle_health") or {}
     anomalies = _bounded_issue_fingerprint(lifecycle.get("anomalies"))
     decision = _structured_state_decision(

@@ -73,7 +73,158 @@ Do NOT output any text outside the JSON.
 
 #  Self-healing helper (called by launcher.pyw)
 import os as _os  # noqa: E402 - kept beside the self-healing helper
+import stat as _stat  # noqa: E402
 import tempfile as _tempfile  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+from bot_utils.atomic_publish import _sync_directory as _sync_prompt_directory  # noqa: E402
+
+
+_PROMPT_PROJECT_ROOT = _Path(__file__).resolve().parent.parent
+
+
+def _sync_prompt_parent_chain(directory: _Path) -> None:
+    """Persist a newly created project-local prompt directory ancestry."""
+    directory = directory.absolute()
+    try:
+        directory.relative_to(_PROMPT_PROJECT_ROOT)
+    except ValueError:
+        # Non-production callers still receive a useful leaf-parent barrier
+        # without attempting to flush an unrelated filesystem root.
+        anchor = directory.parent
+    else:
+        anchor = _PROMPT_PROJECT_ROOT
+    current = directory
+    while True:
+        _sync_prompt_directory(current)
+        if current == anchor:
+            return
+        parent = current.parent
+        if parent == current:
+            raise RuntimeError("prompt durability anchor is unreachable")
+        current = parent
+
+
+def _note_default_cleanup_error(
+    primary: BaseException,
+    cleanup_error: BaseException,
+) -> None:
+    try:
+        primary.add_note(
+            "default prompt temporary cleanup failed: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+    except BaseException:
+        pass
+
+
+def _default_target_matches(path: str, raw: bytes) -> bool:
+    try:
+        current = _os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if (
+        not _stat.S_ISREG(current.st_mode)
+        or _os.path.islink(path)
+        or current.st_size != len(raw)
+    ):
+        return False
+    with open(path, "rb") as handle:
+        return handle.read(len(raw) + 1) == raw
+
+
+def _durable_create_default(path: str, content: str) -> bool:
+    """Create one default without overwriting users or trusting stale temps."""
+    raw = content.encode("utf-8")
+    directory = _Path(_os.path.dirname(path) or ".").absolute()
+    if _os.path.lexists(path):
+        if _default_target_matches(path, raw):
+            # A prior link may have become visible before its barrier failed.
+            # Retrying the self-heal must be able to confirm that entry.
+            _sync_prompt_directory(directory)
+        return False
+
+    fd, temporary = _tempfile.mkstemp(
+        prefix=f".{_os.path.basename(path)}.",
+        suffix=".tmp",
+        dir=str(directory),
+    )
+    fd_owned = True
+    temporary_owned = True
+    temporary_identity: tuple[int, int] | None = None
+    primary_error: BaseException | None = None
+    try:
+        temporary_stat = _os.fstat(fd)
+        if not _stat.S_ISREG(temporary_stat.st_mode):
+            raise OSError("default prompt temporary is not a regular file")
+        temporary_identity = (
+            temporary_stat.st_dev,
+            temporary_stat.st_ino,
+        )
+        handle = None
+        write_primary: BaseException | None = None
+        try:
+            handle = _os.fdopen(fd, "wb")
+            fd_owned = False
+            handle.write(raw)
+            handle.flush()
+            _os.fsync(handle.fileno())
+        except BaseException as exc:
+            write_primary = exc
+            raise
+        finally:
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException as close_error:
+                    if write_primary is None:
+                        raise
+                    _note_default_cleanup_error(write_primary, close_error)
+        try:
+            _os.link(temporary, path)
+        except FileExistsError:
+            if _default_target_matches(path, raw):
+                _sync_prompt_directory(directory)
+            return False
+        _sync_prompt_directory(directory)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        cleanup_error: BaseException | None = None
+        if fd_owned:
+            try:
+                _os.close(fd)
+            except BaseException as exc:
+                cleanup_error = exc
+        same_generation = False
+        if temporary_owned and temporary_identity is not None:
+            try:
+                current = _os.stat(temporary, follow_symlinks=False)
+                same_generation = (
+                    _stat.S_ISREG(current.st_mode)
+                    and not _os.path.islink(temporary)
+                    and (current.st_dev, current.st_ino)
+                    == temporary_identity
+                )
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+        if same_generation:
+            try:
+                _os.unlink(temporary)
+                temporary_owned = False
+                _sync_prompt_directory(directory)
+            except FileNotFoundError:
+                temporary_owned = False
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+        if cleanup_error is not None:
+            if primary_error is None:
+                raise cleanup_error
+            _note_default_cleanup_error(primary_error, cleanup_error)
+    return True
 
 
 def write_all_defaults(prompts_dir: str) -> list:
@@ -89,7 +240,14 @@ def write_all_defaults(prompts_dir: str) -> list:
     edits. Returns a list of the filenames that were actually written
     (empty if everything was already in place).
     """
-    _os.makedirs(prompts_dir, exist_ok=True)
+    try:
+        _os.makedirs(prompts_dir, exist_ok=True)
+        # Run on every invocation, not only immediately after mkdir: an
+        # earlier process may have made directory entries visible but failed
+        # before their parent barriers completed.
+        _sync_prompt_parent_chain(_Path(prompts_dir))
+    except Exception:
+        return []
     targets = {
         "spot.txt": SPOT_DEFAULT,
         "spot_default.txt": SPOT_DEFAULT,
@@ -99,34 +257,11 @@ def write_all_defaults(prompts_dir: str) -> list:
     written = []
     for fname, content in targets.items():
         path = _os.path.join(prompts_dir, fname)
-        if _os.path.exists(path):
-            continue
-        tmp = ""
         try:
-            fd, tmp = _tempfile.mkstemp(
-                prefix=f"{fname}.tmp.",
-                dir=prompts_dir,
-            )
-            with _os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(content)
-                f.flush()
-                try:
-                    _os.fsync(f.fileno())
-                except (AttributeError, OSError):
-                    pass
-            # Hard-link commit is atomic and create-only: unlike replace(),
-            # it cannot overwrite a user prompt that appeared after the
-            # exists check. Removing tmp afterwards leaves the target intact.
-            _os.link(tmp, path)
-            written.append(fname)
+            if _durable_create_default(path, content):
+                written.append(fname)
         except Exception:
             # Best-effort: skip files we cant write (permissions, disk full)
             # rather than raising up to the launcher.
             continue
-        finally:
-            if tmp:
-                try:
-                    _os.remove(tmp)
-                except OSError:
-                    pass
     return written

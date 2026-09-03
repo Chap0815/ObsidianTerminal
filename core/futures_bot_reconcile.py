@@ -9,6 +9,7 @@ Two reconciliation paths:
 """
 from __future__ import annotations
 
+import json
 import math
 import time
 from datetime import datetime, timezone
@@ -140,11 +141,22 @@ def _offline_accounting_retry_due(
     )
     if retry_at is None:
         return True
-    current = time.time() if now_epoch is None else float(now_epoch)
+    current = _finite_float_or_none(
+        time.time() if now_epoch is None else now_epoch
+    )
+    if current is None:
+        return True
+    # Persisted deadlines are bounded by the writer's maximum backoff.  A
+    # farther future value can only come from clock rollback or corrupt state;
+    # never let it suppress idempotent accounting recovery indefinitely.
+    if retry_at > current + _OFFLINE_ACCOUNTING_RETRY_MAX_SEC:
+        return True
     return current >= retry_at
 
 
 def _defer_offline_accounting_retry(bot, sym: str, row: dict) -> float:
+    from bot_utils.trade_state import update_many_if_current
+
     attempts_raw = row.get("accounting_retry_attempts", 0)
     try:
         attempts = max(0, int(attempts_raw)) + 1
@@ -156,12 +168,14 @@ def _defer_offline_accounting_retry(bot, sym: str, row: dict) -> float:
     )
     retry_at = time.time() + delay
     try:
-        bot.state.update_many(
+        update_many_if_current(
+            bot.state,
             sym,
             {
                 "accounting_retry_attempts": attempts,
                 "accounting_retry_next_at": retry_at,
             },
+            row,
         )
     except Exception:
         pass
@@ -794,7 +808,8 @@ def _persist_futures_external_partial_state(
     from core.logger import log_event
 
     try:
-        durable = bool(bot.state.update_many(sym, fields))
+        persisted = bot.state.update_many(sym, fields)
+        durable = persisted is None or persisted is True
     except Exception as exc:
         durable = False
         try:
@@ -811,15 +826,16 @@ def _persist_futures_external_partial_state(
 
 
 def _is_fresh_position(state_row: dict, max_age_s: float) -> bool:
+    """Block partial drift adjustment while age is fresh or unknowable."""
     bt = state_row.get("buy_time", "")
     if not bt:
-        return False
+        return True
     from datetime import datetime, timezone
     try:
         opened = datetime.strptime(str(bt), "%Y-%m-%d %H:%M:%S").replace(
             tzinfo=timezone.utc)
     except (TypeError, ValueError):
-        return False
+        return True
     try:
         from core.clock import now_utc
 
@@ -1065,7 +1081,7 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
     if not _persist_futures_external_partial_state(bot, sym, fields):
         return False, fields
     try:
-        saved = bool(save_trade_db(**item))
+        saved = save_trade_db(**item) is True
     except Exception as exc:
         saved = False
         try:
@@ -1074,11 +1090,12 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
             pass
     if saved:
         try:
-            cleared = bool(bot.state.update(
+            clear_result = bot.state.update(
                 sym,
                 "accounting_pending_partials",
                 pending[:-1],
-            ))
+            )
+            cleared = clear_result is None or clear_result is True
         except Exception as exc:
             cleared = False
             try:
@@ -1154,13 +1171,28 @@ def _row_with_unpriced_futures_partials(state_row: dict) -> dict:
 class FuturesReconcileMixin:
 
     def _store_entry_recovery_health(self, health: dict, blocked: bool) -> None:
-        snapshot = dict(health) if isinstance(health, dict) else {
+        invalid_snapshot = {
             "ok": False,
             "component": "entry_recovery",
             "state": "blocked",
             "reason": "invalid_health_payload",
             "unresolved_count": 1,
         }
+        if isinstance(health, dict):
+            try:
+                encoded = json.dumps(
+                    dict(health),
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if len(encoded.encode("utf-8")) > 64 * 1024:
+                    raise ValueError("entry recovery health payload is oversized")
+                snapshot = json.loads(encoded)
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                snapshot = invalid_snapshot
+        else:
+            snapshot = invalid_snapshot
         lock = getattr(self, "_entry_recovery_lock", None)
         if lock is None:
             self._entry_recovery_health = snapshot
@@ -1320,6 +1352,7 @@ class FuturesReconcileMixin:
                     record_order_intent_recovery_evidence(
                         row["intent_id"],
                         bot_name=self.BOT_NAME,
+                        expected_attempt_count=row["recovery_attempt_count"],
                         evidence_state=item["evidence_state"],
                         sources=item.get("sources"),
                         budget_denied=item.get("budget_denied") is True,
@@ -1356,6 +1389,7 @@ class FuturesReconcileMixin:
                     record_order_intent_recovery_evidence(
                         row["intent_id"],
                         bot_name=self.BOT_NAME,
+                        expected_attempt_count=row["recovery_attempt_count"],
                         evidence_state="attempt_error",
                         sources={},
                     )
@@ -1437,7 +1471,9 @@ class FuturesReconcileMixin:
                 ):
                     continue
                 if finalize_qualified_zero_fill_order_intent(
-                    item["intent_id"], bot_name=self.BOT_NAME
+                    item["intent_id"],
+                    bot_name=self.BOT_NAME,
+                    expected_attempt_count=item["recovery_attempt_count"],
                 ):
                     finalized += 1
             health = order_intent_recovery_health(
@@ -1925,14 +1961,6 @@ class FuturesReconcileMixin:
                             f"for retry",
                             "WARN")
                         continue
-                    if live_row.get("verified_flat_pending_accounting"):
-                        log_event(
-                            f" Reconciliation: {sym} has a verified-flat "
-                            f"fill gap pending exact accounting; state kept "
-                            f"for recovery",
-                            "ERROR",
-                        )
-                        continue
                     close_row = (
                         _row_with_unpriced_futures_partials(live_row)
                         if live_row.get("unpriced_external_partials")
@@ -1963,7 +1991,19 @@ class FuturesReconcileMixin:
                         f"or liquidated while bot was offline)",
                         "WARN"
                     )
-                    booked_row = dict(close_row)
+                    from bot_utils.trade_state import same_position_generation
+                    latest_row = self.state.get(sym)
+                    if latest_row is None:
+                        strikes.pop(sym, None)
+                        continue
+                    if not same_position_generation(latest_row, close_row):
+                        log_event(
+                            f" Reconciliation: {sym} generation changed after "
+                            "close accounting; replacement state kept",
+                            "ERROR",
+                        )
+                        continue
+                    booked_row = dict(latest_row)
                     booked_row.update({
                         "accounting_already_booked": True,
                         "accounting_booked_reason": "Offline reconcile",
@@ -2001,8 +2041,13 @@ class FuturesReconcileMixin:
                     claim_recovery_metadata)
                 own_claim_metadata = claim_recovery_metadata(
                     get_open_positions_db(self.BOT_NAME))
-            except Exception:
-                pass
+            except Exception as claim_metadata_exc:
+                self._log_error(
+                    "read futures orphan claim metadata",
+                    claim_metadata_exc,
+                )
+                claim_registry_verified = False
+                orphan_syms = set()
             if orphan_syms:
                 try:
                     from core.database import get_all_claimed_bases, _base_symbol
@@ -2048,6 +2093,20 @@ class FuturesReconcileMixin:
             except Exception:
                 def try_claim_orphan(*a, **k): return False
                 def remove_open_position(*a, **k): return None
+
+            def release_orphan_claim(base, reason):
+                try:
+                    released = remove_open_position(self.BOT_NAME, base)
+                    if released is not True:
+                        raise RuntimeError(
+                            "remove_open_position did not return True"
+                        )
+                except Exception as release_exc:
+                    self._log_error(
+                        f"futures release {reason} orphan claim {base}",
+                        release_exc,
+                    )
+
             for base in sorted(orphan_syms):
                 # ATOMIC claim: SQLite serialises INSERTWHERE NOT EXISTS, so when
                 # BOTH bots' reconciles race to adopt the same orphan, exactly ONE
@@ -2055,7 +2114,7 @@ class FuturesReconcileMixin:
                 # (Whichever bot wins manages it safely; ownership info is lost
                 # once the state desynced, so first-come is the best we can do 
                 # the alternative, leaving it unmanaged, is worse.)
-                if not try_claim_orphan(self.BOT_NAME, base):
+                if try_claim_orphan(self.BOT_NAME, base) is not True:
                     continue
                 p = exchange_open.get(base) or {}
                 info = p.get("info") if isinstance(p.get("info"), dict) else {}
@@ -2100,7 +2159,7 @@ class FuturesReconcileMixin:
                 if entry <= 0 or contracts <= 0 or side not in ("LONG", "SHORT"):
                     # Won the claim but can't adopt safely  RELEASE it so the
                     # coin isn't blocked-but-unmanaged.
-                    remove_open_position(self.BOT_NAME, base)
+                    release_orphan_claim(base, "invalid")
                     unadoptable.append(base)
                     continue
                 full = f"{base}/USDT:USDT"
@@ -2110,6 +2169,22 @@ class FuturesReconcileMixin:
                     cs = 1.0
                 pos_type = side
                 recovered_metadata = dict(own_claim_metadata.get(base, {}))
+                if recovered_metadata.get("claim_release_pending") is True:
+                    log_event(
+                        f" Reconciliation: {base} claim release is pending; "
+                        "adoption deferred",
+                        "ERROR",
+                    )
+                    unadoptable.append(base)
+                    continue
+                if recovered_metadata.get("claim_recovery_invalid") is True:
+                    log_event(
+                        f" Reconciliation: {base} claim recovery metadata "
+                        "is invalid; adoption deferred",
+                        "ERROR",
+                    )
+                    unadoptable.append(base)
+                    continue
                 if recovered_metadata.get(
                     "partial_claim_recovery_invalid"
                 ) is True:
@@ -2479,6 +2554,7 @@ class FuturesReconcileMixin:
                     initial_liq_distance = 0.0
                 if initial_liq_distance <= 0:
                     initial_liq_distance = max(1.0, 100.0 / max(1.0, lev))
+                adopted_state = None
                 try:
                     adopted_state = {
                         "position_type": pos_type, "buy": entry, "highest": entry,
@@ -2501,45 +2577,94 @@ class FuturesReconcileMixin:
                         adopted_state["initial_entry_fee"] = entry_fee
                         adopted_state["fees_paid"] = entry_fee
                     adopted_state["adopted"] = True
-                    added = self.state.add(base, adopted_state)
+                    from bot_utils.trade_state import add_position_if_absent
+
+                    added = add_position_if_absent(
+                        self.state, base, adopted_state
+                    )
+                    if added is None:
+                        log_event(
+                            f" Reconciliation: {base} adoption was "
+                            "superseded by current local state; replacement "
+                            "retained",
+                            "WARN",
+                        )
+                        continue
                     if added is False:
-                        if self.state.has(base):
-                            try:
-                                self.state.update_many(base, {
-                                    "claim_registry_pending": True,
-                                    "claim_registry_pending_reason": (
-                                        "adoption state.add returned False"),
-                                    "adopted": True,
-                                })
-                            except Exception as state_exc:
-                                self._log_error(
-                                    f"mark adopted claim pending {base}",
-                                    state_exc)
-                            adopted.append(base)
+                        from bot_utils.trade_state import (
+                            promote_position_generation,
+                        )
+
+                        pending_fields = {
+                            "claim_registry_pending": True,
+                            "claim_registry_pending_reason": (
+                                "adoption state.add returned False"
+                            ),
+                            "adopted": True,
+                        }
+                        pending_row = dict(adopted_state)
+                        pending_row.update(pending_fields)
+                        pending = promote_position_generation(
+                            self.state,
+                            base,
+                            pending_fields,
+                            adopted_state,
+                            create_fields=pending_row,
+                        )
+                        if pending is None:
+                            log_event(
+                                f" Reconciliation: {base} adoption state "
+                                "failure was superseded; replacement retained",
+                                "WARN",
+                            )
                             continue
-                        raise RuntimeError("state.add returned False")
+                        if pending is False:
+                            raise RuntimeError("state.add returned False")
                     adopted.append(base)
                 except Exception as _ae:
-                    if self.state.has(base):
+                    recovered = None
+                    if isinstance(adopted_state, dict):
                         try:
-                            self.state.update_many(base, {
+                            from bot_utils.trade_state import (
+                                promote_position_generation,
+                            )
+
+                            pending_fields = {
                                 "claim_registry_pending": True,
                                 "claim_registry_pending_reason": (
-                                    "adoption state write raised after state mutation"),
+                                    "adoption state write raised after state mutation"
+                                ),
                                 "adopted": True,
-                            })
+                            }
+                            pending_row = dict(adopted_state)
+                            pending_row.update(pending_fields)
+                            recovered = promote_position_generation(
+                                self.state,
+                                base,
+                                pending_fields,
+                                adopted_state,
+                                create_fields=pending_row,
+                            )
                         except Exception as state_exc:
                             self._log_error(
                                 f"mark adopted claim pending {base}",
-                                state_exc)
+                                state_exc,
+                            )
+                    if recovered is True:
                         adopted.append(base)
                         self._log_error(f"adopt orphan {base}", _ae)
                         continue
+                    if self.state.has(base):
+                        log_event(
+                            f" Reconciliation: {base} adoption failed after "
+                            "local state appeared; current generation retained",
+                            "WARN",
+                        )
+                        self._log_error(f"adopt orphan {base}", _ae)
+                        continue
                     if not retain_claim_on_state_failure:
-                        remove_open_position(
-                            self.BOT_NAME,
-                            base,
-                        )  # release only an unproven generic orphan claim
+                        # Release only an unproven generic orphan claim.
+                        release_orphan_claim(base, "failed adoption")
                     self._log_error(f"adopt orphan {base}", _ae)
                     unadoptable.append(base)
 
@@ -2684,13 +2809,23 @@ class FuturesReconcileMixin:
         from bot_utils.futures_order import FUTURES_DEFAULT_TAKER_FEE
 
         try:
-            if state_row.get("verified_flat_pending_accounting"):
+            from bot_utils.trade_state import (
+                validated_close_accounting_mode_or_none,
+            )
+            accounting_mode_is_sim = validated_close_accounting_mode_or_none(
+                state_row,
+                getattr(self, "simulation", None),
+            )
+            if accounting_mode_is_sim is None:
                 log_event(
-                    f" {sym}: offline-close record skipped because exact "
-                    f"verified-flat fill accounting is pending",
+                    f" {sym}: offline-close skipped - accounting mode "
+                    "conflicts with runtime",
                     "ERROR",
                 )
                 return False
+            verified_flat_pending = (
+                state_row.get("verified_flat_pending_accounting") is True
+            )
             entry = _positive_float_or_none(state_row.get("buy"))
             amount = _positive_abs_float_or_none(state_row.get("amount"))
             pos_type = state_row.get("position_type", "LONG")
@@ -2809,7 +2944,7 @@ class FuturesReconcileMixin:
 
             if close_price <= 0:
                 # Last-ditch: assume liquidation if liq price was set
-                if liq_price > 0:
+                if liq_price > 0 and not verified_flat_pending:
                     close_price = liq_price
                     close_source = "liquidation_price"
                 else:
@@ -2923,10 +3058,6 @@ class FuturesReconcileMixin:
                     f"non-finite accounting value", "WARN")
                 return False
 
-            accounting_mode_is_sim = state_row.get(
-                "accounting_pending_mode_is_sim",
-                getattr(self, "simulation", None),
-            )
             accounting_exchange_order_id = state_row.get(
                 "accounting_pending_exchange_order_id"
             )
@@ -3010,7 +3141,7 @@ class FuturesReconcileMixin:
                 entry_quality_reasons=entry_quality_reasons,
                 entry_id=state_row.get("entry_id"),
             )
-            if not saved:
+            if saved is not True:
                 retry_delay = _defer_offline_accounting_retry(
                     self, sym, state_row
                 )

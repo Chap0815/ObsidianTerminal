@@ -5,7 +5,6 @@ import hashlib
 import json
 import math
 import os
-import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -13,6 +12,8 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Mapping
 
+from bot_utils.atomic_publish import atomic_create_bytes, atomic_write_bytes
+from bot_utils.atomic_publish import _sync_directory as _sync_status_directory
 from core.paths import PROJECT_ROOT
 
 
@@ -26,6 +27,10 @@ _STATUS_MAX_KEY_CHARS = 256
 _STATUS_LOCK_TIMEOUT_SEC = 1.0
 _STATUS_LOCK_CHECK_SEC = 0.01
 _STATUS_TEMP_CLEANUP_MAX_FILES = 512
+_STATUS_TEMP_CLEANUP_MAX_SCAN_SEC = 0.5
+_STATUS_TEMP_CLEANUP_MAX_ERRORS = 16
+_STATUS_PUBLISH_SEQUENCE_MAX = (1 << 63) - 1
+_STATUS_PUBLISH_COUNTER_MAX_BYTES = 32
 _CLOCK_OFFSET_MAX_AGE_SECONDS = 6.0 * 60.0 * 60.0
 _BUILD_ID_CHARS = 16
 _BUILD_CREATED_AT_MAX_CHARS = 128
@@ -55,7 +60,7 @@ def _runtime_status_path_lock(path: Path):
             check_interval=_STATUS_LOCK_CHECK_SEC,
             flags=portalocker.LOCK_EX | portalocker.LOCK_NB,
         )
-        lock.acquire()
+        handle = lock.acquire()
     except Exception as exc:
         if lock is not None:
             try:
@@ -68,7 +73,7 @@ def _runtime_status_path_lock(path: Path):
         yield False
         return
     try:
-        yield True
+        yield handle
     finally:
         try:
             lock.release()
@@ -247,22 +252,29 @@ def cleanup_runtime_status_temps(logs_root: str | os.PathLike[str] | None = None
     root = Path(logs_root) if logs_root is not None else PROJECT_ROOT / "logs"
     cutoff = time.time() - max(0.0, float(min_age_sec))
     removed = 0
+    logged_errors = 0
     try:
-        candidates = islice(
-            root.glob("*/runtime_status*.tmp"),
-            _STATUS_TEMP_CLEANUP_MAX_FILES,
-        )
+        deadline = time.monotonic() + _STATUS_TEMP_CLEANUP_MAX_SCAN_SEC
+        candidates = root.glob("*/runtime_status*.tmp")
         for path in candidates:
+            if time.monotonic() >= deadline:
+                break
             try:
                 if path.stat().st_mtime > cutoff:
                     continue
                 path.unlink()
                 removed += 1
+                if removed >= _STATUS_TEMP_CLEANUP_MAX_FILES:
+                    break
             except Exception as exc:
-                _log_status_write_failure(
-                    f"cleanup_runtime_status_temps({path})", exc
-                )
-    except Exception:
+                if logged_errors < _STATUS_TEMP_CLEANUP_MAX_ERRORS:
+                    _log_status_write_failure(
+                        f"cleanup_runtime_status_temps({path})", exc
+                    )
+                    logged_errors += 1
+    except Exception as exc:
+        if logged_errors < _STATUS_TEMP_CLEANUP_MAX_ERRORS:
+            _log_status_write_failure("cleanup_runtime_status_temps scan", exc)
         return removed
     return removed
 
@@ -292,6 +304,54 @@ def _status_freshness(data: Mapping[str, Any]) -> float:
     if rejected_wall_timestamp:
         return 0.0
     return _positive_finite_timestamp(data.get("monotonic_ts")) or 0.0
+
+
+def _status_publish_sequence(data: Mapping[str, Any]) -> int:
+    raw = data.get("publish_seq")
+    if (
+        isinstance(raw, bool)
+        or not isinstance(raw, int)
+        or raw <= 0
+        or raw > _STATUS_PUBLISH_SEQUENCE_MAX
+    ):
+        return 0
+    return raw
+
+
+def _next_status_publish_sequence(path: Path, lock_handle: Any) -> int:
+    """Reserve one durable generation while the path publish lock is held."""
+    fallback = path.with_name("runtime_status.fallback.json")
+    highest = max(
+        _status_publish_sequence(_read_json(path)),
+        _status_publish_sequence(_read_json(fallback)),
+    )
+    file_methods = ("seek", "read", "truncate", "write", "flush", "fileno")
+    if all(callable(getattr(lock_handle, name, None)) for name in file_methods):
+        lock_handle.seek(0)
+        raw = lock_handle.read(_STATUS_PUBLISH_COUNTER_MAX_BYTES + 1)
+        if isinstance(raw, str):
+            raw = raw.encode("ascii", errors="ignore")
+        if len(raw) <= _STATUS_PUBLISH_COUNTER_MAX_BYTES:
+            try:
+                text = raw.decode("ascii")
+                if text and text.isdigit():
+                    counter = int(text)
+                    if 0 <= counter <= _STATUS_PUBLISH_SEQUENCE_MAX:
+                        highest = max(highest, counter)
+            except (AttributeError, UnicodeError, ValueError, OverflowError):
+                pass
+    if highest >= _STATUS_PUBLISH_SEQUENCE_MAX:
+        raise OverflowError("runtime status publish sequence exhausted")
+    sequence = highest + 1
+    if all(callable(getattr(lock_handle, name, None)) for name in file_methods):
+        encoded = str(sequence).encode("ascii")
+        lock_handle.seek(0)
+        lock_handle.truncate(0)
+        lock_handle.seek(0)
+        lock_handle.write(encoded)
+        lock_handle.flush()
+        os.fsync(lock_handle.fileno())
+    return sequence
 
 
 def _positive_finite_timestamp(raw: Any) -> float | None:
@@ -358,47 +418,24 @@ def _strict_json_value(value: Any, *, depth: int = 0) -> Any:
 
 def _write_fallback_status(path: Path, payload: Mapping[str, Any]) -> bool:
     fallback = path.with_name("runtime_status.fallback.json")
-    tmp_name = ""
-    published = False
     try:
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=fallback.name + ".", suffix=".tmp", dir=str(fallback.parent))
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(dict(payload), fh, indent=2, sort_keys=True, allow_nan=False)
-            fh.flush()
-            try:
-                os.fsync(fh.fileno())
-            except Exception as exc:
-                _log_status_write_failure(
-                    f"write_runtime_status fallback fsync({path})", exc)
+        encoded = json.dumps(
+            dict(payload),
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
         try:
-            os.replace(tmp_name, fallback)
-            tmp_name = ""
-            published = True
-        except OSError as replace_exc:
-            # Never truncate a last-good fallback in place. A hard link makes
-            # the already-flushed temp visible atomically when no fallback
-            # exists; otherwise retain the older valid status for the reader.
-            try:
-                os.link(tmp_name, fallback)
-                published = True
-            except FileExistsError:
-                pass
-            except (AttributeError, OSError) as link_exc:
-                _log_status_write_failure(
-                    f"write_runtime_status fallback publish({path})",
-                    link_exc or replace_exc,
-                )
+            atomic_write_bytes(fallback, encoded)
+            return True
+        except OSError:
+            # Preserve the no-overwrite emergency path whenever atomic
+            # replacement is unavailable (for example a Windows sharing
+            # violation or a filesystem-level replace failure).
+            return atomic_create_bytes(fallback, encoded)
     except Exception as exc:
         _log_status_write_failure(f"write_runtime_status fallback({path})", exc)
-    finally:
-        if tmp_name:
-            try:
-                if os.path.exists(tmp_name):
-                    os.remove(tmp_name)
-            except OSError:
-                pass
-    return published
+        return False
 
 
 def write_runtime_status(log_dir: str | os.PathLike[str],
@@ -451,6 +488,7 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
             "updated_at": "",
             "wall_ts": 0.0,
             "monotonic_ts": 0.0,
+            "publish_seq": 0,
             "build_id": status_build_id,
             "build_source": status_build_source,
             "build_created_at": status_build_created_at,
@@ -470,6 +508,10 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
         with _runtime_status_path_lock(path) as acquired:
             if not acquired:
                 return False
+            payload["publish_seq"] = _next_status_publish_sequence(
+                path,
+                acquired,
+            )
             # Freshness must follow the serialized publication order. Sampling
             # before this lock lets a delayed older writer overwrite a newer
             # heartbeat with a regressed timestamp.
@@ -477,52 +519,44 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
             payload["wall_ts"] = time.time()
             payload["monotonic_ts"] = time.monotonic()
             payload["clock_health"] = _clock_health()
-            fd, tmp_name = tempfile.mkstemp(
-                prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+            encoded = json.dumps(
+                payload,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            ).encode("utf-8")
             published = False
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump(payload, fh, indent=2, sort_keys=True, allow_nan=False)
-                    fh.flush()
+            last_err = None
+            for attempt in range(_STATUS_REPLACE_RETRIES):
+                try:
+                    # Each retry owns a fresh exclusive UUID generation and
+                    # succeeds only after both file and directory durability.
+                    atomic_write_bytes(path, encoded)
+                    last_err = None
                     try:
-                        os.fsync(fh.fileno())
+                        path.with_name("runtime_status.fallback.json").unlink()
+                        _sync_status_directory(path.parent)
+                    except FileNotFoundError:
+                        pass
                     except Exception as exc:
                         _log_status_write_failure(
-                            f"write_runtime_status fsync({path})", exc
+                            f"write_runtime_status cleanup_fallback({path})",
+                            exc,
                         )
-                last_err = None
-                for attempt in range(_STATUS_REPLACE_RETRIES):
-                    try:
-                        os.replace(tmp_name, path)
-                        last_err = None
-                        try:
-                            path.with_name("runtime_status.fallback.json").unlink()
-                        except FileNotFoundError:
-                            pass
-                        except Exception as exc:
-                            _log_status_write_failure(
-                                f"write_runtime_status cleanup_fallback({path})",
-                                exc,
-                            )
-                        published = True
-                        break
-                    except OSError as exc:
-                        last_err = exc
+                    published = True
+                    break
+                except OSError as exc:
+                    last_err = exc
+                    if attempt + 1 < _STATUS_REPLACE_RETRIES:
                         time.sleep(
                             _STATUS_REPLACE_SLEEP_SEC
                             * (1.0 + (attempt % 3) * 0.25)
                         )
-                if last_err is not None:
-                    published = _write_fallback_status(path, payload)
-                    _log_status_write_failure(
-                        f"write_runtime_status({path})", last_err
-                    )
-            finally:
-                try:
-                    if os.path.exists(tmp_name):
-                        os.remove(tmp_name)
-                except OSError:
-                    pass
+            if last_err is not None:
+                published = _write_fallback_status(path, payload)
+                _log_status_write_failure(
+                    f"write_runtime_status({path})", last_err
+                )
             return published
     except Exception as exc:
         _log_status_write_failure(f"write_runtime_status({log_dir})", exc)
@@ -548,6 +582,12 @@ def read_runtime_status_with_path(
             return primary, primary_path if primary else None
         if not primary:
             return fallback, fallback_path
+        primary_sequence = _status_publish_sequence(primary)
+        fallback_sequence = _status_publish_sequence(fallback)
+        if fallback_sequence > primary_sequence:
+            return fallback, fallback_path
+        if primary_sequence > fallback_sequence:
+            return primary, primary_path
         if _status_freshness(fallback) > _status_freshness(primary):
             return fallback, fallback_path
         return primary, primary_path

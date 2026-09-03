@@ -323,9 +323,15 @@ def compute_futures_equity(ex) -> Optional[dict]:
         try:
             # Lazy import  equity_utils mustn't hard-depend on the bot's
             # DB layer (it should still work in a fresh test environment).
-            from core.database import get_futures_state  # type: ignore
-            db_rows = get_futures_state() or []
-            db_by_sym = _live_futures_state_by_symbol(db_rows)
+            from core.database import (  # type: ignore
+                get_claim_bound_live_futures_state,
+            )
+            from bot_utils.pnl_view import is_futures_state_fresh
+
+            db_rows = get_claim_bound_live_futures_state() or []
+            db_by_sym = _live_futures_state_by_symbol(
+                [row for row in db_rows if is_futures_state_fresh(row)]
+            )
             for d in missing_upnl:
                 sym_base = d.get("symbol", "")
                 row = db_by_sym.get(sym_base)

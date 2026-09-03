@@ -6,9 +6,11 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib import request
@@ -24,7 +26,10 @@ from tools.release_requirements import (  # noqa: E402, I001
     REQUIRED_RELEASE_DIRS,
     REQUIRED_RELEASE_ITEMS,
 )
-from tools.update_deploy_manifest import build_manifest  # noqa: E402
+from tools.update_deploy_manifest import (  # noqa: E402
+    _sync_directory as _sync_policy_directory,
+    build_manifest,
+)
 
 
 FORBIDDEN_DIRS = {
@@ -431,21 +436,83 @@ def _refresh_dependency_advisory_policy(source: Path, output: Path) -> None:
     }
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
-    if temporary.exists():
-        raise RuntimeError(f"temporary policy path already exists: {temporary}")
+    temporary = output.with_name(
+        f".{output.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
     encoded = (json.dumps(snapshot, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    temporary_owned = False
+    temporary_identity: tuple[int, int] | None = None
+    primary_error: BaseException | None = None
     try:
-        with temporary.open("xb") as handle:
+        handle = temporary.open("xb")
+        temporary_owned = True
+        write_primary: BaseException | None = None
+        try:
+            temporary_stat = os.fstat(handle.fileno())
+            if not stat.S_ISREG(temporary_stat.st_mode):
+                raise ValueError("dependency policy temporary must be regular")
+            temporary_identity = (
+                temporary_stat.st_dev,
+                temporary_stat.st_ino,
+            )
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            write_primary = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if write_primary is None:
+                    raise
+                try:
+                    write_primary.add_note(
+                        "close dependency-policy temporary after write failure: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
         os.replace(temporary, output)
+        temporary_owned = False
+        _sync_policy_directory(output.parent)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        cleanup_error: BaseException | None = None
+        same_generation = False
+        if temporary_owned and temporary_identity is not None:
+            try:
+                current = temporary.stat(follow_symlinks=False)
+                same_generation = (
+                    stat.S_ISREG(current.st_mode)
+                    and not temporary.is_symlink()
+                    and (current.st_dev, current.st_ino)
+                    == temporary_identity
+                )
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = exc
+        if same_generation:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            if primary_error is None:
+                raise cleanup_error
+            try:
+                primary_error.add_note(
+                    "dependency-policy owned temporary cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            except BaseException:
+                pass
 
 
 def _build_id_from_manifest_files(files: list[dict]) -> str:

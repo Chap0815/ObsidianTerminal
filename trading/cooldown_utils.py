@@ -14,11 +14,16 @@ import json
 import math
 import os
 import socket
+import stat
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional
+
+from bot_utils.runtime_threads import thread_definitely_never_started
 
 
 try:
@@ -73,11 +78,17 @@ def should_cooldown_after_exit(reason: str, profit_usdt: float) -> bool:
 
 
 _COOLDOWN_LOCK = threading.Lock()
+_COOLDOWN_ADMISSION_LOCK = threading.Lock()
+_COOLDOWN_SHUTDOWN_LIFECYCLE_LOCK = threading.Lock()
 _MAX_COOLDOWN_MINUTES = 366 * 24 * 60
 _COOLDOWN_JSON_MAX_BYTES = 1024 * 1024
 _COOLDOWN_PERSIST_RETRY_SEC = 30.0
 _cooldown_retry_timers: dict[str, threading.Timer] = {}
 _cooldown_retry_data: dict[str, dict] = {}
+_cooldown_active_timers: set[threading.Thread] = set()
+_cooldown_retiring_timers: set[threading.Thread] = set()
+_cooldown_persist_shutdown = False
+_cooldown_shutdown_generation: dict | None = None
 
 
 class CooldownState(dict):
@@ -264,36 +275,59 @@ def _schedule_cooldown_retry_locked(path: str) -> None:
                 return
         except Exception:
             pass
-    timer = threading.Timer(
-        _COOLDOWN_PERSIST_RETRY_SEC,
-        lambda: _retry_cooldown_persist(path),
-    )
-    timer.daemon = True
-    _cooldown_retry_timers[path] = timer
-    try:
-        timer.start()
-    except Exception as exc:
-        if _cooldown_retry_timers.get(path) is timer:
-            _cooldown_retry_timers.pop(path, None)
+    with _COOLDOWN_ADMISSION_LOCK:
+        if _cooldown_persist_shutdown:
+            return
+        timer = None
+
+        def retry_owned_generation() -> None:
+            _retry_cooldown_persist(path, timer)
+
+        timer = threading.Timer(
+            _COOLDOWN_PERSIST_RETRY_SEC,
+            retry_owned_generation,
+        )
+        timer.daemon = True
+        _cooldown_retry_timers[path] = timer
         try:
-            from bot_utils.silent_log import silent_log
-            silent_log("schedule cooldown persistence retry", exc)
-        except Exception:
-            pass
+            timer.start()
+        except Exception as exc:
+            if _cooldown_retry_timers.get(path) is timer:
+                _cooldown_retry_timers.pop(path, None)
+            try:
+                from bot_utils.silent_log import silent_log
+                silent_log("schedule cooldown persistence retry", exc)
+            except Exception:
+                pass
 
 
-def _retry_cooldown_persist(path: str) -> None:
+def _retry_cooldown_persist(
+    path: str,
+    owner: threading.Timer | None = None,
+) -> None:
+    current = threading.current_thread()
     with _COOLDOWN_LOCK:
-        _cooldown_retry_timers.pop(path, None)
-        data = _cooldown_retry_data.get(path)
-        if data is not None:
-            _persist_with_retry_locked(path, data)
+        _cooldown_active_timers.add(current)
+        try:
+            if (
+                owner is None
+                or _cooldown_retry_timers.get(path) is not owner
+            ):
+                return
+            _cooldown_retry_timers.pop(path, None)
+            if _cooldown_persist_shutdown:
+                return
+            data = _cooldown_retry_data.get(path)
+            if data is not None:
+                _persist_with_retry_locked(path, data)
+        finally:
+            _cooldown_active_timers.discard(current)
 
 
 def _persist_with_retry_locked(path: str, data: dict) -> bool:
     """Persist now and retain the latest live mapping until it is durable."""
     try:
-        persisted = bool(_persist(path, data))
+        persisted = _persist(path, data) is True
     except Exception:
         persisted = False
     if persisted:
@@ -312,28 +346,213 @@ def _persist_with_retry_locked(path: str, data: dict) -> bool:
     return False
 
 
-def flush_pending_cooldowns() -> bool:
-    """Make one final synchronous attempt for all deferred snapshots."""
-    with _COOLDOWN_LOCK:
+def _shutdown_cooldown_flush(generation: dict) -> None:
+    """Flush one terminal snapshot batch without blocking the closer."""
+    try:
+        current = threading.current_thread()
+        with _COOLDOWN_LOCK:
+            _cooldown_active_timers.add(current)
+            try:
+                for path, data in list(_cooldown_retry_data.items()):
+                    try:
+                        persisted = _persist(path, data) is True
+                    except Exception:
+                        persisted = False
+                    if persisted:
+                        _cooldown_retry_data.pop(path, None)
+            finally:
+                _cooldown_active_timers.discard(current)
+    finally:
+        with _COOLDOWN_LOCK:
+            generation["done"].set()
+
+
+def _acquire_cooldown_lock_until(deadline: float) -> bool:
+    return _COOLDOWN_LOCK.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    )
+
+
+def _shutdown_cooldown_persistence_owned(timeout: float = 0.0) -> bool:
+    """Terminally stop retry timers and durably flush deferred snapshots."""
+    global _cooldown_persist_shutdown, _cooldown_shutdown_generation
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        budget = 0.0
+    if not math.isfinite(budget):
+        budget = 0.0
+    deadline = time.monotonic() + max(0.0, budget)
+
+    # Serialize terminal publication against the short check+Timer.start
+    # admission section.  This lock never protects persistence I/O.
+    if not _COOLDOWN_ADMISSION_LOCK.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    ):
+        return False
+    try:
+        _cooldown_persist_shutdown = True
+    finally:
+        _COOLDOWN_ADMISSION_LOCK.release()
+    if not _acquire_cooldown_lock_until(deadline):
+        return False
+    try:
         timers = list(_cooldown_retry_timers.values())
+        timers.extend(_cooldown_active_timers)
+        timers.extend(_cooldown_retiring_timers)
+        flush_generation = _cooldown_shutdown_generation
+        if flush_generation is not None:
+            flush_worker = flush_generation.get("worker")
+            if flush_worker is not None:
+                timers.append(flush_worker)
+        _cooldown_retiring_timers.update(timers)
         _cooldown_retry_timers.clear()
         for timer in timers:
             try:
                 timer.cancel()
             except Exception:
                 pass
+    finally:
+        _COOLDOWN_LOCK.release()
 
-        all_persisted = True
-        for path, data in list(_cooldown_retry_data.items()):
+    still_alive = []
+    for timer in dict.fromkeys(timers):
+        join = getattr(timer, "join", None)
+        if callable(join) and timer is not threading.current_thread():
             try:
-                persisted = bool(_persist(path, data))
+                join(timeout=max(0.0, deadline - time.monotonic()))
             except Exception:
-                persisted = False
-            if persisted:
-                _cooldown_retry_data.pop(path, None)
-            else:
-                all_persisted = False
-        return all_persisted
+                still_alive.append(timer)
+                continue
+        try:
+            if timer.is_alive():
+                still_alive.append(timer)
+        except Exception:
+            still_alive.append(timer)
+
+    if not _acquire_cooldown_lock_until(deadline):
+        return False
+    try:
+        _cooldown_retiring_timers.intersection_update(still_alive)
+        if still_alive:
+            return False
+        if (
+            flush_generation is not None
+            and not flush_generation["done"].is_set()
+        ):
+            return False
+        if _cooldown_shutdown_generation is flush_generation:
+            _cooldown_shutdown_generation = None
+        if not _cooldown_retry_data:
+            return True
+        generation = {
+            "done": threading.Event(),
+            "worker": None,
+            "start_raised": False,
+        }
+
+        def run_owned_flush() -> None:
+            _shutdown_cooldown_flush(generation)
+
+        try:
+            flush = threading.Thread(
+                target=run_owned_flush,
+                name="cooldown-shutdown-persist",
+                daemon=True,
+            )
+        except BaseException as exc:
+            try:
+                from bot_utils.silent_log import silent_log
+
+                silent_log("construct cooldown shutdown persistence", exc)
+            except BaseException:
+                pass
+            if not isinstance(exc, Exception):
+                raise
+            return False
+        generation["worker"] = flush
+        _cooldown_shutdown_generation = generation
+        _cooldown_retiring_timers.add(flush)
+        try:
+            flush.start()
+        except BaseException as exc:
+            generation["start_raised"] = True
+            if (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(flush)
+            ):
+                generation["done"].set()
+                _cooldown_retiring_timers.discard(flush)
+                if _cooldown_shutdown_generation is generation:
+                    _cooldown_shutdown_generation = None
+            try:
+                from bot_utils.silent_log import silent_log
+
+                silent_log("start cooldown shutdown persistence", exc)
+            except BaseException:
+                pass
+            if not isinstance(exc, Exception):
+                raise
+            return False
+    finally:
+        _COOLDOWN_LOCK.release()
+
+    try:
+        if flush is not threading.current_thread():
+            flush.join(timeout=max(0.0, deadline - time.monotonic()))
+    except Exception:
+        return False
+    try:
+        flush_alive = flush.is_alive()
+    except Exception:
+        flush_alive = True
+    if flush_alive:
+        return False
+    if not _acquire_cooldown_lock_until(deadline):
+        return False
+    try:
+        completed = (
+            _cooldown_shutdown_generation is generation
+            and generation["done"].is_set()
+        )
+        if completed:
+            _cooldown_retiring_timers.discard(flush)
+            _cooldown_shutdown_generation = None
+        return completed and not _cooldown_retry_data
+    finally:
+        _COOLDOWN_LOCK.release()
+
+
+def shutdown_cooldown_persistence(timeout: float = 0.0) -> bool:
+    """Serialize terminal cooldown persistence under one bounded budget."""
+    if isinstance(timeout, bool):
+        return False
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(budget):
+        return False
+    bounded_budget = min(
+        max(0.0, budget),
+        float(threading.TIMEOUT_MAX),
+    )
+    deadline = time.monotonic() + bounded_budget
+    if not _COOLDOWN_SHUTDOWN_LIFECYCLE_LOCK.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    ):
+        return False
+    try:
+        return _shutdown_cooldown_persistence_owned(
+            timeout=max(0.0, deadline - time.monotonic())
+        )
+    finally:
+        _COOLDOWN_SHUTDOWN_LIFECYCLE_LOCK.release()
+
+
+def flush_pending_cooldowns() -> bool:
+    """Interpreter-exit fallback for the managed runtime closer."""
+    return shutdown_cooldown_persistence(timeout=1.0)
 
 def set_cooldown(cool: dict, symbol: str, minutes: int,
                  cooldown_file: str) -> bool:
@@ -492,42 +711,169 @@ def _persist(path: str, data: dict) -> bool:
         return False
 
 
-def _atomic_write_json(path: str, data: dict) -> None:
-    """Retry budget for Windows AV scan interference."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+def _note_cooldown_cleanup_error(
+    primary: BaseException,
+    cleanup_error: BaseException,
+) -> None:
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
+        primary.add_note(
+            "cooldown temporary cleanup failed: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+    except BaseException:
+        pass
+
+
+def _fsync_cooldown_directory(path: Path) -> None:
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(str(path), flags)
+    except AttributeError:
+        return
+    except OSError as exc:
+        if os.name == "nt":
+            if isinstance(exc, PermissionError):
+                return
+            if (
+                isinstance(exc, FileNotFoundError)
+                and path == Path(path.anchor)
+                and path.is_dir()
+            ):
+                return
+        raise
+    primary_error: BaseException | None = None
+    try:
+        os.fsync(directory_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            os.close(directory_fd)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            _note_cooldown_cleanup_error(primary_error, close_error)
+
+
+def _same_cooldown_temp_generation(
+    path: Path,
+    identity: tuple[int, int],
+) -> bool:
+    try:
+        current = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISREG(current.st_mode)
+        and (current.st_dev, current.st_ino) == identity
+    )
+
+
+def _fsync_cooldown_parent_chain(path: Path) -> None:
+    current = path
+    while True:
+        _fsync_cooldown_directory(current)
+        if current == current.parent:
+            return
+        current = current.parent
+
+
+def _atomic_write_json(path: str, data: dict) -> None:
+    """Crash-durable exact-generation JSON publish with Windows retries."""
+    directory = Path(os.path.dirname(path) or ".").absolute()
+    os.makedirs(directory, exist_ok=True)
+    # Retry every parent barrier, including entries created by an earlier
+    # failed attempt.  Existence alone does not prove rename durability.
+    _fsync_cooldown_parent_chain(directory)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{os.path.basename(path)}.tmp.",
+        dir=str(directory),
+    )
+    tmp = Path(tmp_name)
+    fd_owned = True
+    temp_owned = True
+    temp_identity: tuple[int, int] | None = None
+    primary_error: BaseException | None = None
+    try:
+        temp_stat = os.fstat(fd)
+        if not stat.S_ISREG(temp_stat.st_mode):
+            raise OSError("cooldown temporary path is not a regular file")
+        temp_identity = (temp_stat.st_dev, temp_stat.st_ino)
+        handle = None
+        handle_error: BaseException | None = None
+        try:
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+            fd_owned = False
             json.dump(
                 data,
-                fh,
+                handle,
                 indent=2,
                 ensure_ascii=False,
                 allow_nan=False,
             )
-            fh.flush()
-            try:
-                os.fsync(fh.fileno())
-            except (AttributeError, OSError):
-                pass
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException as exc:
+            handle_error = exc
+            raise
+        finally:
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException as close_error:
+                    if handle_error is None:
+                        raise
+                    _note_cooldown_cleanup_error(handle_error, close_error)
 
         delays = (0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3)
         last_exc: Optional[BaseException] = None
-        for d in delays:
+        for delay in delays:
             try:
                 os.replace(tmp, path)
-                return
-            except PermissionError as e:
-                last_exc = e
-                time.sleep(d)
+                temp_owned = False
+                last_exc = None
+                break
+            except PermissionError as exc:
+                last_exc = exc
+                time.sleep(delay)
         if last_exc:
             raise last_exc
+        _fsync_cooldown_directory(directory)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        try:
-            if os.path.exists(tmp):
+        cleanup_error: BaseException | None = None
+        if fd_owned:
+            try:
+                os.close(fd)
+            except BaseException as exc:
+                cleanup_error = exc
+        same_generation = False
+        if temp_owned and temp_identity is not None:
+            try:
+                same_generation = _same_cooldown_temp_generation(
+                    tmp,
+                    temp_identity,
+                )
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                else:
+                    _note_cooldown_cleanup_error(cleanup_error, exc)
+        if same_generation:
+            try:
                 os.remove(tmp)
-        except OSError:
-            pass
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                else:
+                    _note_cooldown_cleanup_error(cleanup_error, exc)
+        if cleanup_error is not None:
+            if primary_error is None:
+                raise cleanup_error
+            _note_cooldown_cleanup_error(primary_error, cleanup_error)
 
 
 atexit.register(flush_pending_cooldowns)

@@ -40,6 +40,7 @@ DAY_MAX_OUTAGE_EPISODES = 6
 CONTINUITY_WINDOW_DAYS = 30
 CONTINUITY_MAX_DEGRADED_RATIO = 0.20
 INTEGRITY_REPORT_MAX_BYTES = 4 * 1024 * 1024
+REST_RECEIPT_CLOCK_TOLERANCE_MS = 30_000
 
 
 def _capture_now_utc() -> datetime:
@@ -581,6 +582,30 @@ def _validate_event_universe(payload: dict) -> None:
         raise ValueError("capture universe contains duplicate symbols")
 
 
+def _validate_rest_request_provenance(
+    payload: dict,
+    received_time: datetime,
+) -> None:
+    fields = ("request_started_ms", "request_ended_ms", "latency_ms")
+    if any(field not in payload for field in fields):
+        raise ValueError("REST request provenance is incomplete")
+    started_ms, ended_ms, latency_ms = (payload[field] for field in fields)
+    if (
+        type(started_ms) is not int
+        or type(ended_ms) is not int
+        or type(latency_ms) is not int
+        or started_ms <= 0
+        or ended_ms <= 0
+        or latency_ms < 0
+    ):
+        raise ValueError("REST request provenance is invalid")
+    if started_ms > ended_ms or latency_ms != ended_ms - started_ms:
+        raise ValueError("REST request chronology is invalid")
+    received_ms = round(received_time.timestamp() * 1000)
+    if abs(received_ms - ended_ms) > REST_RECEIPT_CLOCK_TOLERANCE_MS:
+        raise ValueError("REST receipt provenance mismatch")
+
+
 def _partition_rows(
     path: Path,
     stream: str,
@@ -602,25 +627,29 @@ def _partition_rows(
         uri=True,
         timeout=30.0,
     )
-    connection.row_factory = sqlite3.Row
-    overview_rows = []
-    connection_epochs = set()
-    warnings = set()
-    event_count = 0
-    websocket_trade_events = 0
-    websocket_trade_identities: dict[tuple[str, str], tuple] = {}
-    if (coverage_intervals is None) != (maximum_gap is None):
-        raise ValueError("coverage contract is incomplete")
-    coverage_tracker = None
-    if coverage_intervals is not None and maximum_gap is not None:
-        coverage_tracker = _CoverageGapTracker(
-            coverage_intervals,
-            stream=stream,
-            maximum_gap=maximum_gap,
-        )
-    epoch_tracker = _ConnectionEpochGapTracker(day) if stream == "l2_stream" else None
-    future_limit = _capture_now_utc() + timedelta(minutes=1)
+    primary_error: BaseException | None = None
     try:
+        connection.row_factory = sqlite3.Row
+        overview_rows = []
+        connection_epochs = set()
+        warnings = set()
+        event_count = 0
+        websocket_trade_events = 0
+        if (coverage_intervals is None) != (maximum_gap is None):
+            raise ValueError("coverage contract is incomplete")
+        coverage_tracker = None
+        if coverage_intervals is not None and maximum_gap is not None:
+            coverage_tracker = _CoverageGapTracker(
+                coverage_intervals,
+                stream=stream,
+                maximum_gap=maximum_gap,
+            )
+        epoch_tracker = (
+            _ConnectionEpochGapTracker(day)
+            if stream == "l2_stream"
+            else None
+        )
+        future_limit = _capture_now_utc() + timedelta(minutes=1)
         quick = connection.execute("PRAGMA quick_check").fetchall()
         if [str(row[0]) for row in quick] != ["ok"]:
             raise ValueError(f"{stream} quick_check failed")
@@ -640,8 +669,23 @@ def _partition_rows(
             if receipt_ordered
             else "exchange_time"
         )
-        if receipt_ordered:
+        if receipt_ordered or stream == "trades":
             connection.execute("PRAGMA temp_store=FILE")
+        if stream == "trades":
+            # A liquid closed day can contain millions of public trades. Keep
+            # the strict cross-event identity contract without retaining one
+            # Python object per trade for the entire validation pass.
+            connection.execute(
+                """CREATE TEMP TABLE websocket_trade_identities (
+                       market_id TEXT NOT NULL,
+                       trade_id TEXT NOT NULL,
+                       trade_time INTEGER NOT NULL,
+                       trade_price REAL NOT NULL,
+                       trade_amount REAL NOT NULL,
+                       trade_side TEXT NOT NULL,
+                       PRIMARY KEY (market_id, trade_id)
+                   ) WITHOUT ROWID"""
+            )
         for row in connection.execute(
             "SELECT event_id,market_id,exchange_time,received_time,"
             "schema_version,quality_flags_json,payload_json "
@@ -679,6 +723,11 @@ def _partition_rows(
                 or not isinstance(payload, dict)
             ):
                 raise ValueError(f"{stream} JSON contract mismatch")
+            rest_event = stream in {"overview", "depth"} or (
+                stream == "trades" and payload.get("stream_source") != "ccxt_pro"
+            )
+            if rest_event:
+                _validate_rest_request_provenance(payload, received_time)
             if stream != "overview":
                 _validate_event_universe(payload)
             allowed = {"sequence_unverified"} if stream == "l2_stream" else set()
@@ -759,10 +808,27 @@ def _partition_rows(
                         trade_amount,
                         trade.get("side"),
                     )
-                    previous_identity = websocket_trade_identities.get(
-                        identity_key
+                    identity_values = (*identity_key, *identity_evidence)
+                    identity_cursor = connection.execute(
+                        """INSERT OR IGNORE INTO websocket_trade_identities
+                           (market_id, trade_id, trade_time, trade_price,
+                            trade_amount, trade_side)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        identity_values,
                     )
-                    if previous_identity is not None:
+                    if identity_cursor.rowcount == 0:
+                        previous_identity = connection.execute(
+                            """SELECT trade_time, trade_price, trade_amount,
+                                      trade_side
+                                 FROM websocket_trade_identities
+                                WHERE market_id=? AND trade_id=?""",
+                            identity_key,
+                        ).fetchone()
+                        previous_identity = (
+                            tuple(previous_identity)
+                            if previous_identity is not None
+                            else None
+                        )
                         if previous_identity == identity_evidence:
                             problem = "repeats across events"
                         else:
@@ -773,7 +839,6 @@ def _partition_rows(
                             f"trade_id={_event_diagnostic(trade_id)} "
                             f"event_id={_event_diagnostic(row['event_id'])}"
                         )
-                    websocket_trade_identities[identity_key] = identity_evidence
             if stream in {"trades", "l2_stream"}:
                 epoch = payload.get("connection_epoch")
                 epoch_required = stream == "l2_stream" or (
@@ -790,8 +855,22 @@ def _partition_rows(
                     connection_epochs.add(epoch)
                     if epoch_tracker is not None:
                         epoch_tracker.observe(received_time, epoch)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        connection.close()
+        try:
+            connection.close()
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "capture partition connection close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
     if not event_count:
         raise ValueError(f"{stream} partition is empty")
     coverage_gaps = coverage_tracker.finish() if coverage_tracker else []
@@ -1086,36 +1165,62 @@ def _atomic_create(path: Path, payload: dict) -> None:
         existing = _read_integrity_report_bytes(path)
         if existing != encoded:
             raise RuntimeError("sealed capture report changed")
+        _fsync_parent_directory(path.parent)
         return
     temporary = path.parent / (
         f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
-    with temporary.open("xb") as handle:
-        handle.write(encoded)
-        handle.flush()
-        os.fsync(handle.fileno())
+    temporary_owned = False
+    primary_error: BaseException | None = None
     try:
+        handle = temporary.open("xb")
+        temporary_owned = True
+        with handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
         try:
             os.link(temporary, path)
         except FileExistsError:
             if _read_integrity_report_bytes(path) != encoded:
                 raise RuntimeError("sealed capture report changed")
-        try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-        except (AttributeError, OSError):
-            directory_fd = None
-        if directory_fd is not None:
-            try:
-                os.fsync(directory_fd)
-            except OSError:
-                pass
-            finally:
-                try:
-                    os.close(directory_fd)
-                except OSError:
-                    pass
+        _fsync_parent_directory(path.parent)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary_owned:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    "capture integrity temporary cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+
+
+def _fsync_parent_directory(path: Path) -> None:
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(path, flags)
+    except AttributeError:
+        return
+    except OSError as exc:
+        # CPython on Windows cannot open directories through os.open and
+        # reports EACCES/PermissionError.  Keep that platform limitation as a
+        # best-effort fallback, but never hide real POSIX I/O/open failures.
+        if os.name == "nt" and isinstance(exc, PermissionError):
+            return
+        raise
+    try:
+        os.fsync(directory_fd)
+    finally:
+        try:
+            os.close(directory_fd)
+        except OSError:
+            pass
 
 
 def _verify_sealed_report(
@@ -1327,6 +1432,24 @@ def _remove_empty_sidecars(root: Path, report: dict) -> None:
                 sidecar.unlink()
 
 
+def _prune_verification_cache(
+    root: Path,
+    reports: list[dict],
+    verification_cache: dict[str, tuple] | None,
+) -> None:
+    if verification_cache is None:
+        return
+    retained_keys = {
+        str((root / item["path"]).resolve())
+        for report in reports
+        for item in (report.get("manifest") or ())
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    for cache_key in tuple(verification_cache):
+        if cache_key not in retained_keys:
+            verification_cache.pop(cache_key, None)
+
+
 def seal_closed_capture_days(
     root: str | Path,
     *,
@@ -1401,6 +1524,18 @@ def seal_closed_capture_days(
                 if report.get("status") in {"valid", "usable_with_gaps"}:
                     _remove_empty_sidecars(root, report)
                 _atomic_create(report_path, report)
+                # The validation hashes precede publication. Re-read the
+                # create-once artifact and force an uncached verification while
+                # the official writer is still excluded by the day guard, so a
+                # concurrent/non-cooperating filesystem mutation cannot be
+                # reported healthy for one integrity cycle.
+                report = _read_integrity_report(report_path)
+                _verify_sealed_report(
+                    root,
+                    report,
+                    expected_day=day,
+                    verification_cache=None,
+                )
         reports.append(report)
     invalid = [
         report["day"]
@@ -1415,6 +1550,21 @@ def seal_closed_capture_days(
     strict_valid = [
         report["day"] for report in reports if report.get("status") == "valid"
     ]
+    _prune_verification_cache(root, reports, verification_cache)
+    # Keep the runtime health payload useful without copying complete sealed
+    # reports into every heartbeat.  The reports remain authoritative; this
+    # is only a bounded diagnostic projection of the newest invalid days.
+    invalid_day_issues = [
+        {
+            "day": str(report.get("day") or "")[:16],
+            "issues": [
+                str(issue)[:240]
+                for issue in (report.get("issues") or ())[:4]
+            ],
+        }
+        for report in reports
+        if report.get("status") == "invalid"
+    ][-8:]
     return {
         "ok": not invalid,
         "sealed_days": len(reports),
@@ -1422,6 +1572,7 @@ def seal_closed_capture_days(
         "usable_days": len(strict_valid) + len(degraded),
         "degraded_days": degraded,
         "invalid_days": invalid,
+        "invalid_day_issues": invalid_day_issues,
         "latest_day": reports[-1]["day"] if reports else None,
         "continuity": capture_continuity_health(reports),
     }

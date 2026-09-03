@@ -39,6 +39,54 @@ def _absolute_without_links(source: str | Path, *, label: str) -> Path:
     return requested
 
 
+def _fsync_directory(path: Path) -> None:
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(str(path), flags)
+    except AttributeError:
+        return
+    except OSError as exc:
+        if os.name == "nt":
+            if isinstance(exc, PermissionError):
+                return
+            if (
+                isinstance(exc, FileNotFoundError)
+                and path == Path(path.anchor)
+                and path.is_dir()
+            ):
+                return
+        raise
+    primary_error: BaseException | None = None
+    try:
+        os.fsync(directory_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            os.close(directory_fd)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "promotion bundle directory close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
+def _mkdir_with_parent_fsync(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    parent = path.parent
+    while True:
+        _fsync_directory(parent)
+        if parent == parent.parent:
+            break
+        parent = parent.parent
+
+
 def _load_unique_json_object(
     source: str | Path, *, maximum_bytes: int, label: str
 ) -> dict:
@@ -257,21 +305,57 @@ def _write_immutable_json(
     if len(encoded) > maximum_bytes:
         raise ValueError(f"{label} is oversized")
     path = _absolute_without_links(destination, label=f"{label} destination")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_with_parent_fsync(path.parent)
     path = _absolute_without_links(path, label=f"{label} destination")
     if path.exists():
         if _read_existing_bytes(
             path, maximum_bytes=maximum_bytes, label=label
         ) != encoded:
             raise ValueError(f"{label} destination conflicts with existing evidence")
+        _fsync_directory(path.parent)
         return
 
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    temporary: Path | None = None
+    primary_error: BaseException | None = None
+    temporary_owned = False
+    handle = None
     try:
-        with temporary.open("xb") as handle:
+        for attempt in range(3):
+            candidate = path.with_name(
+                f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                handle = candidate.open("xb")
+            except FileExistsError:
+                if attempt == 2:
+                    raise
+                continue
+            temporary = candidate
+            temporary_owned = True
+            break
+        if handle is None or temporary is None:
+            raise RuntimeError("promotion bundle temporary allocation failed")
+        try:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if primary_error is None:
+                    primary_error = close_error
+                    raise
+                try:
+                    primary_error.add_note(
+                        "promotion bundle temporary close failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
         try:
             os.link(temporary, path)
         except FileExistsError:
@@ -282,21 +366,32 @@ def _write_immutable_json(
                     f"{label} destination conflicts with concurrently written evidence"
                 )
         try:
-            directory_fd = os.open(str(path.parent), os.O_RDONLY)
-        except OSError:
-            directory_fd = None
-        if directory_fd is not None:
-            try:
-                os.fsync(directory_fd)
-            except OSError:
-                pass
-            finally:
-                os.close(directory_fd)
-    finally:
-        try:
             temporary.unlink()
         except FileNotFoundError:
             pass
+        else:
+            temporary_owned = False
+        _fsync_directory(path.parent)
+    except BaseException as exc:
+        if primary_error is None:
+            primary_error = exc
+        raise
+    finally:
+        if temporary_owned and temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                try:
+                    primary_error.add_note(
+                        "promotion bundle temporary cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
 
 
 def write_optimizer_promotion_artifact(

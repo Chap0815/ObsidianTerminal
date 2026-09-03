@@ -14,6 +14,8 @@ import subprocess
 import threading
 import time
 
+from bot_utils.runtime_threads import thread_definitely_never_started
+
 try:
     import psutil  # type: ignore
     HAS_PSUTIL = True
@@ -76,7 +78,7 @@ def _probe_nvidia_smi() -> dict | None:
     return data
 
 
-def _nvidia_probe_worker() -> None:
+def _nvidia_probe_worker(owner_state: dict) -> None:
     data = _probe_nvidia_smi()
     cache_seconds = (
         _NVIDIA_SUCCESS_CACHE_SEC
@@ -84,9 +86,12 @@ def _nvidia_probe_worker() -> None:
         else _NVIDIA_FAILURE_CACHE_SEC
     )
     with _NVIDIA_PROBE_LOCK:
-        _query_nvidia_smi._last_result = data
-        _query_nvidia_smi._cached_until = time.monotonic() + cache_seconds
-        _query_nvidia_smi._probe_active = False
+        owner_state["done"].set()
+        if _query_nvidia_smi._probe_state is owner_state:
+            _query_nvidia_smi._last_result = data
+            _query_nvidia_smi._cached_until = time.monotonic() + cache_seconds
+            _query_nvidia_smi._probe_state = None
+            _query_nvidia_smi._probe_active = False
 
 
 def _query_nvidia_smi():
@@ -99,25 +104,53 @@ def _query_nvidia_smi():
         if _query_nvidia_smi._probe_active:
             return cached
         _query_nvidia_smi._probe_active = True
+        owner_state = {"done": threading.Event(), "thread": None}
+        _query_nvidia_smi._probe_state = owner_state
     try:
         worker = threading.Thread(
-            target=_nvidia_probe_worker,
+            target=lambda: _nvidia_probe_worker(owner_state),
             daemon=True,
             name="launcher-nvidia-probe",
         )
-        worker.start()
-    except Exception:
+    except BaseException as exc:
         with _NVIDIA_PROBE_LOCK:
-            _query_nvidia_smi._probe_active = False
-            _query_nvidia_smi._cached_until = (
-                now + _NVIDIA_FAILURE_CACHE_SEC
-            )
+            if _query_nvidia_smi._probe_state is owner_state:
+                owner_state["done"].set()
+                _query_nvidia_smi._probe_state = None
+                _query_nvidia_smi._probe_active = False
+                _query_nvidia_smi._cached_until = (
+                    now + _NVIDIA_FAILURE_CACHE_SEC
+                )
+        if not isinstance(exc, Exception):
+            raise
+        return cached
+    with _NVIDIA_PROBE_LOCK:
+        if _query_nvidia_smi._probe_state is owner_state:
+            owner_state["thread"] = worker
+    try:
+        worker.start()
+    except BaseException as exc:
+        with _NVIDIA_PROBE_LOCK:
+            if (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(worker)
+                and _query_nvidia_smi._probe_state is owner_state
+            ):
+                owner_state["done"].set()
+                _query_nvidia_smi._probe_state = None
+                _query_nvidia_smi._probe_active = False
+                _query_nvidia_smi._cached_until = (
+                    now + _NVIDIA_FAILURE_CACHE_SEC
+                )
+        if not isinstance(exc, Exception):
+            raise
     return cached
 
 
 _query_nvidia_smi._last_result = None      # type: ignore[attr-defined]
 _query_nvidia_smi._cached_until = 0        # type: ignore[attr-defined]
 _query_nvidia_smi._probe_active = False    # type: ignore[attr-defined]
+_query_nvidia_smi._probe_state = None      # type: ignore[attr-defined]
 
 
 def _query_windows_commit_memory() -> dict | None:

@@ -32,16 +32,29 @@ from launcher.core.positions import (
     mode_switch_blockers,
 )
 from launcher.core.runtime_status_values import positive_int_or_zero
-from launcher.state.poller import _runtime_or_config_sim
+from launcher.state.poller import _runtime_or_config_sim, _runtime_status_is_fresh
 from launcher.ui.logging_panel import begin_log_session, log_to_card
 from core.pre_start_check import (
     format_issues,
     has_errors,
     run_pre_start_checks,
 )
+from bot_utils.runtime_threads import thread_definitely_never_started
 
 
 _RESTART_UI_HANDOFF_TIMEOUT_SECONDS = 10.0
+_READINESS_MONITOR_LOCK = threading.Lock()
+
+
+def _write_stderr_best_effort(message: str) -> None:
+    """Emit a diagnostic when a console exists; never mask lifecycle errors."""
+    stderr = sys.stderr
+    if stderr is None:
+        return
+    try:
+        stderr.write(message)
+    except Exception:
+        pass
 
 
 def _post_ui(app, callback, *, delay_ms: int = 0) -> bool:
@@ -52,13 +65,56 @@ def _post_ui(app, callback, *, delay_ms: int = 0) -> bool:
     return True
 
 
-def _start_critical_worker(app, target, *, name: str):
+def _post_ui_lifecycle(app, callback, *, delay_ms: int = 0) -> bool:
+    post = getattr(app, "post_ui_lifecycle", None)
+    if callable(post):
+        return post(callback, delay_ms=delay_ms) is not False
+    return _post_ui(app, callback, delay_ms=delay_ms)
+
+
+def _start_critical_worker(
+    app,
+    target,
+    *,
+    name: str,
+    on_definite_prelaunch_failure=None,
+):
+    def notify_prelaunch_failure() -> None:
+        if not callable(on_definite_prelaunch_failure):
+            return
+        try:
+            on_definite_prelaunch_failure()
+        except BaseException:
+            pass
+
     registry = getattr(app, "critical_workers", None)
     start = getattr(registry, "start", None)
     if callable(start):
-        return start(target, name=name, daemon=True)
-    thread = threading.Thread(target=target, name=name, daemon=True)
-    thread.start()
+        try:
+            return start(target, name=name, daemon=True)
+        except BaseException:
+            active_names = getattr(registry, "active_names", None)
+            if callable(active_names):
+                try:
+                    if name not in active_names():
+                        notify_prelaunch_failure()
+                except BaseException:
+                    pass
+            raise
+    try:
+        thread = threading.Thread(target=target, name=name, daemon=True)
+    except BaseException:
+        notify_prelaunch_failure()
+        raise
+    try:
+        thread.start()
+    except BaseException as exc:
+        if (
+            isinstance(exc, Exception)
+            and thread_definitely_never_started(thread)
+        ):
+            notify_prelaunch_failure()
+        raise
     return thread
 
 
@@ -140,7 +196,10 @@ def _stop_bot_process_verified(
     except Exception as exc:
         raise RuntimeError("bot stop outcome could not be verified") from exc
     if still_running:
-        raise RuntimeError("bot is still running after stop escalation") from stop_error
+        detail = f": {stop_error}" if stop_error is not None else ""
+        raise RuntimeError(
+            f"bot is still running after stop escalation{detail}"
+        ) from stop_error
     if stop_error is not None:
         stderr = sys.stderr
         if stderr is not None:
@@ -238,7 +297,14 @@ def format_start_params(name: str, snapshot: dict) -> str:
     return param_line
 
 
-def _wait_for_bot_ready(name: str, bot, timeout_sec: float = 180.0) -> tuple[bool, str]:
+def _wait_for_bot_ready(
+    name: str,
+    bot,
+    timeout_sec: float = 180.0,
+    *,
+    expected_run_id: str | None = None,
+    expected_pid: int | None = None,
+) -> tuple[bool, str]:
     import time as _time
     try:
         from core.runtime_status import read_runtime_status
@@ -246,7 +312,17 @@ def _wait_for_bot_ready(name: str, bot, timeout_sec: float = 180.0) -> tuple[boo
         return False, f"readiness unavailable: {e}"
 
     log_dir = BOT_META[name]["log_dir"]
-    run_id = getattr(bot, "run_id", None) or ""
+    run_id = expected_run_id
+    if run_id is None:
+        run_id = getattr(bot, "run_id", None) or ""
+    identity_required = expected_pid is not None
+    if expected_pid is None:
+        expected_pid = positive_int_or_zero(
+            getattr(getattr(bot, "proc", None), "pid", 0)
+        )
+        identity_required = expected_pid > 0
+    else:
+        expected_pid = positive_int_or_zero(expected_pid)
     deadline = _time.monotonic() + timeout_sec
     last = {}
     while _time.monotonic() < deadline:
@@ -256,9 +332,18 @@ def _wait_for_bot_ready(name: str, bot, timeout_sec: float = 180.0) -> tuple[boo
             return False, "superseded by newer run"
         last = read_runtime_status(log_dir)
         threads = last.get("threads") if isinstance(last.get("threads"), dict) else {}
+        runtime_pid = positive_int_or_zero(last.get("pid"))
+        owner_matches = not identity_required or bool(
+            run_id and expected_pid and runtime_pid == expected_pid
+        )
+        heartbeat_fresh = (
+            _runtime_status_is_fresh(last) if identity_required else True
+        )
         if (last.get("status") == "ready"
                 and str(last.get("run_id") or "") == str(run_id)
-                and positive_int_or_zero(last.get("pid")) > 0
+                and runtime_pid > 0
+                and owner_matches
+                and heartbeat_fresh
                 and all(bool(threads.get(k))
                         for k in ("monitor", "scan", "reconcile"))):
             return True, str(last.get("build_id") or "unknown")
@@ -266,6 +351,113 @@ def _wait_for_bot_ready(name: str, bot, timeout_sec: float = 180.0) -> tuple[boo
     status = last.get("status") or "missing"
     seen_run = last.get("run_id") or ""
     return False, f"timeout waiting for ready (status={status}, run_id={seen_run})"
+
+
+def _start_readiness_monitor(app, name: str, bot, card) -> None:
+    expected_run_id = str(getattr(bot, "run_id", None) or "")
+    expected_proc = getattr(bot, "proc", None)
+    expected_pid = positive_int_or_zero(getattr(expected_proc, "pid", 0))
+    state = {
+        "run_id": expected_run_id,
+        "pid": expected_pid,
+        "thread": None,
+        "entered": threading.Event(),
+        "done": threading.Event(),
+        "fatal": None,
+    }
+
+    def commit(detail: str, severity: str, message: str) -> None:
+        with _READINESS_MONITOR_LOCK:
+            if getattr(bot, "_readiness_monitor_state", None) is not state:
+                return
+            current_run_id = str(getattr(bot, "run_id", None) or "")
+            current_proc = getattr(bot, "proc", None)
+            current_pid = positive_int_or_zero(getattr(current_proc, "pid", 0))
+            if current_run_id != expected_run_id or (
+                expected_pid and current_pid != expected_pid
+            ):
+                bot._readiness_monitor_state = None
+                return
+            bot._readiness_monitor_state = None
+            log_to_card(card, severity, message.format(detail=detail))
+
+    def ready_worker() -> None:
+        posted = False
+        state["entered"].set()
+        try:
+            ready, detail = _wait_for_bot_ready(
+                name,
+                bot,
+                expected_run_id=expected_run_id,
+                expected_pid=expected_pid,
+            )
+            if detail == "superseded by newer run":
+                return
+            if ready:
+                severity = "system"
+                message = "Started - ready ({detail})"
+            elif bot.is_running():
+                severity = "warn"
+                message = "Started but not ready: {detail}"
+            else:
+                severity = "error"
+                message = "Start failed: {detail}"
+            posted = _post_ui(
+                app,
+                lambda d=detail, s=severity, m=message: commit(d, s, m),
+            )
+        except BaseException as exc:
+            state["fatal"] = exc
+        finally:
+            state["done"].set()
+            if not posted:
+                with _READINESS_MONITOR_LOCK:
+                    if getattr(bot, "_readiness_monitor_state", None) is state:
+                        bot._readiness_monitor_state = None
+
+    try:
+        worker = threading.Thread(
+            target=ready_worker,
+            name=f"ready-{name}",
+            daemon=True,
+        )
+    except BaseException as exc:
+        if not isinstance(exc, Exception):
+            raise
+        log_to_card(
+            card,
+            "warn",
+            "Started; readiness monitor unavailable: "
+            f"{_bounded_exception_summary(exc)}",
+        )
+        return
+    state["thread"] = worker
+    with _READINESS_MONITOR_LOCK:
+        bot._readiness_monitor_state = state
+    try:
+        worker.start()
+    except BaseException as exc:
+        safe_prelaunch = False
+        if (
+            isinstance(exc, Exception)
+            and thread_definitely_never_started(worker)
+        ):
+            with _READINESS_MONITOR_LOCK:
+                safe_prelaunch = (
+                    getattr(bot, "_readiness_monitor_state", None) is state
+                )
+                if safe_prelaunch:
+                    state["done"].set()
+                    bot._readiness_monitor_state = None
+        if not isinstance(exc, Exception):
+            raise
+        if safe_prelaunch:
+            log_to_card(
+                card,
+                "warn",
+                "Started; readiness monitor unavailable: "
+                f"{_bounded_exception_summary(exc)}",
+            )
 
 
 def _has_unsaved_params(app, name: str) -> bool:
@@ -363,36 +555,7 @@ def start_bot(app, name: str) -> None:
         )
         return
 
-    def _ready_worker():
-        ready, detail = _wait_for_bot_ready(name, bot)
-        if detail == "superseded by newer run":
-            return
-        if ready:
-            _post_ui(app, lambda: log_to_card(
-                card, "system", f"Started - ready ({detail})"))
-        elif bot.is_running():
-            _post_ui(app, lambda: log_to_card(
-                card, "warn", f"Started but not ready: {detail}"))
-        else:
-            _post_ui(app, lambda: log_to_card(
-                card, "error", f"Start failed: {detail}"))
-
-    try:
-        threading.Thread(
-            target=_ready_worker,
-            name=f"ready-{name}",
-            daemon=True,
-        ).start()
-    except Exception as exc:
-        # The subprocess has already started successfully. A local diagnostic
-        # thread failure must not escape the Tk callback or imply that the bot
-        # itself failed to start.
-        log_to_card(
-            card,
-            "warn",
-            "Started; readiness monitor unavailable: "
-            f"{_bounded_exception_summary(exc)}",
-        )
+    _start_readiness_monitor(app, name, bot, card)
 
 
 #  Stop 
@@ -569,6 +732,24 @@ def restart_bot(app, name: str) -> None:
         return
     app._restart_in_progress = in_flight
 
+    pending_close = getattr(bot, "close_shutdown_pending", None)
+    try:
+        close_is_pending = callable(pending_close) and pending_close()
+    except Exception as exc:
+        log_to_card(
+            card,
+            "error",
+            f"Restart aborted: shutdown state unavailable: {exc}",
+        )
+        return
+    if close_is_pending:
+        log_to_card(
+            card,
+            "warn",
+            "Restart blocked: close-position shutdown is still pending",
+        )
+        return
+
     # Persist current params first  the new subprocess will read them
     try:
         _save_current_config(app, name)
@@ -623,7 +804,7 @@ def restart_bot(app, name: str) -> None:
                 finally:
                     handoff_complete.set()
 
-            accepted = _post_ui(app, _start_on_ui)
+            accepted = _post_ui_lifecycle(app, _start_on_ui)
             if accepted:
                 try:
                     handoff_timeout = max(
@@ -672,11 +853,20 @@ def restart_bot(app, name: str) -> None:
         finally:
             in_flight.discard(name)
 
-    _start_critical_worker(
-        app,
-        _restart_worker,
-        name=f"restart-{name}",
-    )
+    try:
+        _start_critical_worker(
+            app,
+            _restart_worker,
+            name=f"restart-{name}",
+            on_definite_prelaunch_failure=lambda: in_flight.discard(name),
+        )
+    except Exception as exc:
+        log_to_card(
+            card,
+            "error",
+            "Restart worker launch reported failure: "
+            f"{_bounded_exception_summary(exc)}",
+        )
 
 
 #  Simulation toggle helper 
@@ -827,7 +1017,7 @@ def _async_close_and_stop_spot_owned(app, name: str, update) -> None:
         )
         _release_dead_process_close_locks(stopped_pid)
     except Exception as e:
-        sys.stderr.write(f"[Stop] graceful stop failed: {e}" + "\n")
+        _write_stderr_best_effort(f"[Stop] graceful stop failed: {e}\n")
         _log("error", f"Stop failed; launcher fallback aborted: {e}")
         update("Stop failed - bot is still running; fallback close aborted")
         return
@@ -874,7 +1064,7 @@ def _async_close_and_stop_futures_owned(
         )
         _release_dead_process_close_locks(stopped_pid)
     except Exception as e:
-        sys.stderr.write(f"[Stop] graceful stop failed: {e}" + "\n")
+        _write_stderr_best_effort(f"[Stop] graceful stop failed: {e}\n")
         _log("error", f"Stop failed; launcher fallback aborted: {e}")
         update("Stop failed - bot is still running; fallback close aborted")
         return
@@ -968,7 +1158,9 @@ def _async_emergency_close_owned(
                 )
                 _release_dead_process_close_locks(stopped_pid)
         except Exception as e:
-            sys.stderr.write(f"[Emergency] terminate {bot_name} failed: {e}\n")
+            _write_stderr_best_effort(
+                f"[Emergency] terminate {bot_name} failed: {e}\n"
+            )
             stop_failures.append(bot_name)
             _log("error", f"{bot_name}: stop failed; emergency fallback aborted: {e}")
 

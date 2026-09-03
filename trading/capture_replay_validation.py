@@ -198,8 +198,71 @@ def _read_connection(path: Path) -> sqlite3.Connection:
         raise FileNotFoundError(requested)
     resolved = requested.resolve(strict=True)
     connection = sqlite3.connect(f"file:{resolved.as_posix()}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
+    try:
+        connection.row_factory = sqlite3.Row
+    except BaseException as setup_error:
+        try:
+            connection.close()
+        except BaseException as close_error:
+            try:
+                setup_error.add_note(
+                    "close replay evidence connection after setup failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+        raise
     return connection
+
+
+def _note_replay_cleanup_error(
+    primary: BaseException,
+    context: str,
+    secondary: BaseException,
+) -> None:
+    try:
+        primary.add_note(
+            f"{context}: {type(secondary).__name__}: {secondary}"
+        )
+    except BaseException:
+        pass
+
+
+def _finish_read_transaction(
+    connection: sqlite3.Connection,
+    primary_error: BaseException | None,
+) -> None:
+    """Rollback and close independently while preserving error priority."""
+    cleanup_errors: list[tuple[str, BaseException]] = []
+    try:
+        if connection.in_transaction:
+            connection.rollback()
+    except BaseException as rollback_error:
+        cleanup_errors.append((
+            "rollback replay evidence connection after read",
+            rollback_error,
+        ))
+    try:
+        connection.close()
+    except BaseException as close_error:
+        cleanup_errors.append((
+            "close replay evidence connection after read",
+            close_error,
+        ))
+    if not cleanup_errors:
+        return
+    if primary_error is not None:
+        for context, cleanup_error in cleanup_errors:
+            _note_replay_cleanup_error(
+                primary_error,
+                context,
+                cleanup_error,
+            )
+        return
+    _context, cleanup_primary = cleanup_errors[0]
+    for context, secondary in cleanup_errors[1:]:
+        _note_replay_cleanup_error(cleanup_primary, context, secondary)
+    raise cleanup_primary
 
 
 def _validated_horizons(values: Iterable[int]) -> tuple[int, ...]:
@@ -436,6 +499,7 @@ def collect_sim_cost_evidence(
     database = root / "data" / "trading_bot.db"
 
     connection = _read_connection(database)
+    primary_error: BaseException | None = None
     try:
         connection.execute("BEGIN")
         required_tables = {
@@ -489,10 +553,11 @@ def collect_sim_cost_evidence(
             maximum_tca=maximum_tca,
             maximum_markout=maximum_markout,
         )
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        if connection.in_transaction:
-            connection.rollback()
-        connection.close()
+        _finish_read_transaction(connection, primary_error)
 
     paired_payloads: dict[str, dict[str, tuple[dict, object, object]]] = defaultdict(dict)
     metadata: dict[str, tuple[object, object, object]] = {}

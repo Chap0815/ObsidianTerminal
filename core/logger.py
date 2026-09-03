@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import queue
 import re
 import requests
@@ -20,12 +21,16 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 # Load .env from PROJECT_ROOT explicitly so the logger works regardless of
 # which directory the user starts from.
+from bot_utils.atomic_publish import _sync_directory as _sync_legacy_directory
+from bot_utils.runtime_threads import thread_definitely_never_started
 from core.paths import ENV_FILE
 load_dotenv(str(ENV_FILE))
 
@@ -241,6 +246,7 @@ _STRUCT_WRITER_THREAD: threading.Thread = None
 _STRUCT_WRITER_LOCK = threading.Lock()
 _STRUCT_WRITER_RETRY_AT = 0.0
 _STRUCT_WRITER_RETRY_SECONDS = 60.0
+_STRUCT_WRITER_START_UNCERTAIN = False
 
 
 def _struct_log_writer() -> None:
@@ -289,6 +295,10 @@ def _struct_log_writer() -> None:
                         if attempts >= _STRUCT_WRITE_RETRY_MAX:
                             with _STRUCT_WRITE_FAIL_LOCK:
                                 _STRUCT_WRITE_LOSSES += 1
+                            _log_struct_submit_error(
+                                "structured log write loss",
+                                e,
+                            )
                             break
                         # Keep the accepted record unfinished until durable.
                         # Retry transient Windows/rotation failures, but do
@@ -311,30 +321,87 @@ def _struct_log_writer() -> None:
             time.sleep(0.1)
 
 
-def _ensure_struct_writer() -> None:
+def _logger_worker_status(worker, start_uncertain: bool) -> str:
+    if worker is None:
+        return "absent"
+    try:
+        if worker.is_alive():
+            return "alive"
+    except BaseException:
+        return "unresolved"
+    if not start_uncertain:
+        return "dead"
+    try:
+        return "dead" if worker.ident is not None else "unresolved"
+    except BaseException:
+        return "unresolved"
+
+
+def _ensure_struct_writer(*, timeout: float | None = None) -> None:
     """Start daemon thread on first use, not at import."""
-    global _STRUCT_WRITER_THREAD, _STRUCT_WRITER_RETRY_AT
-    if _STRUCT_WRITER_THREAD and _STRUCT_WRITER_THREAD.is_alive():
+    global _STRUCT_WRITER_START_UNCERTAIN, _STRUCT_WRITER_THREAD
+    global _STRUCT_WRITER_RETRY_AT
+    status = _logger_worker_status(
+        _STRUCT_WRITER_THREAD,
+        _STRUCT_WRITER_START_UNCERTAIN,
+    )
+    if status == "alive":
         return
+    if status == "unresolved":
+        raise RuntimeError("structured log writer start unresolved")
     now = time.monotonic()
     if now < _STRUCT_WRITER_RETRY_AT:
         raise RuntimeError("structured log writer start retry deferred")
-    with _STRUCT_WRITER_LOCK:
-        if _STRUCT_WRITER_THREAD and _STRUCT_WRITER_THREAD.is_alive():
+    if timeout is None:
+        acquired = _STRUCT_WRITER_LOCK.acquire()
+    else:
+        acquired = _STRUCT_WRITER_LOCK.acquire(
+            timeout=min(max(0.0, float(timeout)), threading.TIMEOUT_MAX)
+        )
+    if not acquired:
+        raise RuntimeError("structured log writer lock timeout")
+    try:
+        status = _logger_worker_status(
+            _STRUCT_WRITER_THREAD,
+            _STRUCT_WRITER_START_UNCERTAIN,
+        )
+        if status == "alive":
             return
+        if status == "unresolved":
+            raise RuntimeError("structured log writer start unresolved")
+        _STRUCT_WRITER_START_UNCERTAIN = False
         now = time.monotonic()
         if now < _STRUCT_WRITER_RETRY_AT:
             raise RuntimeError("structured log writer start retry deferred")
-        candidate = threading.Thread(
-            target=_struct_log_writer, daemon=True, name="struct-log-writer")
+        candidate = None
         try:
+            candidate = threading.Thread(
+                target=_struct_log_writer,
+                daemon=True,
+                name="struct-log-writer",
+            )
+            _STRUCT_WRITER_THREAD = candidate
             candidate.start()
-        except Exception:
-            _STRUCT_WRITER_THREAD = None
-            _STRUCT_WRITER_RETRY_AT = now + _STRUCT_WRITER_RETRY_SECONDS
+        except BaseException as exc:
+            definitely_prelaunch = candidate is None or (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(candidate)
+            )
+            if definitely_prelaunch and (
+                candidate is None or _STRUCT_WRITER_THREAD is candidate
+            ):
+                _STRUCT_WRITER_THREAD = None
+                _STRUCT_WRITER_START_UNCERTAIN = False
+                _STRUCT_WRITER_RETRY_AT = (
+                    now + _STRUCT_WRITER_RETRY_SECONDS
+                )
+            else:
+                _STRUCT_WRITER_START_UNCERTAIN = True
+                _STRUCT_WRITER_RETRY_AT = 0.0
             raise
-        _STRUCT_WRITER_THREAD = candidate
         _STRUCT_WRITER_RETRY_AT = 0.0
+    finally:
+        _STRUCT_WRITER_LOCK.release()
 
 
 def flush_structured_logs(timeout: float = 2.0) -> bool:
@@ -361,7 +428,10 @@ def flush_structured_logs(timeout: float = 2.0) -> bool:
                         _STRUCT_WRITE_FAILS == 0
                         and _STRUCT_WRITE_LOSSES == 0
                     )
-            _ensure_struct_writer()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            _ensure_struct_writer(timeout=remaining)
         except Exception:
             return False
         remaining = deadline - time.monotonic()
@@ -926,11 +996,19 @@ def _rotate_jsonl_if_needed(path: str) -> bool:
     )
 
 
-def _log_struct_submit_error(context: str, exc: Exception) -> None:
+def _log_struct_submit_error(
+    context: str,
+    exc: Exception,
+    *,
+    interval: float = 60.0,
+) -> None:
     try:
         from bot_utils.silent_log import silent_log
 
-        silent_log(context, exc)
+        if interval == 60.0:
+            silent_log(context, exc)
+        else:
+            silent_log(context, exc, interval=interval)
     except Exception:
         pass
 
@@ -1130,13 +1208,21 @@ def _record_struct_queue_drop() -> None:
         last = _STRUCT_DROP_LAST_WARN[0]
         if (now - last) >= 30.0:
             _STRUCT_DROP_LAST_WARN[0] = now
+            message = (
+                f"structured-log queue FULL - {n} events dropped "
+                "(last 30s); writer thread may be stuck"
+            )
             try:
-                sys.stderr.write(
-                    f"[logger] structured-log queue FULL  {n} events "
-                    f"dropped (last 30s). Writer thread may be stuck.\n")
+                if sys.stderr is None:
+                    raise RuntimeError("stderr is unavailable")
+                sys.stderr.write(f"[logger] {message}\n")
                 sys.stderr.flush()
             except Exception:
-                pass
+                _log_struct_submit_error(
+                    "structured log queue full",
+                    RuntimeError(message),
+                    interval=30.0,
+                )
 
 
 # 
@@ -1422,44 +1508,142 @@ def load_j(f, default=None, *, preserve_corrupt: bool = False):
 
 def save_j(f, d):
     _ensure_dir(os.path.dirname(f))
-    # Unique tmp per writer (pid+thread) so concurrent writers  Launcher
-    # poller + bot subprocess, or this fallback racing atomic_save_json 
-    # don't clobber each other's tmp file. The final os.replace stays atomic.
-    tmp = f"{f}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(
-                d,
-                fh,
-                indent=2,
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            fh.flush()
-            # This is atomic_save_json's fallback writer. Preserve the same
-            # durability contract instead of acknowledging an unflushed state
-            # snapshot as persisted.
-            os.fsync(fh.fileno())
-        for _attempt in range(8):
-            try:
-                os.replace(tmp, f)
-                return True
-            except PermissionError:
-                if _attempt < 7:
-                    time.sleep(0.05)
-                else:
-                    raise
+        encoded = json.dumps(
+            d,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
     except Exception as e:
         log_event(
             f"Write error ({_safe_log_text(f)}): {_safe_log_text(e)}",
             "WARN",
         )
-        if os.path.exists(tmp):
+        return False
+    tmp = (
+        f"{f}.tmp.{os.getpid()}.{threading.get_ident()}."
+        f"{uuid.uuid4().hex}"
+    )
+    temporary_owned = False
+    temporary_identity: tuple[int, int] | None = None
+    propagating_primary: BaseException | None = None
+
+    def temporary_generation_matches() -> bool:
+        if temporary_identity is None:
+            return False
+        current = os.stat(tmp, follow_symlinks=False)
+        return (
+            stat.S_ISREG(current.st_mode)
+            and not os.path.islink(tmp)
+            and (current.st_dev, current.st_ino) == temporary_identity
+        )
+
+    try:
+        handle = open(tmp, "x", encoding="utf-8")
+        temporary_owned = True
+        write_primary: BaseException | None = None
+        try:
+            temporary_stat = os.fstat(handle.fileno())
+            if not stat.S_ISREG(temporary_stat.st_mode):
+                raise ValueError("logger temporary must be a regular file")
+            temporary_identity = (
+                temporary_stat.st_dev,
+                temporary_stat.st_ino,
+            )
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException as exc:
+            write_primary = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if write_primary is None:
+                    raise
+                try:
+                    write_primary.add_note(
+                        "close logger temporary after write failure: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
+
+        last_error = None
+        for attempt in range(8):
+            if attempt:
+                time.sleep(0.05)
+                try:
+                    same_generation = temporary_generation_matches()
+                except FileNotFoundError:
+                    same_generation = False
+                except BaseException as ownership_error:
+                    try:
+                        last_error.add_note(
+                            "logger temporary ownership verification failed: "
+                            f"{type(ownership_error).__name__}: "
+                            f"{ownership_error}"
+                        )
+                    except BaseException:
+                        pass
+                    break
+                if not same_generation:
+                    break
+            try:
+                os.replace(tmp, f)
+                temporary_owned = False
+                return True
+            except PermissionError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+    except Exception as e:
+        log_event(
+            f"Write error ({_safe_log_text(f)}): {_safe_log_text(e)}",
+            "WARN",
+        )
+        return False
+    except BaseException as exc:
+        propagating_primary = exc
+        raise
+    finally:
+        same_generation = False
+        cleanup_error: BaseException | None = None
+        if temporary_owned and temporary_identity is not None:
+            try:
+                same_generation = temporary_generation_matches()
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = exc
+        if same_generation:
             try:
                 os.remove(tmp)
-            except OSError:
+            except FileNotFoundError:
                 pass
-    return False
+            except BaseException as exc:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            if propagating_primary is not None:
+                try:
+                    propagating_primary.add_note(
+                        "logger temporary cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
+            else:
+                try:
+                    log_event(
+                        "Write cleanup error "
+                        f"({_safe_log_text(f)}): "
+                        f"{_safe_log_text(cleanup_error)}",
+                        "WARN",
+                    )
+                except BaseException:
+                    pass
 
 
 # 
@@ -1470,6 +1654,9 @@ _TRADE_LOG_LOCK = threading.Lock()
 _LEGACY_REBUILD_LOCK = threading.Lock()
 _LAST_LEGACY_REBUILD = 0.0
 _LEGACY_REBUILD_RUNNING = False
+_LEGACY_REBUILD_THREAD: threading.Thread | None = None
+_LEGACY_REBUILD_STATE: dict | None = None
+_LEGACY_REBUILD_SHUTDOWN_EVENT = threading.Event()
 _LEGACY_REBUILD_INTERVAL_SEC = 3600.0  # rebuild at most once per hour
 _LEGACY_REBUILD_RETRY_SEC = 60.0
 _LEGACY_HISTORY_ROW_MAX_BYTES = 64 * 1024
@@ -1485,14 +1672,39 @@ _LEGACY_HISTORY_ROW_MAX_BYTES = 64 * 1024
 
 def _stream_legacy_history(snapshot_path: str, legacy_path: str) -> bool:
     """Atomically rebuild one JSON array with bounded per-row memory."""
-    target_tmp = (
-        f"{legacy_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    directory = os.path.dirname(legacy_path) or "."
+    target_tmp = os.path.join(
+        directory,
+        f".{os.path.basename(legacy_path)}.{os.getpid()}."
+        f"{threading.get_ident()}.{uuid.uuid4().hex}.tmp",
     )
+    temporary_owned = False
+    temporary_identity: tuple[int, int] | None = None
+    primary_error: BaseException | None = None
+
+    def temporary_generation_matches() -> bool:
+        if temporary_identity is None:
+            return False
+        current = os.stat(target_tmp, follow_symlinks=False)
+        return (
+            stat.S_ISREG(current.st_mode)
+            and not os.path.islink(target_tmp)
+            and (current.st_dev, current.st_ino) == temporary_identity
+        )
+
     try:
-        _ensure_dir(os.path.dirname(legacy_path))
+        _ensure_dir(directory)
         with open(snapshot_path, "rb") as source, open(
-            target_tmp, "w", encoding="utf-8"
+            target_tmp, "x", encoding="utf-8"
         ) as target:
+            temporary_owned = True
+            temporary_stat = os.fstat(target.fileno())
+            if not stat.S_ISREG(temporary_stat.st_mode):
+                raise ValueError("legacy history temporary must be regular")
+            temporary_identity = (
+                temporary_stat.st_dev,
+                temporary_stat.st_ino,
+            )
             target.write("[")
             first = True
             while True:
@@ -1519,30 +1731,68 @@ def _stream_legacy_history(snapshot_path: str, legacy_path: str) -> bool:
                 first = False
             target.write("\n]\n" if not first else "]\n")
             target.flush()
-            try:
-                os.fsync(target.fileno())
-            except (AttributeError, OSError):
-                pass
+            os.fsync(target.fileno())
         for attempt in range(8):
+            if attempt:
+                time.sleep(0.05)
+            if not temporary_generation_matches():
+                raise RuntimeError(
+                    "legacy history temporary generation changed before publish"
+                )
             try:
                 os.replace(target_tmp, legacy_path)
+                temporary_owned = False
+                _sync_legacy_directory(Path(directory))
                 return True
             except PermissionError:
                 if attempt >= 7:
                     raise
-                time.sleep(0.05)
     except Exception as exc:
+        primary_error = exc
         log_event(
             f"Write error ({_safe_log_text(legacy_path)}): "
             f"{_safe_log_text(exc)}",
             "WARN",
         )
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        try:
-            if os.path.exists(target_tmp):
+        cleanup_error: BaseException | None = None
+        same_generation = False
+        if temporary_owned and temporary_identity is not None:
+            try:
+                same_generation = temporary_generation_matches()
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = exc
+        if same_generation:
+            try:
                 os.remove(target_tmp)
-        except OSError:
-            pass
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            if primary_error is not None:
+                try:
+                    primary_error.add_note(
+                        "legacy history owned temporary cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
+            else:
+                try:
+                    log_event(
+                        "Write cleanup error "
+                        f"({_safe_log_text(legacy_path)}): "
+                        f"{_safe_log_text(cleanup_error)}",
+                        "WARN",
+                    )
+                except BaseException:
+                    pass
     return False
 
 
@@ -1585,43 +1835,123 @@ def _legacy_rebuild_worker(jsonl_path: str, legacy_path: str) -> None:
 def _legacy_rebuild_worker_singleflight(
     jsonl_path: str,
     legacy_path: str,
+    state: dict,
 ) -> None:
     """Run one rebuild and always release its process-local admission latch."""
-    global _LEGACY_REBUILD_RUNNING
+    global _LEGACY_REBUILD_RUNNING, _LEGACY_REBUILD_STATE
     try:
         _legacy_rebuild_worker(jsonl_path, legacy_path)
     finally:
         with _LEGACY_REBUILD_LOCK:
-            _LEGACY_REBUILD_RUNNING = False
+            state["done"].set()
+            if _LEGACY_REBUILD_STATE is state:
+                _LEGACY_REBUILD_RUNNING = False
 
 
 def _maybe_rebuild_legacy(jsonl_path: str, legacy_path: str) -> None:
     """Rebuild legacy file at most once per hour, on a background thread."""
     global _LAST_LEGACY_REBUILD, _LEGACY_REBUILD_RUNNING
+    global _LEGACY_REBUILD_STATE, _LEGACY_REBUILD_THREAD
     now = time.monotonic()
     with _LEGACY_REBUILD_LOCK:
+        if _LEGACY_REBUILD_SHUTDOWN_EVENT.is_set():
+            return
         if _LEGACY_REBUILD_RUNNING:
             return
         if now - _LAST_LEGACY_REBUILD < _LEGACY_REBUILD_INTERVAL_SEC:
             return
         _LEGACY_REBUILD_RUNNING = True
+        candidate = None
+        state = {"done": threading.Event(), "thread": None}
         try:
             candidate = threading.Thread(
                 target=_legacy_rebuild_worker_singleflight,
-                args=(jsonl_path, legacy_path),
+                args=(jsonl_path, legacy_path, state),
                 daemon=True, name="legacy-history-rebuild",
             )
+            state["thread"] = candidate
+            _LEGACY_REBUILD_STATE = state
+            _LEGACY_REBUILD_THREAD = candidate
             candidate.start()
-        except BaseException:
-            _LEGACY_REBUILD_RUNNING = False
-            # A job that never started must not consume the full hourly slot.
-            # Keep a short retry delay to avoid hot-looping repeated failures.
-            _LAST_LEGACY_REBUILD = (
-                now - _LEGACY_REBUILD_INTERVAL_SEC
-                + _LEGACY_REBUILD_RETRY_SEC
+        except BaseException as exc:
+            definitely_prelaunch = candidate is None or (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(candidate)
             )
+            if (
+                definitely_prelaunch
+                and (
+                    candidate is None
+                    or (
+                        _LEGACY_REBUILD_THREAD is candidate
+                        and _LEGACY_REBUILD_STATE is state
+                    )
+                )
+            ):
+                state["done"].set()
+                _LEGACY_REBUILD_THREAD = None
+                _LEGACY_REBUILD_STATE = None
+                _LEGACY_REBUILD_RUNNING = False
+                # A job that never started must not consume the full hourly
+                # slot. Keep a short retry delay to avoid hot-looping.
+                _LAST_LEGACY_REBUILD = (
+                    now - _LEGACY_REBUILD_INTERVAL_SEC
+                    + _LEGACY_REBUILD_RETRY_SEC
+                )
+            else:
+                _LAST_LEGACY_REBUILD = now
             raise
         _LAST_LEGACY_REBUILD = now
+
+
+def shutdown_legacy_rebuild(timeout: float = 2.0) -> bool:
+    """Close rebuild admission and boundedly join the owned daemon worker."""
+    if isinstance(timeout, bool):
+        return False
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(budget):
+        return False
+    budget = min(max(0.0, budget), threading.TIMEOUT_MAX)
+    deadline = time.monotonic() + budget
+    _LEGACY_REBUILD_SHUTDOWN_EVENT.set()
+    lock_timeout = min(
+        max(0.0, deadline - time.monotonic()),
+        threading.TIMEOUT_MAX,
+    )
+    if not _LEGACY_REBUILD_LOCK.acquire(timeout=lock_timeout):
+        return False
+    try:
+        state = _LEGACY_REBUILD_STATE
+        running = _LEGACY_REBUILD_RUNNING
+    finally:
+        _LEGACY_REBUILD_LOCK.release()
+    done = None
+    if state is not None:
+        if not isinstance(state, dict):
+            return False
+        thread = state.get("thread")
+        done = state.get("done")
+        if thread is None or not isinstance(done, threading.Event):
+            return False
+    else:
+        thread = _LEGACY_REBUILD_THREAD
+    if thread is None:
+        return not running
+    if thread is threading.current_thread():
+        return False
+    try:
+        if thread.is_alive():
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            return False
+        if done is not None and not done.is_set():
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def save_trade(log_dir, symbol, buy_price, buy_time, sell_price,
@@ -1768,6 +2098,7 @@ _TG_WORKER_THREAD = None
 _TG_WORKER_LOCK = threading.Lock()
 _TG_WORKER_RETRY_AT = 0.0
 _TG_WORKER_RETRY_SECONDS = 60.0
+_TG_WORKER_START_UNCERTAIN = False
 
 
 def _telegram_worker() -> None:
@@ -1830,6 +2161,19 @@ def _telegram_worker() -> None:
                         )
                 else:
                     _record_tg_failure(failure_reason, recipient_key)
+                    # Preserve bounded, redacted evidence for an alert that is
+                    # otherwise irretrievably lost after the in-memory queue is
+                    # acknowledged.  This is an audit/dead-letter record only;
+                    # automatic replay could duplicate an already delivered
+                    # message after an ambiguous network failure.
+                    try:
+                        _write_telegram_overflow(
+                            chat_id,
+                            msg,
+                            f"delivery_failed:{failure_reason}",
+                        )
+                    except Exception:
+                        pass
             finally:
                 try:
                     _TG_QUEUE.task_done()
@@ -1844,29 +2188,68 @@ def _telegram_worker() -> None:
             time.sleep(0.1)
 
 
-def _ensure_tg_worker() -> None:
-    global _TG_WORKER_THREAD, _TG_WORKER_RETRY_AT
-    if _TG_WORKER_THREAD and _TG_WORKER_THREAD.is_alive():
+def _ensure_tg_worker(*, timeout: float | None = None) -> None:
+    global _TG_WORKER_START_UNCERTAIN, _TG_WORKER_THREAD
+    global _TG_WORKER_RETRY_AT
+    status = _logger_worker_status(
+        _TG_WORKER_THREAD,
+        _TG_WORKER_START_UNCERTAIN,
+    )
+    if status == "alive":
         return
+    if status == "unresolved":
+        raise RuntimeError("telegram worker start unresolved")
     now = time.monotonic()
     if now < _TG_WORKER_RETRY_AT:
         raise RuntimeError("telegram worker start retry deferred")
-    with _TG_WORKER_LOCK:
-        if _TG_WORKER_THREAD and _TG_WORKER_THREAD.is_alive():
+    if timeout is None:
+        acquired = _TG_WORKER_LOCK.acquire()
+    else:
+        acquired = _TG_WORKER_LOCK.acquire(
+            timeout=min(max(0.0, float(timeout)), threading.TIMEOUT_MAX)
+        )
+    if not acquired:
+        raise RuntimeError("telegram worker lock timeout")
+    try:
+        status = _logger_worker_status(
+            _TG_WORKER_THREAD,
+            _TG_WORKER_START_UNCERTAIN,
+        )
+        if status == "alive":
             return
+        if status == "unresolved":
+            raise RuntimeError("telegram worker start unresolved")
+        _TG_WORKER_START_UNCERTAIN = False
         now = time.monotonic()
         if now < _TG_WORKER_RETRY_AT:
             raise RuntimeError("telegram worker start retry deferred")
-        candidate = threading.Thread(
-            target=_telegram_worker, daemon=True, name="telegram-worker")
+        candidate = None
         try:
+            candidate = threading.Thread(
+                target=_telegram_worker,
+                daemon=True,
+                name="telegram-worker",
+            )
+            _TG_WORKER_THREAD = candidate
             candidate.start()
-        except Exception:
-            _TG_WORKER_THREAD = None
-            _TG_WORKER_RETRY_AT = now + _TG_WORKER_RETRY_SECONDS
+        except BaseException as exc:
+            definitely_prelaunch = candidate is None or (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(candidate)
+            )
+            if definitely_prelaunch and (
+                candidate is None or _TG_WORKER_THREAD is candidate
+            ):
+                _TG_WORKER_THREAD = None
+                _TG_WORKER_START_UNCERTAIN = False
+                _TG_WORKER_RETRY_AT = now + _TG_WORKER_RETRY_SECONDS
+            else:
+                _TG_WORKER_START_UNCERTAIN = True
+                _TG_WORKER_RETRY_AT = 0.0
             raise
-        _TG_WORKER_THREAD = candidate
         _TG_WORKER_RETRY_AT = 0.0
+    finally:
+        _TG_WORKER_LOCK.release()
 
 
 def flush_telegram(timeout: float = 2.0) -> bool:
@@ -1889,7 +2272,10 @@ def flush_telegram(timeout: float = 2.0) -> bool:
         try:
             if _TG_QUEUE.unfinished_tasks == 0:
                 return True
-            _ensure_tg_worker()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            _ensure_tg_worker(timeout=remaining)
         except Exception:
             return False
         remaining = deadline - time.monotonic()
@@ -1970,14 +2356,20 @@ def _rotate_overflow_if_needed() -> bool:
     )
 
 
-def _write_telegram_overflow(cid: str, msg: str) -> None:
+def _write_telegram_overflow(
+    cid: str,
+    msg: str,
+    reason: str = "queue_overflow",
+) -> None:
     safe_cid = _telegram_config_text(cid, max_chars=256) or "[invalid]"
     if len(safe_cid) > 4:
         safe_cid = "***" + safe_cid[-4:]
+    safe_reason = clean_user_text(reason, max_chars=100) or "unknown"
     line = json.dumps({
             "ts": _date(),
             "chat_id": safe_cid,
             "msg": redact(clean_user_text(msg, max_chars=500))[:500],
+            "reason": safe_reason,
         }) + "\n"
     _append_rotating_text(
         _TG_OVERFLOW_LOG,

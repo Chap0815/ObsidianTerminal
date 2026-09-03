@@ -27,6 +27,7 @@ from news.http_limits import (
     require_success,
 )
 from shared_limits import read_loopback_proxy_port
+from bot_utils.runtime_threads import thread_definitely_never_started
 
 # Load .env from PROJECT_ROOT explicitly.
 from core.paths import ENV_FILE
@@ -80,12 +81,68 @@ def _http_get(url, **kwargs):
 # _RSS_POOL, so the two never compete for the same workers.
 _NEWS_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="news")
 _RSS_POOL  = ThreadPoolExecutor(max_workers=8,  thread_name_prefix="news-rss")
+_NEWS_SHUTDOWN_LOCK = threading.Lock()
+_NEWS_SESSION_CLOSED = False
+_NEWS_TERMINAL = False
+_NEWS_SHUTDOWN_GENERATION = None
+_NEWS_ACTIVE_TASKS = []
 
 
-@atexit.register
-def _shutdown_news_pools():
-    """Shut down both pools at process exit so we don't hold the interpreter
-    alive on in-flight RSS fetches."""
+def _complete_news_task(token) -> None:
+    with _NEWS_SHUTDOWN_LOCK:
+        if token["admission_confirmed"].is_set():
+            _NEWS_ACTIVE_TASKS[:] = [
+                active for active in _NEWS_ACTIVE_TASKS if active is not token
+            ]
+
+
+def _run_owned_news_task(token, fn, args):
+    token["thread"] = threading.current_thread()
+    token["started"].set()
+    try:
+        return fn(*args)
+    finally:
+        token["done"].set()
+        _complete_news_task(token)
+
+
+def _complete_cancelled_news_task(token, future) -> None:
+    try:
+        cancelled = future.cancelled()
+    except BaseException:
+        return
+    if cancelled and not token["started"].is_set():
+        token["done"].set()
+        _complete_news_task(token)
+
+
+def _prune_ambiguous_news_tasks_locked() -> None:
+    retained = []
+    for token in _NEWS_ACTIVE_TASKS:
+        if token["admission_confirmed"].is_set():
+            if not token["done"].is_set():
+                retained.append(token)
+            continue
+        if not token["done"].is_set():
+            retained.append(token)
+            continue
+        thread = token.get("thread")
+        if thread is None:
+            # Submit raised before returning a Future and no callable ever
+            # started. Acceptance is unknowable, so retain ownership.
+            retained.append(token)
+            continue
+        try:
+            if thread.is_alive():
+                retained.append(token)
+        except BaseException:
+            retained.append(token)
+    _NEWS_ACTIVE_TASKS[:] = retained
+
+
+def _news_shutdown_attempt() -> bool:
+    global _NEWS_SESSION_CLOSED
+    shutdown_ok = True
     for pool in (_NEWS_POOL, _RSS_POOL):
         try:
             pool.shutdown(wait=False, cancel_futures=True)
@@ -93,9 +150,186 @@ def _shutdown_news_pools():
             try:
                 pool.shutdown(wait=False)
             except Exception:
-                pass
+                shutdown_ok = False
         except Exception:
-            pass
+            shutdown_ok = False
+
+    # shutdown(wait=False) is only a stop request. Do not close the shared
+    # Session while an accepted request can still be using it.
+    workers_alive = False
+    for pool in (_NEWS_POOL, _RSS_POOL):
+        try:
+            workers_alive = workers_alive or any(
+                thread.is_alive() for thread in tuple(pool._threads)
+            )
+        except Exception:
+            shutdown_ok = False
+    with _NEWS_SHUTDOWN_LOCK:
+        _prune_ambiguous_news_tasks_locked()
+        tasks_active = bool(_NEWS_ACTIVE_TASKS)
+    if workers_alive or tasks_active or not shutdown_ok:
+        return False
+
+    if not _NEWS_SESSION_CLOSED:
+        try:
+            _SESSION.close()
+        except Exception:
+            return False
+        _NEWS_SESSION_CLOSED = True
+    return True
+
+
+def _news_shutdown_generation_unresolved(generation) -> bool:
+    if generation is None:
+        return False
+    if not generation["done"].is_set():
+        return True
+    thread = generation.get("thread")
+    if thread is None:
+        return False
+    try:
+        return bool(thread.is_alive())
+    except BaseException:
+        return True
+
+
+def shutdown_news_resources(timeout: float = 1.0) -> bool:
+    """Terminally close news resources within one end-to-end deadline."""
+    global _NEWS_SHUTDOWN_GENERATION, _NEWS_TERMINAL
+    if isinstance(timeout, bool):
+        return False
+    try:
+        requested_timeout = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(requested_timeout):
+        return False
+    budget = min(max(0.0, requested_timeout), threading.TIMEOUT_MAX)
+    deadline = time.monotonic() + budget
+
+    lock_timeout = min(
+        max(0.0, deadline - time.monotonic()),
+        threading.TIMEOUT_MAX,
+    )
+    if not _NEWS_SHUTDOWN_LOCK.acquire(timeout=lock_timeout):
+        return False
+    candidate = None
+    generation = None
+    try:
+        _NEWS_TERMINAL = True
+        existing = _NEWS_SHUTDOWN_GENERATION
+        if _news_shutdown_generation_unresolved(existing):
+            generation = existing
+        elif existing is not None and existing.get("result") is True:
+            generation = existing
+        else:
+            generation = {
+                "thread": None,
+                "done": threading.Event(),
+                "result": False,
+            }
+
+            def run_shutdown_generation() -> None:
+                try:
+                    generation["result"] = _news_shutdown_attempt()
+                except BaseException:
+                    generation["result"] = False
+                finally:
+                    generation["done"].set()
+
+            try:
+                candidate = threading.Thread(
+                    target=run_shutdown_generation,
+                    name="news-resource-shutdown",
+                    daemon=True,
+                )
+            except BaseException as exc:
+                generation["done"].set()
+                if not isinstance(exc, Exception):
+                    raise
+                return False
+            generation["thread"] = candidate
+            _NEWS_SHUTDOWN_GENERATION = generation
+    finally:
+        _NEWS_SHUTDOWN_LOCK.release()
+
+    if candidate is not None:
+        try:
+            candidate.start()
+        except BaseException as exc:
+            if (
+                isinstance(exc, Exception)
+                and thread_definitely_never_started(candidate)
+            ):
+                generation["done"].set()
+            if not isinstance(exc, Exception):
+                raise
+            return False
+
+    thread = generation.get("thread")
+    if thread is not None and thread is not threading.current_thread():
+        try:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        except (RuntimeError, AttributeError):
+            return False
+
+    lock_timeout = min(
+        max(0.0, deadline - time.monotonic()),
+        threading.TIMEOUT_MAX,
+    )
+    if not _NEWS_SHUTDOWN_LOCK.acquire(timeout=lock_timeout):
+        return False
+    try:
+        return (
+            _NEWS_SHUTDOWN_GENERATION is generation
+            and generation["done"].is_set()
+            and generation.get("result") is True
+            and not _news_shutdown_generation_unresolved(generation)
+        )
+    finally:
+        _NEWS_SHUTDOWN_LOCK.release()
+
+
+def _submit_news_work(pool, fn, *args):
+    """Serialize task admission against terminal resource shutdown."""
+    with _NEWS_SHUTDOWN_LOCK:
+        if _NEWS_TERMINAL:
+            return None
+        token = {
+            "started": threading.Event(),
+            "done": threading.Event(),
+            "admission_confirmed": threading.Event(),
+            "thread": None,
+        }
+        _NEWS_ACTIVE_TASKS.append(token)
+        # Keep the token sticky when submit raises: ThreadPoolExecutor can
+        # enqueue/start work before propagating a worker-start failure. The
+        # callable finalizer remains the only authoritative completion signal.
+        future = pool.submit(_run_owned_news_task, token, fn, args)
+        token["admission_confirmed"].set()
+        if token["done"].is_set():
+            _NEWS_ACTIVE_TASKS[:] = [
+                active for active in _NEWS_ACTIVE_TASKS if active is not token
+            ]
+    try:
+        future.add_done_callback(
+            lambda completed: _complete_cancelled_news_task(token, completed)
+        )
+    except BaseException:
+        # The callable finalizer still owns executed work. If callback
+        # registration itself is ambiguous, retaining the token is fail-closed
+        # for a task cancelled before execution.
+        pass
+    return future
+
+
+@atexit.register
+def _shutdown_news_pools():
+    """Best-effort fallback for callers outside the managed bot lifecycle."""
+    try:
+        shutdown_news_resources(timeout=1.0)
+    except Exception:
+        pass
 
 
 _news_cache: "OrderedDict[str, dict]" = OrderedDict()
@@ -497,10 +731,11 @@ def _fetch_one_rss(url: str, symbol: str) -> list:
 def _fetch_rss_feeds(symbol: str) -> list:
     # Submit to the dedicated RSS pool so the outer _NEWS_POOL isn't blocked
     # by the per-feed sub-tasks.
-    futures = {
-        _RSS_POOL.submit(_fetch_one_rss, url, symbol): url
-        for url in _RSS_FEEDS
-    }
+    futures = {}
+    for url in _RSS_FEEDS:
+        future = _submit_news_work(_RSS_POOL, _fetch_one_rss, url, symbol)
+        if future is not None:
+            futures[future] = url
     all_found = _gather_futures(futures, _ASCOMPLETED_BUFFER_SEC)
     return _dedupe(all_found)[:8]
 
@@ -688,8 +923,11 @@ def fetch_general_market_news() -> list:
             ("coingecko_global",   _fetch_coingecko_global_status),
             ("fear_greed",         _fetch_fear_greed_history),
         ]
-        futs = {_NEWS_POOL.submit(_safe_fetch, name, fn): name
-                 for name, fn in sources}
+        futs = {}
+        for name, fn in sources:
+            future = _submit_news_work(_NEWS_POOL, _safe_fetch, name, fn)
+            if future is not None:
+                futs[future] = name
         results = _gather_futures(futs, _ASCOMPLETED_BUFFER_SEC)
 
         if results:
@@ -715,8 +953,11 @@ def fetch_symbol_news(symbol: str, max_items: int = 8) -> list:
         ("reddit",      lambda: _fetch_reddit(sym_up)),
         ("rss",         lambda: _fetch_rss_feeds(sym_up)),
     ]
-    futs = {_NEWS_POOL.submit(_safe_fetch, name, fn): name
-             for name, fn in sources}
+    futs = {}
+    for name, fn in sources:
+        future = _submit_news_work(_NEWS_POOL, _safe_fetch, name, fn)
+        if future is not None:
+            futs[future] = name
     all_headlines = _gather_futures(futs, _ASCOMPLETED_BUFFER_SEC + 4)
 
     unique = _dedupe(all_headlines)

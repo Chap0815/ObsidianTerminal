@@ -95,11 +95,59 @@ def _read_config(path: Path | None) -> dict:
     return value
 
 
+def _fsync_directory(path: Path) -> None:
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(str(path), flags)
+    except AttributeError:
+        return
+    except OSError as exc:
+        if os.name == "nt":
+            if isinstance(exc, PermissionError):
+                return
+            if (
+                isinstance(exc, FileNotFoundError)
+                and path == Path(path.anchor)
+                and path.is_dir()
+            ):
+                return
+        raise
+    primary_error: BaseException | None = None
+    try:
+        os.fsync(directory_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            os.close(directory_fd)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            try:
+                primary_error.add_note(
+                    "replay output directory close failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            except BaseException:
+                pass
+
+
+def _mkdir_with_parent_fsync(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    parent = path.parent
+    while True:
+        _fsync_directory(parent)
+        if parent == parent.parent:
+            break
+        parent = parent.parent
+
+
 def _write_immutable_output(path: Path, encoded: bytes) -> Path:
     if len(encoded) > MAX_REPLAY_REPORT_BYTES:
         raise ValueError("replay output is oversized")
     path = _absolute_without_links(path, label="replay output")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_with_parent_fsync(path.parent)
     path = _absolute_without_links(path, label="replay output")
 
     def existing_matches() -> bool:
@@ -115,41 +163,67 @@ def _write_immutable_output(path: Path, encoded: bytes) -> Path:
 
     if path.exists() or _is_linklike(path):
         if existing_matches():
+            _fsync_directory(path.parent)
             return path
         raise FileExistsError("immutable replay output conflict")
     temporary = path.with_name(
         f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
+    primary_error: BaseException | None = None
+    temporary_owned = False
+    handle = None
     try:
-        with temporary.open("xb") as handle:
+        handle = temporary.open("xb")
+        temporary_owned = True
+        try:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                if primary_error is None:
+                    primary_error = close_error
+                    raise
+                try:
+                    primary_error.add_note(
+                        "replay output close failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                except BaseException:
+                    pass
         try:
             os.link(temporary, path)
         except FileExistsError as exc:
             if existing_matches():
+                _fsync_directory(path.parent)
                 return path
             raise FileExistsError("immutable replay output conflict") from exc
-        try:
-            directory_fd = os.open(str(path.parent), os.O_RDONLY)
-        except OSError:
-            directory_fd = None
-        if directory_fd is not None:
-            try:
-                os.fsync(directory_fd)
-            except OSError:
-                pass
-            finally:
-                try:
-                    os.close(directory_fd)
-                except OSError:
-                    pass
+        _fsync_directory(path.parent)
+    except BaseException as exc:
+        if primary_error is None:
+            primary_error = exc
+        raise
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if temporary_owned:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                try:
+                    primary_error.add_note(
+                        "replay output cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
     return path
 
 

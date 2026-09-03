@@ -130,8 +130,14 @@ class TrendBot(SpotBot):
             ExitsMixin._cleanup_accounted_close_state(self, sym, d)
             return True
         if d.get("accounting_pending"):
+            from core.spot_bot_reconcile import (
+                _defer_spot_accounting_retry,
+                _record_spot_offline_close,
+                _spot_accounting_retry_due,
+            )
+            if not _spot_accounting_retry_due(d):
+                return True
             try:
-                from core.spot_bot_reconcile import _record_spot_offline_close
                 if _record_spot_offline_close(self, sym, d):
                     booked = dict(d)
                     booked.update({
@@ -146,8 +152,11 @@ class TrendBot(SpotBot):
                     })
                     from core.spot_bot_exits import ExitsMixin
                     ExitsMixin._cleanup_accounted_close_state(self, sym, booked)
+                else:
+                    _defer_spot_accounting_retry(self, sym, d)
             except Exception as exc:
                 self._log_error(f"trend pending accounting retry {sym}", exc)
+                _defer_spot_accounting_retry(self, sym, d)
             return True
         if d.get("claim_conflict"):
             try:
@@ -466,7 +475,7 @@ class TrendBot(SpotBot):
             from core.spot_bot_scan import SpotBuyOutcomeUnknown
 
             try:
-                entry = self._place_buy_order(
+                entry = self._place_buy_order_with_runtime_guard(
                     sym,
                     {"price": price},
                     coin_size,
@@ -494,7 +503,10 @@ class TrendBot(SpotBot):
                 clean_failure = not self.state.has(sym)
                 released = not _trend_claimed
                 if _trend_claimed:
-                    released = self._release_entry_claim_if_untracked(sym)
+                    released = self._release_entry_claim_if_untracked(
+                        sym,
+                        entry_id=entry_id,
+                    )
                     if released:
                         from core.database import release_portfolio_reservation
 
@@ -521,7 +533,10 @@ class TrendBot(SpotBot):
                     reason="no_verified_fill",
                 )
                 if _trend_claimed:
-                    released = self._release_entry_claim_if_untracked(sym)
+                    released = self._release_entry_claim_if_untracked(
+                        sym,
+                        entry_id=entry_id,
+                    )
                     if released:
                         from core.database import release_portfolio_reservation
 
@@ -543,6 +558,13 @@ class TrendBot(SpotBot):
                 entry_fee, votes, entry_id,
                 sim_tca_pending=sim_tca_pending,
             )
+            if state_ok is None:
+                log_event(
+                    f"Trend BUY {sym}: final state promotion was superseded "
+                    "by another entry generation; no rollback was sent",
+                    "ERROR",
+                )
+                continue
             if state_ok is False:
                 emit_entry_lifecycle(
                     entry_id,
@@ -620,7 +642,24 @@ class TrendBot(SpotBot):
             if not self.simulation:
                 from core.database import release_portfolio_reservation
 
-                release_portfolio_reservation(entry_id, status="CONSUMED")
+                try:
+                    release_portfolio_reservation(entry_id, status="CONSUMED")
+                except Exception as reservation_exc:
+                    try:
+                        log_event(
+                            f"Trend BUY {sym}: portfolio reservation consume "
+                            "failed; reservation remains ACTIVE fail-closed",
+                            "ERROR",
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        self._log_error(
+                            f"consume trend portfolio reservation {sym}",
+                            reservation_exc,
+                        )
+                    except Exception:
+                        pass
             emit_entry_lifecycle(
                 entry_id,
                 bot=self.BOT_NAME,
@@ -666,11 +705,17 @@ class TrendBot(SpotBot):
         }
         if sim_tca_pending is not None:
             fields[self._SIM_TCA_PENDING_FIELD] = sim_tca_pending
-        if self.state.has(sym):
-            return self.state.update_many(sym, fields)
-        else:
-            fields["buy_time"] = _utc_now_str()
-            return self.state.add(sym, fields)
+        from bot_utils.trade_state import promote_position_generation
+
+        create_fields = dict(fields)
+        create_fields["buy_time"] = _utc_now_str()
+        return promote_position_generation(
+            self.state,
+            sym,
+            fields,
+            {"entry_id": entry_id},
+            create_fields=create_fields,
+        )
 
     #  MONITOR loop: exit coins that fell out of trend, + killswitch 
 

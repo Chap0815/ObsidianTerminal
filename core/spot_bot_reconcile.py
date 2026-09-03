@@ -59,11 +59,22 @@ def _spot_accounting_retry_due(
     retry_at = _finite_float_or_none(row.get("accounting_retry_next_at"))
     if retry_at is None:
         return True
-    current = time.time() if now_epoch is None else float(now_epoch)
+    current = _finite_float_or_none(
+        time.time() if now_epoch is None else now_epoch
+    )
+    if current is None:
+        return True
+    # Persisted deadlines are bounded by the writer's maximum backoff.  A
+    # farther future value can only come from clock rollback or corrupt state;
+    # never let it suppress idempotent accounting recovery indefinitely.
+    if retry_at > current + _SPOT_ACCOUNTING_RETRY_MAX_SEC:
+        return True
     return current >= retry_at
 
 
 def _defer_spot_accounting_retry(bot, sym: str, row: dict) -> float:
+    from bot_utils.trade_state import update_many_if_current
+
     attempts_raw = row.get("accounting_retry_attempts", 0)
     try:
         attempts = max(0, int(attempts_raw)) + 1
@@ -75,12 +86,14 @@ def _defer_spot_accounting_retry(bot, sym: str, row: dict) -> float:
     )
     retry_at = time.time() + delay
     try:
-        bot.state.update_many(
+        update_many_if_current(
+            bot.state,
             sym,
             {
                 "accounting_retry_attempts": attempts,
                 "accounting_retry_next_at": retry_at,
             },
+            row,
         )
     except Exception:
         pass
@@ -392,6 +405,20 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
     from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
     try:
+        from bot_utils.trade_state import (
+            validated_close_accounting_mode_or_none,
+        )
+        accounting_mode_is_sim = validated_close_accounting_mode_or_none(
+            state_row,
+            getattr(bot, "simulation", None),
+        )
+        if accounting_mode_is_sim is None:
+            log_event(
+                f" {sym}: offline-close skipped - accounting mode conflicts "
+                "with runtime",
+                "ERROR",
+            )
+            return False
         buy = _positive_float_or_none(state_row.get("buy"))
         amount = _positive_float_or_none(state_row.get("amount"))
         buy_time = state_row.get("buy_time", "")
@@ -542,10 +569,6 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
                 "WARN")
             return False
 
-        accounting_mode_is_sim = state_row.get(
-            "accounting_pending_mode_is_sim",
-            getattr(bot, "simulation", None),
-        )
         accounting_exchange_order_id = state_row.get(
             "accounting_pending_exchange_order_id"
         )
@@ -600,7 +623,7 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
             mae_pct=mae_pct,
             giveback_pct=giveback_pct,
         )
-        if not saved:
+        if saved is not True:
             log_event(
                 f" {sym}: offline-close DB save failed  state kept "
                 f"for accounting retry.", "WARN")
@@ -681,7 +704,8 @@ def _persist_spot_external_partial_state(
     from core.logger import log_event
 
     try:
-        durable = bool(bot.state.update_many(sym, fields))
+        persisted = bot.state.update_many(sym, fields)
+        durable = persisted is None or persisted is True
     except Exception as exc:
         durable = False
         try:
@@ -700,6 +724,18 @@ def _persist_spot_external_partial_state(
 def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
     from core.database import _strict_claim_extra_object
 
+    raw_state = pos.get("state")
+    if raw_state is not None and (
+        not isinstance(raw_state, str)
+        or raw_state.strip().upper() != "OPEN"
+    ):
+        return None
+    raw_position_type = pos.get("position_type")
+    if raw_position_type is not None and (
+        not isinstance(raw_position_type, str)
+        or raw_position_type.strip().upper() != "SPOT"
+    ):
+        return None
     extra = _strict_claim_extra_object(pos.get("extra_json"))
     if extra is None:
         return None
@@ -938,7 +974,7 @@ def _record_spot_external_partial(bot, sym: str, state_row: dict,
     if not _persist_spot_external_partial_state(bot, sym, fields):
         return False, fields
     try:
-        saved = bool(save_trade_db(**item))
+        saved = save_trade_db(**item) is True
     except Exception as exc:
         saved = False
         try:
@@ -947,11 +983,12 @@ def _record_spot_external_partial(bot, sym: str, state_row: dict,
             pass
     if saved:
         try:
-            cleared = bool(bot.state.update(
+            clear_result = bot.state.update(
                 sym,
                 "accounting_pending_partials",
                 pending[:-1],
-            ))
+            )
+            cleared = clear_result is None or clear_result is True
         except Exception as exc:
             cleared = False
             try:
@@ -1026,16 +1063,17 @@ def _is_fresh_position(state_row, max_age_s: float) -> bool:
     would WRONGLY shrink a live position. Skipping the shrink for one reconcile
     interval lets the balance settle; a real external partial-sell is adjusted
     on the next cycle once the position is older. Missing/unparseable buy_time
-    treated as NOT fresh (don't block the normal adjust)."""
+    has unknown provenance and therefore keeps this destructive adjustment
+    blocked until state integrity is repaired."""
     bt = state_row.get("buy_time", "")
     if not bt:
-        return False
+        return True
     from datetime import datetime, timezone
     try:
         opened = datetime.strptime(str(bt), "%Y-%m-%d %H:%M:%S").replace(
             tzinfo=timezone.utc)
     except (ValueError, TypeError):
-        return False
+        return True
     try:
         from core.clock import now_utc
 
@@ -1164,12 +1202,26 @@ def _gate_missing_for_removal(bot, sym, state_row, strikes, threshold: int = 2) 
         except AttributeError:
             live_row = state_row
         if bool(live_row.get("accounting_already_booked")):
-            removed = bot.state.remove(sym)
+            from bot_utils.trade_state import remove_with_restore_fields
+
+            removed = remove_with_restore_fields(
+                bot.state,
+                sym,
+                {"accounting_already_booked": True},
+                expected_row=live_row,
+            )
             if removed:
                 strikes.pop(sym, None)
                 return True
             try:
-                bot.state.update_many(sym, {"accounting_already_booked": True})
+                from bot_utils.trade_state import update_many_if_current
+
+                update_many_if_current(
+                    bot.state,
+                    sym,
+                    {"accounting_already_booked": True},
+                    live_row,
+                )
             except Exception:
                 pass
             return False
@@ -1208,6 +1260,27 @@ def _gate_missing_for_removal(bot, sym, state_row, strikes, threshold: int = 2) 
                 f"offline-close accounting failed  state kept for retry",
                 "WARN")
             return False
+        from bot_utils.trade_state import same_position_generation
+        try:
+            latest_row = bot.state.get(sym)
+            latest_is_authoritative = True
+        except AttributeError:
+            # Preserve compatibility with minimal legacy state adapters. The
+            # production TradeState always provides the authoritative re-read.
+            latest_row = close_row
+            latest_is_authoritative = False
+        if latest_row is None:
+            return True
+        if (
+            latest_is_authoritative
+            and not same_position_generation(latest_row, close_row)
+        ):
+            log_event(
+                f" Spot reconciliation: {sym} generation changed after close "
+                "accounting; replacement state kept",
+                "ERROR",
+            )
+            return False
         try:
             from bot_utils.trade_state import remove_with_restore_fields
             removed = remove_with_restore_fields(
@@ -1217,16 +1290,19 @@ def _gate_missing_for_removal(bot, sym, state_row, strikes, threshold: int = 2) 
                     "accounting_already_booked": True,
                     "accounting_booked_reason": "Spot offline reconcile",
                 },
+                expected_row=latest_row,
             )
         except Exception:
             removed = False
         if removed:
             return True
         try:
-            bot.state.update_many(sym, {
+            from bot_utils.trade_state import update_many_if_current
+
+            update_many_if_current(bot.state, sym, {
                 "accounting_already_booked": True,
                 "accounting_booked_reason": "Spot offline reconcile",
-            })
+            }, latest_row)
         except Exception:
             pass
         log_event(
@@ -1319,11 +1395,14 @@ def _adopt_spot_orphans(
                 continue
             if value_usdt < _SPOT_DUST_USDT:
                 continue
-            if not try_claim_orphan(bot.BOT_NAME, base, "SPOT"):
+            if try_claim_orphan(bot.BOT_NAME, base, "SPOT") is not True:
                 continue
+            adopted_state = None
             try:
                 from core.clock import now_utc as _now_utc
-                added = bot.state.add(base, {
+                from bot_utils.trade_state import add_position_if_absent
+
+                adopted_state = {
                     "buy": price,
                     "buy_time": _now_utc().strftime("%Y-%m-%d %H:%M:%S"),
                     "amount": exch_amt,
@@ -1336,44 +1415,105 @@ def _adopt_spot_orphans(
                     "break_even": False,
                     "be_active": False,
                     "adopted": True,
-                })
+                }
+                added = add_position_if_absent(
+                    bot.state, base, adopted_state
+                )
+                if added is None:
+                    current_syms.add(base)
+                    log_event(
+                        f" Spot orphan adoption {base} was superseded by "
+                        "current local state; replacement retained",
+                        "WARN",
+                    )
+                    continue
                 if added is False:
-                    if bot.state.has(base):
-                        try:
-                            bot.state.update_many(base, {
-                                "claim_registry_pending": True,
-                                "claim_registry_pending_reason": (
-                                    "adoption state.add returned False"),
-                                "adopted": True,
-                            })
-                        except Exception as state_exc:
-                            bot._log_error(
-                                f"mark adopted claim pending {base}",
-                                state_exc)
+                    from bot_utils.trade_state import (
+                        promote_position_generation,
+                    )
+
+                    pending_fields = {
+                        "claim_registry_pending": True,
+                        "claim_registry_pending_reason": (
+                            "adoption state.add returned False"
+                        ),
+                        "adopted": True,
+                    }
+                    pending_row = dict(adopted_state)
+                    pending_row.update(pending_fields)
+                    pending = promote_position_generation(
+                        bot.state,
+                        base,
+                        pending_fields,
+                        adopted_state,
+                        create_fields=pending_row,
+                    )
+                    if pending is None:
                         current_syms.add(base)
-                        adopted.append(base)
+                        log_event(
+                            f" Spot orphan adoption {base} state failure "
+                            "was superseded; replacement retained",
+                            "WARN",
+                        )
                         continue
-                    raise RuntimeError("state.add returned False")
+                    if pending is False:
+                        raise RuntimeError("state.add returned False")
                 current_syms.add(base)
                 adopted.append(base)
             except Exception as exc:
-                if bot.state.has(base):
+                recovered = None
+                if isinstance(adopted_state, dict):
                     try:
-                        bot.state.update_many(base, {
+                        from bot_utils.trade_state import (
+                            promote_position_generation,
+                        )
+
+                        pending_fields = {
                             "claim_registry_pending": True,
                             "claim_registry_pending_reason": (
-                                "adoption state write raised after state mutation"),
+                                "adoption state write raised after state mutation"
+                            ),
                             "adopted": True,
-                        })
+                        }
+                        pending_row = dict(adopted_state)
+                        pending_row.update(pending_fields)
+                        recovered = promote_position_generation(
+                            bot.state,
+                            base,
+                            pending_fields,
+                            adopted_state,
+                            create_fields=pending_row,
+                        )
                     except Exception as state_exc:
                         bot._log_error(
                             f"mark adopted claim pending {base}",
-                            state_exc)
+                            state_exc,
+                        )
+                if recovered is True:
                     current_syms.add(base)
                     adopted.append(base)
                     bot._log_error(f"spot adopt orphan {base}", exc)
                     continue
-                remove_open_position(bot.BOT_NAME, base)
+                if recovered is None and bot.state.has(base):
+                    current_syms.add(base)
+                    log_event(
+                        f" Spot orphan adoption {base} failed after a "
+                        "replacement generation won; replacement retained",
+                        "WARN",
+                    )
+                    bot._log_error(f"spot adopt orphan {base}", exc)
+                    continue
+                try:
+                    claim_released = remove_open_position(bot.BOT_NAME, base)
+                    if claim_released is not True:
+                        raise RuntimeError(
+                            "remove_open_position did not return True"
+                        )
+                except Exception as release_exc:
+                    bot._log_error(
+                        f"spot release orphan claim {base}",
+                        release_exc,
+                    )
                 bot._log_error(f"spot adopt orphan {base}", exc)
                 unadoptable.append(base)
 
@@ -1413,6 +1553,7 @@ def _emit_spot_position_integrity(
     bal_data: dict,
     *,
     telemetry_phase: str,
+    entry_recovery_generation: int | None = None,
 ) -> dict:
     """Audit State/Claim/Balance layers from an already-fetched snapshot."""
     from core.database import get_open_positions_db, _base_symbol
@@ -1445,6 +1586,25 @@ def _emit_spot_position_integrity(
     record_integrity = getattr(bot, "_record_position_integrity_health", None)
     if callable(record_integrity):
         record_integrity(report, telemetry_phase=telemetry_phase)
+    if (
+        entry_recovery_generation is not None
+        and report.get("ok") is True
+        and report.get("claims_available") is True
+        and report.get("metadata_complete") is True
+    ):
+        lock = getattr(bot, "_position_integrity_health_lock", None)
+
+        def _complete() -> None:
+            if int(getattr(bot, "_spot_entry_recovery_generation", 0)) == int(
+                entry_recovery_generation
+            ):
+                bot._spot_entry_recovery_blocked = False
+
+        if lock is None:
+            _complete()
+        else:
+            with lock:
+                _complete()
     return report
 
 
@@ -1460,6 +1620,9 @@ def startup_reconciliation(bot) -> None:
     from core.logger import log_event
 
     trades = bot.state.get_all()
+    entry_recovery_generation = int(
+        getattr(bot, "_spot_entry_recovery_generation", 0)
+    )
 
     bal_data = None
     try:
@@ -1569,15 +1732,45 @@ def startup_reconciliation(bot) -> None:
                 )
                 continue
             corrupt_ghost_syms.discard(base)
-            added = bot.state.add(base, restored)
+            from bot_utils.trade_state import (
+                add_position_if_absent,
+                promote_position_generation,
+            )
+
+            added = add_position_if_absent(bot.state, base, restored)
+            if added is None:
+                current_syms.add(base)
+                log_event(
+                    f" Crash recovery: {base} rehydrate was superseded by "
+                    "current local state; replacement retained",
+                    "WARN",
+                )
+                continue
             if added is False:
-                if bot.state.has(base):
-                    bot.state.update_many(base, {
-                        "claim_registry_pending": True,
-                        "claim_registry_pending_reason": (
-                            "rehydrate state.add returned False"),
-                    })
-                else:
+                pending_fields = {
+                    "claim_registry_pending": True,
+                    "claim_registry_pending_reason": (
+                        "rehydrate state.add returned False"
+                    ),
+                }
+                pending_row = dict(restored)
+                pending_row.update(pending_fields)
+                pending = promote_position_generation(
+                    bot.state,
+                    base,
+                    pending_fields,
+                    restored,
+                    create_fields=pending_row,
+                )
+                if pending is None:
+                    current_syms.add(base)
+                    log_event(
+                        f" Crash recovery: {base} rehydrate state failure "
+                        "was superseded; replacement retained",
+                        "WARN",
+                    )
+                    continue
+                if pending is False:
                     raise RuntimeError(f"state.add returned False for {base}")
             current_syms.add(base)
             rehydrated.append(base)
@@ -1594,12 +1787,14 @@ def startup_reconciliation(bot) -> None:
     if ghost_scan_completed:
         corrupt_ghost_syms.intersection_update(seen_ghost_bases)
     bot._spot_corrupt_ghost_bases = corrupt_ghost_syms
-    _adopt_spot_orphans(bot, bal_data, skip_bases=corrupt_ghost_syms)
+    if ghost_scan_completed:
+        _adopt_spot_orphans(bot, bal_data, skip_bases=corrupt_ghost_syms)
     try:
         _emit_spot_position_integrity(
             bot,
             bal_data,
             telemetry_phase="startup",
+            entry_recovery_generation=entry_recovery_generation,
         )
     except Exception:
         pass
@@ -1696,6 +1891,9 @@ class ReconcileMixin:
 
             # Exchange drift check
             try:
+                entry_recovery_generation = int(
+                    getattr(self, "_spot_entry_recovery_generation", 0)
+                )
                 if not try_consume_api_call(
                     "spot_reconcile_periodic_fetch_balance", critical=True
                 ):
@@ -1771,6 +1969,7 @@ class ReconcileMixin:
                     self,
                     bal_data,
                     telemetry_phase="reconcile",
+                    entry_recovery_generation=entry_recovery_generation,
                 )
             except Exception as e:
                 # Transient network blips (DNS fail, SSL EOF, timeout) are not

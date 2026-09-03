@@ -14,6 +14,9 @@ DEFAULT_CAPTURE_BYTES_PER_STREAM = 64 * 1024
 _READ_CHUNK_BYTES = 16 * 1024
 _READER_DRAIN_TIMEOUT_SEC = 1.0
 _PROCESS_TERMINATION_TIMEOUT_SEC = 10.0
+_READER_THREAD_TYPE = threading.Thread
+_UNCERTAIN_READERS_LOCK = threading.Lock()
+_UNCERTAIN_READERS: set[threading.Thread] = set()
 _WINDOWS_GATE_WORKER = (
     "import sys\n"
     "if 'site' in sys.modules:\n"
@@ -523,10 +526,28 @@ def _join_readers(
 ) -> bool:
     deadline = time.monotonic() + _READER_DRAIN_TIMEOUT_SEC
     for reader in readers:
-        reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        if not isinstance(reader, _READER_THREAD_TYPE):
+            continue
+        try:
+            reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        except RuntimeError:
+            pass
     drained = True
     for reader, tail in zip(readers, tails):
-        if reader.is_alive():
+        if not isinstance(reader, _READER_THREAD_TYPE):
+            continue
+        try:
+            alive = reader.is_alive()
+            start_observed = reader.ident is not None
+        except BaseException:
+            alive = True
+            start_observed = False
+        with _UNCERTAIN_READERS_LOCK:
+            uncertain = reader in _UNCERTAIN_READERS
+            if uncertain and not alive and start_observed:
+                _UNCERTAIN_READERS.discard(reader)
+                uncertain = False
+        if alive or uncertain:
             drained = False
             tail.append(
                 b"\n[... output pipe remained open after child exit ...]\n"
@@ -552,10 +573,14 @@ def _close_finished_streams(
         if stream is None:
             continue
         reader = readers[index] if index < len(readers) else None
+        try:
+            reader_alive = reader is not None and reader.is_alive()
+        except BaseException:
+            reader_alive = False
         if (
             reader is None
             or id(reader) not in started_ids
-            or not reader.is_alive()
+            or not reader_alive
         ):
             _close_stream(stream)
 
@@ -600,12 +625,16 @@ def _cleanup_failed_run(
         _terminate_owned_processes(process, job)
     except BaseException as exc:
         termination_error = exc
-    _join_readers(started_readers, tails[:len(started_readers)])
+    readers_drained = _join_readers(
+        started_readers, tails[:len(started_readers)]
+    )
     _close_finished_streams(process, readers, started_readers)
     if termination_error is not None:
         raise RuntimeError(
             "bounded child cleanup could not confirm process-tree termination"
         ) from termination_error
+    if not readers_drained:
+        raise RuntimeError("bounded child cleanup could not confirm reader shutdown")
 
 
 def run_bounded_capture(
@@ -674,25 +703,55 @@ def run_bounded_capture(
     started_readers: list[threading.Thread] = []
     tails = [stdout_tail, stderr_tail]
     try:
-        readers.append(
-            threading.Thread(
-                target=_drain_pipe,
-                args=(process.stdout, stdout_tail),
+        def build_reader(stream, tail, name):
+            state: dict[str, threading.Thread] = {}
+
+            def runner() -> None:
+                try:
+                    _drain_pipe(stream, tail)
+                finally:
+                    reader = state.get("reader")
+                    if reader is not None:
+                        with _UNCERTAIN_READERS_LOCK:
+                            _UNCERTAIN_READERS.discard(reader)
+
+            reader = threading.Thread(
+                target=runner,
                 daemon=True,
-                name="bounded-child-stdout",
+                name=name,
+            )
+            state["reader"] = reader
+            return reader
+
+        readers.append(
+            build_reader(
+                process.stdout,
+                stdout_tail,
+                "bounded-child-stdout",
             )
         )
         readers.append(
-            threading.Thread(
-                target=_drain_pipe,
-                args=(process.stderr, stderr_tail),
-                daemon=True,
-                name="bounded-child-stderr",
+            build_reader(
+                process.stderr,
+                stderr_tail,
+                "bounded-child-stderr",
             )
         )
         for reader in readers:
-            reader.start()
             started_readers.append(reader)
+            try:
+                reader.start()
+            except BaseException:
+                if isinstance(reader, _READER_THREAD_TYPE):
+                    with _UNCERTAIN_READERS_LOCK:
+                        _UNCERTAIN_READERS.add(reader)
+                    try:
+                        if not reader.is_alive() and reader.ident is not None:
+                            with _UNCERTAIN_READERS_LOCK:
+                                _UNCERTAIN_READERS.discard(reader)
+                    except BaseException:
+                        pass
+                raise
         if start_gate is not None:
             try:
                 start_gate.signal()
