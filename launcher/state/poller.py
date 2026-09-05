@@ -29,6 +29,7 @@ from launcher.core.runtime_status_values import (
 )
 from launcher.core.metrics_service import (
     MetricsDbReadError,
+    MetricsMarketDataError,
     get_exchange_status,  # noqa: F401 - legacy monkeypatch surface
     get_futures_state_count,  # noqa: F401 - legacy monkeypatch surface
     get_futures_state_counts,
@@ -376,8 +377,11 @@ class DataPoller:
         self._llm_next        = 0.0
         self._balance_next    = 0.0
         self._unrealized_next = 0.0
+        self._unrealized_metrics_error = ""
         self._sparkline_next  = 0.0
+        self._sparkline_metrics_error = ""
         self._metrics_next    = 0.0
+        self._trade_metrics_error = ""
         self._trade_metrics_signature = None
         self._trade_metrics_cached = (
             dict(self.cache["stats"]),
@@ -639,9 +643,16 @@ class DataPoller:
                         self._metrics_next = (
                             cadence_now + _TRADE_METRICS_REFRESH_SEC
                         )
-                        stats, trades_total = self._get_trade_metrics_cached(
-                            mode_is_sim
-                        )
+                        try:
+                            stats, trades_total = self._get_trade_metrics_cached(
+                                mode_is_sim
+                            )
+                            self._trade_metrics_error = ""
+                        except Exception as exc:
+                            self._trade_metrics_error = _safe_error_text(
+                                exc, 160
+                            )
+                            raise
                     else:
                         stats = self.cache.get("stats", {})
                         trades_total = self.cache.get("trades_total", 0)
@@ -673,9 +684,15 @@ class DataPoller:
                         if BOT_META[bot].get("is_futures")
                     )
                     new_data.setdefault("metrics_error", "")
-                except MetricsDbReadError as exc:
+                except Exception as exc:
+                    if isinstance(exc, MetricsMarketDataError):
+                        failure_scope = "metrics state read failed"
+                    elif isinstance(exc, MetricsDbReadError):
+                        failure_scope = "metrics DB read failed"
+                    else:
+                        failure_scope = "metrics read failed"
                     self._log_diag(
-                        f"metrics DB read failed: {_safe_error_text(exc)}"
+                        f"{failure_scope}: {_safe_error_text(exc)}"
                     )
                     new_data["stats"] = self.cache.get("stats", {})
                     new_data["open"] = self.cache.get("open", {})
@@ -683,38 +700,60 @@ class DataPoller:
                         "futures_positions", 0)
                     new_data["trades_total"] = self.cache.get("trades_total", 0)
                     new_data["metrics_error"] = _safe_error_text(exc, 160)
+                trade_metrics_error = getattr(
+                    self, "_trade_metrics_error", ""
+                )
+                if trade_metrics_error and not new_data.get("metrics_error"):
+                    new_data["metrics_error"] = trade_metrics_error
 
                 #  Sparkline (PnL trend, last ~30 closed trades) 
                 # Refresh every 30s  sparklines only change when a trade
                 # closes, so polling faster than that is pure DB load.
                 cadence_now = time.monotonic()
                 if cadence_now >= self._sparkline_next:
+                    sparkline_error = getattr(
+                        self, "_sparkline_metrics_error", ""
+                    )
                     try:
                         spark = get_pnl_sparklines(mode_is_sim, limit=30)
+                        sparkline_error = ""
                     except MetricsDbReadError as exc:
+                        sparkline_error = _safe_error_text(exc, 160)
                         self._log_diag(
                             f"sparkline DB read failed: {_safe_error_text(exc)}"
                         )
-                        new_data["metrics_error"] = _safe_error_text(exc, 160)
+                        new_data["metrics_error"] = sparkline_error
                         spark = self.cache.get(
                             "sparkline", {bot: [] for bot in BOT_ORDER}
                         )
-                    except Exception:
+                    except Exception as exc:
                         # Keep the previous values rather than wiping
                         # the chart on a transient read failure.
+                        sparkline_error = _safe_error_text(exc, 160)
+                        self._log_diag(
+                            "sparkline read failed: "
+                            f"{_safe_error_text(exc)}"
+                        )
                         spark = self.cache.get(
                             "sparkline", {bot: [] for bot in BOT_ORDER}
                         )
                     new_data["sparkline"] = spark
+                    self._sparkline_metrics_error = sparkline_error
                     self._sparkline_next = cadence_now + 30.0
                 else:
                     new_data["sparkline"] = self.cache.get(
                         "sparkline", {b: [] for b in BOT_ORDER})
+                    sparkline_error = getattr(
+                        self, "_sparkline_metrics_error", ""
+                    )
+                if sparkline_error:
+                    new_data["metrics_error"] = sparkline_error
 
                 #  Unrealized PnL (every 15 s) 
                 cadence_now = time.monotonic()
                 if cadence_now >= self._unrealized_next:
                     unr: dict = {}
+                    unrealized_error = ""
                     # Futures-type bots (FUTURES, CROSS)  futures_state, SCOPED
                     # per bot so Cross PnL doesn't leak into Futures (and Cross
                     # gets its own unrealized shown).
@@ -728,13 +767,14 @@ class DataPoller:
                             get_unrealized_pnl_futures_batch(futures_requests)
                         )
                     except MetricsDbReadError as exc:
+                        unrealized_error = _safe_error_text(exc, 160)
                         self._log_diag(
                             f"unrealized DB read failed: {_safe_error_text(exc)}"
                         )
                         cached_unrealized = self.cache.get("unrealized", {})
                         for fut_bot in futures_requests:
                             unr[fut_bot] = cached_unrealized.get(fut_bot, 0.0)
-                        new_data["metrics_error"] = _safe_error_text(exc, 160)
+                        new_data["metrics_error"] = unrealized_error
                     # SPOT bots share one union ticker batch. This avoids two
                     # API reservations and round trips for one UI refresh.
                     spot_requests = {
@@ -760,18 +800,29 @@ class DataPoller:
                                     spot_exchange,
                                 )
                             )
-                        except Exception:
-                            # Reset connection so the next cycle tries a fresh one
+                        except Exception as exc:
+                            unrealized_error = _safe_error_text(exc, 160)
+                            self._log_diag(
+                                "spot unrealized read failed: "
+                                f"{_safe_error_text(exc)}"
+                            )
                             self._discard_exchange("_spot_exchange")
                             for spot_bot in spot_requests:
                                 unr[spot_bot] = self.cache.get(
                                     "unrealized", {}
                                 ).get(spot_bot, 0.0)
+                            new_data["metrics_error"] = unrealized_error
                     new_data["unrealized"] = unr
+                    self._unrealized_metrics_error = unrealized_error
                     self._unrealized_next = cadence_now + 15.0
                 else:
                     new_data["unrealized"] = self.cache.get(
                         "unrealized", {b: 0.0 for b in BOT_ORDER})
+                    unrealized_error = getattr(
+                        self, "_unrealized_metrics_error", ""
+                    )
+                if unrealized_error:
+                    new_data["metrics_error"] = unrealized_error
 
                 # Incremental read via _ErrorLogCounter  O(1) when no new errors.
                 new_data["error_count"] = self._error_counter.count()
@@ -835,6 +886,8 @@ class DataPoller:
                                 (no position margin), but better than crash."""
                                 try:
                                     from bot_utils.api_budget import (
+                                        ApiCallReservation,
+                                        record_api_error,
                                         try_consume_api_call,
                                     )
                                 except Exception as budget_import_exc:
@@ -842,38 +895,62 @@ class DataPoller:
                                         "legacy equity API budget gate unavailable"
                                     ) from budget_import_exc
                                 try:
-                                    balance_allowed = bool(try_consume_api_call(
-                                        "dashboard_legacy_fetch_balance"
-                                    ))
+                                    balance_reservation = try_consume_api_call(
+                                        "dashboard_legacy_fetch_balance",
+                                        return_reservation=True,
+                                    )
                                 except Exception as budget_exc:
                                     raise RuntimeError(
                                         "legacy equity API budget gate unavailable"
                                     ) from budget_exc
-                                if not balance_allowed:
+                                if not balance_reservation:
                                     return None
-                                bal = ex_obj.fetch_balance()
-                                paths = (
-                                    ("USDT", "free"), ("USDT", "available"),
-                                    ("free", "USDT"),
-                                )
-                                for path in paths:
-                                    v = bal
-                                    for k in path:
-                                        if isinstance(v, dict):
-                                            v = v.get(k)
-                                        else:
-                                            v = None
-                                            break
-                                    if v is not None:
+                                try:
+                                    bal = ex_obj.fetch_balance()
+                                    if not isinstance(bal, dict):
+                                        raise TypeError(
+                                            "legacy fetch_balance returned "
+                                            "no balance object"
+                                        )
+                                    paths = (
+                                        ("USDT", "free"),
+                                        ("USDT", "available"),
+                                        ("free", "USDT"),
+                                    )
+                                    for path in paths:
+                                        v = bal
+                                        for k in path:
+                                            if isinstance(v, dict):
+                                                v = v.get(k)
+                                            else:
+                                                v = None
+                                                break
+                                        if v is not None:
+                                            try:
+                                                if isinstance(v, bool):
+                                                    continue
+                                                fv = float(v)
+                                                if math.isfinite(fv) and fv >= 0:
+                                                    return fv
+                                            except Exception:
+                                                pass
+                                    raise ValueError(
+                                        "legacy fetch_balance returned no valid "
+                                        "USDT free balance"
+                                    )
+                                except Exception:
+                                    if isinstance(
+                                        balance_reservation,
+                                        ApiCallReservation,
+                                    ):
                                         try:
-                                            if isinstance(v, bool):
-                                                continue
-                                            fv = float(v)
-                                            if math.isfinite(fv) and fv >= 0:
-                                                return fv
+                                            record_api_error(
+                                                "dashboard_legacy_fetch_balance",
+                                                balance_reservation,
+                                            )
                                         except Exception:
                                             pass
-                                return 0.0
+                                    raise
 
                             # Equity (or free-only fallback) per wallet
                             spot_equity = None     # dict | None

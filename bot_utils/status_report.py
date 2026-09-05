@@ -27,7 +27,11 @@ def _log_status_report_error(context: str, exc: Exception) -> None:
 
 def _retry_timestamp(now: float, interval_sec: float) -> float:
     retry_delay = min(_STATUS_RETRY_SECONDS, interval_sec)
-    return now - max(0.0, interval_sec - retry_delay)
+    marker = now - max(0.0, interval_sec - retry_delay)
+    # ``0.0`` is the public "never sent" sentinel. Preserve a negative
+    # monotonic marker during very early process uptime so the retry remains
+    # due after ``retry_delay`` instead of immediately.
+    return marker if marker != 0.0 else -1e-12
 
 
 def _finite_float_or_none(value):
@@ -94,16 +98,22 @@ def maybe_send_hourly_status(*, bot_name: str, is_futures: bool,
     unchanged. Safe to call every heartbeat (it self-throttles).
 
     Default cadence is every 3h (10800s) for all bots."""
-    now = time.time()
+    # This marker is process-local and never serialized, so wall-clock time
+    # would only make cadence vulnerable to NTP/manual clock rollback.
+    now = time.monotonic()
     interval = _finite_float_or_none(interval_sec)
     if interval is None or interval < 0.0:
         interval = 10800.0
     previous = _finite_float_or_none(last_sent)
     if previous is None:
         previous = 0.0
+    elif previous > now:
+        # Compatibility with an epoch marker from a caller surviving this
+        # process-local contract change, and fail-safe handling of corruption.
+        previous = 0.0
     if simulation:
         return now
-    if now - previous < interval:
+    if previous != 0.0 and now - previous < interval:
         return previous
 
     try:

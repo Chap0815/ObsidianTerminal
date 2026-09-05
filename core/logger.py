@@ -1412,6 +1412,10 @@ class _LoggerStateDuplicateKey(ValueError):
     pass
 
 
+class _LoggerStateNonStandardConstant(ValueError):
+    pass
+
+
 def _logger_state_object_without_duplicate_keys(pairs):
     result = {}
     for key, value in pairs:
@@ -1423,6 +1427,12 @@ def _logger_state_object_without_duplicate_keys(pairs):
     return result
 
 
+def _reject_logger_state_constant(value: str):
+    raise _LoggerStateNonStandardConstant(
+        f"non-standard state JSON constant: {value}"
+    )
+
+
 def _read_logger_state_json(path: str):
     with open(path, "rb") as stream:
         raw = stream.read(_LOGGER_STATE_JSON_MAX_BYTES + 1)
@@ -1431,6 +1441,7 @@ def _read_logger_state_json(path: str):
     return json.loads(
         raw.decode("utf-8-sig"),
         object_pairs_hook=_logger_state_object_without_duplicate_keys,
+        parse_constant=_reject_logger_state_constant,
     )
 
 def _preserve_corrupt_json(
@@ -1491,6 +1502,7 @@ def load_j(f, default=None, *, preserve_corrupt: bool = False):
             json.JSONDecodeError,
             UnicodeError,
             _LoggerStateDuplicateKey,
+            _LoggerStateNonStandardConstant,
         ) as e:
             if preserve_corrupt:
                 _preserve_corrupt_json(f)
@@ -1717,8 +1729,14 @@ def _stream_legacy_history(snapshot_path: str, legacy_path: str) -> bool:
                 if not raw_line:
                     continue
                 try:
-                    entry = json.loads(raw_line)
-                except (json.JSONDecodeError, UnicodeError):
+                    entry = json.loads(
+                        raw_line,
+                        object_pairs_hook=(
+                            _logger_state_object_without_duplicate_keys
+                        ),
+                        parse_constant=_reject_logger_state_constant,
+                    )
+                except (ValueError, UnicodeError):
                     continue
                 encoded = json.dumps(
                     entry,

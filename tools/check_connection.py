@@ -15,8 +15,11 @@ Verifies:
 from __future__ import annotations
 
 import os
+import math
 import sys
 import time
+
+from bot_utils.order_utils import explicit_trade_symbol_matches
 
 
 def _hdr(text: str) -> None:
@@ -30,7 +33,7 @@ def _redact_text(text: str) -> str:
         from core.logger import redact
         return redact(text)
     except Exception:
-        return text
+        return "<redaction unavailable>"
 
 
 def _safe_exc(exc: Exception) -> str:
@@ -46,6 +49,69 @@ def _mask_chat_ids(raw: str) -> str:
     return ", ".join(masked)
 
 
+def _finite_number(value, field: str, *, positive: bool = False) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a finite number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be a finite number") from exc
+    if not math.isfinite(parsed) or (parsed <= 0.0 if positive else parsed < 0.0):
+        qualifier = "finite and positive" if positive else "finite and non-negative"
+        raise ValueError(f"{field} must be {qualifier}")
+    return parsed
+
+
+def _finite_signed_number(value, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a finite number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be a finite number") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field} must be a finite number")
+    return parsed
+
+
+def _fear_greed_index(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("Fear & Greed must be an integer from 0 to 100")
+    if not 0 <= value <= 100:
+        raise ValueError("Fear & Greed must be an integer from 0 to 100")
+    return value
+
+
+def _valid_ohlcv_response(bars, *, limit: int) -> bool:
+    if not isinstance(bars, (list, tuple)) or not 1 <= len(bars) <= limit:
+        return False
+    for row in bars:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            return False
+        if any(isinstance(value, bool) for value in row[:6]):
+            return False
+        try:
+            timestamp = float(row[0])
+            open_price, high, low, close, volume = map(float, row[1:6])
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not (
+            math.isfinite(timestamp)
+            and timestamp >= 0.0
+            and timestamp.is_integer()
+            and all(
+                math.isfinite(value)
+                for value in (open_price, high, low, close, volume)
+            )
+            and min(open_price, high, low, close) > 0.0
+            and low <= open_price <= high
+            and low <= close <= high
+            and volume >= 0.0
+        ):
+            return False
+    return True
+
+
 def _check_spot() -> int:
     _hdr("1/6  SPOT exchange connection")
     try:
@@ -53,23 +119,36 @@ def _check_spot() -> int:
         ex = get_exchange_connection()
         ex.timeout = 15000
         t0 = time.time()
-        ex.load_markets()
+        markets = ex.load_markets()
+        if not isinstance(markets, dict) or not markets:
+            raise ValueError("spot market catalog is empty or invalid")
         markets_ms = int((time.time() - t0) * 1000)
-        print(f"  load_markets: {len(ex.markets)} symbols in {markets_ms} ms")
+        print(f"  load_markets: {len(markets)} symbols in {markets_ms} ms")
 
         t0 = time.time()
         bal = ex.fetch_balance()
         bal_ms = int((time.time() - t0) * 1000)
-        usdt_free = (bal.get("USDT") or {}).get("free", 0) or 0
+        usdt_free = _finite_number(
+            (bal.get("USDT") or {}).get("free", 0) or 0,
+            "spot USDT free balance",
+        )
         print(f"  fetch_balance: {bal_ms} ms  USDT free: {usdt_free}")
 
         t0 = time.time()
         t = ex.fetch_ticker("BTC/USDT")
-        last = t.get("last")
+        if not explicit_trade_symbol_matches(t, "BTC/USDT"):
+            raise ValueError("spot connection ticker changed requested symbol")
+        last = _finite_number(
+            t.get("last"),
+            "spot BTC/USDT last price",
+            positive=True,
+        )
         print(f"  fetch_ticker(BTC/USDT): {int((time.time()-t0)*1000)} ms  last: {last}")
 
         t0 = time.time()
         bars = ex.fetch_ohlcv("BTC/USDT", timeframe="1h", limit=10)
+        if not _valid_ohlcv_response(bars, limit=10):
+            raise ValueError("spot BTC/USDT OHLCV response is invalid")
         print(f"  fetch_ohlcv: {len(bars)} bars in {int((time.time()-t0)*1000)} ms")
         return 0
     except Exception as e:
@@ -90,11 +169,16 @@ def _check_futures() -> int:
         ex = get_futures_exchange_connection()
         ex.timeout = 15000
         t0 = time.time()
-        ex.load_markets()
-        print(f"  load_markets: {len(ex.markets)} swaps in {int((time.time()-t0)*1000)} ms")
+        markets = ex.load_markets()
+        if not isinstance(markets, dict) or not markets:
+            raise ValueError("futures market catalog is empty or invalid")
+        print(f"  load_markets: {len(markets)} swaps in {int((time.time()-t0)*1000)} ms")
 
         bal = ex.fetch_balance()
-        usdt_free = (bal.get("USDT") or {}).get("free", 0) or 0
+        usdt_free = _finite_number(
+            (bal.get("USDT") or {}).get("free", 0) or 0,
+            "futures USDT free balance",
+        )
         print(f"  fetch_balance  USDT free: {usdt_free}")
 
         try:
@@ -114,12 +198,26 @@ def _check_market_data() -> int:
         from config.exchange_config import get_exchange_connection
         from trading.market_filters  import get_market_regime, get_fear_greed
         ex = get_exchange_connection()
-        ex.load_markets()
+        ex.timeout = 15000
+        markets = ex.load_markets()
+        if not isinstance(markets, dict) or not markets:
+            raise ValueError("market-data catalog is empty or invalid")
         regime = get_market_regime(ex)
-        fg = get_fear_greed()
-        print(f"  Market regime: {regime.get('regime')}")
-        print(f"  BTC 24h:  {regime.get('btc_24h', 0):+.2f}%")
-        print(f"  BTC 7d:  {regime.get('btc_7d',  0):+.2f}%")
+        regime_label = regime.get("regime")
+        if regime_label not in {"BULL", "BEAR", "NEUTRAL", "UNKNOWN"}:
+            raise ValueError("market regime label is invalid")
+        if regime_label == "UNKNOWN":
+            raise RuntimeError("market regime data is unavailable")
+        fg = _fear_greed_index(get_fear_greed())
+        btc_24h = _finite_signed_number(
+            regime.get("btc_24h"), "BTC 24h change"
+        )
+        btc_7d = _finite_signed_number(
+            regime.get("btc_7d"), "BTC 7d change"
+        )
+        print(f"  Market regime: {regime_label}")
+        print(f"  BTC 24h:  {btc_24h:+.2f}%")
+        print(f"  BTC 7d:  {btc_7d:+.2f}%")
         print(f"  Fear & Greed:  {fg}")
         return 0
     except Exception as e:
@@ -132,7 +230,11 @@ def _check_database() -> int:
     try:
         from core.database import init_db, DB_PATH
         init_db()
-        size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+        if not os.path.isfile(DB_PATH):
+            raise RuntimeError("database artifact was not created")
+        size = os.path.getsize(DB_PATH)
+        if size <= 0:
+            raise RuntimeError("database artifact is empty")
         print(f"  Database initialised: {DB_PATH} ({size/1024:.1f} KB)")
         return 0
     except Exception as e:

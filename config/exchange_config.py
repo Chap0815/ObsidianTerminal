@@ -17,7 +17,12 @@ import ccxt
 from typing import Optional, Tuple
 from dotenv import load_dotenv
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from core.paths import ENV_FILE
 load_dotenv(str(ENV_FILE))
 
@@ -377,6 +382,21 @@ def _finite_time_difference(ex) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def _finite_exchange_epoch_ms(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        epoch_ms = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not math.isfinite(epoch_ms)
+        or not _EXCHANGE_EPOCH_MIN_MS <= epoch_ms < _EXCHANGE_EPOCH_MAX_MS
+    ):
+        return None
+    return epoch_ms
+
+
 def _publish_clock_offset_ms(offset_ms: float) -> None:
     from core.clock import set_exchange_offset_ms
 
@@ -389,8 +409,7 @@ def _publish_clock_offset_ms(offset_ms: float) -> None:
         raise ValueError("exchange clock offset is invalid") from exc
     if (
         not math.isfinite(normalized_offset)
-        or not math.isfinite(exchange_epoch_ms)
-        or not _EXCHANGE_EPOCH_MIN_MS <= exchange_epoch_ms < _EXCHANGE_EPOCH_MAX_MS
+        or _finite_exchange_epoch_ms(exchange_epoch_ms) is None
     ):
         raise ValueError("exchange clock epoch is outside the millisecond contract")
     set_exchange_offset_ms(normalized_offset)
@@ -446,17 +465,35 @@ def resync_time_difference(ex) -> bool:
             except (TypeError, ValueError, OverflowError):
                 pass
         try:
-            if not try_consume_api_call(
+            reservation = try_consume_api_call(
                 "exchange_clock_resync_fetch_time",
                 critical=True,
-            ):
+                return_reservation=True,
+            )
+            if not reservation:
                 return False
             ex._in_time_resync = True
-            ex.load_time_difference()   # sets ex.options['timeDifference']
-            time_difference = _finite_time_difference(ex)
-            if time_difference is None:
-                return False
-            offset_ms = -time_difference
+            try:
+                ex.load_time_difference()  # sets ex.options['timeDifference']
+                time_difference = _finite_time_difference(ex)
+                if time_difference is None:
+                    raise ValueError(
+                        "exchange time resync returned no finite offset"
+                    )
+                offset_ms = -time_difference
+                if _finite_exchange_epoch_ms(
+                    time.time() * 1000.0 + offset_ms
+                ) is None:
+                    raise ValueError(
+                        "exchange time resync returned an invalid epoch"
+                    )
+            except Exception:
+                if isinstance(reservation, ApiCallReservation):
+                    record_api_error(
+                        "exchange_clock_resync_fetch_time",
+                        reservation,
+                    )
+                raise
             _publish_clock_offset_ms(offset_ms)
             _LAST_TIME_RESYNC["mono"] = now
             _LAST_TIME_RESYNC["exchange_key"] = exchange_key
@@ -531,14 +568,31 @@ def _install_nonce_selfheal(ex):
                 raise
             if is_clock_skew_error(e) and resync_time_difference(ex):
                 try:
-                    retry_allowed = bool(try_consume_api_call(
-                        "exchange_clock_signed_retry"
-                    ))
+                    retry_reservation = try_consume_api_call(
+                        "exchange_clock_signed_retry",
+                        return_reservation=True,
+                    )
+                    retry_allowed = bool(retry_reservation)
                 except Exception as budget_exc:
+                    retry_reservation = None
                     _silent("clock_skew_retry_budget", budget_exc)
                     retry_allowed = False
                 if retry_allowed:
-                    return orig_fetch2(*args, **kwargs)  # once, re-signed
+                    try:
+                        return orig_fetch2(*args, **kwargs)  # once, re-signed
+                    except Exception:
+                        if isinstance(
+                            retry_reservation,
+                            ApiCallReservation,
+                        ):
+                            try:
+                                record_api_error(
+                                    "exchange_clock_signed_retry",
+                                    retry_reservation,
+                                )
+                            except Exception:
+                                pass
+                        raise
             raise
 
     ex.fetch2 = _fetch2_selfheal
@@ -557,9 +611,23 @@ def _publish_clock_offset(ex) -> None:
     local fallback. WARNs on large drift (the bot self-heals; the user need not
     fix their OS clock)."""
     try:
-        if not try_consume_api_call("exchange_clock_fetch_time"):
+        reservation = try_consume_api_call(
+            "exchange_clock_fetch_time",
+            return_reservation=True,
+        )
+        if not reservation:
             return
-        server_ms = float(ex.fetch_time())
+        try:
+            server_time = ex.fetch_time()
+            server_ms = _finite_exchange_epoch_ms(server_time)
+            if server_ms is None:
+                raise ValueError(
+                    "exchange fetch_time returned no valid millisecond epoch"
+                )
+        except Exception:
+            if isinstance(reservation, ApiCallReservation):
+                record_api_error("exchange_clock_fetch_time", reservation)
+            raise
     except Exception as e:
         _silent("publish_clock_offset", e)
         return
@@ -711,6 +779,19 @@ def supports(ex, capability: str) -> bool:
 
 #  Leverage helpers 
 
+def _valid_market_snapshot(markets) -> bool:
+    return (
+        isinstance(markets, dict)
+        and bool(markets)
+        and all(
+            isinstance(symbol, str)
+            and bool(symbol.strip())
+            and isinstance(market, dict)
+            for symbol, market in markets.items()
+        )
+    )
+
+
 def _ensure_markets_loaded(ex) -> bool:
     """Ensure ex.markets is populated before leverage calls.
 
@@ -723,12 +804,29 @@ def _ensure_markets_loaded(ex) -> bool:
     """
     try:
         markets = getattr(ex, "markets", None)
-        if markets:  # already loaded
+        if _valid_market_snapshot(markets):  # already loaded
             return True
-        if not try_consume_api_call("futures_leverage_load_markets"):
+        reservation = try_consume_api_call(
+            "futures_leverage_load_markets",
+            return_reservation=True,
+        )
+        if not reservation:
             return False
-        ex.load_markets()
-        return bool(getattr(ex, "markets", None))
+        try:
+            ex.load_markets()
+            loaded_markets = getattr(ex, "markets", None)
+            if not _valid_market_snapshot(loaded_markets):
+                raise ValueError(
+                    "load_markets returned no populated market snapshot"
+                )
+        except Exception:
+            if isinstance(reservation, ApiCallReservation):
+                record_api_error(
+                    "futures_leverage_load_markets",
+                    reservation,
+                )
+            raise
+        return True
     except Exception as e:
         _log_event(
             f"[exchange] load_markets() failed before leverage call: "
@@ -872,18 +970,22 @@ def try_set_leverage(ex, leverage, symbol=None, direction=None,
         # rebalance  wait out the limit and retry the SAME (correct) param
         # shape rather than cycling to wrong ones (which amplifies the burst).
         for _retry in range(4):
+            leverage_reservation = None
+            request_issued = False
             try:
                 try:
-                    leverage_allowed = bool(try_consume_api_call(
-                        "futures_set_leverage"
-                    ))
+                    leverage_reservation = try_consume_api_call(
+                        "futures_set_leverage",
+                        return_reservation=True,
+                    )
                 except Exception as budget_exc:
                     return False, budget_exc
-                if not leverage_allowed:
+                if not leverage_reservation:
                     return False, RuntimeError(
                         "futures set_leverage API budget exhausted"
                     )
                 _throttle_admin()
+                request_issued = True
                 if params:
                     ex.set_leverage(leverage, symbol, params=params)
                 else:
@@ -892,11 +994,24 @@ def try_set_leverage(ex, leverage, symbol=None, direction=None,
             except Exception as e:
                 last_err = e
                 es = str(e).lower()
+                if (
+                    not is_authentication_error(e)
+                    and _admin_setting_already_applied(e)
+                ):
+                    return True, None
+                if (
+                    request_issued
+                    and isinstance(leverage_reservation, ApiCallReservation)
+                ):
+                    try:
+                        record_api_error(
+                            "futures_set_leverage", leverage_reservation
+                        )
+                    except Exception:
+                        pass
                 if is_authentication_error(e):
                     authentication_failed = True
                     break
-                if _admin_setting_already_applied(e):
-                    return True, None
                 if _is_rate_limited(es) and _retry < 3:
                     _time.sleep(1.0 * (2 ** _retry))
                     continue
@@ -971,10 +1086,17 @@ def safe_set_margin_mode(ex, mode: str = "isolated", symbol=None,
     if direction is not None:
         params["direction"] = "short" if str(direction).upper() == "SHORT" \
             else "long"
+    margin_reservation = None
+    request_issued = False
     try:
-        if not try_consume_api_call("futures_set_margin_mode"):
+        margin_reservation = try_consume_api_call(
+            "futures_set_margin_mode",
+            return_reservation=True,
+        )
+        if not margin_reservation:
             return False
         _throttle_admin()
+        request_issued = True
         ex.set_margin_mode(mode, symbol, params=params)
         return True
     except Exception as e:
@@ -985,6 +1107,16 @@ def safe_set_margin_mode(ex, mode: str = "isolated", symbol=None,
             and _admin_setting_already_applied(e)
         ):
             return True
+        if (
+            request_issued
+            and isinstance(margin_reservation, ApiCallReservation)
+        ):
+            try:
+                record_api_error(
+                    "futures_set_margin_mode", margin_reservation
+                )
+            except Exception:
+                pass
         # MEXC 510 rate-limit here is expected under concurrent multi-leg opens
         # and harmless  the order carries marginMode+leverage itself, so the
         # position still opens. Skip silently; only log genuinely unexpected ones.
@@ -1004,34 +1136,145 @@ def safe_set_margin_mode(ex, mode: str = "isolated", symbol=None,
 
 #  safe_fetch_* family: log failures via silent_log 
 
-def safe_fetch_open_interest(ex, symbol: str):
-    if not supports(ex, "fetchOpenInterest"):
+def _safe_fetch_reservation(endpoint: str, *, critical: bool):
+    try:
+        return try_consume_api_call(
+            endpoint,
+            critical=critical,
+            return_reservation=True,
+        )
+    except Exception as exc:
+        _silent(f"{endpoint} API budget", exc)
+        return None
+
+
+class SafeFetchBudgetUnavailable(RuntimeError):
+    """Internal signal for callers that must not try a fallback endpoint."""
+
+
+def _finite_api_number(value) -> float | None:
+    if isinstance(value, bool):
         return None
     try:
-        return ex.fetch_open_interest(symbol)
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def safe_fetch_open_interest(
+    ex,
+    symbol: str,
+    *,
+    endpoint: str = "safe_fetch_open_interest",
+    critical: bool = False,
+):
+    if not supports(ex, "fetchOpenInterest"):
+        return None
+    reservation = _safe_fetch_reservation(endpoint, critical=critical)
+    if not reservation:
+        return None
+    try:
+        open_interest = ex.fetch_open_interest(symbol)
+        if not isinstance(open_interest, dict):
+            raise TypeError("fetch_open_interest returned no data object")
+        if not explicit_trade_symbol_matches(open_interest, symbol):
+            raise ValueError("fetch_open_interest returned a symbol mismatch")
+        raw_value = open_interest.get("openInterestValue")
+        if raw_value is None and isinstance(open_interest.get("info"), dict):
+            raw_value = open_interest["info"].get("openInterestValue")
+        parsed_value = _finite_api_number(raw_value)
+        if parsed_value is None or parsed_value < 0:
+            raise ValueError("fetch_open_interest returned no valid USDT value")
+        return open_interest
     except Exception as e:
+        if isinstance(reservation, ApiCallReservation):
+            try:
+                record_api_error(endpoint, reservation)
+            except Exception:
+                pass
         _silent(f"safe_fetch_open_interest({symbol})", e)
         return None
 
 
-def safe_fetch_funding_rate(ex, symbol: str):
+def safe_fetch_funding_rate(
+    ex,
+    symbol: str,
+    *,
+    endpoint: str = "safe_fetch_funding_rate",
+    critical: bool = False,
+):
     if not supports(ex, "fetchFundingRate"):
         return None
+    reservation = _safe_fetch_reservation(endpoint, critical=critical)
+    if not reservation:
+        return None
     try:
-        return ex.fetch_funding_rate(symbol)
+        funding_rate = ex.fetch_funding_rate(symbol)
+        if not isinstance(funding_rate, dict):
+            raise TypeError("fetch_funding_rate returned no data object")
+        if not explicit_trade_symbol_matches(funding_rate, symbol):
+            raise ValueError("fetch_funding_rate returned a symbol mismatch")
+        if _finite_api_number(funding_rate.get("fundingRate")) is None:
+            raise ValueError("fetch_funding_rate returned no valid rate")
+        return funding_rate
     except Exception as e:
+        if isinstance(reservation, ApiCallReservation):
+            try:
+                record_api_error(endpoint, reservation)
+            except Exception:
+                pass
         _silent(f"safe_fetch_funding_rate({symbol})", e)
         return None
 
 
-def safe_fetch_positions(ex, symbols=None):
+def safe_fetch_positions(
+    ex,
+    symbols=None,
+    *,
+    endpoint: str = "safe_fetch_positions",
+    critical: bool = False,
+    raise_on_budget_denied: bool = False,
+):
     if not supports(ex, "fetchPositions"):
+        return None
+    reservation = _safe_fetch_reservation(endpoint, critical=critical)
+    if not reservation:
+        if raise_on_budget_denied:
+            raise SafeFetchBudgetUnavailable(endpoint)
         return None
     try:
         if symbols:
-            return ex.fetch_positions(symbols)
-        return ex.fetch_positions()
+            positions = ex.fetch_positions(symbols)
+        else:
+            positions = ex.fetch_positions()
+        if not isinstance(positions, (list, tuple)):
+            raise TypeError("fetch_positions returned no position list")
+        if any(not isinstance(position, dict) for position in positions):
+            raise TypeError("fetch_positions returned a malformed position row")
+        if symbols:
+            expected_symbols = (
+                (symbols,)
+                if isinstance(symbols, str)
+                else tuple(symbols)
+            )
+            if not expected_symbols or any(
+                not any(
+                    explicit_trade_symbol_matches(position, expected_symbol)
+                    for expected_symbol in expected_symbols
+                )
+                for position in positions
+            ):
+                raise ValueError(
+                    "fetch_positions returned a position outside requested symbols"
+                )
+        return positions
     except Exception as e:
+        if isinstance(reservation, ApiCallReservation):
+            try:
+                record_api_error(endpoint, reservation)
+            except Exception:
+                pass
         # Authentication loss is operational state, not a transient missing
         # snapshot. Let guarded callers fail closed and publish explicit health
         # instead of persisting the same swallowed error every minute.

@@ -274,8 +274,14 @@ def load_expectancy_model(path: str | Path) -> LinearExpectancyModel | None:
         if not target.is_file():
             return None
         with open(target, "rb") as handle:
+            opened_stat = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened_stat.st_mode):
+                return None
+            opened_identity = (opened_stat.st_dev, opened_stat.st_ino)
             raw = handle.read(_EXPECTANCY_MODEL_JSON_MAX_BYTES + 1)
         _absolute_without_links(target, label="expectancy model path")
+        if not _same_file_generation(target, opened_identity):
+            return None
         if len(raw) > _EXPECTANCY_MODEL_JSON_MAX_BYTES:
             raise ValueError("expectancy model JSON exceeds size limit")
         payload = json.loads(

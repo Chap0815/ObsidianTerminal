@@ -38,8 +38,14 @@ from bot_utils import (
     safe_funding_scale,
     safe_remaining_funding,
 )
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.order_utils import order_id_text_or_none
+from bot_utils.safe_numeric import safe_liq_safety_pct, safe_stop_loss_pct
+from bot_utils.state_persist import persisted_epoch_ttl_active
 
 
 def _fetch_positions_compat_once(exchange, symbol_full: str):
@@ -74,6 +80,53 @@ _FULL_EXIT_SIDE = "full_exit_position_side"
 _FULL_EXIT_MODE = "full_exit_mode"
 _FULL_EXIT_BASE_FILLED = "full_exit_base_filled_amount"
 _FULL_EXIT_CREATED_AT = "full_exit_created_at"
+_PARTIAL_TP_BLOCK_TTL_SEC = 300.0
+
+
+def _partial_tp_block_active(bot, sym: str, row: dict) -> bool:
+    deadlines = getattr(bot, "_partial_tp_block_deadlines", None)
+    if not isinstance(deadlines, dict):
+        deadlines = {}
+        bot._partial_tp_block_deadlines = deadlines
+    return persisted_epoch_ttl_active(
+        deadlines,
+        sym,
+        enabled=row.get("partial_tp_blocked_min_notional") is True,
+        expires_at=row.get("partial_tp_blocked_min_notional_until"),
+        max_ttl_sec=_PARTIAL_TP_BLOCK_TTL_SEC,
+    )
+
+
+def _liq_refresh_active(bot, sym: str, row: dict, interval: float) -> bool:
+    deadlines = getattr(bot, "_liq_refresh_deadlines", None)
+    if not isinstance(deadlines, dict):
+        deadlines = {}
+        bot._liq_refresh_deadlines = deadlines
+    return persisted_epoch_ttl_active(
+        deadlines,
+        sym,
+        enabled=True,
+        expires_at=row.get("liq_next_check_at"),
+        max_ttl_sec=interval,
+    )
+
+
+def _funding_refresh_active(bot, sym: str, expires_at: float) -> bool:
+    deadlines = getattr(bot, "_funding_refresh_deadlines", None)
+    if not isinstance(deadlines, dict):
+        deadlines = {}
+        bot._funding_refresh_deadlines = deadlines
+    interval = FuturesExitsMixin._safe_positive_float(
+        getattr(bot, "_FUNDING_REFRESH_INTERVAL_SEC", 4 * 3600),
+        4 * 3600,
+    )
+    return persisted_epoch_ttl_active(
+        deadlines,
+        sym,
+        enabled=True,
+        expires_at=expires_at,
+        max_ttl_sec=interval + 599.0,
+    )
 
 
 def _futures_order_lookup_since_ms(value) -> int | None:
@@ -88,17 +141,22 @@ def _futures_order_lookup_since_ms(value) -> int | None:
             text = str(value).strip().replace("Z", "+00:00")
             if not text:
                 return None
-            try:
-                parsed = datetime.fromisoformat(text)
-            except ValueError:
-                parsed = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+            parsed = datetime.fromisoformat(text)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             seconds = parsed.timestamp()
         if not math.isfinite(seconds) or seconds <= 0:
             return None
         milliseconds = int(seconds * 1000)
-        if milliseconds > int(time.time() * 1000) + 60_000:
+        try:
+            from core.clock import now_ms
+
+            current_ms = float(now_ms())
+        except Exception:
+            return None
+        if not math.isfinite(current_ms) or current_ms <= 0.0:
+            return None
+        if milliseconds > int(current_ms) + 60_000:
             return None
         return milliseconds
     except (TypeError, ValueError, OverflowError, OSError):
@@ -934,6 +992,11 @@ class FuturesExitsMixin:
         parsed = cls._safe_finite_float(value, default)
         return parsed if parsed > 0 else default
 
+    @staticmethod
+    def _safe_daily_loss_limit(value, default: float = -30.0) -> float:
+        parsed = FuturesExitsMixin._safe_finite_float(value, default)
+        return parsed if -1000.0 <= parsed < 0.0 else default
+
     @classmethod
     def _reconstructed_margin_usdt(
         cls, *, amount, contract_size, entry_price, leverage
@@ -1223,6 +1286,15 @@ class FuturesExitsMixin:
 
         while not self._shutdown_event.is_set():
             try:
+                refreshed_interval = int(float(self.C(
+                    "MONITOR_INTERVAL",
+                    self.DEFAULT_MONITOR_INTERVAL,
+                )))
+                if 5 <= refreshed_interval <= 600:
+                    monitor_interval = refreshed_interval
+            except (TypeError, ValueError, OverflowError):
+                pass
+            try:
                 trades = self.state.get_all()
                 now = time.time()
                 now_monotonic = time.monotonic()
@@ -1241,7 +1313,9 @@ class FuturesExitsMixin:
                         last_killswitch_monotonic = now_monotonic
                         try:
                             _today = getattr(self, "_ks_last_total", 0.0)
-                            _maxloss = float(self.C("MAX_DAILY_LOSS", -30.0))
+                            _maxloss = FuturesExitsMixin._safe_daily_loss_limit(
+                                self.C("MAX_DAILY_LOSS", -30.0)
+                            )
                             ks_interval = (
                                 8.0
                                 if (_maxloss < 0 and _today <= _maxloss * 0.7)
@@ -1326,7 +1400,11 @@ class FuturesExitsMixin:
           a hard stop should require a human to look before trading resumes.
         """
         try:
-            from core.database import get_today_pnl, opened_today_local
+            from core.database import (
+                get_today_pnl,
+                opened_today_local,
+                pause_bot_today,
+            )
             from core.logger import log_event
             if not getattr(self, "safe_mode", None):
                 return True  # bot not fully initialized yet
@@ -1367,7 +1445,9 @@ class FuturesExitsMixin:
             total_all = today_realized + unrealized_all
             total_soft = today_realized + unrealized_today
             self._ks_last_total = total_all   # adaptive cadence tracks the hard cap
-            max_loss = float(self.C("MAX_DAILY_LOSS", -30.0))
+            max_loss = FuturesExitsMixin._safe_daily_loss_limit(
+                self.C("MAX_DAILY_LOSS", -30.0)
+            )
 
   #  SOFT tier: block new entries (reversible) 
             # Guard on is_active() so we don't re-log/re-trigger every 60s.
@@ -1380,11 +1460,21 @@ class FuturesExitsMixin:
                 self.safe_mode.trigger(
                     f"daily-loss killswitch ({total_soft:+.2f} USDT)"
                 )
+                try:
+                    pause_bot_today(
+                        self.BOT_NAME,
+                        f"Daily loss {total_soft:+.2f} USDT reached",
+                        mode_is_sim=self.simulation,
+                    )
+                except Exception as exc:
+                    self._log_error("persist futures daily-loss pause", exc)
 
   #  HARD tier: flatten everything (one-shot per process) 
             try:
                 hard_mult = float(self.C("MAX_DAILY_LOSS_HARD_MULT", 1.5))
             except (TypeError, ValueError):
+                hard_mult = 1.5
+            if not math.isfinite(hard_mult) or not 1.0 <= hard_mult <= 10.0:
                 hard_mult = 1.5
   # both operands negative  hard_limit is MORE negative than max_loss
             hard_limit = max_loss * hard_mult
@@ -1399,6 +1489,17 @@ class FuturesExitsMixin:
                     self.safe_mode.trigger(
                         f"HARD daily-loss killswitch ({total_all:+.2f} USDT)"
                     )
+                if total_soft > max_loss:
+                    try:
+                        pause_bot_today(
+                            self.BOT_NAME,
+                            f"Hard daily loss {total_all:+.2f} USDT reached",
+                            mode_is_sim=self.simulation,
+                        )
+                    except Exception as exc:
+                        self._log_error(
+                            "persist futures hard daily-loss pause", exc
+                        )
                 try:
                     self._emergency_close_all(
                         reason=f"HARD daily-loss killswitch "
@@ -1427,7 +1528,9 @@ class FuturesExitsMixin:
             if not getattr(self, "_hard_kill_fired", False):
                 try:
                     crash_pct = float(self.C("FUT_FLATTEN_BTC_CRASH_PCT", -12.0))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
+                    crash_pct = -12.0
+                if not math.isfinite(crash_pct) or not -100.0 <= crash_pct <= 0.0:
                     crash_pct = -12.0
                 if crash_pct < 0:
                     try:
@@ -1546,7 +1649,7 @@ class FuturesExitsMixin:
                         sym, "funding_next_check_at",
                         now_epoch + self._FUNDING_REFRESH_INTERVAL_SEC + jitter)
                     continue
-                if now_epoch < next_check:
+                if _funding_refresh_active(self, sym, next_check):
                     continue  # not yet due
                 buy_time = d.get("buy_time")
                 if not buy_time:
@@ -2047,18 +2150,17 @@ class FuturesExitsMixin:
         # earlier rather than too late.
         mm_rate = get_maintenance_margin_rate(self.ex, symbol_full)
         if not self.simulation:
-            now_ts = time.time()
             # Throttle the exchange-liq API call; between refreshes use the
             # cached liquidation_price (or a local estimate if none stored yet).
-            if now_ts >= FuturesExitsMixin._safe_finite_float(
-                    d.get("liq_next_check_at"), 0.0):
+            interval = FuturesExitsMixin._safe_positive_float(
+                getattr(self, "LIQ_REFRESH_INTERVAL_SEC", 90.0), 90.0)
+            if not _liq_refresh_active(self, sym, d, interval):
+                now_ts = time.time()
                 exch_liq = get_exchange_liq_price(
                     self.ex,
                     symbol_full,
                     expected_position_side=pos_type,
                 )
-                interval = FuturesExitsMixin._safe_positive_float(
-                    getattr(self, "LIQ_REFRESH_INTERVAL_SEC", 90.0), 90.0)
                 upd = {"liq_next_check_at": now_ts + interval}
                 if exch_liq > 0:
                     liq_price = exch_liq
@@ -2156,8 +2258,8 @@ class FuturesExitsMixin:
                 funding_paid=d.get("funding_paid", 0.0),
                 opened_at=d["buy_time"], entry_id=d.get("entry_id")
             )
-        except Exception:
-            pass  # dashboard state is best-effort
+        except Exception as exc:
+            self._log_error(f"futures dashboard state {sym}", exc)
 
   #  Breakeven activation 
         be_trigger = FuturesExitsMixin._safe_finite_float(
@@ -2187,17 +2289,13 @@ class FuturesExitsMixin:
   #  Partial TP (only if no exit fired) 
         activation = FuturesExitsMixin._safe_finite_float(
             self.C("ACTIVATION_PROFIT"), 0.0)
-        partial_blocked_until = FuturesExitsMixin._safe_finite_float(
-            d.get("partial_tp_blocked_min_notional_until"), 0.0)
-        partial_block_active = (
-            bool(d.get("partial_tp_blocked_min_notional"))
-            and time.time() < partial_blocked_until
-        )
+        partial_block_active = _partial_tp_block_active(self, sym, d)
         pending_partial_intent = _has_futures_partial_exit_intent(d)
         if (
             pending_partial_intent
             or (
                 not sell_trigger
+                and activation > 0.0
                 and not d.get("partial_sold")
                 and not partial_block_active
                 and move_pct >= activation
@@ -2216,17 +2314,12 @@ class FuturesExitsMixin:
                 ):
                     return
                 live_pending_partial = _has_futures_partial_exit_intent(live)
-                live_partial_blocked_until = (
-                    FuturesExitsMixin._safe_finite_float(
-                        live.get("partial_tp_blocked_min_notional_until"), 0.0
-                    )
-                )
-                live_partial_block_active = (
-                    bool(live.get("partial_tp_blocked_min_notional"))
-                    and time.time() < live_partial_blocked_until
+                live_partial_block_active = _partial_tp_block_active(
+                    self, sym, live
                 )
                 if live_pending_partial or (
                     not sell_trigger
+                    and activation > 0.0
                     and not live.get("partial_sold")
                     and not live_partial_block_active
                     and move_pct >= activation
@@ -2395,8 +2488,9 @@ class FuturesExitsMixin:
                 pass
 
         consumed = liq_buffer_consumed_pct(initial_liq_dist, liq_dist)
-        panic_threshold = 100.0 - FuturesExitsMixin._safe_finite_float(
-            self.C("LIQ_SAFETY_PCT", 25.0), 25.0)
+        panic_threshold = 100.0 - safe_liq_safety_pct(
+            self.C("LIQ_SAFETY_PCT", 25.0), 25.0
+        )
         if consumed >= panic_threshold:
             log_event(
                 f"EMERGENCY: Liquidation buffer "
@@ -2436,14 +2530,44 @@ class FuturesExitsMixin:
                     "PRE_ACTIVATION_GIVEBACK_PCT", 0.75),
             )
             if peak_error:
+                boot_cfg = getattr(self, "cfg", None)
+                required_boot_keys = (
+                    "PRE_ACTIVATION_GIVEBACK_STOP_ENABLED",
+                    "PRE_ACTIVATION_MIN_MFE_PCT",
+                    "PRE_ACTIVATION_GIVEBACK_PCT",
+                )
+                if (
+                    isinstance(boot_cfg, dict)
+                    and all(key in boot_cfg for key in required_boot_keys)
+                ):
+                    peak_config, _boot_error = validate_peak_trail_config(
+                        enabled=boot_cfg[
+                            "PRE_ACTIVATION_GIVEBACK_STOP_ENABLED"
+                        ],
+                        activation_mfe_pct=boot_cfg[
+                            "PRE_ACTIVATION_MIN_MFE_PCT"
+                        ],
+                        giveback_pct=boot_cfg[
+                            "PRE_ACTIVATION_GIVEBACK_PCT"
+                        ],
+                    )
+                else:
+                    peak_config = None
                 if getattr(self, "_peak_trail_config_warning", "") != peak_error:
                     self._peak_trail_config_warning = peak_error
+                    fallback_action = (
+                        "using validated boot config"
+                        if peak_config is not None
+                        else "protection ignored"
+                    )
                     log_event(
-                        f"[FUTURES] peak trail config ignored: {peak_error}",
+                        f"[FUTURES] invalid live peak trail config; "
+                        f"{fallback_action}: {peak_error}",
                         "WARN",
                     )
             else:
                 self._peak_trail_config_warning = ""
+            if peak_config is not None:
                 mfe_pct = FuturesExitsMixin._safe_finite_float(
                     d.get("max_profit_pct"), move_pct)
                 if peak_trail_hit(
@@ -2470,7 +2594,11 @@ class FuturesExitsMixin:
                     "MFE_FALLBACK_MIN_AGE_MINUTES", 45.0),
                 min_mfe_pct=self.C("MFE_FALLBACK_MIN_MFE_PCT", 0.8),
                 exit_move_pct=self.C("MFE_FALLBACK_EXIT_MOVE_PCT", -1.5),
-                initial_stop_loss_pct=self.C("INITIAL_STOP_LOSS", -4.0),
+                initial_stop_loss_pct=safe_stop_loss_pct(
+                    self.C("INITIAL_STOP_LOSS", -4.0),
+                    -4.0,
+                    leverage=lev,
+                ),
             )
             if fallback_error:
                 if (getattr(self, "_mfe_fallback_config_warning", "")
@@ -2501,8 +2629,11 @@ class FuturesExitsMixin:
         if (post_partial_trailing_dist <= 0.0
                 or (activation > 0.0 and post_partial_trailing_dist >= activation)):
             post_partial_trailing_dist = trailing_dist
-        initial_sl = FuturesExitsMixin._safe_finite_float(
-            self.C("INITIAL_STOP_LOSS"), -100.0)
+        initial_sl = safe_stop_loss_pct(
+            self.C("INITIAL_STOP_LOSS", -4.0),
+            -4.0,
+            leverage=lev,
+        )
 
         if d.get("break_even"):
             # Post-partial-TP: trailing fully armed
@@ -2520,7 +2651,7 @@ class FuturesExitsMixin:
             # that hits +5% then pulls back to +4% keeps the trailing block
             # active instead of falling through to only INITIAL_STOP_LOSS.
             high_prof = price_move_pct(entry, highest, pos_type)
-            if high_prof >= activation:
+            if activation > 0.0 and trailing_dist > 0.0 and high_prof >= activation:
                 if trailing_stop_hit(curr, highest, trailing_dist, pos_type):
                     return True, "Trailing Stop"
             if not d.get("be_active") and move_pct <= initial_sl:
@@ -2972,9 +3103,10 @@ class FuturesExitsMixin:
                         for _att in range(2):
                             _t.sleep(0.35 * (1 + _att))
                             try:
-                                allowed = try_consume_api_call(
+                                reservation = try_consume_api_call(
                                     "futures_partial_tp_fill_fetch_order",
                                     critical=True,
+                                    return_reservation=True,
                                 )
                             except Exception as budget_exc:
                                 log_event(
@@ -2984,14 +3116,37 @@ class FuturesExitsMixin:
                                     "WARN",
                                 )
                                 break
-                            if not allowed:
+                            if not reservation:
                                 log_event(
                                     f"Partial-TP {sym}: fill refresh skipped - "
                                     f"API budget exhausted",
                                     "WARN",
                                 )
                                 break
-                            refreshed = self.ex.fetch_order(str(exch_oid), symbol_full)
+                            try:
+                                refreshed = self.ex.fetch_order(
+                                    str(exch_oid), symbol_full
+                                )
+                            except Exception:
+                                if isinstance(reservation, ApiCallReservation):
+                                    try:
+                                        record_api_error(
+                                            "futures_partial_tp_fill_fetch_order",
+                                            reservation,
+                                        )
+                                    except Exception:
+                                        pass
+                                raise
+                            if not isinstance(refreshed, dict) or not refreshed:
+                                if isinstance(reservation, ApiCallReservation):
+                                    try:
+                                        record_api_error(
+                                            "futures_partial_tp_fill_fetch_order",
+                                            reservation,
+                                        )
+                                    except Exception:
+                                        pass
+                                break
                             if refreshed and (
                                 not isinstance(refreshed, dict)
                                 or _order_refresh_conflicts(

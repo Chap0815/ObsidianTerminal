@@ -12,6 +12,7 @@ from bot_utils.api_budget import (
     try_consume_api_call,
 )
 from bot_utils.futures_order import _position_contracts_abs, position_row_side
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from core.constants import STABLECOIN_EQUIVALENTS
 from shared_limits import normalize_gate_mode
 from trading.portfolio_risk import (
@@ -37,7 +38,10 @@ def _budgeted_api_call(endpoint: str, operation):
         # keeps narrow test doubles/backwards-compatible callers harmless
         # without ever double-counting a call as a new error row.
         if isinstance(reservation, ApiCallReservation):
-            record_api_error(endpoint, reservation)
+            try:
+                record_api_error(endpoint, reservation)
+            except Exception:
+                pass
         raise
 
 
@@ -467,12 +471,23 @@ def collect_spot_snapshot(exchange) -> PortfolioSnapshot:
         ]
         tickers = {}
         if symbols:
+            def fetch_spot_tickers():
+                snapshot = exchange.fetch_tickers(symbols)
+                if not isinstance(snapshot, dict):
+                    raise ValueError("spot ticker snapshot unavailable")
+                if any(
+                    ticker is not None
+                    and not explicit_trade_symbol_matches(ticker, symbol)
+                    for symbol in symbols
+                    for ticker in (snapshot.get(symbol),)
+                ):
+                    raise ValueError("spot ticker snapshot symbol mismatch")
+                return snapshot
+
             fetched_tickers = _budgeted_api_call(
                 "portfolio_guard_fetch_tickers",
-                lambda: exchange.fetch_tickers(symbols),
+                fetch_spot_tickers,
             )
-            if not isinstance(fetched_tickers, dict):
-                raise ValueError("spot ticker snapshot unavailable")
             tickers = fetched_tickers
         equity = 0.0
         positions = []

@@ -16,6 +16,7 @@ from bot_utils.api_budget import (
     record_api_error,
     try_consume_api_call,
 )
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.silent_log import silent_log
 
 
@@ -775,24 +776,45 @@ def process_due_tca_markouts(
                 if ticker_failure is not None:
                     raise _RetryableMarkoutError(ticker_failure)
                 if ticker_observation is None:
-                    if not try_consume_api_call(
-                        "execution_markout_fetch_ticker"
-                    ):
-                        break
-                    ticker = exchange.fetch_ticker(symbol_key)
-                    if not isinstance(ticker, Mapping):
-                        ticker_failure = "ticker payload unavailable"
-                        ticker_failures[symbol_key] = ticker_failure
-                        raise _RetryableMarkoutError(ticker_failure)
-                    mark = _first_positive_finite(
-                        ticker.get("mark"),
-                        ticker.get("last"),
-                        ticker.get("close"),
+                    api_reservation = try_consume_api_call(
+                        "execution_markout_fetch_ticker",
+                        return_reservation=True,
                     )
-                    if mark is None:
-                        ticker_failure = "mark price unavailable"
-                        ticker_failures[symbol_key] = ticker_failure
-                        raise _RetryableMarkoutError(ticker_failure)
+                    if not api_reservation:
+                        break
+                    try:
+                        ticker = exchange.fetch_ticker(symbol_key)
+                        if not isinstance(ticker, Mapping):
+                            ticker_failure = "ticker payload unavailable"
+                            ticker_failures[symbol_key] = ticker_failure
+                            raise _RetryableMarkoutError(ticker_failure)
+                        ticker = dict(ticker)
+                        if not explicit_trade_symbol_matches(
+                            ticker,
+                            symbol_key,
+                        ):
+                            ticker_failure = "ticker symbol mismatch"
+                            ticker_failures[symbol_key] = ticker_failure
+                            raise _RetryableMarkoutError(ticker_failure)
+                        mark = _first_positive_finite(
+                            ticker.get("mark"),
+                            ticker.get("last"),
+                            ticker.get("close"),
+                        )
+                        if mark is None:
+                            ticker_failure = "mark price unavailable"
+                            ticker_failures[symbol_key] = ticker_failure
+                            raise _RetryableMarkoutError(ticker_failure)
+                    except Exception:
+                        if isinstance(api_reservation, ApiCallReservation):
+                            try:
+                                record_api_error(
+                                    "execution_markout_fetch_ticker",
+                                    api_reservation,
+                                )
+                            except Exception:
+                                pass
+                        raise
                     observed_at_utc = _markout_now_utc()
                     if not isinstance(observed_at_utc, datetime):
                         raise ValueError("markout observation time is invalid")

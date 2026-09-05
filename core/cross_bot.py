@@ -29,10 +29,23 @@ from typing import Dict, List, Optional, Tuple
 
 from shared_limits import normalize_gate_mode
 from core.futures_bot import FuturesBot
-from bot_utils.api_budget import try_consume_api_call
-from bot_utils.order_utils import order_id_text_or_none
-from bot_utils.safe_numeric import parse_ohlcv_closes
+from bot_utils.config import parse_explicit_bool
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
+from bot_utils.order_utils import (
+    explicit_trade_symbol_matches,
+    order_id_text_or_none,
+)
+from bot_utils.safe_numeric import (
+    parse_ohlcv_closes,
+    safe_daily_loss_limit,
+    safe_liq_safety_pct,
+)
 from bot_utils.silent_log import silent_log
+from bot_utils.state_persist import persisted_epoch_ttl_active
 from core.constants import NONCRYPTO_BASES, STOCK_TOKEN_BASES
 from trading.xsec_signal import (
     XSecParams,
@@ -43,6 +56,17 @@ from trading.xsec_signal import (
 
 _REBALANCE_STATE_PARAM = "REBALANCE_STATE_V2"
 _REBALANCE_STATE_SCHEMA = 1
+_MAX_BASE_CAPITAL_USDT = 100_000.0
+
+
+def _rebalance_now_sec() -> float:
+    """Return exchange-anchored epoch seconds for the fixed cadence grid."""
+    from core.clock import now_ms
+
+    value = float(now_ms()) / 1000.0
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError("invalid exchange-anchored rebalance time")
+    return value
 
 
 def _force_rebalance_token(value) -> Optional[float]:
@@ -56,6 +80,58 @@ def _force_rebalance_token(value) -> Optional[float]:
         return None
     return generation
 _MONITOR_TICKER_BATCH_SIZE = 20
+
+
+def _liq_refresh_active(bot, base: str, row: dict, interval: float) -> bool:
+    deadlines = getattr(bot, "_liq_refresh_deadlines", None)
+    if not isinstance(deadlines, dict):
+        deadlines = {}
+        bot._liq_refresh_deadlines = deadlines
+    return persisted_epoch_ttl_active(
+        deadlines,
+        base,
+        enabled=True,
+        expires_at=row.get("liq_next_check_at"),
+        max_ttl_sec=interval,
+    )
+
+
+def _entry_inflight_active(bot, base: str, expires_at) -> bool:
+    from core.clock import now_ms
+
+    deadlines = getattr(bot, "_entry_inflight_deadlines", None)
+    if not isinstance(deadlines, dict):
+        deadlines = {}
+        bot._entry_inflight_deadlines = deadlines
+    return persisted_epoch_ttl_active(
+        deadlines,
+        base,
+        enabled=True,
+        expires_at=expires_at,
+        max_ttl_sec=120.0,
+        epoch_now=now_ms() / 1000.0,
+    )
+
+
+def _funding_refresh_active(bot, base: str, expires_at: float) -> bool:
+    deadlines = getattr(bot, "_funding_refresh_deadlines", None)
+    if not isinstance(deadlines, dict):
+        deadlines = {}
+        bot._funding_refresh_deadlines = deadlines
+    interval = CrossBot._safe_float(
+        bot,
+        getattr(bot, "_FUNDING_REFRESH_INTERVAL_SEC", 4 * 3600),
+        4 * 3600,
+    )
+    if interval <= 0:
+        interval = 4 * 3600
+    return persisted_epoch_ttl_active(
+        deadlines,
+        base,
+        enabled=True,
+        expires_at=expires_at,
+        max_ttl_sec=interval,
+    )
 
 
 def _encode_rebalance_state(slot: int, recent_returns, crash_flat: bool) -> str:
@@ -87,11 +163,23 @@ def _encode_rebalance_state(slot: int, recent_returns, crash_flat: bool) -> str:
     )
 
 
+def _unique_rebalance_state_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate rebalance state key: {key}")
+        result[key] = value
+    return result
+
+
 def _decode_rebalance_state(raw: str) -> tuple[int, List[float], bool]:
     if not isinstance(raw, str) or not raw.strip():
         raise ValueError("rebalance state must be non-empty text")
     try:
-        payload = json.loads(raw)
+        payload = json.loads(
+            raw,
+            object_pairs_hook=_unique_rebalance_state_object,
+        )
     except json.JSONDecodeError as exc:
         raise ValueError("rebalance state is not valid JSON") from exc
     if not isinstance(payload, dict) or set(payload) != {
@@ -208,7 +296,8 @@ class CrossBot(FuturesBot):
                 return d
         def _b(k, d):
             v = self.C(k, d)
-            return str(v).strip().lower() not in ("0", "false", "no", "off") if v is not None else d
+            parsed = parse_explicit_bool(v)
+            return d if parsed is None else parsed
         return XSecParams(
             lookback_hours=_i("XSEC_LOOKBACK_HOURS", 24),
             k_per_side=_i("XSEC_K", 6),
@@ -746,17 +835,34 @@ class CrossBot(FuturesBot):
                     break
                 time.sleep(0.4 * (1 + attempt))
                 try:
-                    allowed = try_consume_api_call(
+                    reservation = try_consume_api_call(
                         "cross_entry_fetch_order",
                         critical=True,
+                        return_reservation=True,
                     )
                 except Exception:
-                    allowed = False
-                if not allowed:
+                    reservation = False
+                if not reservation:
                     continue
                 try:
-                    refreshed = self.ex.fetch_order(oid, full) or {}
+                    refreshed = self.ex.fetch_order(oid, full)
                 except Exception:
+                    if isinstance(reservation, ApiCallReservation):
+                        try:
+                            record_api_error(
+                                "cross_entry_fetch_order", reservation
+                            )
+                        except Exception:
+                            pass
+                    continue
+                if not isinstance(refreshed, dict) or not refreshed:
+                    if isinstance(reservation, ApiCallReservation):
+                        try:
+                            record_api_error(
+                                "cross_entry_fetch_order", reservation
+                            )
+                        except Exception:
+                            pass
                     continue
                 if _order_refresh_conflicts(
                     order,
@@ -935,10 +1041,9 @@ class CrossBot(FuturesBot):
         from core.logger import log_event
 
         full = f"{base}/USDT:USDT"
-        from core.clock import now_ms
-
-        inflight_active = CrossBot._safe_float(
-            self, d.get("entry_inflight_until"), 0.0) > now_ms() / 1000.0
+        inflight_active = _entry_inflight_active(
+            self, base, d.get("entry_inflight_until")
+        )
         recovery_blocked = (
             self._entry_recovery_runtime_health().get("ok") is False
         )
@@ -1335,7 +1440,7 @@ class CrossBot(FuturesBot):
             try:
                 next_check = CrossBot._safe_float(
                     self, d.get("funding_next_check_at"), 0.0)
-                if now_epoch < next_check:
+                if _funding_refresh_active(self, base, next_check):
                     continue
 
                 current_raw = d.get("funding_paid")
@@ -1389,10 +1494,12 @@ class CrossBot(FuturesBot):
         if max_pct <= 0:
             return True
         try:
-            if not try_consume_api_call("cross_fetch_funding_rate"):
-                return False
             from config.exchange_config import safe_fetch_funding_rate
-            fr = safe_fetch_funding_rate(self.ex, full_symbol)
+            fr = safe_fetch_funding_rate(
+                self.ex,
+                full_symbol,
+                endpoint="cross_fetch_funding_rate",
+            )
             if not isinstance(fr, dict) or "fundingRate" not in fr:
                 return False
             raw_rate = fr.get("fundingRate")
@@ -1417,9 +1524,16 @@ class CrossBot(FuturesBot):
     #  Rebalance cadence (anchored, not per-restart) 
     def _rebalance_interval_sec(self) -> int:
         try:
-            return max(3600, int(float(self.C("XSEC_REBALANCE_HOURS", 72)) * 3600))
-        except (TypeError, ValueError):
-            return 72 * 3600
+            hours = float(self.C("XSEC_REBALANCE_HOURS", 48))
+        except (TypeError, ValueError, OverflowError):
+            hours = 48.0
+        if (
+            not math.isfinite(hours)
+            or not hours.is_integer()
+            or not 6.0 <= hours <= 336.0
+        ):
+            hours = 48.0
+        return int(hours) * 3600
 
     def _load_rebalance_state(self) -> bool:
         """Load the crash-filter and cadence state once, failing closed."""
@@ -1451,11 +1565,30 @@ class CrossBot(FuturesBot):
         except Exception as exc:
             self._rebalance_state_load_error = type(exc).__name__
             return False
+        try:
+            current_slot = (
+                int(_rebalance_now_sec())
+                // self._rebalance_interval_sec()
+            )
+        except Exception as exc:
+            self._rebalance_state_load_error = type(exc).__name__
+            return False
+        repair_future_slot = slot > current_slot
+        if repair_future_slot:
+            # A persisted marker can predate the exchange-anchored clock and
+            # contain an OS-clock jump. Keeping it would suppress scheduled
+            # rebalances until wall time eventually caught up.
+            slot = current_slot
         self._last_rebalance_slot = slot
         self._recent_rebalance_returns = recent
         self._cross_crash_flat = crash_flat
         self._rebalance_state_load_error = ""
         self._rebalance_state_loaded = True
+        if repair_future_slot and not CrossBot._persist_rebalance_state(
+            self,
+            slot,
+        ):
+            return False
         return True
 
     def _persist_rebalance_state(self, slot: int) -> bool:
@@ -1535,7 +1668,7 @@ class CrossBot(FuturesBot):
         first run establishes the book once.
         """
         iv = self._rebalance_interval_sec()
-        slot = int(time.time()) // iv
+        slot = int(_rebalance_now_sec()) // iv
         CrossBot._retry_rebalance_state_persistence(self)
         state_unavailable = not CrossBot._load_rebalance_state(self)
         # Rebalance when the slot advances OR when we currently hold NOTHING.
@@ -1549,6 +1682,8 @@ class CrossBot(FuturesBot):
             empty = False
         if state_unavailable:
             return False
+        if getattr(self, "_rebalance_state_persist_pending", None) is not None:
+            return False
         if bool(getattr(self, "_cross_crash_flat", False)):
             return slot > self._last_rebalance_slot
         return slot > self._last_rebalance_slot or empty
@@ -1558,7 +1693,7 @@ class CrossBot(FuturesBot):
         actually applied a book, so an interrupted/failed rebalance retries on
         the next loop instead of being skipped until the next slot."""
         iv = self._rebalance_interval_sec()
-        observed_slot = int(time.time()) // iv
+        observed_slot = int(_rebalance_now_sec()) // iv
         previous_slot = getattr(self, "_last_rebalance_slot", -1)
         if (
             isinstance(previous_slot, bool)
@@ -1870,7 +2005,7 @@ class CrossBot(FuturesBot):
         seconds_to_next_rebalance = None
         try:
             interval = self._rebalance_interval_sec()
-            now = float(time.time())
+            now = _rebalance_now_sec()
             if (
                 isinstance(interval, bool)
                 or not isinstance(interval, int)
@@ -1989,7 +2124,9 @@ class CrossBot(FuturesBot):
         self._topup_attempts = 0
         try:
             self._topup_max = int(float(self.C("XSEC_TOPUP_MAX_ATTEMPTS", 12)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            self._topup_max = 12
+        if not 1 <= self._topup_max <= 100:
             self._topup_max = 12
         # Seed the manual-force token with the CURRENT stored value so a stale
         # button press from a PREVIOUS run doesn't fire a rebalance on boot.
@@ -2053,9 +2190,12 @@ class CrossBot(FuturesBot):
                 return
 
     def _consume_force_rebalance(self) -> bool:
-        """True (once) when the launcher's manual-rebalance button wrote a fresh
-        FORCE_REBALANCE token since we last acted. Cross-process via bot_params;
-        seen within ~one param-cache TTL (60s) of the press."""
+        """True once when the launcher's persisted manual token changes.
+
+        Compare identity rather than ordering: the launcher currently uses an
+        epoch timestamp, and an OS clock correction must not make every later
+        button press invisible until the old high-water mark is reached.
+        """
         try:
             from core.database import get_param
             generation = _force_rebalance_token(
@@ -2069,7 +2209,7 @@ class CrossBot(FuturesBot):
         if seen is None:
             self._force_token_seen = generation
             return False
-        if generation > seen:
+        if generation != seen:
             self._force_token_seen = generation
             return True
         return False
@@ -2113,7 +2253,10 @@ class CrossBot(FuturesBot):
         last_slot = getattr(self, "_last_rebalance_slot", None)
         slot_advanced = last_slot is None
         if last_slot is not None:
-            current_slot = int(time.time()) // CrossBot._rebalance_interval_sec(self)
+            current_slot = (
+                int(_rebalance_now_sec())
+                // CrossBot._rebalance_interval_sec(self)
+            )
             slot_advanced = current_slot > last_slot
         was_crash_flat = bool(getattr(self, "_cross_crash_flat", False))
         staged_returns = advance_crash_history(
@@ -2259,7 +2402,11 @@ class CrossBot(FuturesBot):
             n = 40
         min_vol = self._f("MIN_VOLUME", 5_000_000.0)
         try:
-            if not try_consume_api_call("cross_fetch_tickers"):
+            ticker_reservation = try_consume_api_call(
+                "cross_fetch_tickers",
+                return_reservation=True,
+            )
+            if not ticker_reservation:
                 log_event(f"[{self.BOT_NAME}] universe scan skipped "
                           f"(API budget exhausted)", "WARN")
                 return {}, {}
@@ -2272,7 +2419,21 @@ class CrossBot(FuturesBot):
             return {}, {}
         try:
             tickers = self.ex.fetch_tickers()
+            if not isinstance(tickers, dict) or any(
+                not isinstance(symbol, str)
+                or not isinstance(ticker, dict)
+                or not explicit_trade_symbol_matches(ticker, symbol)
+                for symbol, ticker in tickers.items()
+            ):
+                raise TypeError("cross ticker universe returned no ticker map")
         except Exception as e:
+            if isinstance(ticker_reservation, ApiCallReservation):
+                try:
+                    record_api_error(
+                        "cross_fetch_tickers", ticker_reservation
+                    )
+                except Exception:
+                    pass
             log_event(f"[{self.BOT_NAME}] ticker fetch failed: {e}", "WARN")
             return {}, {}
         cands = []
@@ -2354,7 +2515,11 @@ class CrossBot(FuturesBot):
                 return discard_partial_snapshot()
             try:
                 try:
-                    if not try_consume_api_call("cross_fetch_ohlcv"):
+                    ohlcv_reservation = try_consume_api_call(
+                        "cross_fetch_ohlcv",
+                        return_reservation=True,
+                    )
+                    if not ohlcv_reservation:
                         log_event(
                             f"[{self.BOT_NAME}] partial universe discarded "
                             f"(API budget exhausted)",
@@ -2368,18 +2533,63 @@ class CrossBot(FuturesBot):
                         "WARN",
                     )
                     return discard_partial_snapshot()
-                bars = self.ex.fetch_ohlcv(sym, timeframe="1h", limit=need)
+                try:
+                    bars = self.ex.fetch_ohlcv(
+                        sym, timeframe="1h", limit=need
+                    )
+                    if not isinstance(bars, list):
+                        raise TypeError(
+                            "cross OHLCV returned no candle list"
+                        )
+                    if any(
+                        not isinstance(bar, (list, tuple)) or len(bar) < 5
+                        for bar in bars
+                    ):
+                        raise TypeError(
+                            "cross OHLCV returned a malformed candle row"
+                        )
+                    for bar in bars:
+                        if isinstance(bar[4], bool):
+                            raise ValueError(
+                                "cross OHLCV returned a boolean close"
+                            )
+                        try:
+                            close = float(bar[4])
+                        except (TypeError, ValueError, OverflowError) as exc:
+                            raise ValueError(
+                                "cross OHLCV returned a nonnumeric close"
+                            ) from exc
+                        if not math.isfinite(close) or close <= 0:
+                            raise ValueError(
+                                "cross OHLCV returned an invalid close"
+                            )
+                except Exception:
+                    if isinstance(ohlcv_reservation, ApiCallReservation):
+                        try:
+                            record_api_error(
+                                "cross_fetch_ohlcv", ohlcv_reservation
+                            )
+                        except Exception:
+                            pass
+                    raise
                 try:
                     from core.clock import now_ms as _clock_now_ms
                     current_time_ms = int(_clock_now_ms())
                 except Exception:
-                    current_time_ms = int(time.time() * 1000)
+                    continue
                 closes = parse_ohlcv_closes(
                     bars,
                     expected_interval_ms=3_600_000,
                     now_ms=current_time_ms,
                 )
                 if closes is None:
+                    if isinstance(ohlcv_reservation, ApiCallReservation):
+                        try:
+                            record_api_error(
+                                "cross_fetch_ohlcv", ohlcv_reservation
+                            )
+                        except Exception:
+                            pass
                     continue
                 if len(closes) >= lookback + 1:
                     if not self._funding_ok(sym, max_fund):
@@ -2402,6 +2612,30 @@ class CrossBot(FuturesBot):
     #  Equity + sizing 
     def _equity(self) -> float:
         cap = self._f("BASE_CAPITAL_USDT", 0.0)
+        if cap < 0.0:
+            try:
+                from core.logger import log_event
+
+                log_event(
+                    f"[{self.BOT_NAME}] invalid negative BASE_CAPITAL_USDT; "
+                    "skip sizing fail-closed",
+                    "WARN",
+                )
+            except Exception:
+                pass
+            return 0.0
+        if cap > _MAX_BASE_CAPITAL_USDT:
+            try:
+                from core.logger import log_event
+
+                log_event(
+                    f"[{self.BOT_NAME}] BASE_CAPITAL_USDT exceeds configured "
+                    f"maximum; capped at {_MAX_BASE_CAPITAL_USDT:.0f}",
+                    "WARN",
+                )
+            except Exception:
+                pass
+            cap = _MAX_BASE_CAPITAL_USDT
         if self.simulation:
             return cap if cap > 0 else 1000.0
         bal = None
@@ -2819,31 +3053,89 @@ class CrossBot(FuturesBot):
         spread_pct = None
         max_spread = self._f("XSEC_MAX_SPREAD_PCT", 0.5)
         try:
-            if not try_consume_api_call("cross_entry_fetch_order_book"):
+            entry_book_reservation = try_consume_api_call(
+                "cross_entry_fetch_order_book",
+                return_reservation=True,
+            )
+            if not entry_book_reservation:
                 raise RuntimeError("API budget denied")
-            ob = self.ex.fetch_order_book(full, limit=5)
-            arrival_book = ob
-            bids = (ob or {}).get("bids") or []
-            asks = (ob or {}).get("asks") or []
-            if bids and asks:
-                bid = CrossBot._safe_positive_price(bids[0][0])
-                ask = CrossBot._safe_positive_price(asks[0][0])
-                if bid > 0 and ask > 0:
-                    if ask < bid:
-                        log_event(
-                            f"[{self.BOT_NAME}] {base}: invalid orderbook "
-                            f"(bid {bid:.8g} > ask {ask:.8g}) - skip leg",
-                            "WARN",
+            try:
+                ob = self.ex.fetch_order_book(full, limit=5)
+                if not explicit_trade_symbol_matches(ob, full):
+                    raise ValueError(
+                        "cross entry order book changed requested symbol"
+                    )
+            except Exception:
+                if isinstance(
+                    entry_book_reservation, ApiCallReservation
+                ):
+                    try:
+                        record_api_error(
+                            "cross_entry_fetch_order_book",
+                            entry_book_reservation,
                         )
-                        return
-                    spread_pct = (ask - bid) / ((ask + bid) / 2.0) * 100.0
-                    if spread_pct > max_spread:
-                        log_event(f"[{self.BOT_NAME}] {base}: spread "
-                                  f"{spread_pct:.2f}% > {max_spread:g}% - skip "
-                                  f"leg (illiquid)", "WAIT")
-                        return
-                    exec_price = ask if side == "LONG" else bid
-                    book_ok = True
+                    except Exception:
+                        pass
+                raise
+            arrival_book = ob
+            try:
+                bids = (ob or {}).get("bids") or []
+                asks = (ob or {}).get("asks") or []
+                if bids and asks:
+                    bid = CrossBot._safe_positive_price(bids[0][0])
+                    ask = CrossBot._safe_positive_price(asks[0][0])
+                    if bid > 0 and ask > 0:
+                        if ask < bid:
+                            if isinstance(
+                                entry_book_reservation, ApiCallReservation
+                            ):
+                                try:
+                                    record_api_error(
+                                        "cross_entry_fetch_order_book",
+                                        entry_book_reservation,
+                                    )
+                                except Exception:
+                                    pass
+                            log_event(
+                                f"[{self.BOT_NAME}] {base}: invalid orderbook "
+                                f"(bid {bid:.8g} > ask {ask:.8g}) - skip leg",
+                                "WARN",
+                            )
+                            return
+                        spread_pct = (
+                            (ask - bid) / ((ask + bid) / 2.0) * 100.0
+                        )
+                        if spread_pct > max_spread:
+                            log_event(
+                                f"[{self.BOT_NAME}] {base}: spread "
+                                f"{spread_pct:.2f}% > {max_spread:g}% - skip "
+                                "leg (illiquid)",
+                                "WAIT",
+                            )
+                            return
+                        exec_price = ask if side == "LONG" else bid
+                        book_ok = True
+            except Exception:
+                if isinstance(entry_book_reservation, ApiCallReservation):
+                    try:
+                        record_api_error(
+                            "cross_entry_fetch_order_book",
+                            entry_book_reservation,
+                        )
+                    except Exception:
+                        pass
+                raise
+            if (
+                not book_ok
+                and isinstance(entry_book_reservation, ApiCallReservation)
+            ):
+                try:
+                    record_api_error(
+                        "cross_entry_fetch_order_book",
+                        entry_book_reservation,
+                    )
+                except Exception:
+                    pass
         except Exception as exc:
             if not self.simulation:
                 log_event(f"[{self.BOT_NAME}] {base}: orderbook unavailable "
@@ -3890,20 +4182,65 @@ class CrossBot(FuturesBot):
             # Realistic exit: cross the spread (long -> sell into the bid, short ->
             # buy at the ask) so SIM pays the round-trip spread, not the mid.
             try:
-                if try_consume_api_call("cross_exit_fetch_order_book"):
-                    ob = self.ex.fetch_order_book(full, limit=5)
-                    bids = (ob or {}).get("bids") or []
-                    asks = (ob or {}).get("asks") or []
-                    if pos_type == "LONG" and bids:
-                        close_price = (
-                            CrossBot._safe_positive_price(bids[0][0])
-                            or close_price
-                        )
-                    elif pos_type == "SHORT" and asks:
-                        close_price = (
-                            CrossBot._safe_positive_price(asks[0][0])
-                            or close_price
-                        )
+                exit_book_reservation = try_consume_api_call(
+                    "cross_exit_fetch_order_book",
+                    return_reservation=True,
+                )
+                if exit_book_reservation:
+                    try:
+                        ob = self.ex.fetch_order_book(full, limit=5)
+                        if not explicit_trade_symbol_matches(ob, full):
+                            raise ValueError(
+                                "cross exit order book changed requested symbol"
+                            )
+                    except Exception:
+                        if isinstance(
+                            exit_book_reservation, ApiCallReservation
+                        ):
+                            try:
+                                record_api_error(
+                                    "cross_exit_fetch_order_book",
+                                    exit_book_reservation,
+                                )
+                            except Exception:
+                                pass
+                        raise
+                    try:
+                        bids = (ob or {}).get("bids") or []
+                        asks = (ob or {}).get("asks") or []
+                        exit_book_price = 0.0
+                        if pos_type == "LONG" and bids:
+                            exit_book_price = CrossBot._safe_positive_price(
+                                bids[0][0]
+                            )
+                        elif pos_type == "SHORT" and asks:
+                            exit_book_price = CrossBot._safe_positive_price(
+                                asks[0][0]
+                            )
+                    except Exception:
+                        if isinstance(
+                            exit_book_reservation, ApiCallReservation
+                        ):
+                            try:
+                                record_api_error(
+                                    "cross_exit_fetch_order_book",
+                                    exit_book_reservation,
+                                )
+                            except Exception:
+                                pass
+                        raise
+                    if exit_book_price > 0:
+                        close_price = exit_book_price
+                    elif isinstance(
+                        exit_book_reservation, ApiCallReservation
+                    ):
+                        try:
+                            record_api_error(
+                                "cross_exit_fetch_order_book",
+                                exit_book_reservation,
+                            )
+                        except Exception:
+                            pass
             except Exception:
                 pass
             from bot_utils.fee_math import taker_fee_rate
@@ -4500,7 +4837,9 @@ class CrossBot(FuturesBot):
         """Temporarily exclude a symbol after a CROSS disaster stop."""
         try:
             hours = int(float(self.C("CROSS_DISASTER_BLACKLIST_HOURS", 72)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            hours = 72
+        if not 0 <= hours <= 87_600:
             hours = 72
         if hours <= 0:
             return
@@ -4604,11 +4943,24 @@ class CrossBot(FuturesBot):
         return weighted_sum / tot_w   # notional-weighted book return
 
     #  CROSS monitor (reuses the 'Monitor' thread) 
+    def _monitor_interval_sec(self) -> int:
+        try:
+            interval = int(float(self.C(
+                "MONITOR_INTERVAL",
+                self.DEFAULT_MONITOR_INTERVAL,
+            )))
+        except (TypeError, ValueError, OverflowError):
+            interval = self.DEFAULT_MONITOR_INTERVAL
+        if not 5 <= interval <= 600:
+            interval = self.DEFAULT_MONITOR_INTERVAL
+        return interval
+
     def _monitor_loop(self):
         from core.logger import log_event
-        interval = int(self.C("MONITOR_INTERVAL", self.DEFAULT_MONITOR_INTERVAL))
+        interval = CrossBot._monitor_interval_sec(self)
         log_event(f"Cross monitor-loop started (interval: {interval}s)", "INFO")
         while not self._shutdown_event.is_set():
+            interval = CrossBot._monitor_interval_sec(self)
             try:
                 self._monitor_tick()
             except Exception as e:
@@ -4673,10 +5025,26 @@ class CrossBot(FuturesBot):
                     except Exception:
                         pass
                 continue
+            invalid_payload = False
             for symbol in chunk:
                 ticker = rows.get(symbol)
+                if (
+                    ticker is not None
+                    and not explicit_trade_symbol_matches(ticker, symbol)
+                ):
+                    failed_symbols.add(symbol)
+                    invalid_payload = True
+                    continue
                 if CrossBot._ticker_price(ticker) > 0:
                     snapshot[symbol] = ticker
+            if invalid_payload and callable(record_api_error):
+                try:
+                    record_api_error(
+                        endpoint="cross_monitor_fetch_tickers",
+                        reservation=reservation,
+                    )
+                except Exception:
+                    pass
         return snapshot, frozenset(failed_symbols)
 
     def _check_daily_killswitch(self, trades: dict) -> bool:
@@ -4694,7 +5062,7 @@ class CrossBot(FuturesBot):
                 return True
         self._last_ks_check = now
         try:
-            from core.database import get_today_pnl
+            from core.database import get_today_pnl, pause_bot_today
             from bot_utils.futures_math import calc_unrealized_pnl
             from core.logger import log_event
             validated = []
@@ -4748,7 +5116,9 @@ class CrossBot(FuturesBot):
                 )
                 unreal += u - (margin * lev * 0.001)   # conservative exit fee
             total = realized + unreal
-            max_loss = self._f("MAX_DAILY_LOSS", -50.0)
+            max_loss = safe_daily_loss_limit(
+                self._f("MAX_DAILY_LOSS", -50.0), -50.0
+            )
             if max_loss < 0 and total <= max_loss:
                 log_event(f"[{self.BOT_NAME}] DAILY-LOSS KILLSWITCH "
                           f"{total:+.2f} <= {max_loss:.0f} USDT - flattening book "
@@ -4765,6 +5135,14 @@ class CrossBot(FuturesBot):
                     pass
                 if self.safe_mode is not None and not self.safe_mode.is_active():
                     self.safe_mode.trigger(f"daily-loss killswitch ({total:+.2f} USDT)")
+                try:
+                    pause_bot_today(
+                        self.BOT_NAME,
+                        f"Daily loss {total:+.2f} USDT reached",
+                        mode_is_sim=self.simulation,
+                    )
+                except Exception as exc:
+                    self._log_error("persist cross daily-loss pause", exc)
                 for base, _d, _side, _entry, _last, _margin, _lev in validated:
                     if self.state.has(base):
                         self._close_leg(base, trades[base], reason="daily-loss killswitch")
@@ -4924,7 +5302,9 @@ class CrossBot(FuturesBot):
         self._cross_risk_snapshot_ok = risk_check_ok
         self._maybe_persist_funding_for_all(monitored_trades, time.time())
         disaster = self._f("PER_LEG_DISASTER_STOP", -25.0)
-        liq_safety = max(0.0, min(95.0, self._f("LIQ_SAFETY_PCT", 20.0)))
+        liq_safety = safe_liq_safety_pct(
+            self._f("LIQ_SAFETY_PCT", 20.0), 20.0, maximum=95.0
+        )
         # Snapshot every leg once for the equity-aware CROSS liq below - each
         # leg's liq depends on the OTHER legs' uPnL + maintenance margin.
         if invalid_sides:
@@ -5018,10 +5398,15 @@ class CrossBot(FuturesBot):
             liq_dist = 0.0
             try:
                 if not self.simulation:
-                    now_ts = time.time()
-                    next_liq_check = CrossBot._safe_float(
-                        self, d.get("liq_next_check_at"), 0.0)
-                    if now_ts >= next_liq_check:
+                    interval = CrossBot._safe_float(
+                        self,
+                        getattr(self, "LIQ_REFRESH_INTERVAL_SEC", 90.0),
+                        90.0,
+                    )
+                    if interval <= 0:
+                        interval = 90.0
+                    if not _liq_refresh_active(self, base, d, interval):
+                        now_ts = time.time()
                         try:
                             from bot_utils import get_exchange_liq_price
                             liq_price = CrossBot._safe_positive_price(
@@ -5032,8 +5417,7 @@ class CrossBot(FuturesBot):
                                 ))
                         except Exception:
                             liq_price = 0.0
-                        upd = {"liq_next_check_at": now_ts + float(
-                            getattr(self, "LIQ_REFRESH_INTERVAL_SEC", 90.0))}
+                        upd = {"liq_next_check_at": now_ts + interval}
                         if liq_price > 0:
                             upd["liquidation_price"] = liq_price
                         try:
@@ -5172,8 +5556,8 @@ class CrossBot(FuturesBot):
                     liquidation_price=liq_price, liq_distance_pct=liq_dist,
                     funding_paid=d.get("funding_paid", 0.0),
                     opened_at=d.get("buy_time", ""), entry_id=d.get("entry_id"))
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log_error(f"cross dashboard state {base}", exc)
 
         # Continuous dollar-neutrality guard (throttled). Runs EVERY monitor
         # tick window, not just at the 72h rebalance, so a book that turned

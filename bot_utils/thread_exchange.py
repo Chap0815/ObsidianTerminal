@@ -414,6 +414,13 @@ def _build_clone(src) -> Any:
         # dictionaries.
         src_markets = getattr(src, "markets", None)
         if src_markets:
+            if not isinstance(src_markets, dict):
+                raise ValueError("exchange market metadata is invalid")
+            if any(
+                not isinstance(symbol, str) or not isinstance(market, dict)
+                for symbol, market in src_markets.items()
+            ):
+                raise ValueError("exchange market metadata contains invalid rows")
             try:
                 markets = copy.deepcopy(src_markets)
             except (TypeError, copy.Error):
@@ -421,7 +428,17 @@ def _build_clone(src) -> Any:
                     markets = dict(src_markets)
                 except TypeError:
                     markets = src_markets
-            src_currencies = getattr(src, "currencies", None) or {}
+            raw_currencies = getattr(src, "currencies", None)
+            if raw_currencies is not None and not isinstance(
+                raw_currencies, dict
+            ):
+                raise TypeError("exchange currency metadata is invalid")
+            src_currencies = raw_currencies or {}
+            if any(
+                not isinstance(code, str) or not isinstance(currency, dict)
+                for code, currency in src_currencies.items()
+            ):
+                raise ValueError("exchange currency metadata contains invalid rows")
             try:
                 currencies = copy.deepcopy(src_currencies)
             except (TypeError, copy.Error):
@@ -626,7 +643,26 @@ class ThreadLocalExchange:
                 raise RuntimeError("exchange wrapper is shut down")
             markets = self._base.load_markets(*args, **kwargs)
             source_markets = getattr(self._base, "markets", None) or markets or {}
-            source_currencies = getattr(self._base, "currencies", None) or {}
+            if not isinstance(source_markets, dict) or not source_markets:
+                raise ValueError("exchange market refresh returned invalid snapshot")
+            if any(
+                not isinstance(symbol, str) or not isinstance(market, dict)
+                for symbol, market in source_markets.items()
+            ):
+                raise ValueError(
+                    "exchange market refresh returned invalid snapshot rows"
+                )
+            raw_currencies = getattr(self._base, "currencies", None)
+            source_currencies = {} if raw_currencies is None else raw_currencies
+            if not isinstance(source_currencies, dict):
+                raise TypeError("exchange currency refresh returned invalid snapshot")
+            if any(
+                not isinstance(code, str) or not isinstance(currency, dict)
+                for code, currency in source_currencies.items()
+            ):
+                raise ValueError(
+                    "exchange currency refresh returned invalid snapshot rows"
+                )
             with self._clones_lock:
                 clones = [clone for _thread, clone in self._clones]
             refresh_error = None

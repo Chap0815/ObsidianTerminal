@@ -32,13 +32,26 @@ from typing import Dict, Any, Optional
 _INT_FIELDS = frozenset((
     "MAX_OPEN_TRADES", "SCAN_INTERVAL", "MONITOR_INTERVAL",
     "COOLDOWN_AFTER_SL", "MAX_NEW_TRADES_PER_TICK",
+    "OWN_MOMENTUM_WINDOW",
     "FAILED_ENTRY_MAX_AGE_MIN",
     "TREND_VOTE_MIN", "TREND_EXIT_VOTE",
     "TREND_SMA_FAST", "TREND_SMA_SLOW",
     "TREND_CROSS_FAST", "TREND_CROSS_SLOW",
     "TREND_VOL_TARGET", "TREND_VOL_TARGET_LOOKBACK",
     "TREND_EXIT_STALE_LIMIT", "XSEC_K", "XSEC_LOOKBACK_HOURS",
-    "XSEC_REBALANCE_HOURS", "XSEC_UNIVERSE_SIZE", "CRASH_WINDOW",
+    "XSEC_REBALANCE_HOURS", "XSEC_UNIVERSE_SIZE",
+    "XSEC_TOPUP_MAX_ATTEMPTS", "CRASH_WINDOW",
+    "CROSS_DISASTER_BLACKLIST_HOURS",
+    "SINGLE_STOP_BLACKLIST_HOURS", "BAD_SYMBOL_BLACKLIST_HOURS",
+    "BAD_SYMBOL_LOSS_COUNT", "BAD_SYMBOL_LOOKBACK_DAYS",
+    "TREND_CHECK_MINUTES",
+    "TREND_UNIVERSE_SIZE",
+    "TREND_CHECK_HOURS",
+    "TCA_DEPTH_LEVELS",
+    "VENUE_RECORDER_MAX_SYMBOLS",
+    "VENUE_RECORDER_DEPTH_LEVELS",
+    "VENUE_RECORDER_RETENTION_DAYS",
+    "VENUE_L2_STALE_AFTER_MS",
 ))
 # LEVERAGE is kept as a FLOAT so a bot can run a fractional EFFECTIVE leverage
 # (e.g. 1.5: size notional = margin*1.5, send ceil()=2 to the exchange as the
@@ -47,49 +60,82 @@ _INT_FIELDS = frozenset((
 
 
 _CLAMPS = {
-    "MIN_PUMP":          (0.0, 100.0, float),
-    "ACTIVATION_PROFIT": (0.0, 100.0, float),
-    "TRAILING_DISTANCE": (0.0, 100.0, float),
-    "POST_PARTIAL_TRAILING_DISTANCE": (0.25, 100.0, float),
-    "INITIAL_STOP_LOSS": (-99.0, -0.01, float),
-    "PER_LEG_DISASTER_STOP": (-99.0, -0.01, float),
-    "FAILED_ENTRY_LOSS_PCT": (-99.0, -0.01, float),
-    "FAILED_ENTRY_MIN_MFE_PCT": (0.0, 100.0, float),
-    "FAILED_ENTRY_MAX_AGE_MIN": (1, 1440, int),
-    "PRE_ACTIVATION_MIN_MFE_PCT": (0.0, 20.0, float),
-    "PRE_ACTIVATION_GIVEBACK_PCT": (0.1, 50.0, float),
-    "BREAKEVEN_TRIGGER": (0.0, 20.0, float),
+    "MIN_PUMP":          (0.5, 20.0, float),
+    "ACTIVATION_PROFIT": (0.0, 20.0, float),
+    "TRAILING_DISTANCE": (0.25, 10.0, float),
+    "POST_PARTIAL_TRAILING_DISTANCE": (0.25, 10.0, float),
+    "INITIAL_STOP_LOSS": (-90.0, -0.5, float),
+    "PER_LEG_DISASTER_STOP": (-90.0, -5.0, float),
+    "FAILED_ENTRY_LOSS_PCT": (-10.0, -0.5, float),
+    "FAILED_ENTRY_MIN_MFE_PCT": (0.0, 5.0, float),
+    "FAILED_ENTRY_MAX_AGE_MIN": (15, 360, int),
+    "PRE_ACTIVATION_MIN_MFE_PCT": (0.0, 10.0, float),
+    "PRE_ACTIVATION_GIVEBACK_PCT": (0.25, 10.0, float),
+    "BREAKEVEN_TRIGGER": (0.0, 10.0, float),
     "PARTIAL_SELL_PCT":  (0.0, 1.0, float),
-    "RSI_MAX":           (0.0, 100.0, float),
-    "MAX_DAILY_LOSS":    (-100000.0, -0.01, float),
+    "RSI_MAX":           (40.0, 90.0, float),
+    "MAX_DAILY_LOSS":    (-1000.0, -0.01, float),
     "SCAN_INTERVAL":     (30, 600, int),
     "COOLDOWN_AFTER_SL": (0, 1440, int),
-    "MONITOR_INTERVAL":  (5, 600, int),
-    "MAX_OPEN_TRADES":   (1, 50, int),
-    "MAX_NEW_TRADES_PER_TICK": (0, 50, int),
+    "MONITOR_INTERVAL":  (5, 120, int),
+    "MAX_OPEN_TRADES":   (1, 30, int),
+    "MAX_NEW_TRADES_PER_TICK": (0, 10, int),
+    "OWN_MOMENTUM_WINDOW": (3, 50, int),
+    "OWN_MOMENTUM_MIN_LOSS_PCT": (0.0, 50.0, float),
     "LEVERAGE":          (1.0, 25.0, float),
-    "LIQ_SAFETY_PCT":    (0.01, 100.0, float),
+    "LIQ_SAFETY_PCT":    (5.0, 50.0, float),
     "MAX_DAILY_LOSS_HARD_MULT": (1.0, 5.0, float),
-    "MAX_GROSS_EXPOSURE_PCT":   (0.0, 500.0, float),
+    "MAX_GROSS_EXPOSURE_PCT":   (0.0, 200.0, float),
+    "PORTFOLIO_MAX_GROSS_PCT":  (0.0, 1000.0, float),
+    "PORTFOLIO_MAX_NET_PCT":    (0.0, 1000.0, float),
+    "PORTFOLIO_MIN_FREE_PCT":   (0.0, 100.0, float),
+    "PORTFOLIO_MAX_CLUSTER_PCT": (0.0, 1000.0, float),
+    "PORTFOLIO_MAX_BETA_PCT":   (0.0, 1000.0, float),
     "XSEC_MAX_FUNDING_PCT":     (0.0, 5.0, float),
-    "MIN_VOLUME":        (0.0, 1_000_000_000.0, float),
+    "MIN_VOLUME":        (1_000_000.0, 1_000_000_000.0, float),
+    "BASE_CAPITAL_USDT": (50.0, 100_000.0, float),
     "POSITION_SIZE":     (0.0, 10000.0, float),
     "POSITION_SIZE_MAX": (0.0, 10000.0, float),
     "TREND_VOTE_MIN":    (1, 3, int),
     "TREND_EXIT_VOTE":   (1, 3, int),
-    "TREND_SMA_FAST":    (1, 5000, int),
-    "TREND_SMA_SLOW":    (1, 5000, int),
+    "TREND_SMA_FAST":    (10, 1000, int),
+    "TREND_SMA_SLOW":    (20, 2000, int),
     "TREND_CROSS_FAST":  (1, 5000, int),
     "TREND_CROSS_SLOW":  (1, 5000, int),
     "TREND_VOL_TARGET":  (0, 1, int),
-    "TREND_VOL_TARGET_LOOKBACK": (2, 500, int),
-    "TREND_EXIT_STALE_LIMIT": (1, 50, int),
+    "TREND_VOL_TARGET_LOOKBACK": (10, 200, int),
+    "TREND_EXIT_STALE_LIMIT": (1, 10, int),
     "XSEC_K":            (1, 15, int),
     "XSEC_LOOKBACK_HOURS":   (6, 336, int),
     "XSEC_REBALANCE_HOURS":  (6, 336, int),
     "XSEC_UNIVERSE_SIZE":    (10, 100, int),
+    "XSEC_TOPUP_MAX_ATTEMPTS": (1, 100, int),
+    "CROSS_DISASTER_BLACKLIST_HOURS": (0, 87_600, int),
+    "SINGLE_STOP_BLACKLIST_HOURS": (0, 87_600, int),
+    "BAD_SYMBOL_BLACKLIST_HOURS": (0, 87_600, int),
+    "BAD_SYMBOL_LOSS_COUNT": (1, 40, int),
+    "BAD_SYMBOL_LOOKBACK_DAYS": (1, 3650, int),
+    "SINGLE_STOP_MIN_LOSS_PCT": (0.0, 99.0, float),
+    "TREND_CHECK_MINUTES": (5, 240, int),
+    "TREND_UNIVERSE_SIZE": (10, 100, int),
+    "TREND_CHECK_HOURS": (1, 24, int),
+    "TCA_DEPTH_LEVELS": (5, 100, int),
+    "MAKER_FIRST_TTL_SECONDS": (0.0, 30.0, float),
+    "TIME_DECAY_MAX_AGE_MINUTES": (5.0, 10_080.0, float),
+    "TIME_DECAY_MIN_MFE_PCT": (0.0, 20.0, float),
+    "VENUE_RECORDER_MAX_SYMBOLS": (1, 50, int),
+    "VENUE_RECORDER_MICRO_INTERVAL_SECONDS": (1.0, 600.0, float),
+    "VENUE_RECORDER_OVERVIEW_INTERVAL_SECONDS": (5.0, 3600.0, float),
+    "VENUE_RECORDER_DEPTH_LEVELS": (5, 100, int),
+    "VENUE_RECORDER_RETENTION_DAYS": (1, 3650, int),
+    "VENUE_RECORDER_MAX_STORAGE_GIB": (0.1, 1000.0, float),
+    "VENUE_L2_SAMPLE_INTERVAL_SECONDS": (0.25, 60.0, float),
+    "VENUE_L2_STALE_AFTER_MS": (250, 60_000, int),
+    "MFE_FALLBACK_MIN_AGE_MINUTES": (5.0, 1440.0, float),
+    "MFE_FALLBACK_MIN_MFE_PCT": (0.1, 5.0, float),
+    "MFE_FALLBACK_EXIT_MOVE_PCT": (-10.0, -0.25, float),
     "CRASH_WINDOW":      (1, 50, int),
-    "XSEC_MAX_SPREAD_PCT":   (0.01, 10.0, float),
+    "XSEC_MAX_SPREAD_PCT":   (0.01, 3.0, float),
     "ENTRY_QUALITY_MIN_SCORE": (0.0, 100.0, float),
     "ENTRY_QUALITY_SHADOW_MIN_SCORE": (0.0, 100.0, float),
 }
@@ -115,12 +161,20 @@ _CLAMP_DEFAULTS = {
     "MONITOR_INTERVAL": 20,
     "MAX_OPEN_TRADES": 5,
     "MAX_NEW_TRADES_PER_TICK": 1,
+    "OWN_MOMENTUM_WINDOW": 8,
+    "OWN_MOMENTUM_MIN_LOSS_PCT": 0.5,
     "LEVERAGE": 1.0,
     "LIQ_SAFETY_PCT": 20.0,
     "MAX_DAILY_LOSS_HARD_MULT": 1.5,
     "MAX_GROSS_EXPOSURE_PCT": 100.0,
+    "PORTFOLIO_MAX_GROSS_PCT": 100.0,
+    "PORTFOLIO_MAX_NET_PCT": 75.0,
+    "PORTFOLIO_MIN_FREE_PCT": 20.0,
+    "PORTFOLIO_MAX_CLUSTER_PCT": 35.0,
+    "PORTFOLIO_MAX_BETA_PCT": 75.0,
     "XSEC_MAX_FUNDING_PCT": 0.0,
     "MIN_VOLUME": 10_000_000.0,
+    "BASE_CAPITAL_USDT": 150.0,
     "POSITION_SIZE": 20.0,
     "POSITION_SIZE_MAX": 40.0,
     "TREND_VOTE_MIN": 2,
@@ -136,6 +190,31 @@ _CLAMP_DEFAULTS = {
     "XSEC_LOOKBACK_HOURS": 24,
     "XSEC_REBALANCE_HOURS": 48,
     "XSEC_UNIVERSE_SIZE": 30,
+    "XSEC_TOPUP_MAX_ATTEMPTS": 12,
+    "CROSS_DISASTER_BLACKLIST_HOURS": 72,
+    "SINGLE_STOP_BLACKLIST_HOURS": 4,
+    "BAD_SYMBOL_BLACKLIST_HOURS": 24,
+    "BAD_SYMBOL_LOSS_COUNT": 2,
+    "BAD_SYMBOL_LOOKBACK_DAYS": 1,
+    "SINGLE_STOP_MIN_LOSS_PCT": 5.0,
+    "TREND_CHECK_MINUTES": 60,
+    "TREND_UNIVERSE_SIZE": 30,
+    "TREND_CHECK_HOURS": 12,
+    "TCA_DEPTH_LEVELS": 20,
+    "MAKER_FIRST_TTL_SECONDS": 3.0,
+    "TIME_DECAY_MAX_AGE_MINUTES": 360.0,
+    "TIME_DECAY_MIN_MFE_PCT": 0.5,
+    "VENUE_RECORDER_MAX_SYMBOLS": 8,
+    "VENUE_RECORDER_MICRO_INTERVAL_SECONDS": 6.0,
+    "VENUE_RECORDER_OVERVIEW_INTERVAL_SECONDS": 60.0,
+    "VENUE_RECORDER_DEPTH_LEVELS": 20,
+    "VENUE_RECORDER_RETENTION_DAYS": 30,
+    "VENUE_RECORDER_MAX_STORAGE_GIB": 150.0,
+    "VENUE_L2_SAMPLE_INTERVAL_SECONDS": 1.0,
+    "VENUE_L2_STALE_AFTER_MS": 5000,
+    "MFE_FALLBACK_MIN_AGE_MINUTES": 45.0,
+    "MFE_FALLBACK_MIN_MFE_PCT": 0.8,
+    "MFE_FALLBACK_EXIT_MOVE_PCT": -1.5,
     "CRASH_WINDOW": 4,
     "XSEC_MAX_SPREAD_PCT": 0.5,
     "ENTRY_QUALITY_MIN_SCORE": 75.0,
@@ -269,6 +348,22 @@ def _clamp_live_sizing(bot_name: str,
     return val
 
 
+def _activation_fallback_value(value: Any) -> float:
+    """Return a valid disabled or above-trailing-floor activation value."""
+    try:
+        if isinstance(value, bool):
+            raise ValueError("boolean is not a numeric config value")
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("non-finite numeric config value")
+        parsed = float(_clamp("ACTIVATION_PROFIT", parsed))
+    except (TypeError, ValueError, OverflowError):
+        parsed = float(_CLAMP_DEFAULTS["ACTIVATION_PROFIT"])
+    if parsed == 0.0 or parsed > 0.25:
+        return parsed
+    return float(_CLAMP_DEFAULTS["ACTIVATION_PROFIT"])
+
+
 def _effective_live_numeric(section: Dict[str, Any],
                             fallback_cfg: Dict[str, Any],
                             key: str,
@@ -291,12 +386,21 @@ def _effective_live_numeric(section: Dict[str, Any],
                 raise ValueError("non-finite fallback config value")
         except (TypeError, ValueError, OverflowError):
             parsed = float(_CLAMP_DEFAULTS.get(key, 0.0))
-    return float(_clamp(key, parsed))
+    value = float(_clamp(key, parsed))
+    if key == "ACTIVATION_PROFIT" and 0.0 < value <= 0.25:
+        return _activation_fallback_value(fallback_cfg.get(key, default))
+    return value
 
 
-def _enforce_invariants(cfg: Dict[str, Any]) -> None:
+def _enforce_invariants(cfg: Dict[str, Any],
+                        fallback_cfg: Optional[Dict[str, Any]] = None) -> None:
     try:
         activation = float(cfg.get("ACTIVATION_PROFIT", 0.0) or 0.0)
+        if 0.0 < activation <= 0.25:
+            activation = _activation_fallback_value(
+                (fallback_cfg or {}).get("ACTIVATION_PROFIT")
+            )
+            cfg["ACTIVATION_PROFIT"] = activation
         trailing = float(cfg.get("TRAILING_DISTANCE", 0.0) or 0.0)
         if activation > 0 and trailing >= activation:
             cfg["TRAILING_DISTANCE"] = max(0.25, activation * 0.5)
@@ -330,15 +434,23 @@ def _config_object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict:
     return result
 
 
+def _reject_config_json_constant(value: str):
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 def _read_config_json(path: str) -> dict:
     with open(path, "rb") as fh:
         raw = fh.read(_CONFIG_JSON_MAX_BYTES + 1)
     if len(raw) > _CONFIG_JSON_MAX_BYTES:
         raise ValueError("config JSON exceeds size limit")
-    return json.loads(
-        raw.decode("utf-8-sig"),
-        object_pairs_hook=_config_object_without_duplicate_keys,
-    )
+    try:
+        return json.loads(
+            raw.decode("utf-8-sig"),
+            object_pairs_hook=_config_object_without_duplicate_keys,
+            parse_constant=_reject_config_json_constant,
+        )
+    except RecursionError as exc:
+        raise ValueError("config JSON nesting exceeds parser limit") from exc
 
 
 def merge_runtime_config(
@@ -372,7 +484,10 @@ def merge_runtime_config(
             elif isinstance(defaults.get(key), bool):
                 cfg[key] = _coerce_bool(value, bool(defaults.get(key)))
             elif key in _INT_FIELDS:
-                cfg[key] = int(value)
+                parsed_int = _finite_integral_or_none(value)
+                if parsed_int is None:
+                    raise ValueError("integer config value required")
+                cfg[key] = parsed_int
             elif isinstance(value, str):
                 cfg[key] = value
             else:
@@ -380,10 +495,14 @@ def merge_runtime_config(
         except (TypeError, ValueError, OverflowError):
             cfg[key] = value
 
+    for key in _FAIL_CLOSED_BOOL_FIELDS:
+        if key in defaults and key not in user_cfg:
+            cfg[key] = False
+
     for key in _CLAMPS:
         if key in cfg:
             cfg[key] = _clamp(key, cfg[key])
-    _enforce_invariants(cfg)
+    _enforce_invariants(cfg, defaults)
     return cfg
 
 
@@ -435,9 +554,11 @@ _FAIL_CLOSED_BOOL_FIELDS = frozenset(("NEW_ENTRIES_ENABLED",))
 # PRICE-move stops that must stay negative; a positive live edit would stop
 # every position out at entry, so we keep the validated boot value instead.
 _NEGATIVE_ONLY = frozenset((
+    "MAX_DAILY_LOSS",
     "INITIAL_STOP_LOSS",
     "PER_LEG_DISASTER_STOP",
     "FAILED_ENTRY_LOSS_PCT",
+    "MFE_FALLBACK_EXIT_MOVE_PCT",
 ))
 
 
@@ -603,6 +724,8 @@ def get_live_value(bot_name: str, key: str, default: Any = None,
                     default,
                 )
             val = _clamp(key, parsed_numeric)
+            if key == "ACTIVATION_PROFIT" and 0.0 < float(val) <= 0.25:
+                return fallback_cfg.get(key, default)
             if key in {"TRAILING_DISTANCE", "POST_PARTIAL_TRAILING_DISTANCE"}:
                 activation = _effective_live_numeric(
                     section,

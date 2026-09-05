@@ -21,6 +21,7 @@ Run:
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -45,6 +46,7 @@ from tools.trend_check import (
     _sig_price_ma,
     _sig_cross,
     _max_dd,
+    _safe_exc,
     _validated_trend_ohlc,
     COST,
 )
@@ -89,6 +91,9 @@ UNIVERSE_30 = [
 UNIVERSE_SIZES = [20, 30, 50]
 LEVERAGES = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
 DD_GATE = 40.0
+MAX_TREND_DAYS = 3_650
+MAX_CUSTOM_COINS = 100
+MAX_COIN_LENGTH = 20
 
 
 def _fetch_daily(ex, symbol: str, since_ms: int) -> list:
@@ -116,9 +121,11 @@ def backtest_lev(
     """All-in long/flat with leverage; models liquidation on close-to-close moves."""
     try:
         closes = np.asarray(closes, dtype=float)
-        sig = np.asarray(sig, dtype=bool)
+        sig = np.asarray(sig)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("closes and signal must be numeric vectors") from exc
+    if sig.dtype.kind != "b":
+        raise ValueError("signal must contain booleans")
     if (
         closes.ndim != 1
         or sig.ndim != 1
@@ -161,15 +168,21 @@ def backtest_lev(
             pos = 0
         if pos == 1:
             bars_in += 1
-            factor = 1.0 + lev * (closes[i] / closes[i - 1] - 1.0)
-            if factor <= mm or (entry is not None and eq * factor <= entry * mm):
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                factor = 1.0 + lev * (closes[i] / closes[i - 1] - 1.0)
+                projected_equity = eq * factor
+            if not np.isfinite(factor) or not np.isfinite(projected_equity):
+                raise ValueError("non-finite leveraged equity transition")
+            if factor <= mm or (
+                entry is not None and projected_equity <= entry * mm
+            ):
                 eq = (entry if entry is not None else eq) * mm
                 liqs += 1
                 trades += 1
                 entry = None
                 pos = 0
             else:
-                eq *= factor
+                eq = projected_equity
         if eq > peak:
             peak = eq
         dd = (peak - eq) / peak
@@ -217,22 +230,79 @@ def _get_symbols_for_size(
     ex, n: int, days: int, fallback_symbols: list[str]
 ) -> list[str]:
     """Return top-N USDT-pair symbols from exchange by $-volume, listing-age filtered."""
-    syms = get_top_volume_coins(ex, n, days)
-    if syms:
+    fallback = [f"{c}/USDT" for c in fallback_symbols[:n]]
+    try:
+        syms = get_top_volume_coins(ex, n, days)
+    except Exception as exc:
+        print(
+            f"   [warn] volume fetch failed for N={n}: {_safe_exc(exc)}; "
+            f"falling back to hardcoded list (first {n})"
+        )
+        return fallback
+
+    valid_symbols = (
+        isinstance(syms, list)
+        and 1 <= len(syms) <= n
+        and all(
+            isinstance(symbol, str)
+            and symbol.isascii()
+            and symbol == symbol.upper()
+            and symbol.count("/") == 1
+            and symbol.endswith("/USDT")
+            and 1 <= len(symbol.split("/", 1)[0]) <= 20
+            and symbol.split("/", 1)[0].isalnum()
+            for symbol in syms
+        )
+        and len(set(syms)) == len(syms)
+    )
+    if valid_symbols:
         return syms
     print(
-        f"   [warn] volume fetch failed for N={n}, falling back to hardcoded list (first {n})"
+        f"   [warn] invalid volume symbols for N={n}, "
+        f"falling back to hardcoded list (first {n})"
     )
-    return [f"{c}/USDT" for c in fallback_symbols[:n]]
+    return fallback
 
 
-def _run_sweep(ex, days: int, custom_coins: list[str]) -> None:
+def _run_sweep(
+    ex,
+    days: int,
+    custom_coins: list[str],
+    markets: dict | None = None,
+) -> int:
     """Execute the 36 matrix sweep and print the result table."""
     from datetime import datetime, timezone
 
-    now_ms = ex.milliseconds()
+    if (
+        isinstance(days, bool)
+        or not isinstance(days, int)
+        or not 1 <= days <= MAX_TREND_DAYS
+    ):
+        print("   [warn] days must be a positive integer")
+        return 1
+    try:
+        raw_now_ms = ex.milliseconds()
+    except Exception as e:
+        print(f"   [warn] exchange clock failed: {_safe_exc(e)}")
+        return 1
+    if isinstance(raw_now_ms, bool):
+        print("   [warn] invalid exchange clock")
+        return 1
+    try:
+        numeric_now_ms = float(raw_now_ms)
+    except (TypeError, ValueError, OverflowError):
+        print("   [warn] invalid exchange clock")
+        return 1
+    if (
+        not math.isfinite(numeric_now_ms)
+        or numeric_now_ms <= 0.0
+        or not numeric_now_ms.is_integer()
+    ):
+        print("   [warn] invalid exchange clock")
+        return 1
+    now_ms = int(numeric_now_ms)
     since_ms = now_ms - (days + 10) * 86_400_000
-    min_bars = 150  # 100-bar SMA + 50 warmup
+    min_bars = max(150, days)  # requested window plus model warmup floor
     weeks = days / 7.0
 
     print("=" * 100)
@@ -246,7 +316,12 @@ def _run_sweep(ex, days: int, custom_coins: list[str]) -> None:
     universe_sets: dict[str, dict] = {}
 
     if custom_coins:
-        syms = [f"{c}/USDT" for c in custom_coins if f"{c}/USDT" in ex.markets]
+        market_catalog = markets if markets is not None else getattr(ex, "markets", {})
+        syms = [
+            f"{c}/USDT"
+            for c in custom_coins
+            if f"{c}/USDT" in market_catalog
+        ]
         data = _load_data(ex, syms, since_ms, min_bars, now_ms)
         universe_sets["custom"] = data
         sweep_sizes = ["custom"]
@@ -264,6 +339,7 @@ def _run_sweep(ex, days: int, custom_coins: list[str]) -> None:
     print()
 
     best_cell = None  # (n, lev, port_ret) among deployable cells
+    evaluated = False
 
     for n in sweep_sizes:
         data = universe_sets[n]
@@ -272,9 +348,10 @@ def _run_sweep(ex, days: int, custom_coins: list[str]) -> None:
         if not data:
             print(f"\n  [{label}] no data  skipped")
             continue
+        evaluated = True
 
         series = [(c, h, low, ensemble(c, h, low)) for c, h, low in data.values()]
-        K = min(len(c) for c, h, low, _ in series)
+        K = min(days, min(len(c) for c, h, low, _ in series))
         series = [(c[-K:], s[-K:]) for c, h, low, s in series]
         bh = float(np.mean([(c[-1] / c[0] - 1) * 100 for c, _ in series]))
 
@@ -305,6 +382,9 @@ def _run_sweep(ex, days: int, custom_coins: list[str]) -> None:
         print("  " + "-" * 58)
 
     print()
+    if not evaluated:
+        print("  CONCLUSION: No data; no leverage cell could be evaluated.")
+        return 1
     if best_cell:
         label, lev, ret, dd = best_cell
         print(
@@ -319,9 +399,10 @@ def _run_sweep(ex, days: int, custom_coins: list[str]) -> None:
 
     print(f"\n  Generated: {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}")
     print("=" * 100)
+    return 0
 
 
-def main() -> None:
+def main() -> int:
     if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         try:
             sys.stdout = open(
@@ -331,21 +412,55 @@ def main() -> None:
             pass
 
     args = sys.argv[1:]
+    unknown_options = [arg for arg in args if arg.startswith("--")]
+    if unknown_options:
+        print(f"  Unknown option: {unknown_options[0]}")
+        return 2
     pos = [a for a in args if not a.startswith("--")]
-    days = int(pos[0]) if pos and pos[0].isdigit() else 730
+    if pos:
+        try:
+            days = int(pos[0])
+        except (TypeError, ValueError, OverflowError):
+            print(f"  Invalid days argument: {pos[0]!r}")
+            return 2
+        if not 1 <= days <= MAX_TREND_DAYS:
+            print(f"  Invalid days argument: {pos[0]!r}")
+            return 2
+    else:
+        days = 730
     custom_coins = [a.upper() for a in pos[1:]] if len(pos) > 1 else []
+    if custom_coins and (
+        len(custom_coins) > MAX_CUSTOM_COINS
+        or len(set(custom_coins)) != len(custom_coins)
+        or any(
+            not coin
+            or len(coin) > MAX_COIN_LENGTH
+            or not coin.isascii()
+            or not coin.isalnum()
+            for coin in custom_coins
+        )
+    ):
+        print("  Invalid coin scope: use 1-100 unique ASCII bases")
+        return 2
 
     print(f"\n  Connecting to {get_active_exchange_name().upper()} (SPOT) ...")
-    ex = get_exchange_connection()
-    ex.timeout = 30000
     try:
-        ex.load_markets()
+        ex = get_exchange_connection()
+        ex.timeout = 30000
+        markets = ex.load_markets()
     except Exception as e:
-        print(f"  Connection failed: {e}")
-        sys.exit(1)
+        print(f"  Connection failed: {_safe_exc(e)}")
+        return 1
+    if (
+        not isinstance(markets, dict)
+        or not markets
+        or any(not isinstance(symbol, str) for symbol in markets)
+    ):
+        print("  Invalid or empty market catalog; cannot run.")
+        return 1
 
-    _run_sweep(ex, days, custom_coins)
+    return _run_sweep(ex, days, custom_coins, markets)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

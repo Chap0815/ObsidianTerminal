@@ -22,6 +22,7 @@ from news.news_brain_core import (
     render_prompt,
     parse_last_result,
     parse_confidence as _parse_conf,
+    parse_llm_json_object,
     strip_thinking,
     is_valid_symbol,
 )
@@ -136,7 +137,7 @@ def analyze_sentiment(
             if _text.startswith("json"):
                 _text = _text[4:].lstrip()
         try:
-            parsed = _json.loads(_text)
+            parsed = parse_llm_json_object(_text)
             steelman = parsed.get("steelman", "")
             if steelman:
                 log_event(f"[{symbol}] Steelman: {steelman}", "INFO")
@@ -198,10 +199,8 @@ def parse_confidence(llm_response: str) -> str:
     """Parse confidence from new JSON or old free-text format."""
     if not llm_response:
         return "LOW"
-    import json as _json
-
     try:
-        parsed = _json.loads(llm_response.strip())
+        parsed = parse_llm_json_object(llm_response.strip())
         c = str(parsed.get("confidence", "LOW")).upper()
         return c if c in ("HIGH", "MEDIUM", "LOW") else "LOW"
     except Exception:
@@ -214,15 +213,13 @@ def parse_direction_and_confidence(llm_response: str):
     """
     if not isinstance(llm_response, str) or not llm_response:
         return ("WAIT", "LOW")
-    import json as _json
-
     _text = llm_response.strip()
     if _text.startswith("```"):
         _text = _text.split("```")[1].strip()
         if _text.startswith("json"):
             _text = _text[4:].lstrip()
     try:
-        parsed = _json.loads(_text)
+        parsed = parse_llm_json_object(_text)
         raw_dir = str(parsed.get("direction", "WAIT")).upper()
         direction = raw_dir if raw_dir in ("BUY", "WAIT") else "WAIT"
         conf = str(parsed.get("confidence", "LOW")).upper()

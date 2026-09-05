@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -65,7 +66,7 @@ LEVERAGE_LIMIT_BY_BOT = {
     "FUTREND": (1.0, 6.0),
     "CROSS": (1.0, 3.0),
 }
-MAX_DAILY_LOSS_LIMIT = 100_000.0
+MAX_DAILY_LOSS_LIMIT = 1_000.0
 MAX_DAILY_LOSS_MIN_ABS = 0.01
 _PRE_START_CONFIG_JSON_MAX_BYTES = 2 * 1024 * 1024
 _PRE_START_STATE_JSON_MAX_BYTES = 4 * 1024 * 1024
@@ -149,9 +150,9 @@ def _causal_entry_id_or_none(value) -> str | None:
 
 def _pid_cmdline(pid: int) -> str:
     try:
-        import psutil  # type: ignore
-        p = psutil.Process(pid)
-        return " ".join(p.cmdline())
+        from core.process_identity import pid_cmdline
+
+        return pid_cmdline(pid)
     except Exception:
         return ""
 
@@ -552,6 +553,17 @@ def _check_config(bot_name: str | None,
         if not sim and name not in visible:
             issues.append(_issue("error", "hidden_live_bot",
                                  f"{name}: LIVE but hidden in UI.VISIBLE_BOTS"))
+        if (
+            name == "FUTREND"
+            and "TREND_TIMEFRAME" in section
+            and str(section["TREND_TIMEFRAME"]).strip().lower()
+            not in {"1h", "4h", "1d"}
+        ):
+            issues.append(_issue(
+                "error",
+                "trend_timeframe_invalid",
+                f"{name}: TREND_TIMEFRAME must be 1h, 4h, or 1d",
+            ))
         for key in sorted(_INT_FIELDS):
             if key in section and _finite_integral_or_none(section[key]) is None:
                 issues.append(_issue(
@@ -562,10 +574,10 @@ def _check_config(bot_name: str | None,
         for key in ("POSITION_SIZE", "MAX_OPEN_TRADES", "MAX_DAILY_LOSS"):
             try:
                 val = _finite_float(section.get(key))
-                if key == "MAX_OPEN_TRADES" and not (1.0 <= val <= 50.0):
+                if key == "MAX_OPEN_TRADES" and not (1.0 <= val <= 30.0):
                     issues.append(_issue(
                         "error", "max_open_trades_invalid",
-                        f"{name}: MAX_OPEN_TRADES={val} outside 1-50"))
+                        f"{name}: MAX_OPEN_TRADES={val} outside 1-30"))
                 if key == "MAX_DAILY_LOSS" and not (
                     -MAX_DAILY_LOSS_LIMIT <= val <= -MAX_DAILY_LOSS_MIN_ABS
                 ):
@@ -641,7 +653,14 @@ def _check_config(bot_name: str | None,
             try:
                 td = _finite_float(section.get("TRAILING_DISTANCE"))
                 ap = _finite_float(section.get("ACTIVATION_PROFIT"))
-                if td >= ap:
+                if 0.0 < ap <= 0.25:
+                    issues.append(_issue(
+                        "error",
+                        "activation_profit_invalid",
+                        f"{name}: ACTIVATION_PROFIT={ap:g} must be 0 "
+                        "(disabled) or above 0.25",
+                    ))
+                if ap > 0 and td >= ap:
                     issues.append(_issue("error", "trailing_invalid",
                                          f"{name}: TRAILING_DISTANCE >= ACTIVATION_PROFIT"))
                 if "POST_PARTIAL_TRAILING_DISTANCE" in section:
@@ -649,7 +668,7 @@ def _check_config(bot_name: str | None,
                     if ptd <= 0:
                         issues.append(_issue("error", "post_partial_trailing_invalid",
                                              f"{name}: POST_PARTIAL_TRAILING_DISTANCE <= 0"))
-                    elif ptd >= ap:
+                    elif ap > 0 and ptd >= ap:
                         issues.append(_issue("error", "post_partial_trailing_invalid",
                                              f"{name}: POST_PARTIAL_TRAILING_DISTANCE >= ACTIVATION_PROFIT"))
             except Exception:
@@ -683,28 +702,112 @@ def _check_config(bot_name: str | None,
                 issues.append(_issue(
                     "error", "mfe_fallback_invalid",
                     f"FUTURES: invalid MFE fallback config: {fallback_error}"))
+        for mode_key in (
+            "PORTFOLIO_RISK_MODE",
+            "NET_EXPECTANCY_MODE",
+            "TIME_DECAY_MODE",
+            "DEPTH_GATE_MODE",
+            "MAKER_FIRST_MODE",
+        ):
+            if (
+                mode_key in section
+                and str(section[mode_key]).strip().lower()
+                not in {"disabled", "shadow", "enforce"}
+            ):
+                issues.append(_issue(
+                    "error",
+                    "config_mode_invalid",
+                    f"{name}: {mode_key}={section[mode_key]!r} is invalid",
+                ))
+        for mode_key, allowed in (
+            ("VENUE_RECORDER_MODE", {"disabled", "enabled"}),
+            ("VENUE_L2_MODE", {"disabled", "shadow"}),
+        ):
+            if (
+                mode_key in section
+                and str(section[mode_key]).strip().lower() not in allowed
+            ):
+                issues.append(_issue(
+                    "error",
+                    "config_mode_invalid",
+                    f"{name}: {mode_key}={section[mode_key]!r} is invalid",
+                ))
         bounded_numeric = (
+            ("SCAN_INTERVAL", 30.0, 600.0),
+            ("MONITOR_INTERVAL", 5.0, 120.0),
+            ("COOLDOWN_AFTER_SL", 0.0, 1440.0),
+            ("MIN_VOLUME", 1_000_000.0, 1_000_000_000.0),
+            ("BASE_CAPITAL_USDT", 50.0, 100_000.0),
+            ("MAX_GROSS_EXPOSURE_PCT", 0.0, 200.0),
             ("TREND_VOTE_MIN", 1.0, 3.0),
             ("TREND_EXIT_VOTE", 1.0, 3.0),
-            ("TREND_SMA_FAST", 1.0, 5000.0),
-            ("TREND_SMA_SLOW", 1.0, 5000.0),
+            ("TREND_SMA_FAST", 10.0, 1000.0),
+            ("TREND_SMA_SLOW", 20.0, 2000.0),
             ("TREND_CROSS_FAST", 1.0, 5000.0),
             ("TREND_CROSS_SLOW", 1.0, 5000.0),
-            ("TREND_VOL_TARGET_LOOKBACK", 2.0, 500.0),
-            ("TREND_EXIT_STALE_LIMIT", 1.0, 50.0),
-            ("MAX_NEW_TRADES_PER_TICK", 0.0, 50.0),
+            ("TREND_VOL_TARGET", 0.0, 1.0),
+            ("TREND_VOL_TARGET_LOOKBACK", 10.0, 200.0),
+            ("TREND_EXIT_STALE_LIMIT", 1.0, 10.0),
+            ("MAX_NEW_TRADES_PER_TICK", 0.0, 10.0),
+            ("OWN_MOMENTUM_WINDOW", 3.0, 50.0),
+            ("OWN_MOMENTUM_MIN_LOSS_PCT", 0.0, 50.0),
+            ("FAILED_ENTRY_MAX_AGE_MIN", 15.0, 360.0),
+            ("FAILED_ENTRY_MIN_MFE_PCT", 0.0, 5.0),
+            ("FAILED_ENTRY_LOSS_PCT", -10.0, -0.5),
+            ("PRE_ACTIVATION_MIN_MFE_PCT", 0.0, 10.0),
+            ("PRE_ACTIVATION_GIVEBACK_PCT", 0.25, 10.0),
+            ("ACTIVATION_PROFIT", 0.0, 20.0),
+            ("TRAILING_DISTANCE", 0.0, 10.0),
+            ("POST_PARTIAL_TRAILING_DISTANCE", 0.25, 10.0),
+            ("INITIAL_STOP_LOSS", -90.0, -0.5),
+            ("PER_LEG_DISASTER_STOP", -90.0, -5.0),
+            ("BREAKEVEN_TRIGGER", 0.0, 10.0),
+            ("RSI_MAX", 40.0, 90.0),
+            ("MIN_PUMP", 0.5, 20.0),
+            ("LIQ_SAFETY_PCT", 5.0, 50.0),
+            ("MAX_DAILY_LOSS_HARD_MULT", 1.0, 5.0),
+            ("FUT_FLATTEN_BTC_CRASH_PCT", -100.0, 0.0),
             ("ENTRY_QUALITY_FILTER_ENABLED", 0.0, 1.0),
             ("NEW_ENTRIES_ENABLED", 0.0, 1.0),
             ("ENTRY_QUALITY_MIN_SCORE", 0.0, 100.0),
             ("ENTRY_QUALITY_SHADOW_ENABLED", 0.0, 1.0),
             ("ENTRY_QUALITY_SHADOW_MIN_SCORE", 0.0, 100.0),
             ("SPOT_EXIT_SHADOW_ENABLED", 0.0, 1.0),
+            ("LEARNING_DISABLED", 0.0, 1.0),
+            ("OWN_MOMENTUM_FILTER", 0.0, 1.0),
+            ("CRASH_FILTER", 0.0, 1.0),
+            ("FAILED_ENTRY_STOP_ENABLED", 0.0, 1.0),
+            ("PRE_ACTIVATION_GIVEBACK_STOP_ENABLED", 0.0, 1.0),
+            ("MFE_FALLBACK_STOP_ENABLED", 0.0, 1.0),
             ("XSEC_K", 1.0, 15.0),
+            ("XSEC_MAX_FUNDING_PCT", 0.0, 5.0),
             ("XSEC_LOOKBACK_HOURS", 6.0, 336.0),
             ("XSEC_REBALANCE_HOURS", 6.0, 336.0),
             ("XSEC_UNIVERSE_SIZE", 10.0, 100.0),
+            ("XSEC_TOPUP_MAX_ATTEMPTS", 1.0, 100.0),
+            ("CROSS_DISASTER_BLACKLIST_HOURS", 0.0, 87_600.0),
+            ("SINGLE_STOP_BLACKLIST_HOURS", 0.0, 87_600.0),
+            ("BAD_SYMBOL_BLACKLIST_HOURS", 0.0, 87_600.0),
+            ("BAD_SYMBOL_LOSS_COUNT", 1.0, 40.0),
+            ("BAD_SYMBOL_LOOKBACK_DAYS", 1.0, 3650.0),
+            ("SINGLE_STOP_MIN_LOSS_PCT", 0.0, 99.0),
+            ("TREND_CHECK_MINUTES", 5.0, 240.0),
+            ("TREND_UNIVERSE_SIZE", 10.0, 100.0),
+            ("TREND_CHECK_HOURS", 1.0, 24.0),
             ("CRASH_WINDOW", 1.0, 50.0),
-            ("XSEC_MAX_SPREAD_PCT", 0.01, 10.0),
+            ("XSEC_MAX_SPREAD_PCT", 0.01, 3.0),
+            ("MAKER_FIRST_TTL_SECONDS", 0.0, 30.0),
+            ("TCA_DEPTH_LEVELS", 5.0, 100.0),
+            ("TIME_DECAY_MAX_AGE_MINUTES", 5.0, 10_080.0),
+            ("TIME_DECAY_MIN_MFE_PCT", 0.0, 20.0),
+            ("VENUE_RECORDER_MAX_SYMBOLS", 1.0, 50.0),
+            ("VENUE_RECORDER_MICRO_INTERVAL_SECONDS", 1.0, 600.0),
+            ("VENUE_RECORDER_OVERVIEW_INTERVAL_SECONDS", 5.0, 3600.0),
+            ("VENUE_RECORDER_DEPTH_LEVELS", 5.0, 100.0),
+            ("VENUE_RECORDER_RETENTION_DAYS", 1.0, 3650.0),
+            ("VENUE_RECORDER_MAX_STORAGE_GIB", 0.1, 1000.0),
+            ("VENUE_L2_SAMPLE_INTERVAL_SECONDS", 0.25, 60.0),
+            ("VENUE_L2_STALE_AFTER_MS", 250.0, 60_000.0),
             ("PORTFOLIO_MAX_GROSS_PCT", 0.0, 1000.0),
             ("PORTFOLIO_MAX_NET_PCT", 0.0, 1000.0),
             ("PORTFOLIO_MIN_FREE_PCT", 0.0, 100.0),
@@ -720,6 +823,12 @@ def _check_config(bot_name: str | None,
                     "NEW_ENTRIES_ENABLED",
                     "ENTRY_QUALITY_SHADOW_ENABLED",
                     "SPOT_EXIT_SHADOW_ENABLED",
+                    "LEARNING_DISABLED",
+                    "OWN_MOMENTUM_FILTER",
+                    "CRASH_FILTER",
+                    "FAILED_ENTRY_STOP_ENABLED",
+                    "PRE_ACTIVATION_GIVEBACK_STOP_ENABLED",
+                    "MFE_FALLBACK_STOP_ENABLED",
                 }:
                     bool_val = _to_bool(section.get(key))
                     if bool_val is None:
@@ -766,6 +875,150 @@ def _check_module(bot_name: str, meta: dict) -> list[CheckIssue]:
     return []
 
 
+def _claim_exposure_values(row: dict) -> tuple[float, float] | None:
+    amount = row.get("amount")
+    invested = row.get("invested_usdt")
+    if (
+        isinstance(amount, bool)
+        or not isinstance(amount, (int, float))
+        or not math.isfinite(float(amount))
+        or float(amount) < 0.0
+        or isinstance(invested, bool)
+        or not isinstance(invested, (int, float))
+        or not math.isfinite(float(invested))
+        or float(invested) < 0.0
+    ):
+        return None
+    return float(amount), float(invested)
+
+
+def _is_exact_transient_placeholder(
+    row: dict,
+    exposure: tuple[float, float] | None,
+) -> bool:
+    buy_price = row.get("buy_price")
+    leverage = row.get("leverage")
+    opened_at = row.get("opened_at")
+    try:
+        opened = datetime.strptime(opened_at, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        exposure == (0.0, 0.0)
+        and not isinstance(buy_price, bool)
+        and isinstance(buy_price, (int, float))
+        and math.isfinite(float(buy_price))
+        and float(buy_price) == 0.0
+        and row.get("buy_time") == ""
+        and not isinstance(leverage, bool)
+        and isinstance(leverage, (int, float))
+        and math.isfinite(float(leverage))
+        and float(leverage) == 1.0
+        and row.get("position_type") in {"SPOT", "FUTURES", "LONG", "SHORT"}
+        and opened.strftime("%Y-%m-%d %H:%M:%S") == opened_at
+    )
+
+
+def _claim_metadata_valid(extra: dict | None) -> bool:
+    if not isinstance(extra, dict):
+        return False
+    if "claim_release_pending" in extra and not isinstance(
+        extra.get("claim_release_pending"), bool
+    ):
+        return False
+    if "entry_id" not in extra:
+        return True
+    entry_id = extra.get("entry_id")
+    return (
+        isinstance(entry_id, str)
+        and bool(entry_id.strip())
+        and entry_id == entry_id.strip()
+        and len(entry_id) <= 64
+        and not any(
+            ord(char) < 32 or ord(char) == 127 for char in entry_id
+        )
+    )
+
+
+def _canonical_db_timestamp(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return parsed.strftime("%Y-%m-%d %H:%M:%S") == value
+
+
+def _claim_terms_valid(row: dict, state: str) -> bool:
+    buy_price = row.get("buy_price")
+    leverage = row.get("leverage")
+    buy_time = row.get("buy_time")
+    return (
+        not isinstance(buy_price, bool)
+        and isinstance(buy_price, (int, float))
+        and math.isfinite(float(buy_price))
+        and float(buy_price) >= 0.0
+        and (state != "OPEN" or float(buy_price) > 0.0)
+        and not isinstance(leverage, bool)
+        and isinstance(leverage, (int, float))
+        and math.isfinite(float(leverage))
+        and float(leverage) > 0.0
+        and _canonical_db_timestamp(row.get("opened_at"))
+        and (
+            _canonical_db_timestamp(buy_time)
+            or (state in {"CLAIMING", "ADOPTING"} and buy_time == "")
+        )
+    )
+
+
+def _futures_state_payload_valid(row: dict) -> bool:
+    def finite_number(value) -> bool:
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+        )
+
+    positive_terms = (
+        row.get("entry_price"),
+        row.get("current_price"),
+        row.get("leverage"),
+        row.get("margin_usdt"),
+        row.get("position_size_usdt"),
+    )
+    signed_metrics = (
+        row.get("unrealized_pnl"),
+        row.get("unrealized_pct"),
+        row.get("liq_distance_pct"),
+        row.get("funding_paid"),
+    )
+    liquidation_price = row.get("liquidation_price")
+    entry_id = row.get("entry_id")
+    try:
+        opened_at = row.get("opened_at")
+        last_update = row.get("last_update")
+        opened = datetime.strptime(opened_at, "%Y-%m-%d %H:%M:%S")
+        updated = datetime.strptime(last_update, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        row.get("position_type") in {"LONG", "SHORT"}
+        and all(finite_number(value) and float(value) > 0.0
+                for value in positive_terms)
+        and all(finite_number(value) for value in signed_metrics)
+        and finite_number(liquidation_price)
+        and float(liquidation_price) >= 0.0
+        and opened.strftime("%Y-%m-%d %H:%M:%S") == opened_at
+        and updated.strftime("%Y-%m-%d %H:%M:%S") == last_update
+        and updated >= opened
+        and (
+            entry_id is None
+            or _causal_entry_id_or_none(entry_id) == entry_id
+        )
+    )
+
+
 def _check_state_and_claims(bot_name: str | None,
                             cfg: dict,
                             bot_meta: dict) -> list[CheckIssue]:
@@ -776,11 +1029,57 @@ def _check_state_and_claims(bot_name: str | None,
         issues.append(_issue("error", "db_claims_read",
                              f"bot_open_positions unreadable: {err}"))
         all_claims = []
+    invalid_claim_identity = []
+    for index, row in enumerate(all_claims):
+        claim_bot = row.get("bot_name")
+        symbol = row.get("symbol")
+        if (
+            not isinstance(claim_bot, str)
+            or claim_bot not in bot_meta
+            or "/" in claim_bot
+            or ":" in claim_bot
+            or not isinstance(symbol, str)
+            or not symbol.strip()
+            or symbol != symbol.strip()
+        ):
+            invalid_claim_identity.append(index)
+    if invalid_claim_identity:
+        issues.append(_issue(
+            "error", "invalid_claim_identity",
+            "bot_open_positions has invalid identity rows at indexes: "
+            f"{invalid_claim_identity}",
+        ))
     all_fstate, err = _db_rows("futures_state")
     if err:
         issues.append(_issue("error", "db_futures_state_read",
                              f"futures_state unreadable: {err}"))
         all_fstate = []
+    valid_fstate_bots = {
+        namespace
+        for name, meta in bot_meta.items()
+        if meta.get("is_futures")
+        for namespace in (name, f"{name} (SIM)")
+    }
+    invalid_fstate_rows = []
+    for row in all_fstate:
+        metric_bot = row.get("bot_name")
+        symbol = row.get("symbol")
+        if (
+            not isinstance(metric_bot, str)
+            or metric_bot not in valid_fstate_bots
+            or not isinstance(symbol, str)
+            or not symbol.strip()
+            or symbol != symbol.strip()
+            or len(symbol) > 64
+            or any(ord(char) < 32 or ord(char) == 127 for char in symbol)
+            or not _futures_state_payload_valid(row)
+        ):
+            invalid_fstate_rows.append(row.get("rowid"))
+    if invalid_fstate_rows:
+        issues.append(_issue(
+            "error", "invalid_futures_state_rows",
+            f"futures_state has invalid identity rows: {invalid_fstate_rows}",
+        ))
 
     for name in targets:
         meta = bot_meta[name]
@@ -814,6 +1113,44 @@ def _check_state_and_claims(bot_name: str | None,
             and str(r.get("state") or "").strip().upper()
             not in {"CLOSED", "FLAT"}
         ]
+        try:
+            from core.database import _strict_claim_extra_object
+        except ImportError:
+            _strict_claim_extra_object = None
+        invalid_claim_bases = set()
+        for row in claims:
+            raw_state = row.get("state")
+            raw_position_type = row.get("position_type")
+            try:
+                extra = (
+                    _strict_claim_extra_object(row.get("extra_json"))
+                    if _strict_claim_extra_object is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                extra = None
+            if (
+                _claim_exposure_values(row) is None
+                or not isinstance(raw_state, str)
+                or raw_state not in {"CLAIMING", "ADOPTING", "OPEN"}
+                or not isinstance(raw_position_type, str)
+                or raw_position_type
+                not in {"SPOT", "FUTURES", "LONG", "SHORT"}
+                or not _claim_metadata_valid(extra)
+                or not _claim_terms_valid(row, raw_state)
+            ):
+                invalid_claim_bases.add(
+                    str(row.get("symbol") or "")
+                    .split("/")[0]
+                    .split(":")[0]
+                    .upper()
+                )
+        if invalid_claim_bases:
+            issues.append(_issue(
+                "error", "invalid_claim_rows",
+                f"{name}: claims have invalid exposure: "
+                f"{sorted(invalid_claim_bases)}",
+            ))
         claim_bases = {str(r.get("symbol") or "").split("/")[0].split(":")[0].upper()
                        for r in claims}
         if sim and claims:
@@ -828,26 +1165,25 @@ def _check_state_and_claims(bot_name: str | None,
                 if base in bases:
                     continue
                 state = str(r.get("state") or "").upper()
-                try:
-                    amount = float(r.get("amount") or 0)
-                    invested = float(r.get("invested_usdt") or 0)
-                except (TypeError, ValueError):
-                    amount = invested = 0.0
+                exposure = _claim_exposure_values(r)
+                valid_exposure = exposure is not None
                 try:
                     from core.database import _strict_claim_extra_object
 
                     extra = _strict_claim_extra_object(r.get("extra_json"))
                 except (ImportError, TypeError, ValueError):
                     extra = None
+                valid_metadata = _claim_metadata_valid(extra)
                 if (
-                    isinstance(extra, dict)
+                    valid_exposure
+                    and valid_metadata
                     and extra.get("claim_release_pending") is True
                 ):
                     pending_release.append(base)
                 elif (
                     state in {"CLAIMING", "ADOPTING"}
-                    and amount <= 0
-                    and invested <= 0
+                    and valid_metadata
+                    and _is_exact_transient_placeholder(r, exposure)
                 ):
                     recoverable.append(base)
                 else:

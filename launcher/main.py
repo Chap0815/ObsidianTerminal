@@ -423,7 +423,26 @@ def _setup_wizard_is_running(wizard_path: str, *, process_iter=None) -> bool:
                 if not python_like:
                     continue
                 raw_cwd = info.get("cwd")
-                for raw_token in raw_cmdline[1:]:
+                script_token = None
+                token_index = 1
+                while token_index < len(raw_cmdline):
+                    token = str(raw_cmdline[token_index] or "").strip('"\'')
+                    if token in {"-m", "-c"}:
+                        break
+                    if token == "--":
+                        token_index += 1
+                        if token_index < len(raw_cmdline):
+                            script_token = raw_cmdline[token_index]
+                        break
+                    if token.startswith("-"):
+                        token_index += 2 if token in {"-W", "-X"} else 1
+                        continue
+                    script_token = raw_cmdline[token_index]
+                    break
+                script_tokens = (
+                    () if script_token is None else (script_token,)
+                )
+                for raw_token in script_tokens:
                     token = str(raw_token or "")
                     if not token:
                         continue

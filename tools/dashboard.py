@@ -40,6 +40,7 @@ import streamlit as st
 
 from bot_utils.atomic_publish import atomic_write_bytes
 from bot_utils.config import parse_explicit_bool
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.pnl_view import (
     futures_state_age_sec,
     futures_unrealized_from_row,
@@ -1035,6 +1036,8 @@ def get_live_prices(symbols: tuple[str, ...] = ()) -> dict:
             base = sym.split("/")[0].upper()
             if base not in wanted:
                 continue
+            if not explicit_trade_symbol_matches(t, sym):
+                continue
             price = _ticker_price_or_none(t)
             if price is not None:
                 out[f"{base}USDT"] = price
@@ -1042,7 +1045,10 @@ def get_live_prices(symbols: tuple[str, ...] = ()) -> dict:
             if f"{base}USDT" in out:
                 continue
             try:
+                expected_pair = f"{base}/USDT"
                 t = ex.fetch_ticker(f"{base}/USDT") or {}
+                if not explicit_trade_symbol_matches(t, expected_pair):
+                    continue
                 price = _ticker_price_or_none(t)
                 if price is not None:
                     out[f"{base}USDT"] = price
@@ -1055,7 +1061,10 @@ def get_live_prices(symbols: tuple[str, ...] = ()) -> dict:
             ex = _dash_spot_exchange()
             for base in wanted:
                 try:
+                    expected_pair = f"{base}/USDT"
                     t = ex.fetch_ticker(f"{base}/USDT") or {}
+                    if not explicit_trade_symbol_matches(t, expected_pair):
+                        continue
                     price = _ticker_price_or_none(t)
                     if price is not None:
                         out[f"{base}USDT"] = price

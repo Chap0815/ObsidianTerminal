@@ -20,9 +20,17 @@ import threading
 import time
 from typing import Tuple, Optional
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.network_retry import RetryForbiddenError
-from bot_utils.order_utils import order_id_text_or_none, strict_order_snapshot_equal
+from bot_utils.order_utils import (
+    explicit_trade_symbol_matches,
+    order_id_text_or_none,
+    strict_order_snapshot_equal,
+)
 
 
 def _utc_now_str() -> str:
@@ -988,21 +996,47 @@ def _find_order_by_client_id(
     ):
         lookup_since_ms = None
 
+    source_requests: dict[str, tuple[str, object]] = {}
+    source_request_errors: set[str] = set()
+
+    def _record_source_error(source: str) -> None:
+        request = source_requests.get(source)
+        if request is None or source in source_request_errors:
+            return
+        endpoint, reservation = request
+        if not isinstance(reservation, ApiCallReservation):
+            return
+        source_request_errors.add(source)
+        try:
+            record_api_error(endpoint, reservation)
+        except Exception:
+            pass
+
     def _budgeted(endpoint: str, source: str, fn):
         try:
-            allowed = try_consume_api_call(endpoint, critical=True)
+            reservation = try_consume_api_call(
+                endpoint,
+                critical=True,
+                return_reservation=True,
+            )
         except Exception:
             _mark_unavailable(source)
             return None
-        if not allowed:
+        if not reservation:
             _mark_unavailable(source)
             if isinstance(lookup_status, dict):
                 lookup_status["budget_denied"] = True
             return None
-        return fn()
+        source_requests[source] = (endpoint, reservation)
+        try:
+            return fn()
+        except Exception:
+            _record_source_error(source)
+            raise
 
     def _recovery_rows(raw, source: str, *, page_limit: int | None = None):
         if not isinstance(raw, list):
+            _record_source_error(source)
             _mark_unavailable(source)
             source_complete[source] = False
             return ()
@@ -1012,6 +1046,7 @@ def _find_order_by_client_id(
         rows = []
         for row in raw:
             if not isinstance(row, dict):
+                _record_source_error(source)
                 _mark_unavailable(source)
                 continue
             rows.append(row)
@@ -1428,16 +1463,39 @@ def create_order_with_retry(ex,
     endpoint = f"create_order:{action_label or 'order'}"
     submission_attempted = False
     for attempt in range(1, attempts_limit + 1):
-        if not try_consume_api_call(endpoint, critical=reduce_only):
+        try:
+            reservation = try_consume_api_call(
+                endpoint,
+                critical=reduce_only,
+                return_reservation=True,
+            )
+        except Exception as exc:
+            error = f"API budget gate unavailable before {action_label}"
+            if not submission_attempted:
+                raise FuturesOrderNotSubmitted(error) from exc
+            raise RuntimeError(error) from exc
+        if not reservation:
             error = f"API budget exhausted before {action_label}"
             if not submission_attempted:
                 raise FuturesOrderNotSubmitted(error)
             raise RuntimeError(error)
+
+        def _record_create_error() -> None:
+            if isinstance(reservation, ApiCallReservation):
+                try:
+                    record_api_error(endpoint, reservation)
+                except Exception:
+                    pass
+
         try:
             submission_attempted = True
-            order = ex.create_order(
-                order_symbol, "market", order_side, order_amount,
-                params=order_params)
+            try:
+                order = ex.create_order(
+                    order_symbol, "market", order_side, order_amount,
+                    params=order_params)
+            except Exception:
+                _record_create_error()
+                raise
             cid = order_params.get("clientOrderId")
             client_id_conflict = _order_client_id_conflicts(order, cid)
             request_conflict = _order_request_conflicts(
@@ -1455,6 +1513,7 @@ def create_order_with_retry(ex,
                 or client_id_conflict
                 or request_conflict
             ):
+                _record_create_error()
                 lookup_status = {}
                 existing = _find_order_by_client_id(
                     ex,
@@ -1519,6 +1578,7 @@ def create_order_with_retry(ex,
                 )
                 and not _order_response_has_fill_evidence(order)
             ):
+                _record_create_error()
                 raise _InvalidOrderResponse(
                     f"{action_label}: exchange returned terminal order state "
                     f"{order_state}; not treating it as placed"
@@ -1822,22 +1882,43 @@ def _discount_token_fee_to_usdt(currency: str, cost: float,
     ex = order_dict.get("_bot_ex")
     if ex is not None:
         try:
-            allowed = try_consume_api_call(
-                "futures_fee_conversion_fetch_ticker", critical=True
+            reservation = try_consume_api_call(
+                "futures_fee_conversion_fetch_ticker",
+                critical=True,
+                return_reservation=True,
             )
         except Exception:
-            allowed = False
-        if allowed:
+            reservation = False
+        if reservation:
             try:
-                ticker = ex.fetch_ticker(f"{currency}/USDT")
-                px = _first_positive_float(
-                    (ticker or {}).get("last"),
-                    (ticker or {}).get("close"),
-                )
-                if px > 0:
-                    converted = round(cost * px, 6)
-                    if math.isfinite(converted):
-                        return converted
+                try:
+                    symbol = f"{currency}/USDT"
+                    ticker = ex.fetch_ticker(symbol)
+                    if not explicit_trade_symbol_matches(ticker, symbol):
+                        raise ValueError(
+                            "futures fee ticker returned a symbol mismatch"
+                        )
+                    px = _first_positive_float(
+                        (ticker or {}).get("last"),
+                        (ticker or {}).get("close"),
+                    )
+                    if px <= 0:
+                        raise ValueError(
+                            "futures fee ticker returned no positive price"
+                        )
+                except Exception:
+                    if isinstance(reservation, ApiCallReservation):
+                        try:
+                            record_api_error(
+                                "futures_fee_conversion_fetch_ticker",
+                                reservation,
+                            )
+                        except Exception:
+                            pass
+                    raise
+                converted = round(cost * px, 6)
+                if math.isfinite(converted):
+                    return converted
             except Exception:
                 pass
     if cost < 0 or not allow_estimate:
@@ -2131,33 +2212,61 @@ def extract_or_estimate_futures_fee(ex,
             else:
                 time.sleep(retry_delay)
             try:
-                allowed = try_consume_api_call(
-                    "futures_fee_fetch_order", critical=True
+                reservation = try_consume_api_call(
+                    "futures_fee_fetch_order",
+                    critical=True,
+                    return_reservation=True,
                 )
             except Exception:
                 break
-            if not allowed:
+            if not reservation:
                 break
             try:
                 refreshed = ex.fetch_order(str(order_id), symbol_full)
-                if isinstance(refreshed, dict):
-                    refreshed_payload = _order_with_fee_context(
-                        refreshed,
-                        ex=ex,
-                        symbol_full=symbol_full,
-                        contract_size=contract_size,
+                if not isinstance(refreshed, dict) or not refreshed:
+                    raise TypeError(
+                        "futures fee refetch returned no order object"
                     )
-                    if _first_positive_float(
-                        refreshed_payload.get("filled"),
-                        refreshed_payload.get("amount"),
-                    ) > 0:
-                        estimate_payload = refreshed_payload
-                    real, fee_known = _extract_order_fee_futures_known(
-                        refreshed_payload
+                refreshed_order_ids = _explicit_order_ids(refreshed)
+                if len(refreshed_order_ids) > 1 or (
+                    refreshed_order_ids
+                    and refreshed_order_ids != {str(order_id)}
+                ):
+                    raise ValueError(
+                        "futures fee refetch changed order id"
                     )
-                    if fee_known:
-                        return real
+                raw_refreshed_symbol = refreshed.get("symbol")
+                if raw_refreshed_symbol not in (None, "") and (
+                    _normalize_order_symbol(raw_refreshed_symbol)
+                    != _normalize_order_symbol(symbol_full)
+                ):
+                    raise ValueError(
+                        "futures fee refetch changed order symbol"
+                    )
+                refreshed_payload = _order_with_fee_context(
+                    refreshed,
+                    ex=ex,
+                    symbol_full=symbol_full,
+                    contract_size=contract_size,
+                )
+                if _first_positive_float(
+                    refreshed_payload.get("filled"),
+                    refreshed_payload.get("amount"),
+                ) > 0:
+                    estimate_payload = refreshed_payload
+                real, fee_known = _extract_order_fee_futures_known(
+                    refreshed_payload
+                )
+                if fee_known:
+                    return real
             except Exception:
+                if isinstance(reservation, ApiCallReservation):
+                    try:
+                        record_api_error(
+                            "futures_fee_fetch_order", reservation
+                        )
+                    except Exception:
+                        pass
                 continue
 
     # Estimate fallback
@@ -2296,7 +2405,8 @@ def fetch_open_position(
     symbol_full: str,
     *,
     expected_position_side: Optional[str] = None,
-    _reserve_api_call=None,
+    _api_endpoint_prefix: str = "fetch_positions:",
+    _api_critical: bool = False,
 ) -> Tuple[Optional[dict], bool]:
     """Return the open exchange position for ``symbol_full``.
 
@@ -2310,10 +2420,15 @@ def fetch_open_position(
     exchange position endpoint could not be trusted and callers should keep or
     create provisional state instead of deleting claims/state.
 
-    ``_reserve_api_call`` is an internal integration hook for callers that
-    require a dedicated critical API-budget namespace while reusing this exact
-    position-selection contract.
+    The private endpoint options let reconciliation use its dedicated critical
+    API-budget namespace while reusing this exact position-selection contract.
     """
+    if (
+        not isinstance(symbol_full, str)
+        or not symbol_full.strip()
+        or symbol_full != symbol_full.strip()
+    ):
+        return None, True
     try:
         from config.exchange_config import safe_fetch_positions
     except Exception:
@@ -2321,20 +2436,23 @@ def fetch_open_position(
 
     expected_side = ""
     if expected_position_side not in (None, ""):
+        if (
+            not isinstance(expected_position_side, str)
+            or expected_position_side != expected_position_side.strip()
+        ):
+            return None, True
         expected_side = _normalize_order_position_side(expected_position_side)
         if not expected_side:
             return None, True
 
-    if _reserve_api_call is None:
-        def reserve_api_call(stage):
-            return try_consume_api_call(f"fetch_positions:{stage}")
-    else:
-        reserve_api_call = _reserve_api_call
-
     try:
-        if not reserve_api_call("scoped"):
-            return None, True
-        scoped_raw = safe_fetch_positions(ex, [symbol_full])
+        scoped_raw = safe_fetch_positions(
+            ex,
+            [symbol_full],
+            endpoint=f"{_api_endpoint_prefix}scoped",
+            critical=_api_critical,
+            raise_on_budget_denied=True,
+        )
         if scoped_raw is None:
             positions = None
         else:
@@ -2363,9 +2481,12 @@ def fetch_open_position(
                 if observed_side == expected_side:
                     scoped_has_symbol = True
         if positions is None or not scoped_has_symbol:
-            if not reserve_api_call("global"):
-                return None, True
-            global_raw = safe_fetch_positions(ex)
+            global_raw = safe_fetch_positions(
+                ex,
+                endpoint=f"{_api_endpoint_prefix}global",
+                critical=_api_critical,
+                raise_on_budget_denied=True,
+            )
             if global_raw is None:
                 return None, True
             positions = _validated_position_rows(global_raw)
@@ -2418,23 +2539,43 @@ def verify_position_closed(
     ``safe_fetch_positions`` returns None (auth/network glitch), return
   ``(False, -1.0)``  same pessimistic signal as an exception.
     """
-    deadline = time.monotonic() + max(0.0, timeout)
-    def reserve_api_call(stage: str) -> bool:
-        return try_consume_api_call(
-            f"fetch_positions:{stage}",
-            critical=True,
-        )
-
+    if (
+        not isinstance(symbol_full, str)
+        or not symbol_full.strip()
+        or symbol_full != symbol_full.strip()
+    ):
+        return False, -1.0
+    if expected_position_side not in (None, ""):
+        if (
+            not isinstance(expected_position_side, str)
+            or expected_position_side != expected_position_side.strip()
+        ):
+            return False, -1.0
+        normalized_side = _normalize_order_position_side(expected_position_side)
+        if not normalized_side:
+            return False, -1.0
+        expected_position_side = normalized_side
+    if isinstance(timeout, bool):
+        return False, -1.0
+    try:
+        timeout_value = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        return False, -1.0
+    if not math.isfinite(timeout_value) or timeout_value < 0.0:
+        return False, -1.0
+    deadline = time.monotonic() + timeout_value
     # Do at most 2 attempts within the window, with a small gap. If both
     # exceed the deadline, report "not verified" so the caller keeps state.
     last_remaining = -1.0
-    while time.monotonic() < deadline:
+    attempts = 0
+    while attempts < 2 and (attempts == 0 or time.monotonic() < deadline):
+        attempts += 1
         try:
             pos, unavailable = fetch_open_position(
                 ex,
                 symbol_full,
                 expected_position_side=expected_position_side,
-                _reserve_api_call=reserve_api_call,
+                _api_critical=True,
             )
             if unavailable:
                 pass
@@ -2449,6 +2590,8 @@ def verify_position_closed(
         except Exception:
             pass
 
+        if attempts >= 2:
+            break
         # Small backoff between retries, capped by remaining deadline
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -2502,11 +2645,11 @@ def get_exchange_liq_price(
             )
             if not expected_side:
                 return 0.0
-        if not try_consume_api_call(
-            "futures_liquidation_fetch_positions", critical=True
-        ):
-            return 0.0
-        positions = safe_fetch_positions(ex)
+        positions = safe_fetch_positions(
+            ex,
+            endpoint="futures_liquidation_fetch_positions",
+            critical=True,
+        )
         positions = _validated_position_rows(positions)
         if positions is None:
             return 0.0

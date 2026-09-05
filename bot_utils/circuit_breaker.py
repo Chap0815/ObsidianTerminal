@@ -109,12 +109,24 @@ def _log_safe_mode_error(context: str, exc: BaseException) -> None:
         pass
 
 
+def _unique_safe_mode_state_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate safe-mode state JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def _read_safe_mode_state_json(path: str) -> dict:
     with open(path, "rb") as stream:
         raw = stream.read(_SAFE_MODE_STATE_JSON_MAX_BYTES + 1)
     if len(raw) > _SAFE_MODE_STATE_JSON_MAX_BYTES:
         raise ValueError("safe-mode state JSON exceeds size limit")
-    data = json.loads(raw.decode("utf-8-sig"))
+    data = json.loads(
+        raw.decode("utf-8-sig"),
+        object_pairs_hook=_unique_safe_mode_state_object,
+    )
     return data if isinstance(data, dict) else {}
 
 

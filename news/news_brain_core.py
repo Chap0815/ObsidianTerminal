@@ -394,6 +394,32 @@ _CONFIDENCE_LINE_RE = re.compile(
 )
 
 
+def _unique_llm_json_object(pairs) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate LLM JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_llm_json_constant(value: str):
+    raise ValueError(f"invalid LLM JSON constant: {value}")
+
+
+def parse_llm_json_object(text: str) -> dict:
+    import json as _json
+
+    data = _json.loads(
+        text,
+        object_pairs_hook=_unique_llm_json_object,
+        parse_constant=_reject_llm_json_constant,
+    )
+    if not isinstance(data, dict):
+        raise ValueError("LLM JSON response must be an object")
+    return data
+
+
 def _try_parse_json_fields(text: str) -> dict:
     """Extract direction/confidence from a JSON response if present.
 
@@ -406,7 +432,6 @@ def _try_parse_json_fields(text: str) -> dict:
     """
     if not isinstance(text, str) or not text or "{" not in text:
         return {}
-    import json as _json
     # Find the outermost-looking {...} span
     start = text.find("{")
     end = text.rfind("}")
@@ -414,9 +439,7 @@ def _try_parse_json_fields(text: str) -> dict:
         return {}
     blob = text[start:end + 1]
     try:
-        data = _json.loads(blob)
-        if isinstance(data, dict):
-            return data
+        return parse_llm_json_object(blob)
     except Exception:
         pass
     return {}

@@ -224,7 +224,15 @@ def position_age_minutes(opened_at, now: datetime | None = None) -> float | None
         return None
     if opened.tzinfo is None:
         opened = opened.replace(tzinfo=timezone.utc)
-    current = now or datetime.now(timezone.utc)
+    if now is None:
+        try:
+            from core.clock import now_utc
+
+            current = now_utc()
+        except Exception:
+            return None
+    else:
+        current = now
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     age_minutes = (

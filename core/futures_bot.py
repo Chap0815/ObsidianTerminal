@@ -53,7 +53,11 @@ from bot_utils import (
     SafeMode,
     emergency_close_all_futures,
 )
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.runtime_threads import (finalize_runtime_shutdown,
                                        format_runtime_thread_liveness,
                                        shared_runtime_resource_closers,
@@ -69,6 +73,15 @@ from core.futures_bot_exits import (
 )
 from core.futures_bot_scan import FuturesScanMixin
 from core.futures_bot_reconcile import FuturesReconcileMixin
+
+
+def _record_reserved_api_error(endpoint, reservation) -> None:
+    if not isinstance(reservation, ApiCallReservation):
+        return
+    try:
+        record_api_error(endpoint, reservation)
+    except Exception:
+        pass
 
 
 _STATE_ROWS_UNSET = object()
@@ -2607,9 +2620,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         from config.exchange_config import is_authentication_error
         from core.logger import log_event
 
-        def _startup_probe_allowed(endpoint: str) -> bool:
+        def _startup_probe_allowed(endpoint: str):
             try:
-                return bool(try_consume_api_call(endpoint))
+                return try_consume_api_call(
+                    endpoint,
+                    return_reservation=True,
+                )
             except Exception as budget_exc:
                 log_event(
                     f"Futures startup probe skipped - API budget gate "
@@ -2649,19 +2665,42 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             for attempt in range(1, 4):
                 try:
                     try:
-                        markets_allowed = bool(try_consume_api_call(
+                        markets_reservation = try_consume_api_call(
                             "futures_startup_load_markets",
                             critical=True,
-                        ))
+                            return_reservation=True,
+                        )
                     except Exception as budget_exc:
                         raise RuntimeError(
                             "futures load_markets API budget gate unavailable"
                         ) from budget_exc
-                    if not markets_allowed:
+                    if not markets_reservation:
                         raise RuntimeError(
                             "futures load_markets API budget exhausted"
                         )
-                    raw_ex.load_markets()
+                    try:
+                        raw_ex.load_markets()
+                        if hasattr(raw_ex, "markets"):
+                            market_snapshot = raw_ex.markets
+                            if (
+                                not isinstance(market_snapshot, dict)
+                                or not market_snapshot
+                                or any(
+                                    not isinstance(symbol, str)
+                                    or not symbol.strip()
+                                    or not isinstance(market, dict)
+                                    for symbol, market in market_snapshot.items()
+                                )
+                            ):
+                                raise ValueError(
+                                    "futures load_markets returned no market snapshot"
+                                )
+                    except Exception:
+                        _record_reserved_api_error(
+                            "futures_startup_load_markets",
+                            markets_reservation,
+                        )
+                        raise
                     break
                 except Exception as le:
                     if is_authentication_error(le):
@@ -2685,9 +2724,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
 
             # Auth smoke-test BEFORE going threaded, so a dead key surfaces
             # here instead of on the first close-order.
-            auth_probe_allowed = _startup_probe_allowed(
+            auth_reservation = _startup_probe_allowed(
                 "futures_startup_auth_fetch_balance"
             )
+            auth_probe_allowed = bool(auth_reservation)
             if not auth_probe_allowed and not self.C("SIMULATION", True):
                 log_event(
                     "Futures LIVE startup blocked - authentication could not "
@@ -2699,8 +2739,16 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 try:
                     _bal = raw_ex.fetch_balance()
                     # We only care that the call succeeded; ignore content.
-                    _ = (_bal or {}).get("USDT", {})
+                    if not isinstance(_bal, dict):
+                        raise TypeError(
+                            "futures auth probe returned no balance object"
+                        )
+                    _ = _bal.get("USDT", {})
                 except Exception as se:
+                    _record_reserved_api_error(
+                        "futures_startup_auth_fetch_balance",
+                        auth_reservation,
+                    )
                     # Don't fail the connect on a transient network blip:
                     # log and continue. Credential failures fail closed before
                     # worker threads start or a connected status is emitted.
@@ -2741,30 +2789,53 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             # avoid false-alarm ERROR badges when Bitget is temporarily
             # unreachable. In LIVE mode we distinguish transient network
             # errors (INFO) from auth failures (WARN) which are actionable.
-            if (not self.C("SIMULATION", True)
-                    and _startup_probe_allowed(
-                        "futures_startup_live_fetch_balance")):
-                try:
-                    self.ex.fetch_balance()
-                except Exception as bal_err:
-                    if is_authentication_error(bal_err):
-                        log_event(
-                            f"H-6 smoke test: fetch_balance  AUTH FAILURE "
-                            f"({type(bal_err).__name__}: {str(bal_err)[:80]}) "
-                            f" check API key permissions", "WARN")
-                        return False
-                    else:
-                        # NetworkError / timeout  transient, not actionable
-                        log_event(
-                            f"H-6 smoke test: fetch_balance transient error "
-                            f"({type(bal_err).__name__})  bot will retry on "
-                            f"first reconcile cycle", "INFO")
-            if _startup_probe_allowed("futures_startup_fetch_positions"):
+            if not self.C("SIMULATION", True):
+                live_balance_reservation = _startup_probe_allowed(
+                    "futures_startup_live_fetch_balance"
+                )
+                if live_balance_reservation:
+                    try:
+                        live_balance = self.ex.fetch_balance()
+                        if not isinstance(live_balance, dict):
+                            raise TypeError(
+                                "futures live probe returned no balance object"
+                            )
+                    except Exception as bal_err:
+                        _record_reserved_api_error(
+                            "futures_startup_live_fetch_balance",
+                            live_balance_reservation,
+                        )
+                        if is_authentication_error(bal_err):
+                            log_event(
+                                f"H-6 smoke test: fetch_balance  AUTH FAILURE "
+                                f"({type(bal_err).__name__}: {str(bal_err)[:80]}) "
+                                f" check API key permissions", "WARN")
+                            return False
+                        else:
+                            # NetworkError / timeout  transient, not actionable
+                            log_event(
+                                f"H-6 smoke test: fetch_balance transient error "
+                                f"({type(bal_err).__name__})  bot will retry on "
+                                f"first reconcile cycle", "INFO")
+            positions_reservation = _startup_probe_allowed(
+                "futures_startup_fetch_positions"
+            )
+            if positions_reservation:
                 try:
                     # fetch_positions sometimes needs a symbol on Bitget; we
                     # only need to know the call path WORKS, not the data.
-                    self.ex.fetch_positions(["BTC/USDT:USDT"])
+                    probe_positions = self.ex.fetch_positions(
+                        ["BTC/USDT:USDT"]
+                    )
+                    if not isinstance(probe_positions, list):
+                        raise TypeError(
+                            "futures position probe returned no position list"
+                        )
                 except Exception as pos_err:
+                    _record_reserved_api_error(
+                        "futures_startup_fetch_positions",
+                        positions_reservation,
+                    )
                     if is_authentication_error(pos_err):
                         log_event(
                             f"H-6 smoke test: fetch_positions AUTH FAILURE "

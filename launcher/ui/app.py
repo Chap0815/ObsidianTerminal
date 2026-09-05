@@ -141,17 +141,28 @@ def _scan_active_bot_processes(
     own_pid = os.getpid() if current_pid is None else int(current_pid)
     saw_current = False
     scan_incomplete = False
+    current_owner = ""
+    incomplete_candidate_owners: list[str] = []
     found: dict[str, dict[str, int]] = {}
     python_name = re.compile(r"python(?:w|[0-9.]*)?(?:\.exe)?$")
 
+    def normalized_owner(value) -> str:
+        try:
+            return str(value or "").strip().casefold()
+        except Exception:
+            return ""
+
     try:
-        processes = process_iter(["pid", "name", "exe", "cmdline", "cwd"])
+        processes = process_iter(
+            ["pid", "name", "exe", "cmdline", "cwd", "username"]
+        )
         for proc in processes:
             try:
                 info = proc.info
                 pid = int(info.get("pid") or 0)
                 if pid == own_pid:
                     saw_current = True
+                    current_owner = normalized_owner(info.get("username"))
                     continue
                 if pid <= 0:
                     if pid < 0:
@@ -175,18 +186,38 @@ def _scan_active_bot_processes(
                 )
                 if not isinstance(raw_cmdline, (list, tuple)) or not raw_cmdline:
                     if python_like or not identity_known:
-                        scan_incomplete = True
+                        incomplete_candidate_owners.append(
+                            normalized_owner(info.get("username"))
+                        )
                     continue
                 if not python_like:
                     continue
 
-                cmdline = " ".join(str(part) for part in raw_cmdline)
+                cmdline = subprocess.list2cmdline(
+                    [str(part) for part in raw_cmdline]
+                )
                 raw_cwd = info.get("cwd")
                 process_root = (
                     canonical_path(raw_cwd)
                     if raw_cwd
                     else ""
                 )
+                script_token = None
+                token_index = 1
+                while token_index < len(raw_cmdline):
+                    token = str(raw_cmdline[token_index] or "").strip('"\'')
+                    if token in {"-m", "-c"}:
+                        break
+                    if token == "--":
+                        token_index += 1
+                        if token_index < len(raw_cmdline):
+                            script_token = raw_cmdline[token_index]
+                        break
+                    if token.startswith("-"):
+                        token_index += 2 if token in {"-W", "-X"} else 1
+                        continue
+                    script_token = raw_cmdline[token_index]
+                    break
                 for bot in BOT_ORDER:
                     expected_script = canonical_path(
                         os.path.join(PROJECT_ROOT, BOT_META[bot]["script"])
@@ -197,7 +228,10 @@ def _scan_active_bot_processes(
                     expected_basename = os.path.basename(expected_script)
                     script_proven = False
                     relative_script_without_cwd = False
-                    for raw_token in raw_cmdline[1:]:
+                    script_tokens = (
+                        () if script_token is None else (script_token,)
+                    )
+                    for raw_token in script_tokens:
                         token = str(raw_token or "").strip('"\'')
                         if not token:
                             continue
@@ -234,10 +268,18 @@ def _scan_active_bot_processes(
                     ):
                         # A relative script/module invocation without cwd cannot
                         # be assigned to this or a foreign runtime root.
-                        scan_incomplete = True
+                        incomplete_candidate_owners.append(
+                            normalized_owner(info.get("username"))
+                        )
             except Exception:
                 scan_incomplete = True
     except Exception:
+        scan_incomplete = True
+
+    if any(
+        not current_owner or not owner or owner == current_owner
+        for owner in incomplete_candidate_owners
+    ):
         scan_incomplete = True
 
     if scan_incomplete or not saw_current:
@@ -2615,6 +2657,12 @@ class ObsidianApp(ctk.CTk):
     @staticmethod
     def _find_dashboard_port(preferred: int = 8501) -> int:
         """Return a local port for Streamlit without assuming 8501 is free."""
+        if (
+            not isinstance(preferred, int)
+            or isinstance(preferred, bool)
+            or not 0 <= preferred <= 65535
+        ):
+            raise ValueError("dashboard port must be an integer from 0 to 65535")
         for port in (preferred, 0):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -2643,8 +2691,17 @@ class ObsidianApp(ctk.CTk):
 
     @staticmethod
     def _dashboard_health_ok(port: int) -> bool:
+        if (
+            not isinstance(port, int)
+            or isinstance(port, bool)
+            or not 1 <= port <= 65535
+        ):
+            return False
         try:
-            response = _req.get(f"http://127.0.0.1:{int(port)}/_stcore/health", timeout=0.35)
+            response = _req.get(
+                f"http://127.0.0.1:{port}/_stcore/health",
+                timeout=0.35,
+            )
             return response.status_code < 500
         except Exception:
             return False
@@ -2673,11 +2730,36 @@ class ObsidianApp(ctk.CTk):
             return False
         root_text = str(PROJECT_ROOT).replace("\\", "/").rstrip("/").lower()
         script = f"{root_text}/tools/dashboard.py"
-        has_streamlit = any(token == "streamlit" for token in tokens)
-        has_script = script in tokens or (
-            "tools/dashboard.py" in tokens and cwd_text == root_text
-        )
-        return has_streamlit and has_script
+        if not tokens:
+            return False
+        executable_name = tokens[0].rsplit("/", 1)[-1]
+        if not re.fullmatch(
+            r"(?:python(?:w|\d+(?:\.\d+)*)?|pypy\d*|py)(?:\.exe)?",
+            executable_name,
+        ):
+            return False
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "-m":
+                if (
+                    index + 3 >= len(tokens)
+                    or tokens[index + 1] != "streamlit"
+                    or tokens[index + 2] != "run"
+                ):
+                    return False
+                dashboard_script = tokens[index + 3]
+                return dashboard_script == script or (
+                    dashboard_script == "tools/dashboard.py"
+                    and cwd_text == root_text
+                )
+            if token in {"-c", "--"}:
+                return False
+            if token.startswith("-"):
+                index += 2 if token in {"-W", "-X"} else 1
+                continue
+            return False
+        return False
 
     @staticmethod
     def _running_dashboard_processes() -> list[dict[str, int | float]]:
@@ -2750,10 +2832,14 @@ class ObsidianApp(ctk.CTk):
     def _terminate_dashboard_process(entry: dict[str, int | float]) -> bool:
         if not isinstance(entry, dict):
             return False
-        pid = int(entry.get("pid") or 0)
-        expected_created = _ui_finite_float(entry.get("create_time"), 0.0)
-        if not pid:
+        pid = entry.get("pid")
+        if (
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or not 0 < pid <= 0xFFFFFFFF
+        ):
             return False
+        expected_created = _ui_finite_float(entry.get("create_time"), 0.0)
         try:
             import psutil  # type: ignore
         except Exception:
@@ -2790,7 +2876,7 @@ class ObsidianApp(ctk.CTk):
             return "same" if scoped else "unknown"
 
         try:
-            proc = psutil.Process(int(pid))
+            proc = psutil.Process(pid)
         except Exception as exc:
             return _gone(exc)
 

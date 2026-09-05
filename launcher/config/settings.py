@@ -837,6 +837,10 @@ def load_config() -> dict:
                 f"{section} config section must be an object"
             )
     existing_ui = cfg.get("UI")
+    legacy_missing_new_entries = (
+        isinstance(cfg.get("FUTURES"), dict)
+        and "NEW_ENTRIES_ENABLED" not in cfg["FUTURES"]
+    )
     legacy_dashboard_binding = not (
         isinstance(existing_ui, dict)
         and "DASHBOARD_BIND_ADDRESS" in existing_ui
@@ -857,6 +861,10 @@ def load_config() -> dict:
     else:
         for k, v in defaults_cfg["UI"].items():
             cfg["UI"].setdefault(k, v)
+    if legacy_missing_new_entries:
+        # Match the runtime's fail-closed admission contract for legacy files.
+        # Fresh files persist the explicit True default before reaching here.
+        cfg["FUTURES"]["NEW_ENTRIES_ENABLED"] = False
     if legacy_dashboard_binding:
         # Before this option existed Streamlit implicitly listened on all
         # interfaces. Preserve that established remote-access contract for an

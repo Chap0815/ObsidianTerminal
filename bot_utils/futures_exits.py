@@ -14,7 +14,11 @@ from decimal import Decimal, ROUND_DOWN
 from threading import Lock
 from typing import Callable, Optional, Tuple
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.futures_order import (
     _explicit_client_order_ids,
     _explicit_order_ids,
@@ -33,7 +37,10 @@ from bot_utils.futures_funding import (
     fetch_realized_funding,
 )
 from bot_utils.fee_math import taker_fee_rate
-from bot_utils.order_utils import order_id_text_or_none
+from bot_utils.order_utils import (
+    explicit_trade_symbol_matches,
+    order_id_text_or_none,
+)
 
 
 _MAX_PARALLEL_CLOSES = 3
@@ -43,6 +50,15 @@ _VERIFY_CLOSE_TIMEOUT_SEC = 5.0
 _FALLBACK_MIN_NOTIONAL = 5.0
 _EMERGENCY_CLOSE_FRAGMENT_BLOCKED: set[tuple[str, str]] = set()
 _EMERGENCY_CLOSE_FRAGMENT_BLOCKED_LOCK = Lock()
+
+
+def _record_reserved_api_error(endpoint: str, reservation) -> None:
+    if not isinstance(reservation, ApiCallReservation):
+        return
+    try:
+        record_api_error(endpoint, reservation)
+    except Exception:
+        pass
 
 
 def _emergency_fragment_key(bot_name, sym) -> tuple[str, str]:
@@ -258,16 +274,29 @@ def _resolve_fill_price(ex,
     if _order_id_is_fetchable(ex, symbol_full, order_id):
         for attempt in range(_FILL_RESOLVE_MAX_RETRIES):
             try:
-                allowed = try_consume_api_call(
-                    "futures_exit_fill_fetch_order", critical=True
+                reservation = try_consume_api_call(
+                    "futures_exit_fill_fetch_order",
+                    critical=True,
+                    return_reservation=True,
                 )
             except Exception:
                 return fallback, "fallback"
-            if not allowed:
+            if not reservation:
                 return fallback, "fallback"
             try:
                 time.sleep(_FILL_RESOLVE_DELAY_SEC * (1 + attempt))
-                fetched = ex.fetch_order(order_id, symbol_full)
+                try:
+                    fetched = ex.fetch_order(order_id, symbol_full)
+                except Exception:
+                    _record_reserved_api_error(
+                        "futures_exit_fill_fetch_order", reservation
+                    )
+                    raise
+                if not isinstance(fetched, dict) or not fetched:
+                    _record_reserved_api_error(
+                        "futures_exit_fill_fetch_order", reservation
+                    )
+                    continue
                 if _order_refresh_conflicts(
                     order,
                     fetched,
@@ -310,17 +339,34 @@ def _resolve_fill_price(ex,
                         pass
 
     try:
-        allowed = try_consume_api_call(
-            "futures_exit_fill_fetch_trades", critical=True
+        reservation = try_consume_api_call(
+            "futures_exit_fill_fetch_trades",
+            critical=True,
+            return_reservation=True,
         )
     except Exception:
         return fallback, "fallback"
-    if not allowed:
+    if not reservation:
         return fallback, "fallback"
 
     try:
-        trades = ex.fetch_my_trades(symbol_full, limit=10) or []
+        try:
+            trades = ex.fetch_my_trades(symbol_full, limit=10)
+        except Exception:
+            _record_reserved_api_error(
+                "futures_exit_fill_fetch_trades", reservation
+            )
+            raise
+        if not isinstance(trades, list):
+            _record_reserved_api_error(
+                "futures_exit_fill_fetch_trades", reservation
+            )
+            return fallback, "fallback"
         if isinstance(trades, list) and trades:
+            if any(not isinstance(trade, dict) for trade in trades):
+                _record_reserved_api_error(
+                    "futures_exit_fill_fetch_trades", reservation
+                )
             trades = [trade for trade in trades if isinstance(trade, dict)]
             same_order = []
             for trade in trades:
@@ -621,6 +667,10 @@ def _close_single_position_impl(*,
                 ticker = ticker_cache.get(
                     ex, symbol_full, timeout=5.0, critical=True
                 )
+                if not explicit_trade_symbol_matches(ticker, symbol_full):
+                    raise ValueError(
+                        "cached emergency futures ticker changed requested symbol"
+                    )
                 curr = _positive_finite_or_zero(ticker.get("last"))
                 if curr <= 0:
                     curr = _positive_finite_or_zero(ticker.get("close"))
@@ -631,22 +681,40 @@ def _close_single_position_impl(*,
                 )
         if curr <= 0:
             try:
-                allowed = try_consume_api_call(
-                    "futures_emergency_exit_fetch_ticker", critical=True
+                price_reservation = try_consume_api_call(
+                    "futures_emergency_exit_fetch_ticker",
+                    critical=True,
+                    return_reservation=True,
                 )
             except Exception as gate_error:
                 log_event(
                     f"  Price (direct) for {sym} unavailable: "
                     f"API budget gate failed ({gate_error})", "WARN"
                 )
-                allowed = False
-            if allowed:
+                price_reservation = None
+            if price_reservation:
                 try:
                     ticker = ex.fetch_ticker(symbol_full)
+                    if not explicit_trade_symbol_matches(ticker, symbol_full):
+                        raise ValueError(
+                            "emergency futures ticker changed requested symbol"
+                        )
                     curr = _positive_finite_or_zero(ticker.get("last"))
                     if curr <= 0:
                         curr = _positive_finite_or_zero(ticker.get("close"))
+                    if curr <= 0:
+                        raise ValueError(
+                            "emergency futures ticker returned no positive price"
+                        )
                 except Exception as e2:
+                    if isinstance(price_reservation, ApiCallReservation):
+                        try:
+                            record_api_error(
+                                "futures_emergency_exit_fetch_ticker",
+                                price_reservation,
+                            )
+                        except Exception:
+                            pass
                     log_event(
                         f"  Price (direct) for {sym} unavailable: {e2}", "WARN"
                     )

@@ -23,8 +23,13 @@ from core.constants import (
     NONCRYPTO_BASES,
     STOCK_TOKEN_BASES,
 )
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.circuit_breaker import extract_valid_top_of_book
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.safe_numeric import safe_positive_float
 from news.http_limits import read_bounded_json_response
 
@@ -305,14 +310,39 @@ def get_btc_change(
         limit = max(3, hours + 2) + (1 if closed_only else 0)
 
         def _fetch_bars(symbol: str):
-            if not try_consume_api_call(
+            reservation = try_consume_api_call(
                 "market_filter_fetch_btc_ohlcv",
                 critical=bool(closed_only),
-            ):
+                return_reservation=True,
+            )
+            if not reservation:
                 raise BTCPriceUnavailable(
                     "API budget exhausted before BTC OHLCV request"
                 )
-            return exchange.fetch_ohlcv(symbol, "1h", limit=limit)
+            try:
+                bars = exchange.fetch_ohlcv(symbol, "1h", limit=limit)
+                if not isinstance(bars, list):
+                    raise TypeError("BTC OHLCV returned no candle list")
+                if any(
+                    not isinstance(bar, (list, tuple)) or len(bar) < 5
+                    for bar in bars
+                ):
+                    raise TypeError("BTC OHLCV returned a malformed candle row")
+                for bar in bars:
+                    raw_close = bar[4]
+                    if isinstance(raw_close, bool):
+                        raise ValueError("BTC OHLCV returned an invalid close price")
+                    close = float(raw_close)
+                    if not math.isfinite(close) or close <= 0.0:
+                        raise ValueError("BTC OHLCV returned an invalid close price")
+                return bars
+            except Exception:
+                if isinstance(reservation, ApiCallReservation):
+                    record_api_error(
+                        "market_filter_fetch_btc_ohlcv",
+                        reservation,
+                    )
+                raise
 
         def _calc(bars):
             if not bars:
@@ -659,9 +689,29 @@ def get_market_regime(exchange) -> dict:
 
         try:
             symbol = _btc_symbol_for(exchange)
-            if not try_consume_api_call("market_regime_fetch_ticker"):
+            ticker_reservation = try_consume_api_call(
+                "market_regime_fetch_ticker",
+                return_reservation=True,
+            )
+            if not ticker_reservation:
                 raise RuntimeError("API budget exhausted before market-regime ticker")
-            ticker_24h = exchange.fetch_ticker(symbol)
+            try:
+                ticker_24h = exchange.fetch_ticker(symbol)
+                if not isinstance(ticker_24h, dict):
+                    raise TypeError(
+                        "market-regime ticker returned no ticker object"
+                    )
+                if not explicit_trade_symbol_matches(ticker_24h, symbol):
+                    raise ValueError(
+                        "market-regime ticker returned a symbol mismatch"
+                    )
+            except Exception:
+                if isinstance(ticker_reservation, ApiCallReservation):
+                    record_api_error(
+                        "market_regime_fetch_ticker",
+                        ticker_reservation,
+                    )
+                raise
             raw_percentage = ticker_24h.get("percentage")
             percentage_missing = (
                 raw_percentage is None
@@ -683,9 +733,43 @@ def get_market_regime(exchange) -> dict:
                         "market-regime ticker percentage is invalid"
                     )
 
-            if not try_consume_api_call("market_regime_fetch_ohlcv"):
+            ohlcv_reservation = try_consume_api_call(
+                "market_regime_fetch_ohlcv",
+                return_reservation=True,
+            )
+            if not ohlcv_reservation:
                 raise RuntimeError("API budget exhausted before market-regime OHLCV")
-            bars = exchange.fetch_ohlcv(symbol, "1d", limit=9)
+            try:
+                bars = exchange.fetch_ohlcv(symbol, "1d", limit=9)
+                if not isinstance(bars, list):
+                    raise TypeError(
+                        "market-regime OHLCV returned no candle list"
+                    )
+                if any(
+                    not isinstance(bar, (list, tuple)) or len(bar) < 5
+                    for bar in bars
+                ):
+                    raise TypeError(
+                        "market-regime OHLCV returned a malformed candle row"
+                    )
+                for bar in bars:
+                    raw_close = bar[4]
+                    if isinstance(raw_close, bool):
+                        raise ValueError(
+                            "market-regime OHLCV returned an invalid close price"
+                        )
+                    close = float(raw_close)
+                    if not math.isfinite(close) or close <= 0.0:
+                        raise ValueError(
+                            "market-regime OHLCV returned an invalid close price"
+                        )
+            except Exception:
+                if isinstance(ohlcv_reservation, ApiCallReservation):
+                    record_api_error(
+                        "market_regime_fetch_ohlcv",
+                        ohlcv_reservation,
+                    )
+                raise
             closed_bars = _closed_daily_bars(bars)
             if len(closed_bars) < 8:
                 raise RuntimeError(
@@ -816,18 +900,45 @@ def check_spread_quality(
     if entry and entry["expires"] > now:
         return entry["value"]
 
-    if not try_consume_api_call("market_filter_fetch_spread_order_book"):
+    try:
+        reservation = try_consume_api_call(
+            "market_filter_fetch_spread_order_book",
+            return_reservation=True,
+        )
+    except Exception:
+        reservation = None
+    if not reservation:
         return (
             (False, f"{symbol}: spread API budget unavailable")
             if fail_closed
             else (True, "OK")
         )
 
+    def _record_book_response_error() -> None:
+        if not isinstance(reservation, ApiCallReservation):
+            return
+        try:
+            record_api_error(
+                "market_filter_fetch_spread_order_book",
+                reservation,
+            )
+        except Exception:
+            pass
+
     try:
-        ob = exchange.fetch_order_book(symbol, limit=1)
+        try:
+            ob = exchange.fetch_order_book(symbol, limit=1)
+            if not isinstance(ob, dict):
+                raise TypeError("spread order book returned no data object")
+            if not explicit_trade_symbol_matches(ob, symbol):
+                raise ValueError("spread order book changed requested symbol")
+        except Exception:
+            _record_book_response_error()
+            raise
         bids = ob.get("bids") or []
         asks = ob.get("asks") or []
         if not bids or not asks:
+            _record_book_response_error()
             result = (
                 (False, f"{symbol}: order book missing bids/asks")
                 if fail_closed
@@ -836,6 +947,7 @@ def check_spread_quality(
         else:
             top = extract_valid_top_of_book(ob)
             if top is None:
+                _record_book_response_error()
                 result = (
                     (False, f"{symbol}: invalid order book quotes")
                     if fail_closed
@@ -851,6 +963,7 @@ def check_spread_quality(
                     or not math.isfinite(spread_pct)
                     or spread_pct < 0.0
                 ):
+                    _record_book_response_error()
                     result = (
                         (False, f"{symbol}: invalid order book quotes")
                         if fail_closed
@@ -999,18 +1112,47 @@ def can_buy_now(
         price = known_price
         if price is None:
             try:
-                ticker_allowed = bool(try_consume_api_call(
-                    "can_buy_now_fetch_ticker"
-                ))
+                ticker_reservation = try_consume_api_call(
+                    "can_buy_now_fetch_ticker",
+                    return_reservation=True,
+                )
+                ticker_allowed = bool(ticker_reservation)
             except Exception:
+                ticker_reservation = None
                 ticker_allowed = False
             if ticker_allowed:
                 try:
                     ticker = exchange.fetch_ticker(candidate_symbol)
+                    if not explicit_trade_symbol_matches(
+                        ticker,
+                        candidate_symbol,
+                    ):
+                        raise ValueError(
+                            "candidate ticker returned a symbol mismatch"
+                        )
                     price = safe_positive_float(ticker.get("last"), 0.0)
                     if price <= 0:
                         price = safe_positive_float(ticker.get("close"), 0.0)
+                    if (
+                        price <= 0
+                        and isinstance(ticker_reservation, ApiCallReservation)
+                    ):
+                        try:
+                            record_api_error(
+                                "can_buy_now_fetch_ticker",
+                                ticker_reservation,
+                            )
+                        except Exception:
+                            pass
                 except Exception:
+                    if isinstance(ticker_reservation, ApiCallReservation):
+                        try:
+                            record_api_error(
+                                "can_buy_now_fetch_ticker",
+                                ticker_reservation,
+                            )
+                        except Exception:
+                            pass
                     price = None
         if price is not None and not is_price_valid(price):
             return (False, f"Invalid price ({price!r}) for {candidate_symbol}")

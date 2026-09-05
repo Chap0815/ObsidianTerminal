@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from core import clock as exchange_clock
 from core.constants import SIM_CAPTURE_CONTRACT_SCHEMA
+from bot_utils.order_utils import explicit_trade_symbol_matches
 
 
 _SUPPORTED_SIM_TCA_BOTS = frozenset({"CROSS", "FUTREND", "SPOT", "TREND"})
@@ -169,6 +170,7 @@ def capture_simulated_entry_tca(
             ):
                 return False
         book = arrival_book
+        reservation = None
         if book is None:
             if _sim_tca_rate_limit_active():
                 if default_persistence:
@@ -237,12 +239,37 @@ def capture_simulated_entry_tca(
         failure_reason = "arrival_tca_invalid"
         from trading.execution_quality import build_arrival_tca, compute_fill_tca
 
-        arrival = build_arrival_tca(
-            book,
-            side=normalized_side,
-            amount=requested_amount,
-            local_time_ms=int(exchange_clock.now_ms()),
-        )
+        local_time_ms = int(exchange_clock.now_ms())
+        try:
+            if (
+                isinstance(book, dict)
+                and not explicit_trade_symbol_matches(
+                    book,
+                    normalized_symbol,
+                )
+            ):
+                raise ValueError("arrival order book symbol mismatch")
+            arrival = build_arrival_tca(
+                book,
+                side=normalized_side,
+                amount=requested_amount,
+                local_time_ms=local_time_ms,
+            )
+        except Exception:
+            try:
+                from bot_utils.api_budget import (
+                    ApiCallReservation,
+                    record_api_error,
+                )
+
+                if isinstance(reservation, ApiCallReservation):
+                    record_api_error(
+                        "candidate_microstructure_fetch_order_book",
+                        reservation,
+                    )
+            except Exception:
+                pass
+            raise
         fill = compute_fill_tca(
             arrival,
             average_fill_price=reference,

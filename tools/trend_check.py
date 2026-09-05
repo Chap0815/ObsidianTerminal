@@ -53,6 +53,10 @@ from tools.ohlcv_cache import get_series
 
 DEFAULT_DAYS = 365
 DEFAULT_COINS = ["BTC", "ETH", "BNB", "XRP", "SOL"]
+MIN_TREND_DAYS = 200
+MAX_TREND_DAYS = 3_650
+MAX_TREND_COINS = 100
+MAX_COIN_LENGTH = 20
 # Cost per position switch (one side), spot-taker-ish. Round trip = 2. Few
 # trades on daily trend, so this is minor. Override TREND_COST_PCT.
 def _trend_cost_from_env(raw=None) -> float:
@@ -71,49 +75,129 @@ def _trend_cost_from_env(raw=None) -> float:
 COST = _trend_cost_from_env()
 
 
+def _safe_exc(exc: Exception) -> str:
+    try:
+        from core.logger import redact
+
+        return f"{type(exc).__name__}: {redact(str(exc))}"
+    except Exception:
+        return f"{type(exc).__name__}: <redaction unavailable>"
+
+
 def _validated_trend_ohlc(series, *, since_ms: int, until_ms: int) -> list:
     if not isinstance(series, (list, tuple)):
         return []
     candles = {}
     for row in series:
         if not isinstance(row, (list, tuple)) or len(row) < 5:
-            continue
+            return []
         if isinstance(row[0], bool):
-            continue
+            return []
         try:
             timestamp = float(row[0])
+        except (TypeError, ValueError, OverflowError):
+            return []
+        if not math.isfinite(timestamp) or not timestamp.is_integer():
+            return []
+        if not since_ms <= timestamp <= until_ms:
+            continue
+        if any(isinstance(row[index], bool) for index in range(1, 5)):
+            return []
+        try:
             open_, high, low, close = (float(row[index]) for index in range(1, 5))
         except (TypeError, ValueError, OverflowError):
-            continue
+            return []
         if (
-            not timestamp.is_integer()
-            or not since_ms <= timestamp <= until_ms
-            or any(
+            any(
                 not math.isfinite(value) or value <= 0.0
                 for value in (open_, high, low, close)
             )
             or high < max(open_, close)
             or low > min(open_, close)
         ):
-            continue
-        candles[int(timestamp)] = [int(timestamp), open_, high, low, close]
-    return [candles[timestamp] for timestamp in sorted(candles)]
+            return []
+        timestamp_int = int(timestamp)
+        candle = [timestamp_int, open_, high, low, close]
+        if timestamp_int in candles and candles[timestamp_int] != candle:
+            return []
+        candles[timestamp_int] = candle
+    timestamps = sorted(candles)
+    if any(
+        current - previous != 86_400_000
+        for previous, current in zip(timestamps, timestamps[1:])
+    ):
+        return []
+    return [candles[timestamp] for timestamp in timestamps]
 
 
 def _fetch_ohlc(ex, symbol: str, days: int) -> list:
     """Cache-backed, rate-limit-safe DAILY OHLC  list of [ts,o,h,l,c,...]."""
+    if (
+        isinstance(days, bool)
+        or not isinstance(days, int)
+        or not 1 <= days <= MAX_TREND_DAYS
+    ):
+        return []
     tf_ms = 86_400_000
-    now_ms = ex.milliseconds()
-    asof = backtest_asof_ms()  # IS/OOS wall: cap "now" to cutoff
-    if asof is not None and asof < now_ms:
-        now_ms = asof
+    try:
+        raw_now_ms = ex.milliseconds()
+    except Exception as e:
+        print(f"   [WARN] {symbol}: {_safe_exc(e)}")
+        return []
+    if isinstance(raw_now_ms, bool):
+        print(f"   [WARN] {symbol}: invalid exchange clock")
+        return []
+    try:
+        numeric_now_ms = float(raw_now_ms)
+    except (TypeError, ValueError, OverflowError):
+        print(f"   [WARN] {symbol}: invalid exchange clock")
+        return []
+    if (
+        not math.isfinite(numeric_now_ms)
+        or numeric_now_ms <= 0.0
+        or not numeric_now_ms.is_integer()
+    ):
+        print(f"   [WARN] {symbol}: invalid exchange clock")
+        return []
+    now_ms = int(numeric_now_ms)
+    try:
+        raw_asof = backtest_asof_ms()  # IS/OOS wall: cap "now" to cutoff
+    except Exception as exc:
+        print(f"   [WARN] {symbol}: invalid backtest cutoff: {_safe_exc(exc)}")
+        return []
+    if raw_asof is not None:
+        if isinstance(raw_asof, bool):
+            print(f"   [WARN] {symbol}: invalid backtest cutoff")
+            return []
+        try:
+            numeric_asof = float(raw_asof)
+        except (TypeError, ValueError, OverflowError):
+            print(f"   [WARN] {symbol}: invalid backtest cutoff")
+            return []
+        if (
+            not math.isfinite(numeric_asof)
+            or numeric_asof <= 0.0
+            or not numeric_asof.is_integer()
+        ):
+            print(f"   [WARN] {symbol}: invalid backtest cutoff")
+            return []
+        now_ms = min(now_ms, int(numeric_asof))
     since = now_ms - (days + 5) * tf_ms
     try:
         series = get_series(ex, symbol, "1d", since)
     except Exception as e:
-        print(f"   [WARN] {symbol}: {type(e).__name__}: {e}")
+        print(f"   [WARN] {symbol}: {_safe_exc(e)}")
         return []
-    return _validated_trend_ohlc(series, since_ms=since, until_ms=now_ms)
+    current_bucket_start = (now_ms // tf_ms) * tf_ms
+    validated = _validated_trend_ohlc(
+        series,
+        since_ms=since,
+        until_ms=current_bucket_start - 1,
+    )
+    if not validated or validated[-1][0] != current_bucket_start - tf_ms:
+        print(f"   [WARN] {symbol}: stale daily history")
+        return []
+    return validated
 
 
 def _sma(a: np.ndarray, n: int) -> np.ndarray:
@@ -167,15 +251,20 @@ def _max_dd(equity: np.ndarray) -> float:
 
 def _backtest_trend(closes, highs, lows, signal_fn):
     """Long/flat trend backtest vs buy-and-hold. Returns per-coin metrics."""
-    in_mkt = signal_fn(closes, highs, lows)
     n = len(closes)
+    in_mkt = np.asarray(signal_fn(closes, highs, lows))
+    if in_mkt.dtype.kind != "b" or in_mkt.ndim != 1 or len(in_mkt) != n:
+        raise ValueError("signal must be an aligned boolean vector")
     eq = np.ones(n)
     entry_eq = None
     trades, wins, days_in = [], 0, 0
     for i in range(1, n):
-        r = closes[i] / closes[i - 1] - 1.0
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            r = closes[i] / closes[i - 1] - 1.0
         held = 1 if in_mkt[i - 1] else 0
         e = eq[i - 1] * (1 + r) if held else eq[i - 1]
+        if not np.isfinite(r) or not np.isfinite(e):
+            raise ValueError("non-finite trend equity transition")
         if held:
             days_in += 1
         new = 1 if in_mkt[i] else 0
@@ -190,7 +279,10 @@ def _backtest_trend(closes, highs, lows, signal_fn):
                 entry_eq = e
         eq[i] = e
 
-    bh = closes / closes[0]
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        bh = closes / closes[0]
+    if not np.all(np.isfinite(eq)) or not np.all(np.isfinite(bh)):
+        raise ValueError("non-finite trend equity transition")
     strat_ret = (eq[-1] - 1) * 100.0
     bh_ret = (bh[-1] - 1) * 100.0
     return {
@@ -288,10 +380,37 @@ def _print_sweep(data):
 
 def main():
     args = sys.argv[1:]
+    unknown_options = [arg for arg in args if arg.startswith("--") and arg != "--sweep"]
+    if unknown_options:
+        print(f"  Unknown option: {unknown_options[0]}")
+        return 2
     do_sweep = "--sweep" in args
     pos = [a for a in args if not a.startswith("--")]
-    days = int(pos[0]) if pos and pos[0].isdigit() else DEFAULT_DAYS
+    if pos:
+        try:
+            days = int(pos[0])
+        except (TypeError, ValueError, OverflowError):
+            print(f"  Invalid days argument: {pos[0]!r}")
+            return 2
+        if not MIN_TREND_DAYS <= days <= MAX_TREND_DAYS:
+            print(f"  Invalid days argument: {pos[0]!r}")
+            return 2
+    else:
+        days = DEFAULT_DAYS
     coins = [a.upper() for a in pos[1:]] if len(pos) > 1 else DEFAULT_COINS
+    if (
+        not 1 <= len(coins) <= MAX_TREND_COINS
+        or len(set(coins)) != len(coins)
+        or any(
+            not coin
+            or len(coin) > MAX_COIN_LENGTH
+            or not coin.isascii()
+            or not coin.isalnum()
+            for coin in coins
+        )
+    ):
+        print("  Invalid coin scope: use 1-100 unique ASCII bases")
+        return 2
 
     print("=" * 90)
     print("  TREND-FOLLOWING EDGE CHECK (long/flat, vs buy-and-hold)")
@@ -305,23 +424,30 @@ def main():
         f"\n  Connecting to {get_active_exchange_name().upper()} (SPOT, for "
         f"long history) ..."
     )
-    ex = get_exchange_connection()  # spot = years of data
-    ex.timeout = 30000
     try:
-        ex.load_markets()
+        ex = get_exchange_connection()  # spot = years of data
+        ex.timeout = 30000
+        markets = ex.load_markets()
     except Exception as e:
-        print(f"  Connection failed: {e}")
-        sys.exit(1)
+        print(f"  Connection failed: {_safe_exc(e)}")
+        return 1
+    if (
+        not isinstance(markets, dict)
+        or not markets
+        or any(not isinstance(symbol, str) for symbol in markets)
+    ):
+        print("  Invalid or empty market catalog; cannot run.")
+        return 1
     print("  Connected. Loading daily history ...\n")
 
     data = {}
     for coin in coins:
         sym = f"{coin}/USDT"  # spot symbol
-        if sym not in ex.markets:
+        if sym not in markets:
             print(f"  {coin}: no spot market  skipped")
             continue
         ohlc = _fetch_ohlc(ex, sym, days)
-        if len(ohlc) < 120:
+        if len(ohlc) < days:
             print(f"  {coin}: only {len(ohlc)} daily bars  skipped")
             continue
         arr = np.array(ohlc, dtype=float)
@@ -330,7 +456,7 @@ def main():
 
     if not data:
         print("\n  No data  aborting.\n")
-        return
+        return 1
 
     # Per config: average metrics across coins (equal weight).
     print(
@@ -379,7 +505,8 @@ def main():
     print("  classic trend-following benefit. 'WORSE' = whipsawed vs just holding.")
     print(f"  Generated: {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}")
     print("=" * 90)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

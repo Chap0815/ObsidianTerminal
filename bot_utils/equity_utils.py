@@ -33,9 +33,17 @@ from functools import wraps
 import math
 from typing import Optional
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
+from bot_utils.order_utils import explicit_trade_symbol_matches
 
 LIVE_FUTURES_BOTS = {"FUTURES", "CROSS", "FUTREND"}
+_BALANCE_METADATA_KEYS = frozenset({
+    "info", "free", "used", "total", "timestamp", "datetime",
+})
 
 
 #  Helpers 
@@ -258,28 +266,60 @@ def compute_futures_equity(ex) -> Optional[dict]:
         return None
 
     # Free USDT
-    if not try_consume_api_call("dashboard_futures_fetch_balance"):
+    balance_reservation = try_consume_api_call(
+        "dashboard_futures_fetch_balance",
+        return_reservation=True,
+    )
+    if not balance_reservation:
         return None
     try:
         bal = ex.fetch_balance()
+        if not isinstance(bal, dict):
+            raise TypeError("futures equity returned no balance object")
+        free = _read_usdt_free(bal)
+        if free is None:
+            raise ValueError(
+                "futures equity returned no valid USDT free balance"
+            )
     except Exception:
-        return None
-
-    free = _read_usdt_free(bal)
-    if free is None:
-        # We could not parse the balance  without 'free' the rest is
-        # meaningless. Better to return None than show a wrong total.
+        if isinstance(balance_reservation, ApiCallReservation):
+            try:
+                record_api_error(
+                    "dashboard_futures_fetch_balance", balance_reservation
+                )
+            except Exception:
+                pass
         return None
 
     # Position margin + unrealized
-    if not try_consume_api_call("dashboard_futures_fetch_positions"):
+    positions_reservation = try_consume_api_call(
+        "dashboard_futures_fetch_positions",
+        return_reservation=True,
+    )
+    if not positions_reservation:
         return None
     try:
         positions = ex.fetch_positions()
     except Exception:
+        if isinstance(positions_reservation, ApiCallReservation):
+            try:
+                record_api_error(
+                    "dashboard_futures_fetch_positions",
+                    positions_reservation,
+                )
+            except Exception:
+                pass
         # Free margin is not total wallet equity while positions are unknown.
         return None
     if not isinstance(positions, list):
+        if isinstance(positions_reservation, ApiCallReservation):
+            try:
+                record_api_error(
+                    "dashboard_futures_fetch_positions",
+                    positions_reservation,
+                )
+            except Exception:
+                pass
         return None
 
     # A malformed row cannot safely be treated as a closed position: doing so
@@ -291,6 +331,14 @@ def compute_futures_equity(ex) -> Optional[dict]:
         or _position_contracts_abs(position) is None
         for position in positions
     ):
+        if isinstance(positions_reservation, ApiCallReservation):
+            try:
+                record_api_error(
+                    "dashboard_futures_fetch_positions",
+                    positions_reservation,
+                )
+            except Exception:
+                pass
         return None
 
     open_positions = [
@@ -300,8 +348,18 @@ def compute_futures_equity(ex) -> Optional[dict]:
     ]
     if any(
         _position_margin_or_none(position) is None
+        or not isinstance(position.get("symbol"), str)
+        or not position.get("symbol").strip()
         for position in open_positions
     ):
+        if isinstance(positions_reservation, ApiCallReservation):
+            try:
+                record_api_error(
+                    "dashboard_futures_fetch_positions",
+                    positions_reservation,
+                )
+            except Exception:
+                pass
         return None
 
     margin_sum, upnl_sum, count, details = _sum_position_margin_and_upnl(positions)
@@ -395,14 +453,41 @@ def compute_spot_equity(ex) -> Optional[dict]:
     if ex is None:
         return None
 
-    if not try_consume_api_call("dashboard_spot_fetch_balance"):
+    balance_reservation = try_consume_api_call(
+        "dashboard_spot_fetch_balance",
+        return_reservation=True,
+    )
+    if not balance_reservation:
         return None
     try:
         bal = ex.fetch_balance()
+        if not isinstance(bal, dict):
+            raise TypeError("spot equity returned no balance object")
+        if any(
+            not isinstance(raw_symbol, str)
+            or not raw_symbol.strip()
+            or not isinstance(data, dict)
+            for raw_symbol, data in bal.items()
+            if raw_symbol not in _BALANCE_METADATA_KEYS
+        ):
+            raise TypeError("spot equity returned a malformed currency row")
+        if any(
+            data.get("total") is not None
+            and _finite_float_or_none(data.get("total")) is None
+            for raw_symbol, data in bal.items()
+            if raw_symbol not in _BALANCE_METADATA_KEYS
+        ):
+            raise ValueError(
+                "spot equity returned a non-finite currency amount"
+            )
     except Exception:
-        return None
-
-    if not isinstance(bal, dict):
+        if isinstance(balance_reservation, ApiCallReservation):
+            try:
+                record_api_error(
+                    "dashboard_spot_fetch_balance", balance_reservation
+                )
+            except Exception:
+                pass
         return None
 
     # First pass: collect stablecoin free totals separately from stablecoin
@@ -414,13 +499,11 @@ def compute_spot_equity(ex) -> Optional[dict]:
 
     # Iterate top-level keys that are currency dicts (skip ccxt metadata
     # keys like 'info', 'free', 'used', 'total' which mirror everything).
-    skip_keys = {"info", "free", "used", "total", "timestamp", "datetime"}
-
     for raw_symbol, data in bal.items():
         symbol = _safe_label(raw_symbol, "")
         if not symbol:
             continue
-        if symbol in skip_keys:
+        if symbol in _BALANCE_METADATA_KEYS:
             continue
         if not isinstance(data, dict):
             continue
@@ -451,13 +534,65 @@ def compute_spot_equity(ex) -> Optional[dict]:
         ticker_cache: dict = {}
         batch_fetch_failed = False
         try:
-            if (
-                getattr(ex, "has", {}).get("fetchTickers")
-                and try_consume_api_call("dashboard_spot_fetch_tickers")
-            ):
-                tickers = ex.fetch_tickers(list(symbol_pairs.values()))
-                if isinstance(tickers, dict):
-                    ticker_cache = tickers
+            if getattr(ex, "has", {}).get("fetchTickers"):
+                tickers_reservation = try_consume_api_call(
+                    "dashboard_spot_fetch_tickers",
+                    return_reservation=True,
+                )
+                if tickers_reservation:
+                    try:
+                        tickers = ex.fetch_tickers(
+                            list(symbol_pairs.values())
+                        )
+                    except Exception:
+                        if isinstance(
+                            tickers_reservation, ApiCallReservation
+                        ):
+                            try:
+                                record_api_error(
+                                    "dashboard_spot_fetch_tickers",
+                                    tickers_reservation,
+                                )
+                            except Exception:
+                                pass
+                        raise
+                    if isinstance(tickers, dict):
+                        invalid_ticker_identity = False
+                        for pair in symbol_pairs.values():
+                            ticker = tickers.get(pair)
+                            if ticker is None:
+                                continue
+                            if not explicit_trade_symbol_matches(
+                                ticker,
+                                pair,
+                            ):
+                                invalid_ticker_identity = True
+                                continue
+                            ticker_cache[pair] = ticker
+                        if (
+                            invalid_ticker_identity
+                            and isinstance(
+                                tickers_reservation,
+                                ApiCallReservation,
+                            )
+                        ):
+                            try:
+                                record_api_error(
+                                    "dashboard_spot_fetch_tickers",
+                                    tickers_reservation,
+                                )
+                            except Exception:
+                                pass
+                    elif isinstance(
+                        tickers_reservation, ApiCallReservation
+                    ):
+                        try:
+                            record_api_error(
+                                "dashboard_spot_fetch_tickers",
+                                tickers_reservation,
+                            )
+                        except Exception:
+                            pass
         except Exception:
             ticker_cache = {}
             batch_fetch_failed = True
@@ -480,19 +615,45 @@ def compute_spot_equity(ex) -> Optional[dict]:
                     price = _safe_float(t.get("close"))
 
             # Fall back to per-symbol fetch
-            if (
-                price <= 0
-                and not batch_fetch_failed
-                and try_consume_api_call("dashboard_spot_fetch_ticker")
-            ):
-                try:
-                    t = ex.fetch_ticker(pair)
+            if price <= 0 and not batch_fetch_failed:
+                ticker_reservation = try_consume_api_call(
+                    "dashboard_spot_fetch_ticker",
+                    return_reservation=True,
+                )
+                if ticker_reservation:
+                    try:
+                        t = ex.fetch_ticker(pair)
+                        if not isinstance(t, dict):
+                            raise TypeError(
+                                "spot equity ticker returned no ticker object"
+                            )
+                        if not explicit_trade_symbol_matches(t, pair):
+                            raise ValueError(
+                                "spot equity ticker returned a symbol mismatch"
+                            )
+                        if (
+                            _safe_float(t.get("last")) <= 0
+                            and _safe_float(t.get("close")) <= 0
+                        ):
+                            raise ValueError(
+                                "spot equity ticker returned no positive price"
+                            )
+                    except Exception:
+                        if isinstance(
+                            ticker_reservation, ApiCallReservation
+                        ):
+                            try:
+                                record_api_error(
+                                    "dashboard_spot_fetch_ticker",
+                                    ticker_reservation,
+                                )
+                            except Exception:
+                                pass
+                        t = None
                     if isinstance(t, dict):
                         price = _safe_float(t.get("last"))
                         if price <= 0:
                             price = _safe_float(t.get("close"))
-                except Exception:
-                    price = 0.0
 
             if price <= 0:
                 # An amount cannot be classified as dust without a price.  A

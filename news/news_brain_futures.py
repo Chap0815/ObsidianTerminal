@@ -22,6 +22,7 @@ from news.news_brain_core import (
     render_prompt,
     parse_confidence as _parse_conf,
     parse_last_result,
+    parse_llm_json_object,
     strip_thinking,
     is_valid_symbol,
 )
@@ -239,7 +240,7 @@ def analyze_sentiment(
             if _jtext.startswith("json"):
                 _jtext = _jtext[4:].lstrip()
         try:
-            parsed = _json.loads(_jtext)
+            parsed = parse_llm_json_object(_jtext)
             direction = str(parsed.get("direction", "WAIT")).upper()
             if direction not in ("LONG", "SHORT", "WAIT"):
                 direction = "WAIT"
@@ -353,7 +354,7 @@ def parse_direction_and_confidence(llm_response: str):
             _text = _text[4:]
         _text = _text.strip()
     try:
-        parsed = _json.loads(_text)
+        parsed = parse_llm_json_object(_text)
         direction = str(parsed.get("direction", "WAIT")).upper()
         confidence = str(parsed.get("confidence", "LOW")).upper()
         if direction not in ("LONG", "SHORT", "WAIT"):

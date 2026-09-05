@@ -25,9 +25,16 @@ from bot_utils import (
     safe_fetch_balance_usdt,
     budget_exhausted,
 )
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.network_retry import RetryForbiddenError
-from bot_utils.order_utils import strict_order_snapshot_equal
+from bot_utils.order_utils import (
+    explicit_trade_symbol_matches,
+    strict_order_snapshot_equal,
+)
 from bot_utils.silent_log import silent_log
 
 
@@ -48,19 +55,47 @@ class SpotBuyOutcomeUnknown(RetryForbiddenError):
 
 def _create_market_buy_budgeted(ex, symbol_pair: str, amount: float,
                                 *, params=None):
+    valid_symbol = (
+        isinstance(symbol_pair, str)
+        and symbol_pair.count("/") == 1
+        and all(part.strip() for part in symbol_pair.split("/", 1))
+    )
     try:
-        allowed = try_consume_api_call("spot_entry_create_market_buy")
+        parsed_amount = float(amount)
+    except (TypeError, ValueError, OverflowError):
+        parsed_amount = 0.0
+    if (
+        not valid_symbol
+        or isinstance(amount, bool)
+        or not math.isfinite(parsed_amount)
+        or parsed_amount <= 0.0
+        or (params is not None and not isinstance(params, dict))
+    ):
+        raise ValueError("invalid SPOT market buy request")
+    try:
+        reservation = try_consume_api_call(
+            "spot_entry_create_market_buy",
+            return_reservation=True,
+        )
     except Exception as exc:
         raise _SpotBuyBudgetUnavailable(
             "API budget gate unavailable before SPOT market buy"
         ) from exc
-    if not allowed:
+    if not reservation:
         raise _SpotBuyBudgetUnavailable(
             "API budget exhausted before SPOT market buy"
         )
-    if params is None:
-        return ex.create_market_buy_order(symbol_pair, amount)
-    return ex.create_market_buy_order(symbol_pair, amount, params=params)
+    try:
+        if params is None:
+            return ex.create_market_buy_order(symbol_pair, amount)
+        return ex.create_market_buy_order(symbol_pair, amount, params=params)
+    except Exception:
+        if isinstance(reservation, ApiCallReservation):
+            try:
+                record_api_error("spot_entry_create_market_buy", reservation)
+            except Exception:
+                pass
+        raise
 
 
 def _client_order_id_parameter_rejected(exc: Exception) -> bool:
@@ -119,6 +154,16 @@ class ScanMixin:
         except (TypeError, ValueError, OverflowError):
             return None
         return parsed if math.isfinite(parsed) else None
+
+    def _report_failed_reservation_release(self, symbol: str, exc: Exception) -> None:
+        """Keep failed-entry cleanup observable without masking its outcome."""
+        try:
+            self._log_error(
+                f"release failed {str(self.BOT_NAME).lower()} reservation {symbol}",
+                exc,
+            )
+        except Exception:
+            pass
 
     def _entry_pre_submit_allowed(self) -> bool:
         """Revalidate runtime safety gates immediately before a LIVE buy."""
@@ -1079,7 +1124,12 @@ class ScanMixin:
                 if released:
                     from core.database import release_portfolio_reservation
 
-                    release_portfolio_reservation(entry_id)
+                    try:
+                        release_portfolio_reservation(entry_id)
+                    except Exception as reservation_exc:
+                        self._report_failed_reservation_release(
+                            sym, reservation_exc
+                        )
             raise _buy_exc
         if entry is None:
             emit_entry_lifecycle(
@@ -1094,7 +1144,12 @@ class ScanMixin:
                 if released:
                     from core.database import release_portfolio_reservation
 
-                    release_portfolio_reservation(entry_id)
+                    try:
+                        release_portfolio_reservation(entry_id)
+                    except Exception as reservation_exc:
+                        self._report_failed_reservation_release(
+                            sym, reservation_exc
+                        )
             return None  # buy failed  already logged
 
         amount, fill_price, gross_amount, invested_usdt, entry_fee = entry
@@ -1422,27 +1477,41 @@ class ScanMixin:
         def _query(endpoint, fetch):
             nonlocal attempted, uncertain
             try:
-                allowed = try_consume_api_call(endpoint, critical=True)
+                reservation = try_consume_api_call(
+                    endpoint,
+                    critical=True,
+                    return_reservation=True,
+                )
             except Exception as exc:
                 raise RuntimeError(
                     f"order reconciliation unavailable: {endpoint}"
                 ) from exc
-            if not allowed:
+            if not reservation:
                 raise RuntimeError(
                     f"order reconciliation unavailable: {endpoint}"
                 )
             attempted = True
             try:
                 rows = fetch()
+                if not isinstance(rows, list):
+                    raise TypeError(
+                        "spot order reconciliation returned no order list"
+                    )
+                if any(not isinstance(row, dict) for row in rows):
+                    raise TypeError(
+                        "spot order reconciliation returned a malformed row"
+                    )
             except Exception as exc:
+                if isinstance(reservation, ApiCallReservation):
+                    try:
+                        record_api_error(endpoint, reservation)
+                    except Exception:
+                        pass
                 uncertain = True
                 try:
                     self._log_error(f"spot cid reconcile {endpoint}", exc)
                 except Exception:
                     pass
-                return []
-            if not isinstance(rows, list):
-                uncertain = True
                 return []
             return rows
 
@@ -1590,7 +1659,18 @@ class ScanMixin:
         except Exception as e:
             self._log_error("exec-quality import", e)
             return bool(self.simulation)
-        if not try_consume_api_call("spot_entry_fetch_ticker"):
+        try:
+            ticker_reservation = try_consume_api_call(
+                "spot_entry_fetch_ticker",
+                return_reservation=True,
+            )
+        except Exception as exc:
+            try:
+                self._log_error("spot entry ticker API budget", exc)
+            except Exception:
+                pass
+            return False
+        if not ticker_reservation:
             log_event(
                 f"{sym}: spread gate blocked - API budget exhausted",
                 "WAIT",
@@ -1598,16 +1678,47 @@ class ScanMixin:
             return False
         try:
             ticker = self.ex.fetch_ticker(pair)
+            if isinstance(ticker, dict) and not explicit_trade_symbol_matches(
+                ticker, pair
+            ):
+                raise ValueError("spot entry ticker changed requested symbol")
         except Exception as e:
+            if isinstance(ticker_reservation, ApiCallReservation):
+                try:
+                    record_api_error(
+                        "spot_entry_fetch_ticker", ticker_reservation
+                    )
+                except Exception:
+                    pass
             log_event(f"{sym}: spread gate skipped  ticker fetch failed ({e})",
                       "WARN")
             return bool(self.simulation)
+        if not isinstance(ticker, dict):
+            if isinstance(ticker_reservation, ApiCallReservation):
+                try:
+                    record_api_error(
+                        "spot_entry_fetch_ticker", ticker_reservation
+                    )
+                except Exception:
+                    pass
+            ticker = {}
         # Order-book fallback when the exchange didn't populate bid/ask. Without
         # this, check_spread_ok returns True on missing quotes  illiquid coins
         # slip ~5% on entry. Fail-CLOSED: no readable book = skip the trade.
         ob_derived = False
         if not self.simulation and not has_valid_spread_quotes(ticker):
-            if not try_consume_api_call("spot_entry_fetch_spread_book"):
+            try:
+                book_reservation = try_consume_api_call(
+                    "spot_entry_fetch_spread_book",
+                    return_reservation=True,
+                )
+            except Exception as exc:
+                try:
+                    self._log_error("spot entry spread-book API budget", exc)
+                except Exception:
+                    pass
+                return False
+            if not book_reservation:
                 log_event(
                     f"{sym}: order-book spread check blocked - "
                     "API budget exhausted",
@@ -1615,9 +1726,29 @@ class ScanMixin:
                 )
                 return False
             try:
-                ob = self.ex.fetch_order_book(pair, limit=5)
+                try:
+                    ob = self.ex.fetch_order_book(pair, limit=5)
+                    if not explicit_trade_symbol_matches(ob, pair):
+                        raise ValueError(
+                            "spot entry spread book changed requested symbol"
+                        )
+                except Exception:
+                    if isinstance(book_reservation, ApiCallReservation):
+                        record_api_error(
+                            "spot_entry_fetch_spread_book",
+                            book_reservation,
+                        )
+                    raise
                 top = extract_valid_top_of_book(ob)
                 if top is None:
+                    if isinstance(book_reservation, ApiCallReservation):
+                        try:
+                            record_api_error(
+                                "spot_entry_fetch_spread_book",
+                                book_reservation,
+                            )
+                        except Exception:
+                            pass
                     log_event(
                         f"{sym}: invalid or empty order book  blocking entry "
                         f"(illiquid, fail-closed)",
@@ -1750,7 +1881,18 @@ class ScanMixin:
         # amount/slippage math reflect what we actually pay.
         from core.constants import SPOT_MAX_CHASE_PCT
         _chase_max = SPOT_MAX_CHASE_PCT
-        if not try_consume_api_call("spot_entry_fetch_chase_book"):
+        try:
+            chase_reservation = try_consume_api_call(
+                "spot_entry_fetch_chase_book",
+                return_reservation=True,
+            )
+        except Exception as exc:
+            try:
+                self._log_error("spot entry chase-book API budget", exc)
+            except Exception:
+                pass
+            return None
+        if not chase_reservation:
             log_event(
                 f"Buy {sym}: ABORT - API budget exhausted before "
                 "order-book ask",
@@ -1758,9 +1900,27 @@ class ScanMixin:
             )
             return None
         try:
-            _ob = self.ex.fetch_order_book(f"{sym}/USDT", limit=5)
-            _asks = (_ob or {}).get("asks") or []
-            _ask = float(_asks[0][0]) if _asks else 0.0
+            try:
+                _pair = f"{sym}/USDT"
+                _ob = self.ex.fetch_order_book(_pair, limit=5)
+                if not explicit_trade_symbol_matches(_ob, _pair):
+                    raise ValueError(
+                        "spot entry chase book changed requested symbol"
+                    )
+                _asks = (_ob or {}).get("asks") or []
+                raw_ask = _asks[0][0] if _asks else None
+                if isinstance(raw_ask, bool):
+                    raise ValueError("chase order book returned an invalid ask")
+                _ask = float(raw_ask)
+                if not math.isfinite(_ask) or _ask <= 0:
+                    raise ValueError("chase order book returned an invalid ask")
+            except Exception:
+                if isinstance(chase_reservation, ApiCallReservation):
+                    record_api_error(
+                        "spot_entry_fetch_chase_book",
+                        chase_reservation,
+                    )
+                raise
             if _ask > 0 and price > 0:
                 _run_pct = (_ask / price - 1.0) * 100.0
                 if _run_pct > _chase_max:

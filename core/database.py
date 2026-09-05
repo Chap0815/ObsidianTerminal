@@ -77,7 +77,9 @@ def _local_today_str() -> str:
     tz_name = os.getenv("BOT_TIMEZONE", "UTC")
     try:
         from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+        from core.clock import now_utc
+
+        return now_utc().astimezone(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
     except Exception:
         return _utcnow().strftime("%Y-%m-%d")
 
@@ -137,10 +139,11 @@ def opened_today_local(buy_time_utc_str) -> bool:
     by the tz offset at the day boundary (e.g. UTC+8: a local-morning open carries
     yesterday's UTC date and is wrongly excluded). Convert UTClocal, then compare.
 
-    An unparseable persisted timestamp is conservatively assigned to today's
-    risk bucket. This helper is used by the daily-loss kill-switches: treating
-    unknown provenance as an old position would exclude current unrealized loss
-    and could leave the entry gate open past its configured soft limit.
+    An unparseable persisted timestamp or a buy date ahead of the current local
+    date is conservatively assigned to today's risk bucket. This helper is used
+    by the daily-loss kill-switches: treating unknown provenance or an entry
+    made before a wall-clock rollback as an old position would exclude current
+    unrealized loss and could leave the entry gate open past its soft limit.
     """
     try:
         dt = datetime.strptime(str(buy_time_utc_str), "%Y-%m-%d %H:%M:%S").replace(
@@ -154,7 +157,7 @@ def opened_today_local(buy_time_utc_str) -> bool:
             dt = dt.astimezone(ZoneInfo(tz_name))
         except Exception:
             pass
-    return dt.strftime("%Y-%m-%d") == _local_today_str()
+    return dt.strftime("%Y-%m-%d") >= _local_today_str()
 
 
 def _local_hour_dow(utc_str: str):
@@ -2559,7 +2562,12 @@ def _gc_expired_blacklist() -> None:
     """
     cutoff = (_utcnow() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     _run_maintenance_delete(
-        "DELETE FROM coin_blacklist WHERE blacklisted_until < ?",
+        """DELETE FROM coin_blacklist
+             WHERE blacklisted_until < ?
+               AND length(blacklisted_until) = 19
+               AND strftime(
+                       '%Y-%m-%d %H:%M:%S', blacklisted_until
+                   ) = blacklisted_until""",
         (cutoff,),
         context="expired-blacklist GC",
     )
@@ -5894,36 +5902,52 @@ def get_today_pnl(bot_name: str, mode_is_sim=None) -> dict:
     )
     today = _local_today_str()   # lokal-konsistent mit Bad-Hours
     try:
-        row = get_connection().execute("""
+        conn = get_connection()
+        row = conn.execute("""
         SELECT total_profit, trade_count, is_paused FROM daily_pnl
         WHERE bot_name=? AND trade_date=?""", (
             validated_bot, today)).fetchone()
     except Exception:
         return _paused_daily_pnl_db()
     if not row:
-        return {"total_profit": 0.0, "trade_count": 0, "is_paused": 0}
+        result = {"total_profit": 0.0, "trade_count": 0, "is_paused": 0}
+    else:
+        try:
+            total_profit = _required_finite_float_db(
+                row["total_profit"], "total_profit"
+            )
+        except ValueError:
+            return _paused_daily_pnl_db()
+        trade_count = row["trade_count"]
+        is_paused = row["is_paused"]
+        if (
+            isinstance(trade_count, bool)
+            or not isinstance(trade_count, int)
+            or trade_count < 0
+            or isinstance(is_paused, bool)
+            or not isinstance(is_paused, int)
+            or is_paused not in (0, 1)
+        ):
+            return _paused_daily_pnl_db()
+        result = {
+            "total_profit": total_profit,
+            "trade_count": trade_count,
+            "is_paused": is_paused,
+        }
+
+    if result["is_paused"]:
+        return result
+
     try:
-        total_profit = _required_finite_float_db(
-            row["total_profit"], "total_profit"
-        )
-    except ValueError:
+        future_pause = conn.execute("""
+        SELECT 1 FROM daily_pnl
+        WHERE bot_name=? AND trade_date>? AND is_paused=1
+        LIMIT 1""", (validated_bot, today)).fetchone()
+    except Exception:
         return _paused_daily_pnl_db()
-    trade_count = row["trade_count"]
-    is_paused = row["is_paused"]
-    if (
-        isinstance(trade_count, bool)
-        or not isinstance(trade_count, int)
-        or trade_count < 0
-        or isinstance(is_paused, bool)
-        or not isinstance(is_paused, int)
-        or is_paused not in (0, 1)
-    ):
-        return _paused_daily_pnl_db()
-    return {
-        "total_profit": total_profit,
-        "trade_count": trade_count,
-        "is_paused": is_paused,
-    }
+    if future_pause:
+        result["is_paused"] = 1
+    return result
 
 
 def pause_bot_today(bot_name: str, reason: str = "", mode_is_sim=None) -> None:
@@ -6149,7 +6173,12 @@ def _execute_thread_local_delete(
 
 def cleanup_expired_blacklist() -> int:
     return _execute_thread_local_delete(
-        "DELETE FROM coin_blacklist WHERE blacklisted_until < ?",
+        """DELETE FROM coin_blacklist
+             WHERE blacklisted_until < ?
+               AND length(blacklisted_until) = 19
+               AND strftime(
+                       '%Y-%m-%d %H:%M:%S', blacklisted_until
+                   ) = blacklisted_until""",
         (_utcnow_str(),),
         context="expired blacklist cleanup",
     )
@@ -6528,17 +6557,20 @@ def get_cached_fear_greed(max_age_sec: int = 290) -> Optional[int]:
     if not 1 <= max_age_sec <= 7 * 24 * 3600:
         raise ValueError("max_age_sec must be between 1 and 604800")
     try:
+        now = _utcnow()
         row = get_connection().execute("""
         SELECT fear_greed, timestamp FROM market_regime
-        WHERE fear_greed IS NOT NULL
-        ORDER BY timestamp DESC LIMIT 1""").fetchone()
+        WHERE fear_greed IS NOT NULL AND timestamp <= ?
+        ORDER BY timestamp DESC LIMIT 1""", (
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+        )).fetchone()
     except Exception:
         return None
     if not row:
         return None
     try:
         ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S")
-        age = (_utcnow() - ts).total_seconds()
+        age = (now - ts).total_seconds()
         value = row["fear_greed"]
         if age < 0 or age > max_age_sec:
             return None
@@ -6798,8 +6830,8 @@ def _log_api_gate_error(exc) -> None:
     cross-process cap. Exit-critical callers own their explicit bypass policy;
     this lower-level ledger must never silently permit an uncounted call."""
     global _API_GATE_ERR_LOG_AT
-    now = _time.time()
-    if now - _API_GATE_ERR_LOG_AT < 60.0:
+    now = _time.monotonic()
+    if _API_GATE_ERR_LOG_AT != 0.0 and now - _API_GATE_ERR_LOG_AT < 60.0:
         return
     _API_GATE_ERR_LOG_AT = now
     try:
@@ -10445,7 +10477,10 @@ def finalize_qualified_zero_fill_order_intent(
             raise ValueError("zero-fill quorum is not qualified")
         if row["resolved_at"] is not None:
             raise ValueError("zero-fill quorum resolution is inconsistent")
-        sources = json.loads(row["quorum_sources"])
+        sources = json.loads(
+            row["quorum_sources"],
+            object_pairs_hook=_unique_json_object_db,
+        )
         sources, _ = _order_recovery_sources_db(sources)
         if not _complete_negative_order_sources_db(sources):
             raise ValueError("persisted zero-fill quorum sources are incomplete")
@@ -10718,7 +10753,10 @@ def order_intent_recovery_health(
             evidence = "attempt_error"
             invalid_state = True
         try:
-            sources = json.loads(row.get("source_status_json") or "{}")
+            sources = json.loads(
+                row.get("source_status_json") or "{}",
+                object_pairs_hook=_unique_json_object_db,
+            )
             sources, _ = _order_recovery_sources_db(sources)
         except (TypeError, ValueError):
             sources = {}
@@ -10857,9 +10895,18 @@ def order_intent_recovery_health(
     }
 
 
+def _unique_json_object_db(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate database JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def _canonical_finite_json_object_db(raw) -> tuple[dict, str] | None:
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw, object_pairs_hook=_unique_json_object_db)
         canonical = json.dumps(
             payload,
             sort_keys=True,
@@ -11545,6 +11592,10 @@ def _simulated_execution_evidence_health_snapshot(
                    MIN(CASE WHEN tca.stage='arrival' THEN
                      CASE WHEN json_valid(tca.payload_json)=1 THEN
                        CASE WHEN json_type(tca.payload_json, '$')='object'
+                                  AND (SELECT COUNT(*)
+                                         FROM json_each(tca.payload_json))
+                                      =(SELECT COUNT(DISTINCT key)
+                                          FROM json_each(tca.payload_json))
                             THEN json(tca.payload_json) END
                      END
                    END) AS arrival_payload_canonical,
@@ -11552,6 +11603,10 @@ def _simulated_execution_evidence_health_snapshot(
                      CASE WHEN json_valid(tca.payload_json)=1 THEN
                        CASE
                          WHEN json_type(tca.payload_json, '$')='object'
+                          AND (SELECT COUNT(*)
+                                 FROM json_each(tca.payload_json))
+                              =(SELECT COUNT(DISTINCT key)
+                                  FROM json_each(tca.payload_json))
                           AND (
                               json_type(
                                   tca.payload_json, '$.bot_name'
@@ -11672,6 +11727,10 @@ def _simulated_execution_evidence_health_snapshot(
                      THEN 0
                      ELSE CASE
                        WHEN json_type(micro.payload_json, '$')='object'
+                        AND (SELECT COUNT(*)
+                               FROM json_each(micro.payload_json))
+                            =(SELECT COUNT(DISTINCT key)
+                                FROM json_each(micro.payload_json))
                         AND (
                             json_type(micro.payload_json, '$.bot_name') IS NULL
                             OR (
@@ -11707,6 +11766,10 @@ def _simulated_execution_evidence_health_snapshot(
                    MIN(micro.symbol) AS available_book_symbol,
                    MIN(CASE WHEN json_valid(micro.payload_json)=1 THEN
                      CASE WHEN json_type(micro.payload_json, '$')='object'
+                                AND (SELECT COUNT(*)
+                                       FROM json_each(micro.payload_json))
+                                    =(SELECT COUNT(DISTINCT key)
+                                        FROM json_each(micro.payload_json))
                           THEN json(micro.payload_json) END
                    END) AS available_book_payload_canonical
               FROM evidence_entries
@@ -13764,7 +13827,13 @@ def list_experiment_trials(experiment_name: str | None = None) -> list[dict]:
     rows = []
     for row in conn.execute(query, params).fetchall():
         item = dict(row)
-        item["params"] = json.loads(item.pop("params_json"))
+        decoded = _canonical_finite_json_object_db(item.pop("params_json"))
+        if decoded is None:
+            raise ValueError(
+                "persisted experiment params must be a finite "
+                "unambiguous JSON object"
+            )
+        item["params"] = decoded[0]
         rows.append(item)
     return rows
 
@@ -13862,7 +13931,10 @@ def load_open_carry_campaigns() -> list[dict]:
     payloads = []
     for row in rows:
         try:
-            payload = json.loads(row["payload_json"])
+            payload = json.loads(
+                row["payload_json"],
+                object_pairs_hook=_unique_json_object_db,
+            )
         except (TypeError, ValueError) as exc:
             _log_open_carry_skip(
                 row["campaign_id"],

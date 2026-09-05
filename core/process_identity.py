@@ -8,7 +8,17 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
+import subprocess
 from pathlib import Path
+
+
+def _valid_pid(pid: object) -> bool:
+    return (
+        isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and 0 < pid <= 0xFFFFFFFF
+    )
 
 
 def _windows_pid_alive(pid: int) -> bool:
@@ -51,11 +61,22 @@ def _windows_pid_alive(pid: int) -> bool:
 
 
 def pid_alive(pid: int) -> bool:
-    if pid <= 0:
+    if not _valid_pid(pid):
         return False
     try:
         import psutil  # type: ignore
-        return psutil.pid_exists(pid)
+
+        try:
+            if not psutil.pid_exists(pid):
+                return False
+            process = psutil.Process(pid)
+            if not process.is_running():
+                return False
+            return process.status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return False
+        except Exception:
+            return True
     except Exception:
         pass
     if os.name == "nt":
@@ -74,18 +95,18 @@ def pid_alive(pid: int) -> bool:
 
 
 def pid_cmdline(pid: int) -> str:
-    if pid <= 0:
+    if not _valid_pid(pid):
         return ""
     try:
         import psutil  # type: ignore
         proc = psutil.Process(pid)
-        return " ".join(proc.cmdline() or [])
+        return subprocess.list2cmdline(proc.cmdline() or [])
     except Exception:
         return ""
 
 
 def pid_cwd(pid: int) -> str:
-    if pid <= 0:
+    if not _valid_pid(pid):
         return ""
     try:
         import psutil  # type: ignore
@@ -121,6 +142,53 @@ def _script_token_seen(cmdline: str, script: str) -> bool:
     )
 
 
+def _unquote_cmdline_token(token: str) -> str:
+    if (
+        len(token) >= 2
+        and token[0] == token[-1]
+        and token[0] in {'"', "'"}
+    ):
+        return token[1:-1]
+    return token
+
+
+def _python_invocation_target(cmdline: str) -> tuple[str, str]:
+    try:
+        tokens = [
+            _unquote_cmdline_token(token)
+            for token in shlex.split(cmdline, posix=False)
+        ]
+    except (TypeError, ValueError):
+        return "", ""
+    if len(tokens) < 2:
+        return "", ""
+    executable_name = _norm(tokens[0]).rsplit("/", 1)[-1]
+    if not re.fullmatch(
+        r"(?:python(?:w|\d+(?:\.\d+)*)?|pypy\d*|py)(?:\.exe)?",
+        executable_name,
+    ):
+        return "", ""
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-m":
+            if index + 1 >= len(tokens):
+                return "", ""
+            return "module", _norm(tokens[index + 1])
+        if token == "-c":
+            return "", ""
+        if token == "--":
+            index += 1
+            if index >= len(tokens):
+                return "", ""
+            return "script", _norm(tokens[index])
+        if token.startswith("-"):
+            index += 2 if token in {"-W", "-X"} else 1
+            continue
+        return "script", _norm(token)
+    return "", ""
+
+
 def cmdline_bot_match_kind(bot_name: str, cmdline: str) -> str:
     """Return the exact bot invocation kind: ``module``, ``script`` or empty."""
     if not cmdline:
@@ -134,15 +202,20 @@ def cmdline_bot_match_kind(bot_name: str, cmdline: str) -> str:
     module = _norm(meta.get("module") or "")
     script = _norm(meta.get("script") or "")
     script_name = _norm(Path(script).name) if script else ""
-    if _module_token_seen(low, module):
+    invocation_kind, target = _python_invocation_target(cmdline)
+    if invocation_kind == "module" and target == module:
         return "module"
     root = _norm(str(PROJECT_ROOT))
     root_seen = bool(root and root in low)
     script_seen = bool(
-        _script_token_seen(low, script)
-        or (
-            _script_token_seen(low, script_name)
-            and (root_seen or "/bots/" in low)
+        invocation_kind == "script"
+        and (
+            target == script
+            or target.endswith("/" + script)
+            or (
+                target == script_name
+                and (root_seen or "/bots/" in low)
+            )
         )
     )
     return "script" if script_seen else ""

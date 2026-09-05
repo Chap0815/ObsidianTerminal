@@ -18,15 +18,26 @@ import math
 import time
 from datetime import datetime, timezone
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.balance_resolver import effective_balance
-from bot_utils.order_utils import explicit_trade_symbol_matches
+from bot_utils.order_utils import (
+    explicit_trade_symbol_matches,
+    order_id_text_or_none,
+    strict_order_snapshot_equal,
+)
 from core.clock import now_utc
 from core.constants import SPOT_NON_POSITION_ASSETS
 
 _SPOT_ORPHAN_MAX_USDT = 1_000_000_000.0
 _SPOT_ACCOUNTING_RETRY_BASE_SEC = 30.0
 _SPOT_ACCOUNTING_RETRY_MAX_SEC = 300.0
+_SPOT_BALANCE_METADATA_KEYS = frozenset({
+    "info", "free", "used", "total", "timestamp", "datetime",
+})
 
 
 def _finite_float_or_none(value) -> float | None:
@@ -122,6 +133,18 @@ def _spot_balance_payload_unclear(info: dict) -> bool:
     return False
 
 
+def _spot_balance_snapshot_rows_valid(bal_data) -> bool:
+    if not isinstance(bal_data, dict):
+        return False
+    return all(
+        isinstance(symbol, str)
+        and bool(symbol.strip())
+        and isinstance(balance, dict)
+        for symbol, balance in bal_data.items()
+        if symbol not in _SPOT_BALANCE_METADATA_KEYS
+    )
+
+
 def _spot_effective_balance(bal_data: dict | None, sym: str) -> float:
     amount = _spot_effective_balance_or_none(bal_data, sym)
     return amount if amount is not None else 0.0
@@ -189,8 +212,16 @@ def _trade_price(t: dict) -> float:
     return price if price > 0 else 0.0
 
 
-def _spot_ticker_price(ticker: dict | None) -> float:
+def _spot_ticker_price(
+    ticker: dict | None,
+    expected_symbol: str | None = None,
+) -> float:
     if not isinstance(ticker, dict):
+        return 0.0
+    if (
+        expected_symbol is not None
+        and not explicit_trade_symbol_matches(ticker, expected_symbol)
+    ):
         return 0.0
     for key in ("last", "close"):
         raw = ticker.get(key)
@@ -317,24 +348,71 @@ def _aggregate_spot_sell_trades(
     ):
         return 0.0, 0.0, "unavailable"
     try:
-        if not try_consume_api_call("spot_reconcile_close_fetch_my_trades"):
+        api_reservation = try_consume_api_call(
+            "spot_reconcile_close_fetch_my_trades",
+            return_reservation=True,
+        )
+        if not api_reservation:
             return 0.0, 0.0, "budget_unavailable"
     except Exception:
         return 0.0, 0.0, "budget_unavailable"
+
+    def _record_fetch_error() -> None:
+        if not isinstance(api_reservation, ApiCallReservation):
+            return
+        try:
+            record_api_error(
+                "spot_reconcile_close_fetch_my_trades",
+                api_reservation,
+            )
+        except Exception:
+            pass
+
     try:
-        trades = bot.ex.fetch_my_trades(pair, limit=50) or []
+        trades = bot.ex.fetch_my_trades(pair, limit=50)
     except Exception:
+        _record_fetch_error()
+        return 0.0, 0.0, "unavailable"
+    if not isinstance(trades, list):
+        _record_fetch_error()
         return 0.0, 0.0, "unavailable"
     eligible_trades = []
+    seen_trade_ids: dict[str, dict] = {}
+    unidentified_trades: list[dict] = []
     for trade in trades:
         if not isinstance(trade, dict):
+            _record_fetch_error()
             return 0.0, 0.0, "unavailable"
         if not explicit_trade_symbol_matches(trade, pair):
-            continue
+            _record_fetch_error()
+            return 0.0, 0.0, "unavailable"
+        raw_trade_id = trade.get("id")
+        if raw_trade_id is not None:
+            trade_id = order_id_text_or_none(raw_trade_id)
+            if trade_id is None:
+                _record_fetch_error()
+                return 0.0, 0.0, "unavailable"
+            previous_trade = seen_trade_ids.get(trade_id)
+            if previous_trade is not None:
+                if not strict_order_snapshot_equal(previous_trade, trade):
+                    _record_fetch_error()
+                    return 0.0, 0.0, "unavailable"
+                continue
+            seen_trade_ids[trade_id] = trade
+        else:
+            if any(
+                strict_order_snapshot_equal(previous_trade, trade)
+                for previous_trade in unidentified_trades
+            ):
+                _record_fetch_error()
+                return 0.0, 0.0, "unavailable"
+            unidentified_trades.append(trade)
         timestamp_ms = _trade_timestamp_ms_or_none(trade)
         if timestamp_ms is None and _trade_side(trade) == "sell":
+            _record_fetch_error()
             return 0.0, 0.0, "unavailable"
         if timestamp_ms is not None and timestamp_ms > future_ceiling_ms:
+            _record_fetch_error()
             return 0.0, 0.0, "unavailable"
         if timestamp_ms is None or timestamp_ms < boundary_ms:
             continue
@@ -351,6 +429,7 @@ def _aggregate_spot_sell_trades(
         amt = _trade_amount(t)
         price = _trade_price(t)
         if amt <= 0 or price <= 0:
+            _record_fetch_error()
             return 0.0, 0.0, "unavailable"
         take = min(amt, max(0.0, target - qty))
         if take <= 0:
@@ -668,12 +747,30 @@ def _find_spot_external_close_price(bot, sym: str, amount: float = 0.0,
     if not allow_ticker:
         return 0.0, 0.0, "unavailable"
     try:
-        if not try_consume_api_call("spot_reconcile_close_fetch_ticker"):
+        api_reservation = try_consume_api_call(
+            "spot_reconcile_close_fetch_ticker",
+            return_reservation=True,
+        )
+        if not api_reservation:
             return 0.0, 0.0, "unavailable"
-        ticker = bot.ex.fetch_ticker(pair)
-        price = _spot_ticker_price(ticker)
-        if price > 0:
-            return price, 0.0, "current_ticker"
+        try:
+            ticker = bot.ex.fetch_ticker(pair)
+            price = _spot_ticker_price(ticker, pair)
+            if price <= 0:
+                raise ValueError(
+                    "spot reconcile ticker returned no positive price"
+                )
+        except Exception:
+            if isinstance(api_reservation, ApiCallReservation):
+                try:
+                    record_api_error(
+                        "spot_reconcile_close_fetch_ticker",
+                        api_reservation,
+                    )
+                except Exception:
+                    pass
+            return 0.0, 0.0, "unavailable"
+        return price, 0.0, "current_ticker"
     except Exception:
         pass
     return 0.0, 0.0, "unavailable"
@@ -1092,11 +1189,29 @@ def _still_held_on_spot_exchange(bot, sym: str, dust_usdt: float = 1.0) -> bool:
     returns True  never book a close we couldn't confirm. Sub-dust holdings
     count as not-held (matches the $1 spot dust filter)."""
     try:
-        if not try_consume_api_call(
-            "spot_reconcile_confirm_fetch_balance", critical=True
-        ):
+        balance_reservation = try_consume_api_call(
+            "spot_reconcile_confirm_fetch_balance",
+            critical=True,
+            return_reservation=True,
+        )
+        if not balance_reservation:
             return True
-        bal = bot.ex.fetch_balance()
+        try:
+            bal = bot.ex.fetch_balance()
+            if not _spot_balance_snapshot_rows_valid(bal):
+                raise TypeError(
+                    "spot close confirmation returned malformed balance data"
+                )
+        except Exception:
+            if isinstance(balance_reservation, ApiCallReservation):
+                try:
+                    record_api_error(
+                        "spot_reconcile_confirm_fetch_balance",
+                        balance_reservation,
+                    )
+                except Exception:
+                    pass
+            return True
         total = _spot_effective_balance_or_none(bal, sym)
     except Exception:
         return True
@@ -1105,11 +1220,31 @@ def _still_held_on_spot_exchange(bot, sym: str, dust_usdt: float = 1.0) -> bool:
     if total <= 0:
         return False
     try:
-        if not try_consume_api_call(
-            "spot_reconcile_confirm_fetch_ticker", critical=True
-        ):
+        ticker_reservation = try_consume_api_call(
+            "spot_reconcile_confirm_fetch_ticker",
+            critical=True,
+            return_reservation=True,
+        )
+        if not ticker_reservation:
             return True
-        px = _spot_ticker_price(bot.ex.fetch_ticker(f"{sym}/USDT"))
+        try:
+            symbol = f"{sym}/USDT"
+            ticker = bot.ex.fetch_ticker(symbol)
+            px = _spot_ticker_price(ticker, symbol)
+            if px <= 0:
+                raise ValueError(
+                    "spot confirmation ticker returned no positive price"
+                )
+        except Exception:
+            if isinstance(ticker_reservation, ApiCallReservation):
+                try:
+                    record_api_error(
+                        "spot_reconcile_confirm_fetch_ticker",
+                        ticker_reservation,
+                    )
+                except Exception:
+                    pass
+            return True
         if px > 0 and total * px < dust_usdt:
             return False
     except Exception:
@@ -1120,11 +1255,29 @@ def _still_held_on_spot_exchange(bot, sym: str, dust_usdt: float = 1.0) -> bool:
 def _fetch_spot_total(bot, sym: str) -> float | None:
     """Return confirmed wallet total for a coin, or None on unclear fetch."""
     try:
-        if not try_consume_api_call(
-            "spot_reconcile_confirm_fetch_balance", critical=True
-        ):
+        api_reservation = try_consume_api_call(
+            "spot_reconcile_confirm_fetch_balance",
+            critical=True,
+            return_reservation=True,
+        )
+        if not api_reservation:
             return None
-        bal = bot.ex.fetch_balance()
+        try:
+            bal = bot.ex.fetch_balance()
+            if not _spot_balance_snapshot_rows_valid(bal):
+                raise TypeError(
+                    "spot partial confirmation returned malformed balance data"
+                )
+        except Exception:
+            if isinstance(api_reservation, ApiCallReservation):
+                try:
+                    record_api_error(
+                        "spot_reconcile_confirm_fetch_balance",
+                        api_reservation,
+                    )
+                except Exception:
+                    pass
+            return None
         return _spot_effective_balance_or_none(bal, sym)
     except Exception:
         return None
@@ -1368,22 +1521,37 @@ def _adopt_spot_orphans(
             if not (math.isfinite(exch_amt) and exch_amt > 1e-8):
                 continue
             try:
-                ticker_allowed = try_consume_api_call(
-                    "spot_reconcile_adopt_fetch_ticker", critical=True
+                ticker_reservation = try_consume_api_call(
+                    "spot_reconcile_adopt_fetch_ticker",
+                    critical=True,
+                    return_reservation=True,
                 )
             except Exception as exc:
                 bot._log_error("spot orphan adoption ticker budget", exc)
                 break
-            if not ticker_allowed:
+            if not ticker_reservation:
                 log_event(
                     " Spot orphan adoption deferred: API budget exhausted",
                     "WARN",
                 )
                 break
             try:
-                ticker = bot.ex.fetch_ticker(f"{base}/USDT")
-                price = _spot_ticker_price(ticker)
+                symbol = f"{base}/USDT"
+                ticker = bot.ex.fetch_ticker(symbol)
+                price = _spot_ticker_price(ticker, symbol)
+                if not (math.isfinite(price) and price > 0):
+                    raise ValueError(
+                        "spot orphan ticker returned no positive price"
+                    )
             except Exception:
+                if isinstance(ticker_reservation, ApiCallReservation):
+                    try:
+                        record_api_error(
+                            "spot_reconcile_adopt_fetch_ticker",
+                            ticker_reservation,
+                        )
+                    except Exception:
+                        pass
                 price = 0.0
             if not (math.isfinite(price) and price > 0):
                 unadoptable.append(base)
@@ -1626,16 +1794,31 @@ def startup_reconciliation(bot) -> None:
 
     bal_data = None
     try:
-        if not try_consume_api_call(
-            "spot_reconcile_startup_fetch_balance", critical=True
-        ):
+        api_reservation = try_consume_api_call(
+            "spot_reconcile_startup_fetch_balance",
+            critical=True,
+            return_reservation=True,
+        )
+        if not api_reservation:
             return
-        bal_data = bot.ex.fetch_balance()
+        try:
+            bal_data = bot.ex.fetch_balance()
+            if not _spot_balance_snapshot_rows_valid(bal_data):
+                raise TypeError(
+                    "spot startup balance returned malformed balance data"
+                )
+        except Exception:
+            if isinstance(api_reservation, ApiCallReservation):
+                try:
+                    record_api_error(
+                        "spot_reconcile_startup_fetch_balance",
+                        api_reservation,
+                    )
+                except Exception:
+                    pass
+            raise
     except Exception as e:
         bot._log_error("startup reconciliation fetch_balance", e)
-        return
-
-    if not isinstance(bal_data, dict):
         return
 
     if trades:
@@ -1894,13 +2077,29 @@ class ReconcileMixin:
                 entry_recovery_generation = int(
                     getattr(self, "_spot_entry_recovery_generation", 0)
                 )
-                if not try_consume_api_call(
-                    "spot_reconcile_periodic_fetch_balance", critical=True
-                ):
+                api_reservation = try_consume_api_call(
+                    "spot_reconcile_periodic_fetch_balance",
+                    critical=True,
+                    return_reservation=True,
+                )
+                if not api_reservation:
                     continue
-                bal_data = self.ex.fetch_balance()
-                if not isinstance(bal_data, dict):
-                    continue
+                try:
+                    bal_data = self.ex.fetch_balance()
+                    if not _spot_balance_snapshot_rows_valid(bal_data):
+                        raise TypeError(
+                            "spot periodic balance returned malformed balance data"
+                        )
+                except Exception:
+                    if isinstance(api_reservation, ApiCallReservation):
+                        try:
+                            record_api_error(
+                                "spot_reconcile_periodic_fetch_balance",
+                                api_reservation,
+                            )
+                        except Exception:
+                            pass
+                    raise
                 phantoms = []
                 adjusted = []
                 trades = self.state.get_all()

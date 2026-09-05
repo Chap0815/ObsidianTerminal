@@ -207,6 +207,50 @@ def _fallback_remaining(now: float) -> int:
     return max(0, per_process_cap - _fallback_count(now))
 
 
+def _try_fallback_admission(
+    now: float,
+    *,
+    expected_consumers: int,
+    burst_scope: str,
+    burst_max: Optional[int],
+    burst_window: Optional[int],
+    critical: bool,
+) -> bool:
+    """Atomically check and record one process-local fallback slot."""
+    with _lock:
+        minute_cutoff = now - 60.0
+        _call_log_fallback[:] = [
+            timestamp
+            for timestamp in _call_log_fallback
+            if timestamp >= minute_cutoff
+        ]
+        per_process_cap = max(
+            1, MAX_API_CALLS_PER_MINUTE // expected_consumers
+        )
+        exhausted = len(_call_log_fallback) >= per_process_cap
+
+        recent_burst = None
+        if burst_max is not None and burst_window is not None:
+            burst_cutoff = now - float(burst_window)
+            recent_burst = [
+                timestamp
+                for timestamp in _burst_call_log_fallback.get(
+                    burst_scope, ()
+                )
+                if timestamp >= burst_cutoff
+            ]
+            burst_cap = max(1, burst_max // expected_consumers)
+            exhausted = exhausted or len(recent_burst) >= burst_cap
+
+        if exhausted and not critical:
+            return False
+        _call_log_fallback.append(now)
+        if recent_burst is not None:
+            recent_burst.append(now)
+            _burst_call_log_fallback[burst_scope] = recent_burst
+        return True
+
+
 def _db_available() -> bool:
     return time.monotonic() >= _db_failed_until
 
@@ -411,19 +455,6 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
     # plus the launcher, which also performs budgeted exchange calls.
     expected_bot_count = _read_expected_bot_count()
 
-    def _burst_fallback_exhausted() -> bool:
-        if burst_max is None or burst_window is None:
-            return False
-        per_process_cap = max(1, burst_max // expected_bot_count)
-        return (
-            _fallback_burst_count(
-                ledger_endpoint,
-                now_mono,
-                burst_window,
-            )
-            >= per_process_cap
-        )
-
     def _record_fallback_admission() -> None:
         _fallback_record(now_mono)
         if burst_max is not None and burst_window is not None:
@@ -436,19 +467,15 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
     if not _db_available():
         # Process-local fallback. Conservative: each process enforces
         # its OWN budget so N bots at MAX/N each  MAX global.
-        used = _fallback_count(now_mono)
-        per_proc_cap = max(1, MAX_API_CALLS_PER_MINUTE // expected_bot_count)
-        if used >= per_proc_cap or _burst_fallback_exhausted():
-            # exit-critical calls (price for an OPEN position, close/verify)
-            # must NOT be starved by the budget  a missed stop-loss is far
-            # worse than a marginal over-budget. Record it (keep the count
-            # honest) but allow it through.
-            if critical:
-                _record_fallback_admission()
-                return _result(True)
-            return _result(False)
-        _record_fallback_admission()
-        return _result(True)
+        allowed = _try_fallback_admission(
+            now_mono,
+            expected_consumers=expected_bot_count,
+            burst_scope=ledger_endpoint,
+            burst_max=burst_max,
+            burst_window=burst_window,
+            critical=critical,
+        )
+        return _result(allowed)
 
     try:
         from core.database import check_and_consume_global_api
@@ -487,12 +514,12 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
         _mark_db_failed()
         # On unexpected exception, prefer fail-open with a per-proc
         # cap so trading continues during transient DB issues.
-        used = _fallback_count(now_mono)
-        per_proc_cap = max(1, MAX_API_CALLS_PER_MINUTE // expected_bot_count)
-        if used >= per_proc_cap or _burst_fallback_exhausted():
-            if critical:   # never starve exit-critical calls
-                _record_fallback_admission()
-                return _result(True)
-            return _result(False)
-        _record_fallback_admission()
-        return _result(True)
+        allowed = _try_fallback_admission(
+            now_mono,
+            expected_consumers=expected_bot_count,
+            burst_scope=ledger_endpoint,
+            burst_max=burst_max,
+            burst_window=burst_window,
+            critical=critical,
+        )
+        return _result(allowed)

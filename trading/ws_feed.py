@@ -17,7 +17,12 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from typing import Dict, List, Optional, Set
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.safe_numeric import safe_positive_float
 from bot_utils.silent_log import silent_log
 from core.constants import TICKER_STALE_MAX_SEC
@@ -525,6 +530,8 @@ class WebSocketFeed:
 
     def _update_cache(self, symbol: str, ticker: dict) -> bool:
         if not isinstance(ticker, dict):
+            return False
+        if not explicit_trade_symbol_matches(ticker, symbol):
             return False
         price = safe_positive_float(ticker.get("last"), 0.0)
         if price <= 0:
@@ -1264,14 +1271,37 @@ class WebSocketFeed:
 
         def _fetch(sym: str) -> dict:
             try:
-                allowed = try_consume_api_call(
-                    "ws_feed_rest_fetch_ticker"
+                reservation = try_consume_api_call(
+                    "ws_feed_rest_fetch_ticker",
+                    return_reservation=True,
                 )
             except Exception:
-                allowed = False
-            if not allowed:
+                reservation = False
+            if not reservation:
                 return {}
-            return _my_clone().fetch_ticker(sym)
+            try:
+                ticker = _my_clone().fetch_ticker(sym)
+                if not isinstance(ticker, dict):
+                    raise TypeError("WS REST ticker returned no ticker object")
+                if not explicit_trade_symbol_matches(ticker, sym):
+                    raise ValueError(
+                        "WS REST ticker returned a symbol mismatch"
+                    )
+                price = safe_positive_float(ticker.get("last"), 0.0)
+                if price <= 0:
+                    price = safe_positive_float(ticker.get("close"), 0.0)
+                if price <= 0:
+                    raise ValueError("WS REST ticker returned no positive price")
+                return ticker
+            except Exception:
+                if isinstance(reservation, ApiCallReservation):
+                    try:
+                        record_api_error(
+                            "ws_feed_rest_fetch_ticker", reservation
+                        )
+                    except Exception:
+                        pass
+                raise
 
         try:
             pool = ThreadPoolExecutor(

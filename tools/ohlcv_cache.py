@@ -283,6 +283,8 @@ def _save(
             timestamp = int(float(bar[0]))
             if timestamp % tf_ms != 0:
                 return
+            if timestamp in incoming and incoming[timestamp] != bar:
+                return
             incoming[timestamp] = bar
         p = _cache_path_without_links(_path(symbol, timeframe, cache_namespace))
         os.makedirs(p.parent, exist_ok=True)
@@ -318,6 +320,11 @@ def _save(
                 int(float(bar[0])): bar
                 for bar in (_load(symbol, timeframe, cache_namespace) or [])
             }
+            if any(
+                timestamp in merged and merged[timestamp] != bar
+                for timestamp, bar in incoming.items()
+            ):
+                return
             merged.update(incoming)
             rows = [merged[timestamp] for timestamp in sorted(merged)]
             timestamps = [int(float(row[0])) for row in rows]
@@ -397,6 +404,7 @@ def _paginate(exchange, symbol, timeframe, since_ms, until_ms) -> list:
     tf_ms = _TF_MS[timeframe]
     rl_sleep = max(0.05, getattr(exchange, "rateLimit", 100) / 1000.0)
     out, since, prev_last = {}, since_ms, None
+    pagination_complete = False
     span = max(1, int((until_ms - since_ms) // tf_ms))
     max_pages = math.ceil(span / _OHLCV_PAGE_LIMIT) + 8
     for _ in range(max_pages):
@@ -415,7 +423,7 @@ def _paginate(exchange, symbol, timeframe, since_ms, until_ms) -> list:
             limit=_OHLCV_PAGE_LIMIT,
         )
         if not batch:
-            break
+            return []
         timestamps = [int(float(row[0])) for row in batch]
         if any(timestamp % tf_ms != 0 for timestamp in timestamps):
             return []
@@ -430,12 +438,17 @@ def _paginate(exchange, symbol, timeframe, since_ms, until_ms) -> list:
             out[c[0]] = c
         last = batch[-1][0]
         if prev_last is not None and last <= prev_last:
-            break
+            return []
         prev_last = last
         since = last + tf_ms
-        if since >= until_ms or len(batch) < 2:
+        if since >= until_ms:
+            pagination_complete = True
             break
+        if len(batch) < 2:
+            return []
         _time.sleep(rl_sleep)
+    if not pagination_complete:
+        return []
     return [out[k] for k in sorted(out)]
 
 
@@ -482,6 +495,8 @@ def get_series(exchange, symbol: str, timeframe: str, since_ms: int) -> list:
         c_first, c_last = cached[0][0], cached[-1][0]
         if since_ms < c_first - tf_ms:                  # need older history
             got = _paginate(exchange, symbol, timeframe, since_ms, c_first)
+            if not got:
+                return []
             for b in got:
                 merged[b[0]] = b
             changed = changed or bool(got)
@@ -489,6 +504,8 @@ def get_series(exchange, symbol: str, timeframe: str, since_ms: int) -> list:
             got = _paginate(
                 exchange, symbol, timeframe, c_last + tf_ms, closed_until_ms
             )
+            if not got:
+                return []
             for b in got:
                 merged[b[0]] = b
             changed = changed or bool(got)

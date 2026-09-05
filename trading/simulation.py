@@ -35,6 +35,7 @@ from core.constants import (
     DEFAULT_MAINT_MARGIN, BASE_CAPITAL_USDT,
 )
 from bot_utils.fee_math import taker_fee_rate
+from bot_utils.order_utils import explicit_trade_symbol_matches
 
 
 # Seedable Random instance for reproducible backtests. Set env var
@@ -481,6 +482,8 @@ class SimulatedExchange:
             ticker = self._ex.fetch_ticker(symbol)
             if not isinstance(ticker, dict):
                 raise ValueError("ticker is not a mapping")
+            if not explicit_trade_symbol_matches(ticker, symbol):
+                raise ValueError("simulation ticker changed requested symbol")
 
             def _optional_number(name: str) -> float | None:
                 raw = ticker.get(name)

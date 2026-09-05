@@ -19,6 +19,7 @@ import statistics
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from numbers import Real
 from pathlib import Path
 
 _TOOL_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -33,6 +34,7 @@ import pandas as pd
 
 from tools.backtester import connect_exchange, get_top_volume_coins, fetch_history
 from tools.simulation_workspace import load_history_dataset
+from tools.trend_check import _safe_exc
 from trading.xsec_signal import (
     XSecParams,
     advance_crash_history,
@@ -42,6 +44,8 @@ from trading.xsec_signal import (
 DEFAULT_DAYS = 180
 MAX_DAYS = 3650
 MAX_XSEC_REPORT_BYTES = 64 * 1024 * 1024
+MIN_ONLINE_ROWS = 4 * (24 + 24 + 1)
+MIN_ONLINE_COINS = 2 * 8 + 2
 
 
 def _is_linklike(path: Path) -> bool:
@@ -258,7 +262,126 @@ def _parse_xsec_days(args=None) -> int:
     return days if 1 <= days <= MAX_DAYS else DEFAULT_DAYS
 
 
-DAYS = _parse_xsec_days()
+def _parse_online_days(args: list[str]) -> int | None:
+    if len(args) > 1:
+        return None
+    if not args:
+        return DEFAULT_DAYS
+    try:
+        days = int(args[0])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return days if 1 <= days <= MAX_DAYS else None
+
+
+def _valid_online_universe(coins: object) -> bool:
+    return (
+        isinstance(coins, list)
+        and 1 <= len(coins) <= 120
+        and all(
+            isinstance(symbol, str)
+            and symbol.isascii()
+            and symbol == symbol.upper()
+            and symbol.count("/") == 1
+            and symbol.endswith("/USDT")
+            and 1 <= len(symbol.split("/", 1)[0]) <= 20
+            and symbol.split("/", 1)[0].isalnum()
+            for symbol in coins
+        )
+        and len(set(coins)) == len(coins)
+    )
+
+
+def _valid_online_hourly_grid(index: object) -> bool:
+    return (
+        isinstance(index, pd.DatetimeIndex)
+        and index.tz is not None
+        and str(index.tz).upper() == "UTC"
+        and not index.hasnans
+        and index.is_unique
+        and index.is_monotonic_increasing
+        and len(index) >= 2
+        and bool(
+            ((index[1:] - index[:-1]) == pd.Timedelta(hours=1)).all()
+        )
+    )
+
+
+def _valid_online_freshness(index: pd.DatetimeIndex) -> bool:
+    now = pd.Timestamp.now(tz="UTC")
+    latest = index[-1]
+    return (
+        now - pd.Timedelta(hours=3)
+        <= latest
+        <= now + pd.Timedelta(minutes=5)
+    )
+
+
+def _valid_online_price_data(prices: pd.DataFrame) -> bool:
+    if any(
+        not pd.api.types.is_numeric_dtype(dtype)
+        or pd.api.types.is_bool_dtype(dtype)
+        for dtype in prices.dtypes
+    ):
+        return False
+    return all(
+        math.isfinite(float(value)) and float(value) > 0.0
+        for value in prices.to_numpy().flat
+    )
+
+
+def _valid_online_panel_symbols(prices: pd.DataFrame, coins: list[str]) -> bool:
+    columns = list(prices.columns)
+    return (
+        prices.columns.is_unique
+        and all(isinstance(column, str) for column in columns)
+        and set(columns).issubset(coins)
+    )
+
+
+def _valid_online_returns(returns: object) -> bool:
+    return (
+        isinstance(returns, list)
+        and bool(returns)
+        and all(
+            isinstance(value, Real)
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and float(value) > -1.0
+            for value in returns
+        )
+    )
+
+
+def _validated_online_stats(returns: list) -> tuple[float, float, float, int] | None:
+    try:
+        result = equity_stats(returns)
+    except Exception as exc:
+        print(f"Simulation failed: {_safe_exc(exc)}")
+        return None
+    if not isinstance(result, tuple) or len(result) != 4:
+        print("Invalid simulation statistics; cannot produce a reliable report")
+        return None
+    total, drawdown, sharpe, periods = result
+    numeric = (total, drawdown, sharpe)
+    if (
+        any(
+            not isinstance(value, Real)
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            for value in numeric
+        )
+        or float(total) < -100.0
+        or not 0.0 <= float(drawdown) <= 100.0
+        or isinstance(periods, bool)
+        or not isinstance(periods, int)
+        or periods != len(returns)
+    ):
+        print("Invalid simulation statistics; cannot produce a reliable report")
+        return None
+    return float(total), float(drawdown), float(sharpe), periods
+
+
 FEE_ONE_WAY = 0.0006  # futures taker 0.01% + slippage 0.05% per side
 
 
@@ -306,11 +429,30 @@ def _panel_from_history(history: dict) -> pd.DataFrame:
 
 
 def _target_weights(book, k: int) -> dict[str, float]:
-    if book.exposure_mult <= 0.0:
+    raw_exposure = book.exposure_mult
+    if isinstance(raw_exposure, bool):
+        raise ValueError("replay exposure must be finite and within [0, 1]")
+    try:
+        exposure = float(raw_exposure)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "replay exposure must be finite and within [0, 1]"
+        ) from exc
+    if not math.isfinite(exposure) or not 0.0 <= exposure <= 1.0:
+        raise ValueError("replay exposure must be finite and within [0, 1]")
+    if exposure <= 0.0:
         return {}
     if len(book.longs) != len(book.shorts) or len(book.longs) != k:
         raise ValueError("replay target book is not fully dollar-neutral")
-    leg_weight = 0.5 / k
+    if (
+        any(not isinstance(symbol, str) or not symbol for symbol in book.longs)
+        or any(not isinstance(symbol, str) or not symbol for symbol in book.shorts)
+        or len(set(book.longs)) != k
+        or len(set(book.shorts)) != k
+        or not set(book.longs).isdisjoint(book.shorts)
+    ):
+        raise ValueError("replay target symbols must be unique and disjoint")
+    leg_weight = 0.5 * exposure / k
     weights = {symbol: leg_weight for symbol in book.longs}
     weights.update({symbol: -leg_weight for symbol in book.shorts})
     return weights
@@ -365,6 +507,18 @@ def run_stateful_replay(
         raise ValueError("prices must be a non-empty DataFrame")
     if not prices.index.is_monotonic_increasing or not prices.index.is_unique:
         raise ValueError("prices must have a unique ascending timeline")
+    if (
+        not isinstance(prices.index, pd.DatetimeIndex)
+        or prices.index.tz is None
+        or str(prices.index.tz).upper() != "UTC"
+        or prices.index.isna().any()
+    ):
+        raise ValueError("prices must have a timezone-aware UTC timeline")
+    if any(
+        current - previous != pd.Timedelta(hours=1)
+        for previous, current in zip(prices.index, prices.index[1:])
+    ):
+        raise ValueError("prices must have a contiguous hourly timeline")
 
     recent = advance_crash_history(
         list(initial_recent_returns or []),
@@ -407,6 +561,7 @@ def run_stateful_replay(
         net = gross - fees - funding
         if not all(math.isfinite(value) for value in (gross, fees, funding, net)):
             raise ValueError("non-finite CROSS replay accounting")
+        net = _period_return(net)
         periods.append(
             {
                 "entry_utc": prices.index[index].isoformat(),
@@ -438,7 +593,9 @@ def run_stateful_replay(
         terminal_fee = terminal_turnover * fee_one_way
         periods[-1]["turnover"] += terminal_turnover
         periods[-1]["fees"] += terminal_fee
-        periods[-1]["net"] -= terminal_fee
+        periods[-1]["net"] = _period_return(
+            periods[-1]["net"] - terminal_fee
+        )
 
     return {
         "periods": periods,
@@ -446,6 +603,18 @@ def run_stateful_replay(
         "terminal_turnover": terminal_turnover,
         "recent_returns": recent,
     }
+
+
+def _period_return(value) -> float:
+    if isinstance(value, bool):
+        raise ValueError("period return must be finite and at least -100%")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("period return must be finite and at least -100%") from exc
+    if not math.isfinite(numeric) or numeric < -1.0:
+        raise ValueError("period return must be finite and at least -100%")
+    return numeric
 
 
 def _replay_metrics(periods: list[dict]) -> dict:
@@ -459,21 +628,41 @@ def _replay_metrics(periods: list[dict]) -> dict:
             "max_drawdown": 0.0,
             "positive_periods": 0,
         }
+    normalized = []
+    for period in periods:
+        if not isinstance(period, dict):
+            raise ValueError("period return evidence is invalid")
+        values = {}
+        for field in ("gross", "fees", "funding", "net"):
+            value = period.get(field)
+            if isinstance(value, bool):
+                raise ValueError("period return evidence is invalid")
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("period return evidence is invalid") from exc
+            if not math.isfinite(numeric):
+                raise ValueError("period return must be finite and at least -100%")
+            values[field] = numeric
+        values["net"] = _period_return(values["net"])
+        normalized.append(values)
     equity = peak = 1.0
     max_drawdown = 0.0
-    for period in periods:
+    for period in normalized:
         equity *= 1.0 + period["net"]
+        if not math.isfinite(equity):
+            raise ValueError("period return compounding is non-finite")
         peak = max(peak, equity)
         max_drawdown = max(max_drawdown, (peak - equity) / peak)
     return {
         "periods": len(periods),
-        "gross": math.fsum(period["gross"] for period in periods),
-        "fees": math.fsum(period["fees"] for period in periods),
-        "funding": math.fsum(period["funding"] for period in periods),
-        "net": math.fsum(period["net"] for period in periods),
+        "gross": math.fsum(period["gross"] for period in normalized),
+        "fees": math.fsum(period["fees"] for period in normalized),
+        "funding": math.fsum(period["funding"] for period in normalized),
+        "net": math.fsum(period["net"] for period in normalized),
         "compounded_return": equity - 1.0,
         "max_drawdown": max_drawdown,
-        "positive_periods": sum(period["net"] > 0.0 for period in periods),
+        "positive_periods": sum(period["net"] > 0.0 for period in normalized),
     }
 
 
@@ -548,24 +737,41 @@ def _validated_close_series(df):
     if not isinstance(df, pd.DataFrame) or not {"dt", "close"}.issubset(df.columns):
         return None
     frame = df.loc[:, ["dt", "close"]].copy()
+    if frame.empty or frame["close"].map(lambda value: isinstance(value, bool)).any():
+        return None
     frame["dt"] = pd.to_datetime(frame["dt"], errors="coerce", utc=True)
     frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
-    frame = frame[
+    valid = (
         frame["dt"].notna()
+        & frame["dt"].eq(frame["dt"].dt.floor("h"))
         & frame["close"].map(
             lambda value: math.isfinite(float(value)) and float(value) > 0.0
         )
-    ]
-    if frame.empty:
+    )
+    if not valid.all():
         return None
-    frame = frame.drop_duplicates(subset="dt", keep="last").sort_values("dt")
+    duplicate_rows = frame[frame.duplicated(subset="dt", keep=False)]
+    if any(
+        group["close"].nunique(dropna=False) > 1
+        for _, group in duplicate_rows.groupby("dt")
+    ):
+        return None
+    frame = frame.drop_duplicates(subset="dt", keep="first").sort_values("dt")
     return frame.set_index("dt")["close"].astype(float)
 
 
-def load_panel(ex, coins):
+def load_panel(ex, coins, days=DEFAULT_DAYS):
+    if not _valid_online_universe(coins):
+        raise ValueError("history universe is invalid")
+    if (
+        isinstance(days, bool)
+        or not isinstance(days, int)
+        or not 1 <= days <= MAX_DAYS
+    ):
+        raise ValueError(f"history days must be an integer in [1, {MAX_DAYS}]")
     hist = {}
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futs = {pool.submit(fetch_history, ex, c, DAYS): c for c in coins}
+        futs = {pool.submit(fetch_history, ex, c, days): c for c in coins}
         for f in as_completed(futs):
             try:
                 df = f.result()
@@ -574,7 +780,9 @@ def load_panel(ex, coins):
                     hist[futs[f]] = series
             except Exception:
                 pass
-    panel = pd.DataFrame(hist).sort_index()
+    if not hist:
+        return pd.DataFrame()
+    panel = pd.DataFrame({symbol: hist[symbol] for symbol in sorted(hist)}).sort_index()
     panel = panel.resample("1h").last().ffill(limit=3)
     return panel
 
@@ -582,6 +790,32 @@ def load_panel(ex, coins):
 def run(prices, L, reb, K, fee=FEE_ONE_WAY, fund_day=0.0):
     """L=lookback (h), reb=rebalance (h), K=Korbgre je Seite,
     fee=one-way Kosten, fund_day=Funding-Drag pro Tag auf dem Buch."""
+    if not isinstance(prices, pd.DataFrame) or prices.empty:
+        raise ValueError("prices must be a non-empty DataFrame")
+    columns = list(prices.columns)
+    if (
+        not prices.columns.is_unique
+        or any(not isinstance(column, str) or not column for column in columns)
+    ):
+        raise ValueError("price symbols must be unique non-empty strings")
+    if not _valid_online_price_data(prices):
+        raise ValueError("price data must be numeric, finite, and positive")
+    controls = (L, reb, K)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in controls):
+        raise ValueError("lookback, rebalance, and K must be integers")
+    if L <= 0 or reb <= 0 or K <= 0:
+        raise ValueError("lookback, rebalance, and K must be positive")
+    for name, value in (("fee", fee), ("fund_day", fund_day)):
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be finite and non-negative")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} must be finite and non-negative") from exc
+        if not math.isfinite(numeric) or numeric < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+    fee = float(fee)
+    fund_day = float(fund_day)
     n = len(prices)
     prev_long, prev_short = set(), set()
     ls_rets, lo_rets = [], []  # long-short (neutral) und long-only
@@ -595,9 +829,12 @@ def run(prices, L, reb, K, fee=FEE_ONE_WAY, fund_day=0.0):
         if len(past) < 2 * K + 2:
             i += reb
             continue
-        ranked = past.sort_values(ascending=False)
-        longs = list(ranked.index[:K])
-        shorts = list(ranked.index[-K:])
+        ranked = sorted(
+            past.index,
+            key=lambda symbol: (-float(past[symbol]), symbol),
+        )
+        longs = ranked[:K]
+        shorts = ranked[-K:]
         long_ret = float(fwd_row[longs].mean())
         short_ret = float(fwd_row[shorts].mean())
 
@@ -609,6 +846,19 @@ def run(prices, L, reb, K, fee=FEE_ONE_WAY, fund_day=0.0):
         ls_rets.append(0.5 * (long_ret - short_ret) - cost - funding)
         lo_rets.append(long_ret - (ch_l / K) * fee)
         i += reb
+    if ls_rets:
+        terminal_ls_cost = (
+            0.5 * (len(prev_long) / K) * fee
+            + 0.5 * (len(prev_short) / K) * fee
+        )
+        terminal_lo_cost = (len(prev_long) / K) * fee
+        ls_rets[-1] -= terminal_ls_cost
+        lo_rets[-1] -= terminal_lo_cost
+    if any(
+        not math.isfinite(value) or value <= -1.0
+        for value in (*ls_rets, *lo_rets)
+    ):
+        raise ValueError("simulation return must be finite and greater than -100%")
     return ls_rets, lo_rets
 
 
@@ -628,9 +878,12 @@ def best_config(seg, fee, fund_day):
 def stats(rets):
     if not rets:
         return None
+    rets = [_period_return(value) for value in rets]
     eq = 1.0
     for r in rets:
         eq *= 1 + r
+        if not math.isfinite(eq):
+            raise ValueError("period return compounding is non-finite")
     total = (eq - 1) * 100
     wr = 100 * sum(1 for r in rets if r > 0) / len(rets)
     mean = statistics.mean(rets)
@@ -670,10 +923,13 @@ def equity_stats(rets):
     """(total%, maxDD%, Sharpe-t, n) aus einer per-Rebalance-Return-Liste."""
     if not rets:
         return (0.0, 0.0, 0.0, 0)
+    rets = [_period_return(value) for value in rets]
     eq = peak = 1.0
     mdd = 0.0
     for r in rets:
         eq *= 1 + r
+        if not math.isfinite(eq):
+            raise ValueError("period return compounding is non-finite")
         peak = max(peak, eq)
         mdd = max(mdd, (peak - eq) / peak)
     sd = statistics.stdev(rets) if len(rets) > 1 else 0
@@ -685,6 +941,20 @@ def apply_filter(rets, kind, W=4, target=0.04):
     """Crash-Filter als Exposure-Overlay  nutzt NUR vergangene Returns (kein
     Look-Ahead). voltarget: Exposure ~ target/recent_vol (cap 1.0). ownmom:
     flach wenn letzte W Rebalances im Schnitt negativ. combo: beide."""
+    if kind not in ("none", "voltarget", "ownmom", "combo"):
+        raise ValueError("filter kind is invalid")
+    if isinstance(W, bool) or not isinstance(W, int) or W < 2:
+        raise ValueError("filter window must be an integer of at least two")
+    if isinstance(target, bool):
+        raise ValueError("filter target must be finite and non-negative")
+    try:
+        target = float(target)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("filter target must be finite and non-negative") from exc
+    if not math.isfinite(target) or target < 0.0:
+        raise ValueError("filter target must be finite and non-negative")
+    if not _valid_online_returns(rets):
+        raise ValueError("filter returns must be a non-empty finite return list")
     if kind == "none":
         return list(rets)
     out = []
@@ -704,34 +974,84 @@ def apply_filter(rets, kind, W=4, target=0.04):
     return out
 
 
-def main():
-    if "--dataset" in sys.argv[1:]:
-        report = _offline_replay(sys.argv[1:])
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else list(argv)
+    if "--dataset" in args:
+        report = _offline_replay(args)
         print(json.dumps(report, allow_nan=False, indent=2, sort_keys=True))
-        return
-    ex = connect_exchange()
-    coins = get_top_volume_coins(ex, n=120)  # breiteres Universum
-    print(f"Coins angefragt: {len(coins)} | loading {DAYS}d ...")
-    prices = load_panel(ex, coins)
-
-    if "BTC" in prices.columns:
-        b = prices["BTC"].dropna()
-        print(f"Benchmark BTC B&H: {(b.iloc[-1] / b.iloc[0] - 1) * 100:+.1f}%")
+        return 0
+    days = _parse_online_days(args)
+    if days is None:
+        print(f"Usage: python -m tools.xsec_momentum [days: 1..{MAX_DAYS}]")
+        return 2
+    try:
+        ex = connect_exchange()
+        coins = get_top_volume_coins(ex, n=120)  # breiteres Universum
+    except Exception as exc:
+        print(f"Exchange setup failed: {_safe_exc(exc)}")
+        return 1
+    if not _valid_online_universe(coins):
+        print("Invalid or empty universe; cannot load reliable history")
+        return 1
+    print(f"Coins angefragt: {len(coins)} | loading {days}d ...")
+    try:
+        prices = load_panel(ex, coins, days)
+    except Exception as exc:
+        print(f"History load failed: {_safe_exc(exc)}")
+        return 1
+    if not isinstance(prices, pd.DataFrame) or prices.empty:
+        print("Insufficient history for a reliable XSEC online report")
+        return 1
+    if not _valid_online_panel_symbols(prices, coins):
+        print("Invalid panel symbols; history provenance is not reliable")
+        return 1
 
     #  De-Bias: nur Coins mit VOLLER Historie (am Anfang UND Ende vorhanden)
     head = prices.iloc[:48].notna().all()
     tail = prices.iloc[-48:].notna().all()
     stable = prices.loc[:, head & tail]
+    if len(stable) < MIN_ONLINE_ROWS or stable.shape[1] < MIN_ONLINE_COINS:
+        print("Insufficient history for a reliable XSEC online report")
+        return 1
+    if not _valid_online_hourly_grid(stable.index):
+        print("Invalid hourly grid; cannot run a reliable XSEC online report")
+        return 1
+    if not _valid_online_freshness(stable.index):
+        print("Stale or future history; cannot run a reliable XSEC online report")
+        return 1
+    if not _valid_online_price_data(stable):
+        print("Invalid price data; cannot run a reliable XSEC online report")
+        return 1
+    if len(stable) < days * 24:
+        print("History is shorter than requested; cannot run a reliable XSEC online report")
+        return 1
     print(
         f"Voll-Historie-Universum: {stable.shape[1]} von {prices.shape[1]} Coins "
         f"(frisch gelistete Pumper entfernt)"
     )
+    if "BTC/USDT" in stable.columns:
+        b = stable["BTC/USDT"]
+        print(f"Benchmark BTC B&H: {(b.iloc[-1] / b.iloc[0] - 1) * 100:+.1f}%")
 
     REAL_FEE, REAL_FUND = 0.0006, 0.0006
     L, reb, K = 24, 72, 8
 
     #  B) CRASH-FILTER: Vergleich auf dem GANZEN Fenster
-    base = run(stable, L, reb, K, REAL_FEE, REAL_FUND)[0]
+    try:
+        base_result = run(stable, L, reb, K, REAL_FEE, REAL_FUND)
+    except Exception as exc:
+        print(f"Simulation failed: {_safe_exc(exc)}")
+        return 1
+    expected_periods = (len(stable) - L - 1) // reb
+    if (
+        not isinstance(base_result, tuple)
+        or len(base_result) != 2
+        or not _valid_online_returns(base_result[0])
+        or len(base_result[0]) != expected_periods
+    ):
+        print("Invalid baseline returns; cannot produce a reliable report")
+        return 1
+    base = base_result[0]
     print(
         f"\n#### B) CRASH-FILTER  (Config L={L} reb={reb} K={K}, "
         f"fee {REAL_FEE * 100:.2f}% + funding {REAL_FUND * 100:.2f}%/d) ####"
@@ -739,7 +1059,18 @@ def main():
     print(f"{'Filter':>12} | {'total%':>8} {'maxDD%':>7} {'Sharpe':>7}")
     print("-" * 42)
     for kind in ("none", "voltarget", "ownmom", "combo"):
-        t, dd, sh, _ = equity_stats(apply_filter(base, kind))
+        try:
+            filtered = apply_filter(base, kind)
+        except Exception as exc:
+            print(f"Simulation failed: {_safe_exc(exc)}")
+            return 1
+        if not _valid_online_returns(filtered) or len(filtered) != len(base):
+            print("Invalid filtered returns; cannot produce a reliable report")
+            return 1
+        result = _validated_online_stats(filtered)
+        if result is None:
+            return 1
+        t, dd, sh, _ = result
         print(f"{kind:>12} | {t:>+7.1f}% {dd:>6.1f}% {sh:>+6.2f}")
 
     #  Walk-Forward mit dem besten Filter (combo) vs ohne
@@ -749,32 +1080,73 @@ def main():
     print(
         f"\n#### WALK-FORWARD  (~{seg // 24}d/Fenster, baseline vs combo-Filter) ####"
     )
-    eq_b = eq_f = 1.0
     all_b, all_f = [], []
     for w in range(1, nwin):
         tr = stable.iloc[(w - 1) * seg : w * seg]
         te = stable.iloc[w * seg : (w + 1) * seg]
-        cfg = best_config(tr, REAL_FEE, REAL_FUND)
-        if cfg is None:
-            continue
-        raw = run(te, *cfg, REAL_FEE, REAL_FUND)[0]
-        filt = apply_filter(raw, "combo")
-        sb, sf = equity_stats(raw), equity_stats(filt)
+        try:
+            cfg = best_config(tr, REAL_FEE, REAL_FUND)
+            if cfg is None:
+                continue
+            if not isinstance(cfg, tuple) or cfg not in GRID:
+                print(
+                    "Invalid walk-forward configuration; "
+                    "cannot produce a reliable report"
+                )
+                return 1
+            raw_result = run(te, *cfg, REAL_FEE, REAL_FUND)
+        except Exception as exc:
+            print(f"Walk-forward failed: {_safe_exc(exc)}")
+            return 1
+        expected_periods = (len(te) - cfg[0] - 1) // cfg[1]
+        if (
+            not isinstance(raw_result, tuple)
+            or len(raw_result) != 2
+            or not _valid_online_returns(raw_result[0])
+            or len(raw_result[0]) != expected_periods
+        ):
+            print("Invalid walk-forward returns; cannot produce a reliable report")
+            return 1
+        raw = raw_result[0]
+        try:
+            filt = apply_filter(raw, "combo")
+        except Exception as exc:
+            print(f"Walk-forward failed: {_safe_exc(exc)}")
+            return 1
+        if not _valid_online_returns(filt) or len(filt) != len(raw):
+            print(
+                "Invalid walk-forward filtered returns; "
+                "cannot produce a reliable report"
+            )
+            return 1
+        sb = _validated_online_stats(raw)
+        if sb is None:
+            return 1
+        sf = _validated_online_stats(filt)
+        if sf is None:
+            return 1
         all_b += raw
         all_f += filt
-        eq_b *= 1 + sb[0] / 100
-        eq_f *= 1 + sf[0] / 100
         print(
             f"  Fenster {w} (cfg L={cfg[0]} reb={cfg[1]} K={cfg[2]}):  "
             f"baseline {sb[0]:>+6.1f}% (DD {sb[1]:.0f}%)   "
             f"combo-Filter {sf[0]:>+6.1f}% (DD {sf[1]:.0f}%)"
         )
-    tb, tf = equity_stats(all_b), equity_stats(all_f)
+    if not all_b or not all_f:
+        print("No valid walk-forward windows; cannot produce a reliable report")
+        return 1
+    tb = _validated_online_stats(all_b)
+    if tb is None:
+        return 1
+    tf = _validated_online_stats(all_f)
+    if tf is None:
+        return 1
     print(
-        f"  kombiniert OOS:  baseline {(eq_b - 1) * 100:+.1f}% (maxDD {tb[1]:.0f}%)  "
-        f"combo-Filter {(eq_f - 1) * 100:+.1f}% (maxDD {tf[1]:.0f}%)"
+        f"  kombiniert OOS:  baseline {tb[0]:+.1f}% (maxDD {tb[1]:.0f}%)  "
+        f"combo-Filter {tf[0]:+.1f}% (maxDD {tf[1]:.0f}%)"
     )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

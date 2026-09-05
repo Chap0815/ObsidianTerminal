@@ -10,7 +10,11 @@ from __future__ import annotations
 import math
 from typing import Optional, Callable
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 
 
 # Common balance paths tried in priority order. Each path is walked
@@ -83,12 +87,29 @@ def safe_fetch_balance_usdt(ex,
             except Exception:
                 pass
 
-    if not try_consume_api_call("entry_fetch_balance"):
+    try:
+        reservation = try_consume_api_call(
+            "entry_fetch_balance",
+            return_reservation=True,
+        )
+    except Exception as exc:
+        _log("entry_fetch_balance API budget", exc)
         return None
+    if not reservation:
+        return None
+
+    def _record_response_error() -> None:
+        if not isinstance(reservation, ApiCallReservation):
+            return
+        try:
+            record_api_error("entry_fetch_balance", reservation)
+        except Exception:
+            pass
 
     try:
         bal = ex.fetch_balance()
     except Exception as e:
+        _record_response_error()
         # Transient network blips (DNS fail, SSL EOF, timeout) are not bugs.
         # Skip the full-traceback error log for them; caller retries on None.
         try:
@@ -101,6 +122,7 @@ def safe_fetch_balance_usdt(ex,
         return None
 
     if not isinstance(bal, dict):
+        _record_response_error()
         _log("fetch_balance",
               Exception(f"unexpected payload type: {type(bal).__name__}"))
         return None
@@ -133,6 +155,7 @@ def safe_fetch_balance_usdt(ex,
             continue
 
     if invalid_standard_fields:
+        _record_response_error()
         _log(
             "fetch_balance",
             Exception(
@@ -155,6 +178,7 @@ def safe_fetch_balance_usdt(ex,
                         f"{first_path}={first_value!r}, {path}={value!r}"
                     ),
                 )
+                _record_response_error()
                 return None
         return first_value
 
@@ -196,6 +220,7 @@ def safe_fetch_balance_usdt(ex,
                         "fetch_balance",
                         Exception(f"invalid raw USDT balance field {k}={v!r}"),
                     )
+                    _record_response_error()
                     return None
                 raw_values.append((k, fv))
         if raw_values:
@@ -211,10 +236,12 @@ def safe_fetch_balance_usdt(ex,
                             f"{first_key}={first_value!r}, {key}={value!r}"
                         ),
                     )
+                    _record_response_error()
                     return None
             return first_value
 
     # return None (not 0.0) for unknown layouts  caller retries.
+    _record_response_error()
     _log("fetch_balance",
           Exception(f"no recognized USDT field in payload keys: "
                      f"{list(bal.keys()) if isinstance(bal, dict) else type(bal).__name__}"))

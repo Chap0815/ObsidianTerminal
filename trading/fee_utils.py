@@ -9,8 +9,15 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from bot_utils.api_budget import try_consume_api_call
-from bot_utils.order_utils import order_id_text_or_none
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
+from bot_utils.order_utils import (
+    explicit_trade_symbol_matches,
+    order_id_text_or_none,
+)
 
 try:
     from core.constants import STABLECOIN_EQUIVALENTS, DEFAULT_TAKER_FEE
@@ -240,29 +247,69 @@ def extract_or_estimate_with_refetch(ex, order: dict, symbol_full: str,
         for _attempt in range(max_attempts):
             _time.sleep(retry_delay)
             try:
-                allowed = try_consume_api_call(
-                    "spot_fee_quote_fetch_order", critical=True
+                reservation = try_consume_api_call(
+                    "spot_fee_quote_fetch_order",
+                    critical=True,
+                    return_reservation=True,
                 )
             except Exception:
                 break
-            if not allowed:
+            if not reservation:
                 break
             try:
                 refreshed = ex.fetch_order(order_id, symbol_full)
-                if refreshed:
-                    refreshed_filled = _first_positive_order_value(
-                        refreshed, "filled", "amount"
+                if not isinstance(refreshed, dict) or not refreshed:
+                    raise TypeError(
+                        "spot fee quote refetch returned no order object"
                     )
-                    if refreshed_filled > 0:
-                        estimate_filled = refreshed_filled
-                    real, known = extract_fee_usdt_known(
-                        refreshed, base_override
+                raw_order_ids = []
+                for source in (
+                    refreshed,
+                    refreshed.get("info")
+                    if isinstance(refreshed.get("info"), dict)
+                    else {},
+                ):
+                    for key in ("id", "orderId", "order_id", "orderID"):
+                        raw_value = source.get(key)
+                        if raw_value not in (None, ""):
+                            raw_order_ids.append(
+                                order_id_text_or_none(raw_value)
+                            )
+                if any(value is None for value in raw_order_ids):
+                    raise ValueError(
+                        "spot fee quote refetch returned invalid order id"
                     )
-                    if known and real != 0:
-                        return real
-                    if _has_negative_fee_evidence(refreshed):
-                        return real if known else 0.0
+                refreshed_order_ids = set(raw_order_ids)
+                if len(refreshed_order_ids) > 1 or (
+                    refreshed_order_ids and refreshed_order_ids != {order_id}
+                ):
+                    raise ValueError(
+                        "spot fee quote refetch changed order id"
+                    )
+                if not explicit_trade_symbol_matches(refreshed, symbol_full):
+                    raise ValueError(
+                        "spot fee quote refetch changed order symbol"
+                    )
+                refreshed_filled = _first_positive_order_value(
+                    refreshed, "filled", "amount"
+                )
+                if refreshed_filled > 0:
+                    estimate_filled = refreshed_filled
+                real, known = extract_fee_usdt_known(
+                    refreshed, base_override
+                )
+                if known and real != 0:
+                    return real
+                if _has_negative_fee_evidence(refreshed):
+                    return real if known else 0.0
             except Exception:
+                if isinstance(reservation, ApiCallReservation):
+                    try:
+                        record_api_error(
+                            "spot_fee_quote_fetch_order", reservation
+                        )
+                    except Exception:
+                        pass
                 continue
 
     # Letzter Resort: estimate

@@ -28,7 +28,12 @@ import math
 import os
 from datetime import datetime, timezone
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.state_persist import (
     is_canonical_position_symbol,
     position_boolean_rejection_field,
@@ -44,11 +49,25 @@ def _utc_now_str() -> str:
     would land on the wrong calendar day in dashboard aggregates and miss
     the "today" filter.
     """
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        from core.clock import utc_now_str
+
+        return utc_now_str()
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 _LIVE_RESIDUAL_DUST_USDT = 1.0
 _POSITIONS_JSON_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _unique_position_state_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate position state JSON key: {key}")
+        result[key] = value
+    return result
 
 
 def _read_positions_json(path: str):
@@ -56,7 +75,10 @@ def _read_positions_json(path: str):
         raw = stream.read(_POSITIONS_JSON_MAX_BYTES + 1)
     if len(raw) > _POSITIONS_JSON_MAX_BYTES:
         raise ValueError("position state JSON exceeds size limit")
-    return json.loads(raw.decode("utf-8-sig"))
+    return json.loads(
+        raw.decode("utf-8-sig"),
+        object_pairs_hook=_unique_position_state_object,
+    )
 
 
 def _close_exchange_quietly(exchange) -> None:
@@ -86,20 +108,66 @@ class _LauncherCloseBudgetUnavailable(RuntimeError):
 def _create_futures_close_order_budgeted(ex, symbol_full: str, side: str,
                                          amount: float, params: dict):
     try:
-        allowed = try_consume_api_call(
-            "launcher_futures_close_create_order", critical=True
+        reservation = try_consume_api_call(
+            "launcher_futures_close_create_order",
+            critical=True,
+            return_reservation=True,
         )
     except Exception as exc:
         raise _LauncherCloseBudgetUnavailable(
             "API budget gate unavailable before launcher futures close"
         ) from exc
-    if not allowed:
+    if not reservation:
         raise _LauncherCloseBudgetUnavailable(
             "API budget exhausted before launcher futures close"
         )
-    return ex.create_order(
-        symbol_full, "market", side, amount, params=params
-    )
+    try:
+        return ex.create_order(
+            symbol_full, "market", side, amount, params=params
+        )
+    except Exception:
+        if isinstance(reservation, ApiCallReservation):
+            try:
+                record_api_error(
+                    "launcher_futures_close_create_order",
+                    reservation,
+                )
+            except Exception:
+                pass
+        raise
+
+
+def _fetch_launcher_ticker_budgeted(
+    ex,
+    symbol: str,
+    *,
+    endpoint: str,
+    critical: bool = False,
+):
+    try:
+        reservation = try_consume_api_call(
+            endpoint,
+            critical=critical,
+            return_reservation=True,
+        )
+    except Exception:
+        return None
+    if not reservation:
+        return None
+    try:
+        ticker = ex.fetch_ticker(symbol)
+        if not explicit_trade_symbol_matches(ticker, symbol):
+            raise ValueError("launcher ticker returned a symbol mismatch")
+        if _ticker_last_close_price(ticker) is None:
+            raise ValueError("launcher ticker returned no positive price")
+        return ticker
+    except Exception:
+        if isinstance(reservation, ApiCallReservation):
+            try:
+                record_api_error(endpoint, reservation)
+            except Exception:
+                pass
+        return None
 
 
 def _finite_float(value) -> float | None:
@@ -729,10 +797,34 @@ def _refresh_spot_positions_with_exchange(positions: list, ex) -> list:
             curr = stored_curr
             if ex is not None and sym:
                 try:
-                    if try_consume_api_call(
-                            "launcher_spot_position_refresh_ticker",
-                            critical=False):
-                        t = ex.fetch_ticker(f"{sym}/USDT")
+                    ticker_reservation = try_consume_api_call(
+                        "launcher_spot_position_refresh_ticker",
+                        critical=False,
+                        return_reservation=True,
+                    )
+                    if ticker_reservation:
+                        try:
+                            symbol = f"{sym}/USDT"
+                            t = ex.fetch_ticker(symbol)
+                            if not explicit_trade_symbol_matches(t, symbol):
+                                raise ValueError(
+                                    "launcher spot ticker returned a symbol "
+                                    "mismatch"
+                                )
+                            if _ticker_last_close_price(t) is None:
+                                raise ValueError(
+                                    "launcher spot ticker returned no positive price"
+                                )
+                        except Exception:
+                            if isinstance(
+                                ticker_reservation,
+                                ApiCallReservation,
+                            ):
+                                record_api_error(
+                                    "launcher_spot_position_refresh_ticker",
+                                    ticker_reservation,
+                                )
+                            raise
                         live = _ticker_last_close_price(t)
                         if live is not None:
                             curr = live
@@ -882,10 +974,34 @@ def _refresh_futures_positions_with_exchange(positions: list, ex) -> list:
             curr = db_curr
             if not invalid_fields and ex is not None and sym:
                 try:
-                    if try_consume_api_call(
-                            "launcher_futures_position_refresh_ticker",
-                            critical=False):
-                        t = ex.fetch_ticker(f"{sym}/USDT:USDT")
+                    ticker_reservation = try_consume_api_call(
+                        "launcher_futures_position_refresh_ticker",
+                        critical=False,
+                        return_reservation=True,
+                    )
+                    if ticker_reservation:
+                        try:
+                            symbol = f"{sym}/USDT:USDT"
+                            t = ex.fetch_ticker(symbol)
+                            if not explicit_trade_symbol_matches(t, symbol):
+                                raise ValueError(
+                                    "launcher futures ticker returned a symbol "
+                                    "mismatch"
+                                )
+                            if _ticker_last_close_price(t) is None:
+                                raise ValueError(
+                                    "launcher futures ticker returned no positive price"
+                                )
+                        except Exception:
+                            if isinstance(
+                                ticker_reservation,
+                                ApiCallReservation,
+                            ):
+                                record_api_error(
+                                    "launcher_futures_position_refresh_ticker",
+                                    ticker_reservation,
+                                )
+                            raise
                         live = _ticker_last_close_price(t)
                         if live is not None:
                             curr = live
@@ -1742,10 +1858,13 @@ def _direct_close_remaining_futures(
             curr = _positive_finite(p.get("current_price")) or entry
             if ex is not None:
                 try:
-                    if try_consume_api_call(
-                            "launcher_futures_close_price_ticker",
-                            critical=True):
-                        t = ex.fetch_ticker(symbol_full)
+                    t = _fetch_launcher_ticker_budgeted(
+                        ex,
+                        symbol_full,
+                        endpoint="launcher_futures_close_price_ticker",
+                        critical=True,
+                    )
+                    if t is not None:
                         fresh = _ticker_last_close_price(t)
                         if fresh is not None:
                             curr = fresh
@@ -2530,10 +2649,13 @@ def _direct_close_remaining_spot(
             curr = stored_price if stored_price > 0 else buy_price
             if ex is not None:
                 try:
-                    if try_consume_api_call(
-                            "launcher_spot_close_price_ticker",
-                            critical=True):
-                        t = ex.fetch_ticker(f"{sym}/USDT")
+                    t = _fetch_launcher_ticker_budgeted(
+                        ex,
+                        f"{sym}/USDT",
+                        endpoint="launcher_spot_close_price_ticker",
+                        critical=True,
+                    )
+                    if t is not None:
                         fresh = _ticker_last_close_price(t)
                         if fresh is not None:
                             curr = fresh

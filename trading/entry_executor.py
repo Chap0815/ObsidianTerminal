@@ -7,7 +7,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.futures_order import (
     FuturesOrderNotSubmitted,
     _TradeRecoveryOrder,
@@ -18,6 +22,7 @@ from bot_utils.futures_order import (
     _order_request_conflicts,
     _requested_position_side,
 )
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.silent_log import silent_log
 from core import clock as exchange_clock
 from core.constants import DEFAULT_TAKER_FEE
@@ -253,6 +258,14 @@ class _OrderSnapshotConflict(ValueError):
     """Conflicting cumulative fill evidence must not be retried away."""
 
 
+class _MalformedExchangeResponse(RuntimeError):
+    """A budgeted exchange call returned no usable response object."""
+
+
+class _RefreshIdentityConflict(_MalformedExchangeResponse):
+    """A refresh returned explicit evidence for a different order."""
+
+
 def _is_explicit_finite_zero(value) -> bool:
     if value is None or isinstance(value, bool):
         return False
@@ -325,6 +338,92 @@ def _require_api_budget(endpoint: str, *, critical: bool = False) -> None:
     )
     if not allowed:
         raise RuntimeError(f"API budget denied: {endpoint}")
+
+
+def _budgeted_exchange_call(
+    endpoint: str,
+    call: Callable[[], object],
+    *,
+    critical: bool = False,
+    denied_exception=RuntimeError,
+    response_validator: Callable[[object], bool] | None = None,
+):
+    try:
+        reservation = (
+            try_consume_api_call(
+                endpoint,
+                critical=True,
+                return_reservation=True,
+            )
+            if critical
+            else try_consume_api_call(endpoint, return_reservation=True)
+        )
+    except Exception as exc:
+        raise denied_exception(
+            f"API budget gate unavailable: {endpoint}"
+        ) from exc
+    if not reservation:
+        raise denied_exception(f"API budget denied: {endpoint}")
+    try:
+        response = call()
+    except Exception:
+        if isinstance(reservation, ApiCallReservation):
+            try:
+                record_api_error(endpoint, reservation)
+            except Exception:
+                pass
+        raise
+    if response_validator is not None:
+        validation_error = None
+        try:
+            response_valid = bool(response_validator(response))
+        except (_MalformedExchangeResponse, _OrderSnapshotConflict) as exc:
+            validation_error = exc
+            response_valid = False
+        except Exception:
+            response_valid = False
+        if not response_valid:
+            if isinstance(reservation, ApiCallReservation):
+                try:
+                    record_api_error(endpoint, reservation)
+                except Exception:
+                    pass
+            if validation_error is not None:
+                raise validation_error
+            raise _MalformedExchangeResponse(
+                f"malformed exchange response: {endpoint}"
+            )
+    return response
+
+
+def _is_nonempty_order_response(response: object) -> bool:
+    return isinstance(response, dict) and bool(response)
+
+
+def _is_two_sided_order_book_response(
+    response: object,
+    expected_symbol: str | None = None,
+) -> bool:
+    if not isinstance(response, Mapping):
+        return False
+    if expected_symbol is not None:
+        try:
+            symbol_matches = explicit_trade_symbol_matches(
+                dict(response),
+                expected_symbol,
+            )
+        except Exception:
+            return False
+        if not symbol_matches:
+            return False
+    bids = response.get("bids") or []
+    asks = response.get("asks") or []
+    try:
+        bid = _positive_finite_float(bids[0][0], "book bid")
+        ask = _positive_finite_float(asks[0][0], "book ask")
+    except (IndexError, KeyError, TypeError, ValueError):
+        return False
+    return bid < ask
 
 
 def _finalize_not_submitted_intent(
@@ -438,22 +537,47 @@ def _refresh_order(
     symbol: str,
     *,
     target_amount: float | None = None,
+    response_validator: Callable[[object], bool] | None = None,
 ) -> dict:
     order_id = _order_id(order)
     fetch_order = getattr(exchange, "fetch_order", None)
     if not order_id or not callable(fetch_order):
         return order
-    _require_api_budget("entry_executor_fetch_order", critical=True)
-    refreshed = fetch_order(order_id, symbol)
-    if not isinstance(refreshed, dict):
-        return order
     monotonic_fields = None
-    if target_amount is not None:
-        monotonic_fields = _monotonic_order_fill_fields(
-            order,
-            refreshed,
-            target_amount,
+
+    def _validate_refresh_response(response: object) -> bool:
+        nonlocal monotonic_fields
+        if not _is_nonempty_order_response(response):
+            return False
+        if response_validator is not None and not response_validator(response):
+            return False
+        if target_amount is not None:
+            response_ids = _explicit_order_ids(response)
+            if len(response_ids) > 1 or (
+                response_ids and response_ids != {order_id}
+            ):
+                raise _RefreshIdentityConflict(
+                    "market order reconciliation changed order id"
+                )
+            monotonic_fields = _monotonic_order_fill_fields(
+                order,
+                response,
+                target_amount,
+            )
+        return True
+
+    try:
+        refreshed = _budgeted_exchange_call(
+            "entry_executor_fetch_order",
+            lambda: fetch_order(order_id, symbol),
+            critical=True,
+            response_validator=_validate_refresh_response,
         )
+    except _RefreshIdentityConflict:
+        raise
+    except _MalformedExchangeResponse:
+        return order
+    if target_amount is not None:
         if monotonic_fields is None:
             return order
     merged = (
@@ -506,16 +630,10 @@ def _reconcile_market_response(
                 symbol,
                 target_amount=amount,
             )
-        except _OrderSnapshotConflict:
+        except (_OrderSnapshotConflict, _RefreshIdentityConflict):
             raise
         except Exception:
             continue
-        refreshed_order_id = _order_id(latest)
-        if (
-            refreshed_order_id is not None
-            and refreshed_order_id != expected_order_id
-        ):
-            raise RuntimeError("market order reconciliation changed order id")
         if (
             _order_status(latest, amount) == "FILLED"
             and _recovered_fill_notional(latest, _number(latest.get("filled")))
@@ -701,12 +819,32 @@ def execute_entry_order(
     book_budget_denied = False
     if config.tca_enabled or config.mode == "enforce":
         try:
-            if not try_consume_api_call("entry_executor_fetch_order_book"):
+            book_reservation = try_consume_api_call(
+                "entry_executor_fetch_order_book",
+                return_reservation=True,
+            )
+            if not book_reservation:
                 book_budget_denied = True
             else:
-                book = exchange.fetch_order_book(
-                    symbol, limit=config.depth_levels
-                )
+                try:
+                    book = exchange.fetch_order_book(
+                        symbol, limit=config.depth_levels
+                    )
+                    if not _is_two_sided_order_book_response(book, symbol):
+                        raise _MalformedExchangeResponse(
+                            "malformed exchange response: "
+                            "entry_executor_fetch_order_book"
+                        )
+                except Exception:
+                    if isinstance(book_reservation, ApiCallReservation):
+                        try:
+                            record_api_error(
+                                "entry_executor_fetch_order_book",
+                                book_reservation,
+                            )
+                        except Exception:
+                            pass
+                    raise
         except Exception as exc:
             silent_log("entry arrival TCA", exc)
             book = None
@@ -844,15 +982,25 @@ def execute_entry_order(
     fallback_not_submitted_order = None
     try:
         if not book:
-            if book_budget_denied or not try_consume_api_call(
-                "entry_executor_fetch_order_book"
-            ):
+            if book_budget_denied:
                 raise FuturesOrderNotSubmitted(
                     "API budget denied: entry_executor_fetch_order_book"
                 )
-            book = exchange.fetch_order_book(
-                symbol, limit=config.depth_levels
-            )
+            try:
+                book = _budgeted_exchange_call(
+                    "entry_executor_fetch_order_book",
+                    lambda: exchange.fetch_order_book(
+                        symbol, limit=config.depth_levels
+                    ),
+                    denied_exception=FuturesOrderNotSubmitted,
+                    response_validator=lambda response: (
+                        _is_two_sided_order_book_response(response, symbol)
+                    ),
+                )
+            except _MalformedExchangeResponse as exc:
+                raise FuturesOrderNotSubmitted(
+                    "maker-first order book validation failed"
+                ) from exc
             try:
                 from trading.execution_quality import build_arrival_tca
 
@@ -883,42 +1031,56 @@ def execute_entry_order(
                 "externalOid": client_order_id,
             }
         )
-        if not try_consume_api_call("entry_executor_create_maker"):
-            raise FuturesOrderNotSubmitted(
-                "API budget denied: entry_executor_create_maker"
-            )
         _require_pre_submit_guard()
-        maker_order = exchange.create_order(
-            symbol,
-            "limit",
-            side,
-            amount,
-            maker_price,
-            params=maker_params,
+
+        def _validate_maker_create_response(response: object) -> bool:
+            if not _is_nonempty_order_response(response):
+                return False
+            response_ids = _explicit_order_ids(response)
+            if len(response_ids) > 1:
+                raise _MalformedExchangeResponse(
+                    "maker create changed order id"
+                )
+            if _order_client_id_conflicts(response, client_order_id):
+                raise _MalformedExchangeResponse(
+                    "maker create changed client order id"
+                )
+            if _order_request_conflicts(
+                response,
+                symbol,
+                side,
+                maker_position_side,
+                exchange_id,
+                expected_reduce_only=False,
+                expected_amount=amount,
+            ):
+                raise _MalformedExchangeResponse(
+                    "maker create changed symbol or side"
+                )
+            response_status = _order_status(response, amount)
+            if (
+                response_status in {"FILLED", "PARTIAL"}
+                and len(response_ids) != 1
+            ):
+                raise _MalformedExchangeResponse(
+                    "maker create changed order id"
+                )
+            return True
+
+        maker_order = _budgeted_exchange_call(
+            "entry_executor_create_maker",
+            lambda: exchange.create_order(
+                symbol,
+                "limit",
+                side,
+                amount,
+                maker_price,
+                params=maker_params,
+            ),
+            denied_exception=FuturesOrderNotSubmitted,
+            response_validator=_validate_maker_create_response,
         )
-        if not isinstance(maker_order, dict):
-            raise RuntimeError("maker order returned no order object")
-        maker_order_ids = _explicit_order_ids(maker_order)
-        if len(maker_order_ids) > 1:
-            raise RuntimeError("maker create changed order id")
-        if _order_client_id_conflicts(maker_order, client_order_id):
-            raise RuntimeError("maker create changed client order id")
-        if _order_request_conflicts(
-            maker_order,
-            symbol,
-            side,
-            maker_position_side,
-            exchange_id,
-            expected_reduce_only=False,
-            expected_amount=amount,
-        ):
-            raise RuntimeError("maker create changed symbol or side")
         initial_status = _order_status(maker_order, amount)
-        if (
-            initial_status in {"FILLED", "PARTIAL"}
-            and len(maker_order_ids) != 1
-        ):
-            raise RuntimeError("maker create changed order id")
         if initial_status == "FILLED":
             try:
                 maker_order = _with_verified_fill_notional(
@@ -929,40 +1091,42 @@ def execute_entry_order(
                 order_id = _order_id(maker_order)
                 if not order_id:
                     raise
-                _require_api_budget("entry_executor_fetch_order", critical=True)
-                refreshed_maker = exchange.fetch_order(order_id, symbol)
-                if not isinstance(refreshed_maker, dict):
-                    raise RuntimeError(
-                        "maker fill notional recovery returned no order object"
-                    )
-                refreshed_order_ids = _explicit_order_ids(refreshed_maker)
-                if refreshed_order_ids != {order_id}:
-                    raise RuntimeError(
-                        "maker fill notional recovery changed order id"
-                    )
-                if _order_client_id_conflicts(
-                    refreshed_maker,
-                    client_order_id,
-                ):
-                    raise RuntimeError(
-                        "maker fill notional recovery changed client order id"
-                    )
-                if _order_request_conflicts(
-                    refreshed_maker,
-                    symbol,
-                    side,
-                    maker_position_side,
-                    exchange_id,
-                    expected_reduce_only=False,
-                    expected_amount=amount,
-                ):
-                    raise RuntimeError(
-                        "maker fill notional recovery changed symbol or side"
-                    )
-                if _order_status(refreshed_maker, amount) != "FILLED":
-                    raise RuntimeError(
-                        "maker fill notional recovery was inconclusive"
-                    )
+
+                def _validate_maker_notional_recovery(response: object) -> bool:
+                    if not _is_nonempty_order_response(response):
+                        return False
+                    if _explicit_order_ids(response) != {order_id}:
+                        raise _MalformedExchangeResponse(
+                            "maker fill notional recovery changed order id"
+                        )
+                    if _order_client_id_conflicts(response, client_order_id):
+                        raise _MalformedExchangeResponse(
+                            "maker fill notional recovery changed client order id"
+                        )
+                    if _order_request_conflicts(
+                        response,
+                        symbol,
+                        side,
+                        maker_position_side,
+                        exchange_id,
+                        expected_reduce_only=False,
+                        expected_amount=amount,
+                    ):
+                        raise _MalformedExchangeResponse(
+                            "maker fill notional recovery changed symbol or side"
+                        )
+                    if _order_status(response, amount) != "FILLED":
+                        raise _MalformedExchangeResponse(
+                            "maker fill notional recovery was inconclusive"
+                        )
+                    return True
+
+                refreshed_maker = _budgeted_exchange_call(
+                    "entry_executor_fetch_order",
+                    lambda: exchange.fetch_order(order_id, symbol),
+                    critical=True,
+                    response_validator=_validate_maker_notional_recovery,
+                )
                 maker_order = _with_verified_fill_notional(
                     refreshed_maker,
                     "maker",
@@ -1003,32 +1167,50 @@ def execute_entry_order(
         order_id = _order_id(maker_order)
         if not order_id:
             raise RuntimeError("maker order returned no usable order id")
-        _require_api_budget("entry_executor_fetch_order", critical=True)
-        latest = exchange.fetch_order(order_id, symbol)
-        latest_order_ids = _explicit_order_ids(latest)
-        if len(latest_order_ids) > 1 or (
-            latest_order_ids and latest_order_ids != {order_id}
-        ):
-            raise RuntimeError("maker status refresh changed order id")
-        if _order_client_id_conflicts(latest, client_order_id):
-            raise RuntimeError("maker status refresh changed client order id")
-        if _order_request_conflicts(
-            latest,
-            symbol,
-            side,
-            maker_position_side,
-            exchange_id,
-            expected_reduce_only=False,
-            expected_amount=amount,
-        ):
-            raise RuntimeError("maker status refresh changed symbol or side")
+
+        def _validate_maker_status_refresh(response: object) -> bool:
+            if not _is_nonempty_order_response(response):
+                return False
+            response_ids = _explicit_order_ids(response)
+            if len(response_ids) > 1 or (
+                response_ids and response_ids != {order_id}
+            ):
+                raise _MalformedExchangeResponse(
+                    "maker status refresh changed order id"
+                )
+            if _order_client_id_conflicts(response, client_order_id):
+                raise _MalformedExchangeResponse(
+                    "maker status refresh changed client order id"
+                )
+            if _order_request_conflicts(
+                response,
+                symbol,
+                side,
+                maker_position_side,
+                exchange_id,
+                expected_reduce_only=False,
+                expected_amount=amount,
+            ):
+                raise _MalformedExchangeResponse(
+                    "maker status refresh changed symbol or side"
+                )
+            if (
+                _order_status(response, amount) in {"FILLED", "PARTIAL"}
+                and response_ids != {order_id}
+            ):
+                raise _MalformedExchangeResponse(
+                    "maker status refresh changed order id"
+                )
+            return True
+
+        latest = _budgeted_exchange_call(
+            "entry_executor_fetch_order",
+            lambda: exchange.fetch_order(order_id, symbol),
+            critical=True,
+            response_validator=_validate_maker_status_refresh,
+        )
         _require_positive_partial_fill(latest, "maker status refresh")
         latest_status = _order_status(latest, amount)
-        if (
-            latest_status in {"FILLED", "PARTIAL"}
-            and latest_order_ids != {order_id}
-        ):
-            raise RuntimeError("maker status refresh changed order id")
         if latest_status == "FILLED":
             latest = _with_verified_fill_notional(latest, "maker")
             fill_fields = {
@@ -1077,34 +1259,54 @@ def execute_entry_order(
                 )
                 return latest
         journal.transition(intent_id, "CANCELING")
-        _require_api_budget("entry_executor_cancel_maker", critical=True)
-        exchange.cancel_order(order_id, symbol)
-        _require_api_budget("entry_executor_fetch_order", critical=True)
-        canceled = exchange.fetch_order(order_id, symbol)
-        canceled_order_ids = _explicit_order_ids(canceled)
-        if canceled_order_ids != {order_id}:
-            raise RuntimeError("maker cancel verification changed order id")
-        if _order_client_id_conflicts(canceled, client_order_id):
-            raise RuntimeError(
-                "maker cancel verification changed client order id"
-            )
-        canceled_request = dict(canceled)
-        canceled_request.pop("filled", None)
-        if _order_request_conflicts(
-            canceled_request,
-            symbol,
-            side,
-            maker_position_side,
-            exchange_id,
-            expected_reduce_only=False,
-            expected_amount=amount,
-        ):
-            raise RuntimeError(
-                "maker cancel verification changed symbol or side"
-            )
-        canceled_status = _external_text(canceled.get("status", ""))
-        if canceled_status not in {"canceled", "cancelled", "expired"}:
-            raise RuntimeError("maker cancel was not verified; market fallback refused")
+        _budgeted_exchange_call(
+            "entry_executor_cancel_maker",
+            lambda: exchange.cancel_order(order_id, symbol),
+            critical=True,
+        )
+
+        def _validate_maker_cancel_verification(response: object) -> bool:
+            if not _is_nonempty_order_response(response):
+                return False
+            if _explicit_order_ids(response) != {order_id}:
+                raise _MalformedExchangeResponse(
+                    "maker cancel verification changed order id"
+                )
+            if _order_client_id_conflicts(response, client_order_id):
+                raise _MalformedExchangeResponse(
+                    "maker cancel verification changed client order id"
+                )
+            response_request = dict(response)
+            response_request.pop("filled", None)
+            if _order_request_conflicts(
+                response_request,
+                symbol,
+                side,
+                maker_position_side,
+                exchange_id,
+                expected_reduce_only=False,
+                expected_amount=amount,
+            ):
+                raise _MalformedExchangeResponse(
+                    "maker cancel verification changed symbol or side"
+                )
+            response_status = _external_text(response.get("status", ""))
+            if response_status not in {"canceled", "cancelled", "expired"}:
+                raise _MalformedExchangeResponse(
+                    "maker cancel was not verified; market fallback refused"
+                )
+            try:
+                _verified_final_canceled_fill(response)
+            except RuntimeError as exc:
+                raise _MalformedExchangeResponse(str(exc)) from exc
+            return True
+
+        canceled = _budgeted_exchange_call(
+            "entry_executor_fetch_order",
+            lambda: exchange.fetch_order(order_id, symbol),
+            critical=True,
+            response_validator=_validate_maker_cancel_verification,
+        )
         _verified_final_canceled_fill(canceled)
         if any(
             _has_fill_notional_without_amount(snapshot)
@@ -1523,18 +1725,73 @@ def recover_nonterminal_order_intents(
                 0.0,
                 target_amount - persisted_maker_amount,
             )
+        expected_order_ids = _explicit_order_ids(order)
+        expected_side = "buy" if direction == "LONG" else "sell"
+
+        def _validate_startup_refresh(response: object) -> bool:
+            response_ids = _explicit_order_ids(response)
+            if len(response_ids) > 1:
+                raise _RefreshIdentityConflict(
+                    "startup refresh has missing or conflicting order ids"
+                )
+            if (
+                len(expected_order_ids) == 1
+                and response_ids
+                and response_ids != expected_order_ids
+            ):
+                raise _RefreshIdentityConflict(
+                    "startup refresh changed order id"
+                )
+            if _order_client_id_conflicts(response, lookup_client_order_id):
+                raise _RefreshIdentityConflict(
+                    "startup refresh changed client order id"
+                )
+            if _order_request_conflicts(
+                response,
+                str(intent["symbol"]),
+                expected_side,
+                direction.lower(),
+                _exchange_id(exchange),
+                expected_reduce_only=False,
+                allow_one_way_position_side=True,
+            ):
+                raise _RefreshIdentityConflict(
+                    "startup refresh changed symbol, side, or position side"
+                )
+            response_request = dict(response)
+            response_request.pop("filled", None)
+            if _order_request_conflicts(
+                response_request,
+                str(intent["symbol"]),
+                expected_side,
+                direction.lower(),
+                _exchange_id(exchange),
+                expected_reduce_only=False,
+                allow_one_way_position_side=True,
+                expected_amount=expected_snapshot_amount,
+            ):
+                raise _RefreshIdentityConflict(
+                    "startup refresh changed order amount"
+                )
+            return True
+
+        refresh_identity_error = None
         try:
             refreshed_order = _refresh_order(
                 exchange,
                 order,
                 str(intent["symbol"]),
+                response_validator=_validate_startup_refresh,
             )
+        except _RefreshIdentityConflict as exc:
+            refreshed_order = order
+            refresh_identity_error = str(exc)
         except Exception:
             refreshed_order = order
-        expected_order_ids = _explicit_order_ids(order)
         refreshed_order_ids = _explicit_order_ids(refreshed_order)
-        refresh_identity_error = None
-        if len(expected_order_ids) != 1 or len(refreshed_order_ids) != 1:
+        if refresh_identity_error is not None:
+            pass
+        elif len(expected_order_ids) != 1 or len(refreshed_order_ids) != 1:
             refresh_identity_error = (
                 "startup refresh has missing or conflicting order ids"
             )
@@ -1546,7 +1803,6 @@ def recover_nonterminal_order_intents(
         ):
             refresh_identity_error = "startup refresh changed client order id"
         else:
-            expected_side = "buy" if direction == "LONG" else "sell"
             if _order_request_conflicts(
                 refreshed_order,
                 str(intent["symbol"]),

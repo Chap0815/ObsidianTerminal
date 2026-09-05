@@ -47,6 +47,43 @@ def safe_positive_float(value: Any, default: float = 0.0) -> float:
     return f
 
 
+def safe_daily_loss_limit(value: Any, default: float = -50.0) -> float:
+    """Return a finite, negative daily-loss limit in the runtime-safe range."""
+    limit = safe_float(value, default)
+    return limit if -1000.0 <= limit < 0.0 else default
+
+
+def safe_stop_loss_pct(
+    value: Any,
+    default: float,
+    *,
+    leverage: Any = None,
+) -> float:
+    """Return a finite stop percentage that remains before liquidation."""
+    stop = safe_float(value, default)
+    if not -100.0 < stop < 0.0:
+        return default
+    if leverage is not None:
+        effective_leverage = safe_positive_float(leverage, 1.0)
+        if (
+            effective_leverage > 1.0
+            and stop <= -((100.0 / effective_leverage) * 0.9)
+        ):
+            return default
+    return stop
+
+
+def safe_liq_safety_pct(
+    value: Any,
+    default: float,
+    *,
+    maximum: float = 100.0,
+) -> float:
+    """Return a finite, positive liquidation-buffer safety percentage."""
+    safety = safe_float(value, default)
+    return safety if 0.01 <= safety <= maximum else default
+
+
 def parse_ohlcv_closes(
     bars: Any,
     *,

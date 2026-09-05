@@ -1609,7 +1609,11 @@ def _verified_carry_capture_scope(venue_root: Path) -> dict | None:
         try:
             if report_path.stat().st_size > RESEARCH_VENUE_PAYLOAD_MAX_BYTES:
                 raise ValueError("capture seal is oversized")
-            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report = json.loads(
+                report_path.read_text(encoding="utf-8"),
+                parse_constant=_reject_research_json_constant,
+                object_pairs_hook=_strict_research_json_object,
+            )
             _verify_sealed_report(
                 venue_root, report, expected_day=report_path.stem
             )
@@ -1740,7 +1744,11 @@ def _carry_history_report(
                     continue
                 total_events += 1
                 try:
-                    payload = json.loads(encoded)
+                    payload = json.loads(
+                        encoded,
+                        parse_constant=_reject_research_json_constant,
+                        object_pairs_hook=_strict_research_json_object,
+                    )
                 except (TypeError, ValueError, json.JSONDecodeError):
                     continue
                 markets = payload.get("markets") if isinstance(payload, dict) else None

@@ -64,6 +64,27 @@ _TERMINAL_LIFECYCLE_STAGES = frozenset({
 })
 
 
+def _unique_research_json_object(pairs) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate research JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_research_json_constant(value: str):
+    raise ValueError(f"invalid research JSON constant: {value}")
+
+
+def _decode_research_json(raw):
+    return json.loads(
+        raw,
+        object_pairs_hook=_unique_research_json_object,
+        parse_constant=_reject_research_json_constant,
+    )
+
+
 def _finite(value) -> float | None:
     if value is None or isinstance(value, bool):
         return None
@@ -251,7 +272,7 @@ def _candidate_events(
                 for row in rows:
                     candidate_time = _utc_datetime(row["candidate_time"])
                     try:
-                        features = json.loads(row["features_json"])
+                        features = _decode_research_json(row["features_json"])
                         schema_version = _positive_integer(
                             row["schema_version"], "schema_version"
                         )
@@ -443,7 +464,7 @@ def _candidate_events(
             for raw_line in handle:
                 try:
                     line = raw_line.decode("utf-8")
-                    event = json.loads(line)
+                    event = _decode_research_json(line)
                 except (TypeError, UnicodeError, ValueError, json.JSONDecodeError):
                     if diagnostics is not None:
                         diagnostics["candidate_records_rejected"] += 1
@@ -1328,7 +1349,7 @@ def _venue_rows(root: Path, stream: str, *, limit: int) -> list[dict]:
             market_id = str(row["market_id"])
             exchange_time = str(row["exchange_time"])
             try:
-                raw_flags = json.loads(row["quality_flags_json"])
+                raw_flags = _decode_research_json(row["quality_flags_json"])
                 if not isinstance(raw_flags, list) or any(
                     not isinstance(flag, str) or not flag.strip()
                     for flag in raw_flags

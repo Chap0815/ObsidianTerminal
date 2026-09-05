@@ -38,6 +38,7 @@ from core.clock import backtest_asof_ms
 from core.logger import log_event, log_separator
 from tools.ohlcv_cache import get_series
 from bot_utils.futures_funding import count_funding_settlements
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.futures_math import (
     distance_to_liquidation_pct,
     funding_oi_filter,
@@ -76,6 +77,7 @@ from core.constants import (
 
 
 DEFAULT_DAYS = 60
+MAX_BACKTEST_DAYS = 3650
 INITIAL_CAPITAL = BACKTEST_INITIAL_CAPITAL
 POSITION_SIZE = BACKTEST_POSITION_SIZE
 MAX_OPEN_TRADES = BACKTEST_MAX_OPEN_TRADES
@@ -192,6 +194,43 @@ def _round_trip_cost_rate(
     return bps / 10_000.0
 
 
+def _exchange_now_ms_or_local(exchange) -> int:
+    """Return a finite positive exchange clock, else the local wall clock."""
+    try:
+        raw_now_ms = exchange.milliseconds()
+        if isinstance(raw_now_ms, bool):
+            raise ValueError("boolean exchange clock")
+        numeric_now_ms = float(raw_now_ms)
+        if (
+            not math.isfinite(numeric_now_ms)
+            or numeric_now_ms <= 0.0
+            or not numeric_now_ms.is_integer()
+        ):
+            raise ValueError("invalid exchange clock")
+        return int(numeric_now_ms)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return int(_time.time() * 1000)
+    except Exception:
+        return int(_time.time() * 1000)
+
+
+def _coerce_backtest_days(value, *, default=DEFAULT_DAYS):
+    if isinstance(value, bool):
+        return default
+    try:
+        numeric = float(value)
+        days = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if (
+        not math.isfinite(numeric)
+        or not numeric.is_integer()
+        or not 1 <= days <= MAX_BACKTEST_DAYS
+    ):
+        return default
+    return days
+
+
 def fetch_history(exchange, symbol: str, days: int) -> pd.DataFrame:
     """Load `days` of 1h candles via PAGINATION.
 
@@ -202,14 +241,14 @@ def fetch_history(exchange, symbol: str, days: int) -> pd.DataFrame:
     assuming a page size, and stops on no-progress so a smaller-than-requested
     page can't end the loop prematurely or spin forever.
     """
+    days = _coerce_backtest_days(days, default=None)
+    if days is None:
+        return pd.DataFrame()
     try:
         timeframe = "1h"
         tf_ms = 3_600_000  # 1h in ms
         needed = days * 24 + 50  # +50 warmup bars for RSI/MACD
-        try:
-            now_ms = exchange.milliseconds()
-        except Exception:
-            now_ms = int(_time.time() * 1000)
+        now_ms = _exchange_now_ms_or_local(exchange)
         asof = backtest_asof_ms()  # IS/OOS wall: cap "now" to cutoff
         if asof is not None and asof < now_ms:
             now_ms = asof
@@ -272,21 +311,31 @@ def get_top_volume_coins(exchange, n: int = None, days: int = None) -> list:
         n = TOP_N_VOLUME_COINS_BACKTEST
     try:
         tickers = exchange.fetch_tickers()
-        coins = [
-            (sym, t["quoteVolume"])
-            for sym, t in tickers.items()
-            if sym.endswith("/USDT") and (t.get("quoteVolume") or 0) >= MIN_VOLUME_USDT
-        ]
-        coins.sort(key=lambda x: x[1], reverse=True)
+        coins = []
+        for sym, ticker in tickers.items():
+            if (
+                not isinstance(sym, str)
+                or not sym.endswith("/USDT")
+                or not isinstance(ticker, dict)
+                or not explicit_trade_symbol_matches(ticker, sym)
+            ):
+                continue
+            raw_quote_volume = ticker.get("quoteVolume")
+            if isinstance(raw_quote_volume, bool):
+                continue
+            try:
+                quote_volume = float(raw_quote_volume)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(quote_volume) and quote_volume >= MIN_VOLUME_USDT:
+                coins.append((sym, quote_volume))
+        coins.sort(key=lambda item: (-item[1], item[0]))
         ranked = [s for s, _ in coins]
 
         if days and days > 0:
             eff_now = backtest_asof_ms()
             if eff_now is None:
-                try:
-                    eff_now = exchange.milliseconds()
-                except Exception:
-                    eff_now = int(_time.time() * 1000)
+                eff_now = _exchange_now_ms_or_local(exchange)
             window_start_ms = eff_now - days * 86_400_000
             markets = getattr(exchange, "markets", None) or {}
             kept, dropped = [], 0
@@ -327,6 +376,8 @@ def get_top_futures_volume_coins(
         ranked = []
         for symbol, ticker in tickers.items():
             market = markets.get(symbol) or {}
+            if not explicit_trade_symbol_matches(ticker, symbol):
+                continue
             try:
                 quote_volume = float(ticker.get("quoteVolume") or 0.0)
             except (AttributeError, TypeError, ValueError, OverflowError):
@@ -348,10 +399,7 @@ def get_top_futures_volume_coins(
         if days and days > 0:
             eff_now = backtest_asof_ms()
             if eff_now is None:
-                try:
-                    eff_now = exchange.milliseconds()
-                except Exception:
-                    eff_now = int(_time.time() * 1000)
+                eff_now = _exchange_now_ms_or_local(exchange)
             window_start_ms = eff_now - days * 86_400_000
             filtered = []
             dropped = 0
@@ -2214,6 +2262,7 @@ def print_report(s, strategy, days, use_maker, params):
 
 
 def run_backtest(strategy, days=DEFAULT_DAYS, use_maker=False, params=None):
+    days = _coerce_backtest_days(days)
     params = params or {}
     if strategy == "FUTURES" and not float(params.get("funding_rate_8h", 0.0) or 0.0):
         print(
@@ -2264,11 +2313,11 @@ if __name__ == "__main__":
         # live signal so the backtest matches what the bot actually trades.
         from tools import trend_check
 
-        _days = args[1] if len(args) > 1 and args[1].isdigit() else str(DEFAULT_DAYS)
+        _days = str(_coerce_backtest_days(args[1] if len(args) > 1 else None))
         sys.argv = ["trend_check", _days] + (["--sweep"] if "--sweep" in args else [])
         trend_check.main()
         sys.exit(0)
-    days = int(args[1]) if len(args) > 1 and args[1].isdigit() else DEFAULT_DAYS
+    days = _coerce_backtest_days(args[1] if len(args) > 1 else None)
     maker = "--maker" in args
 
     def _a(flag, default):

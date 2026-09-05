@@ -62,6 +62,7 @@ _POSITION_BOOLEAN_FIELDS = frozenset((
     "accounting_pending_mode_is_sim",
     "accounting_already_booked",
     "provisional",
+    "adopted",
     "claim_conflict",
     "claim_release_pending",
     "entry_sizing_recovery_pending",
@@ -139,6 +140,63 @@ def position_boolean_rejection_field(row) -> str | None:
         ),
         None,
     )
+
+
+def persisted_epoch_ttl_active(
+    deadlines: dict,
+    key,
+    *,
+    enabled: bool,
+    expires_at,
+    max_ttl_sec: float,
+    epoch_now=None,
+) -> bool:
+    """Evaluate a restartable epoch TTL monotonically within this process."""
+    if enabled is not True:
+        deadlines.pop(key, None)
+        return False
+    if isinstance(expires_at, bool) or isinstance(max_ttl_sec, bool):
+        deadlines.pop(key, None)
+        return False
+    try:
+        epoch_deadline = float(expires_at)
+        ttl_limit = float(max_ttl_sec)
+    except (TypeError, ValueError, OverflowError):
+        deadlines.pop(key, None)
+        return False
+    if (
+        not math.isfinite(epoch_deadline)
+        or not math.isfinite(ttl_limit)
+        or epoch_deadline <= 0.0
+        or ttl_limit <= 0.0
+    ):
+        deadlines.pop(key, None)
+        return False
+    monotonic_now = time.monotonic()
+    generation = deadlines.get(key)
+    if (
+        not isinstance(generation, tuple)
+        or len(generation) != 2
+        or generation[0] != epoch_deadline
+    ):
+        if isinstance(epoch_now, bool):
+            deadlines.pop(key, None)
+            return False
+        try:
+            current_epoch = float(time.time() if epoch_now is None else epoch_now)
+        except (TypeError, ValueError, OverflowError):
+            deadlines.pop(key, None)
+            return False
+        if not math.isfinite(current_epoch):
+            deadlines.pop(key, None)
+            return False
+        remaining = min(
+            ttl_limit,
+            max(0.0, epoch_deadline - current_epoch),
+        )
+        generation = (epoch_deadline, monotonic_now + remaining)
+        deadlines[key] = generation
+    return monotonic_now < generation[1]
 
 
 #  Atomic write 
@@ -445,9 +503,14 @@ def _valid_buy_time(value) -> bool:
     # ``buy_time`` is a UTC recovery anchor.  A materially future anchor can
     # hide real fills from offline-close reconstruction and suppress age-based
     # protection indefinitely.  Retain a small clock-skew allowance.
+    try:
+        from core.clock import now_utc
+
+        comparison_now = now_utc().astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        comparison_now = datetime.now(timezone.utc).replace(tzinfo=None)
     return parsed <= (
-        datetime.now(timezone.utc).replace(tzinfo=None)
-        + timedelta(minutes=5)
+        comparison_now + timedelta(minutes=5)
     )
 
 
@@ -630,7 +693,10 @@ def _validate_state(trades: dict,
             (
                 field
                 for field in (
-                    "fees_paid", "initial_entry_fee", "funding_paid"
+                    "fees_paid",
+                    "initial_entry_fee",
+                    "funding_paid",
+                    "funding_booked_on_partials",
                 )
                 if d.get(field) is not None
                 and _finite_float_or_none(d[field]) is None

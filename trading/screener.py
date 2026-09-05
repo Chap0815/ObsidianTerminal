@@ -39,6 +39,7 @@ from concurrent.futures import (
 )
 from core.logger import log_event
 from core.paths import INDICATOR_FAILURES_STR as _FAIL_CACHE_FILE
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.safe_numeric import safe_positive_float
 from bot_utils.state_persist import atomic_save_json
 from bot_utils.runtime_threads import thread_definitely_never_started
@@ -110,6 +111,8 @@ _SOFT_FAILURE_TTL = SOFT_FAILURE_TTL_SEC
 
 _fail_cache_lock = threading.Lock()
 _fail_cache: dict = {}
+_fail_cache_hard_deadlines: dict[str, tuple[float, float]] = {}
+_fail_cache_expired_generations: dict[str, float] = {}
 
 # Debounced disk writes
 _FAIL_CACHE_PERSIST_INTERVAL = 30.0
@@ -117,6 +120,50 @@ _FAIL_CACHE_JSON_MAX_BYTES = 2 * 1024 * 1024
 _FAIL_CACHE_MAX_ENTRIES = 4096
 _fail_cache_dirty = False
 _fail_cache_last_persist = 0.0
+
+
+def _hard_failure_active_locked(
+    key: str,
+    entry: dict,
+    now: float,
+    monotonic_now: float,
+) -> bool:
+    """Evaluate one persisted epoch TTL on a process-local monotonic clock."""
+    try:
+        hard_until = float(entry.get("hard_until", 0.0))
+    except (TypeError, ValueError, OverflowError):
+        _fail_cache_hard_deadlines.pop(key, None)
+        return False
+    if not math.isfinite(hard_until) or hard_until <= 0.0:
+        _fail_cache_hard_deadlines.pop(key, None)
+        return False
+    expired_generation = _fail_cache_expired_generations.get(key)
+    if (
+        expired_generation is not None
+        and hard_until <= expired_generation
+    ):
+        _fail_cache_hard_deadlines.pop(key, None)
+        return False
+    generation = _fail_cache_hard_deadlines.get(key)
+    if generation is None or generation[0] != hard_until:
+        remaining = min(_HARD_FAILURE_TTL, hard_until - now)
+        if remaining <= 0.0:
+            _fail_cache_hard_deadlines.pop(key, None)
+            _fail_cache_expired_generations[key] = max(
+                hard_until,
+                _fail_cache_expired_generations.get(key, 0.0),
+            )
+            return False
+        generation = (hard_until, monotonic_now + remaining)
+        _fail_cache_hard_deadlines[key] = generation
+    if monotonic_now < generation[1]:
+        return True
+    _fail_cache_hard_deadlines.pop(key, None)
+    _fail_cache_expired_generations[key] = max(
+        hard_until,
+        _fail_cache_expired_generations.get(key, 0.0),
+    )
+    return False
 
 
 def _bounded_fail_cache(cache: dict, now: float) -> dict:
@@ -135,13 +182,20 @@ def _bounded_fail_cache(cache: dict, now: float) -> dict:
     return dict(ranked[:_FAIL_CACHE_MAX_ENTRIES])
 
 
-def _make_fail_cache_room_locked(key: str, now: float) -> bool:
+def _make_fail_cache_room_locked(
+    key: str,
+    now: float,
+    monotonic_now: float,
+) -> bool:
     """Make bounded room without discarding a currently active suppression."""
     if key in _fail_cache or len(_fail_cache) < _FAIL_CACHE_MAX_ENTRIES:
         return True
     for candidate, entry in tuple(_fail_cache.items()):
-        if entry.get("hard_until", 0.0) <= now:
+        if not _hard_failure_active_locked(
+            candidate, entry, now, monotonic_now
+        ):
             _fail_cache.pop(candidate, None)
+            _fail_cache_hard_deadlines.pop(candidate, None)
             return True
     return False
 
@@ -185,21 +239,43 @@ def _read_fail_cache(now: float) -> dict:
 
 
 def _load_fail_cache():
-    global _fail_cache
+    global _fail_cache, _fail_cache_hard_deadlines
+    global _fail_cache_expired_generations
     try:
         if os.path.exists(_FAIL_CACHE_FILE):
-            _fail_cache = _read_fail_cache(time.time())
+            now = time.time()
+            monotonic_now = time.monotonic()
+            _fail_cache = _read_fail_cache(now)
+            _fail_cache_hard_deadlines = {
+                key: (
+                    entry["hard_until"],
+                    monotonic_now + min(
+                        _HARD_FAILURE_TTL,
+                        entry["hard_until"] - now,
+                    ),
+                )
+                for key, entry in _fail_cache.items()
+                if entry["hard_until"] > now
+            }
+            _fail_cache_expired_generations = {}
     except Exception:
         _fail_cache = {}
+        _fail_cache_hard_deadlines = {}
+        _fail_cache_expired_generations = {}
 
 
 def _save_fail_cache_locked(force: bool = False) -> bool:
     """Caller MUST hold _fail_cache_lock. Debounced."""
     global _fail_cache_dirty, _fail_cache_last_persist
     now = time.time()
+    persist_now = time.monotonic()
     if not _fail_cache_dirty:
         return True
-    if not force and (now - _fail_cache_last_persist) < _FAIL_CACHE_PERSIST_INTERVAL:
+    if (
+        not force
+        and (persist_now - _fail_cache_last_persist)
+        < _FAIL_CACHE_PERSIST_INTERVAL
+    ):
         return False
     try:
         os.makedirs(os.path.dirname(_FAIL_CACHE_FILE) or ".", exist_ok=True)
@@ -217,8 +293,26 @@ def _save_fail_cache_locked(force: bool = False) -> bool:
             except Exception:
                 disk_cache = {}
 
-            merged = _validated_fail_cache(_fail_cache, now)
+            local_cache = {}
+            for key, entry in _fail_cache.items():
+                serialized_entry = dict(entry)
+                if _hard_failure_active_locked(
+                    key, entry, now, persist_now
+                ):
+                    deadline = _fail_cache_hard_deadlines[key][1]
+                    serialized_entry["hard_until"] = now + min(
+                        _HARD_FAILURE_TTL,
+                        max(0.0, deadline - persist_now),
+                    )
+                elif entry.get("hard_until", 0.0):
+                    serialized_entry["hard_until"] = 0.0
+                local_cache[key] = serialized_entry
+            merged = _validated_fail_cache(local_cache, now)
             for key, disk_entry in disk_cache.items():
+                if disk_entry["hard_until"] <= (
+                    _fail_cache_expired_generations.get(key, -1.0)
+                ):
+                    continue
                 local_entry = merged.get(key, {
                     "count": 0,
                     "hard_until": 0.0,
@@ -248,7 +342,20 @@ def _save_fail_cache_locked(force: bool = False) -> bool:
 
         _fail_cache.clear()
         _fail_cache.update(merged)
-        _fail_cache_last_persist = now
+        _fail_cache_hard_deadlines.clear()
+        _fail_cache_hard_deadlines.update({
+            key: (
+                entry["hard_until"],
+                persist_now + min(
+                    _HARD_FAILURE_TTL,
+                    entry["hard_until"] - now,
+                ),
+            )
+            for key, entry in merged.items()
+            if entry["hard_until"] > now
+        })
+        _fail_cache_expired_generations.clear()
+        _fail_cache_last_persist = persist_now
         _fail_cache_dirty = False
         return True
     except Exception:
@@ -277,16 +384,23 @@ def _record_indicator_fail(symbol: str, timeframe: str) -> bool:
     global _fail_cache_dirty
     key = f"{symbol}|{timeframe}"
     now = time.time()
+    monotonic_now = time.monotonic()
     with _fail_cache_lock:
-        if not _make_fail_cache_room_locked(key, now):
+        if not _make_fail_cache_room_locked(key, now, monotonic_now):
             return True
         entry = _fail_cache.get(key, {"count": 0, "hard_until": 0})
-        if entry["hard_until"] > now:
+        if _hard_failure_active_locked(key, entry, now, monotonic_now):
             return True
+        _fail_cache_hard_deadlines.pop(key, None)
         count = entry["count"] + 1
         if count >= 3:
             entry = {"count": 0, "hard_until": now + _HARD_FAILURE_TTL}
             _fail_cache[key] = entry
+            _fail_cache_expired_generations.pop(key, None)
+            _fail_cache_hard_deadlines[key] = (
+                entry["hard_until"],
+                monotonic_now + _HARD_FAILURE_TTL,
+            )
             _fail_cache_dirty = True
             _save_fail_cache_locked()
             return True
@@ -299,16 +413,20 @@ def _record_indicator_fail(symbol: str, timeframe: str) -> bool:
 
 
 def _is_hard_suppressed(symbol: str, timeframe: str) -> bool:
+    global _fail_cache_dirty
     key = f"{symbol}|{timeframe}"
+    now = time.time()
+    monotonic_now = time.monotonic()
     with _fail_cache_lock:
         entry = _fail_cache.get(key)
         if not entry:
             return False
-        if entry.get("hard_until", 0) > time.time():
+        if _hard_failure_active_locked(key, entry, now, monotonic_now):
             return True
         if entry.get("hard_until", 0) > 0:
             entry["hard_until"] = 0
             _fail_cache[key] = entry
+            _fail_cache_dirty = True
         return False
 
 
@@ -417,7 +535,18 @@ def _is_too_new(symbol: str, markets: dict = None) -> bool:
     if listing_ms is None or listing_ms <= 0:
         return False
 
-    age_ms = time.time() * 1000 - listing_ms
+    try:
+        from core.clock import now_ms as _clock_now_ms
+
+        current_time_ms = float(_clock_now_ms())
+        if not math.isfinite(current_time_ms):
+            return True
+    except Exception:
+        # The listing-age check is an entry gate.  If its exchange-anchored
+        # time base is unavailable, keep that gate closed instead of falling
+        # back to a potentially shifted OS clock.
+        return True
+    age_ms = current_time_ms - listing_ms
     return age_ms < _MIN_LISTING_AGE_MS
 
 
@@ -560,7 +689,9 @@ def _handle_ohlcv_exception(symbol, timeframe, e, bot_name):
 
     # 1. Hard errors  Symbol existiert nicht
     if _is_hard_error(err_str):
-        _symbol_failure_cache.set((symbol, timeframe), time.time() + _HARD_FAILURE_TTL)
+        _symbol_failure_cache.set(
+            (symbol, timeframe), time.monotonic() + _HARD_FAILURE_TTL
+        )
         entry = _fail_cache.get(f"{symbol}|{timeframe}", {})
         if entry.get("count", 0) == 0:
             _record_indicator_fail(symbol, timeframe)
@@ -573,7 +704,9 @@ def _handle_ohlcv_exception(symbol, timeframe, e, bot_name):
     from bot_utils.network_retry import is_rate_limited
 
     if is_rate_limited(e):
-        _symbol_failure_cache.set((symbol, timeframe), time.time() + _SOFT_FAILURE_TTL)
+        _symbol_failure_cache.set(
+            (symbol, timeframe), time.monotonic() + _SOFT_FAILURE_TTL
+        )
         return
 
     # 3. Network errors
@@ -589,7 +722,7 @@ def _handle_ohlcv_exception(symbol, timeframe, e, bot_name):
     )
     if is_network:
         _symbol_failure_cache.set(
-            (symbol, timeframe), time.time() + _SOFT_FAILURE_TTL // 2
+            (symbol, timeframe), time.monotonic() + _SOFT_FAILURE_TTL // 2
         )
         return
 
@@ -612,7 +745,9 @@ def _handle_ohlcv_exception(symbol, timeframe, e, bot_name):
     # 2+ timeframes fail  likely new listing or dead
     if tf_fails >= 2:
         for _tf in ("15m", "1h", "4h"):
-            _symbol_failure_cache.set((symbol, _tf), time.time() + _HARD_FAILURE_TTL)
+            _symbol_failure_cache.set(
+                (symbol, _tf), time.monotonic() + _HARD_FAILURE_TTL
+            )
             for _ in range(3):
                 _record_indicator_fail(symbol, _tf)
         with _sym_scan_lock:
@@ -627,7 +762,9 @@ def _handle_ohlcv_exception(symbol, timeframe, e, bot_name):
 
     hard = _record_indicator_fail(symbol, timeframe)
     if hard:
-        _symbol_failure_cache.set((symbol, timeframe), time.time() + _HARD_FAILURE_TTL)
+        _symbol_failure_cache.set(
+            (symbol, timeframe), time.monotonic() + _HARD_FAILURE_TTL
+        )
         if not in_grace:
             log_event(
                 f"Symbol {symbol} {timeframe}: 3rd failure  silenced for 1h", "INFO"
@@ -636,7 +773,7 @@ def _handle_ohlcv_exception(symbol, timeframe, e, bot_name):
         entry = _fail_cache.get(f"{symbol}|{timeframe}", {})
         count = entry.get("count", 0)
         ttl = _SOFT_FAILURE_TTL if count <= 1 else _SOFT_FAILURE_TTL * 3
-        _symbol_failure_cache.set((symbol, timeframe), time.time() + ttl)
+        _symbol_failure_cache.set((symbol, timeframe), time.monotonic() + ttl)
         # KEIN WARN-LOG bei erster/zweiter Failure  kein WARN-Spam mehr
 
 
@@ -646,18 +783,26 @@ def _safe_get_indicators(
     cache_key = (symbol, timeframe)
     expiry = _symbol_failure_cache.get(cache_key)
     if expiry is not None:
-        if time.time() < expiry:
+        if time.monotonic() < expiry:
             return {}
         _symbol_failure_cache.pop(cache_key, None)
+    if _is_hard_suppressed(symbol, timeframe):
+        return {}
 
     # Track this symbol for grace-period detection
     record_seen(symbol)
 
     try:
-        from bot_utils.api_budget import try_consume_api_call
+        from bot_utils.api_budget import (
+            ApiCallReservation,
+            record_api_error,
+            try_consume_api_call,
+        )
 
-        budget_allowed = try_consume_api_call(
-            f"screener_fetch_ohlcv/{timeframe}"
+        endpoint = f"screener_fetch_ohlcv/{timeframe}"
+        reservation = try_consume_api_call(
+            endpoint,
+            return_reservation=True,
         )
     except Exception as exc:
         log_event(
@@ -666,30 +811,59 @@ def _safe_get_indicators(
             "WARN",
         )
         return {}
-    if not budget_allowed:
+    if not reservation:
         return {}
 
     try:
         bars = exchange.fetch_ohlcv(
             symbol, timeframe=timeframe, limit=SCREENER_OHLCV_LIMIT
         )
+        if not isinstance(bars, list):
+            raise TypeError("screener OHLCV returned no candle list")
+        if any(
+            not isinstance(bar, (list, tuple)) or len(bar) < 5
+            for bar in bars
+        ):
+            raise TypeError("screener OHLCV returned a malformed candle row")
+        for bar in bars:
+            if isinstance(bar[4], bool):
+                raise ValueError("screener OHLCV returned a boolean close")
+            try:
+                close = float(bar[4])
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    "screener OHLCV returned a nonnumeric close"
+                ) from exc
+            if not math.isfinite(close) or close <= 0:
+                raise ValueError("screener OHLCV returned an invalid close")
     except Exception as e:
+        if isinstance(reservation, ApiCallReservation):
+            try:
+                record_api_error(endpoint, reservation)
+            except Exception:
+                pass
         _handle_ohlcv_exception(symbol, timeframe, e, bot_name)
         return {}
 
     if not bars or len(bars) < 30:
         in_grace = is_in_grace_period(symbol)
         if in_grace:
-            _symbol_failure_cache.set(cache_key, time.time() + _SOFT_FAILURE_TTL * 3)
+            _symbol_failure_cache.set(
+                cache_key, time.monotonic() + _SOFT_FAILURE_TTL * 3
+            )
         else:
-            _symbol_failure_cache.set(cache_key, time.time() + _SOFT_FAILURE_TTL)
+            _symbol_failure_cache.set(
+                cache_key, time.monotonic() + _SOFT_FAILURE_TTL
+            )
             _record_indicator_fail(symbol, timeframe)
         return {}
 
     try:
         return _compute_indicators(bars)
     except Exception as e:
-        _symbol_failure_cache.set(cache_key, time.time() + _SOFT_FAILURE_TTL)
+        _symbol_failure_cache.set(
+            cache_key, time.monotonic() + _SOFT_FAILURE_TTL
+        )
         # Computation failure ist real-Bug-Indikator  WARN beibehalten
         log_event(f"Indicator computation failed for {symbol} {timeframe}: {e}", "WARN")
         return {}
@@ -1429,9 +1603,16 @@ def _get_top_momentum_coins_impl(
     )
 
     try:
-        from bot_utils.api_budget import try_consume_api_call
+        from bot_utils.api_budget import (
+            ApiCallReservation,
+            record_api_error,
+            try_consume_api_call,
+        )
 
-        budget_allowed = try_consume_api_call("screener_fetch_tickers")
+        reservation = try_consume_api_call(
+            "screener_fetch_tickers",
+            return_reservation=True,
+        )
     except Exception as exc:
         log_event(
             f"Ticker fetch skipped: API budget gate unavailable "
@@ -1439,13 +1620,25 @@ def _get_top_momentum_coins_impl(
             "WARN",
         )
         return pd.DataFrame()
-    if not budget_allowed:
+    if not reservation:
         log_event("Ticker fetch skipped: API budget exhausted", "WAIT")
         return pd.DataFrame()
 
     try:
         tickers = exchange.fetch_tickers()
+        if not isinstance(tickers, dict) or any(
+            not isinstance(symbol, str)
+            or not isinstance(ticker, dict)
+            or not explicit_trade_symbol_matches(ticker, symbol)
+            for symbol, ticker in tickers.items()
+        ):
+            raise TypeError("screener ticker fetch returned invalid payload")
     except Exception as e:
+        if isinstance(reservation, ApiCallReservation):
+            try:
+                record_api_error("screener_fetch_tickers", reservation)
+            except Exception:
+                pass
         log_event(f"Ticker fetch failed: {e}", "WARN")
         return pd.DataFrame()
 

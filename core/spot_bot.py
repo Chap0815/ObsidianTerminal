@@ -50,7 +50,11 @@ from bot_utils import (
     emergency_close_all_spot,
     SafeMode,
 )
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.runtime_threads import (finalize_runtime_shutdown,
                                        format_runtime_thread_liveness,
                                        shared_runtime_resource_closers,
@@ -63,6 +67,15 @@ from bot_utils.trade_state import state_rows_exposure_count
 from core.spot_bot_exits import ExitsMixin
 from core.spot_bot_scan import ScanMixin
 from core.spot_bot_reconcile import ReconcileMixin
+
+
+def _record_reserved_api_error(endpoint, reservation) -> None:
+    if not isinstance(reservation, ApiCallReservation):
+        return
+    try:
+        record_api_error(endpoint, reservation)
+    except Exception:
+        pass
 
 
 # 
@@ -1361,6 +1374,31 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
         """
         from config.exchange_config import is_authentication_error
         from core.logger import log_event
+
+        raw_ex = None
+        wrapped_ex = None
+        connected = False
+
+        def _cleanup_failed_connection() -> None:
+            target = wrapped_ex if wrapped_ex is not None else raw_ex
+            if target is None:
+                return
+            method_name = "shutdown" if wrapped_ex is not None else "close"
+            closer = getattr(target, method_name, None)
+            if callable(closer):
+                try:
+                    result = closer()
+                    if result is not None and result is not True:
+                        raise RuntimeError(
+                            "failed startup exchange cleanup remained incomplete"
+                        )
+                except Exception as close_err:
+                    self._log_error(
+                        "exchange cleanup after failed startup", close_err
+                    )
+            if getattr(self, "ex", None) is target:
+                self.ex = None
+
         try:
             raw_ex = self.EXCHANGE_FACTORY()
             # HTTP timeout  prevent hanging socket
@@ -1369,19 +1407,42 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             for attempt in range(1, 4):
                 try:
                     try:
-                        markets_allowed = bool(try_consume_api_call(
+                        markets_reservation = try_consume_api_call(
                             "spot_startup_load_markets",
                             critical=True,
-                        ))
+                            return_reservation=True,
+                        )
                     except Exception as budget_exc:
                         raise RuntimeError(
                             "spot load_markets API budget gate unavailable"
                         ) from budget_exc
-                    if not markets_allowed:
+                    if not markets_reservation:
                         raise RuntimeError(
                             "spot load_markets API budget exhausted"
                         )
-                    raw_ex.load_markets()
+                    try:
+                        raw_ex.load_markets()
+                        if hasattr(raw_ex, "markets"):
+                            market_snapshot = raw_ex.markets
+                            if (
+                                not isinstance(market_snapshot, dict)
+                                or not market_snapshot
+                                or any(
+                                    not isinstance(symbol, str)
+                                    or not symbol.strip()
+                                    or not isinstance(market, dict)
+                                    for symbol, market in market_snapshot.items()
+                                )
+                            ):
+                                raise ValueError(
+                                    "spot load_markets returned no market snapshot"
+                                )
+                    except Exception:
+                        _record_reserved_api_error(
+                            "spot_startup_load_markets",
+                            markets_reservation,
+                        )
+                        raise
                     break
                 except Exception as le:
                     if is_authentication_error(le):
@@ -1405,10 +1466,13 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             # expired key or wrong passphrase would otherwise only surface on the
             # first scan-thread fetch, after the other threads are running.
             try:
-                auth_probe_allowed = bool(try_consume_api_call(
-                    "spot_startup_auth_fetch_balance"
-                ))
+                auth_reservation = try_consume_api_call(
+                    "spot_startup_auth_fetch_balance",
+                    return_reservation=True,
+                )
+                auth_probe_allowed = bool(auth_reservation)
             except Exception as budget_exc:
+                auth_reservation = None
                 auth_probe_allowed = False
                 log_event(
                     f"Spot auth smoke-test skipped - API budget gate "
@@ -1427,8 +1491,16 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             if auth_probe_allowed:
                 try:
                     _bal = raw_ex.fetch_balance()
-                    _ = (_bal or {}).get("USDT", {})
+                    if not isinstance(_bal, dict):
+                        raise TypeError(
+                            "spot auth probe returned no balance object"
+                        )
+                    _ = _bal.get("USDT", {})
                 except Exception as se:
+                    _record_reserved_api_error(
+                        "spot_startup_auth_fetch_balance",
+                        auth_reservation,
+                    )
                     if is_authentication_error(se):
                         log_event(
                             f"Spot auth smoke-test FAILED ({type(se).__name__}: "
@@ -1445,6 +1517,7 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             try:
                 from bot_utils.thread_exchange import ThreadLocalExchange
                 self.ex = ThreadLocalExchange(raw_ex)
+                wrapped_ex = self.ex
             except Exception as wrap_err:
                 # A shared CCXT instance is not safe across the scan, monitor
                 # and reconcile threads.  Refuse startup instead of reviving
@@ -1456,18 +1529,18 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
                     f"refusing unsafe shared exchange startup",
                     "WARN",
                 )
-                try:
-                    raw_ex.close()
-                except Exception as close_err:
-                    self._log_error("exchange cleanup after wrapper failure", close_err)
                 return False
             _exname = getattr(self.ex, "name", None) or "Exchange"
             log_event(f"{_exname} API connection established", "INFO")
+            connected = True
             return True
         except Exception as e:
             log_event(f"Connection failed after 3 attempts: {e}", "WARN")
             self._log_error("Connection", e)
             return False
+        finally:
+            if not connected:
+                _cleanup_failed_connection()
 
     #  Startup reconciliation 
 

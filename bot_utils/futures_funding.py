@@ -16,19 +16,12 @@ import math
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.order_utils import order_id_text_or_none
-
-
-def _budget_ok(endpoint: str) -> bool:
-    """Atomic process-wide API budget gate.
-
-    True means the call is allowed. Gate failures block physical exchange I/O.
-    """
-    try:
-        return bool(try_consume_api_call(endpoint))
-    except Exception:
-        return False
 
 
 # Per-symbol OI history: symbol  [(monotonic_ts, oi_usdt), ...]
@@ -255,16 +248,34 @@ def fetch_realized_funding(ex,
     seen_fallback_keys: set[tuple[int, float, str]] = set()
     unverifiable_row = False
     pagination_complete = False
+
+    def _record_page_error(reservation) -> None:
+        if not isinstance(reservation, ApiCallReservation):
+            return
+        try:
+            record_api_error("fetch_funding_history", reservation)
+        except Exception:
+            pass
+
     for _page in range(max_pages):
         # Atomic budget gate. If exhausted, return None and let the caller fall
         # back to state/estimates instead of returning a partial sum.
-        if not _budget_ok("fetch_funding_history"):
-            return None
         try:
-            page = fn(symbol_full, since=next_since, limit=50) or []
+            reservation = try_consume_api_call(
+                "fetch_funding_history",
+                return_reservation=True,
+            )
         except Exception:
             return None
+        if not reservation:
+            return None
+        try:
+            page = fn(symbol_full, since=next_since, limit=50)
+        except Exception:
+            _record_page_error(reservation)
+            return None
         if not isinstance(page, list):
+            _record_page_error(reservation)
             return None
         if not page:
             pagination_complete = True
@@ -277,6 +288,7 @@ def fetch_realized_funding(ex,
                 unverifiable_row = True
                 continue
             if not _funding_row_matches_symbol(ex, symbol_full, h):
+                unverifiable_row = True
                 continue
             amt = _finite_float_or_none(h.get("amount"))
             ts = h.get("timestamp")
@@ -318,6 +330,9 @@ def fetch_realized_funding(ex,
             history.append(h)
             added += 1
 
+        if unverifiable_row:
+            _record_page_error(reservation)
+            return None
         if len(page) < 50:
             pagination_complete = True
             break
@@ -407,12 +422,14 @@ def estimate_funding_paid(ex,
     known_fallback = (
         fallback if fallback is not None and fallback != 0.0 else None
     )
-    if not _budget_ok("estimate_funding_rate"):
-        return known_fallback
     funding_rate_dec = None
     try:
         from config.exchange_config import safe_fetch_funding_rate
-        fr = safe_fetch_funding_rate(ex, symbol_full)
+        fr = safe_fetch_funding_rate(
+            ex,
+            symbol_full,
+            endpoint="estimate_funding_rate",
+        )
         if isinstance(fr, dict):
             parsed_rate = _finite_float_or_none(fr.get("fundingRate"))
             if parsed_rate is not None:
@@ -448,35 +465,41 @@ def get_funding_info(
 
     # Funding rate (current 8h period)
     rate = 0.0
-    if _budget_ok("fetch_funding_rate"):   # atomares Budget-Gate
-        try:
-            from config.exchange_config import safe_fetch_funding_rate
-            funding = safe_fetch_funding_rate(ex, symbol_full)
-            if isinstance(funding, dict):
-                parsed_rate = _finite_float_or_none(funding.get("fundingRate"))
-                rate = (parsed_rate * 100) if parsed_rate is not None else 0.0
-        except Exception:
-            pass
+    try:
+        from config.exchange_config import safe_fetch_funding_rate
+        funding = safe_fetch_funding_rate(
+            ex,
+            symbol_full,
+            endpoint="fetch_funding_rate",
+        )
+        if isinstance(funding, dict):
+            parsed_rate = _finite_float_or_none(funding.get("fundingRate"))
+            rate = (parsed_rate * 100) if parsed_rate is not None else 0.0
+    except Exception:
+        pass
 
     # Open Interest (current)
     oi_usdt = 0.0
-    if _budget_ok("fetch_open_interest"):   # atomares Budget-Gate
-        try:
-            from config.exchange_config import safe_fetch_open_interest
-            oi = safe_fetch_open_interest(ex, symbol_full)
-            if oi is not None:
-                # CCXT separates contract/base quantity
-                # (openInterestAmount) from quote-currency money value
-                # (openInterestValue). This function promises USDT millions,
-                # so an amount can never substitute for the explicit value.
-                value = oi.get("openInterestValue")
-                if value is None and isinstance(oi.get("info"), dict):
-                    value = oi["info"].get("openInterestValue")
-                parsed_oi = _finite_float_or_none(value)
-                if parsed_oi is not None and parsed_oi > 0:
-                    oi_usdt = parsed_oi / 1_000_000
-        except Exception:
-            pass
+    try:
+        from config.exchange_config import safe_fetch_open_interest
+        oi = safe_fetch_open_interest(
+            ex,
+            symbol_full,
+            endpoint="fetch_open_interest",
+        )
+        if oi is not None:
+            # CCXT separates contract/base quantity
+            # (openInterestAmount) from quote-currency money value
+            # (openInterestValue). This function promises USDT millions,
+            # so an amount can never substitute for the explicit value.
+            value = oi.get("openInterestValue")
+            if value is None and isinstance(oi.get("info"), dict):
+                value = oi["info"].get("openInterestValue")
+            parsed_oi = _finite_float_or_none(value)
+            if parsed_oi is not None and parsed_oi > 0:
+                oi_usdt = parsed_oi / 1_000_000
+    except Exception:
+        pass
 
     # OI 24h change  compute from cached history
     oi_change: Optional[float] = None

@@ -22,7 +22,11 @@ from functools import partial
 from pathlib import Path
 from typing import Callable
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.order_utils import order_id_text_or_none
 from bot_utils.runtime_threads import thread_definitely_never_started
 from trading.venue_recorder import (
@@ -1485,17 +1489,17 @@ class L2ShadowCollector:
             trade_exchange = None
             try:
                 for stream_name in ("l2", "trades"):
+                    endpoint = f"{stream_name}_stream_load_markets"
                     try:
-                        markets_allowed = bool(
-                            try_consume_api_call(
-                                f"{stream_name}_stream_load_markets"
-                            )
+                        reservation = try_consume_api_call(
+                            endpoint,
+                            return_reservation=True,
                         )
                     except Exception as budget_exc:
                         raise RuntimeError(
                             f"{stream_name} load_markets API budget gate unavailable"
                         ) from budget_exc
-                    if not markets_allowed:
+                    if not reservation:
                         raise RuntimeError(
                             f"{stream_name} load_markets API budget exhausted"
                         )
@@ -1507,7 +1511,15 @@ class L2ShadowCollector:
                         l2_exchange = exchange
                     else:
                         trade_exchange = exchange
-                    await exchange.load_markets()
+                    try:
+                        await exchange.load_markets()
+                    except Exception:
+                        if isinstance(reservation, ApiCallReservation):
+                            try:
+                                record_api_error(endpoint, reservation)
+                            except Exception:
+                                pass
+                        raise
                 self._begin_connection_epoch(
                     error_type=last_error_type,
                     reconnect_attempts=reconnect_attempts,

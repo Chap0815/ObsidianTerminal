@@ -8,9 +8,14 @@ import math
 from decimal import Decimal, ROUND_DOWN
 from typing import Tuple, Callable, Optional
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.network_retry import RetryForbiddenError
 from bot_utils.order_utils import (
+    explicit_trade_symbol_matches,
     extract_fill_price,
     extract_order_fee,
     order_has_proven_zero_fill,
@@ -341,23 +346,55 @@ def spot_entry_rollback_was_fully_filled(order: dict,
 
 def _create_market_sell_budgeted(ex, symbol_pair: str, amount: float,
                                  client_order_id: Optional[str] = None):
+    valid_symbol = (
+        isinstance(symbol_pair, str)
+        and symbol_pair.count("/") == 1
+        and all(part.strip() for part in symbol_pair.split("/", 1))
+    )
+    stable_client_order_id = (
+        order_id_text_or_none(client_order_id)
+        if client_order_id is not None
+        else None
+    )
+    if (
+        not valid_symbol
+        or _positive_finite(amount) <= 0.0
+        or (
+            client_order_id is not None
+            and stable_client_order_id is None
+        )
+    ):
+        raise ValueError("invalid SPOT market sell request")
+    client_order_id = stable_client_order_id
     try:
-        allowed = try_consume_api_call(
-            "spot_exit_create_market_sell", critical=True
+        reservation = try_consume_api_call(
+            "spot_exit_create_market_sell",
+            critical=True,
+            return_reservation=True,
         )
     except Exception as exc:
         raise _SpotSellBudgetUnavailable(
             "API budget gate unavailable before spot market sell"
         ) from exc
-    if not allowed:
+    if not reservation:
         raise _SpotSellBudgetUnavailable(
             "API budget exhausted before spot market sell"
         )
-    if client_order_id:
-        return ex.create_market_sell_order(
-            symbol_pair, amount, {"clientOrderId": client_order_id}
-        )
-    return ex.create_market_sell_order(symbol_pair, amount)
+    try:
+        if client_order_id:
+            return ex.create_market_sell_order(
+                symbol_pair, amount, {"clientOrderId": client_order_id}
+            )
+        return ex.create_market_sell_order(symbol_pair, amount)
+    except Exception:
+        if isinstance(reservation, ApiCallReservation):
+            try:
+                record_api_error(
+                    "spot_exit_create_market_sell", reservation
+                )
+            except Exception:
+                pass
+        raise
 
 
 def _spot_order_ids(row: dict, *, trade: bool) -> set[str]:
@@ -927,22 +964,36 @@ def _find_spot_exit_order_by_client_id(
     def _query(endpoint: str, fetch):
         nonlocal attempted, uncertain
         try:
-            allowed = try_consume_api_call(endpoint, critical=True)
+            reservation = try_consume_api_call(
+                endpoint,
+                critical=True,
+                return_reservation=True,
+            )
         except Exception as exc:
             raise RuntimeError(
                 f"spot sell reconciliation unavailable: {endpoint}"
             ) from exc
-        if not allowed:
+        if not reservation:
             raise RuntimeError(
                 f"spot sell reconciliation unavailable: {endpoint}"
             )
         attempted = True
         try:
             rows = fetch()
+            if not isinstance(rows, list):
+                raise TypeError(
+                    "spot sell reconciliation returned no order list"
+                )
+            if any(not isinstance(row, dict) for row in rows):
+                raise TypeError(
+                    "spot sell reconciliation returned a malformed row"
+                )
         except Exception:
-            uncertain = True
-            return []
-        if not isinstance(rows, list):
+            if isinstance(reservation, ApiCallReservation):
+                try:
+                    record_api_error(endpoint, reservation)
+                except Exception:
+                    pass
             uncertain = True
             return []
         return rows
@@ -1075,29 +1126,68 @@ def recover_spot_sell_by_client_id(ex, symbol_pair: str,
 def _free_base_balance(ex, symbol_pair: str):
     """Free balance of the BASE asset of ``symbol_pair`` (e.g. FET for
     FET/USDT), or None if it can't be read."""
+    if not isinstance(symbol_pair, str) or symbol_pair.count("/") != 1:
+        return None
+    base, quote = (part.strip() for part in symbol_pair.split("/", 1))
+    if not base or not quote:
+        return None
     try:
-        allowed = try_consume_api_call(
-            "spot_exit_fetch_balance", critical=True
+        reservation = try_consume_api_call(
+            "spot_exit_fetch_balance",
+            critical=True,
+            return_reservation=True,
         )
     except Exception:
         return None
-    if not allowed:
+    if not reservation:
         return None
+
+    def _record_response_error() -> None:
+        if isinstance(reservation, ApiCallReservation):
+            try:
+                record_api_error("spot_exit_fetch_balance", reservation)
+            except Exception:
+                pass
+
     try:
-        base = symbol_pair.split("/")[0]
         bal = ex.fetch_balance()
-        free = (bal.get("free") or {}).get(base)
-        if free is None:
-            sub = bal.get(base)
-            if isinstance(sub, dict):
-                free = sub.get("free")
-        if free is None:
-            return None
-        if isinstance(free, bool):
-            return None
-        parsed = float(free)
-        return parsed if math.isfinite(parsed) and parsed >= 0 else None
+        if not isinstance(bal, dict):
+            raise TypeError("spot exit balance returned no balance object")
+        aggregate = bal.get("free")
+        if aggregate is not None and not isinstance(aggregate, dict):
+            raise TypeError("spot exit balance returned malformed free totals")
+        currency = bal.get(base)
+        if currency is not None and not isinstance(currency, dict):
+            raise TypeError("spot exit balance returned malformed currency row")
+
+        values = []
+        for raw in (
+            aggregate.get(base) if isinstance(aggregate, dict) else None,
+            currency.get("free") if isinstance(currency, dict) else None,
+        ):
+            if raw is None:
+                continue
+            if isinstance(raw, bool):
+                raise ValueError("spot exit balance returned boolean free amount")
+            parsed = float(raw)
+            if not math.isfinite(parsed) or parsed < 0:
+                raise ValueError("spot exit balance returned invalid free amount")
+            values.append(parsed)
+        if not values:
+            raise ValueError("spot exit balance returned no free base amount")
+        if any(
+            not math.isclose(
+                value,
+                values[0],
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            for value in values[1:]
+        ):
+            raise ValueError("spot exit balance returned conflicting free amounts")
+        return values[0]
     except Exception:
+        _record_response_error()
         return None
 
 
@@ -1588,22 +1678,42 @@ def emergency_close_all_spot(*,
 
                 curr = 0.0
                 try:
-                    price_allowed = try_consume_api_call(
-                        "spot_emergency_exit_fetch_ticker", critical=True
+                    price_reservation = try_consume_api_call(
+                        "spot_emergency_exit_fetch_ticker",
+                        critical=True,
+                        return_reservation=True,
                     )
                 except Exception as gate_error:
                     log_event(
                         f"  Price for {sym} unavailable: API budget gate "
                         f"failed ({gate_error})", "WARN"
                     )
-                    price_allowed = False
-                if price_allowed:
+                    price_reservation = None
+                if price_reservation:
                     try:
                         ticker = ex.fetch_ticker(symbol_pair)
+                        if not explicit_trade_symbol_matches(
+                            ticker, symbol_pair
+                        ):
+                            raise ValueError(
+                                "emergency spot ticker changed requested symbol"
+                            )
                         curr = _positive_finite(ticker.get("last"))
                         if curr <= 0:
                             curr = _positive_finite(ticker.get("close"))
+                        if curr <= 0:
+                            raise ValueError(
+                                "emergency spot ticker returned no positive price"
+                            )
                     except Exception as e:
+                        if isinstance(price_reservation, ApiCallReservation):
+                            try:
+                                record_api_error(
+                                    "spot_emergency_exit_fetch_ticker",
+                                    price_reservation,
+                                )
+                            except Exception:
+                                pass
                         log_event(f"  Price for {sym} unavailable: {e}", "WARN")
                 if curr <= 0:
                     curr = buy_price  # fallback

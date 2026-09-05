@@ -72,7 +72,15 @@ def evaluate_spot_exit_shadow_rules(
     move = _finite(move_pct)
     mfe = _finite(mfe_pct)
     mae = _finite(mae_pct)
-    current = now or datetime.now(timezone.utc)
+    if now is None:
+        try:
+            from core.clock import now_utc
+
+            current = now_utc()
+        except Exception:
+            current = datetime.now(timezone.utc)
+    else:
+        current = now
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     else:

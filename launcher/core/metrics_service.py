@@ -29,6 +29,7 @@ from pathlib import Path
 import requests as _req
 
 from bot_utils.config import _read_config_json
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.pnl_view import (
     futures_unrealized_from_row,
     is_futures_state_fresh,
@@ -51,15 +52,31 @@ class MetricsMarketDataError(RuntimeError):
 _METRICS_STATE_JSON_MAX_BYTES = 4 * 1024 * 1024
 
 
+def _unique_metrics_json_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate metrics state JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _read_metrics_json(path: str):
+    with open(path, "rb") as stream:
+        raw = stream.read(_METRICS_STATE_JSON_MAX_BYTES + 1)
+    if len(raw) > _METRICS_STATE_JSON_MAX_BYTES:
+        raise ValueError("metrics state JSON exceeds size limit")
+    return json.loads(
+        raw.decode("utf-8-sig"),
+        object_pairs_hook=_unique_metrics_json_object,
+    )
+
+
 def load_json(path: str) -> dict:
     """Best-effort JSON load. Returns ``{}`` on any failure (missing file,
     parse error, empty file)."""
     try:
-        with open(path, "rb") as stream:
-            raw = stream.read(_METRICS_STATE_JSON_MAX_BYTES + 1)
-        if len(raw) > _METRICS_STATE_JSON_MAX_BYTES:
-            return {}
-        data = json.loads(raw.decode("utf-8-sig"))
+        data = _read_metrics_json(path)
         return data if data else {}
     except Exception:
         return {}
@@ -537,12 +554,32 @@ def _spot_state_file(log_dir: str, bot_name: str = None,
 def get_open_trades(log_dir: str, bot_name: str = None,
                     mode_is_sim: bool | None = None) -> dict:
     """Open spot trades dict from the bot's (mode-aware) state file. ``{}`` if
-    missing or malformed."""
-    d = load_json(_spot_state_file(log_dir, bot_name, mode_is_sim))
-    return d if isinstance(d, dict) else {}
+    missing; an existing malformed file is an observable metrics failure."""
+    state_path = _spot_state_file(log_dir, bot_name, mode_is_sim)
+    if not os.path.exists(state_path):
+        return {}
+    try:
+        data = _read_metrics_json(state_path)
+        if not isinstance(data, dict):
+            raise ValueError("spot metrics state must be a JSON object")
+        return data
+    except Exception as exc:
+        raise MetricsMarketDataError(
+            f"{bot_name or 'SPOT'} state read failed: {exc}"
+        ) from exc
 
 
 #  Market regime + futures count 
+
+def _metrics_now_utc_naive() -> datetime:
+    """Use the same exchange anchor as persisted runtime telemetry."""
+    try:
+        from core.clock import now_utc
+
+        return now_utc().replace(tzinfo=None)
+    except Exception:
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 def _get_market_info_with_query(query):
     """Latest market regime row with most current Fear & Greed value.
@@ -553,7 +590,7 @@ def _get_market_info_with_query(query):
     scan rows (not CACHED_FG rows), so phase and btc_24h stay accurate.
     """
     latest_plausible = (
-        datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=5)
+        _metrics_now_utc_naive() + timedelta(minutes=5)
     ).strftime("%Y-%m-%d %H:%M:%S")
     # Regime + BTC from last real scan (not a CACHED_FG row)
     rows = query(
@@ -818,7 +855,7 @@ def _get_exchange_status_with_query(query) -> dict:
     'Bitget  Active' oder 'Binance  Idle (3m)'.
     """
     exch = _exchange_display_name()
-    status_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    status_now = _metrics_now_utc_naive()
     latest_plausible = (status_now + timedelta(minutes=5)).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
@@ -986,8 +1023,19 @@ def get_unrealized_pnl_spots(
         except (TypeError, ValueError):
             trades_by_bot[bot_name] = {}
             continue
-        trades = load_json(_spot_state_file(log_dir, bot_name, mode_is_sim))
-        trades_by_bot[bot_name] = trades if isinstance(trades, dict) else {}
+        state_path = _spot_state_file(log_dir, bot_name, mode_is_sim)
+        if not os.path.exists(state_path):
+            trades_by_bot[bot_name] = {}
+            continue
+        try:
+            trades = _read_metrics_json(state_path)
+            if not isinstance(trades, dict):
+                raise ValueError("spot metrics state must be a JSON object")
+        except Exception as exc:
+            raise MetricsMarketDataError(
+                f"{bot_name or 'SPOT'} state read failed: {exc}"
+            ) from exc
+        trades_by_bot[bot_name] = trades
 
     result = {bot_name: 0.0 for bot_name in requests}
     symbols = sorted({
@@ -1014,14 +1062,50 @@ def get_unrealized_pnl_spots(
     pairs = [f"{sym}/USDT" for sym in symbols]
     try:
         try:
-            from bot_utils.api_budget import try_consume_api_call
-            if not try_consume_api_call("launcher_fetch_tickers"):
+            from bot_utils.api_budget import (
+                ApiCallReservation,
+                record_api_error,
+                try_consume_api_call,
+            )
+            batch_reservation = try_consume_api_call(
+                "launcher_fetch_tickers",
+                return_reservation=True,
+            )
+            if not batch_reservation:
                 raise RuntimeError("launcher API budget exhausted")
         except ImportError as exc:
             raise RuntimeError(
                 "launcher API budget gate unavailable"
             ) from exc
-        batch = exchange.fetch_tickers(pairs) or {}
+        try:
+            batch = exchange.fetch_tickers(pairs)
+            if not isinstance(batch, dict):
+                raise TypeError("launcher batch ticker returned no ticker map")
+        except Exception:
+            if isinstance(batch_reservation, ApiCallReservation):
+                record_api_error("launcher_fetch_tickers", batch_reservation)
+            raise
+        invalid_batch_rows = any(
+            not isinstance(pair, str)
+            or not isinstance(ticker, dict)
+            or not explicit_trade_symbol_matches(ticker, pair)
+            for pair, ticker in batch.items()
+        )
+        if invalid_batch_rows:
+            if isinstance(batch_reservation, ApiCallReservation):
+                try:
+                    record_api_error(
+                        "launcher_fetch_tickers", batch_reservation
+                    )
+                except Exception:
+                    pass
+            batch = {
+                pair: ticker
+                for pair, ticker in batch.items()
+                if isinstance(pair, str)
+                and isinstance(ticker, dict)
+                and explicit_trade_symbol_matches(ticker, pair)
+            }
         # Instrument the launcher's own API consumption
         for sym in symbols:
             t = batch.get(f"{sym}/USDT") or {}
@@ -1042,19 +1126,46 @@ def get_unrealized_pnl_spots(
             continue
         try:
             try:
-                from bot_utils.api_budget import try_consume_api_call
-                if not try_consume_api_call("launcher_fetch_ticker"):
+                from bot_utils.api_budget import (
+                    ApiCallReservation,
+                    record_api_error,
+                    try_consume_api_call,
+                )
+                ticker_reservation = try_consume_api_call(
+                    "launcher_fetch_ticker",
+                    return_reservation=True,
+                )
+                if not ticker_reservation:
                     continue
             except ImportError as exc:
                 raise RuntimeError(
                     "launcher API budget gate unavailable"
                 ) from exc
-            t = exchange.fetch_ticker(f"{sym}/USDT") or {}
-            p = _finite_float_or_none(t.get("last"))
-            if p is None or p <= 0:
-                p = _finite_float_or_none(t.get("close"))
-            if p is not None and p > 0:
-                price_map[sym] = p
+            try:
+                t = exchange.fetch_ticker(f"{sym}/USDT")
+                if not isinstance(t, dict):
+                    raise TypeError(
+                        "launcher single ticker returned no ticker object"
+                    )
+                if not explicit_trade_symbol_matches(t, f"{sym}/USDT"):
+                    raise ValueError(
+                        "launcher single ticker returned a symbol mismatch"
+                    )
+                p = _finite_float_or_none(t.get("last"))
+                if p is None or p <= 0:
+                    p = _finite_float_or_none(t.get("close"))
+                if p is None or p <= 0:
+                    raise ValueError(
+                        "launcher single ticker returned no positive price"
+                    )
+            except Exception:
+                if isinstance(ticker_reservation, ApiCallReservation):
+                    record_api_error(
+                        "launcher_fetch_ticker",
+                        ticker_reservation,
+                    )
+                raise
+            price_map[sym] = p
         except Exception:
             pass  # price unavailable  position contributes 0
 

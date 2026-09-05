@@ -8,6 +8,19 @@ MAX_RSS_RESPONSE_BYTES = 2 * 1024 * 1024
 _STREAM_CHUNK_BYTES = 64 * 1024
 
 
+def _unique_external_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate external JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_external_json_constant(value: str):
+    raise ValueError(f"non-standard external JSON constant: {value}")
+
+
 def _close_response_quietly(response) -> None:
     try:
         closer = getattr(response, "close", None)
@@ -90,7 +103,11 @@ def read_bounded_json_response(
         getattr(response, "content", None), (bytes, bytearray)
     ):
         payload = read_bounded_response(response, max_bytes=max_bytes)
-        return json.loads(payload)
+        return json.loads(
+            payload,
+            object_pairs_hook=_unique_external_json_object,
+            parse_constant=_reject_external_json_constant,
+        )
     try:
         decoder = getattr(response, "json", None)
         if not callable(decoder):

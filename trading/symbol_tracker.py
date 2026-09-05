@@ -26,6 +26,7 @@ _RETENTION_SEC        = _GRACE_PERIOD_SEC * 30   # 30 Tage Historie
 _TRACKER_JSON_MAX_BYTES = 1024 * 1024
 
 _data: Dict[str, float] = {}          # symbol -> first_seen_epoch
+_last_seen: Dict[str, float] = {}     # process-local activity for retention/LRU
 _lock = threading.Lock()
 _last_persist: float = time.monotonic() - _PERSIST_INTERVAL_SEC
 _dirty = False
@@ -106,12 +107,29 @@ def _read_tracker_data(now: float) -> Dict[str, float]:
 
 def _load() -> None:
     """Ldt die persistierten Daten beim Import. Fehlertolerant."""
-    global _data
+    global _data, _last_seen, _dirty
     try:
         if os.path.exists(_TRACKER_FILE):
-            _data = _read_tracker_data(time.time())
+            now = time.time()
+            loaded = _read_tracker_data(now)
+            truncated = len(loaded) > _MAX_TRACKED
+            if truncated:
+                loaded = dict(sorted(
+                    loaded.items(),
+                    key=lambda item: (item[1], item[0]),
+                    reverse=True,
+                )[:_MAX_TRACKED])
+            _data = loaded
+            # The legacy/on-disk contract intentionally remains
+            # ``symbol -> first_seen``. Treat loaded entries conservatively as
+            # recently observed until this process can refresh them via
+            # record_seen().
+            _last_seen = {symbol: now for symbol in _data}
+            _dirty = truncated
     except Exception:
         _data = {}
+        _last_seen = {}
+        _dirty = False
 
 
 def _persist_locked() -> bool:
@@ -142,23 +160,35 @@ def _persist_locked() -> bool:
                 disk_data = {}
 
             merged = _validated_data(_data, now)
+            valid_local_last_seen = _validated_data(_last_seen, now)
+            merged_last_seen = {
+                symbol: max(timestamp, valid_local_last_seen.get(symbol, timestamp))
+                for symbol, timestamp in merged.items()
+            }
             for symbol, timestamp in disk_data.items():
                 current = merged.get(symbol)
                 if current is None or timestamp < current:
                     merged[symbol] = timestamp
+                if symbol not in merged_last_seen:
+                    # A disk-only entry was written by another live process
+                    # after our load. Preserve it as recently observed.
+                    merged_last_seen[symbol] = now
 
             cutoff = now - _RETENTION_SEC
             snapshot = {
                 symbol: timestamp
                 for symbol, timestamp in merged.items()
-                if timestamp >= cutoff
+                if merged_last_seen.get(symbol, timestamp) >= cutoff
             }
 
             if len(snapshot) > _MAX_TRACKED:
                 # LRU prune: behalte die NEWESTEN N
                 sorted_items = sorted(
                     snapshot.items(),
-                    key=lambda item: item[1],
+                    key=lambda item: (
+                        merged_last_seen.get(item[0], item[1]),
+                        item[1],
+                    ),
                     reverse=True,
                 )
                 snapshot = dict(sorted_items[:_MAX_TRACKED])
@@ -169,6 +199,11 @@ def _persist_locked() -> bool:
 
         _data.clear()
         _data.update(snapshot)
+        _last_seen.clear()
+        _last_seen.update({
+            symbol: merged_last_seen.get(symbol, timestamp)
+            for symbol, timestamp in snapshot.items()
+        })
         _last_persist = persist_now
         _dirty = False
         return True
@@ -185,8 +220,10 @@ def record_seen(symbol: str) -> None:
     with _lock:
         if _persist_shutdown:
             return
+        now = time.time()
+        _last_seen[symbol] = now
         if symbol not in _data:
-            _data[symbol] = time.time()
+            _data[symbol] = now
             _dirty = True
             _persist_locked()
 

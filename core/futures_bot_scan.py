@@ -46,7 +46,12 @@ from bot_utils import (
     filled_margin_usdt,
     get_maintenance_margin_rate,
 )
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.trade_state import state_exposure_count
 from trading.entry_quality import EntryQuality, score_futures_entry
 
@@ -77,7 +82,9 @@ class FuturesScanMixin:
         return str(value).strip().lower() in ("1", "true", "yes", "on")
 
     def _new_entries_enabled(self) -> bool:
-        """Hot-reloaded admission gate; invalid live values fail closed."""
+        """Return the FUTURES-only hot-reloaded admission gate."""
+        if str(getattr(self, "BOT_NAME", "")).upper() != "FUTURES":
+            return True
         return self._bool_cfg_value(
             self.C("NEW_ENTRIES_ENABLED", True), True
         )
@@ -887,18 +894,47 @@ class FuturesScanMixin:
                     timeout=4.0,
                 )
                 if not has_valid_spread_quotes(entry_ticker):
-                    if not try_consume_api_call(
-                        "futures_entry_fetch_spread_book"
-                    ):
+                    spread_book_reservation = try_consume_api_call(
+                        "futures_entry_fetch_spread_book",
+                        return_reservation=True,
+                    )
+                    if not spread_book_reservation:
                         log_event(
                             f"{sym}: {direction} blocked  API budget "
                             "exhausted before spread order book",
                             "WAIT",
                         )
                         return
-                    ob = self.ex.fetch_order_book(symbol_full, limit=5)
+                    try:
+                        ob = self.ex.fetch_order_book(symbol_full, limit=5)
+                        if not explicit_trade_symbol_matches(ob, symbol_full):
+                            raise ValueError(
+                                "futures entry spread book changed requested symbol"
+                            )
+                    except Exception:
+                        if isinstance(
+                            spread_book_reservation, ApiCallReservation
+                        ):
+                            try:
+                                record_api_error(
+                                    "futures_entry_fetch_spread_book",
+                                    spread_book_reservation,
+                                )
+                            except Exception:
+                                pass
+                        raise
                     top = extract_valid_top_of_book(ob)
                     if top is None:
+                        if isinstance(
+                            spread_book_reservation, ApiCallReservation
+                        ):
+                            try:
+                                record_api_error(
+                                    "futures_entry_fetch_spread_book",
+                                    spread_book_reservation,
+                                )
+                            except Exception:
+                                pass
                         log_event(
                             f"{sym}: {direction} blocked  invalid spread "
                             "order book",
@@ -1532,9 +1568,10 @@ class FuturesScanMixin:
                         for _att in range(2):
                             _t.sleep(0.4 * (1 + _att))
                             try:
-                                allowed = try_consume_api_call(
+                                reservation = try_consume_api_call(
                                     "futures_entry_fill_fetch_order",
                                     critical=True,
+                                    return_reservation=True,
                                 )
                             except Exception as budget_exc:
                                 log_event(
@@ -1544,7 +1581,7 @@ class FuturesScanMixin:
                                     "WARN",
                                 )
                                 break
-                            if not allowed:
+                            if not reservation:
                                 log_event(
                                     f"{sym}: entry fill refresh skipped - API "
                                     f"budget exhausted",
@@ -1552,7 +1589,34 @@ class FuturesScanMixin:
                                 )
                                 break
                             try:
-                                refreshed = self.ex.fetch_order(str(oid), symbol_full)
+                                try:
+                                    refreshed = self.ex.fetch_order(
+                                        str(oid), symbol_full
+                                    )
+                                except Exception:
+                                    if isinstance(
+                                        reservation, ApiCallReservation
+                                    ):
+                                        try:
+                                            record_api_error(
+                                                "futures_entry_fill_fetch_order",
+                                                reservation,
+                                            )
+                                        except Exception:
+                                            pass
+                                    raise
+                                if not isinstance(refreshed, dict) or not refreshed:
+                                    if isinstance(
+                                        reservation, ApiCallReservation
+                                    ):
+                                        try:
+                                            record_api_error(
+                                                "futures_entry_fill_fetch_order",
+                                                reservation,
+                                            )
+                                        except Exception:
+                                            pass
+                                    continue
                                 if isinstance(refreshed, dict) and refreshed:
                                     refreshed_ids = _explicit_order_ids(refreshed)
                                     identity_conflict = (
@@ -1579,14 +1643,13 @@ class FuturesScanMixin:
                                         )
                                         continue
                                     latest_order = refreshed
-                                rf = self._positive_float(
-                                    (refreshed or {}).get("filled"))
+                                rf = self._positive_float(refreshed.get("filled"))
                                 if rf > 0:
                                     amount = rf
                                     entry_verified = True
                                     # Realen Fill-Preis gleich mitnehmen
                                     for _k in ("average", "price"):
-                                        _v = (refreshed or {}).get(_k)
+                                        _v = refreshed.get(_k)
                                         if _v:
                                             try:
                                                 _fv = float(_v)
@@ -2614,8 +2677,9 @@ class FuturesScanMixin:
             return os.getenv(flag, "1").strip().lower() not in ("0","false","no","off")
         def _f(flag, default):
             try:
-                return float(os.getenv(flag, str(default)))
-            except (ValueError, TypeError):
+                parsed = float(os.getenv(flag, str(default)))
+                return parsed if math.isfinite(parsed) else default
+            except (ValueError, TypeError, OverflowError):
                 return default
 
         try:

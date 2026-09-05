@@ -28,6 +28,7 @@ from bot_utils.state_persist import (atomic_save_json,
                                        _valid_buy_time,
                                        _valid_pending_accounting_items,
                                        is_canonical_position_symbol,
+                                       position_boolean_rejection_field,
                                        validate_spot_state,
                                        validate_futures_state)
 from bot_utils.order_utils import order_id_text_or_none
@@ -231,6 +232,22 @@ def _normalize_position_row(
 ) -> tuple[Optional[dict], str]:
     if not isinstance(data, dict):
         return None, "not-dict"
+    invalid_boolean = position_boolean_rejection_field(data)
+    if invalid_boolean is not None:
+        return None, f"invalid {invalid_boolean}=non-boolean"
+    invalid_pending = next(
+        (
+            field
+            for field in (
+                "accounting_pending_partials",
+                "unpriced_external_partials",
+            )
+            if field in data and not _valid_pending_accounting_items(data[field])
+        ),
+        None,
+    )
+    if invalid_pending is not None:
+        return None, f"invalid {invalid_pending} structure"
     position_type = data.get("position_type")
     if is_futures and (
         not isinstance(position_type, str)
@@ -264,6 +281,18 @@ def _normalize_position_row(
     nonfinite_path = _nonfinite_value_path(normalized)
     if nonfinite_path is not None:
         return None, f"non-finite {nonfinite_path}"
+    for field in (
+        "fees_paid",
+        "initial_entry_fee",
+        "funding_paid",
+        "funding_booked_on_partials",
+    ):
+        raw_accounting = normalized.get(field)
+        if raw_accounting is not None:
+            accounting = _finite_float_or_none(raw_accounting)
+            if accounting is None:
+                return None, f"invalid {field}=non-numeric"
+            normalized[field] = accounting
     if "buy_price" in normalized:
         normalized["buy_price"] = buy_val
     if "buy" in normalized:

@@ -17,8 +17,10 @@ import math
 import threading
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FutTimeout
 
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.safe_numeric import safe_positive_float
 
 
@@ -27,8 +29,16 @@ class TickerOverloaded(Exception):
     Callers should treat this like a timeout: try cached, else skip."""
 
 
-def _normalize_ticker_price(ticker: dict | None) -> dict | None:
+def _normalize_ticker_price(
+    ticker: dict | None,
+    expected_symbol: str | None = None,
+) -> dict | None:
     if not isinstance(ticker, dict):
+        return None
+    if (
+        expected_symbol is not None
+        and not explicit_trade_symbol_matches(ticker, expected_symbol)
+    ):
         return None
     price = safe_positive_float(ticker.get("last"), 0.0)
     if price <= 0:
@@ -38,6 +48,15 @@ def _normalize_ticker_price(ticker: dict | None) -> dict | None:
     out = dict(ticker)
     out["last"] = price
     return out
+
+
+def _wall_time_or_none() -> float | None:
+    """Read diagnostic wall time without making it part of the price path."""
+    try:
+        value = float(time.time())
+    except (OSError, TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 class TickerCache:
@@ -257,28 +276,31 @@ class TickerCache:
     def _note_request_result(self, *, ok: bool) -> None:
         with self._stats_lock:
             completed_at = time.monotonic()
-            completed_wall_ts = time.time()
+            completed_wall_ts = _wall_time_or_none()
             if ok:
                 self._stats["consecutive_unavailable_requests"] = 0
                 self._stats["first_unavailable_request_wall_ts"] = None
-                self._stats["last_ticker_success_wall_ts"] = completed_wall_ts
+                if completed_wall_ts is not None:
+                    self._stats["last_ticker_success_wall_ts"] = completed_wall_ts
                 self._last_ticker_success_monotonic = completed_at
                 self._unavailable_request_started_monotonic = None
             else:
                 if not self._stats["consecutive_unavailable_requests"]:
-                    self._stats[
-                        "first_unavailable_request_wall_ts"
-                    ] = completed_wall_ts
+                    if completed_wall_ts is not None:
+                        self._stats[
+                            "first_unavailable_request_wall_ts"
+                        ] = completed_wall_ts
                     self._unavailable_request_started_monotonic = completed_at
                 self._stats["consecutive_unavailable_requests"] += 1
-                self._stats[
-                    "last_ticker_unavailable_wall_ts"
-                ] = completed_wall_ts
+                if completed_wall_ts is not None:
+                    self._stats[
+                        "last_ticker_unavailable_wall_ts"
+                    ] = completed_wall_ts
 
     def _note_fetch_result(self, started_at: float, *, ok: bool) -> None:
         with self._stats_lock:
             completed_at = time.monotonic()
-            completed_wall_ts = time.time()
+            completed_wall_ts = _wall_time_or_none()
             elapsed_ms = max(0.0, (completed_at - started_at) * 1000.0)
             key = "fetch_success" if ok else "fetch_errors"
             self._stats[key] += 1
@@ -288,27 +310,31 @@ class TickerCache:
             if ok:
                 self._stats["consecutive_fetch_errors"] = 0
                 self._stats["first_consecutive_error_wall_ts"] = None
-                self._stats["last_fetch_success_wall_ts"] = completed_wall_ts
+                if completed_wall_ts is not None:
+                    self._stats["last_fetch_success_wall_ts"] = completed_wall_ts
                 self._last_fetch_success_monotonic = completed_at
                 self._consecutive_error_started_monotonic = None
             else:
                 if not self._stats["consecutive_fetch_errors"]:
-                    self._stats[
-                        "first_consecutive_error_wall_ts"
-                    ] = completed_wall_ts
+                    if completed_wall_ts is not None:
+                        self._stats[
+                            "first_consecutive_error_wall_ts"
+                        ] = completed_wall_ts
                     self._consecutive_error_started_monotonic = completed_at
                 self._stats["consecutive_fetch_errors"] += 1
-                self._stats["last_fetch_error_wall_ts"] = completed_wall_ts
+                if completed_wall_ts is not None:
+                    self._stats["last_fetch_error_wall_ts"] = completed_wall_ts
 
     def _note_late_fetch_success(self) -> None:
         """Reset current source-outage state without double-counting an attempt."""
         with self._stats_lock:
             completed_at = time.monotonic()
-            completed_wall_ts = time.time()
+            completed_wall_ts = _wall_time_or_none()
             self._stats["late_fetch_success"] += 1
             self._stats["consecutive_fetch_errors"] = 0
             self._stats["first_consecutive_error_wall_ts"] = None
-            self._stats["last_fetch_success_wall_ts"] = completed_wall_ts
+            if completed_wall_ts is not None:
+                self._stats["last_fetch_success_wall_ts"] = completed_wall_ts
             self._last_fetch_success_monotonic = completed_at
             self._consecutive_error_started_monotonic = None
 
@@ -351,7 +377,10 @@ class TickerCache:
     ) -> None:
         """Retain a valid result that arrived after the caller timed out."""
         try:
-            ticker = _normalize_ticker_price(future.result() or {})
+            ticker = _normalize_ticker_price(
+                future.result() or {},
+                symbol_full,
+            )
         except Exception:
             return
         if ticker is None:
@@ -730,7 +759,7 @@ class TickerCache:
             # Timestamp AFTER fetch completes (so cache TTL reflects
             # actual data freshness, not when we submitted the job).
             post_now = time.monotonic()
-            ticker = _normalize_ticker_price(ticker)
+            ticker = _normalize_ticker_price(ticker, symbol_full)
             if ticker is None:
                 _record_fetch_api_error()
                 self._note("invalid_payloads")

@@ -67,6 +67,7 @@ from typing import Dict, List, Optional, Tuple
 from core.models import Position, Signal, PositionType
 from core.state_manager import StateManager
 from core.event_bus import get_bus, register_console_logger, register_structured_logger
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.safe_numeric import safe_positive_float
 
 
@@ -365,6 +366,8 @@ class BaseBot(ABC):
         # REST fallback
         try:
             ticker = self._exchange.fetch_ticker(symbol)
+            if not explicit_trade_symbol_matches(ticker, symbol):
+                raise ValueError("base bot ticker changed requested symbol")
             price = safe_positive_float(ticker.get("last"), 0.0)
             if price > 0:
                 return price

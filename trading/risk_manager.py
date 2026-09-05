@@ -16,8 +16,10 @@ from datetime import datetime, timedelta, timezone
 import core.constants as C
 from bot_utils.config import (
     _INT_FIELDS,
+    _clamp,
     _finite_integral_or_none,
     _read_config_json,
+    parse_explicit_bool,
 )
 from core.constants import MarketRegime
 from core.database import (
@@ -215,8 +217,8 @@ def get_base_capital(bot_name: str) -> float:
     try:
         cfg = _load_bot_config(bot_name)
         value = _finite_float_or_none(cfg.get("BASE_CAPITAL_USDT"))
-        if value is not None and value > 0.0:
-            return value
+        if value is not None:
+            return float(_clamp("BASE_CAPITAL_USDT", value))
     except Exception:
         pass
     return DEFAULT_BASE_CAPITAL
@@ -249,6 +251,18 @@ def validate_config_or_die(bot_name: str) -> dict:
                     "WARN",
                 )
                 _fatal_exit(1)
+        if (
+            bot_name.upper() == "FUTREND"
+            and "TREND_TIMEFRAME" in cfg
+            and str(cfg["TREND_TIMEFRAME"]).strip().lower()
+            not in {"1h", "4h", "1d"}
+        ):
+            log_event(
+                f"[{bot_name}] FATAL: TREND_TIMEFRAME must be 1h, 4h, or "
+                f"1d. Refusing to start.",
+                "WARN",
+            )
+            _fatal_exit(1)
         for fast_key, slow_key in (
             ("TREND_SMA_FAST", "TREND_SMA_SLOW"),
             ("TREND_CROSS_FAST", "TREND_CROSS_SLOW"),
@@ -355,6 +369,12 @@ def validate_config_or_die(bot_name: str) -> dict:
             _td = _require_finite_float(
                 cfg["TRAILING_DISTANCE"], "TRAILING_DISTANCE"
             )
+            if 0.0 < _ap <= 0.25:
+                log_event(
+                    f"[{bot_name}] FATAL: ACTIVATION_PROFIT={_ap} must be 0 "
+                    f"(disabled) or above the 0.25% trailing floor. Refusing "
+                    f"to start.", "WARN")
+                _fatal_exit(1)
             if _ap > 0 and _td >= _ap:
                 log_event(
                     f"[{bot_name}] FATAL: TRAILING_DISTANCE={_td} >= "
@@ -450,25 +470,81 @@ def validate_config_or_die(bot_name: str) -> dict:
                 "WARN",
             )
             _fatal_exit(1)
+        for bool_key in (
+            "LEARNING_DISABLED",
+            "ENTRY_QUALITY_FILTER_ENABLED",
+            "NEW_ENTRIES_ENABLED",
+            "ENTRY_QUALITY_SHADOW_ENABLED",
+            "SPOT_EXIT_SHADOW_ENABLED",
+            "OWN_MOMENTUM_FILTER",
+            "CRASH_FILTER",
+            "FAILED_ENTRY_STOP_ENABLED",
+            "PRE_ACTIVATION_GIVEBACK_STOP_ENABLED",
+            "MFE_FALLBACK_STOP_ENABLED",
+        ):
+            if (
+                bool_key in cfg
+                and parse_explicit_bool(cfg[bool_key]) is None
+            ):
+                log_event(
+                    f"[{bot_name}] FATAL: {bool_key} must be an explicit "
+                    "boolean. Refusing to start.",
+                    "WARN",
+                )
+                _fatal_exit(1)
         _checks = (
-            ("MONITOR_INTERVAL", 5, 600),
-            ("MAX_OPEN_TRADES", 1, 50),
-            ("LIQ_SAFETY_PCT", 0.01, 100.0),
+            ("SCAN_INTERVAL", 30, 600),
+            ("MONITOR_INTERVAL", 5, 120),
+            ("COOLDOWN_AFTER_SL", 0, 1440),
+            ("MAX_OPEN_TRADES", 1, 30),
+            ("MAX_DAILY_LOSS_HARD_MULT", 1.0, 5.0),
+            ("FUT_FLATTEN_BTC_CRASH_PCT", -100.0, 0.0),
+            ("LIQ_SAFETY_PCT", 5.0, 50.0),
+            ("MIN_VOLUME", 1_000_000.0, 1_000_000_000.0),
+            ("BASE_CAPITAL_USDT", 50.0, 100_000.0),
+            ("MAX_GROSS_EXPOSURE_PCT", 0.0, 200.0),
             ("TREND_VOTE_MIN", 1, 3),
             ("TREND_EXIT_VOTE", 1, 3),
-            ("TREND_SMA_FAST", 1, 5000),
-            ("TREND_SMA_SLOW", 1, 5000),
+            ("TREND_SMA_FAST", 10, 1000),
+            ("TREND_SMA_SLOW", 20, 2000),
             ("TREND_CROSS_FAST", 1, 5000),
             ("TREND_CROSS_SLOW", 1, 5000),
-            ("TREND_VOL_TARGET_LOOKBACK", 2, 500),
-            ("TREND_EXIT_STALE_LIMIT", 1, 50),
-            ("MAX_NEW_TRADES_PER_TICK", 0, 50),
+            ("TREND_VOL_TARGET", 0, 1),
+            ("TREND_VOL_TARGET_LOOKBACK", 10, 200),
+            ("TREND_EXIT_STALE_LIMIT", 1, 10),
+            ("MAX_NEW_TRADES_PER_TICK", 0, 10),
+            ("OWN_MOMENTUM_WINDOW", 3, 50),
+            ("OWN_MOMENTUM_MIN_LOSS_PCT", 0, 50),
+            ("FAILED_ENTRY_MAX_AGE_MIN", 15, 360),
+            ("FAILED_ENTRY_MIN_MFE_PCT", 0.0, 5.0),
+            ("FAILED_ENTRY_LOSS_PCT", -10.0, -0.5),
+            ("PRE_ACTIVATION_MIN_MFE_PCT", 0.0, 10.0),
+            ("PRE_ACTIVATION_GIVEBACK_PCT", 0.25, 10.0),
+            ("ACTIVATION_PROFIT", 0.0, 20.0),
+            ("TRAILING_DISTANCE", 0.0, 10.0),
+            ("POST_PARTIAL_TRAILING_DISTANCE", 0.25, 10.0),
+            ("INITIAL_STOP_LOSS", -90.0, -0.5),
+            ("PER_LEG_DISASTER_STOP", -90.0, -5.0),
+            ("BREAKEVEN_TRIGGER", 0.0, 10.0),
+            ("RSI_MAX", 40.0, 90.0),
+            ("MIN_PUMP", 0.5, 20.0),
             ("XSEC_K", 1, 15),
+            ("XSEC_MAX_FUNDING_PCT", 0, 5),
             ("XSEC_LOOKBACK_HOURS", 6, 336),
             ("XSEC_REBALANCE_HOURS", 6, 336),
             ("XSEC_UNIVERSE_SIZE", 10, 100),
+            ("XSEC_TOPUP_MAX_ATTEMPTS", 1, 100),
+            ("CROSS_DISASTER_BLACKLIST_HOURS", 0, 87_600),
+            ("SINGLE_STOP_BLACKLIST_HOURS", 0, 87_600),
+            ("BAD_SYMBOL_BLACKLIST_HOURS", 0, 87_600),
+            ("BAD_SYMBOL_LOSS_COUNT", 1, 40),
+            ("BAD_SYMBOL_LOOKBACK_DAYS", 1, 3650),
+            ("SINGLE_STOP_MIN_LOSS_PCT", 0.0, 99.0),
+            ("TREND_CHECK_MINUTES", 5, 240),
+            ("TREND_UNIVERSE_SIZE", 10, 100),
+            ("TREND_CHECK_HOURS", 1, 24),
             ("CRASH_WINDOW", 1, 50),
-            ("XSEC_MAX_SPREAD_PCT", 0.01, 10.0),
+            ("XSEC_MAX_SPREAD_PCT", 0.01, 3.0),
             ("TIME_DECAY_MAX_AGE_MINUTES", 5, 10080),
             ("TIME_DECAY_MIN_MFE_PCT", 0, 20),
             ("MAKER_FIRST_TTL_SECONDS", 0, 30),
@@ -481,6 +557,13 @@ def validate_config_or_die(bot_name: str) -> dict:
             ("VENUE_RECORDER_MAX_STORAGE_GIB", 0.1, 1000),
             ("VENUE_L2_SAMPLE_INTERVAL_SECONDS", 0.25, 60),
             ("VENUE_L2_STALE_AFTER_MS", 250, 60000),
+            ("PORTFOLIO_MAX_GROSS_PCT", 0.0, 1000.0),
+            ("PORTFOLIO_MAX_NET_PCT", 0.0, 1000.0),
+            ("PORTFOLIO_MIN_FREE_PCT", 0.0, 100.0),
+            ("PORTFOLIO_MAX_CLUSTER_PCT", 0.0, 1000.0),
+            ("PORTFOLIO_MAX_BETA_PCT", 0.0, 1000.0),
+            ("ENTRY_QUALITY_MIN_SCORE", 0.0, 100.0),
+            ("ENTRY_QUALITY_SHADOW_MIN_SCORE", 0.0, 100.0),
         )
         for _key, _lo, _hi in _checks:
             if _key in cfg:
@@ -523,6 +606,9 @@ def _read_position_config(bot_name: str) -> tuple:
         )
         if base is None or maxv is None or base <= 0.0 or maxv <= 0.0:
             raise ValueError("position sizing config must be finite and positive")
+        hard_limit = _max_position_limit(bot_name)
+        base = min(base, hard_limit)
+        maxv = min(maxv, hard_limit)
         minv = max(1.0, base * 0.5)
         minv = min(minv, maxv)
         return base, minv, maxv
@@ -547,11 +633,11 @@ def get_rsi_max(bot_name: str) -> float:
         if "RSI_MAX" in cfg:
             configured = _finite_float_or_none(cfg["RSI_MAX"])
             if configured is not None:
-                return configured
+                return float(_clamp("RSI_MAX", configured))
     except Exception:
         pass
     learned = _finite_float_or_none(get_param(bot_name, "rsi_max", default))
-    return learned if learned is not None else default
+    return float(_clamp("RSI_MAX", learned if learned is not None else default))
 
 
 def check_blacklist(symbol: str, bot_name: str) -> bool:
@@ -626,15 +712,22 @@ def own_momentum_blocked(bot_name: str, mode_is_sim=None) -> tuple:
     """
     try:
         cfg = _load_bot_config(bot_name)
-        on = str(cfg.get("OWN_MOMENTUM_FILTER", False)).strip().lower() in (
-            "1", "true", "yes", "on")
+        on = parse_explicit_bool(cfg.get("OWN_MOMENTUM_FILTER", False))
+        if on is None:
+            return True, "Own-momentum config invalid - pausing new entries"
         if not on:
             return False, ""
-        try:
-            window = int(float(cfg.get("OWN_MOMENTUM_WINDOW", 8)))
-        except (TypeError, ValueError):
-            window = 8
-        window = max(3, min(50, window))
+        window = _finite_integral_or_none(cfg.get("OWN_MOMENTUM_WINDOW", 8))
+        min_loss_pct = _finite_float_or_none(
+            cfg.get("OWN_MOMENTUM_MIN_LOSS_PCT", 0.5)
+        )
+        if (
+            window is None
+            or not 3 <= window <= 50
+            or min_loss_pct is None
+            or not 0.0 <= min_loss_pct <= 50.0
+        ):
+            return True, "Own-momentum config invalid - pausing new entries"
         # get_recent_trades already returns only fully-closed (is_partial=0) rows.
         trades = get_recent_trades(
             bot_name,
@@ -660,14 +753,6 @@ def own_momentum_blocked(bot_name: str, mode_is_sim=None) -> tuple:
         # The loss must exceed OWN_MOMENTUM_MIN_LOSS_PCT % of the capital deployed
         # across the window (default 0.5%). Without this a net of e.g. -0.02 USDT
         # (effectively breakeven) would pause all entries.
-        try:
-            min_loss_pct = _finite_float_or_none(
-                cfg.get("OWN_MOMENTUM_MIN_LOSS_PCT", 0.5))
-            if min_loss_pct is None:
-                raise ValueError("invalid OWN_MOMENTUM_MIN_LOSS_PCT")
-            min_loss_pct = max(0.0, min_loss_pct)
-        except (TypeError, ValueError):
-            min_loss_pct = 0.5
         threshold = -(min_loss_pct / 100.0) * total_inv if total_inv > 0 else 0.0
         if net < threshold:
             _pct = (net / total_inv * 100.0) if total_inv > 0 else 0.0
@@ -727,7 +812,7 @@ def is_bot_paused(bot_name: str, exchange=None, simulation: bool = True) -> tupl
 
 
 def get_reflection_context(bot_name: str) -> str:
-    now = _time.time()
+    now = _time.monotonic()
     with _REFLECTION_LOCK:
         cached = _reflection_cache.get(bot_name)
         if cached is not None:
@@ -831,7 +916,10 @@ def _analyze_and_adapt_once(bot_name: str) -> None:
         bot_config = _load_bot_config(bot_name)
         if isinstance(bot_config, _UnavailableBotConfig):
             return
-        if bot_config.get("LEARNING_DISABLED"):
+        learning_disabled = parse_explicit_bool(
+            bot_config.get("LEARNING_DISABLED", False)
+        )
+        if learning_disabled is None or learning_disabled:
             return
     except Exception:
         return

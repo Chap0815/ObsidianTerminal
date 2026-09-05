@@ -53,6 +53,8 @@ def futures_unrealized_from_row(row: Any) -> tuple[float, float]:
         margin = _finite_float(get("margin_usdt", 0.0))
         leverage = _finite_float(get("leverage", 1.0), 1.0)
         side = str(get("position_type", "") or "").upper()
+        if side not in {"LONG", "SHORT"}:
+            return stored_pnl, stored_pct
         if entry <= 0.0 or current <= 0.0 or margin <= 0.0:
             return stored_pnl, stored_pct
         calc_pnl, calc_pct = calc_unrealized_pnl(
@@ -72,18 +74,11 @@ def _parse_utc_timestamp(value: Any) -> datetime | None:
     text = str(value).strip()
     if not text:
         return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
     try:
-        dt = datetime.fromisoformat(text)
+        dt = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
     except ValueError:
-        try:
-            dt = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        return None
+    return dt.replace(tzinfo=timezone.utc)
 
 
 def futures_state_age_sec(row: Any, *, now: datetime | None = None) -> float | None:
@@ -94,7 +89,15 @@ def futures_state_age_sec(row: Any, *, now: datetime | None = None) -> float | N
     dt = _parse_utc_timestamp(ts)
     if dt is None:
         return None
-    ref = now or datetime.now(timezone.utc)
+    if now is None:
+        try:
+            from core.clock import now_utc
+
+            ref = now_utc()
+        except Exception:
+            ref = datetime.now(timezone.utc)
+    else:
+        ref = now
     if ref.tzinfo is None:
         ref = ref.replace(tzinfo=timezone.utc)
     return (ref.astimezone(timezone.utc) - dt).total_seconds()

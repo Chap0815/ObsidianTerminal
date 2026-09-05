@@ -14,13 +14,21 @@ import math
 import time
 from datetime import datetime, timezone
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
 from bot_utils.futures_order import (
     FUTURES_DEFAULT_TAKER_FEE,
     _position_contracts_abs,
     position_row_side,
 )
-from bot_utils.order_utils import explicit_trade_symbol_matches
+from bot_utils.order_utils import (
+    explicit_trade_symbol_matches,
+    order_id_text_or_none,
+    strict_order_snapshot_equal,
+)
 from core.clock import now_utc
 
 _OFFLINE_ACCOUNTING_RETRY_BASE_SEC = 30.0
@@ -661,28 +669,75 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
     if hedge_mode is None:
         return 0.0, 0.0, "unavailable"
     try:
-        if not try_consume_api_call("futures_reconcile_fetch_my_trades"):
+        api_reservation = try_consume_api_call(
+            "futures_reconcile_fetch_my_trades",
+            return_reservation=True,
+        )
+        if not api_reservation:
             return 0.0, 0.0, "budget_unavailable"
     except Exception:
         return 0.0, 0.0, "budget_unavailable"
+
+    def _record_fetch_error() -> None:
+        if not isinstance(api_reservation, ApiCallReservation):
+            return
+        try:
+            record_api_error(
+                "futures_reconcile_fetch_my_trades",
+                api_reservation,
+            )
+        except Exception:
+            pass
+
     try:
-        trades = bot.ex.fetch_my_trades(symbol_full, limit=50) or []
+        trades = bot.ex.fetch_my_trades(symbol_full, limit=50)
     except Exception:
+        _record_fetch_error()
+        return 0.0, 0.0, "unavailable"
+    if not isinstance(trades, list):
+        _record_fetch_error()
         return 0.0, 0.0, "unavailable"
     eligible_trades = []
+    seen_trade_ids: dict[str, dict] = {}
+    unidentified_trades: list[dict] = []
     for trade in trades:
         if not isinstance(trade, dict):
+            _record_fetch_error()
             return 0.0, 0.0, "unavailable"
         if not explicit_trade_symbol_matches(trade, symbol_full):
-            continue
+            _record_fetch_error()
+            return 0.0, 0.0, "unavailable"
+        raw_trade_id = trade.get("id")
+        if raw_trade_id is not None:
+            trade_id = order_id_text_or_none(raw_trade_id)
+            if trade_id is None:
+                _record_fetch_error()
+                return 0.0, 0.0, "unavailable"
+            previous_trade = seen_trade_ids.get(trade_id)
+            if previous_trade is not None:
+                if not strict_order_snapshot_equal(previous_trade, trade):
+                    _record_fetch_error()
+                    return 0.0, 0.0, "unavailable"
+                continue
+            seen_trade_ids[trade_id] = trade
+        else:
+            if any(
+                strict_order_snapshot_equal(previous_trade, trade)
+                for previous_trade in unidentified_trades
+            ):
+                _record_fetch_error()
+                return 0.0, 0.0, "unavailable"
+            unidentified_trades.append(trade)
         timestamp_ms = _trade_timestamp_ms_or_none(trade)
         if timestamp_ms is None and _is_close_trade_for_position(
             trade,
             pos_type,
             hedge_mode=hedge_mode,
         ):
+            _record_fetch_error()
             return 0.0, 0.0, "unavailable"
         if timestamp_ms is not None and timestamp_ms > future_ceiling_ms:
+            _record_fetch_error()
             return 0.0, 0.0, "unavailable"
         if timestamp_ms is None or timestamp_ms < boundary_ms:
             continue
@@ -706,6 +761,7 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
         amt = _trade_amount(t)
         price = _trade_price(t)
         if amt <= 0 or price <= 0:
+            _record_fetch_error()
             return 0.0, 0.0, "unavailable"
         take = min(amt, max(0.0, target - qty))
         if take <= 0:
@@ -762,14 +818,36 @@ def _find_futures_external_close_price(bot, symbol_full: str,
     if not allow_ticker:
         return 0.0, 0.0, "unavailable"
     try:
-        if not try_consume_api_call("futures_reconcile_fetch_ticker"):
+        api_reservation = try_consume_api_call(
+            "futures_reconcile_fetch_ticker",
+            return_reservation=True,
+        )
+        if not api_reservation:
             return 0.0, 0.0, "unavailable"
-        ticker = bot.ex.fetch_ticker(symbol_full)
-        price = _positive_float_or_none(ticker.get("last"))
-        if price is None:
-            price = _positive_float_or_none(ticker.get("close"))
-        if price is not None and price > 0:
-            return price, 0.0, "current_ticker"
+        try:
+            ticker = bot.ex.fetch_ticker(symbol_full)
+            if not explicit_trade_symbol_matches(ticker, symbol_full):
+                raise ValueError(
+                    "futures reconcile ticker returned a symbol mismatch"
+                )
+            price = _positive_float_or_none(ticker.get("last"))
+            if price is None:
+                price = _positive_float_or_none(ticker.get("close"))
+            if price is None or price <= 0:
+                raise ValueError(
+                    "futures reconcile ticker returned no positive price"
+                )
+        except Exception:
+            if isinstance(api_reservation, ApiCallReservation):
+                try:
+                    record_api_error(
+                        "futures_reconcile_fetch_ticker",
+                        api_reservation,
+                    )
+                except Exception:
+                    pass
+            return 0.0, 0.0, "unavailable"
+        return price, 0.0, "current_ticker"
     except Exception:
         pass
     return 0.0, 0.0, "unavailable"
@@ -857,11 +935,13 @@ def _fetch_futures_contracts(
     full = f"{sym}/USDT:USDT"
     try:
         from config.exchange_config import safe_fetch_positions
-        if not try_consume_api_call(
-            "futures_reconcile_fetch_positions_scoped", critical=True
-        ):
-            return None
-        poss = safe_fetch_positions(bot.ex, [full])
+        poss = safe_fetch_positions(
+            bot.ex,
+            [full],
+            endpoint="futures_reconcile_fetch_positions_scoped",
+            critical=True,
+            raise_on_budget_denied=True,
+        )
         scoped_has_symbol = False
         if poss is not None:
             try:
@@ -869,11 +949,12 @@ def _fetch_futures_contracts(
             except Exception:
                 scoped_has_symbol = False
         if poss is None or not scoped_has_symbol:
-            if not try_consume_api_call(
-                "futures_reconcile_fetch_positions_global", critical=True
-            ):
-                return None
-            poss = safe_fetch_positions(bot.ex)
+            poss = safe_fetch_positions(
+                bot.ex,
+                endpoint="futures_reconcile_fetch_positions_global",
+                critical=True,
+                raise_on_budget_denied=True,
+            )
             if poss is None:
                 return None
     except Exception:
@@ -1695,17 +1776,12 @@ class FuturesReconcileMixin:
         self._entry_recovery_position_snapshot = None
         try:
             local_state = self.state.get_all()
-            if not try_consume_api_call(
-                "futures_reconcile_fetch_positions", critical=True
-            ):
-                log_event(
-                    "Reconciliation: API budget denied fetch_positions; "
-                    "local state kept unchanged.",
-                    "WARN",
-                )
-                return False
             try:
-                exchange_positions = safe_fetch_positions(self.ex)
+                exchange_positions = safe_fetch_positions(
+                    self.ex,
+                    endpoint="futures_reconcile_fetch_positions",
+                    critical=True,
+                )
             except Exception as exc:
                 if not is_authentication_error(exc):
                     raise
@@ -2762,19 +2838,14 @@ class FuturesReconcileMixin:
         leg flat."""
         full = f"{sym}/USDT:USDT"
 
-        def reserve_api_call(stage: str) -> bool:
-            return try_consume_api_call(
-                f"futures_reconcile_fetch_positions_{stage}",
-                critical=True,
-            )
-
         try:
             from bot_utils.futures_order import fetch_open_position
             position, unavailable = fetch_open_position(
                 self.ex,
                 full,
                 expected_position_side=expected_side,
-                _reserve_api_call=reserve_api_call,
+                _api_endpoint_prefix="futures_reconcile_fetch_positions_",
+                _api_critical=True,
             )
         except Exception as e:
             self._log_error(f"reconcile re-fetch {sym}", e)

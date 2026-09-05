@@ -32,8 +32,12 @@ from bot_utils import (
     normalize_spot_order_status,
     spot_sell_requires_terminal_recovery,
 )
-from bot_utils.safe_numeric import safe_positive_float
-from bot_utils.order_utils import order_id_text_or_none
+from bot_utils.safe_numeric import safe_daily_loss_limit, safe_positive_float
+from bot_utils.state_persist import persisted_epoch_ttl_active
+from bot_utils.order_utils import (
+    explicit_trade_symbol_matches,
+    order_id_text_or_none,
+)
 
 
 # Minimum notional safety margin  exchanges reject sells below this.
@@ -62,6 +66,7 @@ _BE_FEE_BUFFER = 0.003
 # dust. This avoids losing real base coins from state after a partial exchange
 # fill.
 _LIVE_RESIDUAL_DUST_USDT = 1.0
+_PARTIAL_TP_BLOCK_TTL_SEC = 300.0
 
 
 def _finite_float(value, default: float = 0.0) -> float:
@@ -77,6 +82,20 @@ def _finite_float(value, default: float = 0.0) -> float:
 def _positive_finite(value, default: float = 0.0) -> float:
     parsed = _finite_float(value, default)
     return parsed if parsed > 0 else default
+
+
+def _partial_tp_block_active(bot, sym: str, row: dict) -> bool:
+    deadlines = getattr(bot, "_partial_tp_block_deadlines", None)
+    if not isinstance(deadlines, dict):
+        deadlines = {}
+        bot._partial_tp_block_deadlines = deadlines
+    return persisted_epoch_ttl_active(
+        deadlines,
+        sym,
+        enabled=row.get("partial_tp_blocked_min_notional") is True,
+        expires_at=row.get("partial_tp_blocked_min_notional_until"),
+        max_ttl_sec=_PARTIAL_TP_BLOCK_TTL_SEC,
+    )
 
 
 def _ensure_spot_exit_client_order_id(bot, sym: str, row: dict,
@@ -451,6 +470,15 @@ class ExitsMixin:
 
         while not self._shutdown_event.is_set():
             try:
+                refreshed_interval = int(float(self.C(
+                    "MONITOR_INTERVAL",
+                    self.DEFAULT_MONITOR_INTERVAL,
+                )))
+                if 5 <= refreshed_interval <= 600:
+                    monitor_interval = refreshed_interval
+            except (TypeError, ValueError, OverflowError):
+                pass
+            try:
                 trades = self.state.get_all()
                 price_health_pruner = getattr(
                     self, "_prune_spot_price_unavailable", None
@@ -546,6 +574,7 @@ class ExitsMixin:
         into _compute_today_pnl + _should_kill for testability.
         """
         try:
+            from core.database import pause_bot_today
             from core.logger import log_event
             if not hasattr(self, "safe_mode") or self.safe_mode is None:
                 return True  # bot not fully initialized yet
@@ -553,7 +582,9 @@ class ExitsMixin:
                 return True  # already tripped  no need to re-check
 
             total_today = self._compute_today_pnl(trades)
-            max_loss = float(self.C("MAX_DAILY_LOSS", -50.0))
+            max_loss = safe_daily_loss_limit(
+                self.C("MAX_DAILY_LOSS", -50.0), -50.0
+            )
 
             if self._should_kill(total_today, max_loss):
                 log_event(
@@ -564,6 +595,14 @@ class ExitsMixin:
                 self.safe_mode.trigger(
                     f"daily-loss killswitch ({total_today:+.2f} USDT)"
                 )
+                try:
+                    pause_bot_today(
+                        self.BOT_NAME,
+                        f"Daily loss {total_today:+.2f} USDT reached",
+                        mode_is_sim=self.simulation,
+                    )
+                except Exception as exc:
+                    self._log_error("persist spot daily-loss pause", exc)
             return True
         except Exception as e:
             self._log_error("spot killswitch check", e)
@@ -690,7 +729,29 @@ class ExitsMixin:
                 failed_pairs.update(chunk)
                 continue
             try:
-                result = self.ex.fetch_tickers(chunk) or {}
+                result = self.ex.fetch_tickers(chunk)
+                if not isinstance(result, dict):
+                    raise TypeError("spot batch ticker returned no ticker map")
+                conflicting_pairs = {
+                    pair
+                    for pair in chunk
+                    if isinstance(result.get(pair), dict)
+                    and not explicit_trade_symbol_matches(result[pair], pair)
+                }
+                if conflicting_pairs:
+                    failed_pairs.update(conflicting_pairs)
+                    try:
+                        record_api_error(
+                            endpoint="fetch_tickers",
+                            reservation=reservation,
+                        )
+                    except Exception:
+                        pass
+                    result = {
+                        pair: ticker
+                        for pair, ticker in result.items()
+                        if pair not in conflicting_pairs
+                    }
                 out.update(result)
             except Exception as e:
                 failed_pairs.update(chunk)
@@ -835,9 +896,13 @@ class ExitsMixin:
             return 0.0
         try:
             ticker = self.ex.fetch_ticker(pair) or {}
+            if not explicit_trade_symbol_matches(ticker, pair):
+                raise ValueError("spot ticker changed requested symbol")
             result = safe_positive_float(ticker.get("last"), 0.0)
             if result <= 0:
                 result = safe_positive_float(ticker.get("close"), 0.0)
+            if result <= 0:
+                raise ValueError("spot ticker returned no positive price")
             return result
         except Exception as e:
             try:
@@ -1095,13 +1160,9 @@ class ExitsMixin:
 
         # Partial Take-Profit
         activation_profit = float(self.C("ACTIVATION_PROFIT"))
-        partial_blocked_until = _finite_float(
-            d.get("partial_tp_blocked_min_notional_until"), 0.0)
-        partial_block_active = (
-            bool(d.get("partial_tp_blocked_min_notional"))
-            and time.time() < partial_blocked_until
-        )
-        if (not d.get("partial_sold")
+        partial_block_active = _partial_tp_block_active(self, sym, d)
+        if (activation_profit > 0.0
+                and not d.get("partial_sold")
                 and not partial_block_active
                 and prof >= activation_profit):
             handled = self._execute_partial_tp(sym, d, curr)
@@ -1144,7 +1205,9 @@ class ExitsMixin:
             if curr <= buy:
                 return True, "Break-Even Stop"
         else:
-            if (high_prof >= activation_profit
+            if (activation_profit > 0.0
+                    and trailing_dist > 0.0
+                    and high_prof >= activation_profit
                     and curr <= highest * (1 - trailing_dist / 100)):
                 return True, "Trailing Stop"
             if prof <= initial_sl:
@@ -1320,11 +1383,8 @@ class ExitsMixin:
             # Re-check after acquiring: maybe state was already mutated
             # by the lock-holder (e.g. emergency-close marked sold).
             d_live = self.state.get(sym)
-            live_blocked_until = _finite_float(
-                (d_live or {}).get("partial_tp_blocked_min_notional_until"), 0.0)
-            live_block_active = (
-                bool((d_live or {}).get("partial_tp_blocked_min_notional"))
-                and time.time() < live_blocked_until
+            live_block_active = _partial_tp_block_active(
+                self, sym, d_live or {}
             )
             if (d_live is None or d_live.get("partial_sold")
                     or (live_block_active and not recovering)):

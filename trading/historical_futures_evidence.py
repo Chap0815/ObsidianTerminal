@@ -24,6 +24,27 @@ MAX_FUNDING_ENDPOINT_AGE_SECONDS = 300
 MAX_FUNDING_RATE_AGE_SECONDS = 300
 
 
+def _unique_evidence_json_object(pairs) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate evidence JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_evidence_json_constant(value: str):
+    raise ValueError(f"invalid evidence JSON constant: {value}")
+
+
+def _decode_evidence_json(raw):
+    return json.loads(
+        raw,
+        object_pairs_hook=_unique_evidence_json_object,
+        parse_constant=_reject_evidence_json_constant,
+    )
+
+
 def _utc(value) -> datetime | None:
     if isinstance(value, bool):
         return None
@@ -478,8 +499,8 @@ def load_overview_snapshots(
                 if exchange_time is None or received_time is None:
                     continue
                 try:
-                    flags_value = json.loads(flags_raw)
-                    payload = json.loads(payload_raw)
+                    flags_value = _decode_evidence_json(flags_raw)
+                    payload = _decode_evidence_json(payload_raw)
                 except (TypeError, ValueError, json.JSONDecodeError) as exc:
                     raise ValueError(
                         f"invalid overview event JSON in {path}: {event_id}"

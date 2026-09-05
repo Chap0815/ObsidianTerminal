@@ -13,8 +13,16 @@ from __future__ import annotations
 import math
 import time
 
-from bot_utils.api_budget import try_consume_api_call
-from bot_utils.order_utils import extract_base_fee_amount, order_id_text_or_none
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
+from bot_utils.order_utils import (
+    explicit_trade_symbol_matches,
+    extract_base_fee_amount,
+    order_id_text_or_none,
+)
 
 
 # Conservative default taker fee  Bitget/Binance spot is 0.1%.
@@ -49,6 +57,27 @@ def _order_id_for_refetch(order: dict) -> str:
         if order_id:
             return order_id
     return ""
+
+
+def _explicit_order_ids(order: dict) -> set[str] | None:
+    """Return explicit aliases, or ``None`` when any supplied alias is invalid."""
+    if not isinstance(order, dict):
+        return None
+    sources = [order]
+    info = order.get("info")
+    if isinstance(info, dict):
+        sources.append(info)
+    order_ids: set[str] = set()
+    for source in sources:
+        for key in ("id", "orderId", "order_id", "orderID"):
+            raw_value = source.get(key)
+            if raw_value in (None, ""):
+                continue
+            normalized = order_id_text_or_none(raw_value)
+            if normalized is None:
+                return None
+            order_ids.add(normalized)
+    return order_ids
 
 
 def _extract_base_fee_known(order: dict, base_symbol: str) -> tuple[float, bool]:
@@ -134,22 +163,42 @@ def extract_or_estimate_base_fee(ex,
             else:
                 time.sleep(retry_delay)
             try:
-                allowed = try_consume_api_call(
-                    "spot_fee_fetch_order", critical=True
+                reservation = try_consume_api_call(
+                    "spot_fee_fetch_order",
+                    critical=True,
+                    return_reservation=True,
                 )
             except Exception:
                 break
-            if not allowed:
+            if not reservation:
                 break
             try:
                 refreshed = ex.fetch_order(order_id, symbol_pair)
-                if isinstance(refreshed, dict):
-                    fee, fee_known = _extract_base_fee_known(
-                        refreshed, base_symbol
+                if not isinstance(refreshed, dict) or not refreshed:
+                    raise TypeError("spot fee refetch returned no order object")
+                refreshed_order_ids = _explicit_order_ids(refreshed)
+                if (
+                    refreshed_order_ids is None
+                    or len(refreshed_order_ids) > 1
+                    or (
+                        refreshed_order_ids
+                        and refreshed_order_ids != {order_id}
                     )
-                    if fee_known:
-                        return fee
+                ):
+                    raise ValueError("spot fee refetch changed order id")
+                if not explicit_trade_symbol_matches(refreshed, symbol_pair):
+                    raise ValueError("spot fee refetch changed order symbol")
+                fee, fee_known = _extract_base_fee_known(
+                    refreshed, base_symbol
+                )
+                if fee_known:
+                    return fee
             except Exception as e:
+                if isinstance(reservation, ApiCallReservation):
+                    try:
+                        record_api_error("spot_fee_fetch_order", reservation)
+                    except Exception:
+                        pass
                 if log_event:
                     try:
                         log_event(

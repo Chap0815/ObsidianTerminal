@@ -39,6 +39,19 @@ except Exception:
     pass
 
 
+def _unique_state_json_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate state JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_state_json_constant(value: str):
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 def _canonical_json_path(path: str) -> str:
     return os.path.realpath(os.path.abspath(os.path.normpath(os.fspath(path))))
 
@@ -1086,7 +1099,11 @@ class StateManager:
                 raw = fh.read(_STATE_JSON_MAX_BYTES + 1)
             if len(raw) > _STATE_JSON_MAX_BYTES:
                 raise ValueError("state JSON exceeds size limit")
-            data = json.loads(raw.decode("utf-8-sig"))
+            data = json.loads(
+                raw.decode("utf-8-sig"),
+                object_pairs_hook=_unique_state_json_object,
+                parse_constant=_reject_state_json_constant,
+            )
             return data if isinstance(data, dict) else {}
         except json.JSONDecodeError as e:
             backup = self.json_path + ".corrupted"

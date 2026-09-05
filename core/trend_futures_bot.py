@@ -29,16 +29,59 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from shared_limits import normalize_gate_mode
-from bot_utils.api_budget import try_consume_api_call
-from bot_utils.safe_numeric import parse_ohlcv_closes
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
+from bot_utils.safe_numeric import (
+    parse_ohlcv_closes,
+    safe_liq_safety_pct,
+    safe_stop_loss_pct,
+)
+from bot_utils.state_persist import persisted_epoch_ttl_active
 from bot_utils.trade_state import state_exposure_count
 from core.futures_bot import FuturesBot
 from core.cross_bot import _is_crypto_base   # shared crypto-only perp filter
-from bot_utils.order_utils import order_id_text_or_none
+from bot_utils.order_utils import (
+    explicit_trade_symbol_matches,
+    order_id_text_or_none,
+)
 from trading.trend_signal import is_in_trend, params_from_cfg, has_full_history
 from trading.entry_quality import EntryQuality, score_futrend_entry
 from trading.vol_target import (realized_vol, vol_target_multiplier,
                                 basket_median_vol)
+
+
+def _liq_refresh_active(bot, base: str, row: dict, interval: float) -> bool:
+    deadlines = getattr(bot, "_liq_refresh_deadlines", None)
+    if not isinstance(deadlines, dict):
+        deadlines = {}
+        bot._liq_refresh_deadlines = deadlines
+    return persisted_epoch_ttl_active(
+        deadlines,
+        base,
+        enabled=True,
+        expires_at=row.get("liq_next_check_at"),
+        max_ttl_sec=interval,
+    )
+
+
+def _entry_inflight_active(bot, base: str, expires_at) -> bool:
+    from core.clock import now_ms
+
+    deadlines = getattr(bot, "_entry_inflight_deadlines", None)
+    if not isinstance(deadlines, dict):
+        deadlines = {}
+        bot._entry_inflight_deadlines = deadlines
+    return persisted_epoch_ttl_active(
+        deadlines,
+        base,
+        enabled=True,
+        expires_at=expires_at,
+        max_ttl_sec=120.0,
+        epoch_now=now_ms() / 1000.0,
+    )
 
 
 class TrendFuturesBot(FuturesBot):
@@ -72,13 +115,22 @@ class TrendFuturesBot(FuturesBot):
         return bool(self._i("ENTRY_QUALITY_FILTER_ENABLED", 1))
 
     def _timeframe(self) -> str:
-        tf = str(self.C("TREND_TIMEFRAME", "1h")).strip().lower()
-        return tf if tf in ("1h", "4h", "1d") else "1h"
+        tf = str(self.C("TREND_TIMEFRAME", "4h")).strip().lower()
+        return tf if tf in ("1h", "4h", "1d") else "4h"
 
     def _check_interval_sec(self) -> int:
         # How often to recompute the trend signal (one candle is the natural
-        # cadence; default 30 min for the 1h timeframe).
-        return max(60, self._i("TREND_CHECK_MINUTES", 30) * 60)
+        # cadence; keep the runtime boundary aligned with the UI contract.
+        minutes = self._i("TREND_CHECK_MINUTES", 60)
+        if not 5 <= minutes <= 240:
+            minutes = 60
+        return minutes * 60
+
+    def _monitor_interval_sec(self) -> int:
+        interval = self._i("MONITOR_INTERVAL", self.DEFAULT_MONITOR_INTERVAL)
+        if not 5 <= interval <= 600:
+            interval = self.DEFAULT_MONITOR_INTERVAL
+        return interval
 
     def _bars_needed(self, p) -> int:
         # Enough history for the slowest SMA + warmup headroom.
@@ -193,18 +245,18 @@ class TrendFuturesBot(FuturesBot):
         if not raw:
             return None
         try:
-            if isinstance(raw, (int, float)):
-                ts = float(raw)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                opened = datetime.fromtimestamp(float(raw), tz=timezone.utc)
             else:
                 text = str(raw).strip().replace("Z", "+00:00")
-                try:
-                    opened = datetime.fromisoformat(text)
-                except ValueError:
-                    opened = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+                opened = datetime.fromisoformat(text)
                 if opened.tzinfo is None:
                     opened = opened.replace(tzinfo=timezone.utc)
-                ts = opened.timestamp()
-            age_minutes = (time.time() - ts) / 60.0
+                else:
+                    opened = opened.astimezone(timezone.utc)
+            from core.clock import now_utc
+
+            age_minutes = (now_utc() - opened).total_seconds() / 60.0
             return age_minutes if age_minutes >= 0.0 else None
         except Exception:
             return None
@@ -265,13 +317,62 @@ class TrendFuturesBot(FuturesBot):
         ask = self._safe_float(self._ticker_field(ticker, "ask", "askPrice"))
         if (bid <= 0 or ask <= 0) and not self.simulation:
             try:
-                if try_consume_api_call("futrend_shadow_fetch_order_book"):
-                    ob = self.ex.fetch_order_book(full, limit=1)
-                    bids = (ob or {}).get("bids") or []
-                    asks = (ob or {}).get("asks") or []
-                    if bids and asks:
-                        bid = self._safe_float(bids[0][0])
-                        ask = self._safe_float(asks[0][0])
+                shadow_book_reservation = try_consume_api_call(
+                    "futrend_shadow_fetch_order_book",
+                    return_reservation=True,
+                )
+                if shadow_book_reservation:
+                    try:
+                        ob = self.ex.fetch_order_book(full, limit=1)
+                        if not explicit_trade_symbol_matches(ob, full):
+                            raise ValueError(
+                                "futrend shadow book changed requested symbol"
+                            )
+                    except Exception:
+                        if isinstance(
+                            shadow_book_reservation, ApiCallReservation
+                        ):
+                            try:
+                                record_api_error(
+                                    "futrend_shadow_fetch_order_book",
+                                    shadow_book_reservation,
+                                )
+                            except Exception:
+                                pass
+                        raise
+                    try:
+                        bids = (ob or {}).get("bids") or []
+                        asks = (ob or {}).get("asks") or []
+                        valid_book = False
+                        if bids and asks:
+                            bid = self._safe_float(bids[0][0])
+                            ask = self._safe_float(asks[0][0])
+                            valid_book = bid > 0 and ask > bid
+                    except Exception:
+                        if isinstance(
+                            shadow_book_reservation, ApiCallReservation
+                        ):
+                            try:
+                                record_api_error(
+                                    "futrend_shadow_fetch_order_book",
+                                    shadow_book_reservation,
+                                )
+                            except Exception:
+                                pass
+                        raise
+                    if (
+                        not valid_book
+                        and isinstance(
+                            shadow_book_reservation, ApiCallReservation
+                        )
+                    ):
+                        try:
+                            record_api_error(
+                                "futrend_shadow_fetch_order_book",
+                                shadow_book_reservation,
+                            )
+                        except Exception:
+                            pass
             except Exception:
                 pass
         mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else price
@@ -575,7 +676,11 @@ class TrendFuturesBot(FuturesBot):
             from core.database import add_to_blacklist, get_recent_trades
             r = str(reason or "").lower()
             single_stop_pct = self._f("SINGLE_STOP_MIN_LOSS_PCT", 5.0)
+            if not 0.0 <= single_stop_pct <= 99.0:
+                single_stop_pct = 5.0
             single_stop_hours = self._i("SINGLE_STOP_BLACKLIST_HOURS", 4)
+            if not 0 <= single_stop_hours <= 87_600:
+                single_stop_hours = 4
             move = self._finite_float_or_none(move_pct)
             if (move is not None and "stop-loss" in r
                     and move <= -abs(single_stop_pct)
@@ -593,8 +698,14 @@ class TrendFuturesBot(FuturesBot):
 
             loss_count_min = max(1, self._i("BAD_SYMBOL_LOSS_COUNT", 2))
             lookback_days = max(1, self._i("BAD_SYMBOL_LOOKBACK_DAYS", 1))
+            if not 1 <= loss_count_min <= 40:
+                loss_count_min = 2
+            if not 1 <= lookback_days <= 3650:
+                lookback_days = 1
             total_loss_min = max(0.0, self._f("BAD_SYMBOL_MIN_TOTAL_LOSS_USDT", 6.0))
             hours = self._i("BAD_SYMBOL_BLACKLIST_HOURS", 24)
+            if not 0 <= hours <= 87_600:
+                hours = 24
             if hours <= 0:
                 return
             recent = get_recent_trades(self.BOT_NAME, limit=40, days=lookback_days)
@@ -629,11 +740,17 @@ class TrendFuturesBot(FuturesBot):
         from core.database import is_claimed_by_other, is_blacklisted
         try:
             n = self._i("TREND_UNIVERSE_SIZE", 30)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            n = 30
+        if not 10 <= n <= 100:
             n = 30
         min_vol = self._f("MIN_VOLUME", 10_000_000.0)
         try:
-            if not try_consume_api_call("futrend_fetch_tickers"):
+            ticker_reservation = try_consume_api_call(
+                "futrend_fetch_tickers",
+                return_reservation=True,
+            )
+            if not ticker_reservation:
                 log_event(f"[{self.BOT_NAME}] universe scan skipped "
                           f"(API budget exhausted)", "WARN")
                 return {}
@@ -646,18 +763,38 @@ class TrendFuturesBot(FuturesBot):
             return {}
         try:
             tickers = self.ex.fetch_tickers()
+            if not isinstance(tickers, dict):
+                raise TypeError("futrend ticker universe returned invalid payload")
         except Exception as e:
+            if isinstance(ticker_reservation, ApiCallReservation):
+                try:
+                    record_api_error(
+                        "futrend_fetch_tickers", ticker_reservation
+                    )
+                except Exception:
+                    pass
             log_event(f"[{self.BOT_NAME}] ticker fetch failed: {e}", "WARN")
             return {}
+        invalid_ticker_rows = any(
+            not isinstance(symbol, str)
+            or not isinstance(ticker, dict)
+            or not explicit_trade_symbol_matches(ticker, symbol)
+            for symbol, ticker in tickers.items()
+        )
+        if invalid_ticker_rows and isinstance(
+            ticker_reservation, ApiCallReservation
+        ):
+            try:
+                record_api_error("futrend_fetch_tickers", ticker_reservation)
+            except Exception:
+                pass
         cands: List[Tuple[float, str, str]] = []
-        if not isinstance(tickers, dict):
-            log_event(
-                f"[{self.BOT_NAME}] ticker fetch returned invalid payload",
-                "WARN",
-            )
-            return {}
         for sym, t in tickers.items():
-            if not isinstance(sym, str) or not isinstance(t, dict):
+            if (
+                not isinstance(sym, str)
+                or not isinstance(t, dict)
+                or not explicit_trade_symbol_matches(t, sym)
+            ):
                 continue
             if not sym.endswith(":USDT"):
                 continue
@@ -701,11 +838,61 @@ class TrendFuturesBot(FuturesBot):
 
         def _fetch_once():
             try:
-                if not try_consume_api_call("futrend_fetch_ohlcv"):
+                reservation = try_consume_api_call(
+                    "futrend_fetch_ohlcv",
+                    return_reservation=True,
+                )
+                if not reservation:
                     return None
             except Exception:
                 return None
-            return self.ex.fetch_ohlcv(full_symbol, tf, limit=need + 2)
+            try:
+                bars = self.ex.fetch_ohlcv(
+                    full_symbol, tf, limit=need + 2
+                )
+            except Exception:
+                if isinstance(reservation, ApiCallReservation):
+                    try:
+                        record_api_error(
+                            "futrend_fetch_ohlcv", reservation
+                        )
+                    except Exception:
+                        pass
+                raise
+            if not isinstance(bars, list):
+                if isinstance(reservation, ApiCallReservation):
+                    try:
+                        record_api_error("futrend_fetch_ohlcv", reservation)
+                    except Exception:
+                        pass
+                return None
+            if any(
+                not isinstance(bar, (list, tuple)) or len(bar) < 5
+                for bar in bars
+            ):
+                if isinstance(reservation, ApiCallReservation):
+                    try:
+                        record_api_error("futrend_fetch_ohlcv", reservation)
+                    except Exception:
+                        pass
+                return None
+            for bar in bars:
+                try:
+                    if isinstance(bar[4], bool):
+                        raise ValueError("boolean close")
+                    close = float(bar[4])
+                    if not math.isfinite(close) or close <= 0:
+                        raise ValueError("invalid close")
+                except (TypeError, ValueError, OverflowError):
+                    if isinstance(reservation, ApiCallReservation):
+                        try:
+                            record_api_error(
+                                "futrend_fetch_ohlcv", reservation
+                            )
+                        except Exception:
+                            pass
+                    return None
+            return bars
 
         try:
             bars = with_network_retry(
@@ -721,7 +908,7 @@ class TrendFuturesBot(FuturesBot):
             from core.clock import now_ms as _clock_now_ms
             current_time_ms = int(_clock_now_ms())
         except Exception:
-            current_time_ms = int(time.time() * 1000)
+            return None
         closes = parse_ohlcv_closes(
             bars,
             expected_interval_ms=interval_ms,
@@ -760,6 +947,7 @@ class TrendFuturesBot(FuturesBot):
         last_check = time.monotonic() - iv
         while not self._shutdown_event.is_set():
             try:
+                iv = self._check_interval_sec()
                 now = time.monotonic()
                 if now - last_check >= iv:
                     last_check = now
@@ -1702,17 +1890,34 @@ class TrendFuturesBot(FuturesBot):
             for attempt in range(2):
                 time.sleep(0.4 * (1 + attempt))
                 try:
-                    allowed = try_consume_api_call(
+                    reservation = try_consume_api_call(
                         "futrend_entry_fetch_order",
                         critical=True,
+                        return_reservation=True,
                     )
                 except Exception:
-                    allowed = False
-                if not allowed:
+                    reservation = False
+                if not reservation:
                     continue
                 try:
-                    refreshed = self.ex.fetch_order(oid, full) or {}
+                    refreshed = self.ex.fetch_order(oid, full)
                 except Exception:
+                    if isinstance(reservation, ApiCallReservation):
+                        try:
+                            record_api_error(
+                                "futrend_entry_fetch_order", reservation
+                            )
+                        except Exception:
+                            pass
+                    continue
+                if not isinstance(refreshed, dict) or not refreshed:
+                    if isinstance(reservation, ApiCallReservation):
+                        try:
+                            record_api_error(
+                                "futrend_entry_fetch_order", reservation
+                            )
+                        except Exception:
+                            pass
                     continue
                 if _order_refresh_conflicts(
                     order,
@@ -2806,11 +3011,12 @@ class TrendFuturesBot(FuturesBot):
     #  Fast safety monitor (reuses the 'Monitor' thread) 
     def _monitor_loop(self):
         from core.logger import log_event
-        interval = self._i("MONITOR_INTERVAL", self.DEFAULT_MONITOR_INTERVAL)
+        interval = TrendFuturesBot._monitor_interval_sec(self)
         log_event(f"Trend-Futures safety monitor started "
                   f"(interval {interval}s)", "INFO")
         last_ks_monotonic = None
         while not self._shutdown_event.is_set():
+            interval = TrendFuturesBot._monitor_interval_sec(self)
             try:
                 trades = dict(self.state.get_all())
                 now_wall = time.time()
@@ -2849,10 +3055,9 @@ class TrendFuturesBot(FuturesBot):
         from bot_utils import calc_liquidation_price, distance_to_liquidation_pct
 
         full = f"{base}/USDT:USDT"
-        from core.clock import now_ms
-
-        inflight_active = self._safe_float(
-            d.get("entry_inflight_until"), 0.0) > now_ms() / 1000.0
+        inflight_active = _entry_inflight_active(
+            self, base, d.get("entry_inflight_until")
+        )
         recovery_blocked = (
             self._entry_recovery_runtime_health().get("ok") is False
         )
@@ -3140,7 +3345,11 @@ class TrendFuturesBot(FuturesBot):
         if self._recover_pending_partial_exit(base, d, curr):
             return
 
-        hard_stop = self._f("INITIAL_STOP_LOSS", -12.0)
+        hard_stop = safe_stop_loss_pct(
+            self._f("INITIAL_STOP_LOSS", -12.0),
+            -12.0,
+            leverage=lev,
+        )
         if hard_stop < 0 and move <= hard_stop:
             self._close_position(base, d, reason="Stop-Loss")
             return
@@ -3155,10 +3364,12 @@ class TrendFuturesBot(FuturesBot):
             calc_liquidation_price(entry, lev, pos_type, mm),
         )
         if not self.simulation:
-            now_ts = time.time()
-            if now_ts >= self._safe_float(d.get("liq_next_check_at"), 0.0):
-                interval = self._safe_float(
-                    getattr(self, "LIQ_REFRESH_INTERVAL_SEC", 90.0), 90.0)
+            interval = self._safe_float(
+                getattr(self, "LIQ_REFRESH_INTERVAL_SEC", 90.0), 90.0)
+            if interval <= 0:
+                interval = 90.0
+            if not _liq_refresh_active(self, base, d, interval):
+                now_ts = time.time()
                 upd = {"liq_next_check_at": now_ts + interval}
                 try:
                     exch_liq = get_exchange_liq_price(
@@ -3180,7 +3391,10 @@ class TrendFuturesBot(FuturesBot):
         if init_dist <= 0:
             init_dist = max(1.0, 100.0 / max(1.0, lev))
         consumed = liq_buffer_consumed_pct(init_dist, cur_dist)
-        if consumed >= 100.0 - self._f("LIQ_SAFETY_PCT", 20.0):
+        liq_safety = safe_liq_safety_pct(
+            self._f("LIQ_SAFETY_PCT", 20.0), 20.0
+        )
+        if consumed >= 100.0 - liq_safety:
             self._close_position(base, d, reason="Liq protection")
             return
         if self._pre_activation_giveback_stop_hit(d, move, high_move):
@@ -3351,5 +3565,5 @@ class TrendFuturesBot(FuturesBot):
                 liquidation_price=liq,
                 liq_distance_pct=cur_dist, funding_paid=d.get("funding_paid", 0.0),
                 opened_at=d.get("buy_time", ""), entry_id=d.get("entry_id"))
-        except Exception:
-            pass
+        except Exception as exc:
+            self._log_error(f"futrend dashboard state {base}", exc)

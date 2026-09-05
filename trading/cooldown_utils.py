@@ -72,9 +72,15 @@ def should_cooldown_after_exit(reason: str, profit_usdt: float) -> bool:
     r = str(reason or "")
     if "Liq" in r:
         return True
-    if profit_usdt < 0 and any(s in r for s in _STOP_EXIT_REASONS):
+    if not any(s in r for s in _STOP_EXIT_REASONS):
+        return False
+    if isinstance(profit_usdt, bool):
         return True
-    return False
+    try:
+        profit = float(profit_usdt)
+    except (TypeError, ValueError, OverflowError):
+        return True
+    return not math.isfinite(profit) or profit < 0.0
 
 
 _COOLDOWN_LOCK = threading.Lock()
@@ -83,6 +89,7 @@ _COOLDOWN_SHUTDOWN_LIFECYCLE_LOCK = threading.Lock()
 _MAX_COOLDOWN_MINUTES = 366 * 24 * 60
 _COOLDOWN_JSON_MAX_BYTES = 1024 * 1024
 _COOLDOWN_PERSIST_RETRY_SEC = 30.0
+_COOLDOWN_LOCK_INIT_GRACE_SEC = 1.0
 _cooldown_retry_timers: dict[str, threading.Timer] = {}
 _cooldown_retry_data: dict[str, dict] = {}
 _cooldown_active_timers: set[threading.Thread] = set()
@@ -98,6 +105,15 @@ class CooldownState(dict):
         super().__init__(*args)
         self.source_valid = source_valid
         self.source_error = source_error
+
+
+def _is_valid_cooldown_symbol(symbol) -> bool:
+    return (
+        isinstance(symbol, str)
+        and symbol == symbol.strip()
+        and 0 < len(symbol) <= 64
+        and not any(ord(char) < 32 or ord(char) == 127 for char in symbol)
+    )
 
 
 def _read_cooldown_json(path: str):
@@ -148,9 +164,14 @@ def _normalize_cooldown_minutes(value) -> Optional[int]:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
-    if not math.isfinite(parsed) or parsed > _MAX_COOLDOWN_MINUTES:
+    if (
+        not math.isfinite(parsed)
+        or parsed < 0.0
+        or parsed > _MAX_COOLDOWN_MINUTES
+        or not parsed.is_integer()
+    ):
         return None
-    return max(0, int(parsed))
+    return int(parsed)
 
 
 def _boot_fingerprint() -> str:
@@ -166,6 +187,14 @@ def _boot_fingerprint() -> str:
             except OSError:
                 pass
         try:
+            import psutil  # type: ignore
+
+            boot_time = float(psutil.boot_time())
+            if math.isfinite(boot_time) and boot_time > 0.0:
+                return f"{socket.gethostname()}-{int(boot_time)}"
+        except Exception:
+            pass
+        try:
             return f"{socket.gethostname()}-{int(os.path.getctime(os.path.abspath(os.sep)))}"
         except OSError:
             return socket.gethostname()
@@ -176,7 +205,11 @@ def _boot_fingerprint() -> str:
 _BOOT_FP = _boot_fingerprint()
 
 
-def _pid_alive(pid: int, payload_boot_fp: str = "") -> bool:
+def _pid_alive(
+    pid: int,
+    payload_boot_fp: str = "",
+    payload_created_at: float | None = None,
+) -> bool:
     """True wenn PID laeuft UND from same boot. Recycled PIDs = dead."""
     if pid <= 0:
         return False
@@ -184,12 +217,38 @@ def _pid_alive(pid: int, payload_boot_fp: str = "") -> bool:
         return False
     from core.process_identity import pid_alive
 
-    return pid_alive(pid)
+    if not pid_alive(pid):
+        return False
+    if payload_created_at is None:
+        return True
+    try:
+        import psutil  # type: ignore
+
+        process_created_at = float(psutil.Process(pid).create_time())
+        if (
+            math.isfinite(process_created_at)
+            and process_created_at > payload_created_at + 0.001
+        ):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 @contextmanager
 def _file_lock(path: str, timeout: float = 5.0):
     """Cross-process advisory lock keyed on path + '.lock'."""
+    if isinstance(timeout, bool):
+        raise ValueError("cooldown lock timeout must be finite and non-negative")
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "cooldown lock timeout must be finite and non-negative"
+        ) from exc
+    if not math.isfinite(timeout) or timeout < 0.0:
+        raise ValueError("cooldown lock timeout must be finite and non-negative")
+
     lock_path = path + ".lock"
     try:
         d = os.path.dirname(lock_path) or "."
@@ -206,51 +265,115 @@ def _file_lock(path: str, timeout: float = 5.0):
         return
 
     # Fallback: TOCTOU-safe rename-takeover
+    def remove_lock_if_same(expected_stat) -> None:
+        if expected_stat is None:
+            return
+        try:
+            current_stat = os.stat(lock_path, follow_symlinks=False)
+            if os.path.samestat(expected_stat, current_stat):
+                os.remove(lock_path)
+        except OSError:
+            pass
+
     deadline = time.monotonic() + timeout
     payload = f"{os.getpid()}|{_BOOT_FP}|{time.time():.3f}".encode()
     acquired = False
-    while time.monotonic() < deadline:
+    acquired_stat = None
+    attempt_immediately = True
+    while attempt_immediately or time.monotonic() < deadline:
+        attempt_immediately = False
+        created_stat = None
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             try:
-                os.write(fd, payload)
+                created_stat = os.fstat(fd)
+                remaining_payload = memoryview(payload)
+                while remaining_payload:
+                    written = os.write(fd, remaining_payload)
+                    if (
+                        isinstance(written, bool)
+                        or not isinstance(written, int)
+                        or written <= 0
+                        or written > len(remaining_payload)
+                    ):
+                        raise OSError("cooldown lock payload write made no progress")
+                    remaining_payload = remaining_payload[written:]
                 try:
                     os.fsync(fd)
                 except (AttributeError, OSError):
                     pass
+                acquired_stat = created_stat
             finally:
                 os.close(fd)
             acquired = True
             break
         except FileExistsError:
             holder_pid, holder_fp = None, ""
+            holder_started = None
+            payload_complete = False
+            observed_stat = None
             try:
                 with open(lock_path, "rb") as fh:
-                    raw = fh.read(256).decode("utf-8", errors="replace").strip()
+                    raw_bytes = fh.read(257)
+                    observed_stat = os.fstat(fh.fileno())
+                raw = raw_bytes.decode("utf-8", errors="replace").strip()
                 parts = raw.split("|")
                 if parts and parts[0].isdigit():
                     holder_pid = int(parts[0])
                 if len(parts) > 1:
                     holder_fp = parts[1]
+                if len(parts) == 3 and len(raw_bytes) <= 256 and holder_fp:
+                    holder_started = float(parts[2])
+                    payload_complete = math.isfinite(holder_started)
             except (OSError, ValueError):
                 holder_pid = None
 
-            stale = (holder_pid is None or
-                     not _pid_alive(holder_pid, holder_fp))
+            initializing = False
+            if not payload_complete:
+                try:
+                    lock_age = max(
+                        0.0,
+                        time.time()
+                        - os.stat(lock_path, follow_symlinks=False).st_mtime,
+                    )
+                    initializing = lock_age <= _COOLDOWN_LOCK_INIT_GRACE_SEC
+                except OSError:
+                    initializing = True
+            stale = not initializing and (
+                holder_pid is None
+                or not _pid_alive(holder_pid, holder_fp, holder_started)
+            )
             if stale:
+                try:
+                    current_stat = os.stat(lock_path, follow_symlinks=False)
+                    if (
+                        observed_stat is None
+                        or not os.path.samestat(observed_stat, current_stat)
+                    ):
+                        continue
+                except OSError:
+                    continue
                 stale_path = f"{lock_path}.stale.{os.getpid()}.{int(time.time())}"
+                reclaimed = False
                 try:
                     os.rename(lock_path, stale_path)
+                    reclaimed = True
                     try:
                         os.remove(stale_path)
                     except OSError:
                         pass
                 except OSError:
                     pass
+                attempt_immediately = reclaimed
                 continue
-            time.sleep(0.05)
+            remaining = deadline - time.monotonic()
+            if remaining > 0.0:
+                time.sleep(min(0.05, remaining))
         except OSError:
-            time.sleep(0.05)
+            remove_lock_if_same(created_stat)
+            remaining = deadline - time.monotonic()
+            if remaining > 0.0:
+                time.sleep(min(0.05, remaining))
 
     try:
         if not acquired:
@@ -258,10 +381,7 @@ def _file_lock(path: str, timeout: float = 5.0):
         yield
     finally:
         if acquired:
-            try:
-                os.remove(lock_path)
-            except OSError:
-                pass
+            remove_lock_if_same(acquired_stat)
 
 
 #  Public API 
@@ -292,7 +412,10 @@ def _schedule_cooldown_retry_locked(path: str) -> None:
         try:
             timer.start()
         except Exception as exc:
-            if _cooldown_retry_timers.get(path) is timer:
+            if (
+                _cooldown_retry_timers.get(path) is timer
+                and thread_definitely_never_started(timer)
+            ):
                 _cooldown_retry_timers.pop(path, None)
             try:
                 from bot_utils.silent_log import silent_log
@@ -557,6 +680,10 @@ def flush_pending_cooldowns() -> bool:
 def set_cooldown(cool: dict, symbol: str, minutes: int,
                  cooldown_file: str) -> bool:
     """Set a cooldown for ``minutes`` minutes from now."""
+    if not isinstance(cool, dict) or not _is_valid_cooldown_symbol(symbol):
+        return False
+    if isinstance(cool, CooldownState) and not cool.source_valid:
+        return False
     minutes = _normalize_cooldown_minutes(minutes)
     if minutes is None:
         return False
@@ -565,15 +692,13 @@ def set_cooldown(cool: dict, symbol: str, minutes: int,
     expiry_iso = (_utcnow() + timedelta(minutes=minutes)).isoformat()
     with _COOLDOWN_LOCK:
         cool[symbol] = expiry_iso
-        if isinstance(cool, CooldownState) and not cool.source_valid:
-            return False
         return _persist_with_retry_locked(cooldown_file, cool)
 
 
 def check_in_cooldown(cool: dict, symbol: str) -> bool:
     """READ-ONLY cooldown check. Mutiert nicht, schreibt nicht.
     Hot-Path-Aufrufe (Buy-Loop) sollten DIES verwenden, nicht is_in_cooldown."""
-    if not isinstance(cool, dict):
+    if not isinstance(cool, dict) or not _is_valid_cooldown_symbol(symbol):
         return True
     if isinstance(cool, CooldownState) and not cool.source_valid:
         return True
@@ -592,7 +717,7 @@ def check_in_cooldown(cool: dict, symbol: str) -> bool:
 def is_in_cooldown(cool: dict, symbol: str, cooldown_file: str) -> bool:
     """Legacy: read AND auto-purge expired entries. Schreibt die Datei
     on expired hits; do not use in hot paths."""
-    if not isinstance(cool, dict):
+    if not isinstance(cool, dict) or not _is_valid_cooldown_symbol(symbol):
         return True
     if isinstance(cool, CooldownState) and not cool.source_valid:
         return True
@@ -652,12 +777,7 @@ def _active_cooldowns(
         raise ValueError("cooldown JSON root must be an object")
     active: dict[str, datetime] = {}
     for symbol, raw_expiry in data.items():
-        if (
-            not isinstance(symbol, str)
-            or not symbol.strip()
-            or len(symbol) > 64
-            or any(ord(char) < 32 or ord(char) == 127 for char in symbol)
-        ):
+        if not _is_valid_cooldown_symbol(symbol):
             raise ValueError("cooldown symbol is invalid")
         try:
             expiry = datetime.fromisoformat(raw_expiry)

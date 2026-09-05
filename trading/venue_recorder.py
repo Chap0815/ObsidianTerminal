@@ -23,7 +23,10 @@ from bot_utils.api_budget import (
     record_api_error,
     try_consume_api_call,
 )
-from bot_utils.order_utils import order_id_text_or_none
+from bot_utils.order_utils import (
+    explicit_trade_symbol_matches,
+    order_id_text_or_none,
+)
 from bot_utils.runtime_threads import thread_definitely_never_started
 from core.constants import NONCRYPTO_BASES
 
@@ -33,6 +36,19 @@ MAX_EXCHANGE_FUTURE_SKEW_MS = 30_000
 _CAPTURE_CONTROL_JSON_MAX_BYTES = 64 * 1024
 _CAPTURE_CONTROL_TEMP_ATTEMPTS = 3
 _CAPACITY_OPERATIONAL_RESERVE_RATIO = 1.05
+
+
+def _unique_capture_control_object(pairs) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate capture control key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_capture_control_constant(value: str):
+    raise ValueError(f"invalid capture control constant: {value}")
 
 
 def _capture_now_ms() -> int:
@@ -333,8 +349,12 @@ class SQLitePartitionWriter:
         if len(raw) > _CAPTURE_CONTROL_JSON_MAX_BYTES:
             raise RuntimeError("capture control state exceeds size limit")
         try:
-            value = json.loads(raw.decode("utf-8-sig"))
-        except (json.JSONDecodeError, UnicodeError) as exc:
+            value = json.loads(
+                raw.decode("utf-8-sig"),
+                object_pairs_hook=_unique_capture_control_object,
+                parse_constant=_reject_capture_control_constant,
+            )
+        except (ValueError, UnicodeError) as exc:
             raise RuntimeError("capture control state is invalid") from exc
         if not isinstance(value, dict) or value.get("schema_version") != 1:
             raise RuntimeError("capture control state schema is invalid")
@@ -1642,6 +1662,7 @@ class VenueRecorder:
         ended = _capture_now_ms()
         candidates = []
         invalid_numeric_payload = False
+        invalid_ticker_identity = False
         invalid_tickers_payload = not isinstance(tickers, dict)
         ticker_rows = tickers if isinstance(tickers, dict) else {}
 
@@ -1656,6 +1677,12 @@ class VenueRecorder:
         quote_volume_sources: dict[str, str] = {}
 
         for symbol, ticker in ticker_rows.items():
+            if (
+                isinstance(ticker, dict)
+                and not explicit_trade_symbol_matches(ticker, symbol)
+            ):
+                invalid_ticker_identity = True
+                continue
             market = (getattr(self.exchange, "markets", None) or {}).get(symbol) or {}
             if not market.get("swap") or market.get("quote") != "USDT":
                 continue
@@ -1749,6 +1776,8 @@ class VenueRecorder:
         overview_flags = []
         if invalid_tickers_payload:
             overview_flags.append("invalid_tickers_payload")
+        if invalid_ticker_identity:
+            overview_flags.append("invalid_ticker_identity")
         if invalid_numeric_payload:
             overview_flags.append("invalid_numeric_payload")
         latest_timestamp, invalid_exchange_timestamp = self._latest_timestamp(
@@ -1756,6 +1785,8 @@ class VenueRecorder:
         )
         if invalid_exchange_timestamp:
             overview_flags.append("invalid_exchange_timestamp")
+        if overview_flags:
+            self._record_api_failure(endpoint, reservation)
         self._write_event(
             "overview",
             "",
@@ -1808,11 +1839,14 @@ class VenueRecorder:
         flags = []
         try:
             from trading.l2_stream import normalize_order_book
+            if not explicit_trade_symbol_matches(book, symbol):
+                raise ValueError("venue order book changed requested symbol")
             normalized_book = normalize_order_book(
                 book,
                 depth_levels=self.depth_levels,
             )
         except Exception as exc:
+            self._record_api_failure(book_endpoint, book_reservation)
             flags.append("invalid_book_payload")
             if "empty" in str(exc):
                 flags.append("incomplete_book")
@@ -1879,6 +1913,9 @@ class VenueRecorder:
             if not isinstance(trade, dict):
                 invalid_trade_payload = True
                 continue
+            if not explicit_trade_symbol_matches(trade, symbol):
+                invalid_trade_payload = True
+                continue
             raw_trade_id = trade.get("id")
             trade_id = order_id_text_or_none(raw_trade_id)
             if raw_trade_id is not None and trade_id is None:
@@ -1939,6 +1976,7 @@ class VenueRecorder:
         if out_of_order:
             trade_flags.append("out_of_order")
         if invalid_trade_payload:
+            self._record_api_failure(trades_endpoint, trades_reservation)
             trade_flags.append("invalid_trade_payload")
         if conflicting_trade_id:
             trade_flags.append("conflicting_trade_id")

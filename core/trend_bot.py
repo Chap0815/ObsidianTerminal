@@ -24,12 +24,23 @@ on new daily candles, so there is nothing to gain from scanning faster.
 """
 from __future__ import annotations
 
+import math
 import time as _time
 from typing import Optional, Tuple, Dict, List
 
-from bot_utils.api_budget import try_consume_api_call
+from bot_utils.api_budget import (
+    ApiCallReservation,
+    record_api_error,
+    try_consume_api_call,
+)
+from bot_utils.order_utils import explicit_trade_symbol_matches
 from core.spot_bot import SpotBot
-from bot_utils.safe_numeric import parse_ohlcv_closes, safe_positive_float
+from bot_utils.safe_numeric import (
+    parse_ohlcv_closes,
+    safe_daily_loss_limit,
+    safe_positive_float,
+    safe_stop_loss_pct,
+)
 from trading.trend_signal import (is_in_trend, params_from_cfg, TrendParams,
                                    has_full_history, bars_required)
 from trading.vol_target import (realized_vol, vol_target_multiplier,
@@ -49,7 +60,8 @@ class TrendBot(SpotBot):
 
     def _trend_universe(self) -> List[str]:
         raw = str(self.C("TREND_UNIVERSE", "BTC,ETH,BNB,XRP,SOL"))
-        return [s.strip().upper() for s in raw.split(",") if s.strip()]
+        symbols = (s.strip().upper() for s in raw.split(","))
+        return list(dict.fromkeys(symbol for symbol in symbols if symbol))
 
     def _trend_params(self) -> TrendParams:
         return params_from_cfg(self.C)
@@ -57,15 +69,20 @@ class TrendBot(SpotBot):
     def _check_interval_sec(self) -> int:
         try:
             hours = float(self.C("TREND_CHECK_HOURS", 12))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             hours = 12.0
-        return max(300, int(hours * 3600))            # floor at 5 min
+        if (
+            not math.isfinite(hours)
+            or not hours.is_integer()
+            or not 1.0 <= hours <= 24.0
+        ):
+            hours = 12.0
+        return int(hours) * 3600
 
     #  Market data 
 
     def _get_daily_closes(self, sym: str, need: int) -> List[float]:
         """Daily closes for `sym`, cached ~1h (signal only moves on new bars)."""
-        wall_now = _time.time()
         cache_now = _time.monotonic()
         cache = getattr(self, "_dc_cache", None)
         if cache is None:
@@ -80,12 +97,33 @@ class TrendBot(SpotBot):
         ):
             return ent[1]
         try:
-            if not try_consume_api_call("trend_fetch_ohlcv"):
+            reservation = try_consume_api_call(
+                "trend_fetch_ohlcv",
+                return_reservation=True,
+            )
+            if not reservation:
                 return []
         except Exception:
             return []
         try:
-            bars = self.ex.fetch_ohlcv(f"{sym}/USDT", "1d", limit=need + 6)
+            try:
+                bars = self.ex.fetch_ohlcv(
+                    f"{sym}/USDT", "1d", limit=need + 6
+                )
+                if not isinstance(bars, list):
+                    raise TypeError("trend OHLCV returned no candle list")
+                if any(
+                    not isinstance(bar, (list, tuple)) or len(bar) < 5
+                    for bar in bars
+                ):
+                    raise TypeError("trend OHLCV returned a malformed candle row")
+            except Exception:
+                if isinstance(reservation, ApiCallReservation):
+                    try:
+                        record_api_error("trend_fetch_ohlcv", reservation)
+                    except Exception:
+                        pass
+                raise
             # Drop the still-FORMING current-day candle so the signal is based
             # on COMPLETED daily closes  exactly like the validated backtest
             # (which acted on closed candles). Without this the live bot reacts
@@ -93,14 +131,21 @@ class TrendBot(SpotBot):
             try:
                 from core.clock import now_ms as _clock_now_ms
                 current_time_ms = int(_clock_now_ms())
-            except Exception:
-                current_time_ms = int(wall_now * 1000)
+            except Exception as exc:
+                raise RuntimeError(
+                    "exchange clock unavailable for closed-candle gate"
+                ) from exc
             closes = parse_ohlcv_closes(
                 bars,
                 expected_interval_ms=86_400_000,
                 now_ms=current_time_ms,
             )
             if closes is None:
+                if isinstance(reservation, ApiCallReservation):
+                    try:
+                        record_api_error("trend_fetch_ohlcv", reservation)
+                    except Exception:
+                        pass
                 raise ValueError("invalid OHLCV close snapshot")
         except Exception as e:
             self._log_error(f"trend fetch_ohlcv {sym}", e)
@@ -110,16 +155,37 @@ class TrendBot(SpotBot):
 
     def _current_price(self, sym: str) -> float:
         try:
-            if not try_consume_api_call("trend_fetch_ticker"):
+            reservation = try_consume_api_call(
+                "trend_fetch_ticker",
+                return_reservation=True,
+            )
+            if not reservation:
                 return 0.0
         except Exception:
             return 0.0
         try:
-            t = self.ex.fetch_ticker(f"{sym}/USDT")
-            price = safe_positive_float(t.get("last"), 0.0)
-            if price > 0:
-                return price
-            return safe_positive_float(t.get("close"), 0.0)
+            try:
+                symbol = f"{sym}/USDT"
+                t = self.ex.fetch_ticker(symbol)
+                if not explicit_trade_symbol_matches(t, symbol):
+                    raise ValueError(
+                        "trend ticker returned a symbol mismatch"
+                    )
+                price = safe_positive_float(t.get("last"), 0.0)
+                if price <= 0:
+                    price = safe_positive_float(t.get("close"), 0.0)
+                if price <= 0:
+                    raise ValueError(
+                        "trend ticker returned no positive price"
+                    )
+            except Exception:
+                if isinstance(reservation, ApiCallReservation):
+                    try:
+                        record_api_error("trend_fetch_ticker", reservation)
+                    except Exception:
+                        pass
+                raise
+            return price
         except Exception:
             return 0.0
 
@@ -208,6 +274,7 @@ class TrendBot(SpotBot):
         interval = self._check_interval_sec()
         log_event(f"Trend scan-loop started (every {interval/3600:.1f}h)", "INFO")
         while not self._shutdown_event.is_set():
+            interval = self._check_interval_sec()
             try:
                 self._trend_buy_pass()
             except Exception as e:
@@ -245,11 +312,12 @@ class TrendBot(SpotBot):
         # signal, so no extra fetches.
         vt_on = str(self.C("TREND_VOL_TARGET", 0)).strip().lower() in (
             "1", "true", "yes", "on")
+        universe = self._trend_universe()
         vols, med = {}, None
         if vt_on:
             _lb = int(float(self.C("TREND_VOL_TARGET_LOOKBACK", 30)))
             _need = max(bars_required(p), _lb + 1)
-            for _s in self._trend_universe():
+            for _s in universe:
                 _v = realized_vol(self._get_daily_closes(_s, _need), _lb)
                 if _v:
                     vols[_s] = _v
@@ -280,7 +348,11 @@ class TrendBot(SpotBot):
         opened = 0
         parts = []                                        # per-coin vote summary
         regime_refresh_attempted = False
-        for sym in self._trend_universe():
+        try:
+            size_cap = float(self.C("POSITION_SIZE_MAX", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            size_cap = 0.0
+        for sym in universe:
             if self._shutdown_event.is_set():
                 return
             held = self.state.has(sym)
@@ -311,10 +383,6 @@ class TrendBot(SpotBot):
                 continue                                  # at Max Open Trades
             coin_size = size * (vol_target_multiplier(vols.get(sym), med)
                                 if vt_on else 1.0)
-            try:
-                size_cap = float(self.C("POSITION_SIZE_MAX", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                size_cap = 0.0
             if size_cap > 0:
                 coin_size = min(coin_size, size_cap)
             if not self.simulation and free is not None and free < coin_size:
@@ -510,7 +578,13 @@ class TrendBot(SpotBot):
                     if released:
                         from core.database import release_portfolio_reservation
 
-                        release_portfolio_reservation(entry_id)
+                        try:
+                            release_portfolio_reservation(entry_id)
+                        except Exception as reservation_exc:
+                            released = False
+                            self._report_failed_reservation_release(
+                                sym, reservation_exc
+                            )
                 if clean_failure and released:
                     log_event(
                         f"Trend entry {sym} failed "
@@ -540,7 +614,12 @@ class TrendBot(SpotBot):
                     if released:
                         from core.database import release_portfolio_reservation
 
-                        release_portfolio_reservation(entry_id)
+                        try:
+                            release_portfolio_reservation(entry_id)
+                        except Exception as reservation_exc:
+                            self._report_failed_reservation_release(
+                                sym, reservation_exc
+                            )
                 continue
             amount, fill_price, gross_amount, invested_usdt, entry_fee = entry
             sim_tca_pending = None
@@ -725,6 +804,7 @@ class TrendBot(SpotBot):
         log_event(f"Trend monitor-loop started (every {interval/3600:.1f}h)",
                   "INFO")
         while not self._shutdown_event.is_set():
+            interval = self._check_interval_sec()
             try:
                 self._trend_killswitch()
                 self._trend_exit_pass()
@@ -737,10 +817,9 @@ class TrendBot(SpotBot):
     def _trend_exit_pass(self):
         from core.logger import log_event
         p = self._trend_params()
-        try:
-            disaster = float(self.C("INITIAL_STOP_LOSS", -30.0))
-        except (TypeError, ValueError):
-            disaster = -30.0
+        disaster = safe_stop_loss_pct(
+            self.C("INITIAL_STOP_LOSS", -30.0), -30.0
+        )
         for sym in list(self.state.keys()):
             if self._shutdown_event.is_set():
                 return
@@ -782,20 +861,27 @@ class TrendBot(SpotBot):
         """Simple daily-loss killswitch (spot, no leverage  no liquidation, so
         a soft SAFE_MODE stop on new buys is sufficient)."""
         try:
-            from core.database import get_today_pnl
+            from core.database import get_today_pnl, pause_bot_today
             from core.logger import log_event
             if self.safe_mode is None or self.safe_mode.is_active():
                 return
             info = get_today_pnl(self.BOT_NAME, mode_is_sim=self.simulation)
             today = info.get("total_profit", 0.0)
-            try:
-                max_loss = float(self.C("MAX_DAILY_LOSS", -50.0))
-            except (TypeError, ValueError):
-                max_loss = -50.0
+            max_loss = safe_daily_loss_limit(
+                self.C("MAX_DAILY_LOSS", -50.0), -50.0
+            )
             if today <= max_loss:
                 log_event(f" KILLSWITCH (Trend): daily {today:+.2f} USDT "
                           f"<= {max_loss}  SAFE_MODE, no new buys", "WARN")
                 self.safe_mode.trigger(
                     f"daily-loss killswitch ({today:+.2f} USDT)")
+                try:
+                    pause_bot_today(
+                        self.BOT_NAME,
+                        f"Daily loss {today:+.2f} USDT reached",
+                        mode_is_sim=self.simulation,
+                    )
+                except Exception as exc:
+                    self._log_error("persist trend daily-loss pause", exc)
         except Exception as e:
             self._log_error("trend killswitch", e)

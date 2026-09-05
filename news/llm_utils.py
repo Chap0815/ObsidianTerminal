@@ -31,6 +31,7 @@ POSITIVE_KEYWORDS = list(_POSITIVE)
 
 OLLAMA_URL = _ollama_url_fn()
 _LLM_SLOT_FILE_MAX_BYTES = 1024
+_LLM_SLOT_MAX_WAIT_SEC = 300.0
 
 
 def _read_llm_slot_payload(path: str) -> str:
@@ -80,27 +81,29 @@ def _config_path() -> str:
         return "bot_config.json"
 
 
+def _load_model_name(config_path: str) -> str:
+    cfg = _read_config_json(config_path)
+    if not isinstance(cfg, dict):
+        return LLM_MODEL_DEFAULT
+    model = cfg.get("LLM_MODEL")
+    if not isinstance(model, str):
+        return LLM_MODEL_DEFAULT
+    model = model.strip()
+    if (
+        not 1 <= len(model) <= 200
+        or any(not ch.isprintable() or ch.isspace() for ch in model)
+    ):
+        return LLM_MODEL_DEFAULT
+    return model
+
+
 def _get_model_name() -> str:
     """Read the configured LLM model name from bot_config.json.
 
     Returns the value of ``LLM_MODEL`` or LLM_MODEL_DEFAULT as fallback.
     """
-    config_path = _config_path()
     try:
-        if os.path.exists(config_path):
-            cfg = _read_config_json(config_path)
-            if not isinstance(cfg, dict):
-                return LLM_MODEL_DEFAULT
-            model = cfg.get("LLM_MODEL")
-            if not isinstance(model, str):
-                return LLM_MODEL_DEFAULT
-            model = model.strip()
-            if (
-                not 1 <= len(model) <= 200
-                or any(not ch.isprintable() or ch.isspace() for ch in model)
-            ):
-                return LLM_MODEL_DEFAULT
-            return model
+        return _load_model_name(_config_path())
     except Exception:
         pass
     return LLM_MODEL_DEFAULT
@@ -108,27 +111,41 @@ def _get_model_name() -> str:
 
 #  Hot-reload of LLM_MODEL 
 # ``get_model_name()`` re-reads bot_config.json on each call, cached by the
-# file's mtime: the first call after an external edit hits disk, subsequent
-# calls within the same mtime window use the cache. ``MODEL_NAME`` below is a
+# file's stat signature: the first call after an external edit hits disk,
+# subsequent calls for the same file generation use the cache. ``MODEL_NAME`` below is a
 # seeded string snapshot for callers that ``from .llm_utils import MODEL_NAME``
 # at startup; on-the-fly model changes are picked up via get_model_name().
 
-_MODEL_CACHE = {"value": None, "mtime": 0.0}
+_MODEL_CACHE = {"value": None, "signature": None}
 
 
 def get_model_name() -> str:
     """Public hot-reloading getter. Re-reads bot_config.json when the file
-    has changed (mtime check). Safe to call from anywhere on the hot path.
+    has changed. Safe to call from anywhere on the hot path.
     """
     config_path = _config_path()
     try:
-        mt = os.path.getmtime(config_path)
+        stat_result = os.stat(config_path)
+        signature = (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+        )
     except OSError:
         # Config gone  keep using whatever we last had, or default
         return _MODEL_CACHE["value"] or LLM_MODEL_DEFAULT
-    if _MODEL_CACHE["value"] is None or mt != _MODEL_CACHE["mtime"]:
-        _MODEL_CACHE["value"] = _get_model_name()
-        _MODEL_CACHE["mtime"] = mt
+    if (_MODEL_CACHE["value"] is None
+            or signature != _MODEL_CACHE.get("signature")):
+        try:
+            value = _load_model_name(config_path)
+        except Exception:
+            # Preserve the last validated value and retry this generation on
+            # the next call after a transient read/replace race.
+            return _MODEL_CACHE["value"] or LLM_MODEL_DEFAULT
+        _MODEL_CACHE["value"] = value
+        _MODEL_CACHE["signature"] = signature
     return _MODEL_CACHE["value"]
 
 
@@ -165,30 +182,22 @@ _BOOT_FP = _boot_fingerprint()
 
 
 def _pid_alive(pid: int, payload_boot_fp: str = "") -> bool:
-    if pid <= 0:
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or not 0 < pid <= 0xFFFFFFFF
+    ):
         return False
     if payload_boot_fp and payload_boot_fp != _BOOT_FP:
         return False
-    if os.name == "nt":
-        # CPython's Windows os.kill() is not a POSIX liveness probe: signal 0
-        # is passed to TerminateProcess and can kill the slot holder. psutil
-        # uses a read-only process query and is already a runtime dependency.
-        try:
-            import psutil
-            return bool(psutil.pid_exists(pid))
-        except Exception:
-            # Fail closed: an indeterminate holder remains alive until the
-            # bounded stale-lock age expires. Never steal a possibly live slot.
-            return True
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+        from core.process_identity import pid_alive
+
+        return pid_alive(pid)
     except Exception:
-        return False
+        # Fail closed: an indeterminate holder remains alive until the bounded
+        # stale-lock age expires. Never steal a possibly live slot.
+        return True
 
 
 class _LLMSlotLease:
@@ -219,6 +228,26 @@ class _LLMSlotLease:
 
 def _acquire_llm_slot():
     """Claim one cross-process OS lock. Returns a lease or ``None``."""
+    if isinstance(LLM_SLOT_WAIT_SEC, bool):
+        return None
+    try:
+        wait_budget = float(LLM_SLOT_WAIT_SEC)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not math.isfinite(wait_budget)
+        or wait_budget < 0.0
+        or wait_budget > _LLM_SLOT_MAX_WAIT_SEC
+    ):
+        return None
+    if (
+        not isinstance(LLM_MAX_CONCURRENT, int)
+        or isinstance(LLM_MAX_CONCURRENT, bool)
+        or not 1 <= LLM_MAX_CONCURRENT <= 64
+    ):
+        return None
+    slot_count = LLM_MAX_CONCURRENT
+
     try:
         os.makedirs(LLM_LOCK_DIR, exist_ok=True)
     except Exception as e:
@@ -228,11 +257,13 @@ def _acquire_llm_slot():
         )
         return None
 
-    deadline = time.monotonic() + LLM_SLOT_WAIT_SEC
+    deadline = time.monotonic() + wait_budget
     my_payload = f"{os.getpid()}:{_BOOT_FP}:{time.time():.3f}".encode()
 
-    while time.monotonic() < deadline:
-        for slot in range(LLM_MAX_CONCURRENT):
+    attempt_immediately = True
+    while attempt_immediately or time.monotonic() < deadline:
+        attempt_immediately = False
+        for slot in range(slot_count):
             lock_path = os.path.join(LLM_LOCK_DIR, f"slot_{slot}.lock")
             lock = None
             try:
@@ -264,7 +295,10 @@ def _acquire_llm_slot():
                         lock.release()
                     except Exception:
                         pass
-        time.sleep(0.3)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        time.sleep(min(0.3, remaining))
 
     return None
 
@@ -331,6 +365,20 @@ def generate_with_timeout(model: str, prompt: str,
     ollama.Client keeps an internal HTTP connection pool, avoiding the
     per-call TCP-handshake overhead of bare requests.post (~1s  calls/scan).
     """
+    valid_model = (
+        isinstance(model, str)
+        and 1 <= len(model) <= 200
+        and all(ch.isprintable() and not ch.isspace() for ch in model)
+    )
+    valid_prompt = (
+        isinstance(prompt, str)
+        and bool(prompt.strip())
+        and len(prompt) <= 1_000_000
+        and "\x00" not in prompt
+    )
+    if not valid_model or not valid_prompt or not isinstance(use_json_format, bool):
+        raise ValueError("LLM generation request is invalid")
+
     slot = _acquire_llm_slot()
     if slot is None:
         raise TimeoutError(
@@ -345,19 +393,17 @@ def generate_with_timeout(model: str, prompt: str,
         # timeout because the new model has to cold-load into VRAM.
         # Old model stays until VRAM pressure forces Ollama to evict it.
         prev_model = _LAST_USED_MODEL[0]
-        model_just_changed = (prev_model is not None and prev_model != model)
-        if model_just_changed:
+        model_needs_cold_load = prev_model != model
+        if prev_model is not None and model_needs_cold_load:
             log_event(
                 f"LLM model changed: {prev_model}  {model} "
                 f" first call will be slower (cold-load)", "INFO"
             )
-        _LAST_USED_MODEL[0] = model
-
         # Use a longer timeout for the first call after a model switch
         # (cold-load can take 15-60s depending on model size and disk speed).
         effective_timeout = (
             max(LLM_INFERENCE_TIMEOUT_SEC, 180.0)
-            if model_just_changed
+            if model_needs_cold_load
             else LLM_INFERENCE_TIMEOUT_SEC
         )
         client = _get_ollama_client(OLLAMA_URL, effective_timeout)
@@ -393,6 +439,7 @@ def generate_with_timeout(model: str, prompt: str,
         if use_json_format and _os.getenv("OLLAMA_FORCE_JSON", "0") == "1":
             kwargs["format"] = "json"
         result  = client.generate(**kwargs)
+        _LAST_USED_MODEL[0] = model
         elapsed = time.perf_counter() - t0
         level   = "INFO"
         suffix  = ""
@@ -504,8 +551,10 @@ def _model_names_from_payload(payload) -> list[str]:
         if not isinstance(model, dict):
             continue
         name = model.get("name")
-        if isinstance(name, str) and name.strip():
-            names.append(name.strip()[:256])
+        if isinstance(name, str):
+            name = name.strip()
+            if name and len(name) <= 256:
+                names.append(name)
     return names
 
 
@@ -951,25 +1000,38 @@ def _challenge_text(value, *, fallback: str, limit: int) -> str:
 def _interpret_challenge(resp, label: str) -> str:
     """Map a challenge response to OVERRIDE_WAIT / PROCEED.
 
-    ``resp`` is the dict (or str) from generate_with_timeout. A trailing
-    'CHALLENGE: STRONG' line means skip the trade; an empty answer is treated
-    like the error path (honours _BULL_BEAR_FAIL_CLOSED)."""
+    ``resp`` is the SDK mapping model (or dict/str) from
+    generate_with_timeout. A trailing 'CHALLENGE: STRONG' line means skip the
+    trade; an empty answer is treated like the error path (honours
+    _BULL_BEAR_FAIL_CLOSED)."""
     text = ""
-    if isinstance(resp, dict):
-        candidate = resp.get("response")
-        if isinstance(candidate, str):
-            text = candidate
-    elif isinstance(resp, str):
+    if isinstance(resp, str):
         text = resp
+    else:
+        getter = getattr(resp, "get", None)
+        if callable(getter):
+            try:
+                candidate = getter("response")
+            except Exception:
+                candidate = None
+            if isinstance(candidate, str):
+                text = candidate
     verdict = text.upper()
     if not verdict.strip():
         return "OVERRIDE_WAIT" if _BULL_BEAR_FAIL_CLOSED else "PROCEED"
     lines = [ln for ln in verdict.splitlines() if ln.strip()]
-    tail = lines[-1] if lines else verdict
-    if "STRONG" in tail:
+    tail_tokens = (lines[-1] if lines else verdict).split()
+    challenge = (
+        tail_tokens[1]
+        if len(tail_tokens) >= 2 and tail_tokens[0] == "CHALLENGE:"
+        else ""
+    )
+    if challenge == "STRONG":
         log_event(f"[Bull/Bear] {label}: STRONG challenge  OVERRIDE_WAIT", "INFO")
         return "OVERRIDE_WAIT"
-    return "PROCEED"
+    if challenge == "WEAK":
+        return "PROCEED"
+    return "OVERRIDE_WAIT" if _BULL_BEAR_FAIL_CLOSED else "PROCEED"
 
 
 def bull_bear_challenge(symbol, bull_analysis, context_brief="", confidence=""):
