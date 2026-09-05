@@ -2329,6 +2329,13 @@ def _telegram_recipient_key(token: str, chat_id: str) -> str:
 def _record_tg_failure(reason: str, recipient_key: str) -> None:
     """Report the first failure immediately and rate-limit later reminders."""
     notice = None
+    blocked_recipient = str(reason).strip().lower() == "http_403"
+    remediation = (
+        "unblock the bot for that recipient or remove the blocked recipient "
+        "from TELEGRAM_CHAT_ID"
+        if blocked_recipient
+        else "check token and network"
+    )
     with _TG_FAIL_LOCK:
         state = _TG_FAILURES.setdefault(
             str(recipient_key), {"count": 0, "last_big_warn": 0.0}
@@ -2340,7 +2347,7 @@ def _record_tg_failure(reason: str, recipient_key: str) -> None:
             notice = (
                 f"Telegram delivery temporarily unavailable for one configured "
                 f"recipient ({reason}); "
-                "trading continues normally"
+                f"trading continues normally; {remediation}"
             )
         elif n >= 5 and (
             now - float(state["last_big_warn"])
@@ -2348,8 +2355,7 @@ def _record_tg_failure(reason: str, recipient_key: str) -> None:
             state["last_big_warn"] = now
             notice = (
                 f"Telegram delivery still unavailable for one configured "
-                f"recipient after {n} attempts (last: {reason}); check token "
-                f"and network"
+                f"recipient after {n} attempts (last: {reason}); {remediation}"
             )
     if notice is not None:
         try:

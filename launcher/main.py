@@ -386,16 +386,27 @@ def _setup_wizard_is_running(wizard_path: str, *, process_iter=None) -> bool:
     current_pid = os.getpid()
     saw_current = False
     scan_incomplete = False
+    current_owner = ""
+    incomplete_candidate_owners: list[str] = []
     found = False
 
+    def normalized_owner(value) -> str:
+        try:
+            return str(value or "").strip().casefold()
+        except Exception:
+            return ""
+
     try:
-        processes = process_iter(["pid", "name", "exe", "cmdline", "cwd"])
+        processes = process_iter(
+            ["pid", "name", "exe", "cmdline", "cwd", "username"]
+        )
         for proc in processes:
             try:
                 info = proc.info
                 pid = int(info.get("pid") or 0)
                 if pid == current_pid:
                     saw_current = True
+                    current_owner = normalized_owner(info.get("username"))
                     continue
                 if pid <= 0:
                     if pid < 0:
@@ -418,7 +429,9 @@ def _setup_wizard_is_running(wizard_path: str, *, process_iter=None) -> bool:
                         for value in executable_names
                     )
                     if python_like or not identity_known:
-                        scan_incomplete = True
+                        incomplete_candidate_owners.append(
+                            normalized_owner(info.get("username"))
+                        )
                     continue
                 if not python_like:
                     continue
@@ -451,7 +464,9 @@ def _setup_wizard_is_running(wizard_path: str, *, process_iter=None) -> bool:
                         candidate = os.path.normcase(os.path.abspath(token))
                     elif os.path.basename(token).lower() == "setup_wizard.pyw":
                         if not raw_cwd:
-                            scan_incomplete = True
+                            incomplete_candidate_owners.append(
+                                normalized_owner(info.get("username"))
+                            )
                             continue
                         candidate = os.path.normcase(
                             os.path.abspath(os.path.join(str(raw_cwd), token))
@@ -474,6 +489,11 @@ def _setup_wizard_is_running(wizard_path: str, *, process_iter=None) -> bool:
 
     if found:
         return True
+    if any(
+        not current_owner or not owner or owner == current_owner
+        for owner in incomplete_candidate_owners
+    ):
+        scan_incomplete = True
     if scan_incomplete or not saw_current:
         raise RuntimeError("setup wizard process scan incomplete")
     return False

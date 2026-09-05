@@ -111,6 +111,12 @@ class _DatabaseJournal:
         transition_order_intent(intent_id, status, **fields)
 
     @staticmethod
+    def get(intent_id):
+        from core.database import get_order_intent
+
+        return get_order_intent(intent_id)
+
+    @staticmethod
     def record_tca(intent_id, stage, payload):
         from core.database import record_execution_tca
 
@@ -153,6 +159,48 @@ def _mark_recovery_required_after_error(
             silent_log("entry recovery journal", journal_error)
         except Exception:
             pass
+
+
+def _durable_finalized_order_matches(
+    journal,
+    intent_id: str,
+    order: object,
+    target_amount: float,
+) -> bool:
+    """Prove a complete venue result survived an ambiguous finalization error."""
+    getter = getattr(journal, "get", None)
+    if not callable(getter) or not isinstance(order, dict):
+        return False
+    try:
+        intent = getter(intent_id)
+        if not isinstance(intent, Mapping) or intent.get("status") != "FINALIZED":
+            return False
+        persisted_target = _positive_finite_float(
+            intent.get("target_amount"), "persisted target amount"
+        )
+        persisted_filled = _positive_finite_float(
+            intent.get("filled_amount"), "persisted filled amount"
+        )
+        persisted_notional = _positive_finite_float(
+            intent.get("filled_notional"), "persisted filled notional"
+        )
+        order_filled = _positive_finite_float(order.get("filled"), "order fill")
+        order_notional = _recovered_fill_notional(order, order_filled)
+        order_ids = _explicit_order_ids(order)
+        persisted_order_id = _external_text(intent.get("exchange_order_id"))
+    except Exception:
+        return False
+    amount_tolerance = max(1e-12, target_amount * 1e-9)
+    notional_tolerance = max(1e-12, persisted_notional * 1e-9)
+    return (
+        abs(persisted_target - target_amount) <= amount_tolerance
+        and abs(persisted_filled - target_amount) <= amount_tolerance
+        and abs(order_filled - persisted_filled) <= amount_tolerance
+        and order_notional is not None
+        and abs(order_notional - persisted_notional) <= notional_tolerance
+        and len(order_ids) == 1
+        and order_ids == {persisted_order_id}
+    )
 
 
 def _number(value, default=0.0) -> float:
@@ -881,6 +929,7 @@ def execute_entry_order(
                         silent_log("entry arrival TCA persistence", exc)
 
     if config.mode != "enforce":
+        order = None
         try:
             _require_pre_submit_guard()
             order = market_order()
@@ -975,6 +1024,14 @@ def execute_entry_order(
             )
             raise
         except Exception as exc:
+            if _durable_finalized_order_matches(
+                journal,
+                intent_id,
+                order,
+                amount,
+            ):
+                silent_log("entry finalized despite acknowledgement error", exc)
+                return order
             _mark_recovery_required_after_error(journal, intent_id, exc)
             raise
 

@@ -453,6 +453,36 @@ def _clamp_sim_cross_close_costs(
     return entry_fee, exit_fee, funding_for_close
 
 
+def _repair_sim_cross_pending_costs(
+    *,
+    bot_name: str,
+    sim_only: bool,
+    notional: float,
+    total_fees: float,
+    funding_for_close: float,
+) -> tuple[float, float]:
+    """Repair only pending CROSS-SIM costs that the DB must reject.
+
+    Legacy low-price paper positions could persist coin-scaled costs in an
+    otherwise complete close marker.  The direct-close retry path must retain
+    exact valid markers, but a value outside the database's notional sanity
+    envelope can never be booked and is deterministically reconstructable for
+    SIM.  LIVE markers never enter this repair path.
+    """
+    if str(bot_name).upper() != "CROSS" or not sim_only or notional <= 0:
+        return total_fees, funding_for_close
+
+    max_total_fee = max(0.25, notional * 0.02)
+    if total_fees < 0 or total_fees > max_total_fee:
+        total_fees = notional * 0.00055 * 2.0
+
+    max_funding = max(0.25, notional * 0.20)
+    if abs(funding_for_close) > max_funding:
+        funding_for_close = 0.0
+
+    return total_fees, funding_for_close
+
+
 def _filled_base_amount(order, wrapper_sold, requested_amount: float) -> float:
     requested = _positive_finite(requested_amount) or 0.0
     if isinstance(order, dict):
@@ -1709,6 +1739,40 @@ def _direct_close_remaining_futures(
                         f"{sym}: pending futures accounting skipped - "
                         f"invalid pending values")
                     continue
+                pending_notional = pending_margin * pending_leverage
+                repaired_fees, repaired_funding = (
+                    _repair_sim_cross_pending_costs(
+                        bot_name=bot_name,
+                        sim_only=sim_only,
+                        notional=pending_notional,
+                        total_fees=pending_fees,
+                        funding_for_close=pending_funding,
+                    )
+                )
+                if (
+                    repaired_fees != pending_fees
+                    or repaired_funding != pending_funding
+                ):
+                    log(
+                        "warn",
+                        f"{sym}: repaired rejected CROSS SIM pending costs "
+                        f"(fees {pending_fees:.6g} -> {repaired_fees:.6g}, "
+                        f"funding {pending_funding:.6g} -> "
+                        f"{repaired_funding:.6g})",
+                    )
+                    pending_fees = repaired_fees
+                    pending_funding = repaired_funding
+                    pending_pnl = round(
+                        pending_notional * (pending_pct / 100.0)
+                        - pending_fees
+                        - pending_funding,
+                        2,
+                    )
+                    pending_retry_state.update({
+                        "accounting_pending_fees_usdt": pending_fees,
+                        "accounting_pending_funding_paid": pending_funding,
+                        "accounting_pending_profit_usdt": pending_pnl,
+                    })
                 pending_kwargs = dict(
                     bot_name=bot_name,
                     symbol=sym,

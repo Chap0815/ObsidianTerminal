@@ -1,6 +1,6 @@
 {
-  "build_id": "5e6905d38f7a8fb2",
-  "created_at": "2026-09-05 10:52:39",
+  "build_id": "fbb93e46f57a48b2",
+  "created_at": "2026-09-05 11:57:15",
   "source": "update_deploy_manifest.py",
   "file_count": 200,
   "files": [
@@ -291,8 +291,8 @@
     },
     {
       "path": "core/logger.py",
-      "sha256": "db2690cd8395512dd3fea2e0f927c3ff595b7a995e14a955392b9a0d51462ae4",
-      "bytes": 82114
+      "sha256": "e0585412433406ee1a662210363b566f551b27cd1716888d99d3865e29122b67",
+      "bytes": 82370
     },
     {
       "path": "core/models.py",
@@ -416,8 +416,8 @@
     },
     {
       "path": "launcher/core/positions.py",
-      "sha256": "36867f65f35a24d2329fcb7f86d55ad83644c3cf7fd28ee8f6ae5e19d13f7b95",
-      "bytes": 134300
+      "sha256": "ecda8753eef188e540914d2277e059f5019c45e2c21e66a0c2ee62e6a2b5fa40",
+      "bytes": 136937
     },
     {
       "path": "launcher/core/process_manager.py",
@@ -436,8 +436,8 @@
     },
     {
       "path": "launcher/main.py",
-      "sha256": "4a2b9a61f743fafde8ef8278c6325ff2618a21cd19f8a26d6204ed008735ba3b",
-      "bytes": 20096
+      "sha256": "9ab1a526c5dd61fbdf3e2706e122f37a77b331b1d98c79b41c29d9267958a6ac",
+      "bytes": 20817
     },
     {
       "path": "launcher/state/__init__.py",
@@ -786,8 +786,8 @@
     },
     {
       "path": "trading/entry_executor.py",
-      "sha256": "e09755a681d5cec78207cf108398171d6db4c8d011946a4189de863e32d7f0a0",
-      "bytes": 87216
+      "sha256": "e8f9d080c3407a1a1a950d13af6e978b09884812bc0ac5419170caec91d33d02",
+      "bytes": 89379
     },
     {
       "path": "trading/entry_lifecycle.py",
