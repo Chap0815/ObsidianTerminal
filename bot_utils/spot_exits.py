@@ -276,25 +276,48 @@ class SpotSellOutcomeUnknown(RetryForbiddenError):
 
 def ensure_spot_exit_client_order_id(state, sym: str, row: dict,
                                      leg: str, bot_name: str) -> str:
-    """Persist a unique client id before the first physical SPOT sell."""
+    """Confirm a generation-bound, durable id before a physical SPOT sell."""
+    from bot_utils.trade_state import same_position_generation, update_many_if_current
+
     key = f"{leg}_exit_client_order_id"
-    existing = order_id_text_or_none(row.get(key))
+    getter = getattr(state, "get", None)
+    current = getter(sym) if callable(getter) else row
+    if callable(getter) and not same_position_generation(current, row):
+        raise RuntimeError(
+            f"cannot persist {key}: position generation changed for {sym}"
+        )
+    existing = order_id_text_or_none(current.get(key))
     if existing and existing.isascii() and len(existing) <= 32:
-        return existing
+        client_order_id = existing
+    else:
+        from uuid import uuid4
+        from trading.execution_quality import make_client_order_id
 
-    from uuid import uuid4
-    from trading.execution_quality import make_client_order_id
-
-    entry_id = order_id_text_or_none(row.get("entry_id")) or "legacy"
-    intent_id = f"{entry_id}:{uuid4().hex}"
-    client_order_id = make_client_order_id(
-        intent_id, f"{bot_name}:{sym}:{leg}", prefix="sx"
-    )
-    persisted = state.update(sym, key, client_order_id)
+        entry_id = order_id_text_or_none(row.get("entry_id")) or "legacy"
+        intent_id = f"{entry_id}:{uuid4().hex}"
+        client_order_id = make_client_order_id(
+            intent_id, f"{bot_name}:{sym}:{leg}", prefix="sx"
+        )
+    # A failed write leaves the id in RAM. Retry the same id, not a new intent.
+    if callable(getattr(state, "update_many", None)):
+        persisted = update_many_if_current(state, sym, {key: client_order_id}, row)
+    else:
+        persisted = state.update(sym, key, client_order_id)
     if persisted is not None and persisted is not True:
         raise RuntimeError(
             f"cannot persist {key} before live SPOT sell for {sym}"
         )
+    if callable(getter):
+        current = getter(sym)
+        # An obsolete conditional update is a successful no-op, not permission
+        # to submit an order against the successor position.
+        if (
+            not same_position_generation(current, row)
+            or current.get(key) != client_order_id
+        ):
+            raise RuntimeError(
+                f"cannot persist {key}: position generation changed for {sym}"
+            )
     row[key] = client_order_id
     return client_order_id
 

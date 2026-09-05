@@ -396,6 +396,9 @@ def collect_futures_snapshot(exchange) -> PortfolioSnapshot:
                         break
                 if price <= 0.0:
                     raise ValueError(f"valuation unavailable for {symbol}")
+                if (price_source.startswith("ticker_")
+                        and not explicit_trade_symbol_matches(ticker, symbol)):
+                    raise ValueError(f"futures ticker snapshot symbol mismatch for {symbol}")
                 notional = contracts * contract_size * price
                 if price_source == "entry_fallback":
                     valuation_notes.append(f"entry-price fallback for {symbol}")

@@ -1393,6 +1393,18 @@ def simulate_fast(
             risk_gate_counts["daily_hard_positions_closed"] += 1
             del open_trades[sym]
 
+    # Entry evidence must refer to this simulation and this symbol.  Keep one
+    # sorted timeline per symbol so checking the next bar stays logarithmic.
+    simulated_entry_times = {_to_epoch_sec(timestamp) for timestamp in all_times}
+    symbol_entry_times = {}
+    for symbol, tick_map in indexed.items():
+        times = []
+        for timestamp in tick_map:
+            seconds = _to_epoch_sec(timestamp)
+            if seconds in simulated_entry_times:
+                times.append(seconds)
+        symbol_entry_times[symbol] = sorted(times)
+
     for now in all_times:
         # Exchange liquidation has priority over every software exit.  Update
         # excursions once here, then remove liquidated positions before the
@@ -1434,6 +1446,17 @@ def simulate_fast(
                         entry_rate=entry_cost_rate,
                         exit_rate=exit_cost_rate,
                     )
+                    funding = _funding_cost(
+                        funding_8h,
+                        side,
+                        notional,
+                        d.get("entry_now", now),
+                        now,
+                        symbol=sym,
+                        funding_timeline=funding_timeline,
+                        entry_price=d["buy"],
+                        mark_price_resolver=funding_mark_resolver(sym),
+                    )
                     rec = _closed_trade_record(
                         d,
                         now,
@@ -1441,7 +1464,7 @@ def simulate_fast(
                         loss_pct,
                         gross_p,
                         fees,
-                        0.0,
+                        funding,
                         notional,
                         False,
                         True,
@@ -1803,6 +1826,28 @@ def simulate_fast(
                 tick.get("next_open"),
             )
             entry_time = tick.get("next_time", now)
+            try:
+                if isinstance(entry_time, bool):
+                    continue
+                entry_seconds = _to_epoch_sec(entry_time)
+                signal_seconds = _to_epoch_sec(now)
+            except (TypeError, ValueError, OverflowError, OSError):
+                continue
+            times = symbol_entry_times[sym]
+            time_index = bisect_left(times, signal_seconds)
+            if (
+                not math.isfinite(entry_seconds)
+                or time_index >= len(times)
+                or times[time_index] != signal_seconds
+            ):
+                continue
+            if entry_seconds != signal_seconds and (
+                time_index + 1 >= len(times)
+                or entry_seconds != times[time_index + 1]
+            ):
+                # Neither a captured current price nor the next symbol bar.
+                # Do not admit side-specific prices through an invalid clock.
+                continue
             candidates.append(
                 (abs(chg), sym, tick["price"], entry_price, side, entry_time)
             )
@@ -1838,8 +1883,8 @@ def simulate_fast(
             next_position_id += 1
 
     if all_times and open_trades:
-        end_time = all_times[-1]
         for sym, d in list(open_trades.items()):
+            end_time = all_times[-1]
             tick = indexed.get(sym, {}).get(end_time)
             if tick is None:
                 for _t in reversed(all_times):
@@ -1847,7 +1892,11 @@ def simulate_fast(
                     if tick is not None:
                         end_time = _t
                         break
-            exit_price = float((tick or {}).get("price") or d.get("buy") or 0.0)
+            if tick is None or _to_epoch_sec(end_time) < _to_epoch_sec(
+                d.get("entry_now", end_time)
+            ):
+                continue
+            exit_price = float(tick.get("price") or 0.0)
             entry = float(d.get("buy") or 0.0)
             side = d.get("side", "LONG")
             if entry <= 0 or exit_price <= 0:

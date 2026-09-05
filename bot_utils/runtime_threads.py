@@ -422,6 +422,74 @@ def _schedule_shutdown_finalization_retry(
             raise
 
 
+def wait_for_runtime_shutdown(
+    owner,
+    status_writer,
+    log_event,
+    *,
+    resource_results: Mapping[str, bool] | None = None,
+    resource_closers: Mapping[str, object] | None = None,
+) -> bool:
+    """Retain the main thread until the existing shutdown action is terminal.
+
+    A non-daemon retry thread alone cannot do this: interpreter shutdown stops
+    accepting executor submissions before joining those threads. This driver
+    never requests a position close or changes a user's preserve decision.
+    Only resource/status failures may exhaust the bounded retry budget.
+    """
+    interval = max(0.01, float(_SHUTDOWN_RETRY_INTERVAL_SEC))
+    deadline = time.monotonic() + max(interval, float(_SHUTDOWN_RETRY_TIMEOUT_SEC))
+    first_pass = True
+    pause_before_retry = False
+    interrupt_pending = False
+    pending_error = None
+    while True:
+        try:
+            if pending_error is not None:
+                error, pending_error = pending_error, None
+                _report_shutdown_error(owner, "Runtime shutdown wait", error)
+            if interrupt_pending:
+                interrupt_pending = False
+                # Only an actually received interrupt authorizes this request.
+                owner._shutdown_handler(signum="KeyboardInterrupt")
+            if pause_before_retry:
+                time.sleep(interval)
+            pause_before_retry = True
+            quiet, first_pass = not first_pass, False
+            if finalize_runtime_shutdown(
+                owner, status_writer, log_event,
+                resource_results=resource_results,
+                resource_closers=resource_closers,
+                _schedule_retry=False,
+                _quiet=quiet,
+            ):
+                return True
+            if time.monotonic() >= deadline:
+                with _shutdown_transition_gate(owner):
+                    threads = owner._runtime_threads()
+                    closed = getattr(owner, "_emergency_closed", False) is True
+                    preserved = getattr(owner, "_shutdown_positions_preserved", False) is True
+                    terminal = (
+                        isinstance(threads, Mapping) and bool(threads)
+                        and not any(bool(alive) for alive in threads.values())
+                        and not getattr(owner, "_emergency_in_progress", False)
+                        and closed != preserved
+                    )
+                    if terminal and closed:
+                        count = getattr(getattr(owner, "state", None), "count", None)
+                        if callable(count):
+                            remaining = count()
+                            terminal = type(remaining) is int and remaining == 0
+                    if terminal:
+                        return False
+        except KeyboardInterrupt:
+            # Handle the request inside the protected loop: the handler and
+            # retry sleep can themselves raise while a close is still active.
+            interrupt_pending = True
+        except Exception as exc:
+            pending_error = exc
+
+
 def finalize_runtime_shutdown(
     owner,
     status_writer,

@@ -578,6 +578,107 @@ def update_many_if_current(
     return result is None or result is True
 
 
+_BREAKEVEN_REPLAY_LOCK = threading.Lock()
+
+
+def persist_breakeven_transition(
+    owner, sym: str, row: dict, be_price: Optional[float] = None,
+) -> Optional[bool]:
+    """Persist/replay one generation's BE activation, including its claim.
+
+    None means no transition (or an obsolete generation). False keeps the
+    exact intent retryable even if another snapshot already saved its RAM
+    flags. This process-local bookkeeping never rolls back position facts;
+    startup resync mirrors any flags that reached the restart snapshot.
+    """
+    state = owner.state
+    getter = getattr(state, "get", None)
+    if not callable(getter):
+        return False if be_price is not None else None
+
+    def matches(current, expected, fields=None):
+        if _same_position_generation(current, expected):
+            return True
+        # Narrow legacy adapters may not carry a canonical generation. Keep
+        # their existing exact-row behavior; real TradeState rows have keys.
+        return (
+            isinstance(current, dict)
+            and _position_generation_key(current) is None
+            and _position_generation_key(expected) is None
+            and (current == expected or current == {**expected, **(fields or {})})
+        )
+
+    with _BREAKEVEN_REPLAY_LOCK:
+        pending = getattr(owner, "_pending_breakeven_replays", None)
+        if pending is None:
+            pending = {}
+            owner._pending_breakeven_replays = pending
+        observed = list(pending.items())
+    # Only live failed generations may occupy the map. State reads can retry
+    # registry I/O, so they must never run under the bookkeeping lock.
+    for key, pending_replay in observed:
+        obsolete = pending_replay["state"] is not state
+        if not obsolete:
+            try:
+                current = getter(key)
+            except Exception:
+                continue  # Unknown is not proof that the intent disappeared.
+            obsolete = not matches(
+                current, pending_replay["row"], pending_replay["fields"]
+            )
+        if obsolete:
+            with _BREAKEVEN_REPLAY_LOCK:
+                if pending.get(key) is pending_replay:
+                    pending.pop(key, None)
+
+    with _BREAKEVEN_REPLAY_LOCK:
+        pending_replay = pending.get(sym)
+    if pending_replay is None and be_price is None:
+        return None
+    if owner.state is not state or not matches(getter(sym), row):
+        return None
+    if pending_replay is None:
+        price = _finite_float_or_none(be_price)
+        if price is None or price <= 0.0:
+            return False
+        candidate = {
+            "state": state,
+            "row": copy.deepcopy(row),
+            "fields": {"be_active": True, "be_price": price},
+        }
+        with _BREAKEVEN_REPLAY_LOCK:
+            pending_replay = pending.setdefault(sym, candidate)
+    if pending_replay["state"] is not state or not matches(
+        row, pending_replay["row"], pending_replay["fields"]
+    ):
+        return None
+
+    persisted = update_many_if_current(
+        state, sym, pending_replay["fields"], pending_replay["row"]
+    )
+    current = getter(sym)
+    obsolete = owner.state is not state or not matches(
+        current, pending_replay["row"], pending_replay["fields"]
+    )
+    if persisted and not obsolete:
+        obsolete = (
+            current.get("be_active") is not True
+            or _finite_float_or_none(current.get("be_price"))
+            != pending_replay["fields"]["be_price"]
+        )
+    if obsolete:
+        with _BREAKEVEN_REPLAY_LOCK:
+            if pending.get(sym) is pending_replay:
+                pending.pop(sym, None)
+        return None
+    if persisted:
+        with _BREAKEVEN_REPLAY_LOCK:
+            if pending.get(sym) is pending_replay:
+                pending.pop(sym, None)
+        row.update(pending_replay["fields"])
+    return persisted
+
+
 def release_claim_if_absent_for_generation(
     state,
     sym: str,
@@ -2050,11 +2151,19 @@ class TradeState:
                 return False
             elif status == "failed":
                 with self._lock:
+                    restore_snapshot = None
                     if sym not in self._trades and removed is not None:
                         restored = copy.deepcopy(removed)
                         if safe_restore_fields:
                             restored.update(safe_restore_fields)
                         self._trades[sym] = restored
+                        # Another symbol may have persisted a newer snapshot
+                        # while this failed removal was awaiting restoration.
+                        # The restored row is a new mutation, not a clean
+                        # return to the revision of the failed snapshot.
+                        restore_rev, restore_snapshot = self._snapshot_locked()
+                if restore_snapshot is not None:
+                    self._persist_snapshot(restore_rev, restore_snapshot)
                 try:
                     from bot_utils.silent_log import silent_log
                     silent_log(

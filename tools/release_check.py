@@ -27,6 +27,7 @@ from tools.release_requirements import (  # noqa: E402, I001
     REQUIRED_RELEASE_ITEMS,
 )
 from tools.update_deploy_manifest import (  # noqa: E402
+    _is_test_temp_name,
     _sync_directory as _sync_policy_directory,
     build_manifest,
 )
@@ -37,6 +38,7 @@ FORBIDDEN_DIRS = {
     ".pytest_cache",
     ".pytest_tmp_review",
     ".ruff_cache",
+    ".test-tmp",
     ".venv",
     "__pycache__",
     "backups",
@@ -633,7 +635,7 @@ def _is_forbidden_release_artifact(path: Path, root: Path) -> str | None:
     rel_posix_lower = rel_posix.lower()
     if rel.parts and rel.parts[0].lower() == "tools" and rel_posix not in RELEASE_TOOL_FILES:
         return f"forbidden non-release tool in release: {rel}"
-    if parts_lower & forbidden_dirs_lower:
+    if parts_lower & forbidden_dirs_lower or any(_is_test_temp_name(part) for part in rel.parts):
         return f"forbidden file under runtime/test directory: {rel}"
     if rel_posix_lower in forbidden_rel_lower:
         return f"forbidden user/update config in release: {rel}"
@@ -880,7 +882,7 @@ def check_release(
         forbidden_rel_lower = {part.lower() for part in FORBIDDEN_REL_PATHS}
         forbidden_names_lower = {part.lower() for part in FORBIDDEN_NAMES}
         if path.is_dir():
-            if path.name.lower() in forbidden_dirs_lower:
+            if path.name.lower() in forbidden_dirs_lower or _is_test_temp_name(path.name):
                 errors.append(f"forbidden runtime/test directory in release: {rel}")
             continue
         artifact_error = _is_forbidden_release_artifact(path, root)

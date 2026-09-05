@@ -27,6 +27,7 @@ EXCLUDED_DIRS = {
     ".pytest_cache",
     ".pytest_tmp_review",
     ".ruff_cache",
+    ".test-tmp",
     ".SynologyWorkingDirectory",
     ".venv",
     "__pycache__",
@@ -288,6 +289,11 @@ def _publish_manifest(path: Path, encoded: bytes) -> None:
                 pass
 
 
+def _is_test_temp_name(name: str) -> bool:
+    normalized = name.casefold()
+    return normalized == ".test-tmp" or normalized.startswith(".test-tmp-")
+
+
 def _secret_name(path: Path) -> bool:
     name_lower = path.name.lower()
     stem_lower = path.stem.lower()
@@ -312,6 +318,7 @@ def _skip(path: Path, root: Path) -> bool:
     return (
         rel_posix_lower in excluded_rel_lower
         or any(part.lower() in excluded_dirs_lower for part in rel.parts)
+        or any(_is_test_temp_name(part) for part in rel.parts)
         or path.name.lower().endswith(".bak")
         or ".bak_" in path.name.lower()
         or path.name.lower().endswith((".tmp", ".old", "~"))
@@ -386,7 +393,7 @@ def _filesystem_source_files(root: Path) -> list[Path]:
         for entry in entries:
             path = Path(entry.path).absolute()
             if entry.is_dir(follow_symlinks=False):
-                if entry.name.lower() in excluded_dirs:
+                if entry.name.lower() in excluded_dirs or _is_test_temp_name(entry.name):
                     continue
                 path = _absolute_without_links(path, label="manifest source")
                 child_dirs.append(path)
@@ -400,8 +407,41 @@ def _filesystem_source_files(root: Path) -> list[Path]:
     return sorted(files)
 
 
+def _is_release_worktree_layout(root: Path) -> bool:
+    return root.name.lower() == "worktree" and root.parent.name.lower() == "releases"
+
+
+def _validate_release_worktree(root: Path, reference: Path | None) -> None:
+    if reference is None:
+        raise ValueError("release worktree requires a separate DEV reference source")
+    if (
+        reference.resolve() == root.resolve()
+        or reference.name.lower().endswith("_release")
+        or _is_release_worktree_layout(reference)
+    ):
+        raise ValueError("release worktree requires a separate DEV reference source")
+    metadata = _absolute_without_links(root / ".git", label="release Git metadata")
+    if not metadata.exists():
+        raise ValueError("release worktree requires Git metadata")
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+    except OSError as exc:
+        raise RuntimeError("release worktree Git root is unavailable") from exc
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError("release worktree Git root is unavailable")
+    reported_root = Path(result.stdout.strip())
+    if not reported_root.is_absolute() or reported_root.resolve() != root.resolve():
+        raise ValueError("release worktree must be the exact Git root")
+
+
 def _git_tracked_files(root: Path) -> list[Path] | None:
+    strict_worktree = _is_release_worktree_layout(root)
     if not (root / ".git").exists():
+        if strict_worktree:
+            raise RuntimeError("release worktree Git inventory is unavailable")
         return None
     try:
         result = subprocess.run(
@@ -411,9 +451,13 @@ def _git_tracked_files(root: Path) -> list[Path] | None:
             timeout=20,
             check=False,
         )
-    except OSError:
+    except OSError as exc:
+        if strict_worktree:
+            raise RuntimeError("release worktree Git inventory is unavailable") from exc
         return None
     if result.returncode != 0:
+        if strict_worktree:
+            raise RuntimeError("release worktree Git inventory is unavailable")
         return None
     files: list[Path] = []
     for line in result.stdout.splitlines():
@@ -515,15 +559,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reference-source")
     args = parser.parse_args(argv)
     root = _manifest_root(args.root)
-    if not root.name.lower().endswith("_release"):
+    release_worktree = _is_release_worktree_layout(root)
+    if not root.name.lower().endswith("_release") and not release_worktree:
         raise ValueError(
             "manifest publication requires a release root ending in _Release"
         )
+    worktree_reference = None
+    if release_worktree:
+        worktree_reference = (
+            _manifest_root(args.reference_source) if args.reference_source else None
+        )
+        _validate_release_worktree(root, worktree_reference)
     manifest = build_manifest(root)
     reference_root = None
     reference_projection = None
     if args.reference_source:
-        reference_root = _manifest_root(args.reference_source)
+        reference_root = worktree_reference or _manifest_root(args.reference_source)
         reference_projection = _reference_projection(manifest, reference_root)
     _verify_manifest_snapshot(root, manifest)
     if (

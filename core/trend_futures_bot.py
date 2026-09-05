@@ -2379,7 +2379,6 @@ class TrendFuturesBot(FuturesBot):
                      log_event, send_telegram, _utc, tg_token, tg_chat) -> None:
         from core.database import save_trade_db
         from core.futures_bot_exits import (
-            FuturesExitsMixin,
             _futures_full_exit_clear_fields,
         )
         from core.logger import log_struct
@@ -2432,7 +2431,7 @@ class TrendFuturesBot(FuturesBot):
             return math.isfinite(parsed)
 
         def _pending_fragment_is_complete(p_amount, p_price, p_fee, state) -> bool:
-            if p_amount + 1e-12 < amt or p_price <= 0:
+            if abs(p_amount - amt) > max(1e-12, amt * 1e-9) or p_price <= 0:
                 return False
             for key in (
                 "pending_close_filled_amount",
@@ -2446,6 +2445,9 @@ class TrendFuturesBot(FuturesBot):
             return _finite_non_bool_number(p_fee)
 
         def _log_invalid_pending_fragment() -> None:
+            from core.futures_bot_exits import _defer_verified_flat_close
+
+            _defer_verified_flat_close(self, base, d, reason, log_event)
             log_event(
                 f"[{self.BOT_NAME}] {base}: invalid pending close fragment - "
                 f"state kept for reconcile/offline accounting",
@@ -2468,6 +2470,7 @@ class TrendFuturesBot(FuturesBot):
                 f"invalid core state - state kept for review", "WARN")
             return
         close_fee = 0.0
+        fill_price_known = False
         initial_entry_fee = _finite_float(
             d.get("initial_entry_fee", d.get("fees_paid", 0.0)), 0.0)
         original_amount = _nonnegative_float(
@@ -2488,6 +2491,7 @@ class TrendFuturesBot(FuturesBot):
         )
         live_close_already_verified = False
         if not self.simulation and d.get("pending_close_price"):
+            _closed = False
             try:
                 from bot_utils import verify_position_closed
                 from bot_utils.close_fragments import pending_close_values
@@ -2507,7 +2511,9 @@ class TrendFuturesBot(FuturesBot):
                     exch_oid = _oid or exch_oid
                     live_close_already_verified = True
             except Exception:
-                pass
+                if _closed:
+                    _log_invalid_pending_fragment()
+                    return
 
         if self.simulation:
             from bot_utils.fee_math import taker_fee_rate
@@ -2515,8 +2521,7 @@ class TrendFuturesBot(FuturesBot):
                 close_fee += amt * cs * close_price * taker_fee_rate(
                     self.ex, f"{base}/USDT:USDT")
         elif amt > 0 and not live_close_already_verified:
-            from bot_utils import (extract_or_estimate_futures_fee,
-                                    futures_contract_size, is_no_position_error,
+            from bot_utils import (futures_contract_size, is_no_position_error,
                                     verify_position_closed)
             from config.exchange_config import safe_amount_to_precision
             lev_cap = max(1, int(math.ceil(lev)))
@@ -2566,10 +2571,6 @@ class TrendFuturesBot(FuturesBot):
                 )
                 if order is None:
                     return
-                try:
-                    order_filled = _nonnegative_float(order.get("filled"), 0.0)
-                except AttributeError:
-                    order_filled = 0.0
             except Exception as e:
                 if is_no_position_error(e):
                     try:
@@ -2587,26 +2588,11 @@ class TrendFuturesBot(FuturesBot):
                         return
                     if _closed:
                         if not d.get("pending_close_order_id"):
-                            try:
-                                marker_persisted = self.state.update_many(base, {
-                                    "verified_flat_pending_accounting": True,
-                                    "verified_flat_reason": reason,
-                                    "verified_flat_at": _utc(),
-                                })
-                            except Exception as state_err:
-                                marker_persisted = False
-                                self._log_error(
-                                    f"trend mark verified-flat {base}",
-                                    state_err)
-                            if (
-                                marker_persisted is not None
-                                and marker_persisted is not True
-                            ):
-                                log_event(
-                                    f"[{self.BOT_NAME}] {base}: verified-flat "
-                                    "recovery marker was not durable",
-                                    "ERROR",
-                                )
+                            from core.futures_bot_exits import _defer_verified_flat_close
+
+                            _defer_verified_flat_close(
+                                self, base, d, reason, log_event,
+                            )
                             log_event(
                                 f"[{self.BOT_NAME}] {base}: position already "
                                 f"flat on exchange ({str(e)[:80]}) - keeping "
@@ -2631,13 +2617,8 @@ class TrendFuturesBot(FuturesBot):
                             close_fee = _fee
                             exch_oid = _oid or d.get("pending_close_order_id") or exch_oid
                         except Exception:
-                            pending_price = _positive_float(
-                                d.get("pending_close_price"), close_price)
-                            if pending_price > 0:
-                                close_price = pending_price
-                            close_fee = _nonnegative_float(
-                                d.get("pending_close_fee"), close_fee)
-                            exch_oid = d.get("pending_close_order_id") or exch_oid
+                            _log_invalid_pending_fragment()
+                            return
                         live_close_already_verified = True
                     else:
                         log_event(
@@ -2668,6 +2649,7 @@ class TrendFuturesBot(FuturesBot):
                         expected_client_id=d.get("full_exit_client_order_id"),
                         expected_amount=close_amount,
                     )
+                    fill_price_known = _fill_src in {"order", "fetch_order", "trades"}
                 except Exception:
                     for _k in ("average", "price"):
                         _v = order.get(_k)
@@ -2675,132 +2657,27 @@ class TrendFuturesBot(FuturesBot):
                             _fv = _positive_float(_v, 0.0)
                             if _fv > 0:
                                 close_price = _fv
+                                fill_price_known = True
                                 break
-            # VERIFY before booking  keep state on a partial/unverifiable close.
             if not live_close_already_verified:
-                try:
-                    _closed, _remaining = verify_position_closed(
-                        self.ex,
-                        full,
-                        expected_position_side=pos_type,
-                    )
-                except Exception as e:
-                    if order_filled > 0 and close_price > 0:
-                        try:
-                            from bot_utils.close_fragments import (
-                                add_close_fragment_update,
-                                pending_close_values,
-                            )
+                from core.futures_bot_exits import _verify_full_exit_coverage
 
-                            prev_amount, _px, _fee, _oid = (
-                                pending_close_values(d)
-                            )
-                            if prev_amount <= 0:
-                                frag_fee = extract_or_estimate_futures_fee(
-                                    self.ex, order, full, close_price,
-                                    amount=order_filled, contract_size=cs)
-                                fields = add_close_fragment_update(
-                                    d, amount=order_filled, price=close_price,
-                                    fee=frag_fee, order_id=exch_oid)
-                                fields["pending_close_reason"] = reason
-                                if full_exit_order_terminal:
-                                    fields.update(
-                                        _futures_full_exit_clear_fields()
-                                    )
-                                if not FuturesExitsMixin._persist_close_fragment(
-                                    self, base, fields, log_event
-                                ):
-                                    return
-                        except Exception as frag_exc:
-                            FuturesExitsMixin._block_close_fragment_recovery(
-                                self, base, log_event, type(frag_exc).__name__
-                            )
-                            self._log_error(
-                                f"trend build close fragment {base}", frag_exc)
-                            return
-                    self._log_error(f"trend verify-close {base}", e)
-                    log_event(f"[{self.BOT_NAME}]  {base}: close unverified  keep, "
-                              f"retry", "WARN")
+                evidence = _verify_full_exit_coverage(
+                    self, base, d, order, symbol_full=full,
+                    close_amount=close_amount, close_price=close_price,
+                    price_known=fill_price_known,
+                    order_terminal=full_exit_order_terminal, contract_size=cs,
+                    position_side=pos_type, reason=reason, log_event=log_event,
+                )
+                if evidence is None:
                     return
-                if not _closed:
-                    try:
-                        from bot_utils.close_fragments import (
-                            add_close_fragment_update, pending_close_values)
-                        prev_amount, _px, _fee, _oid = pending_close_values(d)
-                        total_filled = max(
-                            0.0, amt - _nonnegative_float(_remaining, 0.0))
-                        fragment = max(0.0, total_filled - prev_amount)
-                        if fragment > 0 and close_price > 0:
-                            frag_fee = extract_or_estimate_futures_fee(
-                                self.ex, order, full, close_price,
-                                amount=fragment, contract_size=cs)
-                            fields = add_close_fragment_update(
-                                d, amount=fragment, price=close_price,
-                                fee=frag_fee, order_id=exch_oid)
-                            fields["pending_close_reason"] = reason
-                            if full_exit_order_terminal:
-                                fields.update(
-                                    _futures_full_exit_clear_fields()
-                                )
-                            if not FuturesExitsMixin._persist_close_fragment(
-                                self, base, fields, log_event
-                            ):
-                                return
-                        elif full_exit_order_terminal:
-                            tolerance = max(1e-12, amt * 1e-9)
-                            if abs(total_filled - prev_amount) <= tolerance:
-                                if not FuturesExitsMixin._persist_close_fragment(
-                                    self,
-                                    base,
-                                    _futures_full_exit_clear_fields(),
-                                    log_event,
-                                ):
-                                    return
-                    except Exception as frag_exc:
-                        FuturesExitsMixin._block_close_fragment_recovery(
-                            self, base, log_event, type(frag_exc).__name__
-                        )
-                        self._log_error(
-                            f"trend build close fragment {base}", frag_exc)
-                        return
-                    log_event(f"[{self.BOT_NAME}]  {base}: close incomplete "
-                              f"(remaining {_remaining:.6f})  keep, retry "
-                              f"(partial fill accounted pending)", "WARN")
-                    return
-                try:
-                    from bot_utils.close_fragments import (
-                        add_close_fragment_update, pending_close_values)
-                    prev_amount, _px, _fee, _oid = pending_close_values(d)
-                    fragment = max(0.0, amt - prev_amount)
-                    if fragment > 0 and close_price > 0:
-                        frag_fee = extract_or_estimate_futures_fee(
-                            self.ex, order, full, close_price,
-                            amount=fragment, contract_size=cs)
-                        pending_view = dict(d)
-                        pending_view.update(add_close_fragment_update(
-                            d, amount=fragment, price=close_price,
-                            fee=frag_fee, order_id=exch_oid))
-                        _amt, _price, _fee, _oid = pending_close_values(pending_view)
-                        validation_state = pending_view
-                    else:
-                        _amt, _price, _fee, _oid = pending_close_values(d)
-                        validation_state = d
-                    if not _pending_fragment_is_complete(
-                        _amt, _price, _fee, validation_state
-                    ):
-                        _log_invalid_pending_fragment()
-                        return
-                    if _amt > 0 and _price > 0:
-                        close_price = _price
-                        close_fee = _fee
-                        exch_oid = _oid or exch_oid
-                except Exception:
-                    try:
-                        close_fee += extract_or_estimate_futures_fee(
-                            self.ex, order, full, close_price, amount=amt,
-                            contract_size=cs)
-                    except Exception:
-                        pass
+                _amount, close_price, close_fee, exch_oid = evidence
+
+        if not self.simulation and d.get("unpriced_external_partials"):
+            from core.futures_bot_exits import _defer_verified_flat_close
+
+            _defer_verified_flat_close(self, base, d, reason, log_event)
+            return
 
         #  Book realized PnL 
         profit_usdt = 0.0
@@ -2866,8 +2743,11 @@ class TrendFuturesBot(FuturesBot):
                                               partial_sold=partial_sold)
             profit_usdt = round(pnl - entry_fee - close_fee - funding, 4)
             move = price_move_pct(entry, close_price, pos_type)
-            mfe_pct = _finite_float(d.get("max_profit_pct"), move)
-            mae_pct = _finite_float(d.get("min_profit_pct"), move)
+            # Include the confirmed close fill, not only prior monitor ticks.
+            mfe_pct = max(0.0, move,
+                          _finite_float(d.get("max_profit_pct"), 0.0))
+            mae_pct = min(0.0, move,
+                          _finite_float(d.get("min_profit_pct"), 0.0))
             giveback_pct = max(0.0, mfe_pct - move)
             try:
                 log_struct("futrend_close_audit", bot=self.BOT_NAME, symbol=base,
@@ -3406,41 +3286,90 @@ class TrendFuturesBot(FuturesBot):
         try:
             from bot_utils import trailing_stop_hit, breakeven_stop_hit
             from bot_utils.futures_math import fee_buffered_breakeven
+            from bot_utils.trade_state import persist_breakeven_transition
+
             be_trigger = self._f("BREAKEVEN_TRIGGER", 0.0)
+            be_price = None
             if be_trigger > 0 and not d.get("be_active") and move >= be_trigger:
                 be_price = fee_buffered_breakeven(entry, pos_type, fee_buffer=0.003)
-                d["be_active"] = True
-                d["be_price"] = be_price
-                try:
-                    update_many_if_current(
-                        self.state,
-                        base,
-                        {"be_active": True, "be_price": be_price},
-                        d,
+            try:
+                persisted_be = persist_breakeven_transition(
+                    self, base, d, be_price
+                )
+                if persisted_be is False:
+                    self._log_error(
+                        f"trend breakeven audit update {base}",
+                        RuntimeError("BREAKEVEN activation is not durable"),
                     )
-                except Exception as e:
-                    self._log_error(f"trend breakeven audit update {base}", e)
+            except Exception as e:
+                self._log_error(f"trend breakeven audit update {base}", e)
 
             activation = self._f("ACTIVATION_PROFIT", 0.0)
             partial_pct = self._f("PARTIAL_SELL_PCT", 0.0)
             if (activation > 0 and partial_pct > 0 and not d.get("partial_sold")
                     and move >= activation):
-                pnl, pct = calc_unrealized_pnl(entry, curr, margin, lev, pos_type)
                 from core.symbol_locks import close_lock
                 with close_lock(base, bot_name=self.BOT_NAME) as got:
                     if not got:
                         return
-                    try:
-                        if not self.state.has(base):
-                            return
-                        live = self.state.get(base) or d
-                        if live.get("partial_sold"):
-                            return
-                    except Exception:
-                        live = d
-                    partial_done = self._execute_partial_tp(
-                        base, live, curr, move, pct, entry, liq, margin, lev,
-                        pos_type)
+                    live = self.state.get(base)
+                    if not isinstance(live, dict):
+                        return
+                    if not same_position_generation(live, d) and live != d:
+                        return
+                    if live.get("partial_sold"):
+                        return
+                    # The close lock may have waited through a reconcile or
+                    # another close. Use one current generation's money basis,
+                    # never the pre-lock trigger's entry/margin/side values.
+                    live_entry = self._safe_float(live.get("buy"), 0.0)
+                    live_margin = self._safe_float(live.get("invested_usdt"), 0.0)
+                    live_lev = self._safe_float(live.get("leverage"), 0.0)
+                    live_amount = self._safe_float(live.get("amount"), 0.0)
+                    live_side = live.get("position_type")
+                    if (live_entry <= 0 or live_margin <= 0 or live_lev <= 0
+                            or live_amount <= 0 or live_side not in {"LONG", "SHORT"}):
+                        return
+                    live_move = price_move_pct(live_entry, curr, live_side)
+                    if not math.isfinite(live_move):
+                        return
+                    live_pnl, live_pct = calc_unrealized_pnl(
+                        live_entry, curr, live_margin, live_lev, live_side)
+                    if not math.isfinite(live_pnl) or not math.isfinite(live_pct):
+                        return
+                    live_liq = self._safe_float(live.get("liquidation_price"), 0.0)
+                    if live_liq <= 0:
+                        live_liq = self._safe_float(calc_liquidation_price(
+                            live_entry, live_lev, live_side, mm), 0.0)
+                    # A no-longer-eligible partial must not suppress trailing
+                    # or BE. Their remaining checks also need the fresh basis.
+                    d = live
+                    entry, margin, lev = live_entry, live_margin, live_lev
+                    amount, pos_type, move = live_amount, live_side, live_move
+                    pnl_now, _pct_margin_now = live_pnl, live_pct
+                    liq = live_liq
+                    cur_dist = distance_to_liquidation_pct(curr, liq, pos_type)
+                    highest = self._safe_float(d.get("highest"), entry)
+                    lowest = self._safe_float(d.get("lowest"), entry)
+                    if highest <= 0:
+                        highest = entry
+                    if lowest <= 0:
+                        lowest = entry
+                    if pos_type == "LONG":
+                        highest = max(highest, curr)
+                    else:
+                        lowest = min(lowest, curr)
+                    extreme = highest if pos_type == "LONG" else lowest
+                    high_move = price_move_pct(entry, extreme, pos_type)
+                    if not math.isfinite(high_move):
+                        return
+                    activation = self._f("ACTIVATION_PROFIT", 0.0)
+                    partial_pct = self._f("PARTIAL_SELL_PCT", 0.0)
+                    partial_done = False
+                    if activation > 0 and partial_pct > 0 and move >= activation:
+                        partial_done = self._execute_partial_tp(
+                            base, d, curr, move, live_pct, entry,
+                            liq, margin, lev, pos_type)
                 if partial_done:
                     return
 

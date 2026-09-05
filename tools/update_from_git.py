@@ -25,6 +25,7 @@ import tempfile
 import time
 import tokenize
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1799,6 +1800,63 @@ def _backup_user_files() -> Path:
     return backup
 
 
+def _backup_has_rollback_workspace(backup: Path) -> bool:
+    """Unknown or incomplete recovery evidence must never be auto-pruned."""
+    try:
+        return any(child.name.casefold().startswith("rollback_") for child in backup.iterdir())
+    except Exception:
+        return True
+
+
+@dataclass
+class _RollbackWorkspace:
+    path: Path
+    identity: tuple[int, int]
+    discard: bool = False
+
+
+@contextmanager
+def _rollback_workspace(backup: Path):
+    """Keep recovery data unless this transaction explicitly proves completion."""
+    backup_absolute, backup_root = _root_bound_absolute(
+        backup, BACKUP_ROOT, label="rollback backup")
+    if backup_absolute == backup_root:
+        raise RuntimeError("rollback workspace requires its own user backup directory")
+    safe_backup = _ensure_root_bound_directory(backup, ROOT, label="rollback backup")
+    path = safe_backup / f"rollback_{uuid.uuid4().hex}"
+    path.mkdir(exist_ok=False)
+    _assert_existing_directory_chain(Path(os.path.abspath(ROOT)), path, label="rollback workspace")
+    info = path.lstat()
+    workspace = _RollbackWorkspace(path, (info.st_dev, info.st_ino))
+    try:
+        yield workspace
+    finally:
+        retained = True
+        cleanup_error = ""
+        if workspace.discard:
+            try:
+                root_absolute = Path(os.path.abspath(ROOT))
+                _assert_existing_directory_chain(root_absolute, path, label="rollback cleanup")
+                _assert_real_directory(path, label="rollback cleanup")
+                current = path.lstat()
+                if (current.st_dev, current.st_ino) != workspace.identity:
+                    raise RuntimeError("rollback workspace identity changed")
+                # Never remove the user backup or another transaction's path.
+                _validate_snapshot_source(path)
+                current = path.lstat()
+                if (current.st_dev, current.st_ino) != workspace.identity:
+                    raise RuntimeError("rollback workspace identity changed")
+                _rmtree(path)
+                retained = path.exists() or path.is_symlink()
+            except Exception as exc:
+                cleanup_error = f" ({type(exc).__name__}: {exc})"
+        if retained:
+            try:
+                _print(f"Rollback-Daten aufbewahrt in: {path}{cleanup_error}")
+            except Exception:
+                pass
+
+
 def _prune_old_backups(keep: int | None = None) -> None:
     try:
         keep = BACKUP_KEEP if keep is None else int(keep)
@@ -1828,7 +1886,8 @@ def _prune_old_backups(keep: int | None = None) -> None:
                 or path.resolve(strict=True).parent != root_resolved
             ):
                 continue
-            candidates.append((float(path_stat.st_mtime), path))
+            if not _backup_has_rollback_workspace(path):
+                candidates.append((float(path_stat.st_mtime), path))
         backups = [
             path
             for _modified, path in sorted(
@@ -1838,7 +1897,8 @@ def _prune_old_backups(keep: int | None = None) -> None:
             )
         ]
         for old in backups[max(0, keep):]:
-            _rmtree(old)
+            if not _backup_has_rollback_workspace(old):
+                _rmtree(old)
     except Exception:
         pass
 
@@ -3514,12 +3574,12 @@ def _update_existing_repo(
 
     backup = _backup_user_files()
     protected_hashes = _stash_protected_files(backup)
-    with tempfile.TemporaryDirectory(prefix="obsidian_runtime_rollback_") as runtime_tmp:
+    with _rollback_workspace(backup) as recovery:
         # Product-only updates never mutate the managed Python environment.
         # Snapshot its large tree only when the requirements delta can cause a
         # dependency installation and therefore needs runtime rollback.
         runtime_snapshot = (
-            _snapshot_runtime_env(Path(runtime_tmp))
+            _snapshot_runtime_env(recovery.path / "runtime")
             if dependency_update_needed
             else None
         )
@@ -3550,12 +3610,16 @@ def _update_existing_repo(
             _verify_protected_files(protected_hashes)
             _verify_updated_tree()
             clear_update_marker = True
+            recovery.discard = True
         except Exception:
             rollback_errors: list[str] = []
             if old_head:
-                reset = _run([git, "reset", "--hard", old_head], check=False)
-                if reset.returncode != 0:
-                    rollback_errors.append((reset.stderr or reset.stdout or "git reset failed").strip())
+                try:
+                    reset = _run([git, "reset", "--hard", old_head], check=False)
+                    if reset.returncode != 0:
+                        rollback_errors.append((reset.stderr or reset.stdout or "git reset failed").strip())
+                except Exception as restore_exc:
+                    rollback_errors.append(f"git rollback failed: {restore_exc}")
             try:
                 runtime_restored = _restore_runtime_env(runtime_snapshot)
                 if dependency_install_started and runtime_snapshot is None:
@@ -3573,6 +3637,7 @@ def _update_existing_repo(
                 _print("Rollback-Warnung: " + " | ".join(rollback_errors))
             else:
                 clear_update_marker = not marker_preexisting
+                recovery.discard = True
             raise
         finally:
             if clear_update_marker:
@@ -3591,9 +3656,9 @@ def _bootstrap_from_private_repo(
     git = _git()
     backup = _backup_user_files()
     protected_hashes = _stash_protected_files(backup)
-    with tempfile.TemporaryDirectory(prefix="obsidian_update_") as tmp:
+    with _rollback_workspace(backup) as recovery, tempfile.TemporaryDirectory(prefix="obsidian_update_") as tmp:
         clone_dir = Path(tmp) / "repo"
-        snapshot_dir = Path(tmp) / "rollback"
+        snapshot_dir = recovery.path / "app"
         runtime_snapshot = None
         marker_preexisting = (
             update_marker_exists(UPDATE_MARKER.parent)
@@ -3623,7 +3688,7 @@ def _bootstrap_from_private_repo(
             # environment. Avoid copying its large tree unless dependency
             # rollback can actually become necessary.
             runtime_snapshot = (
-                _snapshot_runtime_env(Path(tmp) / "runtime")
+                _snapshot_runtime_env(recovery.path / "runtime")
                 if dependency_update_needed
                 else None
             )
@@ -3644,6 +3709,7 @@ def _bootstrap_from_private_repo(
             _verify_protected_files(protected_hashes)
             _verify_updated_tree()
             clear_update_marker = True
+            recovery.discard = True
         except Exception:
             rollback_errors: list[str] = []
             try:
@@ -3668,6 +3734,7 @@ def _bootstrap_from_private_repo(
                 _print("Rollback-Warnung: " + " | ".join(rollback_errors))
             else:
                 clear_update_marker = marker_written and not marker_preexisting
+                recovery.discard = True
             raise
         finally:
             if clear_update_marker:

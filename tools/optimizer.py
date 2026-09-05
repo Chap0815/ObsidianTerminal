@@ -72,12 +72,14 @@ from tools.backtester import (
     DEFAULT_DAYS,
     PNL_ZERO_TOLERANCE_PCT,
     _compute_stats,
+    _to_epoch_sec,
 )
 from tools.simulation_workspace import (
     ReproducibleRun,
     canonical_evidence_sha256,
     freeze_history_dataset,
     load_history_dataset,
+    read_dataset_market_identity,
     split_boundaries,
 )
 from trading.promotion_assembly import seal_promotion_fragment
@@ -1312,11 +1314,34 @@ def split_into_folds(
 
 
 def filter_to_period(indexed: dict, time_set: set) -> dict:
-    """Filtert vorindexierte Daten auf eine Zeitperiode."""
-    return {
-        sym: {t: d for t, d in tick_map.items() if t in time_set}
-        for sym, tick_map in indexed.items()
-    }
+    """Clone period rows without carrying a fill from an excluded time."""
+    period_times = {_to_epoch_sec(timestamp) for timestamp in time_set}
+    filtered = {}
+    for symbol, tick_map in indexed.items():
+        period_rows = {}
+        for timestamp, tick in tick_map.items():
+            if timestamp not in time_set:
+                continue
+            row = dict(tick)
+            # Missing next_time is the current-tick capture/legacy contract.
+            # Explicit None must remain unusable even with a side entry price.
+            if "next_time" in row:
+                try:
+                    next_time = row["next_time"]
+                    next_seconds = _to_epoch_sec(next_time)
+                    included = (
+                        not isinstance(next_time, bool)
+                        and math.isfinite(next_seconds)
+                        and next_seconds in period_times
+                    )
+                except (TypeError, ValueError, OverflowError, OSError):
+                    included = False
+                if not included:
+                    row["next_time"] = None
+                    row["next_open"] = None
+            period_rows[timestamp] = row
+        filtered[symbol] = period_rows
+    return filtered
 
 
 def _optimizer_time_number(value) -> float | None:
@@ -3767,19 +3792,9 @@ def _canonical_exchange_name(value) -> str:
 
 
 def _validate_dataset_exchange(dataset_manifest: dict, expected_exchange: str) -> str:
-    if not isinstance(dataset_manifest, dict):
-        raise ValueError("dataset manifest is invalid")
-    provenance = dataset_manifest.get("provenance")
-    if not isinstance(provenance, dict):
-        raise ValueError("dataset exchange provenance is missing")
-    recorded = provenance.get("exchange_id") or provenance.get("exchange")
-    actual = _canonical_exchange_name(recorded)
-    expected = _canonical_exchange_name(expected_exchange)
-    if actual != expected:
-        raise ValueError(
-            f"dataset exchange mismatch: expected {expected}, found {actual}"
-        )
-    return actual
+    return read_dataset_market_identity(
+        dataset_manifest, expected_exchange=expected_exchange,
+    )["exchange"]
 
 
 def _history_cutoff_utc(history: dict) -> datetime:
@@ -3869,9 +3884,18 @@ def _reproducible_code_files() -> list[str]:
         os.path.join(root, "tools", "simulation_workspace.py"),
         os.path.join(root, "bot_utils", "indicators.py"),
         os.path.join(root, "bot_utils", "futures_funding.py"),
+        os.path.join(root, "bot_utils", "futures_math.py"),
+        os.path.join(root, "bot_utils", "fee_math.py"),
+        os.path.join(root, "bot_utils", "order_utils.py"),
         os.path.join(root, "core", "constants.py"),
         os.path.join(root, "trading", "promotion_assembly.py"),
+        os.path.join(root, "trading", "promotion_gate.py"),
         os.path.join(root, "trading", "simulation.py"),
+        os.path.join(root, "trading", "entry_quality.py"),
+        os.path.join(root, "trading", "futures_peak_trail.py"),
+        os.path.join(root, "trading", "futures_mfe_fallback.py"),
+        os.path.join(root, "trading", "cooldown_utils.py"),
+        os.path.join(root, "trading", "historical_futures_evidence.py"),
     ]
 
 

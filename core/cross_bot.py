@@ -3980,7 +3980,6 @@ class CrossBot(FuturesBot):
     def _close_leg_inner(self, base: str, d: dict, reason: str) -> None:
         from core.logger import log_event, _date as _utc
         from core.futures_bot_exits import (
-            FuturesExitsMixin,
             _futures_full_exit_clear_fields,
         )
         from bot_utils.futures_math import calc_unrealized_pnl, price_move_pct
@@ -4023,6 +4022,7 @@ class CrossBot(FuturesBot):
         entry_fee = max(0.0, CrossBot._safe_float(self, d.get("fees_paid"), 0.0))
         close_fee = 0.0
         close_fee_is_total = False
+        fill_price_known = False
         close_price = CrossBot._safe_positive_price(d.get("last_price")) or entry
         exch_oid = None
         profit_usdt = 0.0
@@ -4074,8 +4074,8 @@ class CrossBot(FuturesBot):
                 return False
             if fragment_amount <= 0 or fragment_price <= 0 or amt <= 0:
                 return False
-            tolerance = max(1e-9, abs(amt) * 1e-6)
-            return fragment_amount + tolerance >= amt
+            tolerance = max(1e-12, abs(amt) * 1e-9)
+            return abs(fragment_amount - amt) <= tolerance
 
         def _finite_non_bool_number(value) -> bool:
             if isinstance(value, bool):
@@ -4091,6 +4091,9 @@ class CrossBot(FuturesBot):
             return float(value) >= 0.0
 
         def _log_invalid_pending_fragment() -> None:
+            from core.futures_bot_exits import _defer_verified_flat_close
+
+            _defer_verified_flat_close(self, base, d, reason, log_event)
             log_event(
                 f"[{self.BOT_NAME}] {base}: invalid pending close "
                 f"fragment - state kept for reconcile/offline accounting",
@@ -4156,6 +4159,7 @@ class CrossBot(FuturesBot):
             )
         )
         if not self.simulation and has_pending_close_fragment:
+            _closed = False
             try:
                 from bot_utils import verify_position_closed
                 from bot_utils.close_fragments import pending_close_values
@@ -4176,7 +4180,9 @@ class CrossBot(FuturesBot):
                     exch_oid = _oid or exch_oid
                     live_close_already_verified = True
             except Exception:
-                pass
+                if _closed:
+                    _log_invalid_pending_fragment()
+                    return
 
         if self.simulation and not pending_accounting:
             # Realistic exit: cross the spread (long -> sell into the bid, short ->
@@ -4247,8 +4253,7 @@ class CrossBot(FuturesBot):
             close_fee = amt * close_price * taker_fee_rate(self.ex, full)
         elif amt > 0 and not live_close_already_verified:
             #  LIVE: reduce-only market close 
-            from bot_utils import (extract_or_estimate_futures_fee,
-                                   futures_contract_size,
+            from bot_utils import (futures_contract_size,
                                    is_no_position_error,
                                    verify_position_closed)
             from config.exchange_config import safe_amount_to_precision
@@ -4303,11 +4308,6 @@ class CrossBot(FuturesBot):
                 )
                 if order is None:
                     return
-                try:
-                    order_filled = max(0.0, CrossBot._safe_float(
-                        self, order.get("filled"), 0.0))
-                except Exception:
-                    order_filled = 0.0
             except Exception as e:
                 if is_no_position_error(e):
                     try:
@@ -4326,26 +4326,11 @@ class CrossBot(FuturesBot):
                         return
                     if _closed:
                         if not d.get("pending_close_order_id"):
-                            try:
-                                marker_persisted = self.state.update_many(base, {
-                                    "verified_flat_pending_accounting": True,
-                                    "verified_flat_reason": reason,
-                                    "verified_flat_at": _utc(),
-                                })
-                            except Exception as state_err:
-                                marker_persisted = False
-                                self._log_error(
-                                    f"cross mark verified-flat {base}",
-                                    state_err)
-                            if (
-                                marker_persisted is not None
-                                and marker_persisted is not True
-                            ):
-                                log_event(
-                                    f"[{self.BOT_NAME}] {base}: verified-flat "
-                                    "recovery marker was not durable",
-                                    "ERROR",
-                                )
+                            from core.futures_bot_exits import _defer_verified_flat_close
+
+                            _defer_verified_flat_close(
+                                self, base, d, reason, log_event,
+                            )
                             log_event(
                                 f"[{self.BOT_NAME}] {base}: position already "
                                 f"flat on exchange ({str(e)[:80]}) - keeping "
@@ -4407,6 +4392,7 @@ class CrossBot(FuturesBot):
                         expected_client_id=d.get("full_exit_client_order_id"),
                         expected_amount=close_amount,
                     )
+                    fill_price_known = _fill_src in {"order", "fetch_order", "trades"}
                 except Exception:
                     for _k in ("average", "price"):
                         _v = order.get(_k)
@@ -4414,150 +4400,32 @@ class CrossBot(FuturesBot):
                             _fv = CrossBot._safe_positive_price(_v)
                             if _fv > 0:
                                 close_price = _fv
+                                fill_price_known = True
                                 break
                 try:
                     cs = futures_contract_size(self.ex, full)
                 except Exception:
                     cs = 1.0
 
-                #  VERIFY THE CLOSE BEFORE BOOKING
-                # Confirm the leg is flat (fetch_positions) BEFORE booking PnL and
-                # dropping it. On a partial fill in a thin alt book (routine on
-                # cross-margin alts) or an unverifiable close, keep the leg and let
-                # the monitor / next rebalance retry - the reduce-only retry caps to
-                # the true remaining size, so the eventual confirmed close books
-                # once and never leaves an unmanaged orphan or double-counts PnL.
-                try:
-                    _closed, _remaining = verify_position_closed(
-                        self.ex,
-                        full,
-                        expected_position_side=pos_type,
-                    )
-                except Exception as e:
-                    if order_filled > 0 and close_price > 0:
-                        try:
-                            from bot_utils.close_fragments import (
-                                add_close_fragment_update,
-                                pending_close_values,
-                            )
+                from core.futures_bot_exits import _verify_full_exit_coverage
 
-                            prev_amount, _px, _fee, _oid = (
-                                pending_close_values(d)
-                            )
-                            if prev_amount <= 0:
-                                frag_fee = extract_or_estimate_futures_fee(
-                                    self.ex, order, full, close_price,
-                                    amount=order_filled, contract_size=cs)
-                                fields = add_close_fragment_update(
-                                    d, amount=order_filled, price=close_price,
-                                    fee=frag_fee, order_id=exch_oid)
-                                fields["pending_close_reason"] = reason
-                                if full_exit_order_terminal:
-                                    fields.update(
-                                        _futures_full_exit_clear_fields()
-                                    )
-                                if not FuturesExitsMixin._persist_close_fragment(
-                                    self, base, fields, log_event
-                                ):
-                                    return
-                        except Exception as frag_exc:
-                            FuturesExitsMixin._block_close_fragment_recovery(
-                                self, base, log_event, type(frag_exc).__name__
-                            )
-                            self._log_error(
-                                f"cross build close fragment {base}", frag_exc)
-                            return
-                    self._log_error(f"cross verify-close {base}", e)
-                    log_event(f"[{self.BOT_NAME}] {base}: close unverified - "
-                              f"keeping leg, retry next tick", "WARN")
+                evidence = _verify_full_exit_coverage(
+                    self, base, d, order, symbol_full=full,
+                    close_amount=close_amount, close_price=close_price,
+                    price_known=fill_price_known,
+                    order_terminal=full_exit_order_terminal, contract_size=cs,
+                    position_side=pos_type, reason=reason, log_event=log_event,
+                )
+                if evidence is None:
                     return
-                if not _closed:
-                    try:
-                        from bot_utils.close_fragments import (
-                            add_close_fragment_update, pending_close_values)
-                        prev_amount, _px, _fee, _oid = pending_close_values(d)
-                        total_filled = max(0.0, amt - float(_remaining))
-                        fragment = max(0.0, total_filled - prev_amount)
-                        if fragment > 0 and close_price > 0:
-                            frag_fee = extract_or_estimate_futures_fee(
-                                self.ex, order, full, close_price,
-                                amount=fragment, contract_size=cs)
-                            if not _finite_non_bool_number(frag_fee):
-                                _log_invalid_pending_fragment()
-                                return
-                            fields = add_close_fragment_update(
-                                d, amount=fragment, price=close_price,
-                                fee=frag_fee, order_id=exch_oid)
-                            fields["pending_close_reason"] = reason
-                            if full_exit_order_terminal:
-                                fields.update(
-                                    _futures_full_exit_clear_fields()
-                                )
-                            if not FuturesExitsMixin._persist_close_fragment(
-                                self, base, fields, log_event
-                            ):
-                                return
-                        elif full_exit_order_terminal:
-                            tolerance = max(1e-12, amt * 1e-9)
-                            if abs(total_filled - prev_amount) <= tolerance:
-                                if not FuturesExitsMixin._persist_close_fragment(
-                                    self,
-                                    base,
-                                    _futures_full_exit_clear_fields(),
-                                    log_event,
-                                ):
-                                    return
-                    except Exception as frag_exc:
-                        FuturesExitsMixin._block_close_fragment_recovery(
-                            self, base, log_event, type(frag_exc).__name__
-                        )
-                        self._log_error(
-                            f"cross build close fragment {base}", frag_exc)
-                        return
-                    log_event(
-                        f"[{self.BOT_NAME}] {base}: close incomplete "
-                        f"(remaining {_remaining:.6f}) - keeping leg, retry next "
-                        f"tick (partial fill accounted pending)",
-                        "WARN")
-                    return
-                try:
-                    from bot_utils.close_fragments import (
-                        add_close_fragment_update, pending_close_values)
-                    prev_amount, _px, _fee, _oid = pending_close_values(d)
-                    fragment = max(0.0, amt - prev_amount)
-                    if fragment > 0 and close_price > 0:
-                        frag_fee = extract_or_estimate_futures_fee(
-                            self.ex, order, full, close_price,
-                            amount=fragment, contract_size=cs)
-                        if not _finite_non_bool_number(frag_fee):
-                            _log_invalid_pending_fragment()
-                            return
-                        pending_view = dict(d)
-                        pending_view.update(add_close_fragment_update(
-                            d, amount=fragment, price=close_price,
-                            fee=frag_fee, order_id=exch_oid))
-                        _amt, _price, _fee, _oid = pending_close_values(pending_view)
-                        validation_state = pending_view
-                    else:
-                        _amt, _price, _fee, _oid = pending_close_values(d)
-                        validation_state = d
-                    if not _pending_fragment_is_complete(
-                        _amt, _price, _fee, validation_state
-                    ):
-                        _log_invalid_pending_fragment()
-                        return
-                    close_price = _price
-                    close_fee = _fee
-                    close_fee_is_total = False
-                    exch_oid = _oid or exch_oid
-                except Exception:
-                    try:
-                        close_fee = extract_or_estimate_futures_fee(
-                            self.ex, order, full, close_price, amount=amt,
-                            contract_size=cs)
-                        close_fee_is_total = False
-                    except Exception:
-                        pass
+                _amount, close_price, close_fee, exch_oid = evidence
+                close_fee_is_total = False
+
+        if not self.simulation and d.get("unpriced_external_partials"):
+            from core.futures_bot_exits import _defer_verified_flat_close
+
+            _defer_verified_flat_close(self, base, d, reason, log_event)
+            return
 
         #  Record REALIZED PnL (so get_today_pnl / metrics / killswitch work) 
         if entry > 0 and close_price > 0 and margin > 0 and amt > 0:
@@ -5052,15 +4920,6 @@ class CrossBot(FuturesBot):
         breaches MAX_DAILY_LOSS. Throttled to ~60s. One-shot SAFE_MODE then
         blocks the next rebalance from re-opening."""
         now = time.monotonic()
-        previous = getattr(self, "_last_ks_check", None)
-        if previous is not None:
-            try:
-                elapsed = now - float(previous)
-            except (TypeError, ValueError, OverflowError):
-                elapsed = 60.0
-            if 0.0 <= elapsed < 60.0:
-                return True
-        self._last_ks_check = now
         try:
             from core.database import get_today_pnl, pause_bot_today
             from bot_utils.futures_math import calc_unrealized_pnl
@@ -5069,6 +4928,7 @@ class CrossBot(FuturesBot):
             invalid_bases = []
             for base, d in trades.items():
                 if not self._is_active_leg(d):
+                    invalid_bases.append(base)
                     continue
                 side = CrossBot._safe_exchange_text(
                     d.get("position_type"),
@@ -5106,6 +4966,14 @@ class CrossBot(FuturesBot):
                     "ERROR",
                 )
                 return False
+            # A recent DB check does not certify newly invalid position
+            # evidence. Validate every current row before honoring the cache.
+            previous = CrossBot._safe_float(
+                self, getattr(self, "_last_ks_check", None), 0.0,
+            )
+            if previous > 0.0 and 0.0 <= now - previous < 60.0:
+                return True
+            self._last_ks_check = now
             today = get_today_pnl(self.BOT_NAME, mode_is_sim=self.simulation)
             realized = CrossBot._safe_float(
                 self, (today or {}).get("total_profit"), 0.0)
@@ -5146,7 +5014,7 @@ class CrossBot(FuturesBot):
                 for base, _d, _side, _entry, _last, _margin, _lev in validated:
                     if self.state.has(base):
                         self._close_leg(base, trades[base], reason="daily-loss killswitch")
-                if CrossBot._active_legs(self):
+                if self.state.get_all():
                     self._last_ks_check = 0.0
                     return False
             return True
@@ -5187,8 +5055,6 @@ class CrossBot(FuturesBot):
                     healed = self.state.get(base)
                     if healed:
                         raw_trades[base] = healed
-                else:
-                    raw_trades.pop(base, None)
         from core.symbol_locks import close_lock
         for base, d in list(raw_trades.items()):
             if d.get("accounting_already_booked"):
@@ -5216,9 +5082,25 @@ class CrossBot(FuturesBot):
                     self._log_error(
                         f"cross accounted cleanup lock {base}", exc
                     )
+        # Healing may return False after removing a stale row. Re-read the
+        # complete state instead of retaining ghosts or forgetting unresolved
+        # exposure while constructing the active per-leg monitoring subset.
+        raw_trades = self.state.get_all()
+        excluded_bases = [
+            base for base, row in raw_trades.items()
+            if not CrossBot._is_active_leg(row)
+        ]
+        coverage_complete = not excluded_bases
+        if not coverage_complete:
+            self._last_ks_check = 0.0
+            log_event(
+                f"[{self.BOT_NAME}] incomplete account-risk coverage for "
+                f"{sorted(excluded_bases)} - recovery rows remain unresolved",
+                "ERROR",
+            )
         trades = CrossBot._active_legs(self, raw_trades)
         if not trades:
-            self._cross_risk_snapshot_ok = not bool(self.state.get_all())
+            self._cross_risk_snapshot_ok = not bool(raw_trades)
             return
         monitored_trades = {}
         invalid_sides = []
@@ -5234,6 +5116,7 @@ class CrossBot(FuturesBot):
             monitored_trades[base] = normalized
         if invalid_sides:
             self._cross_risk_snapshot_ok = False
+            self._last_ks_check = 0.0
             log_event(
                 f"[{self.BOT_NAME}] monitor invalid active-leg sides "
                 f"{sorted(invalid_sides)} - unsafe portfolio math skipped",
@@ -5291,7 +5174,7 @@ class CrossBot(FuturesBot):
             price > 0 for price in monitor_prices.values()
         )
         risk_check_ok = False
-        if not invalid_sides and prices_complete:
+        if coverage_complete and not invalid_sides and prices_complete:
             risk_check_ok = (
                 CrossBot._check_daily_killswitch(self, risk_trades) is True
             )
@@ -5307,7 +5190,7 @@ class CrossBot(FuturesBot):
         )
         # Snapshot every leg once for the equity-aware CROSS liq below - each
         # leg's liq depends on the OTHER legs' uPnL + maintenance margin.
-        if invalid_sides:
+        if not coverage_complete or invalid_sides:
             _collateral, _legs = 0.0, {}
         else:
             try:
@@ -5316,6 +5199,8 @@ class CrossBot(FuturesBot):
                     monitored_trades,
                     ticker_snapshot,
                 )
+                if not isinstance(_legs, dict) or set(_legs) != set(monitored_trades):
+                    _collateral, _legs = 0.0, {}
             except Exception:
                 _collateral, _legs = 0.0, {}
         for base, d in monitored_trades.items():

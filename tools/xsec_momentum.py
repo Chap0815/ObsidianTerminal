@@ -33,7 +33,7 @@ guard_tool_entrypoint(__file__, __name__)
 import pandas as pd
 
 from tools.backtester import connect_exchange, get_top_volume_coins, fetch_history
-from tools.simulation_workspace import load_history_dataset
+from tools.simulation_workspace import load_history_dataset, read_dataset_market_identity
 from tools.trend_check import _safe_exc
 from trading.xsec_signal import (
     XSecParams,
@@ -385,32 +385,18 @@ def _validated_online_stats(returns: list) -> tuple[float, float, float, int] | 
 FEE_ONE_WAY = 0.0006  # futures taker 0.01% + slippage 0.05% per side
 
 
-def _canonical_exchange(value) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("dataset exchange provenance is missing")
-    normalized = "".join(char for char in value.lower() if char.isalnum())
-    return {"mexcglobal": "mexc"}.get(normalized, normalized)
-
-
 def _validate_xsec_dataset_manifest(manifest: dict, expected_exchange: str) -> dict:
     if not isinstance(manifest, dict):
         raise ValueError("dataset manifest is invalid")
     payload = manifest.get("fingerprint_payload")
-    provenance = manifest.get("provenance")
     if not isinstance(payload, dict) or payload.get("kind") != "optimizer_ohlcv_1h":
         raise ValueError("CROSS replay requires an immutable 1h optimizer dataset")
-    if not isinstance(provenance, dict):
-        raise ValueError("dataset provenance is missing")
-    recorded = provenance.get("exchange_id") or provenance.get("exchange")
-    actual = _canonical_exchange(recorded)
-    expected = _canonical_exchange(expected_exchange)
-    if actual != expected:
-        raise ValueError(
-            f"dataset exchange mismatch: expected {expected}, found {actual}",
-        )
+    identity = read_dataset_market_identity(
+        manifest, expected_exchange=expected_exchange,
+    )
     return {
-        "exchange": actual,
-        "survivorship_bias": provenance.get("survivorship_bias") is True,
+        "exchange": identity["exchange"],
+        "survivorship_bias": identity["survivorship_bias"],
     }
 
 

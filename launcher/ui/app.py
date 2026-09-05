@@ -108,10 +108,67 @@ _UPDATE_CHECK_CAPTURE_MAX_BYTES = 256 * 1024
 _UI_DISPATCH_QUEUE_MAX = 4096
 
 
+def _windows_process_name_snapshot() -> dict[int, str]:
+    """Read executable names without opening individual process handles."""
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel32.CreateToolhelp32Snapshot
+    create.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    create.restype = wintypes.HANDLE
+    first = kernel32.Process32FirstW
+    next_entry = kernel32.Process32NextW
+    for function in (first, next_entry):
+        function.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+        function.restype = wintypes.BOOL
+    close = kernel32.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+
+    handle = create(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_last_error(), "process name snapshot unavailable")
+    try:
+        entry = ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        if not first(handle, ctypes.byref(entry)):
+            raise OSError(ctypes.get_last_error(), "process name snapshot first failed")
+        names: dict[int, str] = {}
+        while True:
+            pid = int(entry.th32ProcessID)
+            if pid in names:
+                raise RuntimeError("duplicate PID in process name snapshot")
+            names[pid] = str(entry.szExeFile)
+            if not next_entry(handle, ctypes.byref(entry)):
+                error = ctypes.get_last_error()
+                if error != 18:  # ERROR_NO_MORE_FILES is the only complete end.
+                    raise OSError(error, "process name snapshot next failed")
+                return names
+    finally:
+        if not close(handle):
+            raise OSError(ctypes.get_last_error(), "process name snapshot close failed")
+
+
 def _scan_active_bot_processes(
     *,
     process_iter=None,
     current_pid: int | None = None,
+    snapshot_provider=None,
 ) -> dict[str, dict[str, int]]:
     """Return bot processes in this runtime root or fail closed.
 
@@ -120,6 +177,8 @@ def _scan_active_bot_processes(
     conclude that the bot set is empty. An unreadable Python process whose
     identity could be one of ours makes that proof incomplete.
     """
+    if process_iter is None and snapshot_provider is None and os.name == "nt":
+        snapshot_provider = _windows_process_name_snapshot
     if process_iter is None:
         try:
             import psutil  # type: ignore
@@ -143,6 +202,8 @@ def _scan_active_bot_processes(
     scan_incomplete = False
     current_owner = ""
     incomplete_candidate_owners: list[str] = []
+    unknown_identity_candidates: list[tuple[int, str]] = []
+    seen_pids: set[int] = set()
     found: dict[str, dict[str, int]] = {}
     python_name = re.compile(r"python(?:w|[0-9.]*)?(?:\.exe)?$")
 
@@ -152,6 +213,34 @@ def _scan_active_bot_processes(
         except Exception:
             return ""
 
+    def name_snapshot():
+        if snapshot_provider is None:
+            return None
+        try:
+            snapshot = snapshot_provider()
+            if not isinstance(snapshot, dict) or any(
+                isinstance(pid, bool) or not isinstance(pid, int) or pid < 0
+                for pid in snapshot
+            ):
+                return None
+            return dict(snapshot)
+        except Exception:
+            return None
+
+    def known_non_python_name(value) -> bool:
+        return (
+            isinstance(value, str)
+            and bool(value.strip())
+            and value == value.strip()
+            and not any(char in value for char in ("/", "\\", "\x00"))
+            # OS-name evidence must also retain launcher/debug/PyPy aliases;
+            # it is deliberately more conservative than positive bot matching.
+            and value.lower() not in {"py", "py.exe"}
+            and not value.lower().startswith(("python", "pypy"))
+        )
+
+    before_names = name_snapshot()
+
     try:
         processes = process_iter(
             ["pid", "name", "exe", "cmdline", "cwd", "username"]
@@ -160,6 +249,7 @@ def _scan_active_bot_processes(
             try:
                 info = proc.info
                 pid = int(info.get("pid") or 0)
+                seen_pids.add(pid)
                 if pid == own_pid:
                     saw_current = True
                     current_owner = normalized_owner(info.get("username"))
@@ -184,8 +274,13 @@ def _scan_active_bot_processes(
                 identity_known = any(
                     str(value or "").strip() for value in executable_names
                 )
+                if not identity_known:
+                    unknown_identity_candidates.append(
+                        (pid, normalized_owner(info.get("username")))
+                    )
+                    continue
                 if not isinstance(raw_cmdline, (list, tuple)) or not raw_cmdline:
-                    if python_like or not identity_known:
+                    if python_like:
                         incomplete_candidate_owners.append(
                             normalized_owner(info.get("username"))
                         )
@@ -197,16 +292,19 @@ def _scan_active_bot_processes(
                     [str(part) for part in raw_cmdline]
                 )
                 raw_cwd = info.get("cwd")
-                process_root = (
-                    canonical_path(raw_cwd)
-                    if raw_cwd
-                    else ""
-                )
                 script_token = None
+                module_identity_missing = False
                 token_index = 1
                 while token_index < len(raw_cmdline):
                     token = str(raw_cmdline[token_index] or "").strip('"\'')
                     if token in {"-m", "-c"}:
+                        if token == "-m":
+                            module_identity_missing = (
+                                token_index + 1 >= len(raw_cmdline)
+                                or not str(
+                                    raw_cmdline[token_index + 1] or ""
+                                ).strip('"\'').strip()
+                            )
                         break
                     if token == "--":
                         token_index += 1
@@ -218,6 +316,11 @@ def _scan_active_bot_processes(
                         continue
                     script_token = raw_cmdline[token_index]
                     break
+                if module_identity_missing:
+                    incomplete_candidate_owners.append(
+                        normalized_owner(info.get("username"))
+                    )
+                    continue
                 for bot in BOT_ORDER:
                     expected_script = canonical_path(
                         os.path.join(PROJECT_ROOT, BOT_META[bot]["script"])
@@ -259,6 +362,13 @@ def _scan_active_bot_processes(
                     module_seen = (
                         cmdline_bot_match_kind(bot, cmdline) == "module"
                     )
+                    # Absolute scripts and unrelated Python invocations do not
+                    # need cwd evidence. Only a matching module needs its root.
+                    process_root = (
+                        canonical_path(raw_cwd)
+                        if module_seen and raw_cwd
+                        else ""
+                    )
                     if script_proven or (
                         module_seen and process_root == expected_root
                     ):
@@ -275,6 +385,40 @@ def _scan_active_bot_processes(
                 scan_incomplete = True
     except Exception:
         scan_incomplete = True
+
+    after_names = name_snapshot()
+    snapshots_usable = (
+        before_names is not None
+        and after_names is not None
+        and own_pid in before_names
+        and own_pid in after_names
+    )
+    for pid, owner in unknown_identity_candidates:
+        if (
+            snapshots_usable
+            and pid in before_names
+            and pid in after_names
+            and before_names[pid] == after_names[pid]
+            and known_non_python_name(after_names[pid])
+        ):
+            continue
+        incomplete_candidate_owners.append(owner)
+    if after_names is not None:
+        # Extra OS evidence must not overlook Python processes born after the
+        # psutil scan. Bracketing names are not a process-generation proof.
+        if any(
+            not known_non_python_name(name)
+            and (
+                pid not in seen_pids
+                or (
+                    before_names is not None
+                    and pid in before_names
+                    and before_names[pid] != name
+                )
+            )
+            for pid, name in after_names.items()
+        ):
+            scan_incomplete = True
 
     if any(
         not current_owner or not owner or owner == current_owner
@@ -398,6 +542,26 @@ def _runtime_card_led_color(
     if not runtime_healthy:
         return COLORS["warning"]
     return COLORS["info"] if simulation else COLORS["success"]
+
+
+def _runtime_snapshot_card_led_color(rs, *, run_id) -> str:
+    """Color only a known run's fresh health and explicit runtime mode."""
+    if (
+        not isinstance(rs, dict)
+        or not isinstance(run_id, str)
+        or not run_id.strip()
+        or run_id != run_id.strip()
+        or rs.get("run_id") != run_id
+    ):
+        return COLORS["warning"]
+    simulation = _runtime_simulation_flag(rs)
+    if simulation is None:
+        return COLORS["warning"]
+    return _runtime_card_led_color(
+        rs.get("status"),
+        stale_age=_runtime_monotonic_age(rs),
+        simulation=simulation,
+    )
 
 
 def _post_ui(app, callback, *, delay_ms: int = 0) -> None:
@@ -4408,11 +4572,13 @@ class ObsidianApp(ctk.CTk):
             running = self.bots[bot].is_running()
             external_rs = None if running else self._external_runtime_status(bot)
             external_running = external_rs is not None
+            card["_external_running"] = external_running
             _is_sim = bool(self.config.get(bot, {}).get("SIMULATION", True))
             if running:
                 status_label = "Active"
                 runtime_status_value = "starting"
                 stale_age = None
+                rs = {}
                 try:
                     statuses = cache.get("runtime_status") or {}
                     rs = (
@@ -4448,10 +4614,9 @@ class ObsidianApp(ctk.CTk):
                         status_label + " - " + ("SIM" if _is_sim else "LIVE"))
                     self._set_card_led_color(
                         card,
-                        _runtime_card_led_color(
-                            runtime_status_value,
-                            stale_age=stale_age,
-                            simulation=_is_sim,
+                        _runtime_snapshot_card_led_color(
+                            rs,
+                            run_id=getattr(self.bots[bot], "run_id", None),
                         ),
                     )
                 except Exception:
@@ -4496,7 +4661,7 @@ class ObsidianApp(ctk.CTk):
             else:
                 card["status"].set("Stopped")
                 try:
-                    self._set_card_led_color(card, COLORS["text_muted"])
+                    self._set_card_led_color(card, COLORS["danger"])
                 except Exception:
                     pass
                 card["start_btn"].configure(state="normal",
@@ -5034,36 +5199,34 @@ class ObsidianApp(ctk.CTk):
         self._pulse_step = (self._pulse_step + 1) % 20
         phase = abs(10 - self._pulse_step) / 10.0
 
-        # Use global LLM status only while a bot's local mode is unknown.
+        # Health owns this LED.  AI mode has its own badge and cannot override
+        # failed/stale health or turn an unverified runtime into a green light.
         cache = self.poller.get_all()
-        global_llm_online = bool((cache.get("llm") or {}).get("online"))
+        statuses = cache.get("runtime_status") if isinstance(cache, dict) else None
+        if not isinstance(statuses, dict):
+            statuses = {}
 
         for bot in BOT_ORDER:
             card = self.cards[bot]
             if self.bots[bot].is_running():
-                # Mechanical bots (uses_llm=False) must not inherit the global
-                # LLM status; show a neutral running indicator instead.
-                uses_llm = bool(BOT_META[bot].get("uses_llm", True)
-                                and self.config.get(bot, {}).get("USE_LLM", False))
-                if not uses_llm:
-                    base_color = COLORS.get("text_muted", COLORS["balanced"])
-                else:
-                    mode = card.get("ai_mode", "unknown")
-
-                    if mode == "keyword":
-                        base_color = COLORS["warning"]  # Keyword fallback.
-                    elif mode == "llm":
-                        base_color = COLORS["success"]  # Full LLM active.
-                    else:
-                        # No log signal yet: use Ollama status as estimate.
-                        base_color = COLORS["success"] if global_llm_online else COLORS["warning"]
-
-                # Soft pulse.
-                color = base_color if phase > 0.3 else self._darker(base_color, 0.4)
+                base_color = _runtime_snapshot_card_led_color(
+                    statuses.get(bot),
+                    run_id=getattr(self.bots[bot], "run_id", None),
+                )
+                # Pulse only explicitly healthy mode colors; warnings stay static.
+                color = (
+                    self._darker(base_color, 0.4)
+                    if base_color in {COLORS["success"], COLORS["info"]} and phase <= 0.3
+                    else base_color
+                )
                 self._set_card_led_color(card, color)
             else:
-                # Stopped: static red, no blinking.
-                self._set_card_led_color(card, COLORS["danger"])
+                # Reuse refresh's verified external-owner fact without doing any
+                # process or disk lookup at the animation cadence.
+                self._set_card_led_color(
+                    card,
+                    COLORS["warning"] if card.get("_external_running") is True else COLORS["danger"],
+                )
 
         self.after(150, self._pulse)
 

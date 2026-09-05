@@ -285,6 +285,8 @@ class TrendBot(SpotBot):
 
     def _trend_buy_pass(self):
         from core.logger import log_event, log_struct
+        if not self._entry_integrity_allowed():
+            return
         if self.safe_mode is not None and self.safe_mode.is_active():
             return
         try:
@@ -550,6 +552,7 @@ class TrendBot(SpotBot):
                     entry_id=entry_id,
                 )
             except SpotBuyOutcomeUnknown as _buy_exc:
+                self._mark_spot_entry_recovery_pending(_buy_exc.client_order_id)
                 emit_entry_lifecycle(
                     entry_id,
                     bot=self.BOT_NAME,

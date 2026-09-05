@@ -55,7 +55,7 @@ from bot_utils.api_budget import (
     record_api_error,
     try_consume_api_call,
 )
-from bot_utils.runtime_threads import (finalize_runtime_shutdown,
+from bot_utils.runtime_threads import (wait_for_runtime_shutdown,
                                        format_runtime_thread_liveness,
                                        shared_runtime_resource_closers,
                                        start_threads_or_shutdown,
@@ -1266,101 +1266,108 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             name=f"{self.BOT_NAME}Markouts",
         )
         self._markout_started_monotonic = time.monotonic()
-        start_threads_or_shutdown(
-            (
-                self._monitor_thread,
-                self._scan_thread,
-                self._reconcile_thread,
-                self._markout_thread,
-            ),
-            self._shutdown_event,
-        )
-
-        log_event(
-            "Four threads running (monitor, scan, reconcile, markout).",
-            "START",
-        )
-        self._publish_periodic_runtime_status(
-            write_runtime_status, log_snapshot=False
-        )
-
-        #  Main thread: heartbeat + shutdown wait 
         try:
-            last_heartbeat = 0.0
-            last_runtime_status = 0.0
-            self._last_hourly_status = 0.0
-            while not self._shutdown_event.is_set():
-                try:
-                    if self._consume_launcher_shutdown_request(log_event):
-                        break
-                    # Scheduling must be immune to wall-clock corrections. The
-                    # coordinator itself must also survive a transient DB,
-                    # status or diagnostic failure while its safety workers are
-                    # still alive.
-                    now = time.monotonic()
-                    if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_SEC:
-                        self._publish_runtime_heartbeat(
-                            write_runtime_status, log_event
-                        )
-                        last_heartbeat = now
-                    if now - last_runtime_status >= 5.0:
-                        self._publish_periodic_runtime_status(
-                            write_runtime_status, log_snapshot=False
-                        )
-                        last_runtime_status = now
-                    # Self-throttling hourly status; never lifecycle-critical.
-                    try:
-                        from bot_utils.status_report import maybe_send_hourly_status
-                        self._last_hourly_status = maybe_send_hourly_status(
-                            bot_name=self.BOT_NAME, is_futures=False,
-                            simulation=self.simulation, state=self.state,
-                            last_sent=self._last_hourly_status,
-                        )
-                    except Exception:
-                        pass
-                except Exception as exc:
-                    try:
-                        self._log_error("runtime coordinator", exc)
-                    except Exception:
-                        pass
-                self._shutdown_event.wait(timeout=2)
-        except KeyboardInterrupt:
-            self._shutdown_handler(signum="KeyboardInterrupt")
+            start_threads_or_shutdown(
+                (
+                    self._monitor_thread,
+                    self._scan_thread,
+                    self._reconcile_thread,
+                    self._markout_thread,
+                ),
+                self._shutdown_event,
+            )
 
-        log_event("Waiting for threads to finish...", "INFO")
-        # All four threads are daemon=True, so Python reaps them at interpreter
-        # exit anyway. This join is best-effort (gives them a chance to write a
-        # last log line); 2s is plenty since the loops check _shutdown_event
-        # every iteration.
-        for t in (
-            self._monitor_thread,
-            self._scan_thread,
-            self._reconcile_thread,
-            self._markout_thread,
-        ):
-            if t and t.is_alive():
-                t.join(timeout=2)
-        resource_closers = shared_runtime_resource_closers()
-        ws_feed = getattr(self, "_ws_feed", None)
-        if ws_feed is not None:
-            resource_closers["price_feed_resources"] = (
-                lambda feed=ws_feed: feed.stop(timeout=0.0) is True
+            log_event(
+                "Four threads running (monitor, scan, reconcile, markout).",
+                "START",
             )
-        state_flush = getattr(self.state, "finalize_pending", None)
-        if callable(state_flush):
-            resource_closers["trade_state_persistence"] = state_flush
-        if self.safe_mode is not None:
-            resource_closers["safe_mode_persistence"] = (
-                lambda safe_mode=self.safe_mode: safe_mode.shutdown_alert_state_persistence(
-                    timeout=0.0
+            self._publish_periodic_runtime_status(
+                write_runtime_status, log_snapshot=False
+            )
+
+            #  Main thread: heartbeat + shutdown wait
+            try:
+                last_heartbeat = 0.0
+                last_runtime_status = 0.0
+                self._last_hourly_status = 0.0
+                while not self._shutdown_event.is_set():
+                    try:
+                        if self._consume_launcher_shutdown_request(log_event):
+                            break
+                        # Scheduling must be immune to wall-clock corrections. The
+                        # coordinator itself must also survive a transient DB,
+                        # status or diagnostic failure while its safety workers are
+                        # still alive.
+                        now = time.monotonic()
+                        if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_SEC:
+                            self._publish_runtime_heartbeat(
+                                write_runtime_status, log_event
+                            )
+                            last_heartbeat = now
+                        if now - last_runtime_status >= 5.0:
+                            self._publish_periodic_runtime_status(
+                                write_runtime_status, log_snapshot=False
+                            )
+                            last_runtime_status = now
+                        # Self-throttling hourly status; never lifecycle-critical.
+                        try:
+                            from bot_utils.status_report import maybe_send_hourly_status
+                            self._last_hourly_status = maybe_send_hourly_status(
+                                bot_name=self.BOT_NAME, is_futures=False,
+                                simulation=self.simulation, state=self.state,
+                                last_sent=self._last_hourly_status,
+                            )
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        try:
+                            self._log_error("runtime coordinator", exc)
+                        except Exception:
+                            pass
+                    self._shutdown_event.wait(timeout=2)
+            except KeyboardInterrupt:
+                self._shutdown_handler(signum="KeyboardInterrupt")
+        finally:
+            self._shutdown_event.set()
+            try:
+                try:
+                    log_event("Waiting for threads to finish...", "INFO")
+                except Exception:
+                    pass
+                # Short joins are followed by the synchronous shutdown barrier.
+                for t in (
+                    self._monitor_thread,
+                    self._scan_thread,
+                    self._reconcile_thread,
+                    self._markout_thread,
+                ):
+                    try:
+                        if t and t.is_alive():
+                            t.join(timeout=2)
+                    except Exception:
+                        pass
+            finally:
+                resource_closers = shared_runtime_resource_closers()
+                ws_feed = getattr(self, "_ws_feed", None)
+                if ws_feed is not None:
+                    resource_closers["price_feed_resources"] = (
+                        lambda feed=ws_feed: feed.stop(timeout=0.0) is True
+                    )
+                state_flush = getattr(self.state, "finalize_pending", None)
+                if callable(state_flush):
+                    resource_closers["trade_state_persistence"] = state_flush
+                if self.safe_mode is not None:
+                    resource_closers["safe_mode_persistence"] = (
+                        lambda safe_mode=self.safe_mode: safe_mode.shutdown_alert_state_persistence(
+                            timeout=0.0
+                        )
+                    )
+                wait_for_runtime_shutdown(
+                    self,
+                    write_runtime_status,
+                    log_event,
+                    resource_closers=resource_closers,
                 )
-            )
-        finalize_runtime_shutdown(
-            self,
-            write_runtime_status,
-            log_event,
-            resource_closers=resource_closers,
-        )
 
     #  Connection 
 

@@ -165,6 +165,30 @@ class ScanMixin:
         except Exception:
             pass
 
+    def _entry_integrity_allowed(self) -> bool:
+        """Check the fresh LIVE reconciliation snapshot without running recovery."""
+        if getattr(self, "simulation", False):
+            return True
+        integrity_reader = getattr(self, "_position_integrity_runtime_health", None)
+        try:
+            integrity = integrity_reader() if callable(integrity_reader) else {}
+        except Exception:
+            integrity = {}
+        if not isinstance(integrity, dict) or integrity.get("runtime_ok") is not True:
+            from core.logger import log_event
+
+            reason = (
+                str(integrity.get("reason") or "unavailable")[:96]
+                if isinstance(integrity, dict) else "unavailable"
+            )
+            log_event(
+                "Position integrity is not runtime-safe "
+                f"({reason}) - skipping LIVE buy-side this cycle",
+                "WAIT",
+            )
+            return False
+        return True
+
     def _entry_pre_submit_allowed(self) -> bool:
         """Revalidate runtime safety gates immediately before a LIVE buy."""
         shutdown_event = getattr(self, "_shutdown_event", None)
@@ -173,7 +197,10 @@ class ScanMixin:
         safe_mode = getattr(self, "safe_mode", None)
         if safe_mode is None:
             return False
-        return safe_mode.is_active() is False
+        return (
+            safe_mode.is_active() is False
+            and ScanMixin._entry_integrity_allowed(self)
+        )
 
     def _place_buy_order_with_runtime_guard(
         self,
@@ -604,31 +631,8 @@ class ScanMixin:
         # has produced a complete, fresh money-integrity snapshot.  Startup
         # balance failures and stalled periodic reconciliation must therefore
         # block new entries while the monitor remains free to manage exits.
-        if not self.simulation:
-            integrity_reader = getattr(
-                self, "_position_integrity_runtime_health", None
-            )
-            try:
-                integrity = (
-                    integrity_reader() if callable(integrity_reader) else {}
-                )
-            except Exception:
-                integrity = {}
-            if (
-                not isinstance(integrity, dict)
-                or integrity.get("runtime_ok") is not True
-            ):
-                reason = (
-                    str(integrity.get("reason") or "unavailable")[:96]
-                    if isinstance(integrity, dict)
-                    else "unavailable"
-                )
-                log_event(
-                    "Position integrity is not runtime-safe "
-                    f"({reason}) - skipping LIVE buy-side this cycle",
-                    "WAIT",
-                )
-                return
+        if not ScanMixin._entry_integrity_allowed(self):
+            return
 
         # API budget check  shared rate guard across all 3 bots so one bot
         # can't burn the quota and earn a 429 IP-ban for all.
@@ -849,6 +853,14 @@ class ScanMixin:
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
         sym = r["symbol"].split("/")[0]
+        from bot_utils.state_persist import is_canonical_position_symbol
+
+        if not is_canonical_position_symbol(sym):
+            log_event(
+                f"{sym}: spot entry blocked: invalid_position_symbol",
+                "WARN",
+            )
+            return None
         signal_price = self._positive_float(r.get("price"))
         if signal_price <= 0:
             log_event(

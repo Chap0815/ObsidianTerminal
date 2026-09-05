@@ -1440,7 +1440,7 @@ def compute_metrics(trades_df: pd.DataFrame) -> dict:
     sorted_positions = pos_df.sort_values("sell_time")
     equity = sorted_positions["profit_usdt"].cumsum().values
     if len(equity) > 0:
-        peak = np.maximum.accumulate(equity)
+        peak = np.maximum(0.0, np.maximum.accumulate(equity))
         drawdown = peak - equity  # in USDT
         max_dd = drawdown.max() if len(drawdown) > 0 else 0.0
     else:
@@ -1946,7 +1946,7 @@ with tab_overview:
     else:
         eq_df = live_trades.sort_values("sell_time").copy()
         eq_df["cum_pnl"] = eq_df["profit_usdt"].cumsum()
-        eq_df["peak"] = eq_df["cum_pnl"].cummax()
+        eq_df["peak"] = eq_df["cum_pnl"].cummax().clip(lower=0.0)
         eq_df["drawdown"] = (
             eq_df["peak"] - eq_df["cum_pnl"]
         )  # positive = drawdown amount

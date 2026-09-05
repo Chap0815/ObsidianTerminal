@@ -2,132 +2,6 @@
   "advisories": [
     {
       "decision": "waived",
-      "id": "GHSA-2F96-G7MH-G2HX",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-3F7W-8RR8-F37F",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-3RP5-JJMW-4WV2",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-4GMW-GG2M-W46P",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-539M-9XH6-Q6RR",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-6P8H-3WGX-97GF",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-94P4-4CQ8-9G67",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-956X-8GVW-WG5V",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-9RJ7-RF2P-W77R",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-FJR4-X663-MWXC",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-HH9P-6WH2-4MFC",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-HMQ2-W58F-27JC",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-JM78-9FVV-MHGR",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-P538-C434-8V24",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-R9MR-M37C-5FR3",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-RWJ8-PGH3-R573",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-V396-V7Q4-X2QJ",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
-      "id": "GHSA-WVPP-8HX9-P66J",
-      "package": "gitpython",
-      "rationale": "Not reachable in the product runtime: GitPython is limited to lazy Streamlit local-repository metadata, while installed releases contain no Git worktree and expose no clone, submodule, or config-write sink.",
-      "version": "3.1.50"
-    },
-    {
-      "decision": "waived",
       "id": "GHSA-G6CJ-PR64-35W5",
       "package": "cryptography",
       "rationale": "Not reachable in the product runtime: no PKCS7 decrypt API is called and there is no attacker-controlled EnvelopedData decryption path.",
@@ -141,10 +15,11 @@
       "version": "49.0.0"
     }
   ],
-  "requirements_lock_sha256": "df382a218be4d958b418989c1f0755c329e1c2ec0b7ea9acd8b2a85008270eae",
-  "retrieved_at_utc": "2026-08-30T00:00:00+00:00",
+  "requirements_lock_sha256": "7570c76b3d484f470d35495a9ca09704eae7261862b8aa7aa57931bafa26707c",
+  "retrieved_at_utc": "2026-09-05T10:06:59.0483072+00:00",
   "safety_floors": {
-    "aiohttp": "3.14.3"
+    "aiohttp": "3.14.3",
+    "gitpython": "3.1.61"
   },
   "schema_version": 1,
   "source": "https://api.osv.dev/v1/querybatch"

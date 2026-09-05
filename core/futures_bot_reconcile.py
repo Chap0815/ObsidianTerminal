@@ -2894,9 +2894,6 @@ class FuturesReconcileMixin:
                     "ERROR",
                 )
                 return False
-            verified_flat_pending = (
-                state_row.get("verified_flat_pending_accounting") is True
-            )
             entry = _positive_float_or_none(state_row.get("buy"))
             amount = _positive_abs_float_or_none(state_row.get("amount"))
             pos_type = state_row.get("position_type", "LONG")
@@ -3014,23 +3011,22 @@ class FuturesReconcileMixin:
                 )
 
             if close_price <= 0:
-                # Last-ditch: assume liquidation if liq price was set
-                if liq_price > 0 and not verified_flat_pending:
-                    close_price = liq_price
-                    close_source = "liquidation_price"
-                else:
-                    log_event(
-                        f" {sym}: cannot determine offline-close price  "
-                        f"skipping DB record. State kept for retry.",
-                        "WARN"
-                    )
-                    return False
+                # A liquidation threshold is not evidence of an execution.
+                log_event(
+                    f" {sym}: cannot determine offline-close price  "
+                    f"skipping DB record. State kept for retry.",
+                    "WARN"
+                )
+                return False
 
             # Calculate PnL the same way the bot's normal close does
             if pos_type == "LONG":
                 price_move_pct = ((close_price - entry) / entry) * 100
             else:  # SHORT
                 price_move_pct = ((entry - close_price) / entry) * 100
+            # Keep price-derived excursion evidence independent of the frozen
+            # PnL percentage, which legacy pending payloads may override below.
+            close_move_pct = price_move_pct
 
             # Margin  move  leverage = realized P&L on margin
             pnl_pct_margin = price_move_pct * lev
@@ -3106,18 +3102,26 @@ class FuturesReconcileMixin:
                     state_row.get("accounting_pending_profit_pct"))
                 if pending_pct is not None:
                     price_move_pct = pending_pct
-            mfe_pct = state_row.get("accounting_pending_mfe_pct")
-            mae_pct = state_row.get("accounting_pending_mae_pct")
-            giveback_pct = state_row.get("accounting_pending_giveback_pct")
+            mfe_pct = _finite_float_or_none(
+                state_row.get("accounting_pending_mfe_pct"))
+            if mfe_pct is None:
+                mfe_pct = _finite_float_or_none(state_row.get("max_profit_pct"))
+            mae_pct = _finite_float_or_none(
+                state_row.get("accounting_pending_mae_pct"))
+            if mae_pct is None:
+                mae_pct = _finite_float_or_none(state_row.get("min_profit_pct"))
+            # Repair legacy replay excursions before the existing durable WAL
+            # gate. Do not alter its captured price, PnL, fees or funding.
+            mfe_pct = max(0.0, close_move_pct, mfe_pct or 0.0)
+            mae_pct = min(0.0, close_move_pct, mae_pct or 0.0)
+            giveback_pct = max(0.0, mfe_pct - close_move_pct)
 
             sell_time = str(
                 state_row.get("accounting_pending_sell_time")
                 or now_utc().strftime("%Y-%m-%d %H:%M:%S"))
             reason = str(
                 state_row.get("accounting_pending_reason")
-                or (f"Offline close ({close_source})"
-                    if close_source != "liquidation_price"
-                    else "LIQUIDATED (offline)"))
+                or f"Offline close ({close_source})")
 
             if not all(math.isfinite(v) for v in (
                 entry, amount, lev, margin, initial_entry_fee, funding_total,

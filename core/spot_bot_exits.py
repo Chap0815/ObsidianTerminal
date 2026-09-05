@@ -84,6 +84,13 @@ def _positive_finite(value, default: float = 0.0) -> float:
     return parsed if parsed > 0 else default
 
 
+def _has_spot_generation_identity(row: object) -> bool:
+    """Whether a row carries identity evidence used by production state."""
+    if not isinstance(row, dict):
+        return False
+    return bool(row.get("entry_id") or row.get("buy_time"))
+
+
 def _partial_tp_block_active(bot, sym: str, row: dict) -> bool:
     deadlines = getattr(bot, "_partial_tp_block_deadlines", None)
     if not isinstance(deadlines, dict):
@@ -838,7 +845,9 @@ class ExitsMixin:
                 "OK",
             )
 
-    def _maybe_persist_last_price(self, sym: str, curr: float) -> None:
+    def _maybe_persist_last_price(
+        self, sym: str, curr: float, expected_row: dict
+    ) -> None:
         """Persist last_price only every LAST_PRICE_PERSIST_INTERVAL_SEC, not
         every tick.
 
@@ -856,7 +865,11 @@ class ExitsMixin:
             return  # too soon  skip disk write
         self._last_price_persist_at[sym] = now
         try:
-            self.state.update(sym, "last_price", curr)
+            from bot_utils.trade_state import update_many_if_current
+
+            update_many_if_current(
+                self.state, sym, {"last_price": curr}, expected_row
+            )
         except Exception:
             # Persist failures are non-fatal  in-memory state is the
             # source of truth for this tick.
@@ -1084,7 +1097,25 @@ class ExitsMixin:
                 self._claim_conflict_warned = warned
             return
         self._retry_pending_partial_accounting(sym, d)
-        d = self.state.get(sym) or d
+        from bot_utils.trade_state import same_position_generation
+
+        live = self.state.get(sym)
+        if live == {}:
+            # Compatibility for narrow legacy/test state adapters. Real
+            # TradeState rows are schema-validated and never empty.
+            live = d
+        if not isinstance(live, dict):
+            return
+        if (
+            not same_position_generation(live, d)
+            and live != d
+            and (
+                _has_spot_generation_identity(live)
+                or _has_spot_generation_identity(d)
+            )
+        ):
+            return
+        d = live
         if d.get("accounting_pending_partials"):
             return
 
@@ -1098,7 +1129,7 @@ class ExitsMixin:
         # Keep the in-memory ``d["last_price"]`` fresh every tick (all the
         # killswitch needs); persist to disk only every
         # LAST_PRICE_PERSIST_INTERVAL_SEC.
-        self._maybe_persist_last_price(sym, curr)
+        self._maybe_persist_last_price(sym, curr, d)
         d["last_price"] = curr
 
         # Track both favorable and adverse excursion. Older positions may not
@@ -1117,8 +1148,18 @@ class ExitsMixin:
         elif "lowest" not in d:
             extrema_updates["lowest"] = lowest
         if extrema_updates:
-            self.state.update_many(sym, extrema_updates)
-            d.update(extrema_updates)
+            from bot_utils.trade_state import update_many_if_current
+
+            if update_many_if_current(
+                self.state, sym, extrema_updates, d
+            ):
+                d.update(extrema_updates)
+            else:
+                log_event(
+                    f" {sym}: excursion update is not durable; "
+                    "continuing with the last durable extrema",
+                    "ERROR",
+                )
 
         if _has_pending_spot_partial_exit(d):
             self._execute_partial_tp(sym, d, curr)
@@ -1145,18 +1186,31 @@ class ExitsMixin:
 
         # Breakeven activation
         be_trigger = float(self.C("BREAKEVEN_TRIGGER", 0))
+        be_price = None
         if (be_trigger > 0
                 and not d.get("be_active")
                 and prof >= be_trigger):
             be_price = round(buy * (1.0 + _BE_FEE_BUFFER), 8)
-            self.state.update_many(sym, {"be_active": True, "be_price": be_price})
+        from bot_utils.trade_state import persist_breakeven_transition
+
+        try:
+            persisted_be = persist_breakeven_transition(self, sym, d, be_price)
+        except Exception:
+            # A failed retry must not suppress the remaining protective exits.
+            # The helper retains the exact pending intent across exceptions.
+            persisted_be = False
+        if persisted_be is True:
             log_event(
                 f" BREAKEVEN activated: {sym} @ +{prof:.2f}%  "
-                f"SL at {be_price:.6f} (entry {buy:.6f} +fee buffer)",
+                f"SL at {d['be_price']:.6f} (entry {buy:.6f} +fee buffer)",
                 "INFO"
             )
-            d["be_active"] = True
-            d["be_price"] = be_price
+        elif persisted_be is False:
+            log_event(
+                f" {sym}: BREAKEVEN activation is not durable; "
+                "protective transition deferred",
+                "ERROR",
+            )
 
         # Partial Take-Profit
         activation_profit = float(self.C("ACTIVATION_PROFIT"))
@@ -1257,6 +1311,10 @@ class ExitsMixin:
         """
         from core.logger import log_event
         from core.symbol_locks import close_lock
+        from bot_utils.trade_state import (
+            same_position_generation,
+            update_many_if_current,
+        )
 
         amount = _positive_finite(d.get("amount"))
         invested = _positive_finite(d.get("invested_usdt"))
@@ -1285,10 +1343,21 @@ class ExitsMixin:
                     )
                     return False
                 durable_request = amount * legacy_pct
-                persisted = self.state.update(
-                    sym, "partial_exit_requested_amount", durable_request
-                )
-                if persisted is not None and persisted is not True:
+                if callable(getattr(self.state, "update_many", None)):
+                    persisted = update_many_if_current(
+                        self.state,
+                        sym,
+                        {"partial_exit_requested_amount": durable_request},
+                        d,
+                    )
+                else:
+                    # Compatibility for narrow legacy/test adapters. Real
+                    # TradeState instances always expose update_many().
+                    result = self.state.update(
+                        sym, "partial_exit_requested_amount", durable_request
+                    )
+                    persisted = result is None or result is True
+                if not persisted:
                     log_event(
                         f" {sym}: legacy partial-TP amount backfill is not "
                         "durable; recovery deferred",
@@ -1361,11 +1430,18 @@ class ExitsMixin:
                     f"min_per_side={min_notional:.2f}  skipping, going trailing",
                     "WARN"
                 )
-                self.state.update_many(sym, {
+                persisted = update_many_if_current(self.state, sym, {
                     "partial_tp_blocked_min_notional": True,
                     "partial_tp_blocked_min_notional_until": time.time() + 300.0,
                     "break_even": True,
-                })
+                }, d)
+                if not persisted:
+                    log_event(
+                        f" {sym}: partial-TP min-notional transition is not "
+                        "durable; full-exit checks remain enabled",
+                        "ERROR",
+                    )
+                    return False
                 return True
 
         # Acquire close_lock before any sell-side state change.
@@ -1383,6 +1459,18 @@ class ExitsMixin:
             # Re-check after acquiring: maybe state was already mutated
             # by the lock-holder (e.g. emergency-close marked sold).
             d_live = self.state.get(sym)
+            if (
+                not isinstance(d_live, dict)
+                or (
+                    not same_position_generation(d_live, d)
+                    and d_live != d
+                    and (
+                        _has_spot_generation_identity(d_live)
+                        or _has_spot_generation_identity(d)
+                    )
+                )
+            ):
+                return False
             live_block_active = _partial_tp_block_active(
                 self, sym, d_live or {}
             )
@@ -1414,11 +1502,18 @@ class ExitsMixin:
             if (not recovering
                     and (live_sld_test * curr < min_notional
                          or live_rem_test * curr < min_notional)):
-                self.state.update_many(sym, {
+                persisted = update_many_if_current(self.state, sym, {
                     "partial_tp_blocked_min_notional": True,
                     "partial_tp_blocked_min_notional_until": time.time() + 300.0,
                     "break_even": True,
-                })
+                }, d_live)
+                if not persisted:
+                    log_event(
+                        f" {sym}: partial-TP min-notional transition is not "
+                        "durable; full-exit checks remain enabled",
+                        "ERROR",
+                    )
+                    return False
                 return True
 
             return self._execute_partial_tp_unlocked(
@@ -1780,6 +1875,22 @@ class ExitsMixin:
         # Re-check position still exists
         d_live = self.state.get(sym)
         if d_live is None:
+            return
+        from bot_utils.trade_state import same_position_generation
+
+        if (
+            not same_position_generation(d_live, d)
+            and d_live != d
+            and (
+                _has_spot_generation_identity(d_live)
+                or _has_spot_generation_identity(d)
+            )
+        ):
+            log_event(
+                f" {sym}: full exit skipped because the position generation "
+                "changed while waiting for close_lock",
+                "WARN",
+            )
             return
         # Work from the freshly re-read live state, not the snapshot captured
         # before the lock  a partial-TP that ran in between could otherwise

@@ -475,6 +475,76 @@ def _series_filename(symbol: str) -> str:
     return f"series/{digest}.json"
 
 
+def _canonical_dataset_exchange(value) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("dataset exchange provenance is missing or invalid")
+    normalized = "".join(char for char in value.strip().lower() if char.isalnum())
+    if not normalized:
+        raise ValueError("dataset exchange provenance is missing or invalid")
+    return {
+        "mexcglobal": "mexc", "gate": "gateio", "kucoinfutures": "kucoin",
+    }.get(normalized, normalized)
+
+
+def read_dataset_market_identity(
+    manifest: dict, *, expected_exchange: str,
+) -> dict:
+    """Read current/legacy identity without rewriting verified dataset evidence.
+
+    File-backed consumers must still load through verify_history_dataset first.
+    Unknown survivorship is None, not a claim of an unbiased universe.
+    """
+    if not isinstance(manifest, dict):
+        raise ValueError("dataset manifest is invalid")
+    sources = []
+    if "fingerprint_payload" in manifest:
+        payload = manifest["fingerprint_payload"]
+        if not isinstance(payload, dict):
+            raise ValueError("dataset fingerprint payload is invalid")
+        if "market_identity" in payload:
+            identity = payload["market_identity"]
+            if not isinstance(identity, dict):
+                raise ValueError("dataset market identity is invalid")
+            sources.append(identity)
+    if "provenance" in manifest:
+        legacy = manifest["provenance"]
+        if not isinstance(legacy, dict):
+            raise ValueError("dataset provenance is invalid")
+        sources.append(legacy)
+
+    result = {}
+
+    def accept(field: str, value) -> None:
+        if field in result and result[field] != value:
+            raise ValueError(f"dataset {field} provenance conflict")
+        result[field] = value
+
+    for source in sources:
+        for field in ("exchange_id", "exchange"):
+            if field in source:
+                accept("exchange", _canonical_dataset_exchange(source[field]))
+        if "market_type" in source:
+            market_type = source["market_type"]
+            if not isinstance(market_type, str) or not market_type.strip():
+                raise ValueError("dataset market_type provenance is invalid")
+            accept("market_type", market_type.strip().lower())
+        if "survivorship_bias" in source:
+            bias = source["survivorship_bias"]
+            if not isinstance(bias, bool):
+                raise ValueError("dataset survivorship_bias provenance is invalid")
+            accept("survivorship_bias", bias)
+
+    if "exchange" not in result:
+        raise ValueError("dataset exchange provenance is missing")
+    expected = _canonical_dataset_exchange(expected_exchange)
+    if result["exchange"] != expected:
+        raise ValueError(
+            f"dataset exchange mismatch: expected {expected}, found {result['exchange']}"
+        )
+    result.setdefault("survivorship_bias", None)
+    return result
+
+
 def _market_identity_provenance(provenance: dict | None) -> dict:
     if not isinstance(provenance, dict):
         return {}

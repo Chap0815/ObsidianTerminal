@@ -1153,19 +1153,19 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
 
     def _classify_line(line: str) -> str:
         up = line.upper()
-        if "" in line or "BESTE KONFIGURATION" in up:
+        severity = classify_severity(line)
+        if severity in {"error", "critical"}:
+            return "bad"
+        if severity == "warn":
+            return "warn"
+        if "BESTE KONFIGURATION" in up:
             return "trophy"
         if any(t in line for t in ("Avg Netto:", "Konsistenz:", "Folds:",
                                       "Vollperiode:")) and "BESTE" not in up:
             return "trophy_val"
-        severity = classify_severity(line)
-        if severity == "error":
-            return "bad"
-        if severity == "warn":
-            return "warn"
-        if any(t in up for t in ("", "ROBUST", "WIN", "PROFIT")):
+        if any(t in up for t in ("ROBUST", "WIN", "PROFIT")):
             return "good"
-        if any(t in line for t in ("", "", "===")):
+        if "===" in line:
             return "hdr"
         return "info"
 

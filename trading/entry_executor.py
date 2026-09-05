@@ -1433,6 +1433,7 @@ def execute_entry_order(
         )
         fallback_not_submitted_fields = dict(canceled_fields)
         fallback_not_submitted_order = canceled
+        _require_pre_submit_guard()
         fallback = market_order(residual, fallback_client_order_id)
         if not isinstance(fallback, dict):
             raise RuntimeError("market fallback returned no order object")

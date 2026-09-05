@@ -925,8 +925,8 @@ class BadHoursRow(ctk.CTkFrame):
         raw = self._var.get().strip()
         if not raw:
             # Empty = clear the setting (no hours blocked)
-            self._write_to_db("")
-            self._flash_ok()
+            if self._write_to_db("") is True:
+                self._flash_ok()
             return
         # Validate: must be comma-separated integers 0-23
         try:
@@ -943,21 +943,27 @@ class BadHoursRow(ctk.CTkFrame):
         # Normalise: sort + deduplicate, then write
         clean = ",".join(str(h) for h in sorted(set(hours)))
         self._var.set(clean)
-        self._write_to_db(clean)
-        self._flash_ok()
+        if self._write_to_db(clean) is True:
+            self._flash_ok()
 
-    def _write_to_db(self, value: str) -> None:
+    def _write_to_db(self, value: str) -> bool:
         try:
             from core.database import set_param  # type: ignore
 
-            set_param(
+            result = set_param(
                 self.bot_name,
                 "bad_hours",
                 value,
                 f"Gesperrte Stunden (lokal): {value or 'keine'}",
             )
+            # set_param commits synchronously and returns None on success.
+            if result is not None:
+                raise RuntimeError("parameter save returned an unexpected acknowledgement")
+            return True
         except Exception as exc:
             self._err_lbl.configure(text=f"DB error: {exc}")
+            self._entry.configure(border_color=COLORS["danger"])
+            return False
 
     def _flash_ok(self) -> None:
         self._err_lbl.configure(text="")
@@ -966,7 +972,7 @@ class BadHoursRow(ctk.CTkFrame):
             800,
             lambda: (
                 self._entry.configure(border_color=COLORS["border"])
-                if self._entry.winfo_exists()
+                if self._entry.winfo_exists() and not self._err_lbl.cget("text")
                 else None
             ),
         )
