@@ -190,7 +190,7 @@ dashboard defaults to localhost and is not intended as a public trading server.
 | Ask a usage question | [Discussions](https://github.com/Chap0815/ObsidianTerminal/discussions) |
 | Report a reproducible bug | [Issues](https://github.com/Chap0815/ObsidianTerminal/issues) |
 | Report a vulnerability | [Security policy](SECURITY.md) |
-| Contribute or request help | [Contributing](CONTRIBUTING.md) · [Support](SUPPORT.md) |
+| Project maintenance or help | [Maintenance policy](CONTRIBUTING.md) · [Support](SUPPORT.md) |
 
 ## License & responsibility
 
@@ -207,6 +207,41 @@ personal use, commercial services and the underlying license.
 This software is not investment advice. No outcome is promised. Warranty and
 liability exclusions apply only to the extent permitted by applicable law;
 mandatory legal rights are not waived.
+
+## Support the project
+
+If you find Obsidian Trading Terminal useful, you can make a small, voluntary
+crypto contribution to support its maintenance. Using the software does not
+require a contribution. Contributions do not purchase features, support,
+priority, commercial licensing rights or any financial return.
+
+<details>
+<summary>Crypto support addresses — native networks only</summary>
+
+**Bitcoin (BTC) · Bitcoin network**
+
+```text
+376TpKAVU3bnGEaU1RxLbhtA7fekReEuFD
+```
+
+**Litecoin (LTC) · Litecoin network**
+
+```text
+ltc1qwmm0x7c654vandqmd3p83a4hnt4lfx678cfgnd
+```
+
+**Monero (XMR) · Monero network**
+
+```text
+83MnuckJPPYEgrJtrRMUAn5EBiebKzPmyBh4hG6RyMJ2RktJG6UA7HQ67y3G4ksGjcN8M7EoUeu3SRH4pjvao9nqTUrepdu
+```
+
+Use only the matching asset and native network shown above, not wrapped tokens
+or another network. Check the full destination address in your wallet before
+sending. Wrong-address or wrong-network transfers can be unrecoverable.
+Never share a seed phrase or private key. No tax-deductibility claim is made.
+
+</details>
 
 ---
 
