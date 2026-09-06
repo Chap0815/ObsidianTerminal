@@ -22,6 +22,7 @@ pandas-ta-classic>=0.3.14b0   # gepflegter pandas-ta-Fork, kompatibel mit pandas
 
 # --- Exchange / Netzwerk ---
 ccxt>=4.3.0,<5.0.0
+cryptography>=50.0.1,<51.0.0  # Security floor for CCXT signing dependency (CVE-2026-69247).
 aiohttp>=3.14.3,<4.0.0  # CCXT-Pro WebSocket transport for ticker/L2 streams
 requests>=2.31.0
 python-dotenv>=1.0.1
