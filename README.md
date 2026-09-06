@@ -1,7 +1,12 @@
-# Obsidian Trading Terminal  -  Developer Reference
+# Obsidian Trading Terminal
 
-Internal architecture notes for the codebase. For the product overview see
-[`README_GITHUB.md`](README_GITHUB.md).
+Source distribution and developer reference for the Obsidian multi-bot
+cryptocurrency trading terminal.
+
+> **Risk notice:** This software can place real orders and can lose money.
+> Every futures strategy ships in simulation mode. Verify the exchange,
+> credentials, limits and bot-specific SIM/LIVE setting before enabling live
+> trading. Backtests and research results are not profit guarantees.
 
 The bot suite runs **five independent strategy bots** as isolated
 subprocesses, driven by a native CustomTkinter launcher. Each bot has its own

@@ -1,0 +1,51 @@
+# Secrets / local credentials
+.env
+*.pem
+*.key
+*.secret
+
+# Runtime state
+.venv/
+python/
+data/
+logs/
+backups/
+.update_in_progress
+.update_synced.json
+bot_config.json
+bot_config.json.lock
+config/update_config.json
+prompts/spot.txt
+prompts/futures.txt
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.jsonl
+runtime_status.json
+
+# Python / test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build / installer output
+installer/staging/
+installer/Output/
+*.exe
+*.msi
+*.zip
+
+# Research / local outputs
+optimizer_results/
+research_kitraining/
+research_run2/
+structured.jsonl
+
+# Local tooling state
+.agents/
+.agent_reviews/
+.claude/
+.codex/

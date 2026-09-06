@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-09-06
+
+- Hardened completed futures partial-exit recovery so a legacy WAL tail is
+  repaired without submitting a second order, while generation checks prevent
+  stale cleanup from erasing a newer intent.
+- Hardened launcher shutdown and bounded runtime finalization so bot-process
+  scans and open ticker resources cannot strand the launcher during exit.
+- Made venue/L2 capture explicitly research-only. Official user defaults now
+  disable both components; a research installation such as `.118` can retain
+  them through its local update-preserved configuration.
+- Added public-release hygiene: tracked credential/runtime exclusions and an
+  explicit live-trading risk notice.
+
 ## 2026-07-20
 
 - Completed TREND entry lifecycle coverage. The strategy now propagates the

@@ -97,14 +97,15 @@ class FuturesExchangeBot(FuturesBot):
         "TCA_ENABLED": True,
         "TCA_DEPTH_LEVELS": 20,
         "DEPTH_GATE_MODE": "shadow",
-        "VENUE_RECORDER_MODE": "enabled",
+        # Research-only. Production/user installations must opt in explicitly.
+        "VENUE_RECORDER_MODE": "disabled",
         "VENUE_RECORDER_MAX_SYMBOLS": 8,
         "VENUE_RECORDER_MICRO_INTERVAL_SECONDS": 6.0,
         "VENUE_RECORDER_OVERVIEW_INTERVAL_SECONDS": 60.0,
         "VENUE_RECORDER_DEPTH_LEVELS": 20,
         "VENUE_RECORDER_RETENTION_DAYS": 30,
         "VENUE_RECORDER_MAX_STORAGE_GIB": 150.0,
-        "VENUE_L2_MODE": "shadow",
+        "VENUE_L2_MODE": "disabled",
         "VENUE_L2_SAMPLE_INTERVAL_SECONDS": 1.0,
         "VENUE_L2_STALE_AFTER_MS": 5000,
     }

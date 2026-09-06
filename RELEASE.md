@@ -1,5 +1,21 @@
 # Release Notes
 
+## 2026-09-06 - Public release hardening
+
+The official user configuration no longer starts venue or L2 research capture
+by default. These components remain available only through an explicit local
+opt-in, allowing dedicated research installations to keep collecting evidence
+without making research-data integrity part of a normal user's runtime health.
+
+Futures partial-exit recovery now clears completed intent timestamps and
+repairs the exact legacy residue without another exchange order. Persistence
+is generation-aware, verifies the committed state, and never overwrites a
+newer same-generation intent while recovering from a failed write.
+
+Launcher shutdown uses bounded process verification and bounded resource
+finalization. Runtime configuration, credentials, databases, logs and research
+outputs remain outside the published source/release payload.
+
 ## 2026-07-19 - Expanded causal profit research
 
 The operator now exposes ten research-only experiments. CROSS momentum adds

@@ -91,6 +91,7 @@ FORBIDDEN_NAMES = {
     "structured.jsonl",
     "structured.jsonl.rotation.lock",
 }
+ALLOWED_ROOT_METADATA_NAMES = {".gitignore"}
 FORBIDDEN_REL_PATHS = {
     "bot_config.json",
     "bot_config.json.lock",
@@ -633,13 +634,17 @@ def _is_forbidden_release_artifact(path: Path, root: Path) -> str | None:
         return None
     rel_posix = rel.as_posix()
     rel_posix_lower = rel_posix.lower()
+    allowed_root_metadata = rel_posix_lower in ALLOWED_ROOT_METADATA_NAMES
     if rel.parts and rel.parts[0].lower() == "tools" and rel_posix not in RELEASE_TOOL_FILES:
         return f"forbidden non-release tool in release: {rel}"
     if parts_lower & forbidden_dirs_lower or any(_is_test_temp_name(part) for part in rel.parts):
         return f"forbidden file under runtime/test directory: {rel}"
     if rel_posix_lower in forbidden_rel_lower:
         return f"forbidden user/update config in release: {rel}"
-    if path.name.lower() in forbidden_names_lower or path.suffix.lower() in FORBIDDEN_SUFFIXES:
+    if (
+        path.name.lower() in forbidden_names_lower
+        and not allowed_root_metadata
+    ) or path.suffix.lower() in FORBIDDEN_SUFFIXES:
         return f"forbidden runtime/secret artifact in release: {rel}"
     if _is_secret_artifact(path):
         return f"forbidden secret artifact in release: {rel}"
@@ -893,10 +898,16 @@ def check_release(
             errors.append(f"forbidden file under runtime/test directory: {rel}")
             continue
         rel_posix = rel.as_posix()
+        allowed_root_metadata = (
+            rel_posix.lower() in ALLOWED_ROOT_METADATA_NAMES
+        )
         if rel_posix.lower() in forbidden_rel_lower:
             errors.append(f"forbidden user/update config in release: {rel}")
             continue
-        if path.name.lower() in forbidden_names_lower or path.suffix.lower() in FORBIDDEN_SUFFIXES:
+        if (
+            path.name.lower() in forbidden_names_lower
+            and not allowed_root_metadata
+        ) or path.suffix.lower() in FORBIDDEN_SUFFIXES:
             errors.append(f"forbidden runtime/secret artifact in release: {rel}")
             continue
         if _is_secret_artifact(path):

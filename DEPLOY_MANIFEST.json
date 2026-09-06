@@ -1,13 +1,13 @@
 {
-  "build_id": "362d7ce4bdd6ac5c",
-  "created_at": "2026-09-06 09:32:16",
+  "build_id": "08c7ec7615f0b7b5",
+  "created_at": "2026-09-06 10:37:58",
   "source": "update_deploy_manifest.py",
   "file_count": 200,
   "files": [
     {
       "path": "bot_config.default.json",
-      "sha256": "d6a0f692e3f0cc49a1d0491af9094bd7809db5bb06df986b795302e651c705a4",
-      "bytes": 12143
+      "sha256": "c2ae29c622df0bf77d4ebcbbd3d9b32dd2586cab41852ba36c2ba2a63458b902",
+      "bytes": 12147
     },
     {
       "path": "bot_utils/__init__.py",
@@ -196,8 +196,8 @@
     },
     {
       "path": "bots/main_bot_futures.py",
-      "sha256": "3d705135cf563a3b41848164d6c687a091d672cd144857d7f644d06e29ded386",
-      "bytes": 4687
+      "sha256": "4f3b44cddbadb2396fa9a984694fb270746ec7afe7dd074cd509425ac5f5600d",
+      "bytes": 4769
     },
     {
       "path": "bots/main_bot_trendfut.py",
@@ -206,8 +206,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "4e5e3730fd9713196f876343f77d3860e80a453186a70f8529ce5e25bd250c51",
-      "bytes": 61280
+      "sha256": "6a401d1f0c4f15784f11ec495cd7a04ed7ac0b8a59f06963f5418f90b527c16e",
+      "bytes": 61970
     },
     {
       "path": "config/__init__.py",
@@ -271,8 +271,8 @@
     },
     {
       "path": "core/futures_bot.py",
-      "sha256": "7e6c43c726be2c536dd0aa781785f287d362ae93a8953b46aae1ab4a59e07775",
-      "bytes": 138967
+      "sha256": "303f49415e1874957e3bab7bb95bbfd4bbd39b59a6fb5eed60e7646f9d0a733f",
+      "bytes": 139194
     },
     {
       "path": "core/futures_bot_exits.py",
@@ -396,8 +396,8 @@
     },
     {
       "path": "launcher/config/settings.py",
-      "sha256": "11fcf13931fa41e77308912693e6600ced7f600610123b2519e754b0c056cfc9",
-      "bytes": 63668
+      "sha256": "9a73eb6404ee1961fdd6cb1b6b22f6876c7118c15d9c93136e8911ffb4464283",
+      "bytes": 63750
     },
     {
       "path": "launcher/core/__init__.py",
@@ -596,13 +596,13 @@
     },
     {
       "path": "README.md",
-      "sha256": "ddc5c4fb994fdbd65083da51c72048c3073a82509e20c3be0dac031924d3f678",
-      "bytes": 8862
+      "sha256": "4ff27b76c8c3c1b25cebdcca4c2c83a4b3467853b5887297db13d3df9c6c87fb",
+      "bytes": 9121
     },
     {
       "path": "RELEASE.md",
-      "sha256": "ea08acbb9b15271db26c808f8295dd5b6a9c97c75499dc46291f7f7f638884e4",
-      "bytes": 6545
+      "sha256": "0907c1482161ce09d6615432fa7193022e81327c0a18632907e29467e351ef02",
+      "bytes": 7406
     },
     {
       "path": "requirements.lock.txt",
@@ -686,8 +686,8 @@
     },
     {
       "path": "tools/release_check.py",
-      "sha256": "fb003f37492c4c1b599e043efb71f52e7aca10bc433531a3ab58ca7539829591",
-      "bytes": 37668
+      "sha256": "8535fd4a15ff143b9448ee74ffd64af9d59732cca595ddf5c32981950f3b8131",
+      "bytes": 38013
     },
     {
       "path": "tools/release_requirements.py",
