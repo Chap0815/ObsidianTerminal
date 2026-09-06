@@ -1,4 +1,8 @@
-## What changes, and why?
+<!-- This template is for the project owner's maintenance workflow.
+External code contributions are not accepted. Please use Issues for bug reports
+or Discussions for suggestions; see CONTRIBUTING.md. -->
+
+## Maintainer change: what changes, and why?
 
 Describe the defect or user benefit and link the relevant issue.
 
@@ -10,7 +14,7 @@ Describe the defect or user benefit and link the relevant issue.
 - [ ] Update/configuration compatibility and private-data preservation considered.
 - [ ] No credentials, private runtime state, raw logs or account data included.
 - [ ] Documentation and limitations match the implementation.
-- [ ] I have the right to submit this contribution under LICENSE, including its additional permission.
+- [ ] Rights and third-party notices are compatible with LICENSE and its additional permission.
 
 ## Remaining risks or untested cases
 

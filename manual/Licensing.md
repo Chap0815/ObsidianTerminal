@@ -88,10 +88,11 @@ does not relicense those materials or grant rights their owners have not
 provided. The dependency list is not itself a complete third-party license
 inventory; check the notices and licenses of the versions you redistribute.
 
-Contributors retain their copyrights. Contributions accepted under the
-project terms must also carry the personal-trading permission for the
-contributor's material, and contributors must have the authority to provide
-those rights. The root license does not assert ownership of other authors'
+The official repository is owner-maintained and does not accept external code
+contributions; see the [maintenance policy](../CONTRIBUTING.md). Local
+modifications remain subject to the license. This repository policy does not
+withdraw any permissions independently granted by that license. Other authors
+retain their copyrights; the root license does not assert ownership of their
 work or erase separately applicable notices.
 
 The PolyForm text is reproduced from its

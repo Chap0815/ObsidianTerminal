@@ -2,7 +2,7 @@
 
 [Project overview](../README.md) · [Strategies](Strategies.md) · [Operating safely](Operating-Safely.md)
 
-This page describes the public product's major components and the boundaries relevant to operators and contributors. It is not an exhaustive specification or a claim that failures are impossible.
+This page describes the public product's major components and the boundaries relevant to operators and local developers. It is not an exhaustive specification or a claim that failures are impossible.
 
 ## Runtime layout
 
@@ -61,7 +61,7 @@ Orders have failure modes beyond success/failure. A request can time out after r
 
 These sources serve different purposes. A missing local display does not flatten an exchange position, and an external manual close can require local reconciliation and accounting. Preserving intent/state evidence is part of recovery.
 
-SIM and LIVE are distinct operational scopes. Bot identity, symbol, direction and lifecycle identifiers also matter. Contributors should not merge scopes merely to simplify a query or make a display look consistent.
+SIM and LIVE are distinct operational scopes. Bot identity, symbol, direction and lifecycle identifiers also matter. Changes must not merge scopes merely to simplify a query or make a display look consistent.
 
 ## Shared resources and coordination
 
@@ -87,4 +87,4 @@ The public product payload is described by a deployment manifest and a release a
 
 Updater integrity checks and recovery are meant to preserve that boundary. Do not weaken it by broadly copying a development directory into a running installation or adding runtime data to the manifest. A checksum establishes content consistency against its referenced manifest; transport/source trust is a separate concern.
 
-For normal operation, use the launcher and supported update workflow. For contributions, follow the repository's contribution guidance and keep private data out of patches and test fixtures.
+For normal operation, use the launcher and supported update workflow. For local modifications, follow the license and the repository's maintenance guidance and keep private data out of patches and test fixtures. The official branch is maintained by the project owner; external code contributions are not accepted.
