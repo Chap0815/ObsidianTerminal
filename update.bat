@@ -8,17 +8,7 @@ set PYTHONHOME=
 set PYTHONNOUSERSITE=1
 cd /d "%~dp0"
 
-if exist "%~dp0python\python.exe" (
-    "%~dp0python\python.exe" "%~dp0tools\update_from_git.py" %*
-    goto :end
-)
-
-if exist "%~dp0.venv\Scripts\python.exe" (
-    "%~dp0.venv\Scripts\python.exe" "%~dp0tools\update_from_git.py" %*
-    goto :end
-)
-
-py -3.12 --version >nul 2>nul
+py -3.12 -c "import pathlib, portalocker, psutil, sys; root=pathlib.Path(sys.argv[1]).resolve(); exe=pathlib.Path(sys.executable).resolve(); raise SystemExit(1 if sys.version_info[:2] != (3, 12) or exe == root or root in exe.parents else 0)" "%~dp0." >nul 2>nul
 if %errorlevel%==0 (
     py -3.12 "%~dp0tools\update_from_git.py" %*
     goto :end
@@ -26,15 +16,23 @@ if %errorlevel%==0 (
 
 where python >nul 2>nul
 if %errorlevel%==0 (
+    python -c "import pathlib, portalocker, psutil, sys; root=pathlib.Path(sys.argv[1]).resolve(); exe=pathlib.Path(sys.executable).resolve(); raise SystemExit(1 if sys.version_info[:2] != (3, 12) or exe == root or root in exe.parents else 0)" "%~dp0." >nul 2>nul
+)
+if %errorlevel%==0 (
     python "%~dp0tools\update_from_git.py" %*
     goto :end
 )
 
 echo.
-echo   [FEHLER] Kein Python gefunden. Starte zuerst install.bat oder nutze die Setup-EXE.
+echo   [FEHLER] Kein geeignetes externes Update-Python gefunden.
+echo   Starte Obsidian und verwende den gelben Update-Button. Dieser kopiert
+echo   die gebuendelte Runtime vor dem Update in ein verifiziertes Temp-Verzeichnis.
 echo.
+set RC=2
+goto :done
 
 :end
 set RC=%ERRORLEVEL%
+:done
 if not "%1"=="--quiet" pause
 exit /b %RC%

@@ -46,10 +46,15 @@ exchange supervision. A code update cannot provide monitoring while bots are off
 
 ## Apply and verify
 
-Run `update.bat` in the installation folder. Read its result before restarting.
-The updater checks for running processes, validates the source manifest and
-applies the allowed payload. Private configuration and runtime data are excluded
-from the public payload; supported local files are preserved.
+Use the yellow update button in the launcher. It closes the launcher and runs
+the updater from a verified temporary copy of the bundled Python runtime, which
+is required when an update changes Python dependencies. `update.bat` is a
+command-line fallback only when a separate Python 3.12 installation already has
+the updater prerequisites; it refuses to use the Python environment being
+updated and otherwise directs you back to the launcher. Read the result before
+restarting. The updater checks for running processes, validates the source
+manifest and applies the allowed payload. Private configuration and runtime data
+are excluded from the public payload; supported local files are preserved.
 
 After success, start `start_launcher.bat` and verify:
 
@@ -66,8 +71,9 @@ builds to force a restart.
 ## Important: older private / SSH-only installations
 
 An old updater does not become HTTPS-capable just because its configuration URL
-changes. Older builds may also reject the root `.gitignore` now included in the
-public manifest. These are compatibility checks, not a reason to disable
+changes. Some older builds reject repository-only metadata such as a root
+`.gitignore`; current public update trees therefore exclude that file for
+backward compatibility. These are compatibility checks, not a reason to disable
 validation.
 
 For that legacy transition, use a **fresh, separate source installation**:

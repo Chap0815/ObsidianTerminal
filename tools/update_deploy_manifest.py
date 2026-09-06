@@ -344,7 +344,7 @@ def _skip(path: Path, root: Path) -> bool:
         or path.name.lower().endswith(".bak")
         or ".bak_" in path.name.lower()
         or path.name.lower().endswith((".tmp", ".old", "~"))
-        or (path.name.lower() in excluded_names_lower and rel_posix != ".gitignore")
+        or path.name.lower() in excluded_names_lower
         or _secret_name(path)
         or path.suffix.lower() in EXCLUDED_SUFFIXES
     )

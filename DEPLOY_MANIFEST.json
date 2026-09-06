@@ -1,8 +1,8 @@
 {
-  "build_id": "c4242a428654dfbc",
-  "created_at": "2026-09-06 16:03:23",
+  "build_id": "f8b418769fb41add",
+  "created_at": "2026-09-06 17:08:34",
   "source": "update_deploy_manifest.py",
-  "file_count": 222,
+  "file_count": 221,
   "files": [
     {
       "path": ".github/ISSUE_TEMPLATE/bug_report.yml",
@@ -28,11 +28,6 @@
       "path": ".github/workflows/publication.yml",
       "sha256": "026625f924bc7e0b66ee75b8c81438fc6c97e3a7f9e3b6d4a41d31e585ac900e",
       "bytes": 888
-    },
-    {
-      "path": ".gitignore",
-      "sha256": "01468c8211baeeba15fa7e1bca52b0caa1127d0c8a533c6f1c5020f0428aa1f9",
-      "bytes": 866
     },
     {
       "path": "bot_config.default.json",
@@ -236,8 +231,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "706b230ef5daa0e241d258651b74814b5a142a83c532fcde5e0c75729be7f052",
-      "bytes": 62990
+      "sha256": "e13c10ac1a0df5116d435e87b75e8cb38a7a756e270f9b5caf0684af328fde94",
+      "bytes": 63360
     },
     {
       "path": "CODE_OF_CONDUCT.md",
@@ -796,8 +791,8 @@
     },
     {
       "path": "tools/release_check.py",
-      "sha256": "0a7882f3393b752739924adadb0ee6607841ea700e7859f0b5ba960012070aea",
-      "bytes": 38220
+      "sha256": "a42f479f7a36b5e7aa7a7d23a34f30b1c17204a1dc709720049efdc5f205a508",
+      "bytes": 38221
     },
     {
       "path": "tools/release_requirements.py",
@@ -831,13 +826,13 @@
     },
     {
       "path": "tools/update_deploy_manifest.py",
-      "sha256": "8cde2b4bd9cf4927929e49e59b318ad4db817362233ec56466af1d1b4c893ef7",
-      "bytes": 20975
+      "sha256": "b3b5a2224a1e019b7c8ef36e88eb9524e72052dc584fec0e87286d830fafbf06",
+      "bytes": 20943
     },
     {
       "path": "tools/update_from_git.py",
-      "sha256": "7099529c9fb966344cb8e6cc5fc518b7ec6fc26b32172fa811741d5d55e00725",
-      "bytes": 142780
+      "sha256": "a5274ccea0e6102f3fd22e02c53006b3e0e495f937d26168779884115ca6c8f4",
+      "bytes": 142572
     },
     {
       "path": "tools/update_launcher.py",
@@ -1101,8 +1096,8 @@
     },
     {
       "path": "update.bat",
-      "sha256": "6e1cd14b0ecae24f3761303b913e07bf4cebbac33a936829d1b04b6efa194919",
-      "bytes": 962
+      "sha256": "672209d1793ad65eca29237e9898a0880b83d6bcabbacd1ecac3038caa773302",
+      "bytes": 1396
     },
     {
       "path": "update_barrier.py",
@@ -1111,8 +1106,8 @@
     },
     {
       "path": "UPDATE_SETUP.md",
-      "sha256": "00147550e962feb7c20a93e8a0a0b68e6fb2a2fa0b3ca2f99a7d7fa4a6d753f3",
-      "bytes": 4388
+      "sha256": "3954e53c33ca8440d9a6a2a9f0e8970b92847b4b33436963aa59c932d4d93fcd",
+      "bytes": 4860
     }
   ]
 }

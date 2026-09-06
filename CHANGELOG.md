@@ -2,6 +2,11 @@
 
 ## 2026-09-06
 
+- Restored update compatibility for existing installations: repository-only
+  `.gitignore` metadata is no longer part of the public update tree, and
+  `update.bat` now accepts only a suitable external Python or directs users to
+  the launcher's verified external-runtime runner, so hash-locked dependency
+  changes cannot attempt to replace their active Python process.
 - Updated the CCXT cryptography dependency to 50.0.1, removing the affected
   PKCS#7 decryption implementation tracked as CVE-2026-69247. The reviewed
   Windows wheel remains hash-pinned and the release security floor prevents a
