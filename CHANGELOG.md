@@ -2,6 +2,19 @@
 
 ## 2026-09-06
 
+- Stabilized research capture under exchange pressure: each L2 connection epoch
+  now performs one budgeted market-metadata load, partial symbol staleness no
+  longer tears down healthy order-book and trade subscriptions, and full-feed
+  failures retain bounded reconnect behavior.
+- Preserved L2 nonce regressions across sampling and storage retries while
+  accepting non-decreasing repeated MEXC versions without claiming native
+  sequence validity.
+- Recovered committed SQLite WAL data before sealing previously unsealed closed
+  capture days. Active WAL/SHM readers remain a retryable fail-closed condition,
+  and existing hash-bound integrity reports are never mutated.
+- Removed misleading Windows console-handle warnings on normal launcher close;
+  CTRL_BREAK/SIGTERM is now reserved for control-publication failure and the
+  existing preserve-to-close fallback path.
 - Restored update compatibility for existing installations: repository-only
   `.gitignore` metadata is no longer part of the public update tree, and
   `update.bat` now accepts only a suitable external Python or directs users to
