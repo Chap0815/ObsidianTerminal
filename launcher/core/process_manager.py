@@ -1023,6 +1023,7 @@ class BotProcess:
         # the process is genuinely dead.
         control_mode = CLOSE_POSITIONS if graceful_close else PRESERVE_POSITIONS
         already_exited: tuple[int | None, str, int, str | None] | None = None
+        previous_stop_mode = None
         with self._lifecycle_lock:
             if self.proc is None:
                 return None
@@ -1053,6 +1054,8 @@ class BotProcess:
                 control_path_to_stop = getattr(
                     self, "_shutdown_control_path", None
                 )
+                if self._stop_requested_run_id == run_id_to_stop:
+                    previous_stop_mode = self._stop_requested_mode
                 if (
                     self._stop_requested_run_id == run_id_to_stop
                     and self._stop_requested_mode == CLOSE_POSITIONS
@@ -1104,10 +1107,20 @@ class BotProcess:
                     except Exception:
                         pass
 
-        # Send the signal OUTSIDE the lock. It is only a close-path wakeup;
-        # preserve-position shutdowns must never invoke the signal handler.
+        # Send the signal OUTSIDE the lock only as a fallback when publishing
+        # the authoritative run-bound request failed. Hidden ``pythonw``
+        # children commonly have no usable Windows console handle; attempting
+        # CTRL_BREAK after a successful control publication only creates a
+        # misleading WinError 6 while adding no shutdown guarantee.
         signal_ok = control_ok
-        if graceful_close and self.supports_graceful:
+        if (
+            graceful_close
+            and self.supports_graceful
+            and (
+                not control_ok
+                or previous_stop_mode == PRESERVE_POSITIONS
+            )
+        ):
             try:
                 if sys.platform == "win32":
                     # CTRL_BREAK_EVENT works only with CREATE_NEW_PROCESS_GROUP.

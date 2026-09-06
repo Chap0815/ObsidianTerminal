@@ -298,6 +298,7 @@ class L2ShadowCollector:
         self._state_lock = threading.Lock()
         self._last_persist: dict[str, float] = {}
         self._last_nonce: dict[str, object] = {}
+        self._nonce_regressions_since_sample: dict[str, int] = {}
         self._updates_since_sample: dict[str, int] = {}
         self._invalid_warning_state: dict[str, tuple[float, int]] = {}
         self._recent_trade_evidence: dict[
@@ -440,6 +441,7 @@ class L2ShadowCollector:
             for state in (
                 self._last_persist,
                 self._last_nonce,
+                self._nonce_regressions_since_sample,
                 self._updates_since_sample,
                 self._invalid_warning_state,
                 self._recent_trade_evidence,
@@ -512,7 +514,7 @@ class L2ShadowCollector:
         if previous is None or current is None:
             return None
         try:
-            return int(current) > int(previous)
+            return int(current) >= int(previous)
         except (TypeError, ValueError, OverflowError):
             return None
 
@@ -555,7 +557,33 @@ class L2ShadowCollector:
             current_nonce = normalized["nonce"]
             nonce_monotonic = self._nonce_is_monotonic(previous_nonce, current_nonce)
             if current_nonce is not None:
-                self._last_nonce[symbol] = current_nonce
+                try:
+                    current_nonce_value = int(current_nonce)
+                    previous_nonce_value = (
+                        None if previous_nonce is None else int(previous_nonce)
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    current_nonce_value = None
+                    previous_nonce_value = None
+                if (
+                    previous_nonce_value is not None
+                    and current_nonce_value is not None
+                    and current_nonce_value < previous_nonce_value
+                ):
+                    self._nonce_regressions_since_sample[symbol] = (
+                        self._nonce_regressions_since_sample.get(symbol, 0) + 1
+                    )
+                elif (
+                    current_nonce_value is not None
+                    and (
+                        previous_nonce_value is None
+                        or current_nonce_value > previous_nonce_value
+                    )
+                ):
+                    # Preserve a high-water mark. A throttled regression must
+                    # not lower the comparison basis for the next persisted
+                    # sample and thereby disappear from evidence.
+                    self._last_nonce[symbol] = current_nonce_value
             updates = self._updates_since_sample.get(symbol, 0) + 1
             self._updates_since_sample[symbol] = updates
             previous_persist = self._last_persist.get(symbol)
@@ -566,6 +594,11 @@ class L2ShadowCollector:
                 return False
             self._last_persist[symbol] = now_monotonic
             self._updates_since_sample[symbol] = 0
+            nonce_regressions = self._nonce_regressions_since_sample.get(
+                symbol, 0
+            )
+            if nonce_regressions:
+                nonce_monotonic = False
             if connection_epoch is None:
                 connection_epoch = self._connection_epoch
 
@@ -652,6 +685,19 @@ class L2ShadowCollector:
             self._log(f"storage error for {symbol}: {type(exc).__name__}", "WARN")
             self._mark_l2_unhealthy(symbol, type(exc).__name__)
             return False
+        with self._state_lock:
+            current_regressions = self._nonce_regressions_since_sample.get(
+                symbol, 0
+            )
+            remaining_regressions = max(
+                0, current_regressions - nonce_regressions
+            )
+            if remaining_regressions:
+                self._nonce_regressions_since_sample[symbol] = (
+                    remaining_regressions
+                )
+            else:
+                self._nonce_regressions_since_sample.pop(symbol, None)
         disqualifying_flags = set(flags) - {"sequence_unverified"}
         if disqualifying_flags:
             self._mark_l2_unhealthy(
@@ -970,6 +1016,7 @@ class L2ShadowCollector:
         with self._state_lock:
             self._last_persist.clear()
             self._last_nonce.clear()
+            self._nonce_regressions_since_sample.clear()
             self._updates_since_sample.clear()
             self._connection_epoch = epoch
 
@@ -1364,6 +1411,7 @@ class L2ShadowCollector:
             trade_exchange = l2_exchange
         tasks: dict[tuple[str, str], asyncio.Task] = {}
         task_started: dict[tuple[str, str], float] = {}
+        partial_stale: tuple[str, ...] = ()
         try:
             while not self._should_stop():
                 desired = set(self._symbol_snapshot())
@@ -1420,10 +1468,24 @@ class L2ShadowCollector:
                         )
                     )
                 ]
-                if stale:
+                stale_signature = tuple(sorted(stale))
+                desired_l2 = {
+                    symbol for kind, symbol in tasks if kind == "l2"
+                }
+                if stale and set(stale) == desired_l2:
                     raise TimeoutError(
                         "L2 watcher stale for " + ",".join(sorted(stale))
                     )
+                if stale_signature != partial_stale:
+                    if stale_signature:
+                        self._log(
+                            "partial L2 staleness; healthy subscriptions "
+                            "remain active (" + ",".join(stale_signature) + ")",
+                            "WARN",
+                        )
+                    elif partial_stale:
+                        self._log("partial L2 staleness recovered", "OK")
+                    partial_stale = stale_signature
                 for task in done:
                     key = next(key for key, value in tasks.items() if value is task)
                     kind, symbol = key
@@ -1488,38 +1550,42 @@ class L2ShadowCollector:
             l2_exchange = None
             trade_exchange = None
             try:
-                for stream_name in ("l2", "trades"):
-                    endpoint = f"{stream_name}_stream_load_markets"
-                    try:
-                        reservation = try_consume_api_call(
-                            endpoint,
-                            return_reservation=True,
-                        )
-                    except Exception as budget_exc:
-                        raise RuntimeError(
-                            f"{stream_name} load_markets API budget gate unavailable"
-                        ) from budget_exc
-                    if not reservation:
-                        raise RuntimeError(
-                            f"{stream_name} load_markets API budget exhausted"
-                        )
-                    exchange = self._make_async_exchange(
-                        new_updates=stream_name == "trades"
+                endpoint = "l2_stream_load_markets"
+                try:
+                    reservation = try_consume_api_call(
+                        endpoint,
+                        return_reservation=True,
                     )
-                    self._register_async_client(exchange)
-                    if stream_name == "l2":
-                        l2_exchange = exchange
-                    else:
-                        trade_exchange = exchange
-                    try:
-                        await exchange.load_markets()
-                    except Exception:
-                        if isinstance(reservation, ApiCallReservation):
-                            try:
-                                record_api_error(endpoint, reservation)
-                            except Exception:
-                                pass
-                        raise
+                except Exception as budget_exc:
+                    raise RuntimeError(
+                        "l2 load_markets API budget gate unavailable"
+                    ) from budget_exc
+                if not reservation:
+                    raise RuntimeError("l2 load_markets API budget exhausted")
+                l2_exchange = self._make_async_exchange(new_updates=False)
+                self._register_async_client(l2_exchange)
+                try:
+                    await l2_exchange.load_markets()
+                except Exception:
+                    if isinstance(reservation, ApiCallReservation):
+                        try:
+                            record_api_error(endpoint, reservation)
+                        except Exception:
+                            pass
+                    raise
+                trade_exchange = self._make_async_exchange(new_updates=True)
+                self._register_async_client(trade_exchange)
+                share_markets = getattr(
+                    trade_exchange, "set_markets_from_exchange", None
+                )
+                if not callable(share_markets):
+                    raise RuntimeError(
+                        "trade transport cannot share loaded market metadata"
+                    )
+                # Two transports remain independently owned for MEXC stream
+                # isolation, but their immutable market metadata is loaded
+                # exactly once per connection epoch.
+                share_markets(l2_exchange)
                 self._begin_connection_epoch(
                     error_type=last_error_type,
                     reconnect_attempts=reconnect_attempts,

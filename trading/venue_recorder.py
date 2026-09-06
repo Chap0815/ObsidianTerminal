@@ -36,6 +36,7 @@ MAX_EXCHANGE_FUTURE_SKEW_MS = 30_000
 _CAPTURE_CONTROL_JSON_MAX_BYTES = 64 * 1024
 _CAPTURE_CONTROL_TEMP_ATTEMPTS = 3
 _CAPACITY_OPERATIONAL_RESERVE_RATIO = 1.05
+_CAPTURE_PARTITION_STREAMS = ("overview", "depth", "trades", "l2_stream")
 
 
 def _unique_capture_control_object(pairs) -> dict:
@@ -201,6 +202,14 @@ class SQLitePartitionWriter:
         """Checkpoint a closed UTC day and exclude every later write."""
         day_text = day.isoformat() if hasattr(day, "isoformat") else str(day)
         with self.partition_guard(day_text):
+            seal = self.root / "integrity" / f"{day_text}.json"
+            self._assert_scoped_path(seal)
+            if seal.exists():
+                # Published reports are hash-bound to their original files.
+                # Verification owns this branch; even closing a WAL handle can
+                # checkpoint bytes, so a sealed day must remain untouched.
+                yield
+                return
             with self._lock:
                 for path in list(self._connections):
                     if path.stem == day_text:
@@ -221,7 +230,116 @@ class SQLitePartitionWriter:
                     candidate.close()
                     if self._setup_connection_candidate is candidate:
                         self._setup_connection_candidate = None
+            # A prior process can leave committed WAL frames without any
+            # handle in this writer's registry. Recover those frames only for
+            # an unsealed closed day.
+            for stream in _CAPTURE_PARTITION_STREAMS:
+                self._checkpoint_restart_wal(
+                    self.root / stream / f"{day_text}.sqlite3"
+                )
             yield
+
+    def _checkpoint_restart_wal(self, path: Path) -> None:
+        self._assert_scoped_path(path)
+        wal = Path(f"{path}-wal")
+        shm = Path(f"{path}-shm")
+        self._assert_scoped_path(wal)
+        self._assert_scoped_path(shm)
+        try:
+            path_stat = path.lstat()
+        except FileNotFoundError:
+            return
+        if self._stat_is_linklike(path_stat) or not stat.S_ISREG(path_stat.st_mode):
+            raise RuntimeError("capture partition is not a regular file")
+        sidecar_data = False
+        for sidecar, label in ((wal, "WAL"), (shm, "SHM")):
+            try:
+                sidecar_stat = sidecar.lstat()
+            except FileNotFoundError:
+                continue
+            if self._stat_is_linklike(sidecar_stat) or not stat.S_ISREG(
+                sidecar_stat.st_mode
+            ):
+                raise RuntimeError(
+                    f"capture {label} is not a regular file"
+                )
+            sidecar_data = sidecar_data or sidecar_stat.st_size > 0
+        if not sidecar_data:
+            return
+
+        connection = None
+        primary_error = None
+        try:
+            connection = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=rw",
+                uri=True,
+                timeout=15.0,
+            )
+            with self._lock:
+                self._setup_connection_candidate = connection
+                try:
+                    self._setup_connections.append(connection)
+                except BaseException as primary_exc:
+                    try:
+                        connection.close()
+                    except BaseException as close_error:
+                        try:
+                            primary_exc.add_note(
+                                "SQLite checkpoint candidate cleanup failed: "
+                                f"{type(close_error).__name__}: {close_error}"
+                            )
+                        except BaseException:
+                            pass
+                    else:
+                        self._discard_setup_connection(connection)
+                    raise
+                self._setup_connection_candidate = None
+            connection.execute("PRAGMA busy_timeout=15000")
+            result = connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if (
+                not isinstance(result, tuple)
+                or len(result) != 3
+                or any(type(value) is not int for value in result)
+                or result[0] != 0
+            ):
+                raise RuntimeError("capture WAL checkpoint remained busy")
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except BaseException as close_error:
+                    if primary_error is None:
+                        raise
+                    try:
+                        primary_error.add_note(
+                            "restart WAL connection close failed: "
+                            f"{type(close_error).__name__}: {close_error}"
+                        )
+                    except BaseException:
+                        pass
+                else:
+                    with self._lock:
+                        self._discard_setup_connection(connection)
+        for sidecar, label in ((wal, "WAL"), (shm, "SHM")):
+            try:
+                sidecar_stat = sidecar.lstat()
+            except FileNotFoundError:
+                continue
+            if self._stat_is_linklike(sidecar_stat) or not stat.S_ISREG(
+                sidecar_stat.st_mode
+            ):
+                raise RuntimeError(
+                    f"capture {label} is not a regular file"
+                )
+            if sidecar_stat.st_size:
+                raise RuntimeError(
+                    f"capture {label} checkpoint did not quiesce"
+                )
 
     @contextmanager
     def _partition_guards(self, days) -> object:
