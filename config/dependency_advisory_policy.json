@@ -1,24 +1,10 @@
 {
-  "advisories": [
-    {
-      "decision": "waived",
-      "id": "GHSA-G6CJ-PR64-35W5",
-      "package": "cryptography",
-      "rationale": "Not reachable in the product runtime: no PKCS7 decrypt API is called and there is no attacker-controlled EnvelopedData decryption path.",
-      "version": "49.0.0"
-    },
-    {
-      "decision": "waived",
-      "id": "PYSEC-2026-3552",
-      "package": "cryptography",
-      "rationale": "Not reachable in the product runtime: no PKCS7 decrypt API is called and there is no attacker-controlled EnvelopedData decryption path.",
-      "version": "49.0.0"
-    }
-  ],
-  "requirements_lock_sha256": "7570c76b3d484f470d35495a9ca09704eae7261862b8aa7aa57931bafa26707c",
-  "retrieved_at_utc": "2026-09-05T10:06:59.0483072+00:00",
+  "advisories": [],
+  "requirements_lock_sha256": "0fb72ef15e74c0db3532c21fd088838dd0e2da8b47b9d50b96c9596dbf89a06c",
+  "retrieved_at_utc": "2026-09-06T07:47:26.935009+00:00",
   "safety_floors": {
     "aiohttp": "3.14.3",
+    "cryptography": "50.0.1",
     "gitpython": "3.1.61"
   },
   "schema_version": 1,

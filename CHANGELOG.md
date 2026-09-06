@@ -2,6 +2,14 @@
 
 ## 2026-09-06
 
+- Updated the CCXT cryptography dependency to 50.0.1, removing the affected
+  PKCS#7 decryption implementation tracked as CVE-2026-69247. The reviewed
+  Windows wheel remains hash-pinned and the release security floor prevents a
+  downgrade to the affected range.
+- Stop retrying a Telegram recipient for the lifetime of a process after a
+  permanent HTTP 401/403 API rejection. One actionable warning remains; later
+  notifications become quiet no-ops until configuration is corrected and the
+  process is restarted.
 - Reworked public documentation around Obsidian Trading Terminal, optional local
   AI, simulation-first operation, explicit trading risks and noncommercial
   licensing with personal own-account trading permission.

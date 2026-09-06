@@ -2127,6 +2127,9 @@ def _telegram_worker() -> None:
             except queue.Empty:
                 continue
             try:
+                recipient_key = _telegram_recipient_key(token, chat_id)
+                if _telegram_recipient_disabled(recipient_key):
+                    continue
                 delivered = False
                 failure_reason = "unknown"
                 for attempt in range(_TELEGRAM_DELIVERY_ATTEMPTS):
@@ -2165,7 +2168,6 @@ def _telegram_worker() -> None:
                         )
                     )
 
-                recipient_key = _telegram_recipient_key(token, chat_id)
                 if delivered:
                     recovered = _reset_tg_failures(
                         recipient_key
@@ -2317,6 +2319,7 @@ atexit.register(_flush_telegram_at_exit)
 # silently disable critical SAFE_MODE alerts).
 _TG_FAIL_LOCK      = threading.Lock()
 _TG_FAILURES: dict[str, dict[str, float | int]] = {}
+_TG_DISABLED_RECIPIENTS: dict[str, str] = {}
 _TG_BIG_WARN_EVERY = 300.0   # 5 min between escalations
 
 
@@ -2326,10 +2329,18 @@ def _telegram_recipient_key(token: str, chat_id: str) -> str:
     return hashlib.sha256(material).hexdigest()[:20]
 
 
+def _telegram_recipient_disabled(recipient_key: str) -> bool:
+    """True after Telegram permanently rejects this process-local recipient."""
+    with _TG_FAIL_LOCK:
+        return str(recipient_key) in _TG_DISABLED_RECIPIENTS
+
+
 def _record_tg_failure(reason: str, recipient_key: str) -> None:
     """Report the first failure immediately and rate-limit later reminders."""
     notice = None
-    blocked_recipient = str(reason).strip().lower() == "http_403"
+    normalized_reason = str(reason).strip().lower()
+    permanently_rejected = normalized_reason in {"http_401", "http_403"}
+    blocked_recipient = normalized_reason == "http_403"
     remediation = (
         "unblock the bot for that recipient or remove the blocked recipient "
         "from TELEGRAM_CHAT_ID"
@@ -2337,13 +2348,23 @@ def _record_tg_failure(reason: str, recipient_key: str) -> None:
         else "check token and network"
     )
     with _TG_FAIL_LOCK:
+        if str(recipient_key) in _TG_DISABLED_RECIPIENTS:
+            return
         state = _TG_FAILURES.setdefault(
             str(recipient_key), {"count": 0, "last_big_warn": 0.0}
         )
         state["count"] = int(state["count"]) + 1
         n = int(state["count"])
         now = time.monotonic()
-        if n == 1:
+        if permanently_rejected:
+            _TG_DISABLED_RECIPIENTS[str(recipient_key)] = normalized_reason
+            notice = (
+                f"Telegram disabled for one configured recipient in this "
+                f"process after permanent API rejection ({reason}); "
+                f"trading continues normally; {remediation}; restart after "
+                f"correcting the configuration"
+            )
+        elif n == 1:
             notice = (
                 f"Telegram delivery temporarily unavailable for one configured "
                 f"recipient ({reason}); "
@@ -2367,6 +2388,7 @@ def _record_tg_failure(reason: str, recipient_key: str) -> None:
 def _reset_tg_failures(recipient_key: str) -> int:
     """Successful send: reset and return the prior consecutive-failure count."""
     with _TG_FAIL_LOCK:
+        _TG_DISABLED_RECIPIENTS.pop(str(recipient_key), None)
         state = _TG_FAILURES.pop(str(recipient_key), None)
         return int(state["count"]) if state is not None else 0
 
@@ -2405,7 +2427,12 @@ def _write_telegram_overflow(
 
 
 def send_telegram(token, chat_id, msg) -> bool:
-    """Queue a Telegram message and report whether every recipient was accepted."""
+    """Accept configured sends or quietly suppress permanently rejected recipients.
+
+    A true result means that each recipient was queued or had already been
+    disabled after a surfaced permanent API rejection; it is not proof of
+    delivery. The worker remains responsible for delivery evidence.
+    """
     global _TG_OVERFLOW_LAST_WARN
     token_text = _telegram_config_text(
         token,
@@ -2431,13 +2458,24 @@ def send_telegram(token, chat_id, msg) -> bool:
     ids = [c for c in raw.split() if c]
     if not ids:
         return False
+    enabled_ids = [
+        cid for cid in ids
+        if not _telegram_recipient_disabled(
+            _telegram_recipient_key(token_text, cid)
+        )
+    ]
+    if not enabled_ids:
+        # A permanent API rejection was already surfaced once. Treat later
+        # optional notifications as a deliberate no-op so callers do not
+        # retry and fill logs for the lifetime of this process.
+        return True
     try:
         _ensure_tg_worker()
     except Exception as exc:
         _log_struct_submit_error("telegram worker bootstrap", exc)
         return False
     accepted_all = True
-    for cid in ids:
+    for cid in enabled_ids:
         try:
             _TG_QUEUE.put_nowait((token_text, cid, msg))
         except queue.Full:

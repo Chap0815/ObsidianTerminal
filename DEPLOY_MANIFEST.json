@@ -1,6 +1,6 @@
 {
-  "build_id": "16eb5b031acf217f",
-  "created_at": "2026-09-06 14:46:25",
+  "build_id": "c4242a428654dfbc",
+  "created_at": "2026-09-06 16:03:23",
   "source": "update_deploy_manifest.py",
   "file_count": 222,
   "files": [
@@ -236,8 +236,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "sha256": "09b2c052c0ca74e79050c347004bdba13b9d651c2c4966327dbb9e9943a0bafe",
-      "bytes": 62472
+      "sha256": "706b230ef5daa0e241d258651b74814b5a142a83c532fcde5e0c75729be7f052",
+      "bytes": 62990
     },
     {
       "path": "CODE_OF_CONDUCT.md",
@@ -251,8 +251,8 @@
     },
     {
       "path": "config/dependency_advisory_policy.json",
-      "sha256": "1d70f0ad4c5b132fdcae34e4fa33846381c99032f6e150ccc2c5c178cdcae357",
-      "bytes": 913
+      "sha256": "5fc7021e13af534d58a50b2b846307bef309a3982882841cc967143ad1e2b37d",
+      "bytes": 358
     },
     {
       "path": "config/exchange_config.py",
@@ -331,8 +331,8 @@
     },
     {
       "path": "core/logger.py",
-      "sha256": "e0585412433406ee1a662210363b566f551b27cd1716888d99d3865e29122b67",
-      "bytes": 82370
+      "sha256": "d11b26b3487ba81a8626da7384e7f394c3afab09a3b9fa33fa3f2886d02aae4b",
+      "bytes": 84060
     },
     {
       "path": "core/models.py",
@@ -706,13 +706,13 @@
     },
     {
       "path": "requirements.lock.txt",
-      "sha256": "7570c76b3d484f470d35495a9ca09704eae7261862b8aa7aa57931bafa26707c",
+      "sha256": "0fb72ef15e74c0db3532c21fd088838dd0e2da8b47b9d50b96c9596dbf89a06c",
       "bytes": 7900
     },
     {
       "path": "requirements.txt",
-      "sha256": "42d80812fbae3036ea14e047b9413c30efe016f79ac92bc5fdb253a6bc2b3b96",
-      "bytes": 1866
+      "sha256": "626dcdec182c9e125fe1987dfacb886256141f9b9ffd58922a8eef45f5f61bde",
+      "bytes": 1959
     },
     {
       "path": "SECURITY.md",
