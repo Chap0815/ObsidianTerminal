@@ -197,6 +197,27 @@ def _has_futures_partial_exit_intent(row: dict) -> bool:
     )
 
 
+def _is_legacy_completed_partial_exit_tail(row: dict) -> bool:
+    """Identify the exact pre-fix residue of a committed partial exit."""
+    created_at = row.get(_PARTIAL_EXIT_CREATED_AT) if isinstance(row, dict) else None
+    return (
+        isinstance(row, dict)
+        and row.get("partial_sold") is True
+        and isinstance(created_at, str)
+        and _futures_order_lookup_since_ms(created_at) is not None
+        and all(
+            key in row and row[key] is None
+            for key in (
+                _PARTIAL_EXIT_CLIENT_ID,
+                _PARTIAL_EXIT_AMOUNT,
+                _PARTIAL_EXIT_SIDE,
+                _PARTIAL_EXIT_MODE,
+                _PARTIAL_EXIT_OBSERVED_FILLED,
+            )
+        )
+    )
+
+
 def _futures_exit_intent_schema_status(
     row: dict,
     leg: str,
@@ -417,6 +438,11 @@ def _ensure_futures_partial_exit_intent(
 
 
 def _clear_futures_partial_exit_intent(state, sym: str, row: dict) -> bool:
+    from bot_utils.trade_state import (
+        same_position_generation,
+        update_many_if_current,
+    )
+
     updates = {
         _PARTIAL_EXIT_CLIENT_ID: None,
         _PARTIAL_EXIT_AMOUNT: None,
@@ -425,9 +451,41 @@ def _clear_futures_partial_exit_intent(state, sym: str, row: dict) -> bool:
         _PARTIAL_EXIT_OBSERVED_FILLED: None,
         _PARTIAL_EXIT_CREATED_AT: None,
     }
-    persisted = state.update_many(sym, updates)
-    if persisted is not None and persisted is not True:
+    previous = {key: row.get(key) for key in updates}
+    getter = getattr(state, "get", None)
+    if callable(getter):
+        current = getter(sym)
+        if (
+            not same_position_generation(current, row)
+            and current != row
+        ) or not isinstance(current, dict) or any(
+            current.get(key) != value for key, value in previous.items()
+        ):
+            return False
+    if not update_many_if_current(state, sym, updates, row):
+        # TradeState keeps a failed persistence mutation in RAM so later
+        # snapshots cannot roll facts back. Re-arm the original intent there;
+        # the durable pre-clear snapshot remains retryable after restart too.
+        try:
+            current = getter(sym) if callable(getter) else None
+            if (
+                isinstance(current, dict)
+                and same_position_generation(current, row)
+                and all(current.get(key) is None for key in updates)
+            ):
+                update_many_if_current(state, sym, previous, row)
+        except Exception:
+            pass
         return False
+    if callable(getter):
+        current = getter(sym)
+        if (
+            not same_position_generation(current, row)
+            and current != {**row, **updates}
+        ) or not isinstance(current, dict) or any(
+            current.get(key) is not None for key in updates
+        ):
+            return False
     row.update(updates)
     return True
 
@@ -3026,6 +3084,24 @@ class FuturesExitsMixin:
                                  safe_remaining)
         from bot_utils.trade_state import update_many_if_current
 
+        if (
+            not self.simulation
+            and _is_legacy_completed_partial_exit_tail(d)
+        ):
+            if not _clear_futures_partial_exit_intent(self.state, sym, d):
+                log_event(
+                    f"Partial-TP {sym}: completed legacy intent residue "
+                    "could not be cleared durably",
+                    "ERROR",
+                )
+            else:
+                log_event(
+                    f"Partial-TP {sym}: cleared completed legacy intent "
+                    "residue",
+                    "WARN",
+                )
+            return False
+
         pending_partial_intent = _has_futures_partial_exit_intent(d)
         if self.simulation and pending_partial_intent:
             log_event(
@@ -3637,6 +3713,7 @@ class FuturesExitsMixin:
             _PARTIAL_EXIT_SIDE: None,
             _PARTIAL_EXIT_MODE: None,
             _PARTIAL_EXIT_OBSERVED_FILLED: None,
+            _PARTIAL_EXIT_CREATED_AT: None,
         }
         if d.get("entry_funding_window_unverified") is True:
             updates["funding_paid"] = d["funding_paid"]
