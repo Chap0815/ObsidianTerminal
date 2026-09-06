@@ -1,12 +1,8 @@
 """
 bots/main_bot_balanced.py  -  TREND spot trading bot (slim subclass).
 
-Strategy parameters from optimizer-validated 60-day run:
-  - avg_net 60d = +6.05 USDT (+4.31% ROI)
-  - Consistency  = 40% over 4 folds
-  - Win-Rate     = 44.4%
-  - Max DD       =  1.3%
-  - Sharpe       =  0.20
+Mechanical long/flat trend following across major spot assets.
+Defaults are configuration, not a forecast or proof of profitable performance.
 """
 from __future__ import annotations
 
@@ -28,7 +24,7 @@ from bot_utils.sim_flag import read_simulation_flag  # noqa: E402
 
 
 class BalancedBot(TrendBot):
-    """The "Trend" bot (validated majors trend-following). Internal key stays
+    """The "Trend" bot (mechanical majors trend-following). Internal key stays
     TREND so DB / state / config / history remain intact; the UI label and the
     strategy differ from the legacy "Balanced" name. SPOT, no leverage."""
     BOT_NAME = "TREND"
@@ -38,8 +34,8 @@ class BalancedBot(TrendBot):
     COOLDOWN_FILE = f"{LOG_DIR}/cooldown.json"
     BUY_PREFIX = "trend"
     BACKTEST_NOTE = (
-        "Trend-following on majors | 720d: +37% (ensemble) vs B&H -0% | "
-        "DD ~38% vs 64% | spot, no leverage"
+        "Mechanical trend-following on majors | spot, no leverage | "
+        "Start in SIM; historical results do not guarantee future returns."
     )
 
     DEFAULTS = {

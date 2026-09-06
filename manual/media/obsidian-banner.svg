@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-labelledby="title desc">
+  <title id="title">Obsidian Trading Terminal</title>
+  <desc id="desc">Five strategies. One desktop. Optional local AI. Violet geometric branding on a dark background.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#10111c"/><stop offset="1" stop-color="#211332"/></linearGradient>
+    <linearGradient id="gem" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#c4b5fd"/><stop offset="1" stop-color="#7c3aed"/></linearGradient>
+  </defs>
+  <rect width="1200" height="300" rx="20" fill="url(#bg)"/>
+  <path d="M900 0L730 300M1060 0L890 300M1200 28L1050 300" stroke="#a78bfa" stroke-opacity=".10" stroke-width="2"/>
+  <path d="M76 148L117 80L167 106L176 163L130 211Z" fill="url(#gem)"/>
+  <path d="M117 80L130 211L167 106M76 148L176 163" fill="none" stroke="#ddd6fe" stroke-opacity=".4" stroke-width="1.5"/>
+  <text x="218" y="104" fill="#c4b5fd" font-family="Segoe UI,Arial,sans-serif" font-size="15" letter-spacing="4">SIMULATION-FIRST · AI-COMPATIBLE</text>
+  <text x="214" y="167" fill="#f5f3ff" font-family="Segoe UI,Arial,sans-serif" font-size="51" font-weight="700" letter-spacing="1">OBSIDIAN</text>
+  <text x="218" y="208" fill="#ddd6fe" font-family="Segoe UI,Arial,sans-serif" font-size="25" letter-spacing="3">TRADING TERMINAL</text>
+  <rect x="866" y="105" width="252" height="94" rx="12" fill="#15121f" stroke="#46315f"/>
+  <text x="885" y="139" fill="#f5f3ff" font-family="Segoe UI,Arial,sans-serif" font-size="15">Five strategies. One desktop.</text>
+  <text x="891" y="172" fill="#b4a8cc" font-family="Segoe UI,Arial,sans-serif" font-size="16">AI when you choose.</text>
+</svg>

@@ -14,11 +14,9 @@ only the two trading loops:
                     price-based hard stop (INITIAL_STOP_LOSS), a liquidation-buffer
                     guard (LIQ_SAFETY_PCT), and the inherited daily killswitch.
 
-Edge basis: the SMA-ensemble trend edge validated in tools/trend_check.py and
-tools/trend_leverage_check.py  beats buy-and-hold and halves drawdown on a
-diversified universe. LEVERAGE AMPLIFIES the (large) trend drawdowns: the tested
-data showed 3 is account-ruinous, 1 is the sane default. Effective leverage may
-be FRACTIONAL  the bot sizes notional = margin  LEVERAGE and sends ceil(LEVERAGE)
+Historical research does not establish future returns or a loss bound.
+Leverage amplifies exposure and losses. Effective leverage may be FRACTIONAL:
+the bot sizes notional = margin * LEVERAGE and sends ceil(LEVERAGE)
 to the exchange as the integer cap. Long-only by design. SIM-first.
 """
 from __future__ import annotations

@@ -1,183 +1,218 @@
+<div align="center">
+
+<img src="manual/media/obsidian-banner.svg" alt="Obsidian Trading Terminal — five strategies, one desktop, optional local AI" width="100%" />
+
 # Obsidian Trading Terminal
 
-Source distribution and developer reference for the Obsidian multi-bot
-cryptocurrency trading terminal.
+### Your strategies. Your accounts. Your control.
 
-> **Risk notice:** This software can place real orders and can lose money.
-> Every futures strategy ships in simulation mode. Verify the exchange,
-> credentials, limits and bot-specific SIM/LIVE setting before enabling live
-> trading. Backtests and research results are not profit guarantees.
+A Windows desktop terminal for automated cryptocurrency spot and perpetuals trading.<br />
+**Five strategies · Simulation-first · AI-compatible · Optional local Ollama integration**
 
-The bot suite runs **five independent strategy bots** as isolated
-subprocesses, driven by a native CustomTkinter launcher. Each bot has its own
-SIM/LIVE flag, risk envelope, log dir and live-editable config.
+[Get started](manual/Getting-Started.md) · [Deutsch](manual/Getting-Started-DE.md) · [Wiki](https://github.com/Chap0815/ObsidianTerminal/wiki) · [Strategy guide](manual/Strategies.md) · [Operating safely](manual/Operating-Safely.md) · [Updates](UPDATE_SETUP.md)
 
-| Bot | Entry module | Class chain | Style |
-|-----|--------------|-------------|-------|
-| **TREND** | `bots/main_bot_balanced.py` | `BalancedBot -> TrendBot -> SpotBot` | Majors trend-following, spot, **no leverage**, LLM-free |
-| **SPOT** | `bots/main_bot_aggressive.py` | `AggressiveBot -> SpotBot` | Momentum breakouts, spot, LLM news veto |
-| **FUTURES** | `bots/main_bot_futures.py` | `FuturesExchangeBot -> FuturesBot` | Leveraged perps, long/short, LLM veto |
-| **CROSS** | `bots/main_bot_cross.py` | `CrossMomentumBot -> CrossBot -> FuturesBot` | Market-neutral cross-sectional momentum, cross-margin |
-| **FUTREND** | `bots/main_bot_trendfut.py` | `TrendFuturesLauncher -> TrendFuturesBot -> FuturesBot` | Per-coin trend-following on perps, long/flat, fractional leverage 1 - 6x, LLM-free |
+[Source releases](https://github.com/Chap0815/ObsidianTerminal/releases) · [Report a bug](https://github.com/Chap0815/ObsidianTerminal/issues) · [Ask the community](https://github.com/Chap0815/ObsidianTerminal/discussions)
 
-> Filenames (`aggressive`/`balanced`) are legacy; the `BOT_NAME` is the source
-> of truth. SPOT and TREND share the `SpotBot` lifecycle; CROSS and FUTREND reuse
-> the `FuturesBot` lifecycle and override only their two trading loops.
+</div>
 
-## Folder layout
+> **Start in simulation.** Live mode can place real orders and cause financial losses.
+> No profits, uninterrupted operation, execution quality or preservation of capital
+> are promised. Local stop-loss and trailing logic require the software and its
+> connections to work; they are not guaranteed exchange-side protection.
+> [Read the operating guide](manual/Operating-Safely.md) before enabling LIVE.
 
-```
-TradingBot/
- launcher.pyw              # Main entry point (UI)  -  or python -m launcher.main
- setup_wizard.pyw          # First-run setup
- reset_bot.py              # Clean-slate reset (keeps .env / bot_config / prompts)
- .env                      # API keys, feature flags (NEVER commit)
- bot_config.json           # Per-bot parameter overrides (TREND/SPOT/FUTURES/CROSS/FUTREND/UI)
- env_parameter.txt         # Full reference of every .env variable
+## One terminal, five distinct approaches
 
- bots/                     # Slim bot entry points  -  python -m bots.main_bot_X
-    main_bot_balanced.py      # -> TREND
-    main_bot_aggressive.py    # -> SPOT
-    main_bot_futures.py       # -> FUTURES
-    main_bot_cross.py         # -> CROSS
-    main_bot_trendfut.py      # -> FUTREND (leveraged trend-following perps)
+Monitor strategy status, positions and PnL; manage parameters; inspect logs; and
+start or stop individual bots from a native desktop interface. Each strategy runs
+in a separate process with its own SIM/LIVE setting.
 
- core/                     # Bot lifecycles + foundational services
-    paths.py                  #  Single source of truth for filesystem paths
-    database.py               # SQLite layer (trades, daily_pnl, claims registry)
-    state_manager.py          # Optional ARCH_V2 SQLite position mirror
-    models.py                 # Position / TradeState dataclasses
-    constants.py              # Global constants + MarketRegime
-    logger.py                 # log_event / log_struct / log_buy / log_sell
-    symbol_locks.py           # Per-symbol mutex with idle GC
-    event_bus.py              # Thread-safe pub/sub
-    spot_bot{,_scan,_exits,_reconcile}.py     # SPOT/TREND engine (mixins)
-    futures_bot{,_scan,_exits,_reconcile}.py  # FUTURES engine (mixins)
-    trend_bot.py              # TREND overlay on top of SpotBot
-    cross_bot.py              # CROSS engine (rebalance + monitor loops)
-    trend_futures_bot.py      # FUTREND engine (trend entries + safety monitor)
+| Strategy | Market | Approach | Direction | Optional AI |
+| :-- | :-- | :-- | :-- | :-- |
+| **TREND** | Spot | Moving-average trend following across major assets | Long / flat | No |
+| **SPOT** | Spot | Momentum candidates with entry and risk filters | Long / flat | Ollama news filter |
+| **FUTURES** | USDT-linear perpetuals | Directional momentum with entry and risk filters | Long / short | Ollama news filter |
+| **CROSS** | USDT-linear perpetuals | Relative-momentum long and short baskets | Long + short | No |
+| **FUTREND** | USDT-linear perpetuals | Per-asset trend following | Long / flat | No |
 
- trading/                  # Strategy + execution logic
-    trend_signal.py           # Pure majors ensemble (unit-tested, no I/O)
-    xsec_signal.py            # Cross-sectional ranking / target book
-    screener.py               # Coin discovery + indicators (lookahead-free, [-2])
-    risk_manager.py           # Kelly sizing, kill-switches, score_trade_quality
-    market_filters.py         # Regime detection, BTC change, Fear & Greed
-    fee_utils.py              # Fee extraction with refetch fallback
-    cooldown_utils.py         # Sell-fail / post-SL cooldowns
-    ws_feed.py                # WebSocket ticker feed (REST pool fallback)
-    simulation.py             # SimulatedExchange wrapper
-    base_bot.py               # Reference architecture (not inherited)
-    symbol_tracker.py         # First-seen tracker (WARN-spam suppression)
+CROSS targets a balanced book; this does **not** guarantee market neutrality or
+protection from losses. Perpetuals introduce funding, margin and liquidation risks.
+Strategy names describe their mechanics, not evidence of profitability.
 
- bot_utils/                # Reusable, side-effect-light helpers
-    indicators.py             # Native RSI/EMA/ATR/MACD (no pandas_ta dependency)
-    futures_math.py           # Liquidation, PnL, trailing-stop math (pure)
-    fee_math.py               # Corruption-safe proportional fee/funding
-    futures_order.py          # create_order_with_retry, verify_position_closed
-    futures_exits.py          # Emergency-close-all (futures)
-    futures_funding.py        # Realized/estimated funding + OI
-    spot_exits.py             # spot_market_sell_safe, emergency-close-all (spot)
-    order_utils.py            # extract_fill_price / order_was_filled / safe_remaining
-    trade_state.py            #  TradeState  -  live position store + claims registry
-    api_budget.py             # Cross-process API budget (atomic SQLite gate)
-    network_retry.py          # with_network_retry backoff wrapper
-    ticker_cache.py           # Bounded, TTL'd price cache
-    ... (balance, equity_utils, circuit_breaker, state_persist, sim_flag, ...)
+All five shipped configurations use **simulation**. The optional AI filter is
+disabled by default. Venue recording and L2 research capture are also disabled by
+default; ordinary users do not need to collect research data to run the terminal.
 
- news/                     # News fetching + local-LLM sentiment
-    news_brain_spot.py        # SPOT bot LLM adapter
-    news_brain_futures.py     # FUTURES bot LLM adapter (LONG/SHORT/WAIT veto)
-    news_brain_core.py        # Shared LLM infrastructure
-    news_sources.py           # RSS + CryptoPanic + trending fetcher
-    llm_utils.py              # Ollama wrappers + keyword fallback
-    prompts_defaults.py       # Default prompt templates
+[Explore how the strategies differ →](manual/Strategies.md)
 
- config/                   # exchange_config.py - telegram_config.py
- launcher/                 # CustomTkinter UI (config - core - state - ui)
+## What you can do
 
- tools/                    # Standalone, lookahead-free research utilities
-    trend_check.py - trend_futures_check.py   # validate the trend edge
-    trend_leverage_check.py                   # trend frequency/edge/leverage curve
-    xsec_momentum.py                          # cross-sectional momentum study
-    optimizer.py - backtester.py              # K-Fold opt + multi-day backtest
-    pairs_check.py - funding_check.py         # honest viability checks
-    signal_edge.py - analyze_strategies.py    # edge diagnostics
-    dashboard.py                              # Streamlit dashboard
-    check_connection.py                       # API smoke-test
-    test_indicator_fidelity.py                # indicator regression guard
+<table>
+<tr>
+<td width="50%" valign="top">
 
- data/                     # Runtime data (auto-created): trading_bot.db, *.json
- logs/                     # Per-bot logs (auto-created): Trend/ Spot/ Futures/ Cross/ FuTrend/
- prompts/                  # User-editable LLM prompts (auto-created)
-```
+### Operate from one desktop
 
-## Running
+- Start, stop and restart individual strategies.
+- Inspect positions, realized/unrealized PnL and health information.
+- Change supported parameters and optional AI prompts.
+- Open logs and the local dashboard.
 
-**Launcher (UI):**
-```
-python launcher.pyw            # or: python -m launcher.main  /  double-click on Windows
-```
+</td>
+<td width="50%" valign="top">
 
-**A bot directly (no UI):**
-```
-python -m bots.main_bot_balanced     # TREND
-python -m bots.main_bot_aggressive   # SPOT
-python -m bots.main_bot_futures      # FUTURES
-python -m bots.main_bot_cross        # CROSS
-python -m bots.main_bot_trendfut     # FUTREND
-```
+### Evaluate before going live
 
-**Research / tools:**
-```
-python -m tools.check_connection
-python tools/trend_check.py 720 --sweep
-python tools/xsec_momentum.py
-python -m tools.optimizer FUTURES 90
-python tools/test_indicator_fidelity.py
-```
+- Begin with simulated execution.
+- Explore backtests and parameter optimization.
+- Inspect strategy and research output.
+- Keep research collection an explicit opt-in.
 
-**Reset to a clean slate** (keeps `.env`, `bot_config.json`, `prompts/`, code):
-```
-python reset_bot.py --dry-run        # preview
-python reset_bot.py --yes            # do it (DB is backed up first)
-```
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
 
-## Multi-bot coexistence
+### Keep AI optional
 
-All five bots can run **simultaneously on one exchange account**. To stop two
-bots from opening the same coin (which would net into one position on a
-perp account), each open position is registered in a shared **claims
-registry** (`bot_open_positions`), and every bot checks
-`is_claimed_by_other()` before entering. The registry is maintained from a
-single choke-point  -  `bot_utils/trade_state.TradeState.add/remove`  -  so every
-lifecycle path (open, provisional, close, emergency, reconcile) keeps it in
-sync, and a startup resync makes the registry match each bot's loaded state.
-Claims are **exclusive per base coin across all bots**.
+- Use deterministic strategy logic without an LLM.
+- Optionally connect SPOT/FUTURES to local Ollama.
+- Use AI as a news-based entry filter, not a profit oracle.
+- No hosted AI subscription is required for this integration.
 
-## Imports
+</td>
+<td width="50%" valign="top">
 
-All imports use full package paths from the project root:
+### Manage your own installation
 
-```python
-from core.database import init_db
-from trading.risk_manager import score_trade_quality
-from bot_utils.trade_state import TradeState
-from core.logger import log_event
-```
+- Store credentials and runtime state locally.
+- Use a supported exchange adapter.
+- Obtain public source updates over verified HTTPS.
+- Preserve private configuration across supported updates.
 
-The launcher starts bots via `python -m bots.main_bot_X`, which puts the
-project root (not `bots/`) on `sys.path`. **Do not** run a bot as
-`python bots/main_bot_X.py`  -  that breaks `from core.X import ...`.
+</td>
+</tr>
+</table>
 
-## Filesystem paths
+Backtests and simulated fills are models, not predictions. An optimizer can
+overfit. A green health indicator describes technical readiness, not strategy
+quality. See [Research & AI](manual/Research-and-AI.md).
 
-`core.paths` is the single source of truth. Add new persistent files there
-rather than hard-coding paths:
+## Get started on Windows
 
-```python
-from core.paths import (
-    PROJECT_ROOT, DB_PATH, LOG_DIR_TREND, LOG_DIR_CROSS,
-    BOT_CONFIG, ENV_FILE,
-)
-```
+The reference environment is **Windows x64 with Python 3.12**. Python 3.12 is
+recommended for the supplied dependency lock. Other platforms are not presented
+as verified installation targets. A GPU is not needed for trading without AI;
+optional local models have their own hardware requirements.
+
+1. Download the [current source ZIP](https://github.com/Chap0815/ObsidianTerminal/archive/refs/heads/main.zip)
+   and extract it into a dedicated folder. Do not run it inside the ZIP.
+   Alternatively, clone the repository:
+
+   ```powershell
+   git clone https://github.com/Chap0815/ObsidianTerminal.git
+   cd ObsidianTerminal
+   ```
+
+2. Run `install.bat` and read its prompts. The installer creates a local Python
+   environment and installs dependencies. Ollama is optional; when available,
+   the installer can download the configured model.
+
+3. Run `start_launcher.bat`; on first launch it opens the setup wizard when
+   `.env` is absent. Complete the wizard. Keep every strategy in **SIM**, review your exchange
+   settings and use API permissions appropriate to your account.
+   **Do not grant withdrawal permissions.**
+
+4. In the launcher, start one strategy in simulation, inspect its logs
+   and status, and learn the stop/restart behavior before considering LIVE.
+
+The main branch changes over time. Review [release notes](RELEASE.md) and
+[update instructions](UPDATE_SETUP.md), especially when migrating from an older
+private/SSH-only installation. Source availability does not imply a signed
+Windows installer is available.
+
+[Complete installation walkthrough →](manual/Getting-Started.md)
+
+## Exchange connectivity
+
+The setup wizard offers **Bitget, Binance, OKX, Bybit, KuCoin, Gate.io and MEXC**.
+Perpetual strategies expect USDT-linear products. Kraken and Coinbase are not
+supported by this application.
+
+An adapter being present does not mean every exchange, region, account mode or
+order type has been certified in LIVE operation. Availability, API access,
+permissions, position mode, market minimums and fees must be checked with your
+exchange. Simulation may still make network requests and account probes.
+
+[Configuration and account setup →](manual/Configuration.md)
+
+## AI-compatible, not AI-dependent
+
+The optional integration uses **Ollama** for local model inference in SPOT and
+FUTURES. TREND, CROSS and FUTREND are mechanical strategies. Disabling the AI filter
+does not disable the terminal.
+
+“Local AI” does not mean “no network traffic”: the application contacts exchanges
+and market-data services, optionally news/notification services, and update or
+dependency sources. Do not publish credentials, raw logs or account data. The
+dashboard defaults to localhost and is not intended as a public trading server.
+
+[AI, network access and research boundaries →](manual/Research-and-AI.md)
+
+## Understand the safety boundaries
+
+- **Stop is not necessarily close.** “Stop without closing” can leave exchange
+  positions open without further bot monitoring. Restart also preserves positions.
+- **Local exits need a functioning runtime.** Outages, gaps, failed orders,
+  unavailable liquidity and resource exhaustion can prevent timely action.
+- **Shared-account coordination has limits.** The application tracks ownership to
+  reduce conflicting bot entries; manual trades and unrelated software remain
+  external activity that needs operator care.
+- **Unknown is not zero.** A DB error or incomplete process scan must be investigated,
+  not cleared by deleting state or disabling checks.
+- **LIVE is your decision.** Review exposure, permissions and account state directly
+  at the exchange. No configuration is offered as a guaranteed profitable setup.
+
+[Safe operation and shutdown →](manual/Operating-Safely.md)
+
+## Documentation & community
+
+| Need | Start here |
+| :-- | :-- |
+| Install and first launch | [Getting started](manual/Getting-Started.md) · [Deutsch](manual/Getting-Started-DE.md) |
+| Choose and understand a strategy | [Strategies](manual/Strategies.md) |
+| Configure exchange, SIM/LIVE and local settings | [Configuration](manual/Configuration.md) |
+| Stop, restart and handle open positions | [Operating safely](manual/Operating-Safely.md) |
+| Update an existing installation | [Update guide](UPDATE_SETUP.md) |
+| Investigate errors and degraded health | [Troubleshooting](manual/Troubleshooting.md) |
+| Understand AI, backtests and research | [Research & AI](manual/Research-and-AI.md) |
+| Understand the code structure | [Architecture](manual/Architecture.md) |
+| Ask a usage question | [Discussions](https://github.com/Chap0815/ObsidianTerminal/discussions) |
+| Report a reproducible bug | [Issues](https://github.com/Chap0815/ObsidianTerminal/issues) |
+| Report a vulnerability | [Security policy](SECURITY.md) |
+| Contribute or request help | [Contributing](CONTRIBUTING.md) · [Support](SUPPORT.md) |
+
+## License & responsibility
+
+**Source-available for noncommercial purposes**, under the
+[project license](LICENSE), with an additional permission for natural persons to
+simulate and trade solely for their own personal account using their own funds.
+Seeking personal trading gains does not by itself disqualify that permitted use.
+
+This is **not an OSI open-source license**. Commercial uses outside the license
+require separate permission. Third-party dependencies retain their own licenses.
+Read the [licensing guide](manual/Licensing.md) for the distinction between
+personal use, commercial services and the underlying license.
+
+This software is not investment advice. No outcome is promised. Warranty and
+liability exclusions apply only to the extent permitted by applicable law;
+mandatory legal rights are not waived.
+
+---
+
+<div align="center">
+
+**Obsidian Trading Terminal**<br />
+Five strategies. Simulation first. AI when you choose.
+
+</div>

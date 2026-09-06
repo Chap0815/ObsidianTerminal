@@ -1,19 +1,25 @@
 ================================================================================
-  TRADINGBOT  -  .env PARAMETER REFERENCE
+  OBSIDIAN TRADING TERMINAL - ADVANCED .env REFERENCE
 ================================================================================
 
-This file documents EVERY environment variable the bot reads from the `.env`
-file in the project root. Each entry lists the DEFAULT used when the variable
-is absent, the accepted values, and what it does.
+This is a selected reference for advanced environment settings, not a complete
+configuration schema. Some entries describe legacy or opt-in paths. Current
+code and validated per-bot configuration determine the effective behavior.
+Start with manual/Configuration.md and the setup wizard.
+
+All five public strategy defaults are SIMULATION=true. SPOT and FUTURES have
+USE_LLM=false in their per-bot configuration. The advanced LLM flags below do
+not mean AI is required or enabled by default. Ollama integration is optional.
+Never commit .env or its variants, credentials, private settings or logs.
 
 HOW TO USE
    Put one `KEY=VALUE` per line in `.env` (no spaces around `=`, no quotes
     needed). Lines starting with `#` are comments.
-   Booleans accept: 1/0, true/false, yes/no, on/off (case-insensitive).
+   Accepted boolean forms depend on the setting; use its documented form.
    Changes take effect on the NEXT START of the affected process. The bot
     reads most values once at startup  -  restart the bot/launcher after editing.
-   Anything you DON'T set simply uses the default below  -  a minimal `.env`
-    only needs the exchange credentials.
+   Avoid copying every advanced setting into .env. Local overrides can change
+    behavior and take precedence over other settings; inspect them deliberately.
 
 ================================================================================
   1. EXCHANGE & API CREDENTIALS
@@ -86,7 +92,7 @@ STRIP_THINKING_MAX_LEN   default: 600
     Max characters of model "thinking" text stripped/trimmed before parsing.
 
 ================================================================================
-  6. FUTURES ENTRY SIGNAL  (the 2026-06-13 rework  -  all default ON, lenient)
+  6. FUTURES ENTRY SIGNAL (advanced controls; AI integration remains optional)
 ================================================================================
 These tune HOW the futures bot picks and confirms entries. Defaults are
 deliberately lenient so they refine quality WITHOUT choking trade frequency.

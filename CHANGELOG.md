@@ -2,13 +2,20 @@
 
 ## 2026-09-06
 
+- Reworked public documentation around Obsidian Trading Terminal, optional local
+  AI, simulation-first operation, explicit trading risks and noncommercial
+  licensing with personal own-account trading permission.
+- Added credential-free public HTTPS updates without disabling TLS verification.
+  Legacy SSH-only clients require the documented migration.
+- Excluded private environment/configuration variants consistently across
+  publication manifests and update validation; preserved those files locally.
 - Hardened completed futures partial-exit recovery so a legacy WAL tail is
   repaired without submitting a second order, while generation checks prevent
   stale cleanup from erasing a newer intent.
 - Hardened launcher shutdown and bounded runtime finalization so bot-process
   scans and open ticker resources cannot strand the launcher during exit.
 - Made venue/L2 capture explicitly research-only. Official user defaults now
-  disable both components; a research installation such as `.118` can retain
+  disable both components; a dedicated research installation can retain
   them through its local update-preserved configuration.
 - Added public-release hygiene: tracked credential/runtime exclusions and an
   explicit live-trading risk notice.

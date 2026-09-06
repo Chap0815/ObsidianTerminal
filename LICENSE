@@ -1,0 +1,53 @@
+Obsidian Trading Terminal - licensing terms
+
+Required Notice: Copyright (c) 2026 Chap0815
+
+The project code and documentation that Chap0815 has the right to license are
+made available under the PolyForm Noncommercial License 1.0.0, reproduced
+without modification in LICENSES/PolyForm-Noncommercial-1.0.0.md, together with
+the additional permission below. The base license is part of these terms:
+https://polyformproject.org/licenses/noncommercial/1.0.0
+
+Additional permission for personal trading
+
+In addition to the permissions granted by the base license, Chap0815 grants
+you permission, if you are a natural person acting solely in a personal
+capacity, to use and modify this material for simulated trading and live
+trading solely for your own account with funds beneficially owned by you.
+Seeking or receiving personal trading gains does not, by itself, disqualify
+this use.
+
+This additional permission does not cover use for or on behalf of a business
+or other legal entity, professional trading services, third-party accounts
+or funds, commercial sale or licensing of the software, or commercial hosted
+services. Except for this additional permitted purpose, the terms of the
+base license continue to apply. This permission does not restrict any
+permission independently granted by the base license or applicable law.
+
+When sharing material under this additional permission, include this file
+and the base license so recipients can identify the terms and permission.
+The base license's notice requirements continue to apply independently.
+
+Scope and third-party material
+
+These terms grant only rights that Chap0815 has the authority to grant.
+Third-party libraries, runtime components, model weights, exchange services,
+and separately licensed material remain subject to their own terms. No
+transfer of another contributor's rights is asserted. A contributor may
+offer their contribution under these same terms without transferring their
+copyright. Separately identified licensing terms continue to govern the
+material to which they apply.
+
+Risk, warranty, and liability
+
+Live trading can cause financial loss, including loss of the capital placed
+at risk. Simulation does not establish future live performance. No profit,
+capital preservation, availability, execution quality, or suitability for a
+particular trading purpose is promised. No investment advice, account
+management, or obligation to monitor users' trading is offered by publishing
+this software.
+
+The base license's No Liability provision applies to the additional
+permission as well. Nothing in these terms excludes or limits any warranty,
+liability, or statutory right that applicable law does not allow to be
+excluded or limited.

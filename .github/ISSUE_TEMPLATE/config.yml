@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Usage questions
+    url: https://github.com/Chap0815/ObsidianTerminal/discussions
+    about: Ask about setup, strategy mechanics or documentation.
+  - name: Security reporting
+    url: https://github.com/Chap0815/ObsidianTerminal/blob/main/SECURITY.md
+    about: Read the private reporting policy. Do not post secrets publicly.

@@ -9,12 +9,9 @@ ticker cache + API budget guard). This file only specifies:
   - Which news_brain module to use
   - Which exchange to connect to (futures-mode)
 
-Strategy parameters from the optimizer's validated futures run:
-  - ACTIVATION_PROFIT 4.5%   (partial-TP fires earlier than spot)
-  - INITIAL_STOP_LOSS -3.5%  (tighter than spot  -  leverage amplifies)
-  - LEVERAGE 3x              (max recommended on USDT-M perpetuals)
-  - LIQ_SAFETY_PCT 25%       (close when 75% of liq buffer is consumed)
-  - MAX_DAILY_LOSS -10 USDT  (daily kill-switch -> SAFE_MODE)
+Directional USDT-linear perpetuals with an optional local AI entry filter.
+See DEFAULTS for current parameters. Funding, margin, execution failures and
+liquidation can cause losses; local safeguards do not guarantee a loss limit.
 """
 from __future__ import annotations
 
@@ -45,8 +42,8 @@ class FuturesExchangeBot(FuturesBot):
     BUY_PREFIX = "fut"
     USES_AGED_MFE_FALLBACK = True
     BACKTEST_NOTE = (
-        "Futures: LONG/SHORT at 3x leverage. "
-        "Strict daily-loss killswitch + safe-mode on slippage anomalies."
+        "Futures: LONG/SHORT with configurable leverage. "
+        "Start in SIM; local safeguards cannot guarantee a loss limit."
     )
 
     DEFAULTS = {

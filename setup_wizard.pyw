@@ -179,43 +179,43 @@ EXCHANGES = {
     "bitget": {
         "label":       "Bitget",
         "passphrase":  True,
-        "tested_with": "This strategy was optimized against Bitget data",
+        "tested_with": "Adapter available; verify account permissions and behavior in SIM",
         "color":       COLORS["balanced"],
     },
     "binance": {
         "label":       "Binance",
         "passphrase":  False,
-        "tested_with": "Strategy works, run optimizer for best parameters",
+        "tested_with": "Adapter available; verify account permissions and behavior in SIM",
         "color":       "#f0b90b",
     },
     "okx": {
         "label":       "OKX",
         "passphrase":  True,
-        "tested_with": "Strategy works, run optimizer for best parameters",
+        "tested_with": "Adapter available; verify account permissions and behavior in SIM",
         "color":       COLORS["purple"],
     },
     "bybit": {
         "label":       "Bybit",
         "passphrase":  False,
-        "tested_with": "Strategy works, run optimizer for best parameters",
+        "tested_with": "Adapter available; verify account permissions and behavior in SIM",
         "color":       COLORS["warning"],
     },
     "kucoin": {
         "label":       "KuCoin",
         "passphrase":  True,
-        "tested_with": "Strategy works, run optimizer for best parameters",
+        "tested_with": "Adapter available; verify account permissions and behavior in SIM",
         "color":       COLORS["success"],
     },
     "gateio": {
         "label":       "Gate.io",
         "passphrase":  False,
-        "tested_with": "Strategy works, run optimizer for best parameters",
+        "tested_with": "Adapter available; verify account permissions and behavior in SIM",
         "color":       COLORS["aggressive"],
     },
     "mexc": {
         "label":       "MEXC",
         "passphrase":  False,
-        "tested_with": "Strategy works, run optimizer for best parameters",
+        "tested_with": "Adapter available; verify account permissions and behavior in SIM",
         "color":       "#0EA5E9",
     },
 }
@@ -428,7 +428,7 @@ class SetupWizard(ctk.CTk):
 
         self.exchange_info_lbl = ctk.CTkLabel(
             info_box,
-            text="i  This strategy was optimized against Bitget data",
+            text="i  Verify your exchange access in simulation; LIVE compatibility is account-dependent.",
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
             text_color=COLORS["text_dim"], anchor="w", justify="left",
             wraplength=640

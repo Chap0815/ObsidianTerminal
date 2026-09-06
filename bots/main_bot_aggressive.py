@@ -1,15 +1,8 @@
 """
 bots/main_bot_aggressive.py  -  SPOT spot trading bot (slim subclass).
 
-Strategy parameters from optimizer-validated 60-day run:
-  - avg_net 60d = +1.90 USDT (+2.05% ROI)
-  - Win-Rate    = 44.8%
-  - Max DD      =  1.6%
-  - Sharpe      =  0.077
-
- SPOT has profitable trades across all 4 folds but with high
-   variance (Konsistenz ~0). Live performance can diverge from backtest  - 
-   only run in SIMULATION until >=20 real trades stabilize behavior.
+Spot momentum with configurable entry filters and an optional local AI filter.
+Start in simulation; neither defaults nor backtests establish future returns.
 """
 from __future__ import annotations
 
@@ -40,8 +33,8 @@ class AggressiveBot(SpotBot):
     NEWS_MODULE_PATH = "news.news_brain_spot"
     BUY_PREFIX = "agg"
     BACKTEST_NOTE = (
-        "Backtest expectation: ~+2% ROI in 60 days | "
-        "Max DD ~1.6% | WR ~45% (HIGH variance  -  verify in SIMULATION)"
+        "Spot momentum | optional local AI filter | "
+        "Start in SIM; no return or drawdown outcome is guaranteed."
     )
 
     DEFAULTS = {

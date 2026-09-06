@@ -7,9 +7,8 @@ with a hard price stop + liquidation guard + daily killswitch. Effective leverag
 is configurable 1 - 6x (fractional allowed). All logic in core/trend_futures_bot.py
 + trading/trend_signal.py.
 
-Edge basis: the SMA-trend edge validated in tools/trend_check.py /
-trend_leverage_check.py (beats buy-and-hold, halves drawdown). Leverage amplifies
-the large trend drawdowns  -  keep it LOW. SIM-first.
+Research tools can evaluate historical trend behavior but do not establish
+future returns. Leverage amplifies exposure and losses. SIM-first.
 
 Start:  python -m bots.main_bot_trendfut
 """
@@ -43,8 +42,8 @@ class TrendFuturesLauncher(TrendFuturesBot):
     BUY_PREFIX = "ftr"
     BACKTEST_NOTE = (
         "Leveraged trend-following futures: long the SMA-ensemble uptrend, exit on "
-        "trend-off. Validated edge (trend_check/trend_leverage_check). Leverage "
-        "amplifies drawdowns  -  keep <=2x. SIM first."
+        "trend-off. Leverage amplifies losses; no future return is guaranteed. "
+        "SIM first."
     )
 
     DEFAULTS = {

@@ -92,6 +92,26 @@ EXCLUDED_REL_PATHS = {
 RUNTIME_REFERENCE_ROOTS = frozenset(
     {"bot_utils", "bots", "core", "launcher", "trading"}
 )
+PROTECTED_LOCAL_CONFIG_SUFFIXES = (
+    ".local.json", ".user.json", ".local.toml", ".user.toml",
+    ".local.yaml", ".user.yaml", ".local.yml", ".user.yml",
+)
+
+
+def _is_private_local_config_rel(rel: str) -> bool:
+    """One publication/preservation rule for local environment and settings files."""
+    rel_key = str(rel or "").replace("\\", "/").lower()
+    name = rel_key.rsplit("/", 1)[-1]
+    return name == ".env" or name.startswith(".env.") or (
+        rel_key.startswith("config/")
+        and name.endswith(PROTECTED_LOCAL_CONFIG_SUFFIXES)
+    )
+
+
+def _is_rotated_log_rel(rel: str) -> bool:
+    """Recognize rotated runtime logs and their locks regardless of final suffix."""
+    name = str(rel or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return ".log." in name or ".jsonl." in name
 
 
 def _is_linklike(path: Path) -> bool:
@@ -317,12 +337,14 @@ def _skip(path: Path, root: Path) -> bool:
         return True
     return (
         rel_posix_lower in excluded_rel_lower
+        or _is_private_local_config_rel(rel_posix)
+        or _is_rotated_log_rel(rel_posix)
         or any(part.lower() in excluded_dirs_lower for part in rel.parts)
         or any(_is_test_temp_name(part) for part in rel.parts)
         or path.name.lower().endswith(".bak")
         or ".bak_" in path.name.lower()
         or path.name.lower().endswith((".tmp", ".old", "~"))
-        or path.name.lower() in excluded_names_lower
+        or (path.name.lower() in excluded_names_lower and rel_posix != ".gitignore")
         or _secret_name(path)
         or path.suffix.lower() in EXCLUDED_SUFFIXES
     )

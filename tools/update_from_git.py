@@ -1,9 +1,9 @@
-"""Private Git updater for installed Obsidian releases.
+"""Git updater for installed Obsidian releases.
 
-The updater never contains credentials. Users configure a private repository in
+The updater never contains credentials. Users configure the official repository in
 ``config/update_config.json`` or via environment variables:
 
-  OBSIDIAN_UPDATE_REPO_URL=ssh://git@ssh.github.com:443/owner/private-repo.git
+  OBSIDIAN_UPDATE_REPO_URL=https://github.com/Chap0815/ObsidianTerminal.git
   OBSIDIAN_UPDATE_BRANCH=main
 
 It refuses to update while bot processes are still alive and preserves local
@@ -41,9 +41,19 @@ from bot_utils.subprocess_capture import run_bounded_capture  # noqa: E402
 try:
     from tools.ensure_git import find_git
     from tools.release_requirements import REQUIRED_RELEASE_ITEMS, UPDATE_SMOKE_FILES
+    from tools.update_deploy_manifest import (
+        PROTECTED_LOCAL_CONFIG_SUFFIXES as PROTECTED_LOCAL_CONFIG_SUFFIXES,
+        _is_private_local_config_rel,
+        _is_rotated_log_rel,
+    )
 except ModuleNotFoundError:
     from ensure_git import find_git
     from release_requirements import REQUIRED_RELEASE_ITEMS, UPDATE_SMOKE_FILES
+    from update_deploy_manifest import (
+        PROTECTED_LOCAL_CONFIG_SUFFIXES as PROTECTED_LOCAL_CONFIG_SUFFIXES,
+        _is_private_local_config_rel,
+        _is_rotated_log_rel,
+    )
 
 from update_barrier import (  # noqa: E402 - root bootstrap above
     update_lifecycle_lock,
@@ -76,16 +86,6 @@ PROTECTED_FILES = [
 PROTECTED_FILE_SET = {Path(rel).as_posix() for rel in PROTECTED_FILES}
 PROTECTED_DIRS = {"data", "logs", "backups", ".venv", "python", "prompts"}
 PROTECTED_DIR_SET_LOWER = {name.lower() for name in PROTECTED_DIRS}
-PROTECTED_LOCAL_CONFIG_SUFFIXES = (
-    ".local.json",
-    ".user.json",
-    ".local.toml",
-    ".user.toml",
-    ".local.yaml",
-    ".user.yaml",
-    ".local.yml",
-    ".user.yml",
-)
 _CIM_SCAN_TIMEOUT_SEC = 8
 _CIM_SCAN_MAX_OUTPUT_BYTES = 256 * 1024
 _CIM_SCAN_ATTEMPTS = 2
@@ -633,22 +633,17 @@ def _load_update_config() -> tuple[str, str]:
             repo = (r.stdout or "").strip()
     if not repo:
         raise RuntimeError(
-            "Kein privates Update-Repo konfiguriert. Lege config/update_config.json "
+            "Kein Update-Repo konfiguriert. Lege config/update_config.json "
             "aus config/update_config.example.json an oder setze OBSIDIAN_UPDATE_REPO_URL."
         )
     if not _is_allowed_repo_url(repo):
         raise RuntimeError(
-            "Update-Repo nicht erlaubt. Erwartet wird das private ObsidianTerminal-Repo "
-            "ueber einen read-only Deploy Key."
+            "Update-Repo nicht erlaubt. Erwartet wird das offizielle ObsidianTerminal-Repo "
+            "ueber HTTPS oder SSH."
         )
     if repo.startswith("http://"):
         raise RuntimeError(
             "Unsichere Update-URL. Kein HTTP verwenden. "
-            "Nutze SSH Deploy Key, z.B. ssh://git@ssh.github.com:443/Chap0815/ObsidianTerminal.git."
-        )
-    if repo.startswith("https://"):
-        raise RuntimeError(
-            "HTTPS-Update-URLs sind fuer Releases deaktiviert. "
             "Nutze SSH Deploy Key, z.B. ssh://git@ssh.github.com:443/Chap0815/ObsidianTerminal.git."
         )
     if not _is_valid_branch_name(branch):
@@ -718,16 +713,18 @@ def _is_allowed_repo_url(repo: str) -> bool:
     text = repo.strip()
     if text in {
         "git@github.com:Chap0815/ObsidianTerminal.git",
+        "https://github.com/Chap0815/ObsidianTerminal.git",
     }:
         return True
     if text.startswith("ssh://"):
-        parsed = urlparse(text)
-        if parsed.password:
+        try:
+            parsed = urlparse(text)
+            host = (parsed.hostname or "").lower()
+            port = parsed.port
+        except ValueError:
             return False
-        if parsed.username != "git":
+        if parsed.password or parsed.username != "git" or parsed.query or parsed.fragment:
             return False
-        host = (parsed.hostname or "").lower()
-        port = parsed.port
         path = parsed.path.strip("/")
         if host == "ssh.github.com" and port == 443 and path == "Chap0815/ObsidianTerminal.git":
             return True
@@ -2905,21 +2902,18 @@ def _rel_posix(path: Path) -> str:
 
 
 def _is_protected_local_config_rel(rel: str) -> bool:
-    rel_key = str(rel or "").replace("\\", "/").lower()
-    name = rel_key.rsplit("/", 1)[-1]
-    if name in {".env.local", ".env.user"}:
-        return True
-    return (
-        rel_key.startswith("config/")
-        and name.endswith(PROTECTED_LOCAL_CONFIG_SUFFIXES)
-    )
+    return _is_private_local_config_rel(rel)
 
 
 def _is_protected_file(path: Path) -> bool:
     rel = _rel_posix(path)
     rel_key = rel.lower()
     protected_keys = {item.lower() for item in PROTECTED_FILE_SET}
-    return rel_key in protected_keys or _is_protected_local_config_rel(rel)
+    return (
+        rel_key in protected_keys
+        or _is_protected_local_config_rel(rel)
+        or _is_rotated_log_rel(rel)
+    )
 
 
 def _dir_contains_protected_file(path: Path) -> bool:
@@ -3002,9 +2996,17 @@ def _is_forbidden_update_file(rel: str) -> bool:
         return True
     rel_key = rel_posix.lower()
     protected_keys = {path.lower() for path in PROTECTED_FILE_SET}
-    if rel_key in protected_keys:
+    if (
+        rel_key in protected_keys
+        or _is_protected_local_config_rel(rel_posix)
+        or _is_rotated_log_rel(rel_posix)
+    ):
         return True
     if rel_key == "deploy_manifest.json":
+        return False
+    # Public source metadata is shipped and hash-verified like other payload.
+    # Keep nested or differently cased ignore files on the forbidden path.
+    if rel_posix == ".gitignore":
         return False
     forbidden_prefixes = tuple(prefix.lower() for prefix in UPDATE_FORBIDDEN_PREFIXES)
     if any(rel_key.startswith(prefix) for prefix in forbidden_prefixes):
@@ -3084,7 +3086,11 @@ def _copy_tracked_tree(src_repo: Path) -> None:
     allowed_paths = _release_manifest_paths(src_repo)
     for rel in sorted(allowed_paths):
         rel_posix = Path(rel).as_posix()
-        if rel_posix in PROTECTED_FILE_SET:
+        if (
+            rel_posix in PROTECTED_FILE_SET
+            or _is_protected_local_config_rel(rel_posix)
+            or _is_rotated_log_rel(rel_posix)
+        ):
             continue
         src = src_repo / rel
         dst = ROOT / rel
@@ -3743,7 +3749,7 @@ def _bootstrap_from_private_repo(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Update Obsidian from a private Git repo.")
+    parser = argparse.ArgumentParser(description="Update Obsidian from the official Git repository.")
     parser.add_argument(
         "--force",
         action="store_true",

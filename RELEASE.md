@@ -1,5 +1,22 @@
 # Release Notes
 
+## 2026-09-06 - Public documentation and HTTPS distribution
+
+The public presentation now describes the five strategies, optional local AI,
+simulation-first setup, safe operation and known limitations. The project is
+source-available under the published noncommercial license, with a separate
+permission for personal own-account trading. No profitability is promised.
+
+Current updaters accept the exact official public HTTPS repository without
+GitHub credentials. TLS verification remains required. Private environment and
+local-configuration variants are excluded from release payloads and rejected
+by update validation, with an additional local overwrite guard.
+
+Older private/SSH-only updaters cannot consume every new public payload. Read
+[the migration instructions](UPDATE_SETUP.md) before changing an existing
+installation. This release does not reset state, enable research capture or
+change strategy parameters.
+
 ## 2026-09-06 - Public release hardening
 
 The official user configuration no longer starts venue or L2 research capture

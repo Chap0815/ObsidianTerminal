@@ -1,6 +1,6 @@
 @echo off
 REM ================================================================
-REM   OBSIDIAN TRADING TERMINAL - Update aus privatem Git
+REM   OBSIDIAN TRADING TERMINAL - Update aus dem offiziellen Git-Repository
 REM ================================================================
 setlocal enableextensions
 set PYTHONPATH=

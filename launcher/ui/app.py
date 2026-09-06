@@ -1179,7 +1179,7 @@ class ObsidianApp(ctk.CTk):
         attach_tooltip(
             bt_btn,
             "Run a historical backtest with current parameters.\n"
-            "Useful after editing the AI prompt.",
+            "Historical simulation is not proof of future returns or AI prompt quality.",
             delay_ms=400
         )
 

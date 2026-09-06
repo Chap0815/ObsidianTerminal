@@ -1,0 +1,31 @@
+name: Public payload integrity
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publication:
+    name: Manifest, source and private-file boundary
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Preserve manifest bytes on the Windows runner
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - name: Check out the public payload
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Validate publication integrity
+        run: python -B -m tools.release_check --source .
+
+# This is the public package/release gate, not the full maintainer regression
+# suite, an exchange-connectivity test, or evidence of trading profitability.

@@ -27,6 +27,8 @@ from tools.release_requirements import (  # noqa: E402, I001
     REQUIRED_RELEASE_ITEMS,
 )
 from tools.update_deploy_manifest import (  # noqa: E402
+    _is_private_local_config_rel,
+    _is_rotated_log_rel,
     _is_test_temp_name,
     _sync_directory as _sync_policy_directory,
     build_manifest,
@@ -639,8 +641,10 @@ def _is_forbidden_release_artifact(path: Path, root: Path) -> str | None:
         return f"forbidden non-release tool in release: {rel}"
     if parts_lower & forbidden_dirs_lower or any(_is_test_temp_name(part) for part in rel.parts):
         return f"forbidden file under runtime/test directory: {rel}"
-    if rel_posix_lower in forbidden_rel_lower:
+    if rel_posix_lower in forbidden_rel_lower or _is_private_local_config_rel(rel_posix):
         return f"forbidden user/update config in release: {rel}"
+    if _is_rotated_log_rel(rel_posix):
+        return f"forbidden rotated runtime log in release: {rel}"
     if (
         path.name.lower() in forbidden_names_lower
         and not allowed_root_metadata
