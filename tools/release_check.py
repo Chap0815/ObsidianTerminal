@@ -93,7 +93,7 @@ FORBIDDEN_NAMES = {
     "structured.jsonl",
     "structured.jsonl.rotation.lock",
 }
-ALLOWED_ROOT_METADATA_NAMES = {".gitignore"}
+ALLOWED_ROOT_METADATA_NAMES: set[str] = set()
 FORBIDDEN_REL_PATHS = {
     "bot_config.json",
     "bot_config.json.lock",

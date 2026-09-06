@@ -3004,10 +3004,6 @@ def _is_forbidden_update_file(rel: str) -> bool:
         return True
     if rel_key == "deploy_manifest.json":
         return False
-    # Public source metadata is shipped and hash-verified like other payload.
-    # Keep nested or differently cased ignore files on the forbidden path.
-    if rel_posix == ".gitignore":
-        return False
     forbidden_prefixes = tuple(prefix.lower() for prefix in UPDATE_FORBIDDEN_PREFIXES)
     if any(rel_key.startswith(prefix) for prefix in forbidden_prefixes):
         return True
