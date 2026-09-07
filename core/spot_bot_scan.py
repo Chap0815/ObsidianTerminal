@@ -2554,10 +2554,26 @@ class ScanMixin:
                 or latest.get(self._SIM_TCA_PENDING_FIELD) != pending
             ):
                 raise RuntimeError("SIM TCA state changed before WAL clear")
-            cleared = self.state.update_many(
-                sym, {self._SIM_TCA_PENDING_FIELD: None}
+            from bot_utils.trade_state import (
+                same_position_generation,
+                update_many_if_current,
+            )
+
+            clear_fields = {self._SIM_TCA_PENDING_FIELD: None}
+            cleared = update_many_if_current(
+                self.state, sym, clear_fields, latest,
             )
             if cleared is not None and cleared is not True:
+                raise RuntimeError("SIM TCA WAL clear was not durable")
+            current = self.state.get(sym)
+            if not (
+                isinstance(current, dict)
+                and (
+                    same_position_generation(current, latest)
+                    or current == {**latest, **clear_fields}
+                )
+                and current.get(self._SIM_TCA_PENDING_FIELD) is None
+            ):
                 raise RuntimeError("SIM TCA WAL clear was not durable")
             return True
         except Exception as exc:

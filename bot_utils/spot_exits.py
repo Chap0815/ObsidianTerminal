@@ -1238,8 +1238,27 @@ def _persist_spot_exit_fields(state, sym: str, row: dict,
                               updates: dict) -> bool:
     """Durably persist exit-control fields and mirror them into ``row``."""
     try:
-        if hasattr(state, "update_many"):
-            persisted = state.update_many(sym, updates)
+        if callable(getattr(state, "update_many", None)):
+            from bot_utils.trade_state import (
+                same_position_generation,
+                update_many_if_current,
+            )
+
+            persisted = update_many_if_current(state, sym, updates, row)
+            getter = getattr(state, "get", None)
+            if persisted and callable(getter):
+                current = getter(sym)
+                persisted = bool(
+                    isinstance(current, dict)
+                    and (
+                        same_position_generation(current, row)
+                        or current == {**row, **updates}
+                    )
+                    and all(
+                        current.get(key) == value
+                        for key, value in updates.items()
+                    )
+                )
         else:
             persisted = True
             for key, value in updates.items():
@@ -1744,7 +1763,7 @@ def emergency_close_all_spot(*,
                 profit_pct = ((curr - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
 
                 partial_sold = bool(d.get("partial_sold"))
-                initial_entry_fee = _positive_finite(
+                initial_entry_fee = _finite_float(
                     d.get(
                         "initial_entry_fee",
                         0.0 if partial_sold else d.get("fees_paid", 0.0),

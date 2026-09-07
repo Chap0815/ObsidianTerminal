@@ -111,6 +111,35 @@ def _defer_spot_accounting_retry(bot, sym: str, row: dict) -> float:
     return delay
 
 
+def _persist_spot_accounting_replay(
+    state, sym: str, row: dict, fields: dict,
+) -> bool:
+    getter = getattr(state, "get", None)
+    if callable(getter):
+        from bot_utils.trade_state import (
+            same_position_generation,
+            update_many_if_current,
+        )
+
+        current = getter(sym)
+        if not same_position_generation(current, row) and current != row:
+            return False
+        if not update_many_if_current(state, sym, fields, row):
+            return False
+        current = getter(sym)
+        if not same_position_generation(current, row) and current != {
+            **row,
+            **fields,
+        }:
+            return False
+        return isinstance(current, dict) and all(
+            key in current and current[key] == value
+            for key, value in fields.items()
+        )
+    result = state.update_many(sym, fields)
+    return result is None or result is True
+
+
 def _is_true_bool(value) -> bool:
     return value is True
 
@@ -561,7 +590,7 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
             )
             else _estimate_spot_close_fee_usdt(amount, close_price)
         )
-        initial_entry_fee = _nonnegative_float_or_none(state_row.get(
+        initial_entry_fee = _finite_float_or_none(state_row.get(
             "initial_entry_fee", state_row.get("fees_paid", 0))) or 0.0
         partial_sold = _is_true_bool(state_row.get("partial_sold"))
         original_amount = _positive_float_or_none(state_row.get("original_amount"))
@@ -616,7 +645,7 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
                 state_row.get("accounting_pending_profit_pct"))
             if pending_pct is not None:
                 profit_pct = pending_pct
-            fees_total = _nonnegative_float_or_none(
+            fees_total = _finite_float_or_none(
                 state_row.get("accounting_pending_fees_usdt"))
             if fees_total is not None:
                 entry_fee = 0.0
@@ -667,7 +696,9 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
             "accounting_pending_giveback_pct": giveback_pct,
         }
         try:
-            replay_durable = bot.state.update_many(sym, replay_fields)
+            replay_durable = _persist_spot_accounting_replay(
+                bot.state, sym, state_row, replay_fields
+            )
         except Exception as exc:
             replay_durable = False
             try:
@@ -795,14 +826,16 @@ def _append_unpriced_partial(row: dict, item: dict) -> list:
 def _persist_spot_external_partial_state(
     bot,
     sym: str,
+    state_row: dict,
     fields: dict,
 ) -> bool:
     """Persist the physical shrink and any accounting WAL atomically."""
     from core.logger import log_event
 
     try:
-        persisted = bot.state.update_many(sym, fields)
-        durable = persisted is None or persisted is True
+        durable = _persist_spot_accounting_replay(
+            bot.state, sym, state_row, fields
+        )
     except Exception as exc:
         durable = False
         try:
@@ -816,6 +849,32 @@ def _persist_spot_external_partial_state(
             "ERROR",
         )
     return durable
+
+
+def _clear_spot_external_partial_wal(
+    bot,
+    sym: str,
+    state_row: dict,
+    wal_fields: dict,
+    remaining_pending: list,
+) -> bool:
+    state = bot.state
+    if callable(getattr(state, "get", None)) and callable(
+        getattr(state, "update_many", None)
+    ):
+        expected = {**state_row, **wal_fields}
+        return _persist_spot_accounting_replay(
+            state,
+            sym,
+            expected,
+            {"accounting_pending_partials": remaining_pending},
+        )
+    result = state.update(
+        sym,
+        "accounting_pending_partials",
+        remaining_pending,
+    )
+    return result is None or result is True
 
 
 def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
@@ -867,11 +926,11 @@ def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
     highest = _positive_float_or_none(pos.get("highest_price"))
     if highest is None:
         highest = buy_price
-    initial_entry_fee = _nonnegative_float_or_none(
+    initial_entry_fee = _finite_float_or_none(
         extra.get("initial_entry_fee"))
     if initial_entry_fee is None:
         initial_entry_fee = 0.0
-    fees_paid = _nonnegative_float_or_none(extra.get("fees_paid"))
+    fees_paid = _finite_float_or_none(extra.get("fees_paid"))
     if fees_paid is None:
         fees_paid = 0.0
 
@@ -1001,7 +1060,7 @@ def _record_spot_external_partial(bot, sym: str, state_row: dict,
             f" Spot reconciliation: {sym} partial drift detected but "
             f"close price unavailable; state shrunk without PnL booking",
             "WARN")
-        _persist_spot_external_partial_state(bot, sym, fields)
+        _persist_spot_external_partial_state(bot, sym, state_row, fields)
         return False, fields
 
     close_fee = (
@@ -1009,7 +1068,7 @@ def _record_spot_external_partial(bot, sym: str, state_row: dict,
         if math.isfinite(close_fee_actual) and source == "fetch_my_trades_vwap"
         else _estimate_spot_close_fee_usdt(sold_amount, close_price)
     )
-    initial_entry_fee = _nonnegative_float_or_none(state_row.get(
+    initial_entry_fee = _finite_float_or_none(state_row.get(
         "initial_entry_fee", state_row.get("fees_paid", 0))) or 0.0
     entry_fee = safe_proportional_fee(
         initial_entry_fee, sold_amount, original_amount,
@@ -1068,7 +1127,9 @@ def _record_spot_external_partial(bot, sym: str, state_row: dict,
         fields["original_amount"] = local_amt
     pending = _append_pending_partial(state_row, item)
     fields["accounting_pending_partials"] = pending
-    if not _persist_spot_external_partial_state(bot, sym, fields):
+    if not _persist_spot_external_partial_state(
+        bot, sym, state_row, fields
+    ):
         return False, fields
     try:
         saved = save_trade_db(**item) is True
@@ -1080,12 +1141,13 @@ def _record_spot_external_partial(bot, sym: str, state_row: dict,
             pass
     if saved:
         try:
-            clear_result = bot.state.update(
+            cleared = _clear_spot_external_partial_wal(
+                bot,
                 sym,
-                "accounting_pending_partials",
+                state_row,
+                fields,
                 pending[:-1],
             )
-            cleared = clear_result is None or clear_result is True
         except Exception as exc:
             cleared = False
             try:

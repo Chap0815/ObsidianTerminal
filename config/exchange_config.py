@@ -1280,7 +1280,8 @@ def safe_fetch_positions(
         # instead of persisting the same swallowed error every minute.
         if is_authentication_error(e):
             raise
-        _silent(f"safe_fetch_positions({symbols})", e)
+        scope = symbols if symbols else "all"
+        _silent(f"{endpoint}({scope})", e)
         return None
 
 

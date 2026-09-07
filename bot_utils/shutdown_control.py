@@ -547,10 +547,14 @@ def consume_shutdown_request(
             run_id if run_id is not None else os.getenv("BOT_RUN_ID", "")
         )
         expected_pid = os.getpid() if pid is None else pid
+        schema_version = payload.get("schema_version")
+        payload_pid = payload.get("pid")
         if (
-            payload.get("schema_version") != 1
+            type(schema_version) is not int
+            or schema_version != 1
             or payload.get("run_id") != expected_run
-            or payload.get("pid") != expected_pid
+            or type(payload_pid) is not int
+            or payload_pid != expected_pid
             or payload.get("mode") not in _VALID_MODES
         ):
             raise ValueError("shutdown control request identity is invalid")

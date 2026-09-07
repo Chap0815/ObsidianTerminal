@@ -1269,10 +1269,13 @@ class SQLitePartitionWriter:
             if peak is not None and len(closed) >= 3
             else None
         )
+        filesystem_probe_error = ""
         try:
             filesystem_free = max(0, int(shutil.disk_usage(self.root).free))
-        except (OSError, TypeError, ValueError, OverflowError):
+        except (OSError, TypeError, ValueError, OverflowError) as exc:
             filesystem_free = None
+            error_type, detail = _safe_exception_summary(exc, max_chars=120)
+            filesystem_probe_error = f"{error_type}: {detail}"
         filesystem_capacity = (
             total + filesystem_free
             if filesystem_free is not None
@@ -1331,6 +1334,7 @@ class SQLitePartitionWriter:
             "required_capacity_bytes": required_capacity,
             "filesystem_free_bytes": filesystem_free,
             "filesystem_capacity_bytes": filesystem_capacity,
+            "filesystem_probe_error": filesystem_probe_error,
             "capacity_ok": capacity_ok,
             "capacity_state": capacity_state,
             "operational_reserve_ratio": (

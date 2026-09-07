@@ -59,7 +59,8 @@ def safe_proportional_fee(initial_fee: Any,
     Parameters
     ----------
     initial_fee : numeric
-        The full entry fee paid when the position was opened, in USDT.
+        The signed full entry fee when the position was opened, in USDT.
+        Negative values are exchange rebates.
     current_amount : numeric
         How many contracts / coins remain to be closed RIGHT NOW.
     original_amount : numeric
@@ -72,7 +73,8 @@ def safe_proportional_fee(initial_fee: Any,
     Returns
     -------
     float
-        The proportional entry fee in USDT, clamped to ``[0, initial_fee]``.
+        The sign-preserving proportional entry fee in USDT, with magnitude
+        capped at the original fee or rebate.
 
     Behavior
     --------
@@ -96,7 +98,7 @@ def safe_proportional_fee(initial_fee: Any,
     if init is None or curr is None or orig is None:
         return 0.0
 
-    if init <= 0 or curr <= 0:
+    if init == 0 or curr <= 0:
         return 0.0
 
     if orig > 0:

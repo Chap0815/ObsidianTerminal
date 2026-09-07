@@ -127,6 +127,34 @@ def _mexc_contract_action(side) -> tuple[str, str, bool] | None:
     }.get(_order_id_text(side))
 
 
+def _trade_info_for_order_evidence(
+    trade: dict,
+    exchange_id: str = "",
+) -> tuple[dict, bool]:
+    """Return trade info safe to validate with order-response semantics."""
+    raw_info = trade.get("info") if isinstance(trade, dict) else None
+    info = dict(raw_info) if isinstance(raw_info, dict) else {}
+    if str(exchange_id or "").strip().lower() != "mexc":
+        return info, True
+    raw_side = info.get("side")
+    if raw_side in (None, ""):
+        return info, True
+    # MEXC's trade endpoint uses 1=buy/2=sell, while its order endpoint uses
+    # 1..4 action codes. Verify against CCXT's unified side before removing
+    # this raw trade-only field from later order-action validation.
+    trade_side = {
+        "1": "buy",
+        "2": "sell",
+        "buy": "buy",
+        "sell": "sell",
+    }.get(str(raw_side).strip().lower())
+    unified_side = _normalize_order_side(trade.get("side"))
+    if not trade_side or unified_side != trade_side:
+        return info, False
+    info.pop("side", None)
+    return info, True
+
+
 def _normalize_order_status(status) -> str:
     if not isinstance(status, str):
         return ""
@@ -783,6 +811,7 @@ def _order_from_recovery_trades(
     cid: str,
     symbol_full: str,
     expected_amount: Optional[float] = None,
+    exchange_id: str = "",
 ) -> dict:
     """Build one order-shaped snapshot from matching CCXT trade fills."""
     order_ids: set[str] = set()
@@ -792,6 +821,7 @@ def _order_from_recovery_trades(
     filled = 0.0
     cost = 0.0
     cost_known = True
+    price_notional = 0.0
     malformed = False
     first_info = {}
     unique_trades: list[dict] = []
@@ -827,9 +857,11 @@ def _order_from_recovery_trades(
         unique_trades.append(trade)
 
     for trade in unique_trades:
-        info = trade.get("info")
-        if not isinstance(info, dict):
-            info = {}
+        info, trade_side_valid = _trade_info_for_order_evidence(
+            trade, exchange_id
+        )
+        if not trade_side_valid:
+            malformed = True
         if not first_info:
             first_info = dict(info)
         observed_order_ids = {
@@ -876,19 +908,22 @@ def _order_from_recovery_trades(
             malformed = True
             continue
         filled += amount
+        price = _finite_order_telemetry_value(
+            trade.get("price"), positive=True
+        )
+        if price is None:
+            malformed = True
+        else:
+            price_notional += amount * price
         raw_cost = trade.get("cost")
         explicit_cost = "cost" in trade and raw_cost not in (None, "")
         trade_cost = _finite_order_telemetry_value(raw_cost)
         if explicit_cost and trade_cost is None:
             malformed = True
         elif trade_cost is None:
-            price = _finite_order_telemetry_value(
-                trade.get("price"), positive=True
-            )
-            if price is None:
-                cost_known = False
-            else:
-                trade_cost = amount * price
+            # Derivative trade cost includes contractSize.  Without an
+            # explicit venue/CCXT cost it cannot be inferred from contracts.
+            cost_known = False
         if trade_cost is not None:
             cost += trade_cost
 
@@ -916,10 +951,12 @@ def _order_from_recovery_trades(
                 malformed = True
     if not math.isfinite(cost):
         malformed = True
+    if not math.isfinite(price_notional):
+        malformed = True
     total_cost = cost if cost_known and not malformed else None
     average = (
-        total_cost / filled
-        if total_cost is not None and filled > 0
+        price_notional / filled
+        if not malformed and filled > 0
         else None
     )
     return _TradeRecoveryOrder({
@@ -1355,6 +1392,7 @@ def _find_order_by_client_id(
                     cid,
                     symbol_full,
                     expected_amount=expected_amount,
+                    exchange_id=exchange_id or _exchange_id(ex),
                 )
                 selected = _select_recovery_candidate(recovered)
                 if selected is not None:
@@ -1812,10 +1850,10 @@ def _order_with_fee_context(order, ex=None, symbol_full: str = "",
     if not payload:
         return payload
     if contract_size is not None:
-        payload.setdefault("_fee_contract_size", contract_size)
+        payload["_fee_contract_size"] = contract_size
     if symbol_full:
-        payload.setdefault("_fee_symbol_full", symbol_full)
-    if ex is not None and "_bot_ex" not in payload:
+        payload["_fee_symbol_full"] = symbol_full
+    if ex is not None:
         payload["_bot_ex"] = ex
     return payload
 
@@ -2046,7 +2084,7 @@ def futures_contract_size_or_none(ex, symbol_full: str) -> float | None:
             info.get("contractSize"),
             info.get("contract_size"),
         ):
-            if candidate is None:
+            if candidate is None or isinstance(candidate, bool):
                 continue
             try:
                 value = float(candidate)

@@ -48,8 +48,7 @@ def evaluate_entry_admission(
         features=features,
     )
     return EntryAdmission(
-        allowed=bool(portfolio.allowed and expectancy.allowed),
+        allowed=portfolio.allowed is True and expectancy.allowed is True,
         portfolio=portfolio,
         expectancy=expectancy,
     )
-
