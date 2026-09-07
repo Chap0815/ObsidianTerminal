@@ -2082,17 +2082,23 @@ def _direct_close_remaining_futures(
             # can never hit UnboundLocalError on these locals.
             taker_fee  = 0.00055
             notional   = margin * lev if (margin > 0 and lev > 0) else 0.0
+            contract_size = (
+                _positive_finite(p.get("entry_contract_size"))
+                or _positive_finite(p.get("contract_size"))
+            )
             try:
                 from bot_utils import (futures_contract_size,
                                        safe_remaining_funding,
                                        safe_proportional_fee)
-                contract_size = (
-                    _positive_finite(futures_contract_size(ex, symbol_full))
-                    or 1.0
-                )
+                if contract_size is None:
+                    contract_size = (
+                        _positive_finite(futures_contract_size(ex, symbol_full))
+                        or 1.0
+                    )
             except Exception:
                 from bot_utils import safe_remaining_funding, safe_proportional_fee
-                contract_size = 1.0
+                if contract_size is None:
+                    contract_size = 1.0
             initial_entry_fee = _non_negative_finite(
                 p.get("initial_entry_fee")
             )

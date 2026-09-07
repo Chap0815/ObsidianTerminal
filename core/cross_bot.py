@@ -1371,7 +1371,28 @@ class CrossBot(FuturesBot):
             "entry_funding_window_unverified": False,
         }
         try:
-            persisted = self.state.update_many(base, pending_fields)
+            from bot_utils.trade_state import (
+                same_position_generation,
+                update_many_if_current,
+            )
+
+            persisted = update_many_if_current(
+                self.state, base, pending_fields, row,
+            )
+            getter = getattr(self.state, "get", None)
+            if persisted and callable(getter):
+                current = getter(base)
+                persisted = bool(
+                    (
+                        same_position_generation(current, row)
+                        or current == {**row, **pending_fields}
+                    )
+                    and isinstance(current, dict)
+                    and all(
+                        current.get(key) == value
+                        for key, value in pending_fields.items()
+                    )
+                )
         except Exception as exc:
             persisted = False
             self._log_error(
@@ -1424,6 +1445,7 @@ class CrossBot(FuturesBot):
             return super()._maybe_persist_funding_for_all(trades, now_epoch)
         try:
             from bot_utils.futures_funding import estimate_funding_paid
+            from bot_utils.trade_state import update_many_if_current
         except Exception:
             return
 
@@ -1455,7 +1477,7 @@ class CrossBot(FuturesBot):
                 if notional <= 0:
                     if current is None:
                         update["funding_paid"] = 0.0
-                    self.state.update_many(base, update)
+                    update_many_if_current(self.state, base, update, d)
                     continue
 
                 realized_raw = estimate_funding_paid(
@@ -1466,7 +1488,7 @@ class CrossBot(FuturesBot):
                 if realized is None:
                     if current is None:
                         update["funding_paid"] = 0.0
-                    self.state.update_many(base, update)
+                    update_many_if_current(self.state, base, update, d)
                     continue
 
                 _fee, realized = self._clamp_cross_sim_costs(
@@ -1475,12 +1497,12 @@ class CrossBot(FuturesBot):
                 if realized is None:
                     if current is None:
                         update["funding_paid"] = 0.0
-                    self.state.update_many(base, update)
+                    update_many_if_current(self.state, base, update, d)
                     continue
 
                 if current is None or realized != current:
                     update["funding_paid"] = realized
-                self.state.update_many(base, update)
+                update_many_if_current(self.state, base, update, d)
             except Exception as e:
                 try:
                     self._log_error(f"cross sim funding-refresh {base}", e)
@@ -2685,9 +2707,9 @@ class CrossBot(FuturesBot):
         except Exception:
             get_maintenance_margin_rate = None
         try:
-            from bot_utils import futures_contract_size
+            from bot_utils import futures_contract_size_or_none
         except Exception:
-            futures_contract_size = None
+            futures_contract_size_or_none = None
         for base, d in trades.items():
             try:
                 entry = CrossBot._safe_positive_price(d.get("buy"))
@@ -2716,10 +2738,20 @@ class CrossBot(FuturesBot):
                 is_sim = getattr(self, "simulation", False)
                 cs = 1.0
                 if not is_sim:
-                    if futures_contract_size is None:
-                        continue
+                    raw_cs = d.get("contract_size")
+                    parsed_cs = (
+                        0.0
+                        if isinstance(raw_cs, bool)
+                        else CrossBot._safe_float(self, raw_cs, 0.0)
+                    )
+                    if (
+                        not math.isfinite(parsed_cs)
+                        or parsed_cs <= 0
+                    ):
+                        if futures_contract_size_or_none is None:
+                            continue
+                        raw_cs = futures_contract_size_or_none(self.ex, full)
                     try:
-                        raw_cs = futures_contract_size(self.ex, full)
                         if isinstance(raw_cs, bool):
                             continue
                         parsed_cs = float(raw_cs)
@@ -3285,13 +3317,13 @@ class CrossBot(FuturesBot):
                                    FuturesOrderOutcomeUnknown,
                                    create_order_with_retry,
                                    extract_or_estimate_futures_fee,
-                                   futures_contract_size)
+                                   futures_contract_size_or_none)
             from config.exchange_config import (must_set_leverage,
                                                 LeverageNotSetError,
                                                 safe_set_margin_mode,
                                                 safe_amount_to_precision,
                                                 entry_params)
-            raw_cs = futures_contract_size(self.ex, full)
+            raw_cs = futures_contract_size_or_none(self.ex, full)
             cs = 0.0 if isinstance(raw_cs, bool) else self._safe_float(raw_cs, 0.0)
             if not math.isfinite(cs) or cs <= 0.0:
                 log_event(f"[{self.BOT_NAME}] {base}: invalid contract size "
@@ -4019,7 +4051,7 @@ class CrossBot(FuturesBot):
         margin = CrossBot._safe_float(self, d.get("invested_usdt"), 0.0)
         lev = CrossBot._safe_float(self, d.get("leverage"), 1.0)
         amt = CrossBot._safe_float(self, d.get("amount"), 0.0)
-        entry_fee = max(0.0, CrossBot._safe_float(self, d.get("fees_paid"), 0.0))
+        entry_fee = CrossBot._safe_float(self, d.get("fees_paid"), 0.0)
         close_fee = 0.0
         close_fee_is_total = False
         fill_price_known = False
@@ -4085,11 +4117,6 @@ class CrossBot(FuturesBot):
             except (TypeError, ValueError, OverflowError):
                 return False
 
-        def _nonnegative_non_bool_number(value) -> bool:
-            if not _finite_non_bool_number(value):
-                return False
-            return float(value) >= 0.0
-
         def _log_invalid_pending_fragment() -> None:
             from core.futures_bot_exits import _defer_verified_flat_close
 
@@ -4126,7 +4153,7 @@ class CrossBot(FuturesBot):
                 return
             close_price = pending_price
             if d.get("accounting_pending_fees_usdt") is not None:
-                if not _nonnegative_non_bool_number(
+                if not _finite_non_bool_number(
                     d.get("accounting_pending_fees_usdt")
                 ):
                     log_event(
@@ -4135,8 +4162,8 @@ class CrossBot(FuturesBot):
                         "WARN",
                     )
                     return
-                close_fee = max(0.0, CrossBot._safe_float(
-                    self, d.get("accounting_pending_fees_usdt"), close_fee))
+                close_fee = CrossBot._safe_float(
+                    self, d.get("accounting_pending_fees_usdt"), close_fee)
                 close_fee_is_total = True
             else:
                 close_fee = max(0.0, CrossBot._safe_float(
@@ -4402,10 +4429,25 @@ class CrossBot(FuturesBot):
                                 close_price = _fv
                                 fill_price_known = True
                                 break
-                try:
-                    cs = futures_contract_size(self.ex, full)
-                except Exception:
-                    cs = 1.0
+                raw_cs = d.get("contract_size")
+                cs = 0.0 if isinstance(raw_cs, bool) else CrossBot._safe_float(
+                    self, raw_cs, 0.0,
+                )
+                if not math.isfinite(cs) or cs <= 0.0:
+                    try:
+                        raw_cs = futures_contract_size(self.ex, full)
+                    except Exception:
+                        raw_cs = 1.0
+                    cs = 0.0 if isinstance(raw_cs, bool) else CrossBot._safe_float(
+                        self, raw_cs, 0.0,
+                    )
+                if not math.isfinite(cs) or cs <= 0.0:
+                    log_event(
+                        f"[{self.BOT_NAME}] {base}: full close contract size "
+                        "unavailable - accounting deferred",
+                        "ERROR",
+                    )
+                    return
 
                 from core.futures_bot_exits import _verify_full_exit_coverage
 
@@ -4604,8 +4646,24 @@ class CrossBot(FuturesBot):
             if not self.simulation:
                 pending_close.update(_futures_full_exit_clear_fields())
             try:
-                pending_persisted = self.state.update_many(
-                    base, pending_close)
+                from bot_utils.trade_state import (
+                    same_position_generation,
+                    update_many_if_current,
+                )
+
+                pending_persisted = update_many_if_current(
+                    self.state, base, pending_close, d,
+                )
+                getter = getattr(self.state, "get", None)
+                if pending_persisted and callable(getter):
+                    current = getter(base)
+                    pending_persisted = bool(
+                        same_position_generation(current, d)
+                        and all(
+                            current.get(key) == value
+                            for key, value in pending_close.items()
+                        )
+                    )
             except Exception as state_err:
                 pending_persisted = False
                 self._log_error(

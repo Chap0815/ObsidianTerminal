@@ -1468,7 +1468,17 @@ class L2ShadowCollector:
                         )
                     )
                 ]
-                stale_signature = tuple(sorted(stale))
+                recovering = {
+                    symbol
+                    for symbol in partial_stale
+                    if ("l2", symbol) in tasks
+                    and (
+                        symbol not in l2_last
+                        or l2_last[symbol]
+                        < task_started.get(("l2", symbol), now)
+                    )
+                }
+                stale_signature = tuple(sorted(set(stale) | recovering))
                 desired_l2 = {
                     symbol for kind, symbol in tasks if kind == "l2"
                 }
@@ -1486,6 +1496,34 @@ class L2ShadowCollector:
                     elif partial_stale:
                         self._log("partial L2 staleness recovered", "OK")
                     partial_stale = stale_signature
+                if stale:
+                    retired_stale = []
+                    for symbol in stale:
+                        key = ("l2", symbol)
+                        task = tasks.pop(key, None)
+                        task_started.pop(key, None)
+                        if task is not None:
+                            task.cancel()
+                            retired_stale.append(task)
+                    if retired_stale:
+                        done.difference_update(retired_stale)
+                        await asyncio.gather(
+                            *retired_stale, return_exceptions=True
+                        )
+                    with self._state_lock:
+                        for symbol in stale:
+                            for state in (
+                                self._last_persist,
+                                self._last_nonce,
+                                self._nonce_regressions_since_sample,
+                                self._updates_since_sample,
+                            ):
+                                state.pop(symbol, None)
+                    with self._health_lock:
+                        for symbol in stale:
+                            self._health_last_persist_monotonic.pop(
+                                symbol, None
+                            )
                 for task in done:
                     key = next(key for key, value in tasks.items() if value is task)
                     kind, symbol = key

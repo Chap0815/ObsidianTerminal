@@ -1030,7 +1030,20 @@ def execute_entry_order(
                 order,
                 amount,
             ):
-                silent_log("entry finalized despite acknowledgement error", exc)
+                try:
+                    from core.logger import log_struct
+
+                    log_struct(
+                        "entry_finalization_converged",
+                        bot=bot_name,
+                        mode=mode,
+                        symbol=symbol,
+                        intent_id=intent_id,
+                        error_type=type(exc).__name__,
+                        outcome="durable_exact_match",
+                    )
+                except Exception:
+                    pass
                 return order
             _mark_recovery_required_after_error(journal, intent_id, exc)
             raise

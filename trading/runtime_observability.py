@@ -609,10 +609,11 @@ def claim_recovery_metadata(
             funding_booked = _strict_finite_float(
                 extra.get("funding_booked_on_partials")
             )
-            initial_entry_fee = _strict_nonnegative_float(
+            # Exchange fee rebates are represented as finite negative fees.
+            initial_entry_fee = _strict_finite_float(
                 extra.get("initial_entry_fee")
             )
-            fees_paid = _strict_nonnegative_float(extra.get("fees_paid"))
+            fees_paid = _strict_finite_float(extra.get("fees_paid"))
             partial_buy_time = _canonical_trade_timestamp(row.get("buy_time"))
             partial_buy_price = _strict_positive_float(row.get("buy_price"))
             partial_bundle_valid = (
@@ -749,7 +750,7 @@ def claim_recovery_metadata(
                 if ceiling is not None:
                     metadata["entry_oversize_notional_ceiling"] = ceiling
                 for fee_key in ("initial_entry_fee", "fees_paid"):
-                    fee = _strict_nonnegative_float(extra.get(fee_key))
+                    fee = _strict_finite_float(extra.get(fee_key))
                     if fee is not None:
                         metadata[fee_key] = fee
         if (
@@ -847,6 +848,11 @@ def compare_position_layers(
         money_issues.append(f"state_without_exchange:{symbol}")
     for symbol in sorted(exchange_symbols - state_symbols):
         money_issues.append(f"exchange_without_state:{symbol}")
+    for symbol in sorted(state_symbols & exchange_symbols):
+        if states[symbol].get("verified_flat_pending_accounting") is True:
+            money_issues.append(
+                f"verified_flat_exchange_reappeared:{symbol}"
+            )
 
     state_directions: dict[str, str] = {}
     for symbol in sorted(state_symbols):

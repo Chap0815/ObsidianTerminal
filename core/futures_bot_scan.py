@@ -135,6 +135,30 @@ class FuturesScanMixin:
                 pass
         return not enabled
 
+    def _entry_integrity_allowed(self) -> bool:
+        """Require a fresh reconciliation snapshot before a LIVE submit."""
+        if getattr(self, "simulation", False):
+            return True
+        integrity_reader = getattr(self, "_position_integrity_runtime_health", None)
+        try:
+            integrity = integrity_reader() if callable(integrity_reader) else {}
+        except Exception:
+            integrity = {}
+        if not isinstance(integrity, dict) or integrity.get("runtime_ok") is not True:
+            from core.logger import log_event
+
+            reason = (
+                str(integrity.get("reason") or "unavailable")[:96]
+                if isinstance(integrity, dict) else "unavailable"
+            )
+            log_event(
+                "Position integrity is not runtime-safe "
+                f"({reason}) - skipping LIVE futures entry submit",
+                "WAIT",
+            )
+            return False
+        return True
+
     def _entry_pre_submit_allowed(self) -> bool:
         """Revalidate operator and runtime safety gates at venue submit."""
         shutdown_event = getattr(self, "_shutdown_event", None)
@@ -145,7 +169,10 @@ class FuturesScanMixin:
         safe_mode = getattr(self, "safe_mode", None)
         if safe_mode is None:
             return False
-        return safe_mode.is_active() is False
+        return (
+            safe_mode.is_active() is False
+            and FuturesScanMixin._entry_integrity_allowed(self)
+        )
 
     @staticmethod
     def _finite_float(value, default: float = 0.0) -> float:

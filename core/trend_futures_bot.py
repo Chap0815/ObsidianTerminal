@@ -192,21 +192,59 @@ class TrendFuturesBot(FuturesBot):
     def _position_contract_size(self, full: str, row: dict,
                                 _fallback_reader) -> float:
         """Resolve close accounting size from durable entry evidence first."""
-        for key in ("entry_contract_size", "contract_size"):
-            value = TrendFuturesBot._safe_float(self, row.get(key), 0.0)
-            if value > 0.0:
-                return value
+        stored = [
+            row.get(key)
+            for key in ("entry_contract_size", "contract_size")
+            if key in row and row.get(key) is not None
+        ]
+        if stored:
+            validated = []
+            for candidate in stored:
+                value = TrendFuturesBot._finite_float_or_none(candidate)
+                if value is None or value <= 0.0:
+                    return 0.0
+                validated.append(value)
+            if any(
+                not math.isclose(value, validated[0], rel_tol=1e-12)
+                for value in validated[1:]
+            ):
+                return 0.0
+            return validated[0]
+        markets = getattr(getattr(self, "ex", None), "markets", None) or {}
+        market = markets.get(full) or {}
+        info = market.get("info") if isinstance(market, dict) else {}
+        if not isinstance(info, dict):
+            info = {}
+        explicit = [
+            candidate
+            for candidate in (
+                market.get("contractSize") if isinstance(market, dict) else None,
+                market.get("contract_size") if isinstance(market, dict) else None,
+                info.get("contractSize"),
+                info.get("contract_size"),
+            )
+            if candidate is not None
+        ]
+        if explicit:
+            validated = []
+            for candidate in explicit:
+                value = TrendFuturesBot._finite_float_or_none(candidate)
+                if value is None or value <= 0.0:
+                    return 0.0
+                validated.append(value)
+            if any(
+                not math.isclose(value, validated[0], rel_tol=1e-12)
+                for value in validated[1:]
+            ):
+                return 0.0
+            return validated[0]
         try:
             raw_value = _fallback_reader(getattr(self, "ex", None), full)
-            value = TrendFuturesBot._safe_float(
-                self,
-                raw_value,
-                0.0,
-            )
+            value = TrendFuturesBot._finite_float_or_none(raw_value)
         except Exception:
             raw_value = None
-            value = 0.0
-        if value > 0.0:
+            value = None
+        if value is not None and value > 0.0:
             return value
         if raw_value is not None:
             return 0.0
@@ -591,6 +629,7 @@ class TrendFuturesBot(FuturesBot):
         if d.get("accounting_pending"):
             from core.logger import log_event
             from core.symbol_locks import close_lock
+            from bot_utils.trade_state import update_many_if_current
             try:
                 with close_lock(
                     base,
@@ -615,7 +654,9 @@ class TrendFuturesBot(FuturesBot):
                         if key == "accounting_pending"
                         or key.startswith("accounting_pending_")
                     }
-                    durable = self.state.update_many(base, pending_fields)
+                    durable = update_many_if_current(
+                        self.state, base, pending_fields, live
+                    )
                     if durable is not None and durable is not True:
                         log_event(
                             f"[{self.BOT_NAME}] {base}: pending full "
@@ -641,6 +682,8 @@ class TrendFuturesBot(FuturesBot):
                         self, base, booked)
             except Exception as exc:
                 self._log_error(f"trend pending accounting retry {base}", exc)
+            return True
+        if d.get("verified_flat_pending_accounting") is True:
             return True
         if d.get("claim_conflict"):
             try:
@@ -2480,12 +2523,12 @@ class TrendFuturesBot(FuturesBot):
                 f"invalid close price - state kept for review", "WARN")
             return
         exch_oid = None
-        from bot_utils import futures_contract_size
+        from bot_utils import futures_contract_size_or_none
         cs = TrendFuturesBot._position_contract_size(
             self,
             full,
             d,
-            futures_contract_size,
+            futures_contract_size_or_none,
         )
         live_close_already_verified = False
         if not self.simulation and d.get("pending_close_price"):
@@ -2519,8 +2562,7 @@ class TrendFuturesBot(FuturesBot):
                 close_fee += amt * cs * close_price * taker_fee_rate(
                     self.ex, f"{base}/USDT:USDT")
         elif amt > 0 and not live_close_already_verified:
-            from bot_utils import (futures_contract_size, is_no_position_error,
-                                    verify_position_closed)
+            from bot_utils import is_no_position_error, verify_position_closed
             from config.exchange_config import safe_amount_to_precision
             lev_cap = max(1, int(math.ceil(lev)))
             try:
@@ -2808,9 +2850,28 @@ class TrendFuturesBot(FuturesBot):
                 pending_close["accounting_pending_funding_unverified"] = False
             if not self.simulation:
                 pending_close.update(_futures_full_exit_clear_fields())
+            from bot_utils.trade_state import (
+                same_position_generation,
+                update_many_if_current,
+            )
             try:
-                pending_persisted = self.state.update_many(
-                    base, pending_close)
+                pending_persisted = update_many_if_current(
+                    self.state, base, pending_close, d
+                )
+                getter = getattr(self.state, "get", None)
+                if pending_persisted and callable(getter):
+                    current = getter(base)
+                    pending_persisted = bool(
+                        (
+                            same_position_generation(current, d)
+                            or current == {**d, **pending_close}
+                        )
+                        and isinstance(current, dict)
+                        and all(
+                            current.get(key) == value
+                            for key, value in pending_close.items()
+                        )
+                    )
             except Exception as state_err:
                 pending_persisted = False
                 self._log_error(
@@ -3131,12 +3192,12 @@ class TrendFuturesBot(FuturesBot):
         amount = abs(self._safe_float(d.get("amount"), 0.0))
         margin = self._safe_float(d.get("invested_usdt"), 0.0)
         if margin <= 0 and amount > 0:
-            from bot_utils import futures_contract_size
+            from bot_utils import futures_contract_size_or_none
             cs = TrendFuturesBot._position_contract_size(
                 self,
                 full,
                 d,
-                futures_contract_size,
+                futures_contract_size_or_none,
             )
             if cs <= 0.0:
                 return
@@ -3154,9 +3215,14 @@ class TrendFuturesBot(FuturesBot):
         pos_type = d.get("position_type", "LONG")
         d["last_price"] = curr
         try:
-            update_many_if_current(
+            persisted_last_price = update_many_if_current(
                 self.state, base, {"last_price": curr}, d
             )
+            if persisted_last_price is False:
+                self._log_error(
+                    f"trend last_price update {base}",
+                    RuntimeError("last price update is not durable"),
+                )
         except Exception as e:
             self._log_error(f"trend last_price update {base}", e)
 
@@ -3200,9 +3266,14 @@ class TrendFuturesBot(FuturesBot):
             highest = curr
             d["highest"] = highest
             try:
-                update_many_if_current(
+                persisted_highest = update_many_if_current(
                     self.state, base, {"highest": highest}, d
                 )
+                if persisted_highest is False:
+                    self._log_error(
+                        f"trend highest update {base}",
+                        RuntimeError("highest price update is not durable"),
+                    )
             except Exception as e:
                 self._log_error(f"trend highest update {base}", e)
         lowest = self._safe_float(d.get("lowest"), entry)
@@ -3210,9 +3281,14 @@ class TrendFuturesBot(FuturesBot):
             lowest = curr
             d["lowest"] = lowest
             try:
-                update_many_if_current(
+                persisted_lowest = update_many_if_current(
                     self.state, base, {"lowest": lowest}, d
                 )
+                if persisted_lowest is False:
+                    self._log_error(
+                        f"trend lowest update {base}",
+                        RuntimeError("lowest price update is not durable"),
+                    )
             except Exception as e:
                 self._log_error(f"trend lowest update {base}", e)
 
@@ -3409,9 +3485,14 @@ class TrendFuturesBot(FuturesBot):
                 }
                 d.update(trail_audit)
                 try:
-                    update_many_if_current(
+                    persisted_trailing = update_many_if_current(
                         self.state, base, trail_audit, d
                     )
+                    if persisted_trailing is False:
+                        self._log_error(
+                            f"trend trailing audit update {base}",
+                            RuntimeError("trailing audit update is not durable"),
+                        )
                 except Exception as e:
                     self._log_error(f"trend trailing audit update {base}", e)
                 audit_decision = self._trailing_audit_log_decision(

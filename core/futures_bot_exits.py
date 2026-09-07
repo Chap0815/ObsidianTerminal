@@ -428,13 +428,85 @@ def _ensure_futures_partial_exit_intent(
         _PARTIAL_EXIT_OBSERVED_FILLED: 0.0,
         _PARTIAL_EXIT_CREATED_AT: _utc_now_str(),
     }
-    persisted = state.update_many(sym, updates)
-    if persisted is not None and persisted is not True:
+    persisted = _persist_full_exit_intent_generation(
+        state, sym, row, updates,
+    )
+    if not persisted:
         raise RuntimeError(
             f"cannot persist partial-exit intent before live order for {sym}"
         )
     row.update(updates)
     return client_order_id, requested_amount, True
+
+
+def _persist_futures_partial_fill_checkpoint(
+    state, sym: str, row: dict, observed_filled: float,
+) -> bool:
+    if callable(getattr(state, "update_many", None)):
+        return _persist_full_exit_intent_generation(
+            state,
+            sym,
+            row,
+            {_PARTIAL_EXIT_OBSERVED_FILLED: observed_filled},
+        )
+    result = state.update(
+        sym, _PARTIAL_EXIT_OBSERVED_FILLED, observed_filled
+    )
+    return result is None or result is True
+
+
+def _persist_futures_partial_accounting_wal(
+    state, sym: str, row: dict, updates: dict,
+) -> bool:
+    return _persist_full_exit_intent_generation(state, sym, row, updates)
+
+
+def _persist_futures_partial_exact_funding(
+    state, sym: str, row: dict, funding_paid: float,
+) -> bool:
+    return _persist_full_exit_intent_generation(
+        state, sym, row, {"funding_paid": funding_paid},
+    )
+
+
+def _persist_futures_funding_schedule(
+    state, sym: str, row: dict, next_check_at: float,
+) -> bool:
+    if callable(getattr(state, "get", None)) and callable(
+        getattr(state, "update_many", None)
+    ):
+        return _persist_full_exit_intent_generation(
+            state, sym, row, {"funding_next_check_at": next_check_at},
+        )
+    result = state.update(sym, "funding_next_check_at", next_check_at)
+    return result is None or result is True
+
+
+def _persist_futures_initial_liq_distance(
+    state, sym: str, row: dict, initial_liq_distance: float,
+) -> bool:
+    if callable(getattr(state, "get", None)) and callable(
+        getattr(state, "update_many", None)
+    ):
+        return _persist_full_exit_intent_generation(
+            state,
+            sym,
+            row,
+            {"initial_liq_distance": initial_liq_distance},
+        )
+    result = state.update(sym, "initial_liq_distance", initial_liq_distance)
+    return result is None or result is True
+
+
+def _persist_futures_peak_trail_decision(
+    state, sym: str, row: dict, fields: dict,
+) -> bool:
+    if callable(getattr(state, "get", None)) and callable(
+        getattr(state, "update_many", None)
+    ):
+        return _persist_full_exit_intent_generation(state, sym, row, fields)
+    result = state.update_many(sym, fields)
+    return result is None or result is True
 
 
 def _clear_futures_partial_exit_intent(state, sym: str, row: dict) -> bool:
@@ -1152,8 +1224,14 @@ class FuturesExitsMixin:
                 )
                 seen.add(str(trigger["rule"]))
             persisted = sorted(seen)
-            persist_result = self.state.update_many(
-                sym, {"exit_shadow_triggered_rules": persisted})
+            from bot_utils.trade_state import update_many_if_current
+
+            persist_result = update_many_if_current(
+                self.state,
+                sym,
+                {"exit_shadow_triggered_rules": persisted},
+                d,
+            )
             d["exit_shadow_triggered_rules"] = persisted
             if persist_result is not None and persist_result is not True:
                 raise RuntimeError("state update returned non-success")
@@ -1247,8 +1325,10 @@ class FuturesExitsMixin:
         prepared = dict(d)
         prepared.update(fields)
         try:
-            persisted = self.state.update_many(sym, fields)
-            if persisted is not None and persisted is not True:
+            persisted = _persist_futures_peak_trail_decision(
+                self.state, sym, d, fields
+            )
+            if not persisted:
                 raise RuntimeError("state update returned False")
         except Exception as exc:
             if not getattr(self, "_peak_trail_decision_error_logged", False):
@@ -1356,6 +1436,8 @@ class FuturesExitsMixin:
     def _retry_pending_partial_accounting(self, sym: str, d: dict) -> None:
         from bot_utils.trade_state import (
             normalize_pending_accounting_items,
+            same_position_generation,
+            update_many_if_current,
             validated_pending_partial_accounting_item,
         )
         from core.futures_bot_reconcile import (
@@ -1387,8 +1469,24 @@ class FuturesExitsMixin:
             if not _offline_accounting_retry_due(live):
                 return
             try:
-                durable = self.state.update_many(
-                    sym, {"accounting_pending_partials": pending}
+                durable = update_many_if_current(
+                    self.state,
+                    sym,
+                    {"accounting_pending_partials": pending},
+                    live,
+                )
+                current = self.state.get(sym)
+                durable = bool(
+                    durable
+                    and isinstance(current, dict)
+                    and (
+                        same_position_generation(current, live)
+                        or current == {
+                            **live,
+                            "accounting_pending_partials": pending,
+                        }
+                    )
+                    and current.get("accounting_pending_partials") == pending
                 )
             except Exception as exc:
                 self._log_error(
@@ -1423,8 +1521,11 @@ class FuturesExitsMixin:
                 if not saved:
                     remaining.append(item)
             try:
-                cleared = self.state.update(
-                    sym, "accounting_pending_partials", remaining
+                cleared = update_many_if_current(
+                    self.state,
+                    sym,
+                    {"accounting_pending_partials": remaining},
+                    live,
                 )
             except Exception as exc:
                 cleared = False
@@ -1457,12 +1558,14 @@ class FuturesExitsMixin:
                     or "accounting_retry_next_at" in live
                 ):
                     try:
-                        self.state.update_many(
+                        update_many_if_current(
+                            self.state,
                             sym,
                             {
                                 "accounting_retry_attempts": 0,
                                 "accounting_retry_next_at": 0.0,
                             },
+                            live,
                         )
                     except Exception as exc:
                         self._log_error(
@@ -1925,6 +2028,7 @@ class FuturesExitsMixin:
         try:
             from bot_utils import fetch_or_estimate_funding
             from bot_utils.futures_funding import estimate_funding_paid
+            from bot_utils.trade_state import update_many_if_current
         except ImportError:
             return
 
@@ -1948,9 +2052,12 @@ class FuturesExitsMixin:
                     # refreshes too. Funding right after open is ~0, so deferring
                     # the first read by one interval loses nothing.
                     jitter = abs(hash(sym)) % 600
-                    self.state.update(
-                        sym, "funding_next_check_at",
-                        now_epoch + self._FUNDING_REFRESH_INTERVAL_SEC + jitter)
+                    _persist_futures_funding_schedule(
+                        self.state,
+                        sym,
+                        d,
+                        now_epoch + self._FUNDING_REFRESH_INTERVAL_SEC + jitter,
+                    )
                     continue
                 if _funding_refresh_active(self, sym, next_check):
                     continue  # not yet due
@@ -2006,7 +2113,7 @@ class FuturesExitsMixin:
                     update["funding_paid"] = realized
                 elif current is None:
                     update["funding_paid"] = 0.0
-                self.state.update_many(sym, update)
+                update_many_if_current(self.state, sym, update, d)
             except Exception as _fr_err:
   # Best-effort  don't fail the monitor over a funding refresh.
                 try:
@@ -2267,6 +2374,8 @@ class FuturesExitsMixin:
                         _defer_offline_accounting_retry(self, sym, live)
             except Exception as exc:
                 self._log_error(f"futures pending accounting retry {sym}", exc)
+            return
+        if d.get("verified_flat_pending_accounting") is True:
             return
         if FuturesExitsMixin._claim_conflict_blocks_monitor(self, sym, d):
             return
@@ -2794,7 +2903,9 @@ class FuturesExitsMixin:
         if initial_liq_dist <= 0:
             initial_liq_dist = max(1.0, 100.0 / max(1.0, lev))
             try:
-                self.state.update(sym, "initial_liq_distance", initial_liq_dist)
+                _persist_futures_initial_liq_distance(
+                    self.state, sym, d, initial_liq_dist
+                )
             except Exception:
                 pass
 
@@ -3042,9 +3153,19 @@ class FuturesExitsMixin:
                     shadow_cache.pop(next(iter(shadow_cache)))
                 d["time_decay_shadow_seen"] = True
                 try:
-                    self.state.update(
-                        sym, "time_decay_shadow_seen", True
-                    )
+                    if callable(getattr(self.state, "update_many", None)):
+                        from bot_utils.trade_state import update_many_if_current
+
+                        update_many_if_current(
+                            self.state,
+                            sym,
+                            {"time_decay_shadow_seen": True},
+                            d,
+                        )
+                    else:
+                        self.state.update(
+                            sym, "time_decay_shadow_seen", True
+                        )
                 except Exception:  # noqa: BLE001 -- telemetry must not block exits
                     self._time_decay_shadow_persist_failed = True
             if decay.should_exit:
@@ -3139,10 +3260,8 @@ class FuturesExitsMixin:
                 )
                 return False
             try:
-                funding_persisted = self.state.update(
-                    sym,
-                    "funding_paid",
-                    exact_funding,
+                funding_persisted = _persist_futures_partial_exact_funding(
+                    self.state, sym, d, exact_funding,
                 )
             except Exception:
                 funding_persisted = False
@@ -3158,6 +3277,18 @@ class FuturesExitsMixin:
         amount_total = FuturesExitsMixin._safe_nonnegative_amount(
             d.get("amount", 0))
         if amount_total <= 0:
+            return False
+        initial_entry_fee = FuturesExitsMixin._safe_finite_float(
+            d.get("initial_entry_fee", d.get("fees_paid", 0.0)), None
+        )
+        original_amount = FuturesExitsMixin._safe_finite_float(
+            d.get("original_amount", d.get("amount", 0)), None
+        )
+        if initial_entry_fee is None or original_amount is None:
+            log_event(
+                f"{sym}: partial-TP accounting state invalid before submit",
+                "ERROR",
+            )
             return False
         raw_partial = (
             FuturesExitsMixin._safe_nonnegative_amount(
@@ -3555,10 +3686,13 @@ class FuturesExitsMixin:
                 if not order_is_terminal:
                     if actual_filled > observed_filled + fill_tolerance:
                         try:
-                            observed_persisted = self.state.update(
-                                sym,
-                                _PARTIAL_EXIT_OBSERVED_FILLED,
-                                actual_filled,
+                            observed_persisted = (
+                                _persist_futures_partial_fill_checkpoint(
+                                    self.state,
+                                    sym,
+                                    d,
+                                    actual_filled,
+                                )
                             )
                         except Exception as e:
                             observed_persisted = False
@@ -3639,9 +3773,6 @@ class FuturesExitsMixin:
         pnl_partial, _ = calc_unrealized_pnl(entry, fill_price,
                                               notional_partial / max(lev, 1),
                                               lev, pos_type)
-        initial_entry_fee = float(d.get("initial_entry_fee",
-                                          d.get("fees_paid", 0.0)))
-        original_amount = float(d.get("original_amount", d.get("amount", 0)))
   # Safe helpers  partial_sold=False because THIS IS the partial. They
         # defend against state corruption leaving original and amount = 0
         # (division crash).
@@ -3717,13 +3848,18 @@ class FuturesExitsMixin:
         }
         if d.get("entry_funding_window_unverified") is True:
             updates["funding_paid"] = d["funding_paid"]
-        from bot_utils.trade_state import normalize_pending_accounting_items
+        from bot_utils.trade_state import (
+            normalize_pending_accounting_items,
+            update_many_if_current,
+        )
         pending = normalize_pending_accounting_items(
             d.get("accounting_pending_partials"))
         pending.append(partial_trade)
         updates["accounting_pending_partials"] = pending
         try:
-            state_persisted = self.state.update_many(sym, updates)
+            state_persisted = _persist_futures_partial_accounting_wal(
+                self.state, sym, d, updates,
+            )
         except Exception as e:
             state_persisted = False
             log_event(f"Partial-TP {sym}: state write-ahead failed: {e}", "ERROR")
@@ -3742,8 +3878,11 @@ class FuturesExitsMixin:
             log_event(f"save_trade_db partial {sym} failed: {e}", "WARN")
         if accounting_ok:
             try:
-                cleared = self.state.update(
-                    sym, "accounting_pending_partials", pending[:-1]
+                cleared = update_many_if_current(
+                    self.state,
+                    sym,
+                    {"accounting_pending_partials": pending[:-1]},
+                    d,
                 )
             except Exception as e:
                 cleared = False
@@ -4288,8 +4427,28 @@ class FuturesExitsMixin:
             pending_close["accounting_pending_funding_unverified"] = False
         if not self.simulation:
             pending_close.update(_futures_full_exit_clear_fields())
+        from bot_utils.trade_state import (
+            same_position_generation,
+            update_many_if_current,
+        )
         try:
-            pending_persisted = self.state.update_many(sym, pending_close)
+            pending_persisted = update_many_if_current(
+                self.state, sym, pending_close, d
+            )
+            getter = getattr(self.state, "get", None)
+            if pending_persisted and callable(getter):
+                current = getter(sym)
+                pending_persisted = bool(
+                    (
+                        same_position_generation(current, d)
+                        or current == {**d, **pending_close}
+                    )
+                    and isinstance(current, dict)
+                    and all(
+                        current.get(key) == value
+                        for key, value in pending_close.items()
+                    )
+                )
         except Exception as state_err:
             pending_persisted = False
             self._log_error(

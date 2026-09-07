@@ -117,21 +117,25 @@ def _ensure_spot_exit_client_order_id(bot, sym: str, row: dict,
 
 def _mark_spot_exit_outcome_uncertain(bot, sym: str, row: dict,
                                       leg: str) -> bool:
+    from bot_utils.trade_state import update_many_if_current
+
     key = f"{leg}_exit_outcome_uncertain"
-    persisted = bot.state.update(
-        sym, key, True
+    persisted = update_many_if_current(
+        bot.state, sym, {key: True}, row
     )
     row[key] = True
-    return persisted is None or persisted is True
+    return persisted
 
 
 def _reset_spot_exit_intent(bot, sym: str, row: dict, leg: str) -> bool:
+    from bot_utils.trade_state import update_many_if_current
+
     updates = {
         f"{leg}_exit_client_order_id": None,
         f"{leg}_exit_outcome_uncertain": False,
         f"{leg}_exit_requested_amount": None,
     }
-    persisted = bot.state.update_many(sym, updates)
+    persisted = update_many_if_current(bot.state, sym, updates, row)
     if persisted is None or persisted is True:
         row.update(updates)
         return True
@@ -277,8 +281,13 @@ class ExitsMixin:
                 )
                 seen.add(str(trigger["rule"]))
             persisted = sorted(seen)
-            persist_result = self.state.update_many(
-                sym, {"spot_exit_shadow_triggered_rules": persisted}
+            from bot_utils.trade_state import update_many_if_current
+
+            persist_result = update_many_if_current(
+                self.state,
+                sym,
+                {"spot_exit_shadow_triggered_rules": persisted},
+                d,
             )
             d["spot_exit_shadow_triggered_rules"] = persisted
             if persist_result is not None and persist_result is not True:
@@ -294,6 +303,8 @@ class ExitsMixin:
     def _retry_pending_partial_accounting(self, sym: str, d: dict) -> None:
         from bot_utils.trade_state import (
             normalize_pending_accounting_items,
+            same_position_generation,
+            update_many_if_current,
             validated_pending_partial_accounting_item,
         )
         from core.spot_bot_reconcile import (
@@ -325,8 +336,24 @@ class ExitsMixin:
             if not _spot_accounting_retry_due(live):
                 return
             try:
-                durable = self.state.update_many(
-                    sym, {"accounting_pending_partials": pending}
+                durable = update_many_if_current(
+                    self.state,
+                    sym,
+                    {"accounting_pending_partials": pending},
+                    live,
+                )
+                current = self.state.get(sym)
+                durable = bool(
+                    durable
+                    and isinstance(current, dict)
+                    and (
+                        same_position_generation(current, live)
+                        or current == {
+                            **live,
+                            "accounting_pending_partials": pending,
+                        }
+                    )
+                    and current.get("accounting_pending_partials") == pending
                 )
             except Exception as exc:
                 self._log_error(
@@ -359,8 +386,11 @@ class ExitsMixin:
                 if not saved:
                     remaining.append(item)
             try:
-                cleared = self.state.update(
-                    sym, "accounting_pending_partials", remaining
+                cleared = update_many_if_current(
+                    self.state,
+                    sym,
+                    {"accounting_pending_partials": remaining},
+                    live,
                 )
             except Exception as exc:
                 cleared = False
@@ -389,12 +419,14 @@ class ExitsMixin:
                     or "accounting_retry_next_at" in live
                 ):
                     try:
-                        self.state.update_many(
+                        update_many_if_current(
+                            self.state,
                             sym,
                             {
                                 "accounting_retry_attempts": 0,
                                 "accounting_retry_next_at": 0.0,
                             },
+                            live,
                         )
                     except Exception as exc:
                         self._log_error(
@@ -487,6 +519,20 @@ class ExitsMixin:
                 pass
             try:
                 trades = self.state.get_all()
+                verified_flat = {
+                    sym: row for sym, row in trades.items()
+                    if row.get("verified_flat_pending_accounting") is True
+                }
+                for sym, row in verified_flat.items():
+                    try:
+                        self._check_position_exits(sym, row, 0.0)
+                    except Exception as exc:
+                        self._log_error(f"monitor recovery {sym}", exc)
+                if verified_flat:
+                    trades = {
+                        sym: row for sym, row in trades.items()
+                        if sym not in verified_flat
+                    }
                 price_health_pruner = getattr(
                     self, "_prune_spot_price_unavailable", None
                 )
@@ -659,7 +705,7 @@ class ExitsMixin:
                 # uses (safe_proportional_fee), so partial-sold positions don't
                 # re-subtract the already-realized partial-close fee.
                 partial_sold = bool(d.get("partial_sold"))
-                initial_entry_fee = _positive_finite(
+                initial_entry_fee = _finite_float(
                     d.get(
                         "initial_entry_fee",
                         0.0 if partial_sold else d.get("fees_paid", 0.0),
@@ -940,6 +986,10 @@ class ExitsMixin:
         batch fetch_tickers rather than N single-ticker calls.
         """
         from core.logger import log_event
+        from bot_utils.trade_state import (
+            same_position_generation,
+            update_many_if_current,
+        )
         from trading.market_filters import get_btc_change
         try:
             try:
@@ -983,7 +1033,31 @@ class ExitsMixin:
                     if curr <= 0:
                         continue
                     if curr > d.get("buy", 0):
-                        self.state.update(sym, "break_even", True)
+                        if callable(getattr(self.state, "update_many", None)):
+                            persisted = update_many_if_current(
+                                self.state, sym, {"break_even": True}, d
+                            )
+                        else:
+                            result = self.state.update(
+                                sym, "break_even", True
+                            )
+                            persisted = result is None or result is True
+                        if not persisted:
+                            log_event(
+                                f" BTC stress: {sym} break-even transition "
+                                "is not durable; protection not confirmed",
+                                "ERROR",
+                            )
+                            continue
+                        getter = getattr(self.state, "get", None)
+                        if callable(getter):
+                            current = getter(sym)
+                            if (
+                                not same_position_generation(current, d)
+                                or current.get("break_even") is not True
+                            ):
+                                continue
+                        d["break_even"] = True
                         log_event(
                             f" BTC stress (1h: {btc_1h:+.2f}%)  "
                             f"{sym} forced to break-even", "WARN"
@@ -1009,28 +1083,9 @@ class ExitsMixin:
         if d.get("accounting_already_booked"):
             ExitsMixin._cleanup_accounted_close_state(self, sym, d)
             return
-        warned_incidents = getattr(
-            self, "_verified_flat_accounting_incidents", None
-        )
-        if not isinstance(warned_incidents, dict):
-            warned_incidents = {}
-            self._verified_flat_accounting_incidents = warned_incidents
-        if d.get("verified_flat_pending_accounting"):
-            incident = (
-                str(d.get("verified_flat_at") or ""),
-                str(d.get("verified_flat_reason") or ""),
-            )
-            if warned_incidents.get(sym) != incident:
-                log_event(
-                    f"{sym}: position already verified flat; waiting for "
-                    f"combined offline accounting",
-                    "WARN",
-                )
-                warned_incidents[sym] = incident
-            return
-        warned_incidents.pop(sym, None)
         if d.get("accounting_pending"):
             from core.symbol_locks import close_lock
+            from bot_utils.trade_state import update_many_if_current
             try:
                 with close_lock(
                     sym,
@@ -1057,7 +1112,9 @@ class ExitsMixin:
                         if key == "accounting_pending"
                         or key.startswith("accounting_pending_")
                     }
-                    durable = self.state.update_many(sym, pending_fields)
+                    durable = update_many_if_current(
+                        self.state, sym, pending_fields, live
+                    )
                     if durable is not None and durable is not True:
                         log_event(
                             f" {sym}: pending full accounting retry deferred; "
@@ -1085,6 +1142,26 @@ class ExitsMixin:
             except Exception as exc:
                 self._log_error(f"spot pending accounting retry {sym}", exc)
             return
+        warned_incidents = getattr(
+            self, "_verified_flat_accounting_incidents", None
+        )
+        if not isinstance(warned_incidents, dict):
+            warned_incidents = {}
+            self._verified_flat_accounting_incidents = warned_incidents
+        if d.get("verified_flat_pending_accounting"):
+            incident = (
+                str(d.get("verified_flat_at") or ""),
+                str(d.get("verified_flat_reason") or ""),
+            )
+            if warned_incidents.get(sym) != incident:
+                log_event(
+                    f"{sym}: position already verified flat; waiting for "
+                    f"combined offline accounting",
+                    "WARN",
+                )
+                warned_incidents[sym] = incident
+            return
+        warned_incidents.pop(sym, None)
         if d.get("claim_conflict"):
             warned = getattr(self, "_claim_conflict_warned", set())
             if sym not in warned:
@@ -1531,6 +1608,7 @@ class ExitsMixin:
         from core.logger import log_event, send_telegram
         from core.database import save_trade_db
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+        from bot_utils.trade_state import update_many_if_current
 
         buy = _positive_finite(d.get("buy"))
         amount = _positive_finite(d.get("amount"))
@@ -1569,10 +1647,13 @@ class ExitsMixin:
                 request_key = "partial_exit_requested_amount"
                 durable_request = _positive_finite(d.get(request_key))
                 if durable_request <= 0:
-                    persisted = self.state.update(
-                        sym, request_key, requested_sell
+                    persisted = update_many_if_current(
+                        self.state,
+                        sym,
+                        {request_key: requested_sell},
+                        d,
                     )
-                    if persisted is not None and persisted is not True:
+                    if not persisted:
                         log_event(
                             f" {sym}: cannot persist partial-TP amount before "
                             "live sell",
@@ -1716,7 +1797,7 @@ class ExitsMixin:
 
         # Compute PnL with proportional entry fee
         real_prof_pct = ((fill_price - buy) / buy) * 100 if buy > 0 else 0.0
-        initial_entry_fee = _positive_finite(
+        initial_entry_fee = _finite_float(
             d.get("initial_entry_fee", d.get("fees_paid", 0.0)))
         original_amount = _positive_finite(d.get("original_amount"))
         if original_amount <= 0:
@@ -1762,7 +1843,7 @@ class ExitsMixin:
         # disk after its partial PnL was already committed.
         new_invested = max(0.0, current_invested - sold_invested)
         new_amount = safe_remaining(amount, sold_amount)
-        new_fees_paid = _positive_finite(d.get("fees_paid", 0.0)) + partial_fee
+        new_fees_paid = _finite_float(d.get("fees_paid", 0.0)) + partial_fee
         updates = {
             "partial_sold": True,
             "invested_usdt": new_invested,
@@ -1777,13 +1858,36 @@ class ExitsMixin:
             "partial_tp_blocked_min_notional": False,
             "partial_tp_blocked_min_notional_until": 0.0,
         }
-        from bot_utils.trade_state import normalize_pending_accounting_items
+        from bot_utils.trade_state import (
+            normalize_pending_accounting_items,
+            same_position_generation,
+            update_many_if_current,
+        )
         pending = normalize_pending_accounting_items(
             d.get("accounting_pending_partials"))
         pending.append(partial_trade)
         updates["accounting_pending_partials"] = pending
         try:
-            state_persisted = self.state.update_many(sym, updates)
+            state_persisted = update_many_if_current(
+                self.state,
+                sym,
+                updates,
+                d,
+            )
+            getter = getattr(self.state, "get", None)
+            if state_persisted and callable(getter):
+                current = getter(sym)
+                state_persisted = bool(
+                    (
+                        same_position_generation(current, d)
+                        or current == {**d, **updates}
+                    )
+                    and isinstance(current, dict)
+                    and all(
+                        current.get(key) == value
+                        for key, value in updates.items()
+                    )
+                )
         except Exception as e:
             state_persisted = False
             self._log_error(f"spot partial state write-ahead {sym}", e)
@@ -1805,8 +1909,11 @@ class ExitsMixin:
             self._log_error(f"spot partial save_trade_db {sym}", e)
         if accounting_ok:
             try:
-                cleared = self.state.update(
-                    sym, "accounting_pending_partials", pending[:-1]
+                cleared = update_many_if_current(
+                    self.state,
+                    sym,
+                    {"accounting_pending_partials": pending[:-1]},
+                    d,
                 )
             except Exception as e:
                 cleared = False
@@ -2114,8 +2221,13 @@ class ExitsMixin:
                         "verified_flat_at": _utc_now_str(),
                     }
                     try:
-                        flat_persisted = self.state.update_many(
-                            sym, flat_pending
+                        from bot_utils.trade_state import update_many_if_current
+
+                        flat_persisted = update_many_if_current(
+                            self.state,
+                            sym,
+                            flat_pending,
+                            d,
                         )
                     except Exception as state_err:
                         flat_persisted = False
@@ -2176,7 +2288,7 @@ class ExitsMixin:
         # Proportional entry fee  safe helper won't double-deduct if
         # original_amount is missing AND a partial-TP already executed.
         partial_sold = bool(d.get("partial_sold"))
-        initial_entry_fee = _positive_finite(
+        initial_entry_fee = _finite_float(
             d.get(
                 "initial_entry_fee",
                 0.0 if partial_sold else d.get("fees_paid", 0.0),
@@ -2189,7 +2301,7 @@ class ExitsMixin:
             initial_entry_fee, remaining_amount, original_amount,
             partial_sold=partial_sold
         )
-        accumulated_fees = _positive_finite(d.get("fees_paid", 0.0)) + close_fee
+        accumulated_fees = _finite_float(d.get("fees_paid", 0.0)) + close_fee
         profit_usdt = round(
             remaining_amount * (fill_price - buy)
             - proportional_entry_fee - close_fee, 2
@@ -2221,7 +2333,14 @@ class ExitsMixin:
                 "verified_flat_exchange_order_id": exch_oid,
             }
             try:
-                flat_persisted = self.state.update_many(sym, flat_pending)
+                from bot_utils.trade_state import update_many_if_current
+
+                flat_persisted = update_many_if_current(
+                    self.state,
+                    sym,
+                    flat_pending,
+                    d,
+                )
             except Exception as state_err:
                 flat_persisted = False
                 self._log_error(
@@ -2278,7 +2397,11 @@ class ExitsMixin:
             remaining_after_fill = safe_remaining(
                 requested_amount, remaining_amount
             )
-            from bot_utils.trade_state import normalize_pending_accounting_items
+            from bot_utils.trade_state import (
+                normalize_pending_accounting_items,
+                same_position_generation,
+                update_many_if_current,
+            )
             pending_partials = normalize_pending_accounting_items(
                 d.get("accounting_pending_partials")
             )
@@ -2299,7 +2422,26 @@ class ExitsMixin:
                 **residual_intent_updates,
             }
             try:
-                pending_persisted = self.state.update_many(sym, partial_state)
+                pending_persisted = update_many_if_current(
+                    self.state,
+                    sym,
+                    partial_state,
+                    d,
+                )
+                getter = getattr(self.state, "get", None)
+                if pending_persisted and callable(getter):
+                    current = getter(sym)
+                    pending_persisted = bool(
+                        (
+                            same_position_generation(current, d)
+                            or current == {**d, **partial_state}
+                        )
+                        and isinstance(current, dict)
+                        and all(
+                            current.get(key) == value
+                            for key, value in partial_state.items()
+                        )
+                    )
             except Exception as state_err:
                 pending_persisted = False
                 self._log_error(
@@ -2313,6 +2455,11 @@ class ExitsMixin:
                 )
                 return
         else:
+            from bot_utils.trade_state import (
+                same_position_generation,
+                update_many_if_current,
+            )
+
             pending_close = {
                 "accounting_pending": True,
                 "accounting_pending_reason": reason,
@@ -2331,7 +2478,26 @@ class ExitsMixin:
                 "accounting_pending_giveback_pct": giveback_pct,
             }
             try:
-                pending_persisted = self.state.update_many(sym, pending_close)
+                pending_persisted = update_many_if_current(
+                    self.state,
+                    sym,
+                    pending_close,
+                    d,
+                )
+                getter = getattr(self.state, "get", None)
+                if pending_persisted and callable(getter):
+                    current = getter(sym)
+                    pending_persisted = bool(
+                        (
+                            same_position_generation(current, d)
+                            or current == {**d, **pending_close}
+                        )
+                        and isinstance(current, dict)
+                        and all(
+                            current.get(key) == value
+                            for key, value in pending_close.items()
+                        )
+                    )
             except Exception as state_err:
                 pending_persisted = False
                 self._log_error(
@@ -2361,10 +2527,11 @@ class ExitsMixin:
             return
         if partial_live_fill:
             try:
-                cleared = self.state.update(
+                cleared = update_many_if_current(
+                    self.state,
                     sym,
-                    "accounting_pending_partials",
-                    pending_partials[:-1],
+                    {"accounting_pending_partials": pending_partials[:-1]},
+                    d,
                 )
             except Exception as state_err:
                 cleared = False

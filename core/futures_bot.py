@@ -393,10 +393,26 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 or latest.get(self._SIM_TCA_PENDING_FIELD) != pending
             ):
                 raise RuntimeError("SIM TCA state changed before WAL clear")
-            cleared = self.state.update_many(
-                base, {self._SIM_TCA_PENDING_FIELD: None}
+            from bot_utils.trade_state import (
+                same_position_generation,
+                update_many_if_current,
+            )
+
+            clear_fields = {self._SIM_TCA_PENDING_FIELD: None}
+            cleared = update_many_if_current(
+                self.state, base, clear_fields, latest,
             )
             if cleared is not None and cleared is not True:
+                raise RuntimeError("SIM TCA WAL clear was not durable")
+            current = self.state.get(base)
+            if not (
+                isinstance(current, dict)
+                and (
+                    same_position_generation(current, latest)
+                    or current == {**latest, **clear_fields}
+                )
+                and current.get(self._SIM_TCA_PENDING_FIELD) is None
+            ):
                 raise RuntimeError("SIM TCA WAL clear was not durable")
             return True
         except Exception as exc:
@@ -1783,6 +1799,14 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 ),
                 "storage_health": {
                     "capacity_ok": capacity_ok,
+                    "measurement_complete": (
+                        raw_storage.get("measurement_complete")
+                        if type(raw_storage.get("measurement_complete")) is bool
+                        else None
+                    ),
+                    "measurement_errors": bounded_nonnegative(
+                        raw_storage.get("measurement_errors")
+                    ),
                     "total_bytes": bounded_nonnegative(
                         raw_storage.get("total_bytes")
                     ),
@@ -1806,6 +1830,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     ),
                     "filesystem_capacity_bytes": bounded_nonnegative(
                         raw_storage.get("filesystem_capacity_bytes")
+                    ),
+                    "filesystem_probe_error": bounded_text(
+                        raw_storage.get("filesystem_probe_error"),
+                        max_chars=164,
                     ),
                     "headroom_ratio": bounded_float(
                         raw_storage.get("headroom_ratio")

@@ -25,6 +25,7 @@ from bot_utils.futures_order import (
     _order_id_text,
     _order_from_recovery_trades,
     _order_refresh_conflicts,
+    _trade_info_for_order_evidence,
     create_order_with_retry,
     extract_or_estimate_futures_fee,
     futures_contract_size,
@@ -78,10 +79,31 @@ def _block_emergency_fragment(bot_name, sym) -> None:
 
 
 def _persist_emergency_fragment(
-    *, state, sym, fields, bot_name, log_event, error_logger
+    *, state, sym, fields, expected_row, bot_name, log_event, error_logger
 ) -> bool:
     try:
-        persisted = state.update_many(sym, fields)
+        from bot_utils.trade_state import (
+            same_position_generation,
+            update_many_if_current,
+        )
+
+        persisted = update_many_if_current(
+            state, sym, fields, expected_row,
+        )
+        getter = getattr(state, "get", None)
+        if persisted and callable(getter):
+            current = getter(sym)
+            persisted = bool(
+                (
+                    same_position_generation(current, expected_row)
+                    or current == {**expected_row, **fields}
+                )
+                and isinstance(current, dict)
+                and all(
+                    current.get(key) == value
+                    for key, value in fields.items()
+                )
+            )
     except Exception as exc:
         persisted = False
         if error_logger:
@@ -221,17 +243,24 @@ def _trade_order_ids(trade: dict) -> set[str]:
     }
 
 
-def _trade_as_order_snapshot(trade: dict, order_id: str) -> dict:
+def _trade_as_order_snapshot(
+    trade: dict,
+    order_id: str,
+    exchange_id: str = "",
+) -> dict:
     snapshot = dict(trade)
     snapshot["id"] = order_id
     snapshot.pop("order", None)
     for key in ("orderId", "order_id", "orderID"):
         snapshot.pop(key, None)
-    info = snapshot.get("info")
-    if isinstance(info, dict):
-        info = dict(info)
+    info, trade_side_valid = _trade_info_for_order_evidence(
+        trade, exchange_id
+    )
+    if isinstance(trade.get("info"), dict):
         info.pop("id", None)
         snapshot["info"] = info
+    if not trade_side_valid:
+        snapshot["_bot_recovery_conflict"] = True
     return snapshot
 
 
@@ -248,6 +277,18 @@ def _resolve_fill_price(ex,
                         ) -> Tuple[float, str]:
     """Multi-stage fill-price recovery  returns (price, source_label)."""
     fallback = _positive_finite_or_zero(fallback_price)
+
+    def _trade_identity_conflict_fallback() -> Tuple[float, str]:
+        try:
+            log_event(
+                "fetch_my_trades fill price conflicts with close order "
+                "identity; using fallback",
+                "ERROR",
+            )
+        except Exception:
+            pass
+        return fallback, "fallback"
+
     fp = _extract_fill_from_order(order)
     if fp is not None:
         return fp, "order"
@@ -374,7 +415,7 @@ def _resolve_fill_price(ex,
                 if order_id in trade_order_ids and trade_order_ids != {
                     order_id
                 }:
-                    return fallback, "fallback"
+                    return _trade_identity_conflict_fallback()
                 if trade_order_ids == {order_id}:
                     same_order.append(trade)
             if not same_order:
@@ -382,7 +423,9 @@ def _resolve_fill_price(ex,
             for trade in same_order:
                 if _order_refresh_conflicts(
                     order,
-                    _trade_as_order_snapshot(trade, order_id),
+                    _trade_as_order_snapshot(
+                        trade, order_id, _exchange_id(ex)
+                    ),
                     symbol_full,
                     expected_side,
                     expected_position_side,
@@ -391,12 +434,13 @@ def _resolve_fill_price(ex,
                     allow_one_way_position_side=True,
                     expected_client_id=bound_client_id or None,
                 ):
-                    return fallback, "fallback"
+                    return _trade_identity_conflict_fallback()
             recovered = _order_from_recovery_trades(
                 same_order,
                 bound_client_id,
                 symbol_full,
                 expected_amount=expected_amount,
+                exchange_id=_exchange_id(ex),
             )
             expected_trade_filled = _positive_finite_or_zero(
                 order.get("filled") if isinstance(order, dict) else None
@@ -424,7 +468,7 @@ def _resolve_fill_price(ex,
                 expected_client_id=bound_client_id or None,
                 expected_amount=expected_amount,
             ):
-                return fallback, "fallback"
+                return _trade_identity_conflict_fallback()
             fp = _extract_fill_from_order(recovered)
             if fp is not None:
                 return fp, "trades"
@@ -737,7 +781,11 @@ def _close_single_position_impl(*,
         order = None
         # contractSize-aware fee math  needed for contract_size != 1 coins
         # (1000SATS, MEME, ).
-        _cs = futures_contract_size(ex, symbol_full)
+        _cs = _positive_finite_or_zero(d.get("entry_contract_size"))
+        if _cs <= 0:
+            _cs = _positive_finite_or_zero(d.get("contract_size"))
+        if _cs <= 0:
+            _cs = futures_contract_size(ex, symbol_full)
 
         if simulation:
             fill_price = curr
@@ -917,6 +965,7 @@ def _close_single_position_impl(*,
                         state=state,
                         sym=sym,
                         fields=fragment_update,
+                        expected_row=d,
                         bot_name=bot_name,
                         log_event=log_event,
                         error_logger=error_logger,
@@ -1059,6 +1108,7 @@ def _close_single_position_impl(*,
                     state=state,
                     sym=sym,
                     fields=gap_update,
+                    expected_row=d,
                     bot_name=bot_name,
                     log_event=log_event,
                     error_logger=error_logger,
@@ -1114,7 +1164,7 @@ def _close_single_position_impl(*,
         pnl_usdt, _ = (calc_unrealized_pnl(entry, fill_price, margin, lev, pos_type)
                         if entry > 0 and margin > 0 else (0.0, 0.0))
 
-        initial_entry_fee = _positive_finite_or_zero(d.get(
+        initial_entry_fee = _finite_or_default(d.get(
             "initial_entry_fee", d.get("fees_paid", 0.0)))
         original_amount = _positive_finite_or_default(
             d.get("original_amount", amount), amount)
@@ -1218,7 +1268,28 @@ def _close_single_position_impl(*,
             pending_close["entry_funding_window_unverified"] = False
             pending_close["accounting_pending_funding_unverified"] = False
         try:
-            pending_persisted = state.update_many(sym, pending_close)
+            from bot_utils.trade_state import (
+                same_position_generation,
+                update_many_if_current,
+            )
+
+            pending_persisted = update_many_if_current(
+                state, sym, pending_close, d,
+            )
+            getter = getattr(state, "get", None)
+            if pending_persisted and callable(getter):
+                current = getter(sym)
+                pending_persisted = bool(
+                    (
+                        same_position_generation(current, d)
+                        or current == {**d, **pending_close}
+                    )
+                    and isinstance(current, dict)
+                    and all(
+                        current.get(key) == value
+                        for key, value in pending_close.items()
+                    )
+                )
         except Exception as state_err:
             pending_persisted = False
             if error_logger:

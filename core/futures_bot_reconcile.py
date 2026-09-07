@@ -50,6 +50,30 @@ def _positive_float_or_none(value) -> float | None:
     return parsed if parsed is not None and parsed > 0 else None
 
 
+def _durable_contract_size_evidence(
+    row: dict,
+) -> tuple[bool, float | None]:
+    stored = [
+        row.get(key)
+        for key in ("entry_contract_size", "contract_size")
+        if key in row and row.get(key) is not None
+    ]
+    if not stored:
+        return False, None
+    validated = []
+    for candidate in stored:
+        value = _positive_float_or_none(candidate)
+        if value is None:
+            return True, None
+        validated.append(value)
+    if any(
+        not math.isclose(value, validated[0], rel_tol=1e-12)
+        for value in validated[1:]
+    ):
+        return True, None
+    return True, validated[0]
+
+
 def _positive_abs_float_or_none(value) -> float | None:
     parsed = _finite_float_or_none(value)
     if parsed is None:
@@ -188,6 +212,35 @@ def _defer_offline_accounting_retry(bot, sym: str, row: dict) -> float:
     except Exception:
         pass
     return delay
+
+
+def _persist_offline_accounting_replay(
+    state, sym: str, row: dict, fields: dict,
+) -> bool:
+    getter = getattr(state, "get", None)
+    if callable(getter):
+        from bot_utils.trade_state import (
+            same_position_generation,
+            update_many_if_current,
+        )
+
+        current = getter(sym)
+        if not same_position_generation(current, row) and current != row:
+            return False
+        if not update_many_if_current(state, sym, fields, row):
+            return False
+        current = getter(sym)
+        if not same_position_generation(current, row) and current != {
+            **row,
+            **fields,
+        }:
+            return False
+        return isinstance(current, dict) and all(
+            key in current and current[key] == value
+            for key, value in fields.items()
+        )
+    result = state.update_many(sym, fields)
+    return result is None or result is True
 
 
 def _safe_identifier(value, *, max_length: int) -> str | None:
@@ -471,7 +524,7 @@ def _position_margin_mode_evidence(
     return observed[0], True
 
 
-def _trade_side(t: dict) -> str:
+def _trade_side(t: dict, exchange_id: str = "") -> str:
     if not isinstance(t, dict):
         return ""
     raw_info = t.get("info")
@@ -484,9 +537,15 @@ def _trade_side(t: dict) -> str:
         if not isinstance(raw, str):
             return ""
         normalized = raw.strip().lower()
-        if normalized in {"buy", "long"}:
+        # MEXC contract trades retain the raw "1"/"2" side in ``info``
+        # alongside CCXT's unified buy/sell value.
+        if normalized in {"buy", "long"} or (
+            exchange_id == "mexc" and normalized == "1"
+        ):
             sides.append("buy")
-        elif normalized in {"sell", "short"}:
+        elif normalized in {"sell", "short"} or (
+            exchange_id == "mexc" and normalized == "2"
+        ):
             sides.append("sell")
         else:
             return ""
@@ -500,8 +559,9 @@ def _is_close_trade_for_position(
     pos_type: str | None,
     *,
     hedge_mode: bool = False,
+    exchange_id: str = "",
 ) -> bool:
-    side = _trade_side(t)
+    side = _trade_side(t, exchange_id)
     ptype = str(pos_type or "").upper()
     reduce_only, reduce_valid = _trade_reduce_only_evidence(t)
     position_leg, leg_valid = _trade_position_leg_evidence(t)
@@ -668,6 +728,7 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
     hedge_mode = _reconcile_hedge_mode_or_none(bot)
     if hedge_mode is None:
         return 0.0, 0.0, "unavailable"
+    exchange_id = str(getattr(bot.ex, "id", "") or "").strip().lower()
     try:
         api_reservation = try_consume_api_call(
             "futures_reconcile_fetch_my_trades",
@@ -700,6 +761,7 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
     eligible_trades = []
     seen_trade_ids: dict[str, dict] = {}
     unidentified_trades: list[dict] = []
+    rejected_side_evidence: dict | None = None
     for trade in trades:
         if not isinstance(trade, dict):
             _record_fetch_error()
@@ -733,6 +795,7 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
             trade,
             pos_type,
             hedge_mode=hedge_mode,
+            exchange_id=exchange_id,
         ):
             _record_fetch_error()
             return 0.0, 0.0, "unavailable"
@@ -741,6 +804,22 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
             return 0.0, 0.0, "unavailable"
         if timestamp_ms is None or timestamp_ms < boundary_ms:
             continue
+        if (
+            rejected_side_evidence is None
+            and not _trade_side(trade, exchange_id)
+        ):
+            info = trade.get("info")
+            info = info if isinstance(info, dict) else {}
+            rejected_side_evidence = {
+                "bot_name": str(getattr(bot, "BOT_NAME", "") or ""),
+                "symbol": symbol_full,
+                "exchange_id": exchange_id,
+                "position_type": str(pos_type or "").upper(),
+                "trade_id": order_id_text_or_none(trade.get("id")),
+                "timestamp_ms": timestamp_ms,
+                "unified_side": trade.get("side"),
+                "raw_side": info.get("side"),
+            }
         eligible_trades.append((timestamp_ms, trade))
     eligible_trades.sort(key=lambda item: item[0], reverse=True)
 
@@ -755,6 +834,7 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
             t,
             pos_type,
             hedge_mode=hedge_mode,
+            exchange_id=exchange_id,
         ):
             continue
         used_side_fallback = used_side_fallback or not is_reduce
@@ -787,6 +867,16 @@ def _aggregate_futures_reduce_trades(bot, symbol_full: str,
         if qty + 1e-12 >= target:
             break
     if qty + 1e-12 < target or qty <= 0:
+        if rejected_side_evidence is not None:
+            try:
+                from core.logger import log_struct
+
+                log_struct(
+                    "futures_offline_close_side_rejected",
+                    **rejected_side_evidence,
+                )
+            except Exception:
+                pass
         return 0.0, 0.0, "unavailable"
     if used_side_fallback:
         source = (
@@ -880,14 +970,16 @@ def _append_unpriced_partial(row: dict, item: dict) -> list:
 def _persist_futures_external_partial_state(
     bot,
     sym: str,
+    state_row: dict,
     fields: dict,
 ) -> bool:
     """Persist the physical shrink and any accounting WAL atomically."""
     from core.logger import log_event
 
     try:
-        persisted = bot.state.update_many(sym, fields)
-        durable = persisted is None or persisted is True
+        durable = _persist_offline_accounting_replay(
+            bot.state, sym, state_row, fields
+        )
     except Exception as exc:
         durable = False
         try:
@@ -901,6 +993,32 @@ def _persist_futures_external_partial_state(
             "ERROR",
         )
     return durable
+
+
+def _clear_futures_external_partial_wal(
+    bot,
+    sym: str,
+    state_row: dict,
+    wal_fields: dict,
+    remaining_pending: list,
+) -> bool:
+    state = bot.state
+    if callable(getattr(state, "get", None)) and callable(
+        getattr(state, "update_many", None)
+    ):
+        expected = {**state_row, **wal_fields}
+        return _persist_offline_accounting_replay(
+            state,
+            sym,
+            expected,
+            {"accounting_pending_partials": remaining_pending},
+        )
+    result = state.update(
+        sym,
+        "accounting_pending_partials",
+        remaining_pending,
+    )
+    return result is None or result is True
 
 
 def _is_fresh_position(state_row: dict, max_age_s: float) -> bool:
@@ -1012,9 +1130,13 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
         return False, {}
 
     symbol_full = f"{sym}/USDT:USDT"
-    contract_size = futures_contract_size_or_none(
-        getattr(bot, "ex", None), symbol_full
+    durable_contract_size, contract_size = _durable_contract_size_evidence(
+        state_row
     )
+    if not durable_contract_size:
+        contract_size = futures_contract_size_or_none(
+            getattr(bot, "ex", None), symbol_full
+        )
     ratio_sold = min(1.0, sold_contracts / local_amt)
     margin_sold = round(margin * ratio_sold, 8)
     margin_remaining = max(0.0, margin - margin_sold)
@@ -1063,7 +1185,7 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
             f" Reconciliation: {sym} external futures partial detected "
             f"but close price unavailable; state shrunk without PnL booking",
             "WARN")
-        _persist_futures_external_partial_state(bot, sym, fields)
+        _persist_futures_external_partial_state(bot, sym, state_row, fields)
         return False, fields
 
     if pos_type == "SHORT":
@@ -1078,7 +1200,7 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
         return False, {}
     if repair_original_amount:
         original_amount = local_amt
-    initial_entry_fee = _nonnegative_float_or_none(state_row.get(
+    initial_entry_fee = _finite_float_or_none(state_row.get(
         "initial_entry_fee", state_row.get("fees_paid", 0))) or 0.0
     funding_total = _finite_float_or_none(state_row.get("funding_paid", 0))
     if funding_total is None:
@@ -1159,7 +1281,9 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
         fields["original_amount"] = local_amt
     pending = _append_pending_partial(state_row, item)
     fields["accounting_pending_partials"] = pending
-    if not _persist_futures_external_partial_state(bot, sym, fields):
+    if not _persist_futures_external_partial_state(
+        bot, sym, state_row, fields
+    ):
         return False, fields
     try:
         saved = save_trade_db(**item) is True
@@ -1171,12 +1295,13 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
             pass
     if saved:
         try:
-            clear_result = bot.state.update(
+            cleared = _clear_futures_external_partial_wal(
+                bot,
                 sym,
-                "accounting_pending_partials",
+                state_row,
+                fields,
                 pending[:-1],
             )
-            cleared = clear_result is None or clear_result is True
         except Exception as exc:
             cleared = False
             try:
@@ -1937,10 +2062,15 @@ class FuturesReconcileMixin:
                                 )
                                 if not side_conflict:
                                     continue
-                                persisted = self.state.update_many(sym, {
-                                    "claim_conflict": True,
-                                    "claim_conflict_reason": side_conflict,
-                                })
+                                persisted = _persist_offline_accounting_replay(
+                                    self.state,
+                                    sym,
+                                    live_row,
+                                    {
+                                        "claim_conflict": True,
+                                        "claim_conflict_reason": side_conflict,
+                                    },
+                                )
                             suffix = "" if persisted else " (persistence failed)"
                             log_event(
                                 f" Reconciliation: {sym} {side_message}; "
@@ -2876,7 +3006,11 @@ class FuturesReconcileMixin:
         from core.logger import log_event, send_telegram
         from core.database import save_trade_db
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-        from bot_utils import safe_proportional_fee, safe_remaining_funding
+        from bot_utils import (
+            futures_contract_size_or_none,
+            safe_proportional_fee,
+            safe_remaining_funding,
+        )
         from bot_utils.futures_order import FUTURES_DEFAULT_TAKER_FEE
 
         try:
@@ -2900,7 +3034,7 @@ class FuturesReconcileMixin:
             lev = _positive_float_or_none(state_row.get("leverage", 1))
             margin = _nonnegative_float_or_none(state_row.get("invested_usdt"))
             buy_time = state_row.get("buy_time", "")
-            initial_entry_fee = _nonnegative_float_or_none(state_row.get(
+            initial_entry_fee = _finite_float_or_none(state_row.get(
                 "initial_entry_fee", state_row.get("fees_paid", 0))) or 0.0
             funding_total = _finite_float_or_none(
                 state_row.get("funding_paid", 0))
@@ -3036,19 +3170,37 @@ class FuturesReconcileMixin:
             # Include contract_size  `amount` is in CONTRACTS, so for
             # contract_size != 1 coins the fee would otherwise be understated by
             # that factor. Mirrors the live close/partial paths.
-            try:
-                _cs = self._get_contract_size(symbol_full)
-            except Exception:
-                _cs = 1.0
-            close_fee = (
-                close_fee_actual
-                if (
-                    _futures_close_fee_is_known(close_source)
-                    and math.isfinite(close_fee_actual)
+            pending_fee_total = None
+            if pending_accounting and close_source == "accounting_pending":
+                pending_fee_total = _finite_float_or_none(
+                    state_row.get("accounting_pending_fees_usdt")
                 )
-                else _estimate_futures_close_fee_usdt(
-                    amount, _cs, close_price, FUTURES_DEFAULT_TAKER_FEE)
-            )
+            if pending_fee_total is not None:
+                close_fee = pending_fee_total
+            elif (
+                _futures_close_fee_is_known(close_source)
+                and math.isfinite(close_fee_actual)
+            ):
+                close_fee = close_fee_actual
+            else:
+                durable_contract_size, _cs = (
+                    _durable_contract_size_evidence(state_row)
+                )
+                if not durable_contract_size:
+                    _cs = futures_contract_size_or_none(
+                        getattr(self, "ex", None), symbol_full
+                    )
+                if _cs is None:
+                    log_event(
+                        f" {sym}: offline-close fee cannot be estimated "
+                        "without verified contract size; state kept for "
+                        "retry",
+                        "WARN",
+                    )
+                    return False
+                close_fee = _estimate_futures_close_fee_usdt(
+                    amount, _cs, close_price, FUTURES_DEFAULT_TAKER_FEE
+                )
             entry_fee = safe_proportional_fee(
                 initial_entry_fee, amount, original_amount,
                 partial_sold=partial_sold,
@@ -3067,11 +3219,9 @@ class FuturesReconcileMixin:
             # its captured realized values over a later ticker estimate.
             net_pnl = round(gross_pnl - entry_fee - close_fee - funding_pd, 4)
             if pending_accounting and close_source == "accounting_pending":
-                close_fee_total = _nonnegative_float_or_none(
-                    state_row.get("accounting_pending_fees_usdt"))
-                if close_fee_total is not None:
+                if pending_fee_total is not None:
                     entry_fee = 0.0
-                    close_fee = close_fee_total
+                    close_fee = pending_fee_total
                 if funding_requires_history:
                     funding_pd = safe_remaining_funding(
                         funding_total,
@@ -3175,7 +3325,9 @@ class FuturesReconcileMixin:
                 "entry_funding_window_unverified": False,
             }
             try:
-                replay_durable = self.state.update_many(sym, replay_fields)
+                replay_durable = _persist_offline_accounting_replay(
+                    self.state, sym, state_row, replay_fields
+                )
             except Exception as exc:
                 replay_durable = False
                 try:
