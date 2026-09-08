@@ -139,19 +139,25 @@ def _trade_info_for_order_evidence(
     raw_side = info.get("side")
     if raw_side in (None, ""):
         return info, True
-    # MEXC's trade endpoint uses 1=buy/2=sell, while its order endpoint uses
-    # 1..4 action codes. Verify against CCXT's unified side before removing
-    # this raw trade-only field from later order-action validation.
-    trade_side = {
-        "1": "buy",
-        "2": "sell",
-        "buy": "buy",
-        "sell": "sell",
-    }.get(str(raw_side).strip().lower())
+    # MEXC contract deal rows use the same 1..4 action codes as orders:
+    # 1=open long, 2=close short, 3=open short, 4=close long. Verify the
+    # resulting order direction against CCXT's unified side. Retain numeric
+    # action evidence so later validation can also prove leg and reduce-only.
+    mexc_action = _mexc_contract_action(raw_side)
+    trade_side = (
+        mexc_action[0]
+        if mexc_action is not None
+        else {"buy": "buy", "sell": "sell"}.get(
+            str(raw_side).strip().lower()
+        )
+    )
     unified_side = _normalize_order_side(trade.get("side"))
     if not trade_side or unified_side != trade_side:
         return info, False
-    info.pop("side", None)
+    if mexc_action is None:
+        # Some adapters expose only a second unified side string in ``info``;
+        # it carries no leg/action evidence and must not be parsed as 1..4.
+        info.pop("side", None)
     return info, True
 
 

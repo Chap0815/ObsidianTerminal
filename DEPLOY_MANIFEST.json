@@ -1,6 +1,6 @@
 {
-  "build_id": "8c618df55e101782",
-  "created_at": "2026-09-07 20:05:20",
+  "build_id": "027dd3f83b9a3fbc",
+  "created_at": "2026-09-08 19:21:49",
   "source": "update_deploy_manifest.py",
   "file_count": 221,
   "files": [
@@ -106,8 +106,8 @@
     },
     {
       "path": "bot_utils/futures_order.py",
-      "sha256": "3205c6982275da47a22a9ebb6f1180ce0eea3c15e8d04d2d6035d56f23a2a8ee",
-      "bytes": 101288
+      "sha256": "8c72f9700a6d9f013b73c21a22efc97fe539e91e34bb6712aa08a3c1559fbe91",
+      "bytes": 101639
     },
     {
       "path": "bot_utils/indicators.py",
@@ -316,8 +316,8 @@
     },
     {
       "path": "core/futures_bot_reconcile.py",
-      "sha256": "e0360ed03bb01ff6a6f7ee80bc0fccfcdf9f603fae2618271b1ec5a0986b10d0",
-      "bytes": 146584
+      "sha256": "68a3b678441b0a85ab057e5dffcb18706198df7e617ae74678df2de1b2ac972a",
+      "bytes": 146768
     },
     {
       "path": "core/futures_bot_scan.py",

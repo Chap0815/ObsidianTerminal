@@ -21,6 +21,7 @@ from bot_utils.api_budget import (
 )
 from bot_utils.futures_order import (
     FUTURES_DEFAULT_TAKER_FEE,
+    _mexc_contract_action,
     _position_contracts_abs,
     position_row_side,
 )
@@ -537,14 +538,19 @@ def _trade_side(t: dict, exchange_id: str = "") -> str:
         if not isinstance(raw, str):
             return ""
         normalized = raw.strip().lower()
-        # MEXC contract trades retain the raw "1"/"2" side in ``info``
+        # MEXC contract deals retain a raw 1..4 action code in ``info``
         # alongside CCXT's unified buy/sell value.
+        mexc_action = (
+            _mexc_contract_action(normalized)
+            if exchange_id == "mexc"
+            else None
+        )
         if normalized in {"buy", "long"} or (
-            exchange_id == "mexc" and normalized == "1"
+            mexc_action is not None and mexc_action[0] == "buy"
         ):
             sides.append("buy")
         elif normalized in {"sell", "short"} or (
-            exchange_id == "mexc" and normalized == "2"
+            mexc_action is not None and mexc_action[0] == "sell"
         ):
             sides.append("sell")
         else:
