@@ -10,7 +10,6 @@ import os
 import re
 import shlex
 import subprocess
-from pathlib import Path
 
 
 def _valid_pid(pid: object) -> bool:
@@ -164,13 +163,29 @@ def _python_invocation_target(cmdline: str) -> tuple[str, str]:
         return "", ""
     executable_name = _norm(tokens[0]).rsplit("/", 1)[-1]
     if not re.fullmatch(
-        r"(?:python(?:w|\d+(?:\.\d+)*)?|pypy\d*|py)(?:\.exe)?",
+        r"(?:python(?:w|\d+(?:\.\d+)*)?|pypy\d*|pyw?)(?:\.exe)?",
         executable_name,
     ):
         return "", ""
     index = 1
     while index < len(tokens):
         token = tokens[index]
+        if token in {
+            "-?",
+            "-h",
+            "--help",
+            "--help-env",
+            "--help-xoptions",
+            "--help-all",
+            "-0",
+            "-0p",
+            "--list",
+            "--list-paths",
+            "-V",
+            "-VV",
+            "--version",
+        }:
+            return "", ""
         if token == "-m":
             if index + 1 >= len(tokens):
                 return "", ""
@@ -182,6 +197,16 @@ def _python_invocation_target(cmdline: str) -> tuple[str, str]:
             if index >= len(tokens):
                 return "", ""
             return "script", _norm(tokens[index])
+        if token == "-":
+            return "", ""
+        if token == "--check-hash-based-pycs":
+            if (
+                index + 1 >= len(tokens)
+                or tokens[index + 1] not in {"always", "default", "never"}
+            ):
+                return "", ""
+            index += 2
+            continue
         if token.startswith("-"):
             index += 2 if token in {"-W", "-X"} else 1
             continue
@@ -194,28 +219,20 @@ def cmdline_bot_match_kind(bot_name: str, cmdline: str) -> str:
     if not cmdline:
         return ""
     try:
-        from launcher.config.settings import BOT_META, PROJECT_ROOT
+        from launcher.config.settings import BOT_META
         meta = BOT_META.get(str(bot_name or "").upper()) or {}
     except Exception:
         return ""
-    low = _norm(cmdline)
     module = _norm(meta.get("module") or "")
     script = _norm(meta.get("script") or "")
-    script_name = _norm(Path(script).name) if script else ""
     invocation_kind, target = _python_invocation_target(cmdline)
     if invocation_kind == "module" and target == module:
         return "module"
-    root = _norm(str(PROJECT_ROOT))
-    root_seen = bool(root and root in low)
     script_seen = bool(
         invocation_kind == "script"
         and (
             target == script
             or target.endswith("/" + script)
-            or (
-                target == script_name
-                and (root_seen or "/bots/" in low)
-            )
         )
     )
     return "script" if script_seen else ""

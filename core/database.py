@@ -6821,6 +6821,7 @@ _API_PRUNE_COUNTER     = 0
 _API_PRUNE_COUNTER_LCK = threading.Lock()
 _API_PRUNE_EVERY_N     = 100
 _API_GATE_ERR_LOG_AT   = 0.0
+_SQLITE_MAX_INTEGER    = (1 << 63) - 1
 
 
 def _log_api_gate_error(exc) -> None:
@@ -7005,8 +7006,8 @@ def mark_global_api_call_error(
     """
     if isinstance(reservation_id, bool) or not isinstance(reservation_id, int):
         raise ValueError("reservation_id must be an integer")
-    if reservation_id <= 0:
-        raise ValueError("reservation_id must be positive")
+    if not 1 <= reservation_id <= _SQLITE_MAX_INTEGER:
+        raise ValueError("reservation_id must be a positive SQLite integer")
     validated_bot = _required_text_db(
         bot_name, "bot_name", max_length=64
     ).upper()

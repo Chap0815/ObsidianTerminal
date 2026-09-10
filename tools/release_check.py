@@ -27,7 +27,10 @@ from tools.release_requirements import (  # noqa: E402, I001
     REQUIRED_RELEASE_ITEMS,
 )
 from tools.update_deploy_manifest import (  # noqa: E402
+    _collect_source_records,
     _is_private_local_config_rel,
+    _is_linklike,
+    _is_release_worktree_layout,
     _is_rotated_log_rel,
     _is_test_temp_name,
     _sync_directory as _sync_policy_directory,
@@ -128,11 +131,27 @@ RUNTIME_MODULE_ROOTS = ("bot_utils", "bots", "core", "trading", "launcher")
 REFERENCE_OPTIONAL_RELEASE_PATHS = {"UPDATE_SETUP.md", "update.bat"}
 
 
+def _file_signature(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
+    byte_count = 0
     with path.open("rb") as fh:
+        before = os.fstat(fh.fileno())
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            byte_count += len(chunk)
             h.update(chunk)
+        after = os.fstat(fh.fileno())
+    if _file_signature(before) != _file_signature(after) or byte_count != before.st_size:
+        raise OSError(f"file changed during hash: {path}")
     return h.hexdigest()
 
 
@@ -144,10 +163,51 @@ def _read_release_text(
     errors: str = "strict",
 ) -> str:
     with path.open("rb") as fh:
+        before = os.fstat(fh.fileno())
         raw = fh.read(max_bytes + 1)
+        after = os.fstat(fh.fileno())
+    with path.open("rb") as verify_fh:
+        verify_before = os.fstat(verify_fh.fileno())
+        verify_raw = verify_fh.read(max_bytes + 1)
+        verify_after = os.fstat(verify_fh.fileno())
+    if (
+        _file_signature(before) != _file_signature(after)
+        or _file_signature(verify_before) != _file_signature(verify_after)
+        or _file_signature(before) != _file_signature(verify_before)
+        or raw != verify_raw
+        or (
+            before.st_size <= max_bytes and len(raw) != before.st_size
+        )
+        or (
+            verify_before.st_size <= max_bytes
+            and len(verify_raw) != verify_before.st_size
+        )
+    ):
+        raise OSError(f"{label} changed during text read")
     if len(raw) > max_bytes:
         raise ValueError(f"{label} exceeds size limit ({max_bytes} bytes)")
     return raw.decode("utf-8-sig", errors=errors)
+
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-finite JSON constant is not allowed: {value}")
+
+
+def _json_object_without_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _strict_json_loads(text: str):
+    return json.loads(
+        text,
+        parse_constant=_reject_json_constant,
+        object_pairs_hook=_json_object_without_duplicate_keys,
+    )
 
 
 def _canonical_manifest_path(value: object) -> str | None:
@@ -585,28 +645,80 @@ def _embedded_secret_reason(text: str) -> str | None:
     return None
 
 
+def _git_command(root: Path, *arguments: str) -> list[str]:
+    return [
+        "git",
+        "-c",
+        f"safe.directory={root.as_posix()}",
+        "-C",
+        str(root),
+        *arguments,
+    ]
+
+
 def _tracked_files(root: Path) -> list[Path] | None:
     """Return git-tracked files, or None when source is not a git worktree."""
+    strict_worktree = _is_release_worktree_layout(root)
     if not (root / ".git").exists():
+        if strict_worktree:
+            raise RuntimeError("release worktree Git inventory is unavailable")
         return None
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), "ls-files"],
+            _git_command(root, "ls-files"),
             text=True,
             capture_output=True,
             timeout=20,
         )
-    except Exception:
+    except Exception as exc:
+        if strict_worktree:
+            raise RuntimeError(
+                "release worktree Git inventory is unavailable"
+            ) from exc
         return None
     if result.returncode != 0:
+        if strict_worktree:
+            raise RuntimeError("release worktree Git inventory is unavailable")
         return None
     files = []
     for line in (result.stdout or "").splitlines():
         rel = line.strip()
         path = root / rel if rel else None
-        if path is not None and path.exists():
+        if path is None:
+            continue
+        if strict_worktree and not path.is_file():
+            raise RuntimeError(f"release worktree tracked file is missing: {rel}")
+        if path.exists():
             files.append(path)
     return files
+
+
+def _release_paths(root: Path) -> list[Path]:
+    pending = [root]
+    paths: list[Path] = []
+    while pending:
+        directory = pending.pop()
+        if directory != root and (
+            _is_linklike(directory)
+            or _resolved_within_root(directory, root) is None
+        ):
+            continue
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name.casefold())
+        except OSError as exc:
+            raise RuntimeError(f"release tree inventory failed: {directory}") from exc
+        child_dirs = []
+        for entry in entries:
+            path = Path(entry.path)
+            relative = path.relative_to(root)
+            if ".git" in relative.parts or _is_ignored_worktree_metadata(path, root):
+                continue
+            paths.append(path)
+            if entry.is_dir(follow_symlinks=False) and not _is_linklike(path):
+                child_dirs.append(path)
+        pending.extend(reversed(child_dirs))
+    return paths
 
 
 def _is_backup_temp_artifact(path: Path) -> bool:
@@ -657,29 +769,21 @@ def _is_forbidden_release_artifact(path: Path, root: Path) -> str | None:
     return None
 
 
-def _runtime_python_inventory(root: Path) -> set[str]:
-    return set(_runtime_python_files(root))
-
-
-def _runtime_python_files(root: Path) -> dict[str, Path]:
-    files: dict[str, Path] = {}
-    for directory in RUNTIME_MODULE_ROOTS:
-        module_root = root / directory
-        if not module_root.is_dir():
-            continue
-        for path in module_root.rglob("*.py"):
-            try:
-                resolved = path.resolve(strict=True)
-                resolved.relative_to(root)
-            except (OSError, ValueError):
-                continue
-            files[path.relative_to(root).as_posix()] = resolved
-    return files
+def _runtime_release_files(root: Path) -> dict[str, dict]:
+    runtime_roots = {part.lower() for part in RUNTIME_MODULE_ROOTS}
+    return {
+        str(item["path"]): item
+        for item in _collect_source_records(root)
+        if str(item["path"]).split("/", 1)[0].lower() in runtime_roots
+    }
 
 
 def _runtime_inventory_errors(root: Path, reference: Path) -> list[str]:
-    release_files = _runtime_python_files(root)
-    reference_files = _runtime_python_files(reference)
+    try:
+        release_files = _runtime_release_files(root)
+        reference_files = _runtime_release_files(reference)
+    except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+        return [f"runtime inventory failed: {exc}"]
     release_modules = set(release_files)
     reference_modules = set(reference_files)
     errors = [
@@ -691,13 +795,7 @@ def _runtime_inventory_errors(root: Path, reference: Path) -> list[str]:
         for rel in sorted(release_modules - reference_modules)
     )
     for rel in sorted(release_modules & reference_modules):
-        try:
-            release_hash = _sha256(release_files[rel])
-            reference_hash = _sha256(reference_files[rel])
-        except OSError as exc:
-            errors.append(f"cannot hash reference runtime module {rel}: {exc}")
-            continue
-        if release_hash != reference_hash:
+        if release_files[rel] != reference_files[rel]:
             errors.append(f"release runtime module differs from reference: {rel}")
     return errors
 
@@ -705,7 +803,11 @@ def _runtime_inventory_errors(root: Path, reference: Path) -> list[str]:
 def _release_payload_reference_errors(root: Path, reference: Path) -> list[str]:
     errors: list[str] = []
     runtime_roots = {part.lower() for part in RUNTIME_MODULE_ROOTS}
-    for item in build_manifest(root).get("files", []):
+    try:
+        manifest_files = build_manifest(root).get("files", [])
+    except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+        return [f"release payload inventory failed: {exc}"]
+    for item in manifest_files:
         rel = str(item["path"]).replace("\\", "/")
         parts = rel.split("/")
         if rel in REFERENCE_OPTIONAL_RELEASE_PATHS:
@@ -713,7 +815,6 @@ def _release_payload_reference_errors(root: Path, reference: Path) -> list[str]:
         if (
             len(parts) > 1
             and parts[0].lower() in runtime_roots
-            and rel.lower().endswith(".py")
         ):
             continue
         reference_path = reference / rel
@@ -773,11 +874,13 @@ def check_release(
     manifest_path = root / "DEPLOY_MANIFEST.json"
     if manifest_path.exists():
         try:
-            manifest = json.loads(_read_release_text(
-                manifest_path,
-                max_bytes=RELEASE_METADATA_MAX_BYTES,
-                label="DEPLOY_MANIFEST.json",
-            ))
+            manifest = _strict_json_loads(
+                _read_release_text(
+                    manifest_path,
+                    max_bytes=RELEASE_METADATA_MAX_BYTES,
+                    label="DEPLOY_MANIFEST.json",
+                )
+            )
             if not manifest.get("build_id"):
                 errors.append("DEPLOY_MANIFEST.json has no build_id")
             files = manifest.get("files")
@@ -786,6 +889,15 @@ def check_release(
             elif not isinstance(files, list):
                 errors.append("DEPLOY_MANIFEST.json files must be a list")
             else:
+                file_count = manifest.get("file_count")
+                if (
+                    isinstance(file_count, bool)
+                    or not isinstance(file_count, int)
+                    or file_count != len(files)
+                ):
+                    errors.append(
+                        "DEPLOY_MANIFEST.json file_count does not match file list"
+                    )
                 by_path = {}
                 for item in files:
                     raw_rel = item.get("path") if isinstance(item, dict) else None
@@ -856,7 +968,17 @@ def check_release(
                             f"DEPLOY_MANIFEST.json cannot hash {rel_norm}: {exc}"
                         )
                         continue
-                    if int(item.get("bytes", -1)) != size:
+                    expected_size = item.get("bytes")
+                    if (
+                        isinstance(expected_size, bool)
+                        or not isinstance(expected_size, int)
+                        or expected_size < 0
+                    ):
+                        errors.append(
+                            "DEPLOY_MANIFEST.json file size is invalid: "
+                            f"{rel_norm}"
+                        )
+                    elif expected_size != size:
                         errors.append(
                             f"DEPLOY_MANIFEST.json byte mismatch: {rel_norm}"
                         )
@@ -867,16 +989,29 @@ def check_release(
         except Exception as exc:
             errors.append(f"DEPLOY_MANIFEST.json unreadable: {exc}")
 
-    tracked = _tracked_files(root)
-    paths = [
-        p for p in root.rglob("*")
-        if ".git" not in p.relative_to(root).parts
-        and not _is_ignored_worktree_metadata(p, root)
-    ]
+    try:
+        tracked = _tracked_files(root)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        tracked = None
+    try:
+        paths = _release_paths(root)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        paths = []
     if tracked is not None:
         warnings.append("checking all release files, including untracked files")
+        tracked_relpaths = {
+            path.relative_to(root).as_posix().casefold()
+            for path in tracked
+        }
         for path in paths:
             if path.is_file():
+                relative = path.relative_to(root)
+                if relative.as_posix().casefold() not in tracked_relpaths:
+                    errors.append(
+                        f"untracked release file excluded from manifest: {relative}"
+                    )
                 artifact_error = _is_forbidden_release_artifact(path, root)
                 if artifact_error:
                     errors.append(artifact_error)
@@ -934,7 +1069,8 @@ def check_release(
             except ValueError as exc:
                 errors.append(str(exc))
                 continue
-            except OSError:
+            except OSError as exc:
+                errors.append(f"could not read release text file {rel}: {exc}")
                 continue
             if _has_mojibake(text):
                 errors.append(f"mojibake marker found in release text file: {rel}")

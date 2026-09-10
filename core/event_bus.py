@@ -115,6 +115,15 @@ def _truncate_for_history(payload: dict) -> dict:
         }
         scalar_only["_truncated"] = True
         scalar_only["_orig_chars"] = len(s)
+        if len(json.dumps(
+            scalar_only,
+            default=str,
+            allow_nan=False,
+        )) > _HISTORY_PAYLOAD_MAX_CHARS:
+            return {
+                "_truncated": True,
+                "_orig_chars": len(s),
+            }
         return scalar_only
     except Exception:
         return {"_unserializable": True}
@@ -441,6 +450,8 @@ class EventBus:
                     self._publish_condition.notify_all()
 
     def get_history(self, event_type: str = None, limit: int = 100) -> List[dict]:
+        if limit <= 0:
+            return []
         with self._history_lock:
             events = list(self._history)
         if event_type:

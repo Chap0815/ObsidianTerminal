@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -84,6 +85,7 @@ PROTECTED_FILES = [
     "prompts/futures.txt",
 ]
 PROTECTED_FILE_SET = {Path(rel).as_posix() for rel in PROTECTED_FILES}
+PROTECTED_FILE_SET_LOWER = {rel.lower() for rel in PROTECTED_FILE_SET}
 PROTECTED_DIRS = {"data", "logs", "backups", ".venv", "python", "prompts"}
 PROTECTED_DIR_SET_LOWER = {name.lower() for name in PROTECTED_DIRS}
 _CIM_SCAN_TIMEOUT_SEC = 8
@@ -101,6 +103,8 @@ UPDATE_STATUS_JSON_MAX_BYTES = 1024 * 1024
 UPDATE_CONFIG_JSON_MAX_BYTES = 1024 * 1024
 UPDATE_MARKER_MAX_BYTES = 64 * 1024
 DEPLOY_MANIFEST_JSON_MAX_BYTES = 4 * 1024 * 1024
+GIT_SCALAR_OUTPUT_MAX_BYTES = 64 * 1024
+GIT_PATH_LIST_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 APP_SNAPSHOT_MANIFEST_MAX_BYTES = 4 * 1024 * 1024
 RUNTIME_SNAPSHOT_MANIFEST_MAX_BYTES = 32 * 1024 * 1024
 RUNTIME_STATUS_FALLBACK_JSON_MAX_BYTES = 2 * 1024 * 1024
@@ -109,11 +113,13 @@ PINNED_KNOWN_HOSTS_SHA256 = (
     "ba69972348dbe13a16aaeed854523c8c78bdeb0e04cbcc13c5fadf8e820cecdf"
 )
 REQUIREMENTS_LOCK_MAX_BYTES = 1024 * 1024
+UPDATE_SMOKE_SOURCE_MAX_BYTES = 1024 * 1024
 SMOKE_FILES = UPDATE_SMOKE_FILES
 BLOCKED_TRACKED_PREFIXES = ("data/", "logs/", "backups/")
 SNAPSHOT_COMPLETE = ".snapshot_complete"
 RUNTIME_SNAPSHOT_COMPLETE_SUFFIX = ".runtime_snapshot_complete"
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+,-]{0,127}$")
+GIT_OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 UPDATE_FORBIDDEN_PREFIXES = (
     ".agents/",
     ".claude/",
@@ -452,8 +458,14 @@ def _write_update_status(
 def _write_sync_marker(repo_url: str, branch: str) -> None:
     try:
         git = _git()
-        local = _run([git, "rev-parse", "HEAD"], check=False)
+        local = _run(
+            [git, "rev-parse", "HEAD"],
+            check=False,
+            max_output_bytes=GIT_SCALAR_OUTPUT_MAX_BYTES,
+        )
         commit = (local.stdout or "").strip() if local.returncode == 0 else ""
+        if GIT_OBJECT_ID_RE.fullmatch(commit) is None:
+            return
         payload = {
             "repo": _redact_repo_url(repo_url),
             "branch": branch,
@@ -555,20 +567,42 @@ def _hidden_kwargs() -> dict:
     }
 
 
+_BOUNDED_STDOUT_OMISSION_RE = re.compile(
+    r"^\[\.\.\. (?:\d+ earlier|undecodable) output bytes omitted \.\.\.\]\n"
+)
+
+
 def _run(
     cmd: list[str],
     *,
     cwd: Path = ROOT,
     check: bool = True,
     timeout: int = 120,
+    max_output_bytes: int | None = None,
 ) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_SSH_COMMAND"] = _ssh_command()
-    r = subprocess.run(
-        cmd, cwd=str(cwd), text=True, capture_output=True, env=env,
-        timeout=timeout, **_hidden_kwargs()
-    )
+    if max_output_bytes is None:
+        r = subprocess.run(
+            cmd, cwd=str(cwd), text=True, capture_output=True, env=env,
+            timeout=timeout, **_hidden_kwargs()
+        )
+    else:
+        r = run_bounded_capture(
+            cmd,
+            cwd=str(cwd),
+            timeout=timeout,
+            max_output_bytes=max_output_bytes,
+            wrapper_python=sys.executable,
+            env=env,
+            **_hidden_kwargs(),
+        )
+        if _BOUNDED_STDOUT_OMISSION_RE.match(r.stdout or ""):
+            cmd_str = _redact_text(" ".join(cmd))
+            raise RuntimeError(
+                f"command stdout exceeded capture limit: {cmd_str}"
+            )
     if check and r.returncode != 0:
         out = _redact_text((r.stdout or "").strip())
         err = _redact_text((r.stderr or "").strip())
@@ -616,19 +650,22 @@ def _load_update_config() -> tuple[str, str]:
     branch = env_branch or "main"
     if CONFIG_PATH.exists():
         try:
-            data = json.loads(
-                _read_bounded_file_bytes(
-                    CONFIG_PATH,
-                    UPDATE_CONFIG_JSON_MAX_BYTES,
-                    "update config",
-                ).decode("utf-8-sig")
+            data = _read_bounded_json_file(
+                CONFIG_PATH,
+                UPDATE_CONFIG_JSON_MAX_BYTES,
+                "update config",
+                encoding="utf-8-sig",
             )
             repo = repo or str(data.get("repo_url") or "").strip()
             branch = env_branch or str(data.get("branch") or branch or "main").strip()
         except Exception as exc:
             raise RuntimeError(f"{CONFIG_PATH.relative_to(ROOT)} ist nicht lesbar: {exc}") from exc
     if not repo and is_valid_git_worktree(ROOT):
-        r = _run([_git(), "remote", "get-url", "origin"], check=False)
+        r = _run(
+            [_git(), "remote", "get-url", "origin"],
+            check=False,
+            max_output_bytes=GIT_SCALAR_OUTPUT_MAX_BYTES,
+        )
         if r.returncode == 0:
             repo = (r.stdout or "").strip()
     if not repo:
@@ -654,12 +691,66 @@ def _load_update_config() -> tuple[str, str]:
     return repo, branch or "main"
 
 
+def _file_snapshot_signature(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
 def _read_bounded_file_bytes(path: Path, max_bytes: int, label: str) -> bytes:
     with open(path, "rb") as stream:
+        before = os.fstat(stream.fileno())
         raw = stream.read(max_bytes + 1)
+        after = os.fstat(stream.fileno())
+    with open(path, "rb") as verify_stream:
+        verify_before = os.fstat(verify_stream.fileno())
+        verify_raw = verify_stream.read(max_bytes + 1)
+        verify_after = os.fstat(verify_stream.fileno())
+    if (
+        _file_snapshot_signature(before) != _file_snapshot_signature(after)
+        or _file_snapshot_signature(verify_before)
+        != _file_snapshot_signature(verify_after)
+        or _file_snapshot_signature(before) != _file_snapshot_signature(verify_before)
+        or raw != verify_raw
+        or (before.st_size <= max_bytes and len(raw) != before.st_size)
+        or (
+            verify_before.st_size <= max_bytes
+            and len(verify_raw) != verify_before.st_size
+        )
+    ):
+        raise OSError(f"{label} changed during bounded read")
     if len(raw) > max_bytes:
         raise ValueError(f"{label} exceeds size limit")
     return raw
+
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-finite JSON constant is not allowed: {value}")
+
+
+def _json_object_without_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _loads_bounded_json_text(text: str, max_bytes: int, label: str):
+    if not isinstance(text, str):
+        raise ValueError(f"{label} is not text")
+    if len(text.encode("utf-8")) > max_bytes:
+        raise ValueError(f"{label} exceeds size limit")
+    return json.loads(
+        text,
+        parse_constant=_reject_json_constant,
+        object_pairs_hook=_json_object_without_duplicate_keys,
+    )
 
 
 def _read_bounded_json_file(
@@ -670,12 +761,16 @@ def _read_bounded_json_file(
     encoding: str,
 ):
     return json.loads(
-        _read_bounded_file_bytes(path, max_bytes, label).decode(encoding)
+        _read_bounded_file_bytes(path, max_bytes, label).decode(encoding),
+        parse_constant=_reject_json_constant,
+        object_pairs_hook=_json_object_without_duplicate_keys,
     )
 
 
 def _is_valid_branch_name(branch: str) -> bool:
     text = str(branch or "").strip()
+    if text == "HEAD":
+        return False
     if not BRANCH_RE.fullmatch(text):
         return False
     if text.endswith((".", "/")):
@@ -699,11 +794,23 @@ def _set_origin_url(git: str, repo_url: str) -> None:
 
 
 def _remote_head(repo_url: str, branch: str) -> str:
+    expected_ref = f"refs/heads/{branch}"
     try:
-        r = _run([_git(), "ls-remote", repo_url, f"refs/heads/{branch}"],
-                 check=False, timeout=30)
-        if r.returncode == 0:
-            return (r.stdout.split() or [""])[0]
+        r = _run(
+            [_git(), "ls-remote", repo_url, expected_ref],
+            check=False,
+            timeout=30,
+            max_output_bytes=GIT_SCALAR_OUTPUT_MAX_BYTES,
+        )
+        lines = (r.stdout or "").splitlines()
+        if r.returncode == 0 and len(lines) == 1:
+            fields = lines[0].split()
+            if (
+                len(fields) == 2
+                and GIT_OBJECT_ID_RE.fullmatch(fields[0]) is not None
+                and fields[1] == expected_ref
+            ):
+                return fields[0]
     except Exception:
         pass
     return ""
@@ -753,6 +860,17 @@ def _read_runtime_status_fallback(path: Path) -> dict[str, Any]:
     return data
 
 
+def _runtime_pid(value: Any) -> int | None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        or value > 0xFFFFFFFF
+    ):
+        return None
+    return value
+
+
 def _running_bots() -> list[str]:
     out: list[str] = []
     logs = ROOT / "logs"
@@ -777,7 +895,9 @@ def _running_bots() -> list[str]:
             except Exception:
                 continue
             status = str(data.get("status") or "").lower()
-            pid = int(data.get("pid") or 0)
+            pid = _runtime_pid(data.get("pid"))
+            if pid is None:
+                continue
             bot = str(data.get("bot") or path.parent.name).upper()
             try:
                 from core.process_identity import pid_matches_bot
@@ -804,7 +924,9 @@ def _running_bots() -> list[str]:
             except Exception:
                 continue
             status = str(data.get("status") or "").lower()
-            pid = int(data.get("pid") or 0)
+            pid = _runtime_pid(data.get("pid"))
+            if pid is None:
+                continue
             bot = str(data.get("bot") or path.parent.name).upper()
             try:
                 from core.process_identity import pid_matches_bot
@@ -1771,12 +1893,29 @@ def _copy_file(src: Path, dst: Path) -> None:
     _prepare_root_bound_file(safe_dst, ROOT, label="backup destination")
 
 
-def _sha256(path: Path) -> str:
+def _sha256_snapshot(path: Path) -> str:
     h = hashlib.sha256()
+    byte_count = 0
     with path.open("rb") as fh:
+        before = os.fstat(fh.fileno())
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            byte_count += len(chunk)
             h.update(chunk)
+        after = os.fstat(fh.fileno())
+    if (
+        _file_snapshot_signature(before) != _file_snapshot_signature(after)
+        or byte_count != before.st_size
+    ):
+        raise OSError(f"file changed during hash: {path}")
     return h.hexdigest()
+
+
+def _sha256(path: Path) -> str:
+    first = _sha256_snapshot(path)
+    second = _sha256_snapshot(path)
+    if first != second:
+        raise OSError(f"file changed during hash: {path}")
+    return first
 
 
 def _backup_user_files() -> Path:
@@ -1905,8 +2044,12 @@ def _stash_protected_files(backup: Path) -> dict[str, str]:
     for rel in PROTECTED_FILES:
         path = ROOT / rel
         if path.exists():
-            hashes[rel] = _sha256(path)
-            _copy_file(path, backup / rel)
+            expected_hash = _sha256(path)
+            backup_path = backup / rel
+            _copy_file(path, backup_path)
+            if _sha256(backup_path) != expected_hash:
+                raise RuntimeError(f"Protected file changed during backup: {rel}")
+            hashes[rel] = expected_hash
     return hashes
 
 
@@ -2151,16 +2294,17 @@ def _runtime_env_in_use_via_cim(path: Path) -> bool:
         pid = row.get("pid")
         exe = row.get("exe")
         cmdline = row.get("cmdline")
-        if pid == 0:
-            continue
         if (
             isinstance(pid, bool)
             or not isinstance(pid, int)
             or pid < 0
+            or pid > 0xFFFFFFFF
             or exe is not None and not isinstance(exe, str)
             or cmdline is not None and not isinstance(cmdline, str)
         ):
             raise RuntimeError("runtime process scan returned malformed CIM output")
+        if pid == 0:
+            continue
         if pid == current:
             continue
         if _process_refs_path(exe, path) or _process_refs_path(cmdline, path):
@@ -2203,7 +2347,9 @@ def _dependency_update_needed_from_ref(git: str, ref: str) -> bool:
     object_ref = f"{ref}:requirements.lock.txt"
     size_result = _run([git, "cat-file", "-s", object_ref], check=False)
     if size_result.returncode != 0:
-        return False
+        raise RuntimeError(
+            "requirements.lock.txt object is unavailable in update ref"
+        )
     try:
         object_size = int((size_result.stdout or "").strip())
     except (TypeError, ValueError) as exc:
@@ -2214,9 +2360,11 @@ def _dependency_update_needed_from_ref(git: str, ref: str) -> bool:
             f"({REQUIREMENTS_LOCK_MAX_BYTES} bytes)"
         )
     r = _run([git, "show", object_ref], check=False)
-    if r.returncode == 0:
-        return _dependency_update_needed(_requirements_text_hash(r.stdout or ""))
-    return False
+    if r.returncode != 0:
+        raise RuntimeError(
+            "requirements.lock.txt could not be read from update ref"
+        )
+    return _dependency_update_needed(_requirements_text_hash(r.stdout or ""))
 
 
 def _runtime_snapshot_ignored(path: Path) -> bool:
@@ -2560,7 +2708,12 @@ def _claim_update_marker(*, force: bool) -> _UpdateMarkerClaim:
 
 def _read_update_marker() -> dict[str, Any] | None:
     try:
-        data = json.loads(_read_update_marker_bytes().decode("utf-8"))
+        data = _read_bounded_json_file(
+            UPDATE_MARKER,
+            UPDATE_MARKER_MAX_BYTES,
+            "update marker",
+            encoding="utf-8",
+        )
     except (OSError, ValueError, TypeError):
         return None
     return data if isinstance(data, dict) else None
@@ -2598,6 +2751,7 @@ def _clear_update_marker(
         UPDATE_MARKER.unlink()
     except FileNotFoundError:
         return True
+    _sync_update_marker_directory(UPDATE_MARKER.parent)
     return True
 
 
@@ -2610,8 +2764,13 @@ def _verify_updated_tree() -> None:
     for rel in compile_files:
         path = ROOT / rel
         try:
-            with tokenize.open(path) as fh:
-                source = fh.read()
+            raw = _read_bounded_file_bytes(
+                path,
+                UPDATE_SMOKE_SOURCE_MAX_BYTES,
+                f"smoke source {rel}",
+            )
+            encoding, _lines = tokenize.detect_encoding(io.BytesIO(raw).readline)
+            source = raw.decode(encoding)
             compile(source, str(path), "exec")
         except Exception as exc:
             raise RuntimeError(f"Update-Smoke fehlgeschlagen fuer {rel}: {exc}") from exc
@@ -2691,6 +2850,13 @@ def _verify_deploy_manifest_hashes_at(
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             problems.append(f"{rel}: manifest hash fehlt/ungueltig")
             continue
+        if (
+            isinstance(expected_bytes, bool)
+            or not isinstance(expected_bytes, int)
+            or expected_bytes < 0
+        ):
+            problems.append(f"{rel}: manifest Byte-Laenge fehlt/ungueltig")
+            continue
         path = root / rel
         if not path.is_file():
             if not (
@@ -2701,10 +2867,7 @@ def _verify_deploy_manifest_hashes_at(
                 problems.append(f"{rel}: fehlt")
                 continue
         try:
-            byte_mismatch = (
-                expected_bytes is not None
-                and path.stat().st_size != int(expected_bytes)
-            )
+            byte_mismatch = path.stat().st_size != expected_bytes
             hash_mismatch = (not byte_mismatch and _sha256(path) != expected_hash)
             if byte_mismatch or hash_mismatch:
                 if (
@@ -2712,10 +2875,7 @@ def _verify_deploy_manifest_hashes_at(
                     and root == ROOT
                     and _rewrite_manifest_file_from_index(rel)
                 ):
-                    byte_mismatch = (
-                        expected_bytes is not None
-                        and path.stat().st_size != int(expected_bytes)
-                    )
+                    byte_mismatch = path.stat().st_size != expected_bytes
                     hash_mismatch = (
                         not byte_mismatch and _sha256(path) != expected_hash
                     )
@@ -2773,15 +2933,19 @@ def _split_git_paths(stdout: str) -> list[str]:
 
 
 def _tracked_files(cwd: Path) -> list[str]:
-    r = _run([_git(), "ls-files", "-z"], cwd=cwd)
+    r = _run(
+        [_git(), "ls-files", "-z"],
+        cwd=cwd,
+        max_output_bytes=GIT_PATH_LIST_MAX_OUTPUT_BYTES,
+    )
     return _split_git_paths(r.stdout or "")
 
 
 def _verify_no_tracked_runtime_files(cwd: Path) -> None:
     bad = [
         rel for rel in _tracked_files(cwd)
-        if rel.replace("\\", "/").startswith(BLOCKED_TRACKED_PREFIXES)
-        or rel.replace("\\", "/") in PROTECTED_FILE_SET
+        if rel.replace("\\", "/").lower().startswith(BLOCKED_TRACKED_PREFIXES)
+        or rel.replace("\\", "/").lower() in PROTECTED_FILE_SET_LOWER
     ]
     if bad:
         raise RuntimeError(
@@ -2791,7 +2955,11 @@ def _verify_no_tracked_runtime_files(cwd: Path) -> None:
 
 
 def _tree_paths_for_ref(git: str, ref: str) -> list[str]:
-    r = _run([git, "ls-tree", "-r", "-z", "--name-only", ref], check=False)
+    r = _run(
+        [git, "ls-tree", "-r", "-z", "--name-only", ref],
+        check=False,
+        max_output_bytes=GIT_PATH_LIST_MAX_OUTPUT_BYTES,
+    )
     if r.returncode != 0:
         raise RuntimeError(f"Update-Tree {ref} konnte nicht geprueft werden.")
     return [line.strip().replace("\\", "/") for line in _split_git_paths(r.stdout or "")]
@@ -2835,11 +3003,28 @@ def _manifest_paths_from_items(
 
 
 def _ref_release_manifest_paths(git: str, ref: str, tree_paths: list[str]) -> set[str]:
-    r = _run([git, "show", f"{ref}:DEPLOY_MANIFEST.json"], check=False)
+    object_ref = f"{ref}:DEPLOY_MANIFEST.json"
+    size_result = _run([git, "cat-file", "-s", object_ref], check=False)
+    if size_result.returncode != 0:
+        raise RuntimeError("Update-Repo enthaelt kein DEPLOY_MANIFEST.json")
+    try:
+        object_size = int((size_result.stdout or "").strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Update-Manifest object size is malformed") from exc
+    if object_size < 0 or object_size > DEPLOY_MANIFEST_JSON_MAX_BYTES:
+        raise RuntimeError(
+            "deploy manifest exceeds size limit "
+            f"({DEPLOY_MANIFEST_JSON_MAX_BYTES} bytes)"
+        )
+    r = _run([git, "show", object_ref], check=False)
     if r.returncode != 0:
         raise RuntimeError("Update-Repo enthaelt kein DEPLOY_MANIFEST.json")
     try:
-        manifest = json.loads(r.stdout or "")
+        manifest = _loads_bounded_json_text(
+            r.stdout or "",
+            DEPLOY_MANIFEST_JSON_MAX_BYTES,
+            "deploy manifest",
+        )
     except Exception as exc:
         raise RuntimeError(f"Update-Manifest konnte nicht gelesen werden: {exc}") from exc
     tree_set = set(tree_paths)
@@ -2889,7 +3074,7 @@ def _tracked_blocked_runtime_files() -> list[str]:
     tracked = _tracked_files(ROOT)
     for line in tracked:
         rel = line.strip().replace("\\", "/")
-        if rel.startswith(BLOCKED_TRACKED_PREFIXES):
+        if rel.lower().startswith(BLOCKED_TRACKED_PREFIXES):
             bad.append(rel)
     return bad
 
@@ -3178,14 +3363,10 @@ def _copy_snapshot_source(
 
 
 def _snapshot_file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
     try:
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
+        return _sha256(path)
     except OSError as exc:
         raise RuntimeError(f"Snapshot file could not be read: {path}") from exc
-    return digest.hexdigest()
 
 
 def _build_snapshot_manifest(
@@ -3472,18 +3653,34 @@ def _restore_app_snapshot(snapshot: Path) -> bool:
 
 def _is_shallow_repo(git: str) -> bool:
     result = _run([git, "rev-parse", "--is-shallow-repository"], check=False)
-    return result.returncode == 0 and (result.stdout or "").strip().lower() == "true"
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Git shallow-repository probe failed "
+            f"(returncode {result.returncode})"
+        )
+    value = (result.stdout or "").strip().lower()
+    if value not in {"true", "false"}:
+        raise RuntimeError("Git shallow-repository probe returned malformed output")
+    return value == "true"
 
 
 def _is_ancestor(git: str, ancestor: str, descendant: str) -> bool:
-    return _run([git, "merge-base", "--is-ancestor", ancestor, descendant], check=False).returncode == 0
+    result = _run(
+        [git, "merge-base", "--is-ancestor", ancestor, descendant],
+        check=False,
+    )
+    if result.returncode not in {0, 1}:
+        raise RuntimeError(
+            f"Git ancestry probe failed (returncode {result.returncode})"
+        )
+    return result.returncode == 0
 
 
 def _configure_git_manifest_checkout(git: str, cwd: Path | None = None) -> None:
     """Keep working-tree bytes stable for DEPLOY_MANIFEST verification."""
     repo = cwd or ROOT
-    _run([git, "config", "core.autocrlf", "false"], cwd=repo, check=False)
-    _run([git, "config", "core.eol", "lf"], cwd=repo, check=False)
+    _run([git, "config", "core.autocrlf", "false"], cwd=repo)
+    _run([git, "config", "core.eol", "lf"], cwd=repo)
 
 
 def _force_git_manifest_checkout(git: str, cwd: Path | None = None) -> None:
@@ -3539,7 +3736,11 @@ def _update_existing_repo(
         _run([git, "fetch", "origin", branch], timeout=300)
         _verify_ref_has_no_runtime_files(git, "FETCH_HEAD")
         if _is_ancestor(git, "FETCH_HEAD", "HEAD"):
-            _print("Lokaler Stand ist neuer oder identisch zum Remote; kein Downgrade ausgefuehrt.")
+            _verify_updated_tree()
+            _print(
+                "Lokaler Stand ist neuer oder identisch zum Remote und "
+                "manifestgleich; kein Downgrade ausgefuehrt."
+            )
             return
     if not _is_ancestor(git, "HEAD", "FETCH_HEAD"):
         raise RuntimeError(
@@ -3787,6 +3988,11 @@ def main(argv: list[str] | None = None) -> int:
                 repo_url, branch = _load_update_config()
                 target_branch = branch
                 target_remote = _remote_head(repo_url, branch)
+                if not target_remote:
+                    raise RuntimeError(
+                        "Remote-Stand konnte nicht eindeutig ermittelt werden; "
+                        "Update vor jeder Produktmutation abgebrochen."
+                    )
                 _print(f"Repo: {_redact_repo_url(repo_url)}")
                 _print(f"Branch: {branch}")
                 update_kwargs = {

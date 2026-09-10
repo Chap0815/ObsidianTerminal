@@ -16,8 +16,13 @@ import math
 from decimal import Decimal, InvalidOperation
 
 
+_MAX_NUMERIC_TEXT_CHARS = 128
+
+
 def _finite_float_or_none(value):
     if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
         return None
     try:
         parsed = float(value)
@@ -57,7 +62,7 @@ def order_has_proven_zero_fill(order) -> bool:
 
 
 def _upper_text(value) -> str:
-    return value.upper() if isinstance(value, str) else ""
+    return value.strip().upper() if isinstance(value, str) else ""
 
 
 def order_id_text_or_none(value) -> str | None:
@@ -188,6 +193,14 @@ def order_was_filled(order: dict, requested_amount: float = 0.0,
     """
     if not isinstance(order, dict):
         return False
+    if not isinstance(trust_terminal_status_with_bad_numbers, bool):
+        return False
+    validated_fill_ratio = _finite_float_or_none(min_fill_ratio)
+    if (
+        validated_fill_ratio is None
+        or not 0.0 < validated_fill_ratio <= 1.0
+    ):
+        return False
     raw_status = order.get("status")
     status_is_malformed = (
         raw_status is not None
@@ -226,7 +239,7 @@ def order_was_filled(order: dict, requested_amount: float = 0.0,
             math.isfinite(f)
             and math.isfinite(req)
             and req > 0
-            and f >= req * min_fill_ratio
+            and f >= req * validated_fill_ratio
         ):
             return True
         return False
@@ -238,7 +251,7 @@ def order_was_filled(order: dict, requested_amount: float = 0.0,
     if math.isfinite(filled) and filled > 0:
         req = _finite_float_or_none(requested_amount) or 0.0
         if math.isfinite(req) and req > 0:
-            return filled >= req * min_fill_ratio
+            return filled >= req * validated_fill_ratio
         return True
     cost_present = order.get("cost") is not None
     cost = _finite_float_or_none(order.get("cost")) if cost_present else 0.0
@@ -247,6 +260,8 @@ def order_was_filled(order: dict, requested_amount: float = 0.0,
     if math.isfinite(cost) and cost > 0:
         return True
     if status_is_malformed:
+        return False
+    if filled_present or cost_present:
         return False
     # AMBIGUOUS: no status, no fill data. If the exchange ACCEPTED the order
     # (it has an id and create_*_order didn't raise), treat it as filled 
@@ -314,7 +329,7 @@ def _convert_fee_to_usdt_known(fee_dict, order_dict) -> tuple[float, bool]:
 
     symbol = (order_dict.get("symbol") or "") if isinstance(order_dict, dict) else ""
     symbol = symbol if isinstance(symbol, str) else ""
-    base = symbol.split("/")[0].upper() if "/" in symbol else ""
+    base = _upper_text(symbol.split("/", 1)[0]) if "/" in symbol else ""
     if currency == base:
         fill_price = 0.0
         for k in ("average", "price"):
@@ -404,13 +419,7 @@ def _is_safe_finite(value) -> bool:
     """Return True iff value can be cast to a finite float."""
     if value is None:
         return False
-    if isinstance(value, bool):
-        return False
-    try:
-        fv = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return False
-    return math.isfinite(fv)
+    return _finite_float_or_none(value) is not None
 
 
 def safe_remaining(current_amount: float, sold_amount: float,
@@ -436,10 +445,10 @@ def safe_remaining(current_amount: float, sold_amount: float,
         sold_amount = 0.0
     else:
         sold_value = float(sold_amount)
-        sold_amount = sold_value if sold_value > 0 else 0.0
+        sold_amount = sold_amount if sold_value > 0 else 0.0
 
     try:
-        rem = Decimal(str(current_value)) - Decimal(str(sold_amount))
+        rem = Decimal(str(current_amount)) - Decimal(str(sold_amount))
     except (InvalidOperation, TypeError, ValueError):
         return 0.0
 
@@ -449,7 +458,11 @@ def safe_remaining(current_amount: float, sold_amount: float,
         return 0.0
 
     try:
-        threshold = Decimal(str(dust_threshold))
+        threshold = (
+            Decimal(str(dust_threshold))
+            if _is_safe_finite(dust_threshold)
+            else Decimal("0")
+        )
         if not threshold.is_finite() or threshold < 0:
             threshold = Decimal("0")
     except (InvalidOperation, TypeError, ValueError):

@@ -66,7 +66,7 @@ def _safe_float(value, default: float = 0.0) -> float:
 
 def _finite_add(total: float, value: float) -> float:
     candidate = total + value
-    return candidate if math.isfinite(candidate) else total
+    return candidate if math.isfinite(candidate) else math.nan
 
 
 def _safe_label(value, default: str = "?", max_length: int = 128) -> str:
@@ -93,8 +93,8 @@ def _never_raises_none(func):
 def _read_usdt_free(bal: dict) -> Optional[float]:
     """Pull the FREE USDT amount from a ccxt balance dict.
 
-    Tries the standard ccxt path first, then a few exchange-specific
-    fallbacks. Returns None if nothing matched (caller should show N/A).
+    Reads the standard ccxt path and exchange-specific mirrors. Returns None
+    if nothing matched or supplied representations are invalid/inconsistent.
     """
     if not isinstance(bal, dict):
         return None
@@ -103,6 +103,7 @@ def _read_usdt_free(bal: dict) -> Optional[float]:
         ("USDT", "available"),
         ("free", "USDT"),
     )
+    supplied_values = []
     for path in paths:
         v = bal
         for key in path:
@@ -113,10 +114,14 @@ def _read_usdt_free(bal: dict) -> Optional[float]:
             if v is None:
                 break
         if v is not None:
-            f = _safe_float(v, -1.0)
-            if f >= 0:
-                return f
-    return None
+            parsed = _finite_float_or_none(v)
+            if parsed is None or parsed < 0.0:
+                return None
+            supplied_values.append(parsed)
+    if not supplied_values:
+        return None
+    expected = supplied_values[0]
+    return expected if all(value == expected for value in supplied_values) else None
 
 
 def _read_currency_free(data: dict) -> float:
@@ -147,6 +152,24 @@ def _position_margin_or_none(position: dict) -> float | None:
         if candidate is not None and candidate > 0.0:
             return candidate
     return None
+
+
+def _position_upnl_evidence_valid(position: dict) -> bool:
+    supplied = [
+        position.get(field)
+        for field in ("unrealizedPnl", "unrealized_pnl")
+        if position.get(field) is not None
+    ]
+    parsed = [_finite_float_or_none(value) for value in supplied]
+    return not any(value is None for value in parsed) and all(
+        math.isclose(
+            value,
+            parsed[0],
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+        for value in parsed[1:]
+    )
 
 
 def _sum_position_margin_and_upnl(positions: list) -> tuple[float, float, int, list]:
@@ -210,11 +233,15 @@ def _sum_position_margin_and_upnl(positions: list) -> tuple[float, float, int, l
 def _configured_live_futures_bots() -> set[str]:
     live = set()
     try:
-        from bot_utils.sim_flag import read_simulation_flag
-        for bot_name in LIVE_FUTURES_BOTS:
-            if not read_simulation_flag(
-                    bot_name, raise_on_corrupt=False, default=True):
-                live.add(bot_name)
+        from bot_utils.sim_flag import read_simulation_flags
+
+        modes = read_simulation_flags(
+            tuple(sorted(LIVE_FUTURES_BOTS)),
+            raise_on_corrupt=False,
+            default=True,
+        )
+        if modes is not None:
+            live.update(bot for bot, simulation in modes.items() if not simulation)
     except Exception:
         pass
     return live
@@ -225,6 +252,7 @@ def _live_futures_state_by_symbol(db_rows: list,
     live_bots = (live_bots if live_bots is not None
                  else _configured_live_futures_bots())
     db_by_sym = {}
+    seen_bases = set()
     for row in db_rows:
         if not isinstance(row, dict):
             continue
@@ -237,12 +265,23 @@ def _live_futures_state_by_symbol(db_rows: list,
         base = _safe_label(sym, "").split("/")[0].split(":")[0]
         if not base:
             continue
-        db_by_sym[base] = {
-            "unrealized":      _safe_float(row.get("unrealized_pnl")),
+        if base in seen_bases:
+            db_by_sym.pop(base, None)
+            continue
+        seen_bases.add(base)
+        unrealized = _finite_float_or_none(row.get("unrealized_pnl"))
+        if unrealized is None:
+            continue
+        state = {
+            "unrealized":      unrealized,
             "unrealized_pct":  _safe_float(row.get("unrealized_pct")),
             "current_price":   _safe_float(row.get("current_price")),
             "entry_price":     _safe_float(row.get("entry_price")),
         }
+        side = _safe_label(row.get("position_type"), "").lower()
+        if side in {"long", "short"}:
+            state["side"] = side
+        db_by_sym[base] = state
     return db_by_sym
 
 
@@ -346,12 +385,20 @@ def compute_futures_equity(ex) -> Optional[dict]:
         for position in positions
         if (_position_contracts_abs(position) or 0.0) > 0.0
     ]
+    open_identities = [
+        (
+            _safe_label(position.get("symbol"), "").casefold(),
+            _safe_label(position.get("side"), "").casefold(),
+        )
+        for position in open_positions
+    ]
     if any(
         _position_margin_or_none(position) is None
         or not isinstance(position.get("symbol"), str)
         or not position.get("symbol").strip()
+        or not _position_upnl_evidence_valid(position)
         for position in open_positions
-    ):
+    ) or len(open_identities) != len(set(open_identities)):
         if isinstance(positions_reservation, ApiCallReservation):
             try:
                 record_api_error(
@@ -390,11 +437,17 @@ def compute_futures_equity(ex) -> Optional[dict]:
             db_by_sym = _live_futures_state_by_symbol(
                 [row for row in db_rows if is_futures_state_fresh(row)]
             )
+            used_db_symbols = set()
             for d in missing_upnl:
                 sym_base = d.get("symbol", "")
                 row = db_by_sym.get(sym_base)
-                if row is None:
+                if (
+                    row is None
+                    or row.get("side") != d.get("side")
+                    or sym_base in used_db_symbols
+                ):
                     return None
+                used_db_symbols.add(sym_base)
                 d["unrealized"] = round(row["unrealized"], 4)
             upnl_sum = sum(d["unrealized"] for d in details)
             if not math.isfinite(upnl_sum):
@@ -466,20 +519,89 @@ def compute_spot_equity(ex) -> Optional[dict]:
         if any(
             not isinstance(raw_symbol, str)
             or not raw_symbol.strip()
+            or any(
+                ord(char) < 32 or ord(char) == 127
+                for char in raw_symbol
+            )
             or not isinstance(data, dict)
             for raw_symbol, data in bal.items()
             if raw_symbol not in _BALANCE_METADATA_KEYS
         ):
             raise TypeError("spot equity returned a malformed currency row")
-        if any(
-            data.get("total") is not None
-            and _finite_float_or_none(data.get("total")) is None
-            for raw_symbol, data in bal.items()
-            if raw_symbol not in _BALANCE_METADATA_KEYS
-        ):
-            raise ValueError(
-                "spot equity returned a non-finite currency amount"
-            )
+        seen_symbols = set()
+        for raw_symbol, data in bal.items():
+            if raw_symbol in _BALANCE_METADATA_KEYS:
+                continue
+            symbol = raw_symbol.strip().upper()
+            raw_total = data.get("total")
+            parsed_total = None
+            if raw_total is not None:
+                parsed_total = _finite_float_or_none(raw_total)
+                if parsed_total is None or parsed_total < 0.0:
+                    raise ValueError(
+                        "spot equity returned an invalid currency total"
+                    )
+            canonical_symbol = symbol.casefold()
+            if canonical_symbol in seen_symbols:
+                raise ValueError(
+                    "spot equity returned duplicate normalized currency symbols"
+                )
+            seen_symbols.add(canonical_symbol)
+            if symbol not in _QUOTE_ASSETS_AS_USDT:
+                supplied_components = [
+                    data.get(key)
+                    for key in ("free", "available", "used")
+                    if data.get(key) is not None
+                ]
+                if data.get("total") is None and any(
+                    _finite_float_or_none(value) != 0.0
+                    for value in supplied_components
+                ):
+                    raise ValueError(
+                        "spot equity returned a holding without a valid total"
+                    )
+                continue
+            supplied_free = [
+                data.get(key)
+                for key in ("free", "available")
+                if data.get(key) is not None
+            ]
+            parsed_free = [
+                _finite_float_or_none(value) for value in supplied_free
+            ]
+            if any(value is None or value < 0.0 for value in parsed_free):
+                raise ValueError("spot equity returned invalid stablecoin free")
+            if parsed_free and any(
+                not math.isclose(
+                    value,
+                    parsed_free[0],
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+                for value in parsed_free[1:]
+            ):
+                raise ValueError(
+                    "spot equity returned conflicting stablecoin free aliases"
+                )
+            raw_used = data.get("used")
+            if parsed_total is None and raw_used is not None:
+                parsed_used = _finite_float_or_none(raw_used)
+                if parsed_used is None or parsed_used != 0.0:
+                    raise ValueError(
+                        "spot equity returned locked stablecoin without total"
+                    )
+            if (
+                parsed_total is not None
+                and parsed_free
+                and parsed_total < parsed_free[0]
+                and not math.isclose(
+                    parsed_total,
+                    parsed_free[0],
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError("spot equity returned total below free")
     except Exception:
         if isinstance(balance_reservation, ApiCallReservation):
             try:
@@ -500,7 +622,7 @@ def compute_spot_equity(ex) -> Optional[dict]:
     # Iterate top-level keys that are currency dicts (skip ccxt metadata
     # keys like 'info', 'free', 'used', 'total' which mirror everything).
     for raw_symbol, data in bal.items():
-        symbol = _safe_label(raw_symbol, "")
+        symbol = _safe_label(raw_symbol, "").upper()
         if not symbol:
             continue
         if symbol in _BALANCE_METADATA_KEYS:
@@ -663,15 +785,14 @@ def compute_spot_equity(ex) -> Optional[dict]:
                 return None
 
             value_usdt = amount * price
-            if (
-                not math.isfinite(value_usdt)
-                or value_usdt < _DUST_USDT_THRESHOLD
-            ):
+            if not math.isfinite(value_usdt):
+                return None
+            if value_usdt < _DUST_USDT_THRESHOLD:
                 continue  # dust filter
 
             next_positions_value = in_positions_value + value_usdt
             if not math.isfinite(next_positions_value):
-                continue
+                return None
             in_positions_value = next_positions_value
             open_count += 1
 

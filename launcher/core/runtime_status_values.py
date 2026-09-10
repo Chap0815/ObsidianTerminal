@@ -6,7 +6,7 @@ import math
 
 
 def finite_float_or_none(value) -> float | None:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
         parsed = float(value)
@@ -18,27 +18,15 @@ def finite_float_or_none(value) -> float | None:
 
 
 def positive_int_or_zero(value) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int):
         return 0
-    if isinstance(value, float) and not value.is_integer():
-        return 0
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return 0
-    return parsed if parsed > 0 else 0
+    return value if 0 < value <= 0xFFFFFFFF else 0
 
 
 def nonnegative_int_or_zero(value) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int):
         return 0
-    if isinstance(value, float) and not value.is_integer():
-        return 0
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return 0
-    return parsed if parsed >= 0 else 0
+    return value if value >= 0 else 0
 
 
 def strict_bool_or_none(value) -> bool | None:

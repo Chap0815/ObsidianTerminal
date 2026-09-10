@@ -16,12 +16,15 @@ from typing import Any
 
 
 DEFAULT_TAKER_FEE_RATE = 0.001
+_MAX_NUMERIC_TEXT_CHARS = 128
 
 
 def _finite_number(value: Any) -> float | None:
     if value is None:
         return 0.0
     if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
         return None
     try:
         parsed = float(value)
@@ -37,17 +40,20 @@ def taker_fee_rate(ex: Any, symbol: str, default: float = DEFAULT_TAKER_FEE_RATE
     returns ``default``. Never raises  any missing/malformed metadata yields the
     default so backtests/simulations stay deterministic.
     """
+    fallback = _finite_number(default)
+    if fallback is None or not 0.0 < fallback < 1.0:
+        fallback = DEFAULT_TAKER_FEE_RATE
     try:
         markets = getattr(ex, "markets", None) or {}
         m = markets.get(symbol) or {}
         t = m.get("taker")
         if t is not None:
             tv = _finite_number(t)
-            if tv is not None and tv > 0:
+            if tv is not None and 0.0 < tv < 1.0:
                 return tv
-    except (TypeError, ValueError, OverflowError, AttributeError):
+    except Exception:
         pass
-    return default
+    return fallback
 
 
 def safe_proportional_fee(initial_fee: Any,
@@ -92,6 +98,8 @@ def safe_proportional_fee(initial_fee: Any,
           by a few cents than to double-deduct the full entry fee, which
           would silently distort PnL accounting.
     """
+    if not isinstance(partial_sold, bool):
+        return 0.0
     init = _finite_number(initial_fee)
     curr = _finite_number(current_amount)
     orig = _finite_number(original_amount)
@@ -128,6 +136,8 @@ def safe_funding_scale(funding_total: Any,
     Returns the funding portion attributable to the remaining slice.
     Behavior mirrors ``safe_proportional_fee``  see its docstring.
     """
+    if not isinstance(partial_sold, bool):
+        return 0.0
     f = _finite_number(funding_total)
     curr = _finite_number(current_amount)
     orig = _finite_number(original_amount)
@@ -162,13 +172,15 @@ def safe_remaining_funding(funding_total: Any,
     scale so old state files remain valid.  ``booked_on_partials_known``
     distinguishes a verified zero booking from a legacy missing value.
     """
+    if not isinstance(partial_sold, bool):
+        return 0.0
     scaled = safe_funding_scale(
         funding_total, current_amount, original_amount,
         partial_sold=partial_sold,
     )
     booked = _finite_number(booked_on_partials)
     if booked is None:
-        booked = 0.0
+        return scaled
     if (
         not partial_sold
         or (
@@ -180,4 +192,7 @@ def safe_remaining_funding(funding_total: Any,
     total = _finite_number(funding_total)
     if total is None:
         return scaled
-    return round(total - booked, 6)
+    remaining = total - booked
+    if not math.isfinite(remaining):
+        return scaled
+    return round(remaining, 6)

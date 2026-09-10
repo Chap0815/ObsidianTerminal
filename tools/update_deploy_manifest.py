@@ -82,6 +82,8 @@ EXCLUDED_NAMES = {
     "structured.jsonl",
     "structured.jsonl.rotation.lock",
 }
+_WINDOWS_DRIVE_REMOTE = 4
+_WINDOWS_REMOTE_DIRECTORY_SYNC_UNSUPPORTED = {1, 50}
 EXCLUDED_REL_PATHS = {
     "bot_config.json",
     "bot_config.json.lock",
@@ -160,6 +162,9 @@ def _sync_directory(path: Path) -> None:
         close_handle = kernel32.CloseHandle
         close_handle.argtypes = [wintypes.HANDLE]
         close_handle.restype = wintypes.BOOL
+        get_drive_type = kernel32.GetDriveTypeW
+        get_drive_type.argtypes = [wintypes.LPCWSTR]
+        get_drive_type.restype = wintypes.UINT
 
         handle = create_file(
             str(directory),
@@ -176,7 +181,22 @@ def _sync_directory(path: Path) -> None:
         primary_error: BaseException | None = None
         try:
             if not flush_file_buffers(handle):
-                raise ctypes.WinError(ctypes.get_last_error())
+                error_code = ctypes.get_last_error()
+                drive_root = directory.anchor
+                remote_sync_unsupported = (
+                    error_code in _WINDOWS_REMOTE_DIRECTORY_SYNC_UNSUPPORTED
+                    and bool(drive_root)
+                    and get_drive_type(drive_root) == _WINDOWS_DRIVE_REMOTE
+                )
+                if remote_sync_unsupported:
+                    print(
+                        "WARN: directory flush unsupported on remote "
+                        f"filesystem ({drive_root}, WinError {error_code}); "
+                        "manifest file data was flushed before atomic replace",
+                        file=sys.stderr,
+                    )
+                else:
+                    raise ctypes.WinError(error_code)
         except BaseException as exc:
             primary_error = exc
             raise
@@ -433,6 +453,17 @@ def _is_release_worktree_layout(root: Path) -> bool:
     return root.name.lower() == "worktree" and root.parent.name.lower() == "releases"
 
 
+def _git_command(root: Path, *arguments: str) -> list[str]:
+    return [
+        "git",
+        "-c",
+        f"safe.directory={root.as_posix()}",
+        "-C",
+        str(root),
+        *arguments,
+    ]
+
+
 def _validate_release_worktree(root: Path, reference: Path | None) -> None:
     if reference is None:
         raise ValueError("release worktree requires a separate DEV reference source")
@@ -447,7 +478,7 @@ def _validate_release_worktree(root: Path, reference: Path | None) -> None:
         raise ValueError("release worktree requires Git metadata")
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            _git_command(root, "rev-parse", "--show-toplevel"),
             capture_output=True, text=True, timeout=20, check=False,
         )
     except OSError as exc:
@@ -467,7 +498,7 @@ def _git_tracked_files(root: Path) -> list[Path] | None:
         return None
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), "ls-files"],
+            _git_command(root, "ls-files"),
             capture_output=True,
             text=True,
             timeout=20,
@@ -487,8 +518,15 @@ def _git_tracked_files(root: Path) -> list[Path] | None:
         if not rel or rel.replace("/", "\\") == "DEPLOY_MANIFEST.json":
             continue
         path = root / rel
-        if path.is_file():
-            files.append(_absolute_without_links(path, label="manifest source"))
+        if _skip(path, root):
+            continue
+        if not path.is_file():
+            if strict_worktree:
+                raise RuntimeError(
+                    f"release worktree tracked release file is missing: {rel}"
+                )
+            continue
+        files.append(_absolute_without_links(path, label="manifest source"))
     return sorted(files)
 
 
@@ -500,6 +538,18 @@ def _manifest_source_files(root: Path) -> list[Path]:
     if source_files is None:
         source_files = _filesystem_source_files(root)
     else:
+        if _is_release_worktree_layout(root):
+            tracked_relpaths = {
+                path.relative_to(root).as_posix().casefold()
+                for path in source_files
+            }
+            for candidate in _filesystem_source_files(root):
+                relative = candidate.relative_to(root)
+                if relative.as_posix().casefold() not in tracked_relpaths:
+                    raise RuntimeError(
+                        "release worktree contains untracked release file: "
+                        f"{relative}"
+                    )
         required_files = {
             _absolute_without_links(root / rel, label="manifest source")
             for rel in REQUIRED_RELEASE_ITEMS
@@ -547,8 +597,7 @@ def _reference_projection(manifest: dict, reference_root: Path) -> dict[str, dic
     runtime_reference_paths = {
         path
         for path in reference_records
-        if path.lower().endswith(".py")
-        and path.split("/", 1)[0].lower() in RUNTIME_REFERENCE_ROOTS
+        if path.split("/", 1)[0].lower() in RUNTIME_REFERENCE_ROOTS
     }
     missing_runtime = runtime_reference_paths - set(release_records)
     if missing_runtime:

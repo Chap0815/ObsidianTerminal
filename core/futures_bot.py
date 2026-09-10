@@ -2068,6 +2068,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                         if state_rows is None
                         else state_rows_exposure_count(state_rows)
                     ),
+                    "open_positions_known": state_rows is not None,
                     "safe_mode": bool(self.safe_mode.is_active()),
                     **self._entry_admission_runtime_fields(),
                     **observability,
@@ -2078,7 +2079,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     ),
                 },
             )
-            if published is False:
+            if published is not True:
                 raise RuntimeError("runtime status publication failed")
         except Exception as exc:
             phase = "heartbeat" if log_snapshot else "periodic"
@@ -3178,7 +3179,13 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         Fast-path: zero open positions  return immediately, skipping the full
         close machinery (thread, fetch_tickers, state loop).
         """
-        from core.logger import log_event
+        from core.logger import log_event as _log_event
+
+        def log_event(*args, **kwargs):
+            try:
+                _log_event(*args, **kwargs)
+            except Exception:
+                pass
 
         # Latch only when the flatten has FULLY succeeded  a partial-failure
         # shutdown must stay un-latched so a repeat signal / atexit can RETRY the
@@ -3253,7 +3260,15 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         def _close_runner():
             try:
                 res = self._emergency_close_all(reason=f"Shutdown signal {signum}")
-                result["failed_count"] = int((res or {}).get("failed_count", 0))
+                if not isinstance(res, dict):
+                    raise RuntimeError("Invalid emergency close result: expected dict")
+                failed_count = res.get("failed_count")
+                if type(failed_count) is not int or failed_count < 0:
+                    raise RuntimeError(
+                        "Invalid emergency close result: failed_count must be "
+                        "a non-negative integer"
+                    )
+                result["failed_count"] = failed_count
                 result["done"] = True
             except Exception as e:
                 result["error"] = e

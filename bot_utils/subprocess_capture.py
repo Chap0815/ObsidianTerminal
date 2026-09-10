@@ -1,16 +1,22 @@
 """Bounded stdout/stderr capture for long-running child processes."""
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import sys
 import threading
 import time
+from itertools import islice
 from os import PathLike
 from typing import Any, Sequence
 
+from bot_utils.runtime_threads import thread_definitely_never_started
+
 
 DEFAULT_CAPTURE_BYTES_PER_STREAM = 64 * 1024
+MAX_CAPTURE_BYTES_PER_STREAM = 16 * 1024 * 1024
+MAX_CAPTURE_ARGUMENTS = 4096
 _READ_CHUNK_BYTES = 16 * 1024
 _READER_DRAIN_TIMEOUT_SEC = 1.0
 _PROCESS_TERMINATION_TIMEOUT_SEC = 10.0
@@ -447,6 +453,10 @@ class _BoundedByteTail:
             or max_bytes <= 0
         ):
             raise ValueError("max_output_bytes must be a positive integer")
+        if max_bytes > MAX_CAPTURE_BYTES_PER_STREAM:
+            raise ValueError(
+                f"max_output_bytes must be at most {MAX_CAPTURE_BYTES_PER_STREAM} bytes"
+            )
         self._max_bytes = max_bytes
         self._data = bytearray()
         self._dropped = 0
@@ -576,7 +586,7 @@ def _close_finished_streams(
         try:
             reader_alive = reader is not None and reader.is_alive()
         except BaseException:
-            reader_alive = False
+            reader_alive = True
         if (
             reader is None
             or id(reader) not in started_ids
@@ -649,9 +659,45 @@ def run_bounded_capture(
     """Run a child while retaining only a fixed byte tail per output stream."""
     if any(
         key in popen_kwargs
-        for key in ("stdout", "stderr", "text", "encoding", "errors")
+        for key in (
+            "stdout",
+            "stderr",
+            "text",
+            "universal_newlines",
+            "encoding",
+            "errors",
+        )
     ):
         raise ValueError("output stream options are managed internally")
+    if popen_kwargs.get("stdin") == subprocess.PIPE:
+        raise ValueError("stdin=PIPE is incompatible with bounded capture")
+    if isinstance(args, (str, bytes)) or not isinstance(args, Sequence):
+        raise ValueError(
+            "args must be a non-empty argument sequence of strings or paths"
+        )
+    reported_count = len(args)
+    if reported_count > MAX_CAPTURE_ARGUMENTS:
+        raise ValueError(
+            f"args must contain at most {MAX_CAPTURE_ARGUMENTS} arguments"
+        )
+    command_args = tuple(islice(args, MAX_CAPTURE_ARGUMENTS + 1))
+    if len(command_args) > MAX_CAPTURE_ARGUMENTS:
+        raise ValueError(
+            f"args must contain at most {MAX_CAPTURE_ARGUMENTS} arguments"
+        )
+    if not command_args or any(
+        not isinstance(arg, (str, PathLike)) for arg in command_args
+    ):
+        raise ValueError(
+            "args must be a non-empty argument sequence of strings or paths"
+        )
+    if timeout is not None and (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError("timeout must be a positive finite number or None")
     stdout_tail = _BoundedByteTail(max_output_bytes)
     stderr_tail = _BoundedByteTail(max_output_bytes)
     job = _new_process_job()
@@ -659,7 +705,7 @@ def run_bounded_capture(
     try:
         spawn_args, prepared_kwargs, start_gate = (
             _prepare_windows_gated_spawn(
-                args,
+                command_args,
                 popen_kwargs,
                 wrapper_python=wrapper_python,
             )
@@ -741,8 +787,12 @@ def run_bounded_capture(
             started_readers.append(reader)
             try:
                 reader.start()
-            except BaseException:
-                if isinstance(reader, _READER_THREAD_TYPE):
+            except BaseException as exc:
+                definite_prelaunch = (
+                    isinstance(exc, Exception)
+                    and thread_definitely_never_started(reader)
+                )
+                if isinstance(reader, _READER_THREAD_TYPE) and not definite_prelaunch:
                     with _UNCERTAIN_READERS_LOCK:
                         _UNCERTAIN_READERS.add(reader)
                     try:
@@ -780,7 +830,7 @@ def run_bounded_capture(
             ) from cleanup_exc
         exc.stdout = stdout_tail.text()
         exc.stderr = stderr_tail.text()
-        exc.cmd = args
+        exc.cmd = command_args
         raise
     except BaseException:
         try:
@@ -811,7 +861,7 @@ def run_bounded_capture(
                 "child process exited while descendant output pipes remained open"
             )
         active_descendants = job.has_live_processes() if job is not None else False
-        if active_descendants:
+        if active_descendants is not False:
             _terminate_owned_processes(process, job)
             _join_readers(readers, tails)
             _close_finished_streams(process, readers, started_readers)
@@ -820,7 +870,7 @@ def run_bounded_capture(
             )
         _close_finished_streams(process, readers, started_readers)
         return subprocess.CompletedProcess(
-            args=args,
+            args=command_args,
             returncode=returncode,
             stdout=stdout_tail.text(),
             stderr=stderr_tail.text(),

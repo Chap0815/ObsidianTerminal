@@ -2507,7 +2507,20 @@ class ObsidianApp(ctk.CTk):
             self._log_to_card(card, "system", "No parameter changes to save")
             return
         rows = self.param_rows.get(bot_name, {})
-        updates = {k: rows[k].value for k in dirty if k in rows}
+        missing_rows = sorted(k for k in dirty if k not in rows)
+        if missing_rows:
+            self._log_to_card(
+                card,
+                "error",
+                "Config save failed: parameter rows unavailable: "
+                + ", ".join(missing_rows),
+            )
+            return
+        try:
+            updates = {k: rows[k].value for k in dirty}
+        except Exception as exc:
+            self._log_to_card(card, "error", f"Config save failed: {exc}")
+            return
         try:
             self.config = save_config_merge({bot_name: updates})
         except Exception as exc:
@@ -2540,10 +2553,24 @@ class ObsidianApp(ctk.CTk):
             return
         defaults = effective_default_config().get(bot_name, {})
         rows = self.param_rows.get(bot_name, {})
+        reset_keys = [k for k in rows if k != "SIMULATION"]
+        missing_defaults = (
+            sorted(k for k in reset_keys if k not in defaults)
+            if isinstance(defaults, dict)
+            else sorted(reset_keys)
+        )
+        if missing_defaults:
+            self._log_to_card(
+                card,
+                "error",
+                "Config reset failed: defaults unavailable: "
+                + ", ".join(missing_defaults),
+            )
+            self._mark_dirty(bot_name, True)
+            return
         updates = {
             k: defaults[k]
-            for k in rows
-            if k != "SIMULATION" and k in defaults
+            for k in reset_keys
         }
         if updates:
             try:
@@ -3074,7 +3101,7 @@ class ObsidianApp(ctk.CTk):
         registry_stop = getattr(registry, "stop", None)
         if callable(registry_stop):
             try:
-                stopped = bool(registry_stop(proc))
+                stopped = registry_stop(proc) is True
             except Exception:
                 # The registry pre-owns a live handle before attempting its
                 # backend. Do not bypass its persistent uncertainty state.
@@ -3082,7 +3109,7 @@ class ObsidianApp(ctk.CTk):
             if not stopped:
                 return False
             verify = getattr(registry, "resume_after_aborted_shutdown", None)
-            return bool(verify()) if callable(verify) else True
+            return verify() is True if callable(verify) else True
         return stop_tool_processes(
             [proc], terminate_timeout=3.0, kill_timeout=2.0
         )
@@ -4372,8 +4399,13 @@ class ObsidianApp(ctk.CTk):
             rs = statuses.get(bot) if isinstance(statuses, dict) else None
             if not isinstance(rs, dict):
                 return None
-            run_id = str(getattr(self.bots[bot], "run_id", "") or "")
-            if run_id and str(rs.get("run_id") or "") != run_id:
+            run_id = getattr(self.bots[bot], "run_id", "")
+            if (
+                not isinstance(run_id, str)
+                or not run_id.strip()
+                or run_id != run_id.strip()
+                or rs.get("run_id") != run_id
+            ):
                 return None
             age = _runtime_monotonic_age(rs)
             if age is None:
@@ -4574,6 +4606,7 @@ class ObsidianApp(ctk.CTk):
             external_running = external_rs is not None
             card["_external_running"] = external_running
             _is_sim = bool(self.config.get(bot, {}).get("SIMULATION", True))
+            runtime_mode_label = None
             if running:
                 status_label = "Active"
                 runtime_status_value = "starting"
@@ -4601,6 +4634,7 @@ class ObsidianApp(ctk.CTk):
                                 and stale_age is not None
                                 and -5.0 <= stale_age <= 45.0):
                             _is_sim = runtime_sim
+                            runtime_mode_label = "SIM" if runtime_sim else "LIVE"
                         if stale_age is not None and stale_age > 45.0:
                             status_label = f"Stale {int(stale_age)}s"
                     else:
@@ -4608,10 +4642,10 @@ class ObsidianApp(ctk.CTk):
                 except Exception:
                     status_label = "Active"
                 # Health-at-a-glance: green = running LIVE, cyan = running SIM.
-                card["status"].set("Active - " + ("SIM" if _is_sim else "LIVE"))
+                card["status"].set("Active - MODE UNKNOWN")
                 try:
                     card["status"].set(
-                        status_label + " - " + ("SIM" if _is_sim else "LIVE"))
+                        status_label + " - " + (runtime_mode_label or "MODE UNKNOWN"))
                     self._set_card_led_color(
                         card,
                         _runtime_snapshot_card_led_color(
@@ -4634,16 +4668,21 @@ class ObsidianApp(ctk.CTk):
                                            border_color=COLORS["danger"])
             elif external_running:
                 try:
-                    external_sim = _runtime_simulation_flag(external_rs)
+                    external_sim = (
+                        _runtime_simulation_flag(external_rs)
+                        if _runtime_status_is_fresh(external_rs)
+                        else None
+                    )
                     if external_sim is not None:
                         _is_sim = external_sim
+                        runtime_mode_label = "SIM" if external_sim else "LIVE"
                     status_label = str(external_rs.get("status") or "running").title()
                     build = str(external_rs.get("build_id") or "")
                     if build and build != "unknown":
                         status_label += f" - {build[:8]}"
                     card["status"].set(
                         f"External {status_label} - "
-                        f"{'SIM' if _is_sim else 'LIVE'}")
+                        f"{runtime_mode_label or 'MODE UNKNOWN'}")
                     self._set_card_led_color(card, COLORS["warning"])
                 except Exception:
                     card["status"].set("External Active")
@@ -5315,7 +5354,7 @@ class ObsidianApp(ctk.CTk):
         """Fail closed unless every launcher-owned tool is proven stopped."""
         try:
             registry = getattr(self, "tool_processes", None)
-            if registry is not None and not registry.stop_all():
+            if registry is not None and registry.stop_all() is not True:
                 raise RuntimeError("at least one launcher tool is still running")
         except Exception as exc:
             try:
@@ -5344,12 +5383,12 @@ class ObsidianApp(ctk.CTk):
         if callable(registry_stop):
             attempted_registry_stop = True
             try:
-                stopped = bool(registry_stop(proc))
+                stopped = registry_stop(proc) is True
             except Exception:
                 attempted_registry_stop = False
         if not attempted_registry_stop:
             try:
-                stopped = bool(stop_tool_processes([proc]))
+                stopped = stop_tool_processes([proc]) is True
             except Exception:
                 stopped = False
         if stopped:

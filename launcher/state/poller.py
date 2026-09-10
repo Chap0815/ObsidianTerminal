@@ -126,6 +126,8 @@ def _runtime_or_config_sim(
         pid = positive_int_or_zero(rs.get("pid"))
         runtime_sim = strict_bool_or_none(rs.get("simulation"))
         if _runtime_status_is_fresh(rs) and runtime_sim is not None:
+            if rs.get("bot") != bot:
+                raise RuntimeError("runtime bot does not match requested bot")
             try:
                 from core.process_identity import pid_matches_bot
                 if not pid_matches_bot(pid, bot):
@@ -151,7 +153,7 @@ def _runtime_or_config_sim(
     try:
         from bot_utils.sim_flag import read_simulation_flag
         return bool(read_simulation_flag(
-            bot, raise_on_corrupt=False, default=True))
+            bot, raise_on_corrupt=True, default=True))
     except Exception:
         pass
     return True
@@ -181,6 +183,7 @@ class _ErrorLogCounter:
         self._cached_file_id: tuple[int, int] | None = None
         self._cached_mtime_ns = 0
         self._cached_tail = b""
+        self._cached_separator_tail = b""
 
     def _tail_at(self, end: int) -> bytes:
         bounded_end = max(0, int(end))
@@ -202,12 +205,17 @@ class _ErrorLogCounter:
             stream.seek(start)
             return stream.read(len(self._cached_tail)) == self._cached_tail
 
-    def _count_range(self, start: int, length: int) -> int:
+    def _count_range(
+        self,
+        start: int,
+        length: int,
+        *,
+        pending: bytes = b"",
+    ) -> tuple[int, bytes]:
         separator = self.SEPARATOR_BYTES
         separator_len = len(separator)
         remaining = max(0, int(length))
         count = 0
-        pending = b""
         with open(self.path, "rb") as stream:
             stream.seek(max(0, int(start)))
             while remaining > 0:
@@ -231,7 +239,9 @@ class _ErrorLogCounter:
                     max(0, len(pending) - (separator_len - 1)),
                 )
                 pending = pending[discard:]
-        return count
+        if remaining > 0:
+            raise OSError("error log ended before the statted byte range")
+        return count, pending
 
     def count(self) -> int:
         import os as _os
@@ -243,6 +253,7 @@ class _ErrorLogCounter:
             self._cached_file_id = None
             self._cached_mtime_ns = 0
             self._cached_tail = b""
+            self._cached_separator_tail = b""
             return 0
         except OSError:
             return self._cached_count  # transient  keep last
@@ -269,7 +280,9 @@ class _ErrorLogCounter:
         if replaced or cur_size < self._cached_size or same_size_rewritten:
             # Rotated, truncated, or rewritten in place  recount from scratch.
             try:
-                self._cached_count = self._count_range(0, cur_size)
+                self._cached_count, self._cached_separator_tail = (
+                    self._count_range(0, cur_size)
+                )
                 self._cached_size = cur_size
                 self._cached_file_id = file_id
                 self._cached_mtime_ns = mtime_ns
@@ -285,6 +298,7 @@ class _ErrorLogCounter:
             self._cached_file_id = file_id
             self._cached_mtime_ns = mtime_ns
             self._cached_tail = b""
+            self._cached_separator_tail = b""
             return 0
 
         # cur_size > cached_size  read only new bytes (tail).
@@ -298,7 +312,9 @@ class _ErrorLogCounter:
             append_continuity = False
         if not append_continuity:
             try:
-                self._cached_count = self._count_range(0, cur_size)
+                self._cached_count, self._cached_separator_tail = (
+                    self._count_range(0, cur_size)
+                )
                 self._cached_size = cur_size
                 self._cached_file_id = file_id
                 self._cached_mtime_ns = mtime_ns
@@ -307,26 +323,19 @@ class _ErrorLogCounter:
                 pass
             return self._cached_count
 
-        # Use a small overlap to catch separators spanning the boundary.
-        delta_start = max(
-            0, self._cached_size - (len(self.SEPARATOR_BYTES) - 1)
-        )
         try:
             # File sizes and seek offsets are bytes. Binary reads keep those
             # units consistent and cannot land inside a UTF-8 code point.
-            new_seps = self._count_range(
-                delta_start, cur_size - delta_start
+            new_seps, separator_tail = self._count_range(
+                self._cached_size,
+                cur_size - self._cached_size,
+                pending=self._cached_separator_tail,
             )
-            # Subtract separators already counted in the overlap region.
-            if delta_start < self._cached_size:
-                overlap_count = self._count_range(
-                    delta_start, self._cached_size - delta_start
-                )
-                new_seps = max(0, new_seps - overlap_count)
             self._cached_count += new_seps
             self._cached_size   = cur_size
             self._cached_file_id = file_id
             self._cached_mtime_ns = mtime_ns
+            self._cached_separator_tail = separator_tail
             self._remember_tail(cur_size)
         except Exception:
             pass  # keep last known on read failure

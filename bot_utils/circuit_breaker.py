@@ -325,6 +325,15 @@ def extract_valid_top_of_book(order_book: dict | None) -> tuple[float, float] | 
     return float(quotes["bid"]), float(quotes["ask"])
 
 
+def _log_spread_warning(log_event: Optional[Callable], message: str) -> None:
+    if not callable(log_event):
+        return
+    try:
+        log_event(message, "WARN")
+    except Exception as exc:
+        _log_safe_mode_error("spread circuit-breaker warning", exc)
+
+
 def check_spread_ok(
     ticker: dict,
     log_event: Optional[Callable] = None,
@@ -342,17 +351,28 @@ def check_spread_ok(
     the breaker on repeated occurrence (a minutes-long flash-crash spread would
     otherwise block trades only transiently, with SAFE_MODE never persisting).
     """
+    if not isinstance(missing_ok, bool):
+        _log_spread_warning(
+            log_event,
+            "Spread check invalid missing-quote policy  blocking entry",
+        )
+        return False
     if not isinstance(ticker, dict):
-        return bool(missing_ok)
+        return missing_ok
     bid = ticker.get("bid")
     ask = ticker.get("ask")
     if bid is None or ask is None:
-        if log_event and not missing_ok:
-            log_event("Spread check unavailable  blocking entry", "WARN")
-        return bool(missing_ok)
+        if not missing_ok:
+            _log_spread_warning(
+                log_event,
+                "Spread check unavailable  blocking entry",
+            )
+        return missing_ok
     if not has_valid_spread_quotes(ticker):
-        if log_event:
-            log_event("Spread check invalid bid/ask  blocking entry", "WARN")
+        _log_spread_warning(
+            log_event,
+            "Spread check invalid bid/ask  blocking entry",
+        )
         return False
     try:
         bid_f = float(bid)
@@ -370,12 +390,11 @@ def check_spread_ok(
         if not math.isfinite(spread_pct) or spread_pct < 0.0:
             raise ValueError("invalid spread result")
         if spread_pct > threshold:
-            if log_event:
-                log_event(
-                    f" Spread check: {spread_pct:.3f}% > {threshold}% "
-                    f"max (bid={bid_f}, ask={ask_f})  blocking entry",
-                    "WARN",
-                )
+            _log_spread_warning(
+                log_event,
+                f" Spread check: {spread_pct:.3f}% > {threshold}% "
+                f"max (bid={bid_f}, ask={ask_f})  blocking entry",
+            )
             # record the bad reading and possibly trip
             if safe_mode_instance is not None:
                 safe_mode_instance.record_spread_abnormal(
@@ -383,8 +402,10 @@ def check_spread_ok(
                 )
             return False
     except (TypeError, ValueError, OverflowError):
-        if log_event:
-            log_event("Spread check invalid ticker values  blocking entry", "WARN")
+        _log_spread_warning(
+            log_event,
+            "Spread check invalid ticker values  blocking entry",
+        )
         return False
     return True
 

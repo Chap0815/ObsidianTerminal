@@ -24,6 +24,7 @@ from core.runtime_status import (
     read_runtime_status_with_path,
     write_runtime_status,
 )
+from tools.release_requirements import REQUIRED_MANIFEST_FILES
 
 
 _MANIFEST_MAX_BYTES = 4 * 1024 * 1024
@@ -395,6 +396,18 @@ def _check_manifest() -> list[CheckIssue]:
                 raise ValueError(f"manifest hash mismatch: {relative}")
             build_digest.update(relative.encode("utf-8"))
             build_digest.update(expected_hash.encode("ascii"))
+        missing_required = next(
+            (
+                relative
+                for relative in REQUIRED_MANIFEST_FILES
+                if relative.casefold() not in seen_targets
+            ),
+            None,
+        )
+        if missing_required is not None:
+            raise ValueError(
+                f"manifest missing required file: {missing_required}"
+            )
         if build_digest.hexdigest()[:16] != build_id:
             raise ValueError("manifest build id does not match its file list")
     except (OSError, UnicodeError, ValueError, TypeError) as exc:
@@ -411,9 +424,32 @@ def _check_manifest() -> list[CheckIssue]:
 
 
 def _check_runtime(bot_name: str, meta: dict, *, cleanup: bool = False) -> list[CheckIssue]:
-    status, status_path = read_runtime_status_with_path(meta.get("log_dir", ""))
+    log_dir = str(meta.get("log_dir", ""))
+    status, status_path = read_runtime_status_with_path(log_dir)
     if not status:
+        for candidate in (
+            PROJECT_ROOT / log_dir / "runtime_status.json",
+            PROJECT_ROOT / log_dir / "runtime_status.fallback.json",
+        ):
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
+            return [_issue(
+                "error",
+                "runtime_status_invalid",
+                f"{bot_name}: runtime_status exists but is not readable JSON",
+            )]
         return []
+    reported_bot = status.get("bot")
+    if reported_bot is not None and reported_bot != bot_name:
+        return [_issue(
+            "error",
+            "runtime_status_invalid",
+            f"{bot_name}: runtime_status belongs to a different bot",
+        )]
     raw_pid = status.get("pid")
     if (
         isinstance(raw_pid, bool)
@@ -427,11 +463,12 @@ def _check_runtime(bot_name: str, meta: dict, *, cleanup: bool = False) -> list[
             f"{bot_name}: runtime_status pid is not a valid process id",
         )]
     pid = raw_pid
-    state = str(status.get("status") or "").lower()
+    raw_state = status.get("status")
+    state = raw_state.strip().lower() if isinstance(raw_state, str) else ""
     cmdline = _pid_cmdline(pid) if pid > 0 else ""
     expected_module = str(meta.get("module") or "")
     active_states = {"starting", "started", "ready", "running", "degraded"}
-    if pid > 0 and state in active_states and _pid_alive(pid):
+    if pid > 0 and _pid_alive(pid):
         try:
             path = status_path or PROJECT_ROOT / str(meta.get("log_dir", "")) / "runtime_status.json"
             age_sec = time.time() - path.stat().st_mtime
@@ -445,16 +482,28 @@ def _check_runtime(bot_name: str, meta: dict, *, cleanup: bool = False) -> list[
         if matches_expected:
             return [_issue("error", "bot_already_running",
                            f"{bot_name}: runtime_status reports live pid {pid}")]
+        if not isinstance(raw_state, str) or not state:
+            return [_issue(
+                "error",
+                "runtime_status_invalid",
+                f"{bot_name}: live runtime_status state is not valid text",
+            )]
+        if state not in active_states:
+            return []
         returncode = status.get("returncode")
+        run_id = status.get("run_id")
         threads = status.get("threads")
         shutdown = status.get("shutdown")
+        required_threads = {"monitor", "scan", "reconcile"}
         launcher_confirmed_exit = (
-            status.get("stopped_by") == "launcher"
+            status.get("launcher_terminal_marker") is True
+            and status.get("stopped_by") == "launcher"
             and isinstance(returncode, int)
             and not isinstance(returncode, bool)
-            and bool(str(status.get("run_id") or ""))
+            and isinstance(run_id, str)
+            and bool(run_id.strip())
             and isinstance(threads, dict)
-            and bool(threads)
+            and required_threads.issubset(threads)
             and all(value is False for value in threads.values())
             and isinstance(shutdown, dict)
             and shutdown.get("complete") is False
@@ -500,11 +549,17 @@ def _check_runtime(bot_name: str, meta: dict, *, cleanup: bool = False) -> list[
             if cleanup:
                 published = False
                 try:
+                    raw_simulation = status.get("simulation")
+                    simulation = (
+                        raw_simulation
+                        if isinstance(raw_simulation, bool)
+                        else True
+                    )
                     published = write_runtime_status(
                         meta.get("log_dir", ""),
                         bot_name,
                         "stopped",
-                        bool(status.get("simulation", True)),
+                        simulation,
                         process_pid=0,
                         threads={"monitor": False, "scan": False, "reconcile": False},
                         extra={
@@ -1025,6 +1080,7 @@ def _check_state_and_claims(bot_name: str | None,
     issues: list[CheckIssue] = []
     targets = [bot_name] if bot_name else list(bot_meta)
     all_claims, err = _db_rows("bot_open_positions")
+    claims_readable = err is None
     if err:
         issues.append(_issue("error", "db_claims_read",
                              f"bot_open_positions unreadable: {err}"))
@@ -1202,6 +1258,14 @@ def _check_state_and_claims(bot_name: str | None,
             if missing:
                 issues.append(_issue("error", "stale_claims",
                                      f"{name}: claims without state rows: {sorted(set(missing))}"))
+
+        if not sim and claims_readable and bases - claim_bases:
+            issues.append(_issue(
+                "error",
+                "live_json_state_without_claim",
+                f"{name}: LIVE JSON state without claim rows: "
+                f"{sorted(bases - claim_bases)}",
+            ))
 
         if meta.get("is_futures"):
             current_fstate_bot = f"{name} (SIM)" if sim else name

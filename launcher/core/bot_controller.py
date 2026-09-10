@@ -31,7 +31,10 @@ from launcher.core.positions import (
     get_open_spot_positions,
     mode_switch_blockers,
 )
-from launcher.core.runtime_status_values import positive_int_or_zero
+from launcher.core.runtime_status_values import (
+    positive_int_or_zero,
+    strict_bool_or_none,
+)
 from launcher.state.poller import _runtime_or_config_sim, _runtime_status_is_fresh
 from launcher.ui.logging_panel import begin_log_session, log_to_card
 from core.pre_start_check import (
@@ -60,7 +63,7 @@ def _write_stderr_best_effort(message: str) -> None:
 def _post_ui(app, callback, *, delay_ms: int = 0) -> bool:
     post = getattr(app, "post_ui", None)
     if callable(post):
-        return post(callback, delay_ms=delay_ms) is not False
+        return post(callback, delay_ms=delay_ms) is True
     app.after(delay_ms, callback)
     return True
 
@@ -68,7 +71,7 @@ def _post_ui(app, callback, *, delay_ms: int = 0) -> bool:
 def _post_ui_lifecycle(app, callback, *, delay_ms: int = 0) -> bool:
     post = getattr(app, "post_ui_lifecycle", None)
     if callable(post):
-        return post(callback, delay_ms=delay_ms) is not False
+        return post(callback, delay_ms=delay_ms) is True
     return _post_ui(app, callback, delay_ms=delay_ms)
 
 
@@ -186,17 +189,19 @@ def _stop_bot_process_verified(
         prior_pid = None
         prior_run_id = ""
     stop_error: Exception | None = None
+    stop_error_detail = ""
     try:
         stopped_pid = bot.stop(graceful_close=graceful_close)
     except Exception as exc:
         stopped_pid = None
         stop_error = exc
+        stop_error_detail = _bounded_exception_summary(exc)
     try:
         still_running = bool(bot.is_running())
     except Exception as exc:
         raise RuntimeError("bot stop outcome could not be verified") from exc
     if still_running:
-        detail = f": {stop_error}" if stop_error is not None else ""
+        detail = f": {stop_error_detail}" if stop_error is not None else ""
         raise RuntimeError(
             f"bot is still running after stop escalation{detail}"
         ) from stop_error
@@ -205,7 +210,8 @@ def _stop_bot_process_verified(
         if stderr is not None:
             try:
                 stderr.write(
-                    f"[Stop] process exited despite stop error: {stop_error}\n"
+                    "[Stop] process exited despite stop error: "
+                    f"{stop_error_detail}\n"
                 )
             except Exception:
                 pass
@@ -315,6 +321,14 @@ def _wait_for_bot_ready(
     run_id = expected_run_id
     if run_id is None:
         run_id = getattr(bot, "run_id", None) or ""
+    start_config = getattr(bot, "start_config", None)
+    mode_required = (
+        isinstance(start_config, dict) and "SIMULATION" in start_config
+    )
+    expected_simulation = (
+        strict_bool_or_none(start_config.get("SIMULATION"))
+        if mode_required else None
+    )
     identity_required = expected_pid is not None
     if expected_pid is None:
         expected_pid = positive_int_or_zero(
@@ -333,18 +347,26 @@ def _wait_for_bot_ready(
         last = read_runtime_status(log_dir)
         threads = last.get("threads") if isinstance(last.get("threads"), dict) else {}
         runtime_pid = positive_int_or_zero(last.get("pid"))
+        runtime_run_id = last.get("run_id")
+        runtime_simulation = strict_bool_or_none(last.get("simulation"))
         owner_matches = not identity_required or bool(
             run_id and expected_pid and runtime_pid == expected_pid
+        )
+        mode_matches = not mode_required or (
+            expected_simulation is not None
+            and runtime_simulation is expected_simulation
         )
         heartbeat_fresh = (
             _runtime_status_is_fresh(last) if identity_required else True
         )
         if (last.get("status") == "ready"
-                and str(last.get("run_id") or "") == str(run_id)
+                and isinstance(runtime_run_id, str)
+                and runtime_run_id == run_id
                 and runtime_pid > 0
                 and owner_matches
+                and mode_matches
                 and heartbeat_fresh
-                and all(bool(threads.get(k))
+                and all(threads.get(k) is True
                         for k in ("monitor", "scan", "reconcile"))):
             return True, str(last.get("build_id") or "unknown")
         _time.sleep(0.25)
@@ -408,6 +430,19 @@ def _start_readiness_monitor(app, name: str, bot, card) -> None:
             )
         except BaseException as exc:
             state["fatal"] = exc
+            if isinstance(exc, Exception):
+                detail = _bounded_exception_summary(exc)
+                try:
+                    posted = _post_ui(
+                        app,
+                        lambda d=detail: commit(
+                            d,
+                            "warn",
+                            "Started; readiness monitor failed: {detail}",
+                        ),
+                    )
+                except Exception:
+                    posted = False
         finally:
             state["done"].set()
             if not posted:
@@ -461,6 +496,9 @@ def _start_readiness_monitor(app, name: str, bot, card) -> None:
 
 
 def _has_unsaved_params(app, name: str) -> bool:
+    dirty_by_bot = getattr(app, "_dirty_param_keys", {})
+    if isinstance(dirty_by_bot, dict) and dirty_by_bot.get(name):
+        return True
     try:
         card = app.cards.get(name) or {}
         lbl = card.get("unsaved_lbl")
@@ -487,12 +525,15 @@ def _save_current_config(app, name: str) -> None:
     dirty = getattr(app, "_dirty_param_keys", {}).get(name) or set()
     if dirty:
         rows = getattr(app, "param_rows", {}).get(name, {})
-        updates = {k: rows[k].value for k in dirty if k in rows}
+        missing_rows = sorted(k for k in dirty if k not in rows)
+        if missing_rows:
+            raise ValueError(
+                "dirty parameter rows unavailable: " + ", ".join(missing_rows)
+            )
+        updates = {k: rows[k].value for k in dirty}
         app.config = save_config_merge({name: updates})
     else:
-        app.config = save_config_merge(section_replacements={
-            name: dict(app.config.get(name, {})),
-        })
+        raise ValueError("unsaved parameter label has no tracked dirty keys")
 
 
 #  Start 
@@ -588,8 +629,12 @@ def open_positions_for_stop(name: str) -> list:
         except Exception as exc:
             read_errors.append(exc)
             rows = []
-        for row in rows or []:
+        if not isinstance(rows, list):
+            read_errors.append(TypeError("position reader returned a non-list"))
+            continue
+        for row in rows:
             if not isinstance(row, dict):
+                read_errors.append(TypeError("position reader returned a non-object row"))
                 continue
             symbol = str(row.get("symbol") or row.get("base") or "")
             key = (symbol, bool(is_sim))
@@ -628,6 +673,35 @@ def close_modes_for_stop(name: str) -> list[bool]:
     if modes:
         return modes
     return _position_modes_for_stop(name)[:1]
+
+
+def _validated_close_modes_for_action(name: str) -> list[bool]:
+    modes = close_modes_for_stop(name)
+    if (
+        not isinstance(modes, list)
+        or not modes
+        or any(type(mode) is not bool for mode in modes)
+        or len(set(modes)) != len(modes)
+    ):
+        raise RuntimeError(
+            f"{name}: position mode verification returned an invalid result"
+        )
+    return modes
+
+
+def _validated_close_failures(result) -> list[str]:
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("failed"), list)
+    ):
+        raise RuntimeError("fallback close returned an invalid result")
+    failed = result["failed"]
+    if any(
+        not isinstance(symbol, str) or not symbol.strip()
+        for symbol in failed
+    ):
+        raise RuntimeError("fallback close returned an invalid failure entry")
+    return [symbol.strip() for symbol in failed]
 
 
 def stop_bot(app, name: str) -> None:
@@ -697,14 +771,23 @@ def stop_bot(app, name: str) -> None:
                 _release_dead_process_close_locks(stopped_pid)
             _post_ui(app, lambda: log_to_card(card, "system", "Stopped"))
         except Exception as e:
-            _post_ui(app, lambda err=e: log_to_card(
+            detail = _bounded_exception_summary(e)
+            _post_ui(app, lambda err=detail: log_to_card(
                 card, "warn", f"Stop failed: {err}"))
 
-    _start_critical_worker(
-        app,
-        _instant_stop_worker,
-        name=f"stop-{name}",
-    )
+    try:
+        _start_critical_worker(
+            app,
+            _instant_stop_worker,
+            name=f"stop-{name}",
+        )
+    except Exception as exc:
+        log_to_card(
+            card,
+            "error",
+            "Stop worker launch failed: "
+            f"{_bounded_exception_summary(exc)}",
+        )
 
 
 #  Restart 
@@ -875,10 +958,28 @@ def apply_simulation(app, bot_name: str, sim: bool, card: dict) -> None:
     """Persist the SIM/LIVE flag and re-style the pill button accordingly."""
 
     bot = app.bots.get(bot_name)
-    if bot is not None and bot.is_running():
-        start_cfg = bot.start_config or {}
-        actual_sim = bool(start_cfg.get(
-            "SIMULATION", app.config[bot_name].get("SIMULATION", True)))
+    try:
+        running = bot is not None and bot.is_running()
+    except Exception as exc:
+        log_to_card(
+            card,
+            "error",
+            "SIM/LIVE switch blocked: runtime state unavailable "
+            f"({_bounded_exception_summary(exc)})",
+        )
+        return
+    if running:
+        start_cfg = getattr(bot, "start_config", None)
+        actual_sim = (
+            start_cfg.get("SIMULATION") if isinstance(start_cfg, dict) else None
+        )
+        if type(actual_sim) is not bool:
+            log_to_card(
+                card,
+                "error",
+                "SIM/LIVE switch blocked: active runtime mode unavailable",
+            )
+            return
         log_to_card(card, "warn",
                     "Stop or restart the bot before switching SIM/LIVE mode")
         app.config[bot_name]["SIMULATION"] = actual_sim
@@ -891,7 +992,16 @@ def apply_simulation(app, bot_name: str, sim: bool, card: dict) -> None:
                           hover_color="#3d1010", text_color="#f87171")
         return
 
-    blockers = mode_switch_blockers(bot_name)
+    try:
+        blockers = mode_switch_blockers(bot_name)
+    except Exception as exc:
+        log_to_card(
+            card,
+            "error",
+            "SIM/LIVE switch blocked: position guard unavailable "
+            f"({_bounded_exception_summary(exc)})",
+        )
+        return
     if blockers:
         log_to_card(
             card, "error",
@@ -908,12 +1018,13 @@ def apply_simulation(app, bot_name: str, sim: bool, card: dict) -> None:
                           hover_color="#3d1010", text_color="#f87171")
         return
 
+    previous_sim = app.config[bot_name].get("SIMULATION", True)
     app.config[bot_name]["SIMULATION"] = sim
     try:
         app.config = save_config_merge({bot_name: {"SIMULATION": sim}})
     except Exception as e:
         log_to_card(card, "error", f"Config save failed - mode unchanged: {e}")
-        app.config[bot_name]["SIMULATION"] = not sim
+        app.config[bot_name]["SIMULATION"] = previous_sim
         return
     btn = card["sim_btn"]
     if sim:
@@ -1006,9 +1117,18 @@ def _async_close_and_stop_spot_owned(app, name: str, update) -> None:
     """Graceful shutdown of a spot bot (its own handler closes positions),
     then verify + cleanup."""
     card = app.cards[name]
-    close_modes = close_modes_for_stop(name)
     def _log(severity, msg):
         _post_ui(app, lambda: log_to_card(card, severity, msg))
+
+    try:
+        close_modes = _validated_close_modes_for_action(name)
+    except Exception as e:
+        _write_stderr_best_effort(
+            f"[Stop] position mode verification failed: {e}\n"
+        )
+        _log("error", f"Close aborted; position mode verification failed: {e}")
+        update("Position verification failed - bot remains running; close aborted")
+        return
 
     update("Sending shutdown signal to bot")
     try:
@@ -1026,10 +1146,16 @@ def _async_close_and_stop_spot_owned(app, name: str, update) -> None:
     # Fallback: if the bot's handler couldn't close everything, do it here in
     # the same SIM/LIVE buckets the pre-stop position scan found.
     failed: list[str] = []
-    for sim_only in close_modes:
-        result = direct_close_remaining_spot(
-            name, _log, sim_only, reason="Manual Close & Stop")
-        failed.extend(str(sym) for sym in result.get("failed", []) if sym)
+    try:
+        for sim_only in close_modes:
+            result = direct_close_remaining_spot(
+                name, _log, sim_only, reason="Manual Close & Stop")
+            failed.extend(_validated_close_failures(result))
+    except Exception as e:
+        _write_stderr_best_effort(f"[Stop] fallback close failed: {e}\n")
+        _log("error", f"Fallback close failed: {e}; manual review required")
+        update("Close failed - manual review needed")
+        return
     if failed:
         msg = "Fallback close failed for: " + ", ".join(sorted(set(failed)))
         _log("error", msg)
@@ -1053,9 +1179,18 @@ def _async_close_and_stop_futures_owned(
     reason: str,
 ) -> None:
     """Graceful shutdown + fallback close for FUTURES."""
-    close_modes = close_modes_for_stop(name)
     def _log(severity, msg):
         _post_ui(app, lambda: log_to_card(card, severity, msg))
+
+    try:
+        close_modes = _validated_close_modes_for_action(name)
+    except Exception as e:
+        _write_stderr_best_effort(
+            f"[Stop] position mode verification failed: {e}\n"
+        )
+        _log("error", f"Close aborted; position mode verification failed: {e}")
+        update("Position verification failed - bot remains running; close aborted")
+        return
 
     update("Sending shutdown signal to bot")
     try:
@@ -1073,10 +1208,16 @@ def _async_close_and_stop_futures_owned(
     # Pass bot_name=name so a CROSS "Close & Stop" closes the CROSS book
     # (it defaults to "FUTURES" otherwise).
     failed: list[str] = []
-    for sim_only in close_modes:
-        result = direct_close_remaining_futures(
-            _log, sim_only, reason=reason, bot_name=name)
-        failed.extend(str(sym) for sym in result.get("failed", []) if sym)
+    try:
+        for sim_only in close_modes:
+            result = direct_close_remaining_futures(
+                _log, sim_only, reason=reason, bot_name=name)
+            failed.extend(_validated_close_failures(result))
+    except Exception as e:
+        _write_stderr_best_effort(f"[Stop] fallback close failed: {e}\n")
+        _log("error", f"Fallback close failed: {e}; manual review required")
+        update("Close failed - manual review needed")
+        return
     if failed:
         msg = "Fallback close failed for: " + ", ".join(sorted(set(failed)))
         _log("error", msg)
@@ -1134,7 +1275,9 @@ def _async_emergency_close_owned(
 
     for bot_name in futures_bots:
         try:
-            close_modes_by_bot[bot_name] = close_modes_for_stop(bot_name)
+            close_modes_by_bot[bot_name] = _validated_close_modes_for_action(
+                bot_name
+            )
         except Exception as exc:
             # Emergency close is explicitly a last-resort action. If we cannot
             # prove the active namespace, try both buckets after killing the bot
@@ -1164,15 +1307,17 @@ def _async_emergency_close_owned(
             stop_failures.append(bot_name)
             _log("error", f"{bot_name}: stop failed; emergency fallback aborted: {e}")
 
-    if stop_failures:
-        update("Emergency close aborted - bot is still running")
-        return
-
     # Step 2: direct close. The bot is now dead, the launcher owns
     # the exchange state.
+    if len(stop_failures) == len(futures_bots):
+        update("Emergency close aborted - bot is still running")
+        return
     update("Closing all open positions")
 
+    emergency_incomplete = bool(stop_failures)
     for bot_name in futures_bots:
+        if bot_name in stop_failures:
+            continue
         if bot_name in mode_errors:
             _log("warn",
                  f"{bot_name}: mode detection failed before emergency close; "
@@ -1182,14 +1327,20 @@ def _async_emergency_close_owned(
             try:
                 result = direct_close_remaining_futures(
                     _log, sim_only, reason="Emergency Close", bot_name=bot_name)
-                failed.extend(str(sym) for sym in result.get("failed", []) if sym)
+                failed.extend(_validated_close_failures(result))
             except Exception as exc:
                 failed.append(f"{bot_name}:{type(exc).__name__}")
-                _log("error", f"{bot_name}: emergency close fallback failed: {exc}")
+                detail = _bounded_exception_summary(exc)
+                _log(
+                    "error",
+                    f"{bot_name}: emergency close fallback failed: {detail}",
+                )
         if failed:
+            emergency_incomplete = True
             _log("error",
                  f"{bot_name}: emergency close incomplete for "
                  + ", ".join(sorted(set(failed))))
-            update("Emergency close incomplete - manual review needed")
-            return
+    if emergency_incomplete:
+        update("Emergency close incomplete - manual review needed")
+        return
     update("Done.")
