@@ -33,10 +33,14 @@ _OI_LOCK = threading.Lock()
 # screening thousands of altcoins doesn't leak _OI_HISTORY dict entries.
 _OI_LAST_SWEEP_MONO: float = 0.0
 _OI_SWEEP_INTERVAL = 600.0   # sweep at most every 10 minutes
+_FUNDING_HISTORY_PAGE_LIMIT = 50
+_MAX_NUMERIC_TEXT_CHARS = 128
 
 
 def _finite_float_or_none(value) -> float | None:
     if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
         return None
     try:
         parsed = float(value)
@@ -61,6 +65,12 @@ def _funding_symbol_key(value) -> str:
     # Unified swap symbols include the settlement currency after ``:`` while
     # venue ids generally do not (H/USDT:USDT versus H_USDT).
     primary = value.split(":", 1)[0]
+    if not primary or any(
+        not char.isascii()
+        or (not char.isalnum() and char not in {"/", "_", "-"})
+        for char in primary
+    ):
+        return ""
     return "".join(char for char in primary.upper() if char.isalnum())
 
 
@@ -87,9 +97,9 @@ def _funding_row_matches_symbol(ex, symbol_full: str, row: dict) -> bool:
     # adapter copies the requested unified symbol into row["symbol"] even if
     # the venue returned a different record.
     raw_symbol = info.get("symbol")
-    observed = _funding_symbol_key(raw_symbol)
-    if observed:
-        return observed in expected
+    if raw_symbol is not None:
+        observed = _funding_symbol_key(raw_symbol)
+        return bool(observed and observed in expected)
     observed = _funding_symbol_key(row.get("symbol"))
     return not observed or observed in expected
 
@@ -270,11 +280,18 @@ def fetch_realized_funding(ex,
         if not reservation:
             return None
         try:
-            page = fn(symbol_full, since=next_since, limit=50)
+            page = fn(
+                symbol_full,
+                since=next_since,
+                limit=_FUNDING_HISTORY_PAGE_LIMIT,
+            )
         except Exception:
             _record_page_error(reservation)
             return None
         if not isinstance(page, list):
+            _record_page_error(reservation)
+            return None
+        if len(page) > _FUNDING_HISTORY_PAGE_LIMIT:
             _record_page_error(reservation)
             return None
         if not page:
@@ -364,14 +381,16 @@ def count_funding_settlements(open_sec: float, close_sec: float) -> int:
     half-open interval (open_sec, close_sec]. Shared by the live estimator and
     the backtester so both use identical discrete-settlement semantics  a hold
     that crosses no boundary pays 0, no continuous proration."""
-    if close_sec <= open_sec:
+    opened = _finite_float_or_none(open_sec)
+    closed = _finite_float_or_none(close_sec)
+    if opened is None or closed is None or closed <= opened:
         return 0
-    next_settle = (int(open_sec) // _FUNDING_SETTLEMENT_SEC + 1) * _FUNDING_SETTLEMENT_SEC
-    n = 0
-    while next_settle <= close_sec:
-        n += 1
-        next_settle += _FUNDING_SETTLEMENT_SEC
-    return n
+    next_settle = (
+        int(opened) // _FUNDING_SETTLEMENT_SEC + 1
+    ) * _FUNDING_SETTLEMENT_SEC
+    if next_settle > closed:
+        return 0
+    return int((closed - next_settle) // _FUNDING_SETTLEMENT_SEC) + 1
 
 
 #  Estimation fallback 
@@ -392,7 +411,10 @@ def estimate_funding_paid(ex,
     normalized_position_type = _funding_position_type(pos_type)
     if normalized_position_type is None:
         return None
-    if notional_usdt <= 0 or not since_time_str:
+    notional = _finite_float_or_none(notional_usdt)
+    if notional is None:
+        return None
+    if notional <= 0 or not since_time_str:
         return 0.0
     try:
         ts_dt = datetime.strptime(since_time_str, "%Y-%m-%d %H:%M:%S")
@@ -443,7 +465,7 @@ def estimate_funding_paid(ex,
     if abs(funding_rate_dec) < 1e-9:
         return 0.0
 
-    raw = notional_usdt * funding_rate_dec * n_settlements
+    raw = notional * funding_rate_dec * n_settlements
     if normalized_position_type == "LONG":
         return raw
     return -raw
@@ -474,7 +496,10 @@ def get_funding_info(
         )
         if isinstance(funding, dict):
             parsed_rate = _finite_float_or_none(funding.get("fundingRate"))
-            rate = (parsed_rate * 100) if parsed_rate is not None else 0.0
+            scaled_rate = (
+                parsed_rate * 100 if parsed_rate is not None else 0.0
+            )
+            rate = scaled_rate if math.isfinite(scaled_rate) else 0.0
     except Exception:
         pass
 
@@ -487,17 +512,35 @@ def get_funding_info(
             symbol_full,
             endpoint="fetch_open_interest",
         )
-        if oi is not None:
+        if isinstance(oi, dict):
             # CCXT separates contract/base quantity
             # (openInterestAmount) from quote-currency money value
             # (openInterestValue). This function promises USDT millions,
             # so an amount can never substitute for the explicit value.
-            value = oi.get("openInterestValue")
-            if value is None and isinstance(oi.get("info"), dict):
-                value = oi["info"].get("openInterestValue")
-            parsed_oi = _finite_float_or_none(value)
-            if parsed_oi is not None and parsed_oi > 0:
-                oi_usdt = parsed_oi / 1_000_000
+            info = oi.get("info") if isinstance(oi.get("info"), dict) else {}
+            values = []
+            values_valid = True
+            for source in (oi, info):
+                raw_value = source.get("openInterestValue")
+                if raw_value is None:
+                    continue
+                parsed_value = _finite_float_or_none(raw_value)
+                if parsed_value is None or parsed_value <= 0:
+                    values_valid = False
+                    break
+                values.append(parsed_value)
+            if values_valid and values:
+                parsed_oi = values[0]
+                for alias_value in values[1:]:
+                    tolerance = max(
+                        1e-12,
+                        max(parsed_oi, alias_value) * 1e-9,
+                    )
+                    if abs(alias_value - parsed_oi) > tolerance:
+                        parsed_oi = None
+                        break
+                if parsed_oi is not None:
+                    oi_usdt = parsed_oi / 1_000_000
     except Exception:
         pass
 
@@ -514,7 +557,9 @@ def get_funding_info(
                 ts_old, oi_old = closest
                 age = now - ts_old
                 if 12 * 3600 <= age <= 26 * 3600 and oi_old > 0:
-                    oi_change = (oi_usdt - oi_old) / oi_old * 100
+                    change = (oi_usdt - oi_old) / oi_old * 100
+                    if math.isfinite(change):
+                        oi_change = change
             history.append((now, oi_usdt))
             pruned = [(ts, v) for ts, v in history if (now - ts) <= _OI_HISTORY_MAX_AGE]
             if pruned:

@@ -16,12 +16,23 @@ import math
 from typing import Tuple
 
 
+_MAX_NUMERIC_TEXT_CHARS = 128
+
+
 def _finite_float(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
+        return None
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def _valid_position_type(value) -> bool:
+    return isinstance(value, str) and value in {"LONG", "SHORT"}
 
 
 #  Liquidation price (approximation) 
@@ -48,19 +59,24 @@ def calc_liquidation_price(entry: float,
 
     Default 0.01 (1.0%)  conservative.
     """
-    # Guard against leverage=0 (would divide by zero). Fall back to a
+    # Guard against sub-1 leverage (including zero). Fall back to a
     # safe 1x assumption rather than crashing  caller should have a
     # valid leverage, but state corruption shouldn't kill the monitor.
     entry = _finite_float(entry)
     leverage = _finite_float(leverage)
     maintenance_margin = _finite_float(maintenance_margin)
+    if not _valid_position_type(position_type):
+        return 0.0
     if entry is None or entry <= 0:
         return 0.0
     if leverage is None:
         return 0.0
-    if leverage <= 0:
+    if leverage < 1.0:
         leverage = 1.0
-    if maintenance_margin is None or maintenance_margin < 0:
+    if (
+        maintenance_margin is None
+        or not 0.0 <= maintenance_margin < 1.0
+    ):
         maintenance_margin = 0.01
     if position_type == "LONG":
         liq = entry * (1 - 1.0 / leverage + maintenance_margin)
@@ -113,7 +129,7 @@ def cross_liquidation_price(entry: float, qty_signed: float, mm_rate: float,
         or collateral_value is None
         or e <= 0.0
         or q == 0.0
-        or mm < 0.0
+        or not 0.0 <= mm < 1.0
         or mk <= 0.0
         or collateral_value <= 0.0
     ):
@@ -132,7 +148,7 @@ def cross_liquidation_price(entry: float, qty_signed: float, mm_rate: float,
                 or mm_i is None
                 or mk_i is None
                 or e_i <= 0.0
-                or mm_i < 0.0
+                or not 0.0 <= mm_i < 1.0
                 or mk_i <= 0.0
             ):
                 return None
@@ -160,7 +176,8 @@ def distance_to_liquidation_pct(current_price: float,
     the position is alive, becomes negative if liquidation is breached."""
     current_price = _finite_float(current_price)
     liq_price = _finite_float(liq_price)
-    if (current_price is None or liq_price is None
+    if (not _valid_position_type(position_type)
+            or current_price is None or liq_price is None
             or current_price <= 0 or liq_price <= 0):
         return 0.0
     if position_type == "LONG":
@@ -184,7 +201,9 @@ def liq_buffer_consumed_pct(initial_dist: float, current_dist: float) -> float:
     if initial_dist <= 0:
         return 100.0
     consumed = ((initial_dist - current_dist) / initial_dist) * 100
-    return consumed if math.isfinite(consumed) else 100.0
+    if not math.isfinite(consumed):
+        return 100.0
+    return min(100.0, max(0.0, consumed))
 
 
 #  PnL math 
@@ -209,7 +228,8 @@ def calc_unrealized_pnl(entry: float,
     current = _finite_float(current)
     margin = _finite_float(margin)
     leverage = _finite_float(leverage)
-    if (entry is None or current is None or margin is None or leverage is None
+    if (not _valid_position_type(position_type)
+            or entry is None or current is None or margin is None or leverage is None
             or entry <= 0 or current < 0 or margin <= 0 or leverage <= 0):
         return 0.0, 0.0
     notional = margin * leverage
@@ -232,7 +252,8 @@ def price_move_pct(entry: float, current: float, position_type: str) -> float:
     ZeroDivisionError (see calc_unrealized_pnl for rationale)."""
     entry = _finite_float(entry)
     current = _finite_float(current)
-    if entry is None or current is None or entry <= 0 or current < 0:
+    if (not _valid_position_type(position_type)
+            or entry is None or current is None or entry <= 0 or current < 0):
         return 0.0
     if position_type == "LONG":
         move = ((current - entry) / entry) * 100
@@ -249,6 +270,8 @@ def is_new_high(curr: float, prev_high: float, position_type: str) -> bool:
     LONG: new high if curr > prev_high.
     SHORT: new (favorable) low if curr < prev_high.
     """
+    if not _valid_position_type(position_type):
+        return False
     curr = _finite_float(curr)
     prev_high = _finite_float(prev_high)
     if curr is None or curr <= 0:
@@ -265,6 +288,8 @@ def trailing_stop_hit(curr: float,
                        trailing_distance_pct: float,
                        position_type: str) -> bool:
     """True if current price retraces by trailing_distance_pct% from highest."""
+    if not _valid_position_type(position_type):
+        return True
     curr = _finite_float(curr)
     highest = _finite_float(highest)
     trailing_distance_pct = _finite_float(trailing_distance_pct)
@@ -272,7 +297,9 @@ def trailing_stop_hit(curr: float,
         return False
     if highest is None or highest <= 0:
         return True
-    if trailing_distance_pct is None or trailing_distance_pct < 0:
+    if (trailing_distance_pct is None
+            or trailing_distance_pct < 0
+            or trailing_distance_pct > 100):
         return True
     if position_type == "LONG":
         stop_price = highest * (1 - trailing_distance_pct / 100)
@@ -286,6 +313,8 @@ def breakeven_stop_hit(curr: float,
                         be_price: float,
                         position_type: str) -> bool:
     """True if BE stop is breached (price returned to entry-area)."""
+    if not _valid_position_type(position_type):
+        return True
     curr = _finite_float(curr)
     be_price = _finite_float(be_price)
     if curr is None or curr <= 0:
@@ -314,6 +343,8 @@ def funding_oi_filter(direction: str,
     SHORT:
       Funding < -0.10%/8h  too crowded short, squeeze risk  BLOCK
     """
+    if not _valid_position_type(direction):
+        return False, "Invalid direction"
     # Non-finite (NaN/Inf) funding/OI from a bad API read would make every
     # comparison below False and silently fail-OPEN  and could leak NaN into
     # stored entry params. Coerce to a neutral 0.0 (no crowding signal): the
@@ -344,9 +375,9 @@ def fee_buffered_breakeven(entry: float,
     """
     entry = _finite_float(entry)
     fee_buffer = _finite_float(fee_buffer)
-    if entry is None or entry <= 0:
+    if not _valid_position_type(position_type) or entry is None or entry <= 0:
         return 0.0
-    if fee_buffer is None or fee_buffer < 0:
+    if fee_buffer is None or not 0.0 <= fee_buffer < 1.0:
         fee_buffer = 0.003
     if position_type == "LONG":
         be_price = round(entry * (1.0 + fee_buffer), 8)

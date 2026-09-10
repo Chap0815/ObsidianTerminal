@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+from itertools import islice
 from typing import Any, Optional
 
 from bot_utils.config import _read_config_json
@@ -19,6 +20,9 @@ from bot_utils.config import _read_config_json
 
 class CorruptConfigError(Exception):
     """Raised when bot_config.json exists but cannot be parsed."""
+
+
+_MISSING = object()
 
 
 def sim_state_path(path: str, simulation: bool) -> str:
@@ -73,14 +77,30 @@ def _find_simulation_value(section: dict) -> Any:
     """Case-insensitive key lookup for 'SIMULATION'."""
     if not isinstance(section, dict):
         return None
-    # Exact match first (fast path)
-    if "SIMULATION" in section:
-        return section["SIMULATION"]
-    # Case-insensitive fallback
-    for k, v in section.items():
-        if isinstance(k, str) and k.lower() == "simulation":
-            return v
-    return None
+    matches = [
+        value
+        for key, value in section.items()
+        if isinstance(key, str) and key.casefold() == "simulation"
+    ]
+    if len(matches) > 1:
+        raise ValueError("duplicate normalized SIMULATION keys")
+    return matches[0] if matches else _MISSING
+
+
+def _find_bot_section(config: dict, bot_name: str) -> dict:
+    matches = [
+        value
+        for key, value in config.items()
+        if isinstance(key, str) and key.casefold() == bot_name.casefold()
+    ]
+    if len(matches) > 1:
+        raise ValueError("duplicate normalized bot config sections")
+    if not matches:
+        return {}
+    section = matches[0]
+    if not isinstance(section, dict):
+        raise ValueError(f"{bot_name} config section must be an object")
+    return section
 
 
 def read_simulation_flag(bot_name: str,
@@ -102,6 +122,16 @@ def read_simulation_flag(bot_name: str,
     behavior (NOT recommended). Accepts case-insensitive boolean strings
     (true/false/yes/no/1/0/on/off).
     """
+    if not isinstance(default, bool):
+        raise ValueError("default must be boolean")
+    if not isinstance(raise_on_corrupt, bool):
+        raise ValueError("raise_on_corrupt must be boolean")
+    if not isinstance(bot_name, str):
+        raise ValueError("bot_name must be a bounded non-empty string")
+    bot_name = bot_name.strip().upper()
+    if not bot_name or len(bot_name) > 32:
+        raise ValueError("bot_name must be a bounded non-empty string")
+
     # Step 1: bot_config.json
     cfg_path = None
     try:
@@ -116,8 +146,8 @@ def read_simulation_flag(bot_name: str,
             cfg = _read_config_json(str(cfg_path))
             if not isinstance(cfg, dict):
                 raise ValueError("bot_config.json root must be an object")
-            if bot_name in cfg and not isinstance(cfg[bot_name], dict):
-                raise ValueError(f"{bot_name} config section must be an object")
+            section = _find_bot_section(cfg, bot_name)
+            raw_value = _find_simulation_value(section)
         except FileNotFoundError:
             # No config file  fine, fall through to env
             cfg = None
@@ -154,12 +184,10 @@ def read_simulation_flag(bot_name: str,
             cfg = None
 
         if cfg is not None:
-            section = cfg.get(bot_name, {})
-            raw_value = _find_simulation_value(section)
             coerced = _to_bool(raw_value)
             if coerced is not None:
                 return coerced
-            if raw_value is not None:
+            if raw_value is not _MISSING:
                 msg = (
                     f"{bot_name}.SIMULATION has unrecognized value "
                     f"{raw_value!r}; refusing env/default fallback"
@@ -203,10 +231,14 @@ def read_simulation_flags(
     retain their last-known modes instead of silently replacing LIVE with the
     safe default during a transient file, memory or decoder failure.
     """
+    if not isinstance(default, bool):
+        raise ValueError("default must be boolean")
+    if not isinstance(raise_on_corrupt, bool):
+        raise ValueError("raise_on_corrupt must be boolean")
     if isinstance(bot_names, (str, bytes)):
         raise ValueError("bot_names must be a bounded collection")
     try:
-        names = tuple(bot_names)
+        names = tuple(islice(iter(bot_names), 65))
     except TypeError as exc:
         raise ValueError("bot_names must be a bounded collection") from exc
     if not names or len(names) > 64:
@@ -214,14 +246,15 @@ def read_simulation_flags(
     if any(
         not isinstance(name, str)
         or not name.strip()
-        or len(name.strip()) > 32
+        or len(name.strip().upper()) > 32
         for name in names
     ):
         raise ValueError("bot_names contains an invalid name")
-    normalized_names = tuple(name.strip() for name in names)
-    if len(set(normalized_names)) != len(normalized_names):
+    normalized_names = tuple(name.strip().upper() for name in names)
+    if len({name.casefold() for name in normalized_names}) != len(normalized_names):
         raise ValueError("bot_names contains duplicates")
 
+    raw_values = {name: _MISSING for name in normalized_names}
     try:
         from core.paths import BOT_CONFIG
 
@@ -229,8 +262,8 @@ def read_simulation_flags(
         if not isinstance(cfg, dict):
             raise ValueError("bot_config.json root must be an object")
         for name in normalized_names:
-            if name in cfg and not isinstance(cfg[name], dict):
-                raise ValueError(f"{name} config section must be an object")
+            section = _find_bot_section(cfg, name)
+            raw_values[name] = _find_simulation_value(section)
     except FileNotFoundError:
         cfg = None
     except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError, MemoryError) as exc:
@@ -272,10 +305,9 @@ def read_simulation_flags(
     fallback = env_value if env_value is not None else bool(default)
     result: dict[str, bool] = {}
     for name in normalized_names:
-        section = cfg.get(name, {}) if cfg is not None else {}
-        raw_value = _find_simulation_value(section)
+        raw_value = raw_values[name]
         value = _to_bool(raw_value)
-        if raw_value is not None and value is None:
+        if raw_value is not _MISSING and value is None:
             message = (
                 f"{name}.SIMULATION has unrecognized value {raw_value!r}; "
                 "refusing a partial/default mode snapshot"

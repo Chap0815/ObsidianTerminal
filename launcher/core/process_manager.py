@@ -78,6 +78,23 @@ _TERMINAL_STATUS_PUBLISH_ATTEMPTS = 3
 _TERMINAL_STATUS_RETRY_INTERVAL_SEC = 0.05
 
 
+def _bounded_exception_summary(exc: BaseException, limit: int = 240) -> str:
+    """Return a one-line, redacted diagnostic for lifecycle failures."""
+    kind = type(exc).__name__
+    try:
+        detail = str(exc).replace("\r", " ").replace("\n", " ")
+    except Exception:
+        detail = ""
+    try:
+        from core.logger import redact
+
+        detail = redact(detail)
+    except Exception:
+        detail = ""
+    detail = detail[:max(0, int(limit))].strip()
+    return f"{kind}: {detail}" if detail else kind
+
+
 class _BoundedStdoutLineReader:
     """Read text-pipe lines without ever materializing an unbounded line."""
 
@@ -122,6 +139,7 @@ def _clean_shutdown_proven(shutdown: object) -> bool:
         and not reasons
         and isinstance(resources, Mapping)
         and bool(resources)
+        and resources.get("exchange") is True
         and all(result is True for result in resources.values())
     )
 
@@ -165,10 +183,13 @@ def _fresh_runtime_status_requires_close_retention(
     if not isinstance(runtime_status, Mapping):
         return None
     expected_pid = positive_int_or_zero(expected_pid)
+    runtime_run_id = runtime_status.get("run_id")
     if (
-        not expected_run_id
+        not isinstance(expected_run_id, str)
+        or not expected_run_id
         or not expected_pid
-        or str(runtime_status.get("run_id") or "") != expected_run_id
+        or not isinstance(runtime_run_id, str)
+        or runtime_run_id != expected_run_id
         or positive_int_or_zero(runtime_status.get("pid")) != expected_pid
     ):
         return None
@@ -188,21 +209,51 @@ def _fresh_runtime_status_requires_close_retention(
     if not -5.0 <= age <= _RUNTIME_SHUTDOWN_STATUS_MAX_AGE_SEC:
         return None
 
-    status = str(runtime_status.get("status") or "").lower()
+    raw_status = runtime_status.get("status")
+    status = raw_status.lower() if isinstance(raw_status, str) else ""
     shutdown = runtime_status.get("shutdown")
     if not isinstance(shutdown, Mapping):
         return None
+    raw_position_knowledge = runtime_status.get("open_positions_known")
+    if (
+        "open_positions_known" in runtime_status
+        and not isinstance(raw_position_knowledge, bool)
+    ):
+        return None
+    if raw_position_knowledge is True:
+        raw_open_positions = runtime_status.get("open_positions")
+        if (
+            isinstance(raw_open_positions, bool)
+            or not isinstance(raw_open_positions, int)
+            or raw_open_positions < 0
+        ):
+            return None
+        if raw_open_positions > 0:
+            return True
     if shutdown.get("complete") is True:
-        return False if _clean_shutdown_proven(shutdown) else None
+        return (
+            False
+            if status == "stopped" and _clean_shutdown_proven(shutdown)
+            else None
+        )
     if status != "degraded":
         return None
     if shutdown.get("complete") is not False:
         return None
-    return (
-        shutdown.get("emergency_closed") is not True
-        or shutdown.get("emergency_in_progress") is True
-        or shutdown.get("positions_preserved") is True
+    emergency_closed = strict_bool_or_none(shutdown.get("emergency_closed"))
+    emergency_in_progress = strict_bool_or_none(
+        shutdown.get("emergency_in_progress")
     )
+    positions_preserved = strict_bool_or_none(
+        shutdown.get("positions_preserved", False)
+    )
+    if (
+        emergency_closed is None
+        or emergency_in_progress is None
+        or positions_preserved is None
+    ):
+        return None
+    return not emergency_closed or emergency_in_progress or positions_preserved
 
 
 def _redact_ui_log_line(line: str) -> str:
@@ -818,7 +869,7 @@ class BotProcess:
                 try:
                     stderr.write(
                         "[BotProcess] shutdown control cleanup failed: "
-                        f"{type(exc).__name__}: {exc}\n"
+                        f"{_bounded_exception_summary(exc)}\n"
                     )
                 except Exception:
                     pass
@@ -892,8 +943,29 @@ class BotProcess:
                 if not log_dir:
                     return
                 last = read_runtime_status(log_dir)
-                last_run_id = str(last.get("run_id") or "")
+                raw_last_run_id = last.get("run_id")
+                last_run_id = (
+                    raw_last_run_id if isinstance(raw_last_run_id, str) else ""
+                )
                 last_pid = positive_int_or_zero(last.get("pid"))
+                if (
+                    expected_run_id
+                    and last_run_id
+                    and last_run_id != expected_run_id
+                ):
+                    return
+                if expected_pid and last_pid and last_pid != expected_pid:
+                    return
+                if (
+                    (expected_run_id and not last_run_id)
+                    or (expected_pid and not last_pid)
+                ):
+                    # An absent or malformed identity cannot bind any payload
+                    # fields to the process being marked. Still publish a
+                    # terminal marker, but rebuild it from unknown evidence.
+                    last = {}
+                    last_run_id = ""
+                    last_pid = 0
                 last_simulation = strict_bool_or_none(last.get("simulation"))
                 start_config = (
                     self.start_config
@@ -905,34 +977,50 @@ class BotProcess:
                 )
                 raw_open_positions = last.get("open_positions")
                 open_positions = nonnegative_int_or_zero(raw_open_positions)
+                raw_last_status = last.get("status")
+                last_status = (
+                    raw_last_status.lower()
+                    if isinstance(raw_last_status, str)
+                    else ""
+                )
+                last_shutdown = last.get("shutdown")
+                last_returncode = last.get("returncode")
+                last_threads = last.get("threads")
+                terminal_shutdown_valid = (
+                    last_status == "degraded"
+                    and isinstance(last_shutdown, Mapping)
+                    and last_shutdown.get("complete") is False
+                ) or (
+                    last_status == "stopped"
+                    and _clean_shutdown_proven(last_shutdown)
+                )
+                raw_position_knowledge = last.get("open_positions_known")
                 open_positions_known = (
                     not isinstance(raw_open_positions, bool)
                     and isinstance(raw_open_positions, int)
                     and raw_open_positions >= 0
-                    and strict_bool_or_none(
-                        last.get("open_positions_known")
+                    and (
+                        "open_positions_known" not in last
+                        or raw_position_knowledge is True
                     )
-                    is not False
                 )
-                if (
-                    expected_run_id
-                    and last_run_id
-                    and last_run_id != expected_run_id
-                ):
-                    return
-                if expected_pid and last_pid and last_pid != expected_pid:
-                    return
                 if (
                     expected_run_id
                     and expected_pid
                     and last_run_id == expected_run_id
                     and last_pid == expected_pid
                     and last.get("launcher_terminal_marker") is True
-                    and str(last.get("status") or "").lower()
-                    in {"stopped", "degraded"}
+                    and last_simulation is not None
+                    and terminal_shutdown_valid
                     and str(last.get("stopped_by") or "")
                     in {"launcher", "process_exit"}
-                    and last.get("returncode") == returncode
+                    and isinstance(last_returncode, int)
+                    and not isinstance(last_returncode, bool)
+                    and isinstance(returncode, int)
+                    and not isinstance(returncode, bool)
+                    and last_returncode == returncode
+                    and last_threads
+                    == {"monitor": False, "scan": False, "reconcile": False}
                 ):
                     return
 
@@ -975,7 +1063,7 @@ class BotProcess:
                         process_run_id=expected_run_id or last_run_id,
                         extra=extra,
                     )
-                    if write_result is not False:
+                    if write_result is True:
                         published = True
                         break
                     if attempt + 1 < attempts:
@@ -994,7 +1082,8 @@ class BotProcess:
             if stderr is not None:
                 try:
                     stderr.write(
-                        f"[BotProcess] runtime stopped marker failed: {e}\n"
+                        "[BotProcess] runtime stopped marker failed: "
+                        f"{_bounded_exception_summary(e)}\n"
                     )
                 except Exception:
                     pass
@@ -1027,11 +1116,11 @@ class BotProcess:
         with self._lifecycle_lock:
             if self.proc is None:
                 return None
-            if self.proc.poll() is not None:
+            returncode_to_mark = self.proc.poll()
+            if returncode_to_mark is not None:
                 proc_to_mark = self.proc
                 run_id_to_mark = self.run_id or ""
                 pid_to_mark = proc_to_mark.pid
-                returncode_to_mark = proc_to_mark.poll()
                 self.proc = None
                 close_failed_start_stdout = (
                     self._failed_start_owned_proc is proc_to_mark
@@ -1102,7 +1191,7 @@ class BotProcess:
                     try:
                         stderr.write(
                             "[BotProcess] shutdown control request failed: "
-                            f"{type(exc).__name__}: {exc}\n"
+                            f"{_bounded_exception_summary(exc)}\n"
                         )
                     except Exception:
                         pass
@@ -1137,7 +1226,8 @@ class BotProcess:
                 if stdout is not None:
                     try:
                         stdout.write(
-                            f"[BotProcess] graceful signal unavailable: {e} "
+                            "[BotProcess] graceful signal unavailable: "
+                            f"{_bounded_exception_summary(e)} "
                             + (
                                 "- shutdown control remains active\n"
                                 if control_ok
@@ -1195,7 +1285,8 @@ class BotProcess:
                     try:
                         stderr.write(
                             f"[BotProcess] graceful close did not finish after "
-                            f"{self._GRACEFUL_TIMEOUT_SEC}s ({exc})  force kill\n"
+                            f"{self._GRACEFUL_TIMEOUT_SEC}s "
+                            f"({_bounded_exception_summary(exc)})  force kill\n"
                         )
                     except Exception:
                         pass
@@ -1210,7 +1301,8 @@ class BotProcess:
                 if stderr is not None:
                     try:
                         stderr.write(
-                            f"[BotProcess] terminate failed ({exc})  force kill\n"
+                            "[BotProcess] terminate failed "
+                            f"({_bounded_exception_summary(exc)})  force kill\n"
                         )
                     except Exception:
                         pass
@@ -1227,7 +1319,10 @@ class BotProcess:
                 stderr = sys.stderr
                 if stderr is not None:
                     try:
-                        stderr.write(f"[BotProcess] force kill failed: {exc}\n")
+                        stderr.write(
+                            "[BotProcess] force kill failed: "
+                            f"{_bounded_exception_summary(exc)}\n"
+                        )
                     except Exception:
                         pass
             try:

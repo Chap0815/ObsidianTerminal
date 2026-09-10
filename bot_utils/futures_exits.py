@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import time
+from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_DOWN
 from threading import Lock
@@ -25,6 +26,7 @@ from bot_utils.futures_order import (
     _order_id_text,
     _order_from_recovery_trades,
     _order_refresh_conflicts,
+    _order_request_conflicts,
     _trade_info_for_order_evidence,
     create_order_with_retry,
     extract_or_estimate_futures_fee,
@@ -42,6 +44,7 @@ from bot_utils.order_utils import (
     explicit_trade_symbol_matches,
     order_id_text_or_none,
 )
+from bot_utils.state_persist import is_canonical_position_symbol
 
 
 _MAX_PARALLEL_CLOSES = 3
@@ -49,6 +52,8 @@ _FILL_RESOLVE_DELAY_SEC = 0.8
 _FILL_RESOLVE_MAX_RETRIES = 2
 _VERIFY_CLOSE_TIMEOUT_SEC = 5.0
 _FALLBACK_MIN_NOTIONAL = 5.0
+_MAX_NUMERIC_TEXT_CHARS = 128
+_MAX_WORKER_FAILURE_DETAIL_CHARS = 256
 _EMERGENCY_CLOSE_FRAGMENT_BLOCKED: set[tuple[str, str]] = set()
 _EMERGENCY_CLOSE_FRAGMENT_BLOCKED_LOCK = Lock()
 
@@ -64,6 +69,26 @@ def _record_reserved_api_error(endpoint: str, reservation) -> None:
 
 def _emergency_fragment_key(bot_name, sym) -> tuple[str, str]:
     return (str(bot_name or "").strip().upper(), str(sym or "").strip().upper())
+
+
+def _valid_emergency_base_symbol(sym) -> bool:
+    return type(sym) is str and is_canonical_position_symbol(sym)
+
+
+def _emergency_symbol_label(sym) -> str:
+    return sym if _valid_emergency_base_symbol(sym) else "<invalid-symbol>"
+
+
+def _safe_worker_failure_detail(detail, fallback: str) -> str:
+    if (
+        not isinstance(detail, str)
+        or not detail
+        or len(detail) > _MAX_WORKER_FAILURE_DETAIL_CHARS
+        or detail != detail.strip()
+        or not detail.isprintable()
+    ):
+        return fallback
+    return detail
 
 
 def _emergency_fragment_is_blocked(bot_name, sym) -> bool:
@@ -108,7 +133,10 @@ def _persist_emergency_fragment(
         persisted = False
         if error_logger:
             try:
-                error_logger(f"emergency close fragment {sym}", exc)
+                error_logger(
+                    f"emergency close fragment {sym}",
+                    RuntimeError(type(exc).__name__),
+                )
             except Exception:
                 pass
     if persisted is not None and persisted is not True:
@@ -134,6 +162,8 @@ def _extract_fill_from_order(order: dict) -> Optional[float]:
         val = order.get(key)
         if isinstance(val, bool):
             continue
+        if isinstance(val, str) and len(val) > _MAX_NUMERIC_TEXT_CHARS:
+            continue
         if val is None:
             continue
         try:
@@ -149,6 +179,8 @@ def _extract_fill_from_order(order: dict) -> Optional[float]:
             val = info.get(key)
             if isinstance(val, bool):
                 continue
+            if isinstance(val, str) and len(val) > _MAX_NUMERIC_TEXT_CHARS:
+                continue
             if val is None:
                 continue
             try:
@@ -163,6 +195,8 @@ def _extract_fill_from_order(order: dict) -> Optional[float]:
 def _positive_finite_or_zero(value) -> float:
     if isinstance(value, bool):
         return 0.0
+    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
+        return 0.0
     try:
         parsed = float(value or 0)
     except (TypeError, ValueError, OverflowError):
@@ -172,6 +206,8 @@ def _positive_finite_or_zero(value) -> float:
 
 def _finite_or_default(value, default: float = 0.0) -> float:
     if isinstance(value, bool):
+        return default
+    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
         return default
     try:
         parsed = float(value)
@@ -187,6 +223,8 @@ def _positive_finite_or_default(value, default: float = 0.0) -> float:
 
 def _finite_precision_amount_or_none(value) -> Optional[float]:
     if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
         return None
     try:
         parsed = float(value)
@@ -289,14 +327,7 @@ def _resolve_fill_price(ex,
             pass
         return fallback, "fallback"
 
-    fp = _extract_fill_from_order(order)
-    if fp is not None:
-        return fp, "order"
-
     order_ids = _explicit_order_ids(order)
-    if len(order_ids) != 1:
-        return fallback, "fallback"
-    order_id = next(iter(order_ids))
     client_ids = _explicit_client_order_ids(order)
     requested_client_id = _order_id_text(expected_client_id)
     if expected_client_id is not None and not requested_client_id:
@@ -307,6 +338,26 @@ def _resolve_fill_price(ex,
         requested_client_id
     }:
         return fallback, "fallback"
+    if _order_request_conflicts(
+        order,
+        symbol_full,
+        expected_side,
+        expected_position_side,
+        _exchange_id(ex),
+        expected_reduce_only=True,
+        allow_one_way_position_side=True,
+        expected_client_id=requested_client_id or None,
+        expected_amount=expected_amount,
+    ):
+        return fallback, "fallback"
+
+    fp = _extract_fill_from_order(order)
+    if fp is not None:
+        return fp, "order"
+
+    if len(order_ids) != 1:
+        return fallback, "fallback"
+    order_id = next(iter(order_ids))
     bound_client_id = (
         requested_client_id
         or next(iter(client_ids), "")
@@ -472,10 +523,12 @@ def _resolve_fill_price(ex,
             fp = _extract_fill_from_order(recovered)
             if fp is not None:
                 return fp, "trades"
-    except Exception as e:
+    except Exception as trade_history_error:
         try:
             log_event(
-                f"  fetch_my_trades for fill price unavailable: {e}", "WARN"
+                "  fetch_my_trades for fill price unavailable "
+                f"({type(trade_history_error).__name__})",
+                "WARN",
             )
         except Exception:
             pass
@@ -522,6 +575,8 @@ def _close_single_position(**kw):
     sym = kw.get("sym")
     state = kw.get("state")
     bot_name = kw.get("bot_name")
+    if not _valid_emergency_base_symbol(sym):
+        return (sym, "failed", 0.0, "symbol invalid")
     if _emergency_fragment_is_blocked(bot_name, sym):
         return (
             sym,
@@ -529,8 +584,18 @@ def _close_single_position(**kw):
             0.0,
             "close fragment recovery blocked; physical close not repeated",
         )
-    with close_lock(sym, timeout=15.0, bot_name=bot_name,
-                    fail_open=True) as got:
+    with ExitStack() as stack:
+        try:
+            got = stack.enter_context(
+                close_lock(
+                    sym,
+                    timeout=15.0,
+                    bot_name=bot_name,
+                    fail_open=True,
+                )
+            )
+        except Exception:
+            return _flatten_without_accounting(**kw)
         if _emergency_fragment_is_blocked(bot_name, sym):
             return (
                 sym,
@@ -538,28 +603,62 @@ def _close_single_position(**kw):
                 0.0,
                 "close fragment recovery blocked; physical close not repeated",
             )
-        if not got:
+        if got is not True:
             return _flatten_without_accounting(**kw)
         if got and state is not None:
             try:
-                if not state.has(sym):
-                    return (sym, "closed", 0.0, None)
-                live = state.get(sym)
-                if isinstance(live, dict):
-                    if live.get("accounting_pending") or live.get(
-                        "accounting_already_booked"
-                    ) or live.get("verified_flat_pending_accounting"):
+                state_present = state.has(sym)
+                if type(state_present) is not bool:
+                    return (sym, "failed", 0.0, "managed state unavailable")
+                if not state_present:
+                    if kw.get("simulation") is True:
+                        return (sym, "closed", 0.0, None)
+                    snapshot = kw.get("d")
+                    pos_type = (
+                        snapshot.get("position_type")
+                        if isinstance(snapshot, dict)
+                        else None
+                    )
+                    if pos_type not in ("LONG", "SHORT"):
                         return (
                             sym,
                             "failed",
                             0.0,
-                            "accounting recovery pending; physical close "
-                            "not repeated",
+                            "managed state missing; exchange flatness unverified",
                         )
-                    kw = dict(kw)
-                    kw["d"] = live
+                    try:
+                        closed_ok, _remaining = verify_position_closed(
+                            kw.get("ex"),
+                            f"{sym}/USDT:USDT",
+                            timeout=_VERIFY_CLOSE_TIMEOUT_SEC,
+                            expected_position_side=pos_type,
+                        )
+                    except Exception:
+                        closed_ok = False
+                    if closed_ok:
+                        return (sym, "closed", 0.0, None)
+                    return (
+                        sym,
+                        "failed",
+                        0.0,
+                        "managed state missing; exchange flatness unverified",
+                    )
+                live = state.get(sym)
             except Exception:
-                pass
+                return (sym, "failed", 0.0, "managed state unavailable")
+            if not isinstance(live, dict):
+                return (sym, "failed", 0.0, "managed state unavailable")
+            if live.get("accounting_pending") or live.get(
+                "accounting_already_booked"
+            ) or live.get("verified_flat_pending_accounting"):
+                return (
+                    sym,
+                    "failed",
+                    0.0,
+                    "accounting recovery pending; physical close not repeated",
+                )
+            kw = dict(kw)
+            kw["d"] = live
         return _close_single_position_impl(**kw)
 
 
@@ -577,7 +676,9 @@ def _flatten_without_accounting(**kw):
         return (sym, "failed", 0.0, "close lock held")
     try:
         pos_type = d.get("position_type", "LONG")
-        amount = abs(_finite_or_default(d.get("amount", 0), 0.0))
+        if pos_type not in ("LONG", "SHORT"):
+            return (sym, "failed", 0.0, "position type invalid")
+        amount = _finite_or_default(d.get("amount", 0), 0.0)
         lev = _positive_finite_or_default(
             d.get("leverage", kw.get("default_leverage", 1)),
             kw.get("default_leverage", 1) or 1,
@@ -618,6 +719,22 @@ def _flatten_without_accounting(**kw):
                 return (sym, "failed", 0.0, "managed state unavailable")
             if ownership_live.get("claim_conflict"):
                 return (sym, "failed", 0.0, "registry claim conflict")
+            if _emergency_fragment_is_blocked(kw.get("bot_name"), sym):
+                return (
+                    sym,
+                    "failed",
+                    0.0,
+                    "close fragment recovery blocked; physical close not repeated",
+                )
+            if ownership_live.get("accounting_pending") or ownership_live.get(
+                "accounting_already_booked"
+            ) or ownership_live.get("verified_flat_pending_accounting"):
+                return (
+                    sym,
+                    "failed",
+                    0.0,
+                    "accounting recovery pending; physical close not repeated",
+                )
             create_order_with_retry(
                 ex, symbol_full, side, close_amount, params=params,
                 shutdown_event=shutdown_event, max_attempts=5,
@@ -637,8 +754,13 @@ def _flatten_without_accounting(**kw):
             return (sym, "failed", 0.0, "flattened without accounting")
         return (sym, "failed", 0.0,
                 f"close lock held; flatten unverified ({remaining})")
-    except Exception as e:
-        return (sym, "failed", 0.0, f"close lock held; flatten failed: {e}")
+    except Exception as flatten_error:
+        return (
+            sym,
+            "failed",
+            0.0,
+            f"close lock held; flatten failed ({type(flatten_error).__name__})",
+        )
 
 
 def _close_single_position_impl(*,
@@ -666,11 +788,13 @@ def _close_single_position_impl(*,
     """Close ONE position. Returns (symbol, status, pnl, error_message)."""
     try:
         pos_type = d.get("position_type", "LONG")
+        if pos_type not in ("LONG", "SHORT"):
+            return (sym, "failed", 0.0, "position type invalid")
         entry = _positive_finite_or_zero(d.get("buy", 0))
         margin = _positive_finite_or_zero(d.get("invested_usdt", 0))
         lev = _positive_finite_or_default(d.get("leverage", default_leverage),
                                           default_leverage or 1)
-        amount = abs(_finite_or_default(d.get("amount", 0), 0.0))
+        amount = _finite_or_default(d.get("amount", 0), 0.0)
         if amount <= 0:
             return (sym, "failed", 0.0, "amount invalid")
         if entry <= 0 or margin <= 0:
@@ -718,10 +842,11 @@ def _close_single_position_impl(*,
                 curr = _positive_finite_or_zero(ticker.get("last"))
                 if curr <= 0:
                     curr = _positive_finite_or_zero(ticker.get("close"))
-            except Exception as e:
+            except Exception as cache_error:
                 log_event(
-                    f"  Price (cached) for {sym} unavailable: {e} - "
-                    f"trying direct fetch", "WARN"
+                    f"  Price (cached) for {sym} unavailable "
+                    f"({type(cache_error).__name__}) - trying direct fetch",
+                    "WARN",
                 )
         if curr <= 0:
             try:
@@ -733,7 +858,8 @@ def _close_single_position_impl(*,
             except Exception as gate_error:
                 log_event(
                     f"  Price (direct) for {sym} unavailable: "
-                    f"API budget gate failed ({gate_error})", "WARN"
+                    f"API budget gate failed ({type(gate_error).__name__})",
+                    "WARN",
                 )
                 price_reservation = None
             if price_reservation:
@@ -750,7 +876,7 @@ def _close_single_position_impl(*,
                         raise ValueError(
                             "emergency futures ticker returned no positive price"
                         )
-                except Exception as e2:
+                except Exception as direct_price_error:
                     if isinstance(price_reservation, ApiCallReservation):
                         try:
                             record_api_error(
@@ -760,7 +886,9 @@ def _close_single_position_impl(*,
                         except Exception:
                             pass
                     log_event(
-                        f"  Price (direct) for {sym} unavailable: {e2}", "WARN"
+                        f"  Price (direct) for {sym} unavailable "
+                        f"({type(direct_price_error).__name__})",
+                        "WARN",
                     )
         if curr <= 0:
             curr = _positive_finite_or_zero(d.get("last_price", 0))
@@ -978,7 +1106,7 @@ def _close_single_position_impl(*,
                         timeout=_VERIFY_CLOSE_TIMEOUT_SEC,
                         expected_position_side=pos_type,
                     )
-                except Exception as ve:
+                except Exception as verify_error:
                     closed_ok, remaining = False, -1.0
                     reported_fill = _positive_finite_or_zero(
                         order.get("filled") if isinstance(order, dict) else None
@@ -995,7 +1123,8 @@ def _close_single_position_impl(*,
                             )
                     log_event(
                         f"  [LIVE] {sym}: verify_position_closed raised "
-                        f"{ve} - assuming NOT closed", "WARN"
+                        f"({type(verify_error).__name__}) - assuming NOT closed",
+                        "WARN",
                     )
 
                 if not closed_ok:
@@ -1036,16 +1165,18 @@ def _close_single_position_impl(*,
                             timeout=_VERIFY_CLOSE_TIMEOUT_SEC,
                             expected_position_side=pos_type,
                         )
-                    except Exception as ve:
+                    except Exception as flat_verify_error:
                         closed_ok, remaining = False, -1.0
                         log_event(
                             f"  [LIVE] {sym}: close error looked flat but "
-                            f"verification failed: {ve}", "WARN"
+                            f"verification failed "
+                            f"({type(flat_verify_error).__name__})",
+                            "WARN",
                         )
                     if closed_ok:
                         log_event(
                             f"  [LIVE] {sym}: position already flat on "
-                            f"exchange ({str(e)[:80]}) - booking local close",
+                            f"exchange ({type(e).__name__}) - booking local close",
                             "WARN",
                         )
                         fill_source = "already_flat"
@@ -1060,13 +1191,26 @@ def _close_single_position_impl(*,
                         )
                         return (sym, "failed", 0.0, msg)
                 else:
-                    log_event(f"  [LIVE] Emergency close {sym} could not complete: {e}", "WARN")
+                    close_error_type = type(e).__name__
+                    log_event(
+                        f"  [LIVE] Emergency close {sym} could not complete "
+                        f"({close_error_type})",
+                        "WARN",
+                    )
                     if error_logger:
                         try:
-                            error_logger(f"emergency close {sym}", e)
+                            error_logger(
+                                f"emergency close {sym}",
+                                RuntimeError(close_error_type),
+                            )
                         except Exception:
                             pass
-                    return (sym, "failed", 0.0, str(e))
+                    return (
+                        sym,
+                        "failed",
+                        0.0,
+                        f"order close failed ({close_error_type})",
+                    )
 
         if fill_price is None or fill_price <= 0:
             fill_price = curr
@@ -1295,7 +1439,8 @@ def _close_single_position_impl(*,
             if error_logger:
                 try:
                     error_logger(
-                        f"emergency accounting write-ahead {sym}", state_err
+                        f"emergency accounting write-ahead {sym}",
+                        RuntimeError(type(state_err).__name__),
                     )
                 except Exception:
                     pass
@@ -1324,7 +1469,7 @@ def _close_single_position_impl(*,
                 "closed but exact funding accounting is pending",
             )
         accounting_ok = False
-        accounting_error = None
+        accounting_error_type = "UnknownError"
         try:
             accounting_ok = save_trade_db(
                 bot_name=bot_name,
@@ -1356,14 +1501,17 @@ def _close_single_position_impl(*,
             if not accounting_ok:
                 raise RuntimeError("save_trade_db returned False")
         except Exception as e:
-            accounting_error = e
+            accounting_error_type = type(e).__name__
             log_event(
-                f"  DB accounting for {sym} could not be saved after close: {e}. "
-                f"State kept for reconcile/accounting recovery.", "WARN")
+                f"  DB accounting for {sym} could not be saved after close "
+                f"({accounting_error_type}). State kept for "
+                f"reconcile/accounting recovery.",
+                "WARN",
+            )
 
         if not accounting_ok:
             return (sym, "failed", 0.0,
-                    f"closed but accounting failed: {accounting_error}")
+                    f"closed but accounting failed ({accounting_error_type})")
 
         try:
             save_trade(
@@ -1373,14 +1521,22 @@ def _close_single_position_impl(*,
                 profit_usdt=profit_usdt,
                 reason=f"Emergency Close ({reason}) ({pos_type})"
             )
-        except Exception as e:
-            log_event(f"  File trade log for {sym} could not be saved: {e}", "WARN")
+        except Exception as file_log_error:
+            log_event(
+                f"  File trade log for {sym} could not be saved "
+                f"({type(file_log_error).__name__})",
+                "WARN",
+            )
 
         try:
             log_sell(bot_name, sym, move_pct, profit_usdt,
                       f"Emergency Close | {pos_type} @ {lev}x")
-        except Exception as e:
-            log_event(f"  Sell log for {sym} could not be written: {e}", "WARN")
+        except Exception as sell_log_error:
+            log_event(
+                f"  Sell log for {sym} could not be written "
+                f"({type(sell_log_error).__name__})",
+                "WARN",
+            )
 
         restore_fields = {
             "accounting_already_booked": True,
@@ -1399,10 +1555,12 @@ def _close_single_position_impl(*,
                 expected_entry_id=d.get("entry_id"),
             )
         except Exception as cleanup_error:
+            cleanup_error_type = type(cleanup_error).__name__
             if error_logger:
                 try:
                     error_logger(
-                        f"emergency remove_futures_state {sym}", cleanup_error
+                        f"emergency remove_futures_state {sym}",
+                        RuntimeError(cleanup_error_type),
                     )
                 except Exception:
                     pass
@@ -1417,7 +1575,7 @@ def _close_single_position_impl(*,
                     try:
                         error_logger(
                             f"emergency mark futures cleanup pending {sym}",
-                            state_error,
+                            RuntimeError(type(state_error).__name__),
                         )
                     except Exception:
                         pass
@@ -1430,7 +1588,8 @@ def _close_single_position_impl(*,
                 sym,
                 "failed",
                 0.0,
-                f"closed but futures_state cleanup failed: {cleanup_error}",
+                f"closed but futures_state cleanup failed "
+                f"({cleanup_error_type})",
             )
 
         try:
@@ -1454,7 +1613,7 @@ def _close_single_position_impl(*,
                     try:
                         error_logger(
                             f"emergency restore accounted state {sym}",
-                            state_error,
+                            RuntimeError(type(state_error).__name__),
                         )
                     except Exception:
                         pass
@@ -1462,7 +1621,7 @@ def _close_single_position_impl(*,
                 try:
                     error_logger(
                         f"emergency remove accounted state {sym}",
-                        cleanup_error,
+                        RuntimeError(type(cleanup_error).__name__),
                     )
                 except Exception:
                     pass
@@ -1494,7 +1653,7 @@ def _close_single_position_impl(*,
                     try:
                         error_logger(
                             f"emergency finalize futures_state cleanup {sym}",
-                            cleanup_error,
+                            RuntimeError(type(cleanup_error).__name__),
                         )
                     except Exception:
                         pass
@@ -1504,10 +1663,18 @@ def _close_single_position_impl(*,
     except Exception as e:
         if error_logger:
             try:
-                error_logger(f"emergency_close {sym}", e)
+                error_logger(
+                    f"emergency_close {sym}",
+                    RuntimeError(type(e).__name__),
+                )
             except Exception:
                 pass
-        return (sym, "failed", 0.0, str(e))
+        return (
+            sym,
+            "failed",
+            0.0,
+            f"unexpected close failure ({type(e).__name__})",
+        )
 
 
 def emergency_close_all_futures(*,
@@ -1538,14 +1705,76 @@ def emergency_close_all_futures(*,
 
     Returns {"closed_count", "failed_count", "failed"} so the caller can decide
     whether to latch shutdown as complete or allow a retry of failed legs."""
-    snapshot = state.get_all()
+    def safe_log_event(message: str, level: str) -> None:
+        try:
+            log_event(message, level)
+        except Exception:
+            pass
+
+    if not isinstance(simulation, bool):
+        safe_log_event("Emergency close: runtime mode invalid", "ERROR")
+        return {
+            "closed_count": 0,
+            "failed_count": 1,
+            "failed": ["runtime mode invalid"],
+        }
+    if (
+        not isinstance(margin_mode, str)
+        or margin_mode != margin_mode.strip()
+        or margin_mode.lower() not in ("isolated", "cross")
+    ):
+        safe_log_event("Emergency close: margin mode invalid", "ERROR")
+        return {
+            "closed_count": 0,
+            "failed_count": 1,
+            "failed": ["margin mode invalid"],
+        }
+    margin_mode = margin_mode.lower()
+
+    snapshot_failure = {
+        "closed_count": 0,
+        "failed_count": 1,
+        "failed": ["state snapshot unavailable"],
+    }
+    try:
+        snapshot = state.get_all()
+    except Exception as snapshot_error:
+        safe_log_event(
+            "Emergency close: state snapshot unavailable "
+            f"({type(snapshot_error).__name__})",
+            "ERROR",
+        )
+        return snapshot_failure
+    if not isinstance(snapshot, dict):
+        safe_log_event("Emergency close: state snapshot malformed", "ERROR")
+        return snapshot_failure
+    try:
+        snapshot = dict(snapshot)
+    except Exception as snapshot_error:
+        safe_log_event(
+            "Emergency close: state snapshot materialization unavailable "
+            f"({type(snapshot_error).__name__})",
+            "ERROR",
+        )
+        return snapshot_failure
     if not snapshot:
-        log_event("Emergency close: no open positions", "INFO")
+        safe_log_event("Emergency close: no open positions", "INFO")
         return {"closed_count": 0, "failed_count": 0, "failed": []}
 
-    log_event(
+    parallel_limit = (
+        min(max_parallel, _MAX_PARALLEL_CLOSES)
+        if (
+            isinstance(max_parallel, int)
+            and not isinstance(max_parallel, bool)
+            and max_parallel > 0
+        )
+        else 1
+    )
+    workers = min(parallel_limit, len(snapshot))
+
+    safe_log_event(
         f"EMERGENCY CLOSE ALL ({reason}) - {len(snapshot)} positions "
-        f"(parallel workers: {min(max_parallel, len(snapshot))})",
+        f"(parallel workers: {workers})",
         "WARN"
     )
 
@@ -1560,40 +1789,91 @@ def emergency_close_all_futures(*,
         margin_mode=margin_mode,
         shutdown_event=shutdown_event, reason=reason,
         ticker_cache=ticker_cache,
-        log_event=log_event, log_sell=log_sell, log_struct=log_struct,
+        log_event=safe_log_event, log_sell=log_sell, log_struct=log_struct,
         save_trade_db=save_trade_db, save_trade=save_trade,
         remove_futures_state=remove_futures_state,
         reduce_only_params=reduce_only_params,
         error_logger=error_logger,
     )
 
-    workers = max(1, min(max_parallel, len(snapshot)))
-    with ThreadPoolExecutor(max_workers=workers,
-                               thread_name_prefix="emergency-close") as ex_pool:
-        futures = {
-            ex_pool.submit(_close_single_position,
-                             sym=sym, d=d,
-                             **worker_kwargs_common): sym
-            for sym, d in snapshot.items()
-        }
-        for fut in as_completed(futures):
-            sym = futures[fut]
-            try:
-                result_sym, status, pnl, err = fut.result()
-            except Exception as e:
+    try:
+        ex_pool = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="emergency-close",
+        )
+    except Exception as pool_error:
+        failed.extend(
+            f"{_emergency_symbol_label(sym)}: worker pool unavailable"
+            for sym in snapshot
+        )
+        safe_log_event(
+            "Emergency close worker pool unavailable "
+            f"({type(pool_error).__name__})",
+            "ERROR",
+        )
+    else:
+        with ex_pool:
+            futures = {}
+            for sym, d in snapshot.items():
+                if not _valid_emergency_base_symbol(sym):
+                    failed.append("<invalid-symbol>: symbol invalid")
+                    safe_log_event(
+                        "Emergency close skipped invalid state symbol",
+                        "WARN",
+                    )
+                    continue
+                try:
+                    future = ex_pool.submit(
+                        _close_single_position,
+                        sym=sym, d=d,
+                        **worker_kwargs_common,
+                    )
+                except Exception as submit_error:
+                    failed.append(f"{sym}: worker submission failed")
+                    safe_log_event(
+                        f"Emergency close worker submission for {sym} failed "
+                        f"({type(submit_error).__name__})",
+                        "WARN",
+                    )
+                    continue
+                futures[future] = sym
+            for fut in as_completed(futures):
+                sym = futures[fut]
+                try:
+                    result_sym, status, pnl, err = fut.result()
+                except Exception as worker_error:
+                    with aggr_lock:
+                        failed.append(f"{sym}: worker crashed")
+                    safe_log_event(
+                        f"Emergency close worker for {sym} crashed "
+                        f"({type(worker_error).__name__})",
+                        "WARN",
+                    )
+                    continue
+                if (
+                    not isinstance(result_sym, str)
+                    or result_sym != sym
+                    or not isinstance(status, str)
+                    or status not in ("closed", "failed")
+                    or (status == "closed" and err is not None)
+                ):
+                    with aggr_lock:
+                        failed.append(f"{sym}: invalid worker result")
+                    safe_log_event(
+                        f"Emergency close worker for {sym} returned "
+                        "an invalid result",
+                        "WARN",
+                    )
+                    continue
                 with aggr_lock:
-                    failed.append(f"{sym}: {e}")
-                log_event(f"Emergency close worker for {sym} crashed: {e}",
-                           "WARN")
-                continue
-            with aggr_lock:
-                if status == "closed":
-                    closed_count += 1
-                    total_pnl += pnl
-                else:
-                    failed.append(f"{result_sym}: {err or status}")
+                    if status == "closed":
+                        closed_count += 1
+                        total_pnl += _finite_or_default(pnl, 0.0)
+                    else:
+                        detail = _safe_worker_failure_detail(err, status)
+                        failed.append(f"{result_sym}: {detail}")
 
-    log_event(
+    safe_log_event(
         f"Emergency close result: {closed_count} closed "
         f"(Total PnL: {total_pnl:+.2f} USDT), {len(failed)} failed",
         "INFO"
@@ -1609,8 +1889,11 @@ def emergency_close_all_futures(*,
                 f"Incomplete: {', '.join(shown)}{extra}\n"
                 f"Close MANUALLY on the exchange!"
             )
-        except Exception as e:
-            log_event(f"Telegram unavailable: {e}", "WARN")
+        except Exception as telegram_error:
+            safe_log_event(
+                f"Telegram unavailable ({type(telegram_error).__name__})",
+                "WARN",
+            )
 
     # Structured result so the shutdown handler can decide whether to LATCH
     # (fully flat  don't retry) or leave room for a repeat-signal/atexit retry

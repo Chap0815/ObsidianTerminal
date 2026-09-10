@@ -505,6 +505,18 @@ def apply_optimizer_best_config_to_app(
     provenance = optimizer_apply_provenance(cfg)
     if not updates:
         return applied
+    dirty_by_strategy = getattr(app, "_dirty_param_keys", {})
+    dirty_keys = (
+        dirty_by_strategy.get(strategy, set())
+        if isinstance(dirty_by_strategy, dict)
+        else set()
+    )
+    dirty_overlap = sorted(set(updates).intersection(dirty_keys or ()))
+    if dirty_overlap:
+        raise ConfigMergeConflict(
+            f"{strategy} optimizer targets have unsaved launcher edits: "
+            + ", ".join(dirty_overlap)
+        )
     if type(expected_section_values) is not dict:
         raise ValueError("optimizer config staging expectation is missing")
     from tools.simulation_workspace import canonical_evidence_sha256
@@ -533,6 +545,28 @@ def apply_optimizer_best_config_to_app(
         except Exception:
             pass
     return applied
+
+
+def _restore_optimizer_apply_targets_from_disk(app, strategy: str) -> None:
+    """Refresh only optimizer-owned UI values after a failed config write."""
+    disk_config = load_config()
+    disk_section = disk_config.get(strategy, {})
+    current_section = app.config.get(strategy, {})
+    if type(disk_section) is not dict or type(current_section) is not dict:
+        raise ValueError("optimizer config section is invalid")
+    rows = app.param_rows.get(strategy, {})
+    dirty_keys = getattr(app, "_dirty_param_keys", {}).get(strategy, set())
+    for cfg_key in OPTIMIZER_CONFIG_MAPPING.values():
+        if cfg_key not in disk_section or cfg_key in dirty_keys:
+            continue
+        value = disk_section[cfg_key]
+        current_section[cfg_key] = value
+        row = rows.get(cfg_key)
+        if row:
+            try:
+                row.set_value(value)
+            except Exception:
+                pass
 
 
 def reset_optimizer_apply_run_state(parse_state: dict, apply_btn_ref: dict) -> bool:
@@ -604,8 +638,11 @@ def finalize_optimizer_apply_run(
         return False
     generation = parse_state.get("run_generation")
     try:
-        publish(generation)
+        published = publish(generation) is True
     except Exception:
+        reset_optimizer_apply_run_state(parse_state, apply_btn_ref)
+        return False
+    if not published:
         reset_optimizer_apply_run_state(parse_state, apply_btn_ref)
         return False
     return True
@@ -914,6 +951,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         "reader_state": None,
         "buffer": _BoundedToolOutputBuffer(),
         "done": False, "exit_code": None, "stop_reading": False,
+        "stopping_proc": None,
     }
 
     #  Header 
@@ -1223,34 +1261,38 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
     #  Apply-best-config button (appears when optimizer finishes) 
     apply_btn_ref: dict = {"btn": None}
 
-    def _show_apply_button(run_generation: int):
+    def _show_apply_button(run_generation: int) -> bool:
         if run_generation != parse_state.get("run_generation"):
-            return
+            return False
         if apply_btn_ref["btn"] is not None:
-            return
+            return False
         cfg = parse_state.get("best_config")
         if not cfg:
-            return
+            return False
         if optimizer_promotion_reasons(cfg):
-            return
+            return False
         try:
             optimizer_apply_provenance(cfg)
         except ValueError:
-            return
+            return False
         if not isinstance(parse_state.get("apply_expectations"), dict):
-            return
+            return False
 
-        apply_btn = ctk.CTkButton(
-            btns,
-            text=f" Apply best config to {cfg.get('strategy', '?')}",
-            height=36, corner_radius=8, width=260,
-            font=ctk.CTkFont(FONT_BODY, 12, "bold"),
-            fg_color=COLORS["success"], hover_color="#0d9b6c",
-            text_color="#ffffff",
-            command=lambda: _apply_best_config(cfg)
-        )
-        apply_btn.pack(side="left", padx=(0, 8))
-        apply_btn_ref["btn"] = apply_btn
+        try:
+            apply_btn = ctk.CTkButton(
+                btns,
+                text=f" Apply best config to {cfg.get('strategy', '?')}",
+                height=36, corner_radius=8, width=260,
+                font=ctk.CTkFont(FONT_BODY, 12, "bold"),
+                fg_color=COLORS["success"], hover_color="#0d9b6c",
+                text_color="#ffffff",
+                command=lambda: _apply_best_config(cfg)
+            )
+            apply_btn_ref["btn"] = apply_btn
+            apply_btn.pack(side="left", padx=(0, 8))
+        except Exception:
+            return False
+        return True
 
     def _apply_best_config(cfg: dict):
         """Promote the optimizer's best config into ``app.config``."""
@@ -1279,14 +1321,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         except Exception as exc:
             stale_conflict = isinstance(exc, ConfigMergeConflict)
             try:
-                app.config = load_config()
-                rows = app.param_rows.get(strategy, {})
-                disk_section = app.config.get(strategy, {})
-                for cfg_key in OPTIMIZER_CONFIG_MAPPING.values():
-                    row = rows.get(cfg_key)
-                    if row and cfg_key in disk_section:
-                        row.set_value(disk_section[cfg_key])
-                app._mark_dirty(strategy, False)
+                _restore_optimizer_apply_targets_from_disk(app, strategy)
             except Exception:
                 pass
             if stale_conflict:
@@ -1302,8 +1337,6 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             _append_line("")
             _append_line(f" No optimizer parameters to apply for {strategy}.")
             return
-        app._mark_dirty(strategy, True)  # show the restart hint
-
         status_var.set(f" Applied {len(applied)} parameter(s) to {strategy}. "
                         f"Restart bot to activate.")
         status_lbl.configure(text_color=COLORS["success"])
@@ -1324,7 +1357,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         """Stage a verified file; config still changes only on the Apply click."""
         if tool_name != "optimizer":
             return
-        if _process_is_alive(proc_state.get("proc")):
+        if _owned_process_is_active(proc_state.get("proc")):
             status_var.set(" Stop the running optimizer before importing evidence")
             status_lbl.configure(text_color=COLORS["danger"])
             return
@@ -1336,10 +1369,6 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             filetypes=(("Promotion JSON", "*.json"), ("All files", "*.*")),
         )
         if not selected:
-            return
-        if not reset_optimizer_apply_run_state(parse_state, apply_btn_ref):
-            status_var.set(" Cannot invalidate the previous optimizer result")
-            status_lbl.configure(text_color=COLORS["danger"])
             return
         expected_strategy = bot_var.get()
         try:
@@ -1356,11 +1385,19 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             status_var.set(f" Promotion artifact rejected: {exc}")
             status_lbl.configure(text_color=COLORS["danger"])
             return
+        if not reset_optimizer_apply_run_state(parse_state, apply_btn_ref):
+            status_var.set(" Cannot invalidate the previous optimizer result")
+            status_lbl.configure(text_color=COLORS["danger"])
+            return
         parse_state["best_config"] = cfg
         parse_state["expected_strategy"] = cfg["strategy"]
         parse_state["output_complete"] = True
         parse_state["apply_expectations"] = expectations
-        _show_apply_button(parse_state["run_generation"])
+        if not _show_apply_button(parse_state["run_generation"]):
+            reset_optimizer_apply_run_state(parse_state, apply_btn_ref)
+            status_var.set(" Cannot safely publish the verified promotion")
+            status_lbl.configure(text_color=COLORS["danger"])
+            return
         status_var.set(
             f" Promotion verified for {cfg['strategy']}; review and Apply manually"
         )
@@ -1487,19 +1524,34 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         except Exception:
             return True
 
+    def _owned_process_is_active(proc) -> bool:
+        if _process_is_alive(proc):
+            return True
+        if proc is None:
+            return False
+        registry = getattr(app, "tool_processes", None)
+        snapshot = getattr(registry, "snapshot", None)
+        if not callable(snapshot):
+            return registry is not None
+        try:
+            return any(candidate is proc for candidate in snapshot())
+        except Exception:
+            return True
+
     def _stop_owned_process(proc) -> bool:
         registry = getattr(app, "tool_processes", None)
-        try:
-            if registry is not None:
-                registry.stop(proc)
-            else:
-                stop_tool_processes([proc])
-        except Exception:
+        stopped = False
+        if registry is not None:
             try:
-                stop_tool_processes([proc])
+                stopped = registry.stop(proc) is True
             except Exception:
                 pass
-        return not _process_is_alive(proc)
+        if not stopped:
+            try:
+                stopped = stop_tool_processes([proc]) is True
+            except Exception:
+                pass
+        return stopped and not _process_is_alive(proc)
 
     def _mark_process_survivor() -> None:
         status_var.set(" Process could not be stopped; launcher still owns it")
@@ -1521,7 +1573,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             if (
                 dlg.winfo_exists()
                 and proc_state.get("proc") is proc
-                and _process_is_alive(proc)
+                and _owned_process_is_active(proc)
             ):
                 _mark_process_survivor()
         except Exception:
@@ -1552,7 +1604,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
                 spinner_var.set(spinner_chars[spinner_idx[0]])
             dlg.after(0 if proc_state["done"] else 120, _ui_tick)
         else:
-            if _process_is_alive(proc_state.get("proc")):
+            if _owned_process_is_active(proc_state.get("proc")):
                 _mark_process_survivor()
                 return
             ec = proc_state["exit_code"]
@@ -1626,12 +1678,18 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         import threading as _threading
 
         proc = proc_state.get("proc")
+        if proc is not None and proc_state.get("stopping_proc") is proc:
+            return True
         proc_state["stop_reading"] = True
         reader_state = proc_state.get("reader_state")
         if reader_state is not None:
             reader_state["stop_reading"] = True
-        if _process_is_alive(proc):
+        if proc is not None:
+            proc_state["stopping_proc"] = proc
+            reap_entered = _threading.Event()
+
             def _reap():
+                reap_entered.set()
                 if not _stop_owned_process(proc):
                     try:
                         _post_ui(
@@ -1643,11 +1701,21 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
                     except Exception:
                         pass
 
+            reaper = _threading.Thread(
+                target=_reap,
+                daemon=True,
+                name="proc-reap",
+            )
             try:
-                _threading.Thread(target=_reap, daemon=True,
-                                   name="proc-reap").start()
+                reaper.start()
             except Exception:
-                if not _stop_owned_process(proc):
+                if reap_entered.is_set():
+                    pass
+                elif thread_definitely_never_started(reaper):
+                    if not _stop_owned_process(proc):
+                        _mark_process_survivor()
+                        return False
+                else:
                     _mark_process_survivor()
                     return False
 
@@ -1666,7 +1734,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             status_var.set(" Previous output reader is still owned")
             status_lbl.configure(text_color=COLORS["danger"])
             return
-        if _process_is_alive(proc_state.get("proc")):
+        if _owned_process_is_active(proc_state.get("proc")):
             _mark_process_survivor()
             return
 
@@ -1720,6 +1788,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         proc_state["done"] = False
         proc_state["exit_code"] = None
         proc_state["stop_reading"] = False
+        proc_state["stopping_proc"] = None
 
         # Run button  Stop button
         run_btn.configure(text=" Stop", fg_color="transparent",
@@ -1852,8 +1921,8 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             stopped = False
             cleanup_error = None
             try:
-                stopped = not _process_is_alive(proc)
-                if not stopped:
+                stopped = proc is None
+                if proc is not None:
                     stopped = _stop_owned_process(proc)
             except BaseException as exc:
                 cleanup_error = exc

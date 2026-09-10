@@ -61,6 +61,10 @@ _LIVE_RESIDUAL_DUST_USDT = 1.0
 _POSITIONS_JSON_MAX_BYTES = 4 * 1024 * 1024
 
 
+class _PositionJsonConstantError(ValueError):
+    """A non-standard numeric token made position state ambiguous."""
+
+
 def _unique_position_state_object(pairs: list[tuple[str, object]]) -> dict:
     result = {}
     for key, value in pairs:
@@ -68,6 +72,12 @@ def _unique_position_state_object(pairs: list[tuple[str, object]]) -> dict:
             raise ValueError(f"duplicate position state JSON key: {key}")
         result[key] = value
     return result
+
+
+def _reject_position_json_constant(value: str):
+    raise _PositionJsonConstantError(
+        f"non-standard JSON constant: {value}"
+    )
 
 
 def _read_positions_json(path: str):
@@ -78,6 +88,7 @@ def _read_positions_json(path: str):
     return json.loads(
         raw.decode("utf-8-sig"),
         object_pairs_hook=_unique_position_state_object,
+        parse_constant=_reject_position_json_constant,
     )
 
 
@@ -712,6 +723,12 @@ def get_open_spot_positions(bot_name: str,
                 raise RuntimeError(detail)
             return [_invalid_spot_position_row(
                 "STATE", {}, detail, bool(effective_sim))]
+    except _PositionJsonConstantError as e:
+        detail = f"invalid open spot state: {e}"
+        if strict:
+            raise RuntimeError(detail) from e
+        return [_invalid_spot_position_row(
+            "STATE", {}, detail, bool(effective_sim))]
     except Exception as e:
         if strict:
             raise

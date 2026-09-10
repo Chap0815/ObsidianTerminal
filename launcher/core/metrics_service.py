@@ -61,6 +61,10 @@ def _unique_metrics_json_object(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
+def _reject_metrics_json_constant(value: str):
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 def _read_metrics_json(path: str):
     with open(path, "rb") as stream:
         raw = stream.read(_METRICS_STATE_JSON_MAX_BYTES + 1)
@@ -69,6 +73,7 @@ def _read_metrics_json(path: str):
     return json.loads(
         raw.decode("utf-8-sig"),
         object_pairs_hook=_unique_metrics_json_object,
+        parse_constant=_reject_metrics_json_constant,
     )
 
 
@@ -101,6 +106,26 @@ def _finite_float_or_none(value) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+def _close_metrics_query_connection(
+    connection,
+    primary_error: BaseException | None,
+) -> None:
+    try:
+        connection.close()
+    except BaseException as close_error:
+        if primary_error is None:
+            if isinstance(close_error, Exception):
+                raise MetricsDbReadError(str(close_error)) from close_error
+            raise
+        try:
+            primary_error.add_note(
+                "close launcher metrics query after read failure: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        except BaseException:
+            pass
+
+
 def query_db(sql: str, params: tuple = ()) -> list:
     """Single-shot SQLite read with a 20 s timeout + busy_timeout PRAGMA.
 
@@ -111,6 +136,7 @@ def query_db(sql: str, params: tuple = ()) -> list:
     if not os.path.exists(DB_PATH):
         return []
     conn = None
+    primary_error: BaseException | None = None
     try:
         uri_path = Path(DB_PATH).resolve().as_posix()
         conn = sqlite3.connect(
@@ -119,22 +145,24 @@ def query_db(sql: str, params: tuple = ()) -> list:
             timeout=20.0,
         )
         conn.execute("PRAGMA busy_timeout=20000")
-        rows = conn.execute(sql, params).fetchall()
-        conn.close()
-        return rows
+        return conn.execute(sql, params).fetchall()
     except Exception as exc:
-        try:
-            if conn is not None:
-                conn.close()
-        except Exception:
-            pass
-        raise MetricsDbReadError(str(exc)) from exc
+        converted = MetricsDbReadError(str(exc))
+        primary_error = converted
+        raise converted from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        if conn is not None:
+            _close_metrics_query_connection(conn, primary_error)
 
 
 def query_db_dict(sql: str, params: tuple = ()) -> list[dict]:
     if not os.path.exists(DB_PATH):
         return []
     conn = None
+    primary_error: BaseException | None = None
     try:
         uri_path = Path(DB_PATH).resolve().as_posix()
         conn = sqlite3.connect(
@@ -144,16 +172,17 @@ def query_db_dict(sql: str, params: tuple = ()) -> list[dict]:
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=20000")
-        rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
-        conn.close()
-        return rows
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
     except Exception as exc:
-        try:
-            if conn is not None:
-                conn.close()
-        except Exception:
-            pass
-        raise MetricsDbReadError(str(exc)) from exc
+        converted = MetricsDbReadError(str(exc))
+        primary_error = converted
+        raise converted from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        if conn is not None:
+            _close_metrics_query_connection(conn, primary_error)
 
 
 #  Per-bot aggregates 
@@ -162,7 +191,9 @@ def _metrics_bot_key(bot: str, mode_is_sim: bool | None = None) -> str:
     from core.database import metrics_bot_name, metrics_bot_name_for_mode
     if mode_is_sim is None:
         return metrics_bot_name(bot)
-    return metrics_bot_name_for_mode(bot, bool(mode_is_sim))
+    if not isinstance(mode_is_sim, bool):
+        raise ValueError("metrics mode must be boolean")
+    return metrics_bot_name_for_mode(bot, mode_is_sim)
 
 
 def _metrics_bot_keys(bot: str, mode_is_sim: bool | None = None) -> tuple[str, ...]:
@@ -542,8 +573,13 @@ def _spot_state_file(log_dir: str, bot_name: str = None,
         return base
     try:
         from bot_utils.sim_flag import read_simulation_flag, sim_state_path
-        is_sim = (bool(read_simulation_flag(bot_name))
-                  if mode_is_sim is None else bool(mode_is_sim))
+        is_sim = (
+            read_simulation_flag(bot_name)
+            if mode_is_sim is None
+            else mode_is_sim
+        )
+        if not isinstance(is_sim, bool):
+            raise ValueError("metrics state mode must be boolean")
         return sim_state_path(base, is_sim)
     except Exception as exc:
         raise RuntimeError(

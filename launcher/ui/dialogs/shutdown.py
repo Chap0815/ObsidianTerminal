@@ -54,7 +54,7 @@ class _DialogRefreshGate:
 def _post_ui(app, callback, *, delay_ms: int = 0) -> bool:
     post = getattr(app, "post_ui", None)
     if callable(post):
-        return post(callback, delay_ms=delay_ms) is not False
+        return post(callback, delay_ms=delay_ms) is True
     app.after(delay_ms, callback)
     return True
 
@@ -62,7 +62,7 @@ def _post_ui(app, callback, *, delay_ms: int = 0) -> bool:
 def _post_ui_lifecycle(app, callback, *, delay_ms: int = 0) -> bool:
     post = getattr(app, "post_ui_lifecycle", None)
     if callable(post):
-        return post(callback, delay_ms=delay_ms) is not False
+        return post(callback, delay_ms=delay_ms) is True
     return _post_ui(app, callback, delay_ms=delay_ms)
 
 
@@ -201,10 +201,20 @@ def _start_dialog_refresh_worker(
 
 
 def _dialog_exception_text(exc: BaseException) -> str:
+    kind = type(exc).__name__
     try:
-        return str(exc)
+        detail = str(exc).replace("\r", " ").replace("\n", " ")
     except BaseException:
-        return type(exc).__name__
+        detail = ""
+    try:
+        from core.logger import redact
+
+        redacted = redact(detail)
+        detail = redacted if isinstance(redacted, str) else ""
+    except BaseException:
+        detail = ""
+    detail = detail[:240].strip()
+    return f"{kind}: {detail}" if detail else kind
 
 
 def show_state_read_error_dialog(app, title: str, detail: str) -> None:
@@ -309,8 +319,9 @@ def show_busy_dialog(app, title: str, intro: str, worker, **worker_kwargs) -> No
         try:
             worker(update_fn)
         except Exception as e:
-            print(f"[BusyDialog] worker failed: {e}")
-            update_fn(f"Failed: {e}")
+            detail = _dialog_exception_text(e)
+            print(f"[BusyDialog] worker failed: {detail}")
+            update_fn(f"Failed: {detail}")
         finally:
             # Clean up on the main thread
             _post_ui_lifecycle(
@@ -330,7 +341,7 @@ def show_busy_dialog(app, title: str, intro: str, worker, **worker_kwargs) -> No
             prog.stop()
         except Exception:
             pass
-        detail = str(exc).replace("\r", " ").replace("\n", " ")[:160]
+        detail = _dialog_exception_text(exc)
         try:
             status_var.set(f"Failed to start: {detail}")
         except Exception:
@@ -1446,15 +1457,16 @@ def _async_stop_all_and_quit_owned(
             )
             _release_dead_process_close_locks(stopped_pid)
         except Exception as e:
+            detail = _dialog_exception_text(e)
             with stop_errors_lock:
-                stop_errors.append(f"{bot_name}: {e}")
+                stop_errors.append(f"{bot_name}: {detail}")
             import sys as _sys
             stderr = _sys.stderr
             if stderr is not None:
                 try:
                     stderr.write(
                         f"[Quit] stop {bot_name} "
-                        f"(graceful={graceful}) failed: {e}\n"
+                        f"(graceful={graceful}) failed: {detail}\n"
                     )
                 except Exception:
                     pass
@@ -1501,6 +1513,14 @@ def _async_stop_all_and_quit_owned(
                 card = app.cards[bot_name]
                 from launcher.core.bot_controller import close_modes_for_stop
                 close_modes = close_modes_for_stop(bot_name)
+                if (
+                    not isinstance(close_modes, list)
+                    or not close_modes
+                    or any(type(mode) is not bool for mode in close_modes)
+                ):
+                    raise RuntimeError(
+                        "position mode verification returned an invalid result"
+                    )
 
                 def _log(severity, msg, _c=card):
                     _post_ui(app, lambda: log_to_card(_c, severity, msg))
@@ -1515,21 +1535,27 @@ def _async_stop_all_and_quit_owned(
                     else:
                         result = direct_close_remaining_spot(
                             bot_name, _log, sim_only, reason="Application Quit")
-                    failed = []
-                    if isinstance(result, dict):
-                        failed = list(result.get("failed") or [])
+                    if (
+                        not isinstance(result, dict)
+                        or not isinstance(result.get("failed"), list)
+                    ):
+                        raise RuntimeError(
+                            "fallback close returned an invalid result"
+                        )
+                    failed = list(result["failed"])
                     if failed:
                         raise RuntimeError(
                             f"fallback close failed for {', '.join(map(str, failed))}")
             except Exception as e:
+                detail = _dialog_exception_text(e)
                 with close_errors_lock:
-                    close_errors.append(f"{bot_name}: {e}")
+                    close_errors.append(f"{bot_name}: {detail}")
                 import sys as _sys
                 stderr = _sys.stderr
                 if stderr is not None:
                     try:
                         stderr.write(
-                            f"[Quit] direct close {bot_name} failed: {e}\n"
+                            f"[Quit] direct close {bot_name} failed: {detail}\n"
                         )
                     except Exception:
                         pass

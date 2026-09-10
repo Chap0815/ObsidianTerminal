@@ -2763,7 +2763,10 @@ class CrossBot(FuturesBot):
                 coins = amt if is_sim else amt * cs
                 if not math.isfinite(coins) or coins <= 0:
                     continue
-                qty = coins if d.get("position_type", "LONG") == "LONG" else -coins
+                position_type = d.get("position_type", "LONG")
+                if position_type not in {"LONG", "SHORT"}:
+                    continue
+                qty = coins if position_type == "LONG" else -coins
                 mm = 0.01
                 if get_maintenance_margin_rate is not None:
                     try:

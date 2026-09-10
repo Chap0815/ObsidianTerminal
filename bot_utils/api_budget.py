@@ -50,6 +50,7 @@ def _read_limit_from_env(default: int = 300) -> int:
 
 
 _DEFAULT_API_CONSUMER_COUNT = 6  # five bot subprocesses plus the launcher
+_SQLITE_MAX_ROW_ID = (1 << 63) - 1
 
 
 def _read_expected_bot_count(default: int = _DEFAULT_API_CONSUMER_COUNT) -> int:
@@ -104,6 +105,21 @@ class ApiCallReservation:
     allowed: bool
     row_id: Optional[int] = None
     ledger_endpoint: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.allowed, bool):
+            raise ValueError("allowed must be boolean")
+        if self.row_id is not None and (
+            isinstance(self.row_id, bool)
+            or not isinstance(self.row_id, int)
+            or self.row_id <= 0
+            or self.row_id > _SQLITE_MAX_ROW_ID
+        ):
+            raise ValueError("row_id must be a positive integer or None")
+        if not self.allowed and self.row_id is not None:
+            raise ValueError("a denied reservation cannot have a row_id")
+        if self.ledger_endpoint is not None:
+            _validated_endpoint(self.ledger_endpoint)
 
     def __bool__(self) -> bool:
         return self.allowed
@@ -305,6 +321,8 @@ def record_api_error(
     ledger_endpoint = endpoint
     if reservation is not None and reservation.ledger_endpoint is not None:
         ledger_endpoint = _validated_endpoint(reservation.ledger_endpoint)
+    if reservation is not None and not reservation.allowed:
+        return
     now_mono = time.monotonic()
     already_counted = bool(reservation and reservation.allowed)
 
@@ -334,8 +352,10 @@ def record_api_error(
             _mark_db_failed()
             return
 
-    if not already_counted:
-        _fallback_record(now_mono)
+    if already_counted:
+        return
+
+    _fallback_record(now_mono)
 
     if not _db_available():
         return
@@ -497,19 +517,24 @@ def try_consume_api_call(endpoint: str = "", ok: int = 1,
         )
         if ok_call is None:
             raise RuntimeError("global API budget gate unavailable")
-        if ok_call:
-            # Mirror to fallback so a sudden DB outage still has recent
-            # data to estimate from.
-            _record_fallback_admission()
-            row_id = (
-                int(ok_call)
-                if not isinstance(ok_call, bool) and int(ok_call) > 0
-                else None
-            )
-            return _result(True, row_id)
-        # The durable gate records critical bypasses even above the normal cap,
-        # so False here is a genuine non-critical budget denial.
-        return _result(False)
+        if ok_call is False:
+            # The durable gate records critical bypasses even above the normal
+            # cap, so False is a genuine non-critical budget denial.
+            return _result(False)
+        if ok_call is True:
+            row_id = None
+        elif (
+            isinstance(ok_call, int)
+            and not isinstance(ok_call, bool)
+            and 0 < ok_call <= _SQLITE_MAX_ROW_ID
+        ):
+            row_id = ok_call
+        else:
+            raise RuntimeError("global API budget gate returned invalid result")
+        # Mirror to fallback so a sudden DB outage still has recent data to
+        # estimate from.
+        _record_fallback_admission()
+        return _result(True, row_id)
     except Exception:
         _mark_db_failed()
         # On unexpected exception, prefer fail-open with a per-proc

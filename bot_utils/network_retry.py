@@ -10,6 +10,7 @@ progress") aren't mistaken for permanent ones.
 """
 from __future__ import annotations
 
+import math
 import re
 import threading
 import time
@@ -76,13 +77,21 @@ _PERMANENT_PATTERNS = re.compile(
 )
 
 
+def _exception_text(exc: BaseException, limit: int = 4096) -> str:
+    try:
+        text = str(exc)
+    except Exception:
+        return f"<{type(exc).__name__} text unavailable>"
+    return text[:limit]
+
+
 def is_permanent_error(exc: BaseException) -> bool:
     """Return True if the exception text matches a permanent failure pattern.
 
     Permanent failures (precision, insufficient balance, symbol not listed)
     will not be fixed by retrying  caller should abort immediately.
     """
-    return bool(_PERMANENT_PATTERNS.search(str(exc)))
+    return bool(_PERMANENT_PATTERNS.search(_exception_text(exc)))
 
 
 # Rate-limit detection for a dedicated longer backoff. A genuine 429 / DDoS
@@ -126,7 +135,7 @@ def is_rate_limited(exc: BaseException) -> bool:
     """
     if _RATE_LIMIT_EXC and isinstance(exc, _RATE_LIMIT_EXC):
         return True
-    s = str(exc).lower()
+    s = _exception_text(exc).lower()
     return (bool(_HTTP_RATE_LIMIT_CODE_RE.search(s)) or "too many requests" in s
             or "rate limit" in s or "ratelimit" in s
             or "too frequent" in s
@@ -140,9 +149,10 @@ def is_server_error(exc: BaseException) -> bool:
     0.512s backoff would burn all 3 attempts in 3.5s and hammer a struggling
     endpoint, so these get the same longer, capped backoff as a 429.
     """
-    s = str(exc).lower()
+    s = _exception_text(exc).lower()
     return (bool(_HTTP_SERVER_ERROR_CODE_RE.search(s)) or "bad gateway" in s
-            or "service unavailable" in s or "gateway time" in s)
+            or "service unavailable" in s or "gateway timeout" in s
+            or "gateway timed out" in s)
 
 
 def is_transient_network(exc: BaseException) -> bool:
@@ -152,11 +162,11 @@ def is_transient_network(exc: BaseException) -> bool:
     networks). Callers should log these compactly (one line) rather than
     dumping a full traceback for every hiccup, and simply retry next cycle.
     """
-    s = str(exc).lower()
+    s = _exception_text(exc).lower()
     needles = (
         "getaddrinfo failed", "failed to resolve", "name resolution",
         "nameresolutionerror", "temporary failure in name resolution",
-        "ssl", "tls/ssl connection has been closed", "eof occurred",
+        "ssl eof", "tls/ssl connection has been closed", "eof occurred",
         "read timed out", "read timeout", "connection timed out",
         "connect timeout", "max retries exceeded", "connection reset",
         "connection aborted", "connection refused", "remote end closed",
@@ -179,6 +189,23 @@ def with_network_retry(operation: Callable[[], Any],
 
     Backoff schedule: 0.5s  1.0s  2.0s (configurable via ``base_delay``).
     """
+    if (
+        isinstance(max_attempts, bool)
+        or not isinstance(max_attempts, int)
+        or max_attempts < 1
+    ):
+        raise ValueError("max_attempts must be a positive integer")
+    if isinstance(base_delay, bool):
+        raise ValueError("base_delay must be a finite non-negative number")
+    try:
+        base_delay = float(base_delay)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            "base_delay must be a finite non-negative number"
+        ) from None
+    if not math.isfinite(base_delay) or base_delay < 0.0:
+        raise ValueError("base_delay must be a finite non-negative number")
+
     last_err: Optional[BaseException] = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -194,7 +221,7 @@ def with_network_retry(operation: Callable[[], Any],
                     try:
                         log_event(
                             f"{action_label}  retry forbidden until outcome "
-                            f"reconciliation: {e}",
+                            f"reconciliation: {_exception_text(e, 120)}",
                             "WARN",
                         )
                     except Exception:
@@ -204,7 +231,8 @@ def with_network_retry(operation: Callable[[], Any],
                 if log_event:
                     try:
                         log_event(
-                            f"{action_label}  permanent error, no retry: {e}",
+                            f"{action_label}  permanent error, no retry: "
+                            f"{_exception_text(e, 120)}",
                             "WARN"
                         )
                     except Exception:
@@ -215,7 +243,7 @@ def with_network_retry(operation: Callable[[], Any],
                     try:
                         log_event(
                             f"{action_label}  failed after {attempt}/{max_attempts} "
-                            f"attempts: {e}",
+                            f"attempts: {_exception_text(e, 120)}",
                             "WARN"
                         )
                     except Exception:
@@ -236,7 +264,7 @@ def with_network_retry(operation: Callable[[], Any],
                     log_event(
                         f"{action_label}  attempt {attempt}/{max_attempts} "
                         f"failed ({type(e).__name__}), retry in {wait_s:.1f}s: "
-                        f"{str(e)[:120]}",
+                        f"{_exception_text(e, 120)}",
                         "INFO"
                     )
                 except Exception:

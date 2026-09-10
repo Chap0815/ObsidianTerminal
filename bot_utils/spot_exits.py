@@ -4,6 +4,7 @@ bot_utils/spot_exits.py  Spot market-sell + emergency-close helpers.
 from __future__ import annotations
 
 
+import inspect
 import math
 from decimal import Decimal, ROUND_DOWN
 from typing import Tuple, Callable, Optional
@@ -22,6 +23,7 @@ from bot_utils.order_utils import (
     order_id_text_or_none,
     strict_order_snapshot_equal,
 )
+from bot_utils.state_persist import is_canonical_position_symbol
 
 _EMERGENCY_RESIDUAL_DUST_USDT = 1.0
 _SPOT_KNOWN_ORDER_STATUSES = frozenset({
@@ -62,6 +64,10 @@ def _finite_float(value, default: float = 0.0) -> float:
 def _positive_finite(value, default: float = 0.0) -> float:
     parsed = _finite_float(value, default)
     return parsed if parsed > 0 else default
+
+
+def _valid_emergency_base_symbol(sym) -> bool:
+    return type(sym) is str and is_canonical_position_symbol(sym)
 
 
 def has_pending_spot_partial_exit(row: dict) -> bool:
@@ -1594,7 +1600,54 @@ def emergency_close_all_spot(*,
     Returns {"closed_count", "failed_count", "failed"} so shutdown handlers
     latch only after a complete flatten and can retry failed legs.
     """
-    snapshot = state.get_all()
+    original_log_event = log_event
+
+    def safe_log_event(*args, **kwargs) -> None:
+        try:
+            original_log_event(*args, **kwargs)
+        except Exception:
+            pass
+
+    log_event = safe_log_event
+    if not isinstance(simulation, bool):
+        log_event("Emergency close: runtime mode invalid", "ERROR")
+        return {
+            "closed_count": 0,
+            "failed_count": 1,
+            "failed": ["runtime mode invalid"],
+        }
+    snapshot_failure = {
+        "closed_count": 0,
+        "failed_count": 1,
+        "failed": ["state snapshot unavailable"],
+    }
+    try:
+        snapshot = state.get_all()
+    except Exception as snapshot_error:
+        try:
+            log_event(
+                "Emergency close: state snapshot unavailable "
+                f"({type(snapshot_error).__name__})",
+                "ERROR",
+            )
+        except Exception:
+            pass
+        return snapshot_failure
+    if not isinstance(snapshot, dict):
+        try:
+            log_event("Emergency close: state snapshot malformed", "ERROR")
+        except Exception:
+            pass
+        return snapshot_failure
+    try:
+        snapshot = dict(snapshot)
+    except Exception as snapshot_error:
+        log_event(
+            "Emergency close: state snapshot materialization unavailable "
+            f"({type(snapshot_error).__name__})",
+            "ERROR",
+        )
+        return snapshot_failure
     if not snapshot:
         log_event("Emergency close: no open positions", "INFO")
         return {"closed_count": 0, "failed_count": 0, "failed": []}
@@ -1607,19 +1660,47 @@ def emergency_close_all_spot(*,
     closed_count = 0
     failed: list = []
     total_pnl = 0.0
+    close_lock_supports_fail_open = True
+    if close_lock_factory:
+        try:
+            lock_parameters = inspect.signature(close_lock_factory).parameters
+        except Exception:
+            pass
+        else:
+            close_lock_supports_fail_open = (
+                "fail_open" in lock_parameters
+                or any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in lock_parameters.values()
+                )
+            )
 
     for sym, d in snapshot.items():
+        if not _valid_emergency_base_symbol(sym):
+            failed.append("invalid state symbol")
+            log_event("Emergency: invalid state symbol", "ERROR")
+            continue
         from contextlib import ExitStack
         with ExitStack() as stack:
             if close_lock_factory:
                 try:
-                    lock_ctx = close_lock_factory(
-                        sym, timeout=2.0, bot_name=bot_name, fail_open=True)
-                except TypeError:
-                    lock_ctx = close_lock_factory(
-                        sym, timeout=2.0, bot_name=bot_name)
-                got = stack.enter_context(lock_ctx)
-                if not got:
+                    lock_kwargs = {
+                        "timeout": 2.0,
+                        "bot_name": bot_name,
+                    }
+                    if close_lock_supports_fail_open:
+                        lock_kwargs["fail_open"] = True
+                    lock_ctx = close_lock_factory(sym, **lock_kwargs)
+                    got = stack.enter_context(lock_ctx)
+                except Exception as lock_error:
+                    failed.append(f"{sym}: close lock unavailable")
+                    log_event(
+                        f"Emergency: close lock unavailable for {sym} "
+                        f"({type(lock_error).__name__})",
+                        "ERROR",
+                    )
+                    continue
+                if got is not True:
                     failed.append(f"{sym}: close lock not acquired")
                     log_event(
                         f"Emergency: could not acquire lock for {sym} in 2s "
@@ -1633,6 +1714,14 @@ def emergency_close_all_spot(*,
                 # emergency sell based on stale state.
                 d_live = state.get(sym)
                 if not isinstance(d_live, dict):
+                    failed.append(f"{sym}: managed state unavailable")
+                    try:
+                        log_event(
+                            f"Emergency: managed state unavailable for {sym}",
+                            "ERROR",
+                        )
+                    except Exception:
+                        pass
                     continue
                 d = d_live
 
@@ -1704,7 +1793,7 @@ def emergency_close_all_spot(*,
                     failed.append(f"{sym}: invalid state amount")
                     log_event(
                         f"Emergency: invalid amount for {sym} "
-                        f"({d.get('amount')!r})  keeping state",
+                        f"(type={type(d.get('amount')).__name__})  keeping state",
                         "WARN",
                     )
                     continue
@@ -1712,7 +1801,9 @@ def emergency_close_all_spot(*,
                     failed.append(f"{sym}: invalid state cost basis")
                     log_event(
                         f"Emergency: invalid cost basis for {sym} "
-                        f"(buy={d.get('buy')!r}, invested={d.get('invested_usdt')!r}) "
+                        f"(buy_type={type(d.get('buy')).__name__}, "
+                        f"invested_type="
+                        f"{type(d.get('invested_usdt')).__name__}) "
                         f" keeping state",
                         "WARN",
                     )
@@ -1728,7 +1819,7 @@ def emergency_close_all_spot(*,
                 except Exception as gate_error:
                     log_event(
                         f"  Price for {sym} unavailable: API budget gate "
-                        f"failed ({gate_error})", "WARN"
+                        f"failed ({type(gate_error).__name__})", "WARN"
                     )
                     price_reservation = None
                 if price_reservation:
@@ -1756,7 +1847,11 @@ def emergency_close_all_spot(*,
                                 )
                             except Exception:
                                 pass
-                        log_event(f"  Price for {sym} unavailable: {e}", "WARN")
+                        log_event(
+                            f"  Price for {sym} unavailable "
+                            f"({type(e).__name__})",
+                            "WARN",
+                        )
                 if curr <= 0:
                     curr = buy_price  # fallback
 
@@ -1824,7 +1919,8 @@ def emergency_close_all_spot(*,
                                 log_event(
                                     f"  [LIVE] {sym}: emergency sell outcome "
                                     f"still unknown (clientOrderId="
-                                    f"{client_order_id}): {recovery_error}",
+                                    f"{client_order_id}); recovery failed "
+                                    f"({type(recovery_error).__name__})",
                                     "WARN",
                                 )
                                 continue
@@ -1848,11 +1944,23 @@ def emergency_close_all_spot(*,
                                 client_order_id=client_order_id,
                             )
                         if order is None:
-                            from bot_utils.trade_state import registry_order_guard
+                            from bot_utils.trade_state import (
+                                registry_order_guard,
+                                same_position_generation,
+                            )
                             with registry_order_guard(
                                 state, sym, d
                             ) as ownership_live:
                                 if not isinstance(ownership_live, dict):
+                                    failed.append(
+                                        f"{sym}: managed state unavailable"
+                                    )
+                                    log_event(
+                                        f"  [LIVE] {sym}: emergency sell "
+                                        "blocked because managed state is "
+                                        "unavailable",
+                                        "ERROR",
+                                    )
                                     continue
                                 if ownership_live.get("claim_conflict"):
                                     failed.append(
@@ -1862,6 +1970,80 @@ def emergency_close_all_spot(*,
                                         f"  [LIVE] {sym}: emergency sell blocked "
                                         f"by registry claim conflict",
                                         "ERROR",
+                                    )
+                                    continue
+                                if (
+                                    ownership_live.get(
+                                        "accounting_already_booked"
+                                    ) is True
+                                    or ownership_live.get(
+                                        "accounting_pending"
+                                    ) is True
+                                    or has_pending_spot_partial_exit(
+                                        ownership_live
+                                    )
+                                    or normalize_pending_accounting_items(
+                                        ownership_live.get(
+                                            "accounting_pending_partials"
+                                        )
+                                    )
+                                ):
+                                    failed.append(
+                                        f"{sym}: close recovery pending"
+                                    )
+                                    log_event(
+                                        f"  [LIVE] {sym}: emergency sell "
+                                        "blocked by fresh recovery state",
+                                        "WARN",
+                                    )
+                                    continue
+                                if not same_position_generation(
+                                    ownership_live,
+                                    d,
+                                ):
+                                    failed.append(
+                                        f"{sym}: managed state changed"
+                                    )
+                                    log_event(
+                                        f"  [LIVE] {sym}: emergency sell "
+                                        "blocked because the managed position "
+                                        "generation changed",
+                                        "WARN",
+                                    )
+                                    continue
+                                live_amount = _positive_finite(
+                                    ownership_live.get("amount")
+                                )
+                                if not math.isclose(
+                                    live_amount,
+                                    amount,
+                                    rel_tol=1e-12,
+                                    abs_tol=1e-12,
+                                ):
+                                    failed.append(
+                                        f"{sym}: managed state changed"
+                                    )
+                                    log_event(
+                                        f"  [LIVE] {sym}: emergency sell "
+                                        "blocked because the managed amount "
+                                        "changed",
+                                        "WARN",
+                                    )
+                                    continue
+                                live_client_order_id = order_id_text_or_none(
+                                    ownership_live.get(
+                                        "emergency_exit_client_order_id"
+                                    )
+                                )
+                                if live_client_order_id != client_order_id:
+                                    failed.append(
+                                        f"{sym}: exit intent changed"
+                                    )
+                                    log_event(
+                                        f"  [LIVE] {sym}: emergency sell "
+                                        "blocked because its durable exit "
+                                        "intent changed",
+                                        "WARN",
                                     )
                                     continue
                                 order, _sold = with_network_retry(
@@ -2048,8 +2230,14 @@ def emergency_close_all_spot(*,
                         )
                         continue
                     except Exception as e:
-                        failed.append(f"{sym}: {e}")
-                        log_event(f"  [LIVE] Sell {sym} FAILED: {e}", "WARN")
+                        error_type = type(e).__name__
+                        failed.append(
+                            f"{sym}: live sell failed ({error_type})"
+                        )
+                        log_event(
+                            f"  [LIVE] Sell {sym} FAILED ({error_type})",
+                            "WARN",
+                        )
                         continue
 
                 buy_time = d.get("buy_time", _utc_now_str())
@@ -2163,8 +2351,10 @@ def emergency_close_all_spot(*,
                         raise RuntimeError("save_trade_db returned False")
                 except Exception as e:
                     log_event(
-                        f"  DB accounting for {sym} failed after close: {e}. "
-                        f"Durable retry state retained.", "WARN")
+                        f"  DB accounting for {sym} failed after close "
+                        f"({type(e).__name__}). Durable retry state retained.",
+                        "WARN",
+                    )
                     failed.append(f"{sym}: accounting failed after close")
                     continue
 
@@ -2207,7 +2397,10 @@ def emergency_close_all_spot(*,
                     )
                     if error_logger:
                         try:
-                            error_logger(f"emergency file log {sym}", e)
+                            error_logger(
+                                f"emergency file log {sym}",
+                                RuntimeError(type(e).__name__),
+                            )
                         except Exception:
                             pass
                 try:
@@ -2226,7 +2419,10 @@ def emergency_close_all_spot(*,
                     )
                     if error_logger:
                         try:
-                            error_logger(f"emergency sell log {sym}", e)
+                            error_logger(
+                                f"emergency sell log {sym}",
+                                RuntimeError(type(e).__name__),
+                            )
                         except Exception:
                             pass
 
@@ -2262,10 +2458,19 @@ def emergency_close_all_spot(*,
                 total_pnl += profit_usdt
 
             except Exception as e:
-                failed.append(f"{sym}: {e}")
-                log_event(f"Emergency close {sym} error: {e}", "WARN")
+                error_type = type(e).__name__
+                failed.append(f"{sym}: emergency close failed ({error_type})")
+                log_event(
+                    f"Emergency close {sym} error ({error_type})", "WARN"
+                )
                 if error_logger:
-                    error_logger(f"emergency_close {sym}", e)
+                    try:
+                        error_logger(
+                            f"emergency_close {sym}",
+                            RuntimeError(error_type),
+                        )
+                    except Exception:
+                        pass
 
     log_event(
         f"Emergency close result: {closed_count} closed "
@@ -2284,7 +2489,7 @@ def emergency_close_all_spot(*,
                 f"Close MANUALLY on the exchange!"
             )
         except Exception as e:
-            log_event(f"Telegram failed: {e}", "WARN")
+            log_event(f"Telegram failed ({type(e).__name__})", "WARN")
 
     return {
         "closed_count": closed_count,

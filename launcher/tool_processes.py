@@ -253,7 +253,7 @@ def _owned_tree_alive(proc: Any) -> bool:
     if job is None:
         return _alive(proc)
     try:
-        return bool(job.has_live_processes())
+        return job.has_live_processes() is not False
     except Exception as exc:
         _log_tool_stop_failure("registered tool job liveness", exc)
         return True
@@ -263,15 +263,19 @@ def _release_quiescent_tool_job(proc: Any) -> bool:
     """Close and detach a Windows job only after exact tree quiescence."""
     job = _tool_process_job(proc)
     if job is None:
-        if not _alive(proc):
-            try:
-                proc.wait(timeout=0)
-            except Exception:
-                pass
-            _close_process_streams(proc)
+        # A root can exit between the registry's liveness probe and release.
+        # Confirm a live observation once before retaining it; otherwise reap
+        # and close it in this call rather than dropping an unclean handle.
+        if _alive(proc) and _alive(proc):
+            return False
+        try:
+            proc.wait(timeout=0)
+        except Exception:
+            pass
+        _close_process_streams(proc)
         return not _alive(proc)
     try:
-        if job.has_live_processes():
+        if job.has_live_processes() is not False:
             return False
         job.close()
         delattr(proc, _TOOL_JOB_ATTRIBUTE)
@@ -297,7 +301,7 @@ def _stop_job_owned_tree(
     if job is None:
         return False
     try:
-        if not job.has_live_processes():
+        if job.has_live_processes() is False:
             return _release_quiescent_tool_job(proc)
         job.terminate()
     except Exception as exc:
@@ -310,7 +314,7 @@ def _stop_job_owned_tree(
     )
     while True:
         try:
-            live = bool(job.has_live_processes())
+            live = job.has_live_processes() is not False
         except Exception as exc:
             _log_tool_stop_failure("registered tool job drain", exc)
             return False
@@ -343,7 +347,9 @@ def _spawned_descendants(proc: Any) -> tuple[list[Any], bool]:
             return children, False
         return children, True
     except psutil.NoSuchProcess:
-        return [], True
+        # The root was observed alive before discovery.  If it disappears
+        # here, already-spawned descendants can no longer be attributed.
+        return [], False
     except (psutil.AccessDenied, OSError):
         # A parent-only stop is not proof that launcher-owned workers died.
         return [], False
@@ -474,7 +480,7 @@ def start_registered_tool_process(
             if job is not None:
                 job.assign(spawned)
                 setattr(spawned, _TOOL_JOB_ATTRIBUTE, job)
-        if not registry.register(spawned):
+        if registry.register(spawned) is not True:
             raise RuntimeError("launcher shutdown is already in progress")
         if start_gate is not None:
             start_gate.signal()
@@ -491,7 +497,7 @@ def start_registered_tool_process(
         if spawned is not None:
             stopped = False
             try:
-                stopped = bool(registry.stop(spawned))
+                stopped = registry.stop(spawned) is True
             except BaseException as exc:
                 cleanup_errors.append(exc)
             fallback_stopped = False
@@ -547,7 +553,10 @@ class ToolProcessRegistry:
 
     def _prune_uncertain_locked(self) -> None:
         for key, proc in list(self._uncertain_processes.items()):
-            if not _owned_tree_alive(proc):
+            if (
+                not _owned_tree_alive(proc)
+                and _release_quiescent_tool_job(proc)
+            ):
                 self._uncertain_processes.pop(key, None)
 
     def _record_diagnostics_locked(self, diagnostics: _StopDiagnostics) -> None:
@@ -580,6 +589,9 @@ class ToolProcessRegistry:
         if proc is None:
             return
         with self._lock:
+            if _owned_tree_alive(proc):
+                self._processes[id(proc)] = proc
+                return
             if (
                 _tool_process_job(proc) is not None
                 and not _release_quiescent_tool_job(proc)

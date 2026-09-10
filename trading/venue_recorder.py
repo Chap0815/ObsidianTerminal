@@ -37,6 +37,8 @@ _CAPTURE_CONTROL_JSON_MAX_BYTES = 64 * 1024
 _CAPTURE_CONTROL_TEMP_ATTEMPTS = 3
 _CAPACITY_OPERATIONAL_RESERVE_RATIO = 1.05
 _CAPTURE_PARTITION_STREAMS = ("overview", "depth", "trades", "l2_stream")
+_CAPTURE_STORAGE_MAX_PARENTS = 256
+_CAPTURE_STORAGE_MAX_ARTIFACTS = 10_000
 
 
 def _unique_capture_control_object(pairs) -> dict:
@@ -350,40 +352,53 @@ class SQLitePartitionWriter:
             yield
 
     def _storage_artifacts(self):
-        """Yield one-level storage files without traversing linked parents."""
+        """Yield a bounded one-level scan without traversing linked parents."""
+        parent_count = 0
+        artifact_count = 0
         try:
-            parents = tuple(self.root.iterdir())
+            parents = self.root.iterdir()
+            for parent in parents:
+                parent_count += 1
+                if parent_count > _CAPTURE_STORAGE_MAX_PARENTS:
+                    raise RuntimeError(
+                        "venue capture storage parent limit exceeded"
+                    )
+                try:
+                    parent_stat = parent.lstat()
+                except OSError as exc:
+                    raise RuntimeError(
+                        "venue capture storage parent unavailable"
+                    ) from exc
+                if self._stat_is_linklike(parent_stat):
+                    raise RuntimeError(
+                        "venue capture storage parent is linked"
+                    )
+                if not stat.S_ISDIR(parent_stat.st_mode):
+                    continue
+                self._assert_scoped_path(parent)
+                try:
+                    for item in parent.iterdir():
+                        artifact_count += 1
+                        if artifact_count > _CAPTURE_STORAGE_MAX_ARTIFACTS:
+                            raise RuntimeError(
+                                "venue capture storage artifact limit exceeded"
+                            )
+                        # ``iterdir`` produced this direct child of an already
+                        # scoped, non-link parent. Its authoritative lstat
+                        # belongs to the caller.
+                        yield item
+                except OSError as exc:
+                    raise RuntimeError(
+                        "venue capture storage directory unavailable"
+                    ) from exc
         except FileNotFoundError:
             return
+        except RuntimeError:
+            raise
         except OSError as exc:
             raise RuntimeError(
                 "venue capture storage tree unavailable"
             ) from exc
-        for parent in parents:
-            try:
-                parent_stat = parent.lstat()
-            except OSError as exc:
-                raise RuntimeError(
-                    "venue capture storage parent unavailable"
-                ) from exc
-            if self._stat_is_linklike(parent_stat):
-                raise RuntimeError(
-                    "venue capture storage parent is linked"
-                )
-            if not stat.S_ISDIR(parent_stat.st_mode):
-                continue
-            self._assert_scoped_path(parent)
-            try:
-                children = tuple(parent.iterdir())
-            except OSError as exc:
-                raise RuntimeError(
-                    "venue capture storage directory unavailable"
-                ) from exc
-            for item in children:
-                # ``iterdir`` produced this direct child of an already scoped,
-                # non-link parent.  Its one authoritative lstat belongs to the
-                # caller so size and link identity come from the same sample.
-                yield item
 
     def _retention_guard_days(self, *, current: datetime) -> set:
         """Snapshot old UTC days retention is allowed to mutate this pass."""
@@ -1235,29 +1250,27 @@ class SQLitePartitionWriter:
         total = 0
         measurement_errors = 0
         try:
-            artifacts = tuple(self._storage_artifacts())
+            for item in self._storage_artifacts():
+                try:
+                    item_stat = item.lstat()
+                except OSError:
+                    measurement_errors += 1
+                    continue
+                if self._stat_is_linklike(item_stat):
+                    measurement_errors += 1
+                    continue
+                if not stat.S_ISREG(item_stat.st_mode):
+                    continue
+                size = item_stat.st_size
+                total += size
+                name = item.name.split(".sqlite3", 1)[0]
+                try:
+                    datetime.strptime(name, "%Y-%m-%d")
+                except ValueError:
+                    continue
+                daily_bytes[name] = daily_bytes.get(name, 0) + size
         except RuntimeError:
-            artifacts = ()
             measurement_errors += 1
-        for item in artifacts:
-            try:
-                item_stat = item.lstat()
-            except OSError:
-                measurement_errors += 1
-                continue
-            if self._stat_is_linklike(item_stat):
-                measurement_errors += 1
-                continue
-            if not stat.S_ISREG(item_stat.st_mode):
-                continue
-            size = item_stat.st_size
-            total += size
-            name = item.name.split(".sqlite3", 1)[0]
-            try:
-                datetime.strptime(name, "%Y-%m-%d")
-            except ValueError:
-                continue
-            daily_bytes[name] = daily_bytes.get(name, 0) + size
         closed = [
             size
             for day, size in daily_bytes.items()

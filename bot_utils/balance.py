@@ -8,6 +8,7 @@ retries instead of treating the wallet as empty.
 from __future__ import annotations
 
 import math
+from itertools import islice
 from typing import Optional, Callable
 
 from bot_utils.api_budget import (
@@ -41,10 +42,14 @@ _INFO_KEYS = (
 )
 
 _USDT_IDENTITIES = {"USDT"}
+_MAX_BALANCE_TEXT_CHARS = 128
+_MAX_CURRENCY_ID_CHARS = 32
 
 
 def _finite_nonnegative_float(value) -> Optional[float]:
     if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and len(value) > _MAX_BALANCE_TEXT_CHARS:
         return None
     try:
         parsed = float(value)
@@ -190,25 +195,34 @@ def safe_fetch_balance_usdt(ex,
             for key in ("coin", "currency", "asset", "marginCoin")
             if key in info and info[key] is not None
         ]
-        currencies = {
-            value.strip().upper()
-            for value in raw_currencies
-            if isinstance(value, str) and value.strip()
-        }
+        currencies = set()
+        currencies_valid = True
+        for value in raw_currencies:
+            if (
+                not isinstance(value, str)
+                or len(value) > _MAX_CURRENCY_ID_CHARS
+                or any(ord(char) < 32 or ord(char) == 127 for char in value)
+            ):
+                currencies_valid = False
+                continue
+            normalized = value.strip().upper()
+            if not normalized:
+                currencies_valid = False
+                continue
+            currencies.add(normalized)
         if (
-            len(currencies) != 1
+            not currencies_valid
+            or len(currencies) != 1
             or currencies != _USDT_IDENTITIES
-            or any(
-                not isinstance(value, str) or not value.strip()
-                for value in raw_currencies
-            )
         ):
+            _record_response_error()
             # This reader funds USDT orders.  A different stablecoin is still
             # portfolio value, but it is not spendable USDT.
             _log("fetch_balance",
-                  Exception(f"info dict currencies={raw_currencies!r} do not "
-                            f"prove one USDT identity  refusing raw fallback "
-                            f"(returning None for retry)"))
+                  Exception(
+                      "info currency fields do not prove one USDT identity; "
+                      f"field_count={len(raw_currencies)}; refusing raw fallback"
+                  ))
             return None
         raw_values = []
         for k in _INFO_KEYS:
@@ -218,7 +232,10 @@ def safe_fetch_balance_usdt(ex,
                 if fv is None:
                     _log(
                         "fetch_balance",
-                        Exception(f"invalid raw USDT balance field {k}={v!r}"),
+                        Exception(
+                            f"invalid raw USDT balance field {k} "
+                            f"(type={type(v).__name__})"
+                        ),
                     )
                     _record_response_error()
                     return None
@@ -242,7 +259,13 @@ def safe_fetch_balance_usdt(ex,
 
     # return None (not 0.0) for unknown layouts  caller retries.
     _record_response_error()
+    key_preview = [
+        key[:32] if isinstance(key, str) else f"<{type(key).__name__}>"
+        for key in islice(bal.keys(), 20)
+    ]
     _log("fetch_balance",
-          Exception(f"no recognized USDT field in payload keys: "
-                     f"{list(bal.keys()) if isinstance(bal, dict) else type(bal).__name__}"))
+          Exception(
+              "no recognized USDT field in payload: "
+              f"key_count={len(bal)}, key_preview={key_preview!r}"
+          ))
     return None

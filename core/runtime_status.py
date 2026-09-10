@@ -24,6 +24,7 @@ _STATUS_JSON_MAX_BYTES = 2 * 1024 * 1024
 _STATUS_MAX_STRING_CHARS = 4096
 _STATUS_MAX_CONTAINER_ITEMS = 256
 _STATUS_MAX_KEY_CHARS = 256
+_STATUS_NORMALIZATION_MAX_NODES = 4096
 _STATUS_LOCK_TIMEOUT_SEC = 1.0
 _STATUS_LOCK_CHECK_SEC = 0.01
 _STATUS_TEMP_CLEANUP_MAX_FILES = 512
@@ -35,6 +36,9 @@ _CLOCK_OFFSET_MAX_AGE_SECONDS = 6.0 * 60.0 * 60.0
 _BUILD_ID_CHARS = 16
 _BUILD_CREATED_AT_MAX_CHARS = 128
 _BUILD_SOURCE_MAX_CHARS = 64
+_MANIFEST_SHA256_CHARS = 64
+_SYNC_MANIFEST_MAX_ROWS = 4096
+_SYNC_BUILD_HASH_DOMAIN = b"TradingBot SYNC_MANIFEST build v2\0"
 
 
 def _log_status_write_failure(context: str, exc: Exception) -> None:
@@ -180,7 +184,7 @@ def _read_json(path: Path) -> dict:
 def _validated_build_id(value: Any) -> str | None:
     if not isinstance(value, str) or len(value) != _BUILD_ID_CHARS:
         return None
-    if any(char not in "0123456789abcdefABCDEF" for char in value):
+    if any(char not in "0123456789abcdef" for char in value):
         return None
     return value
 
@@ -195,6 +199,59 @@ def _bounded_build_source(value: Any) -> str:
     if not isinstance(value, str) or len(value) > _BUILD_SOURCE_MAX_CHARS:
         return "fallback"
     return value
+
+
+def _validated_sync_manifest_rows(value: Any) -> list[Mapping[str, Any]] | None:
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > _SYNC_MANIFEST_MAX_ROWS
+    ):
+        return None
+    rows: list[Mapping[str, Any]] = []
+    seen_paths: set[str] = set()
+    for row in value:
+        if not isinstance(row, Mapping):
+            return None
+        path = row.get("path")
+        sha256 = row.get("sha256")
+        if (
+            not isinstance(path, str)
+            or path != path.strip()
+            or not path
+            or len(path) > _STATUS_MAX_STRING_CHARS
+            or not isinstance(sha256, str)
+            or len(sha256) != _MANIFEST_SHA256_CHARS
+            or any(char not in "0123456789abcdefABCDEF" for char in sha256)
+        ):
+            return None
+        canonical_path = path.replace("\\", "/")
+        parts = canonical_path.split("/")
+        if (
+            canonical_path.startswith("/")
+            or any(not part or part in {".", ".."} for part in parts)
+            or ":" in parts[0]
+        ):
+            return None
+        identity = canonical_path.casefold()
+        if identity in seen_paths:
+            return None
+        seen_paths.add(identity)
+        rows.append({"path": canonical_path, "sha256": sha256.lower()})
+    return rows
+
+
+def _sync_manifest_build_id(files: list[Mapping[str, Any]]) -> str:
+    """Hash canonical rows with explicit framing between variable fields."""
+    h = hashlib.sha256()
+    h.update(_SYNC_BUILD_HASH_DOMAIN)
+    h.update(len(files).to_bytes(4, "big"))
+    for row in sorted(files, key=lambda item: item["path"]):
+        path_bytes = row["path"].encode("utf-8")
+        h.update(len(path_bytes).to_bytes(4, "big"))
+        h.update(path_bytes)
+        h.update(bytes.fromhex(row["sha256"]))
+    return h.hexdigest()[:16]
 
 
 def get_build_info() -> dict:
@@ -215,21 +272,10 @@ def get_build_info() -> dict:
         }
 
     sync = _read_json(PROJECT_ROOT / "SYNC_MANIFEST.json")
-    files = sync.get("files") if isinstance(sync.get("files"), list) else sync
-    if isinstance(files, list):
-        if not files or any(
-            not isinstance(row, Mapping)
-            or not str(row.get("path") or "").strip()
-            or not str(row.get("sha256") or "").strip()
-            for row in files
-        ):
-            return {"build_id": "unknown", "created_at": "", "source": "fallback"}
-        h = hashlib.sha256()
-        for row in sorted(files, key=lambda r: str(r.get("path", ""))):
-            h.update(str(row.get("path", "")).encode("utf-8"))
-            h.update(str(row.get("sha256", "")).encode("ascii", errors="ignore"))
+    files = _validated_sync_manifest_rows(sync.get("files"))
+    if files is not None:
         return {
-            "build_id": h.hexdigest()[:16],
+            "build_id": _sync_manifest_build_id(files),
             "created_at": _bounded_build_created_at(sync.get("created_at") or ""),
             "source": "SYNC_MANIFEST.json",
         }
@@ -237,8 +283,23 @@ def get_build_info() -> dict:
     return {"build_id": "unknown", "created_at": "", "source": "fallback"}
 
 
+def _contained_runtime_status_directory(
+    log_dir: str | os.PathLike[str],
+) -> Path:
+    root = Path(PROJECT_ROOT).resolve(strict=False)
+    candidate = Path(log_dir)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("runtime status directory escapes project root") from exc
+    return resolved
+
+
 def runtime_status_path(log_dir: str | os.PathLike[str]) -> Path:
-    return PROJECT_ROOT / str(log_dir) / "runtime_status.json"
+    return _contained_runtime_status_directory(log_dir) / "runtime_status.json"
 
 
 def runtime_status_fallback_path(log_dir: str | os.PathLike[str]) -> Path:
@@ -249,20 +310,46 @@ def cleanup_runtime_status_temps(logs_root: str | os.PathLike[str] | None = None
                                  *,
                                  min_age_sec: float = 3600.0) -> int:
     """Remove stale runtime_status temp files left by crashes/file locks."""
-    root = Path(logs_root) if logs_root is not None else PROJECT_ROOT / "logs"
-    cutoff = time.time() - max(0.0, float(min_age_sec))
+    root = (
+        Path(logs_root)
+        if logs_root is not None
+        else _contained_runtime_status_directory("logs")
+    )
     removed = 0
+    if isinstance(min_age_sec, bool):
+        return removed
+    try:
+        minimum_age = float(min_age_sec)
+        now = float(time.time())
+    except (TypeError, ValueError, OverflowError):
+        return removed
+    if not math.isfinite(minimum_age) or not math.isfinite(now):
+        return removed
+    cutoff = now - max(0.0, minimum_age)
     logged_errors = 0
     try:
+        try:
+            root_boundary = root.resolve(strict=False)
+        except AttributeError:
+            # Lightweight bounded-iteration test doubles have no filesystem
+            # identity. Real cleanup roots are always concrete ``Path`` values.
+            root_boundary = None
         deadline = time.monotonic() + _STATUS_TEMP_CLEANUP_MAX_SCAN_SEC
         candidates = root.glob("*/runtime_status*.tmp")
         for path in candidates:
             if time.monotonic() >= deadline:
                 break
             try:
-                if path.stat().st_mtime > cutoff:
+                target = path
+                if root_boundary is not None:
+                    target = path.resolve(strict=True)
+                    try:
+                        target.relative_to(root_boundary)
+                    except ValueError:
+                        continue
+                if target.stat().st_mtime > cutoff:
                     continue
-                path.unlink()
+                target.unlink()
                 removed += 1
                 if removed >= _STATUS_TEMP_CLEANUP_MAX_FILES:
                     break
@@ -288,19 +375,24 @@ def _status_freshness(data: Mapping[str, Any]) -> float:
             return value
         if candidate is not None:
             rejected_wall_timestamp = True
-    try:
-        raw = str(data.get("updated_at") or "").strip()
-        if raw:
-            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(
-                tzinfo=timezone.utc)
-            candidate = _positive_finite_timestamp(dt.timestamp())
-            value = _plausible_wall_timestamp(candidate)
-            if value is not None:
-                return value
-            if candidate is not None:
+        elif key in data:
+            rejected_wall_timestamp = True
+    raw_updated_at = data.get("updated_at")
+    if "updated_at" in data:
+        if not isinstance(raw_updated_at, str) or not raw_updated_at.strip():
+            rejected_wall_timestamp = True
+        else:
+            raw = raw_updated_at.strip()
+            try:
+                dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=timezone.utc)
+                candidate = _positive_finite_timestamp(dt.timestamp())
+                value = _plausible_wall_timestamp(candidate)
+                if value is not None:
+                    return value
                 rejected_wall_timestamp = True
-    except (TypeError, ValueError, OverflowError, OSError):
-        pass
+            except (TypeError, ValueError, OverflowError, OSError):
+                rejected_wall_timestamp = True
     if rejected_wall_timestamp:
         return 0.0
     return _positive_finite_timestamp(data.get("monotonic_ts")) or 0.0
@@ -355,7 +447,7 @@ def _next_status_publish_sequence(path: Path, lock_handle: Any) -> int:
 
 
 def _positive_finite_timestamp(raw: Any) -> float | None:
-    if isinstance(raw, bool):
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return None
     try:
         value = float(raw)
@@ -373,16 +465,26 @@ def _plausible_wall_timestamp(raw: Any) -> float | None:
     try:
         upper_bound = time.time() + _STATUS_MAX_FUTURE_SKEW_SEC
     except Exception:
-        return value
+        return None
     if not math.isfinite(upper_bound) or value > upper_bound:
         return None
     return value
 
 
-def _strict_json_value(value: Any, *, depth: int = 0) -> Any:
+def _strict_json_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    _budget: list[int] | None = None,
+) -> Any:
     """Normalize runtime telemetry to interoperable JSON primitives."""
     if depth > 20:
         return None
+    if _budget is None:
+        _budget = [_STATUS_NORMALIZATION_MAX_NODES]
+    if _budget[0] <= 0:
+        return None
+    _budget[0] -= 1
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -401,14 +503,22 @@ def _strict_json_value(value: Any, *, depth: int = 0) -> Any:
             ):
                 if not isinstance(key, str) or len(key) > _STATUS_MAX_KEY_CHARS:
                     continue
-                bounded[key] = _strict_json_value(item, depth=depth + 1)
+                bounded[key] = _strict_json_value(
+                    item,
+                    depth=depth + 1,
+                    _budget=_budget,
+                )
             return bounded
         except Exception:
             return None
     if isinstance(value, (list, tuple)):
         try:
             return [
-                _strict_json_value(item, depth=depth + 1)
+                _strict_json_value(
+                    item,
+                    depth=depth + 1,
+                    _budget=_budget,
+                )
                 for item in value[:_STATUS_MAX_CONTAINER_ITEMS]
             ]
         except Exception:
@@ -451,11 +561,25 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
     try:
         if not isinstance(simulation, bool):
             raise ValueError("runtime simulation must be boolean")
+        if not isinstance(bot_name, str) or not bot_name.strip():
+            raise ValueError("runtime bot name must be non-empty text")
+        if not isinstance(status, str) or not status.strip():
+            raise ValueError("runtime status must be non-empty text")
+        bot_name = bot_name.strip()
+        status = status.strip()
+        if threads is not None and not isinstance(threads, Mapping):
+            raise ValueError("runtime threads must be a mapping")
+        if extra is not None and not isinstance(extra, Mapping):
+            raise ValueError("runtime extra must be a mapping")
+        if build_info is not None and not isinstance(build_info, Mapping):
+            raise ValueError("runtime build info must be a mapping")
+        if process_run_id is not None and not isinstance(process_run_id, str):
+            raise ValueError("runtime run id must be text")
         path = runtime_status_path(log_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         # Long-running bots pass the snapshot captured during startup so an
         # on-disk sync cannot make already-loaded code advertise a newer build.
-        build = dict(build_info) if isinstance(build_info, Mapping) else get_build_info()
+        build = dict(build_info) if build_info is not None else get_build_info()
         status_build_id = _validated_build_id(build.get("build_id")) or "unknown"
         status_build_created_at = _bounded_build_created_at(
             build.get("created_at") or ""
@@ -465,21 +589,25 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
         )
         if process_pid is None:
             status_pid = os.getpid()
-        elif isinstance(process_pid, bool):
+        elif (
+            isinstance(process_pid, bool)
+            or not isinstance(process_pid, int)
+            or process_pid < 0
+            or process_pid > 0xFFFFFFFF
+        ):
             status_pid = 0
         else:
-            try:
-                status_pid = max(0, int(process_pid))
-            except (TypeError, ValueError, OverflowError):
-                status_pid = 0
-        status_run_id = (
-            os.getenv("BOT_RUN_ID", "")
-            if process_run_id is None
-            else str(process_run_id or "")[:_STATUS_MAX_STRING_CHARS]
-        )
+            status_pid = process_pid
+        if process_run_id is None:
+            raw_run_id = os.getenv("BOT_RUN_ID", "")
+        else:
+            raw_run_id = process_run_id
+        status_run_id = raw_run_id[:_STATUS_MAX_STRING_CHARS]
+        status_bot_name = bot_name[:_STATUS_MAX_STRING_CHARS]
+        status_name = status[:_STATUS_MAX_STRING_CHARS]
         payload = {
-            "bot": bot_name,
-            "status": status,
+            "bot": status_bot_name,
+            "status": status_name,
             "simulation": simulation,
             "pid": status_pid,
             "run_id": status_run_id,
@@ -492,10 +620,12 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
             "build_id": status_build_id,
             "build_source": status_build_source,
             "build_created_at": status_build_created_at,
-            "threads": _strict_json_value(threads or {}),
+            "threads": _strict_json_value(
+                threads if threads is not None else {}
+            ),
             "clock_health": {},
         }
-        if extra:
+        if extra is not None:
             normalized_extra = _strict_json_value(extra)
             for key, value in (
                 normalized_extra.items()
@@ -525,6 +655,11 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
                 sort_keys=True,
                 allow_nan=False,
             ).encode("utf-8")
+            if len(encoded) > _STATUS_JSON_MAX_BYTES:
+                raise ValueError(
+                    "runtime status exceeds reader size limit "
+                    f"({_STATUS_JSON_MAX_BYTES} bytes)"
+                )
             published = False
             last_err = None
             for attempt in range(_STATUS_REPLACE_RETRIES):

@@ -53,10 +53,15 @@ ORDER_STATE_EXPIRED = "expired"
 # Fraction of the order amount that must be filled to count as FILLED.
 # Conservative default: 0.9999 (1bp tolerance).
 ORDER_FILL_THRESHOLD = 0.9999
+_MAX_NUMERIC_TEXT_CHARS = 128
+_MAX_ORDER_ATTEMPTS = 5
+_MAX_FEE_REFETCH_DELAY_SECONDS = 5.0
 
 
 def _finite_nonnegative_order_value(value) -> float:
     if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
         return 0.0
     try:
         parsed = float(value or 0)
@@ -67,6 +72,8 @@ def _finite_nonnegative_order_value(value) -> float:
 
 def _finite_order_telemetry_value(value, *, positive: bool = False):
     if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
         return None
     try:
         parsed = float(value)
@@ -168,13 +175,9 @@ def _normalize_order_status(status) -> str:
 
 
 def _normalize_max_attempts(max_attempts) -> int:
-    if isinstance(max_attempts, bool):
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int):
         return 0
-    try:
-        attempts = int(max_attempts)
-    except (TypeError, ValueError, OverflowError):
-        return 0
-    return attempts if attempts > 0 else 0
+    return max_attempts if 0 < max_attempts <= _MAX_ORDER_ATTEMPTS else 0
 
 
 def _normalize_order_params(params):
@@ -207,6 +210,8 @@ def classify_order_state(order) -> str:
     if status == "rejected":
         return ORDER_STATE_FAILED
     if status == "open":
+        if amount > 0 and filled >= amount * ORDER_FILL_THRESHOLD:
+            return ORDER_STATE_FILLED
         if filled > 0 and amount > 0 and filled < amount:
             return ORDER_STATE_PARTIALLY_FILLED
         return ORDER_STATE_ACKNOWLEDGED
@@ -292,7 +297,7 @@ _NO_POSITION_PATTERN_RE = re.compile(
     r"position\s+(?:does\s+not\s+exist|not\s+exist|not\s+found)"
     r"|position\s+is\s+nonexistent"
     r"|nonexistent\s+or\s+closed"
-    r"|no\s+(?:open\s+)?position"
+    r"|no\s+(?:open\s+)?position\b(?!\s+(?:mode|side|size)\b)"
     r"|zero\s+position",
     re.IGNORECASE,
 )
@@ -493,10 +498,13 @@ def _order_request_conflicts(
                 or observed_filled > requested + tolerance
             ):
                 return True
-    if (
-        _normalize_order_status(order.get("status")) == "rejected"
-        and _order_response_has_fill_evidence(order)
-    ):
+    status = _normalize_order_status(order.get("status"))
+    raw_filled = order.get("filled")
+    if status in ("closed", "filled") and raw_filled not in (None, ""):
+        terminal_filled = _finite_order_telemetry_value(raw_filled)
+        if terminal_filled is None or terminal_filled <= 0:
+            return True
+    if status == "rejected" and _order_response_has_fill_evidence(order):
         return True
     raw_symbol = order.get("symbol")
     if raw_symbol not in (None, ""):
@@ -587,7 +595,7 @@ def _order_request_conflicts(
                     continue
                 if not observed_leg or observed_leg != expected_leg:
                     return True
-            elif raw_leg_text != "both":
+            elif raw_leg_text not in {"both", "net"}:
                 return True
     return False
 
@@ -661,15 +669,9 @@ def _order_response_has_evidence(order: dict) -> bool:
         return False
     if _explicit_order_ids(order):
         return True
-    if _order_id_text(order.get("clientOrderId")):
-        return True
-    info = order.get("info")
-    if isinstance(info, dict):
-        if any(_order_id_text(info.get(k)) for k in _CLIENT_ID_INFO_KEYS):
-            return True
     status = _normalize_order_status(order.get("status"))
     if status in (
-        "open", "new", "closed", "filled", "partially_filled",
+        "open", "new", "partially_filled",
         "partiallyfilled", "canceled", "cancelled", "expired", "rejected",
     ):
         return True
@@ -707,7 +709,7 @@ def _order_landed(o: dict) -> bool:
         return True
     if status in ("canceled", "cancelled", "expired"):
         return False
-    if status in ("open", "new", "closed", "partially_filled", "partiallyfilled"):
+    if status in ("open", "new", "partially_filled", "partiallyfilled"):
         return True
     return bool(order_ids)
 
@@ -782,24 +784,14 @@ def _order_confirmed_terminal_zero_fill(order: dict) -> bool:
                 raw_value = source.get(key)
                 if raw_value in (None, ""):
                     continue
-                if isinstance(raw_value, bool):
-                    return False
-                try:
-                    parsed = abs(float(raw_value))
-                except (TypeError, ValueError, OverflowError):
-                    return False
-                if not math.isfinite(parsed):
+                parsed = _finite_order_telemetry_value(raw_value)
+                if parsed is None:
                     return False
                 gate_totals.append(parsed)
         raw_left = info.get("left")
         if gate_totals and raw_left not in (None, ""):
-            if isinstance(raw_left, bool):
-                return False
-            try:
-                left = abs(float(raw_left))
-            except (TypeError, ValueError, OverflowError):
-                return False
-            if not math.isfinite(left):
+            left = _finite_order_telemetry_value(raw_left)
+            if left is None:
                 return False
             for total in gate_totals:
                 tolerance = max(1e-12, total * 1e-9)
@@ -934,8 +926,13 @@ def _order_from_recovery_trades(
             cost += trade_cost
 
         trade_fees = trade.get("fees")
-        if isinstance(trade_fees, list) and trade_fees:
-            fees.extend(dict(fee) for fee in trade_fees if isinstance(fee, dict))
+        valid_trade_fees = (
+            [dict(fee) for fee in trade_fees if isinstance(fee, dict)]
+            if isinstance(trade_fees, list)
+            else []
+        )
+        if valid_trade_fees:
+            fees.extend(valid_trade_fees)
         elif isinstance(trade.get("fee"), dict):
             fees.append(dict(trade["fee"]))
 
@@ -1790,6 +1787,8 @@ _FUTURES_DISCOUNT_TOKENS = ("MX", "BNB", "BGB", "OKB", "HT", "KCS", "GT")
 def _finite_fee_cost(value) -> Optional[float]:
     if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
+        return None
     try:
         cost = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -1799,6 +1798,8 @@ def _finite_fee_cost(value) -> Optional[float]:
 
 def _positive_float(value) -> float:
     if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
         return 0.0
     try:
         parsed = float(value)
@@ -2012,6 +2013,24 @@ def extract_order_fee_futures(order) -> float:
     """
     fee, _known = _extract_order_fee_futures_known(order)
     return fee
+
+
+def _singular_discount_rebate_needs_refetch(order: dict) -> bool:
+    if not isinstance(order, dict):
+        return False
+    fees = order.get("fees")
+    if isinstance(fees, list) and fees:
+        return False
+    fee = order.get("fee")
+    if not isinstance(fee, dict):
+        return False
+    cost = _finite_fee_cost(fee.get("cost"))
+    return (
+        cost is not None
+        and cost < 0
+        and _upper_currency_text(fee.get("currency"))
+        in _FUTURES_DISCOUNT_TOKENS
+    )
 
 
 def _extract_order_fee_futures_known(order) -> tuple[float, bool]:
@@ -2233,11 +2252,30 @@ def extract_or_estimate_futures_fee(ex,
     ``contract_size`` is auto-derived from ``ex`` when not provided, so even
           callers that don't pass it are correct.
     """
+    attempts_limit = (
+        min(max_attempts, _MAX_ORDER_ATTEMPTS)
+        if (
+            isinstance(max_attempts, int)
+            and not isinstance(max_attempts, bool)
+            and max_attempts > 0
+        )
+        else 0
+    )
+    parsed_retry_delay = _finite_order_telemetry_value(retry_delay)
+    retry_delay_seconds = min(
+        parsed_retry_delay or 0.0,
+        _MAX_FEE_REFETCH_DELAY_SECONDS,
+    )
     order_payload = _order_with_fee_context(
         order, ex=ex, symbol_full=symbol_full, contract_size=contract_size
     )
     real, fee_known = _extract_order_fee_futures_known(order_payload)
-    if fee_known:
+    discount_rebate_refetch = (
+        fee_known
+        and real == 0
+        and _singular_discount_rebate_needs_refetch(order_payload)
+    )
+    if fee_known and not discount_rebate_refetch:
         return real
     estimate_payload = order_payload
 
@@ -2248,13 +2286,13 @@ def extract_or_estimate_futures_fee(ex,
         and symbol_full
         and _order_id_is_fetchable(ex, symbol_full, order_id)
     ):
-        for _ in range(max_attempts):
+        for _ in range(attempts_limit):
             # Cancellable sleep
             if shutdown_event is not None:
-                if shutdown_event.wait(timeout=retry_delay):
+                if shutdown_event.wait(timeout=retry_delay_seconds):
                     break  # shutting down - accept estimate
             else:
-                time.sleep(retry_delay)
+                time.sleep(retry_delay_seconds)
             try:
                 reservation = try_consume_api_call(
                     "futures_fee_fetch_order",
@@ -2312,6 +2350,9 @@ def extract_or_estimate_futures_fee(ex,
                     except Exception:
                         pass
                 continue
+
+    if discount_rebate_refetch:
+        return real
 
     # Estimate fallback
     # Prefer the order's own fill; fall back to what the CALLER actually traded
@@ -2407,7 +2448,7 @@ def position_row_side(pos: object) -> tuple[str, bool]:
     if unknown_explicit or len(observed) > 1:
         return "", True
 
-    signed_short = False
+    signed_directions: set[int] = set()
     for key in ("contracts", "size"):
         raw = pos.get(key)
         if raw in (None, ""):
@@ -2420,7 +2461,11 @@ def position_row_side(pos: object) -> tuple[str, bool]:
             return "", True
         if not math.isfinite(parsed):
             return "", True
-        signed_short |= parsed < 0
+        if parsed != 0.0:
+            signed_directions.add(-1 if parsed < 0 else 1)
+    if len(signed_directions) > 1:
+        return "", True
+    signed_short = -1 in signed_directions
     if observed:
         side = next(iter(observed))
         if signed_short and side != "short":
@@ -2438,7 +2483,11 @@ def _validated_position_rows(raw) -> Optional[list[dict]]:
         if not isinstance(row, dict):
             return None
         symbol = row.get("symbol")
-        if not isinstance(symbol, str) or not symbol.strip():
+        if (
+            not isinstance(symbol, str)
+            or not symbol.strip()
+            or symbol != symbol.strip()
+        ):
             return None
         rows.append(row)
     return rows
@@ -2640,7 +2689,7 @@ def verify_position_closed(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        time.sleep(min(0.5, max(0.05, remaining / 2)))
+        time.sleep(min(0.5, remaining, max(0.05, remaining / 2)))
 
     # Deadline exhausted
     if last_remaining > 0:
@@ -2651,11 +2700,21 @@ def verify_position_closed(
 def get_maintenance_margin_rate(ex, symbol_full: str,
                                   default: float = 0.01) -> float:
     """Try to read the exchange's actual maintenance margin rate."""
+    safe_default = 0.01
+    if not isinstance(default, bool):
+        try:
+            parsed_default = float(default)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if math.isfinite(parsed_default) and 0 < parsed_default < 0.5:
+                safe_default = parsed_default
     try:
         markets = getattr(ex, "markets", None) or {}
         m = markets.get(symbol_full) or {}
         info = m.get("info") if isinstance(m, dict) else None
         info = info if isinstance(info, dict) else {}
+        rates = []
         for key in ("maintenanceMarginRate", "maintMarginRate",
                      "maintenance_margin", "mm"):
             for source in (m, info):
@@ -2667,10 +2726,15 @@ def get_maintenance_margin_rate(ex, symbol_full: str,
                 except (TypeError, ValueError, OverflowError):
                     continue
                 if math.isfinite(fv) and 0 < fv < 0.5:
-                    return fv
-        return default
+                    rates.append(fv)
+        rate = rates[0] if rates else safe_default
+        for alias_rate in rates[1:]:
+            tolerance = max(1e-12, max(rate, alias_rate) * 1e-9)
+            if abs(alias_rate - rate) > tolerance:
+                return safe_default
+        return rate
     except Exception:
-        return default
+        return safe_default
 
 
 def get_exchange_liq_price(
@@ -2680,10 +2744,21 @@ def get_exchange_liq_price(
     expected_position_side: Optional[str] = None,
 ) -> float:
     """Fetch the liquidation price of one unambiguous open position leg."""
+    if (
+        not isinstance(symbol_full, str)
+        or not symbol_full.strip()
+        or symbol_full != symbol_full.strip()
+    ):
+        return 0.0
     try:
         from config.exchange_config import safe_fetch_positions
         expected_side = ""
         if expected_position_side not in (None, ""):
+            if (
+                not isinstance(expected_position_side, str)
+                or expected_position_side != expected_position_side.strip()
+            ):
+                return 0.0
             expected_side = _normalize_order_position_side(
                 expected_position_side
             )
@@ -2704,30 +2779,36 @@ def get_exchange_liq_price(
             quantity_present = any(
                 p.get(key) not in (None, "") for key in ("contracts", "size")
             )
-            if quantity_present:
-                contracts = _position_contracts_abs(p)
-                if contracts is None:
-                    return 0.0
-                if contracts <= 1e-8:
-                    continue
+            if not quantity_present:
+                return 0.0
+            contracts = _position_contracts_abs(p)
+            if contracts is None:
+                return 0.0
+            if contracts <= 1e-8:
+                continue
             observed_side, contradictory = position_row_side(p)
             if contradictory:
                 return 0.0
-            liq_price = 0.0
+            liq_prices = []
+            info = p.get("info") if isinstance(p.get("info"), dict) else {}
             for k in ("liquidationPrice", "liquidation_price"):
-                v = p.get(k)
-                if v is None and isinstance(p.get("info"), dict):
-                    v = p["info"].get(k)
-                if v is not None:
+                for source in (p, info):
+                    v = source.get(k)
+                    if v is None:
+                        continue
                     if isinstance(v, bool):
                         continue
                     try:
                         fv = float(v)
                         if math.isfinite(fv) and fv > 0:
-                            liq_price = fv
-                            break
+                            liq_prices.append(fv)
                     except (TypeError, ValueError, OverflowError):
                         continue
+            liq_price = liq_prices[0] if liq_prices else 0.0
+            for alias_price in liq_prices[1:]:
+                tolerance = max(1e-12, max(liq_price, alias_price) * 1e-9)
+                if abs(alias_price - liq_price) > tolerance:
+                    return 0.0
             candidates.append((observed_side, liq_price))
         if expected_side:
             matching = [
