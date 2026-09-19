@@ -1,6 +1,6 @@
 {
-  "build_id": "16a589a1b38aabff",
-  "created_at": "2026-09-10 17:42:28",
+  "build_id": "8a32db0c4e4c35e2",
+  "created_at": "2026-09-19 09:57:35",
   "source": "update_deploy_manifest.py",
   "file_count": 221,
   "files": [
@@ -131,8 +131,8 @@
     },
     {
       "path": "bot_utils/runtime_threads.py",
-      "sha256": "4baedf7ad3d09866952a939f9bab5118b8777deae12a2910755c845454a18783",
-      "bytes": 38262
+      "sha256": "930df2dd22f1051a7cc77ea215099792be953bfb1c9d199c05b8ef02f006a90f",
+      "bytes": 39552
     },
     {
       "path": "bot_utils/safe_numeric.py",
@@ -306,8 +306,8 @@
     },
     {
       "path": "core/futures_bot.py",
-      "sha256": "b1b148fa60211aa583392d542afb23069c8f5ee6cdfbe4b198d20ae914a68d09",
-      "bytes": 141071
+      "sha256": "31b91ab31ae115d8fd93a2eb3ff4f6e335c042dc7b148bd0746ac95bcd71eefe",
+      "bytes": 142891
     },
     {
       "path": "core/futures_bot_exits.py",
@@ -316,8 +316,8 @@
     },
     {
       "path": "core/futures_bot_reconcile.py",
-      "sha256": "68a3b678441b0a85ab057e5dffcb18706198df7e617ae74678df2de1b2ac972a",
-      "bytes": 146768
+      "sha256": "cfb8a53a74eb0752a2d1b5a489caa74dab7a8f910336d116964ce10a7bc345fa",
+      "bytes": 147599
     },
     {
       "path": "core/futures_bot_scan.py",
@@ -861,8 +861,8 @@
     },
     {
       "path": "trading/capture_integrity.py",
-      "sha256": "47bd6e552266bdef331dc246a1e803b97683ee0f91470568a538bd47c0a9323e",
-      "bytes": 60042
+      "sha256": "742e52706f56ce6071e4040b93900934e63c7897207d21ba2f9a494707048cdb",
+      "bytes": 60750
     },
     {
       "path": "trading/capture_replay_validation.py",

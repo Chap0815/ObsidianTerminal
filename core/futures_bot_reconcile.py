@@ -1890,12 +1890,11 @@ class FuturesReconcileMixin:
         """Full reconciliation compares local, claim and exchange state.
 
         Defensive against ``safe_fetch_positions`` returning an EMPTY list
-        (could be a real exchange state, or an auth/network glitch). If we have
-        local positions but the exchange returns nothing, refuse to wipe state
-        log a loud warning and skip removal. Only proceed with removal when
-        the exchange shows at least *some* positions OR local state was empty to
-        begin with. ``telemetry_phase`` only labels/throttles passive audit
-        output; it never changes reconciliation or order behavior.
+        (could be a real exchange state, or an auth/network glitch). Local-only
+        state is removed only after an authoritative per-symbol scoped+global
+        re-fetch also proves the target leg absent. A structurally complete
+        startup snapshot can use that proof immediately; periodic and
+        incomplete snapshots retain the time-separated two-cycle gate.
         """
         from core.logger import log_event, send_telegram
         from config.exchange_config import (
@@ -1987,10 +1986,21 @@ class FuturesReconcileMixin:
                     "ERROR",
                 )
 
-            # SAFETY GATE  if local state has positions but exchange shows
-            # ZERO, refuse to wipe state. Protects against auth/network glitches
-            # returning [] when positions actually exist on the exchange.
-            # Manual intervention required.
+            # Startup already has a freshly authenticated global snapshot.
+            # When that snapshot is structurally complete, the authoritative
+            # per-symbol re-fetch below adds both scoped and global absence
+            # evidence.  That three-query chain is strong enough to repair an
+            # exchange-flat restart immediately.  Periodic reconciliation and
+            # incomplete snapshots keep the time-separated two-cycle gate.
+            missing_strikes_required = (
+                1
+                if telemetry_phase == "startup" and exchange_snapshot_complete
+                else 2
+            )
+
+            # SAFETY GATE  an empty batch snapshot alone never authorizes
+            # deletion. Each local leg still needs the scoped+global proof
+            # below; uncertainty keeps the row and claim intact.
             if (
                 local_state
                 and not exchange_open
@@ -2119,12 +2129,18 @@ class FuturesReconcileMixin:
                 # Require 2 consecutive cycles absent before booking an offline
                 # close  a transient fetch_positions glitch (a real position
                 # briefly reported with 0 contracts) would otherwise book a
-                # phantom close and re-adopt next cycle (double-count).
+                # phantom close and re-adopt next cycle (double-count).  A
+                # complete startup snapshot may proceed in this cycle because
+                # the authoritative scoped+global re-fetch below supplies the
+                # additional independent absence evidence.
                 strikes[sym] = strikes.get(sym, 0) + 1
-                if strikes[sym] < 2:
+                if strikes[sym] < missing_strikes_required:
                     log_event(
                         f" Reconciliation: {sym} missing from exchange "
-                        f"(strike {strikes[sym]}/2)  deferring removal", "WARN")
+                        f"(strike {strikes[sym]}/"
+                        f"{missing_strikes_required})  deferring removal",
+                        "WARN",
+                    )
                     continue
                 # Lock + re-check live state: the monitor thread may have closed
                 # and booked this leg between the snapshot and now.

@@ -41,6 +41,14 @@ CONTINUITY_WINDOW_DAYS = 30
 CONTINUITY_MAX_DEGRADED_RATIO = 0.20
 INTEGRITY_REPORT_MAX_BYTES = 4 * 1024 * 1024
 REST_RECEIPT_CLOCK_TOLERANCE_MS = 30_000
+L2_BASE_QUALITY_FLAGS = ("sequence_unverified",)
+L2_STALE_QUALITY_FLAGS = (
+    *L2_BASE_QUALITY_FLAGS,
+    "stale_exchange_timestamp",
+)
+L2_ALLOWED_QUALITY_FLAGS = frozenset(L2_STALE_QUALITY_FLAGS)
+L2_COVERAGE_EXCLUDED_FLAGS = frozenset({"stale_exchange_timestamp"})
+L2_STALE_WARNING = "l2_stale_exchange_timestamp_excluded"
 
 
 def _capture_now_utc() -> datetime:
@@ -716,6 +724,7 @@ def _partition_rows(
                 raise ValueError(f"{stream} received_time is in the future")
             flags = _json(row["quality_flags_json"])
             payload = _json(row["payload_json"])
+            coverage_eligible = True
             if (
                 not isinstance(flags, list)
                 or any(not isinstance(flag, str) or not flag for flag in flags)
@@ -730,7 +739,11 @@ def _partition_rows(
                 _validate_rest_request_provenance(payload, received_time)
             if stream != "overview":
                 _validate_event_universe(payload)
-            allowed = {"sequence_unverified"} if stream == "l2_stream" else set()
+            allowed = (
+                L2_ALLOWED_QUALITY_FLAGS
+                if stream == "l2_stream"
+                else set()
+            )
             if stream == "trades" and payload.get("stream_source") != "ccxt_pro":
                 allowed.add("saturated_trade_payload")
                 if "saturated_trade_payload" in flags:
@@ -744,11 +757,17 @@ def _partition_rows(
                     f"event_id={_event_diagnostic(row['event_id'])}"
                 )
             if stream == "l2_stream":
-                if flags != ["sequence_unverified"]:
+                if tuple(flags) not in (
+                    L2_BASE_QUALITY_FLAGS,
+                    L2_STALE_QUALITY_FLAGS,
+                ):
                     raise ValueError("l2 quality contract is incomplete")
+                if L2_COVERAGE_EXCLUDED_FLAGS.intersection(flags):
+                    warnings.add(L2_STALE_WARNING)
+                    coverage_eligible = False
                 _validate_l2_payload(payload)
             market_id = str(row["market_id"])
-            if coverage_tracker is not None:
+            if coverage_tracker is not None and coverage_eligible:
                 coverage_tracker.observe(market_id, received_time)
             if stream == "overview":
                 overview_rows.append({
