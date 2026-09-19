@@ -132,9 +132,10 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
     CB_MAX_BACKOFF: float = 600.0
     CB_INITIAL_BACKOFF: float = 30.0
 
-    # Shutdown deadline  emergency close has this many seconds before
-    # we give up and let the process exit
+    # Shutdown deadline  emergency close has this many seconds before an
+    # incomplete result remains visibly pending for operator intervention.
     SHUTDOWN_DEADLINE_SEC: float = 45.0
+    SHUTDOWN_CLOSE_MAX_PASSES: int = 2
 
     #  Lifecycle 
 
@@ -171,6 +172,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         # SIGINT and atexit fire)
         self._emergency_closed = False
         self._emergency_close_generation = None
+        self._last_emergency_close_summary: dict[str, Any] = {}
         self._shutdown_positions_preserved = False
 
         # Threads
@@ -3188,10 +3190,11 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 pass
 
         # Latch only when the flatten has FULLY succeeded  a partial-failure
-        # shutdown must stay un-latched so a repeat signal / atexit can RETRY the
-        # still-open legs (the emergency helper re-snapshots state, so only the
-        # remaining legs are retried). _emergency_in_progress prevents a concurrent
-        # second run; _shutdown_event is still set so the rest of the bot winds down.
+        # shutdown must stay un-latched so the bounded in-request pass and, if
+        # still needed, a repeat signal can retry the remaining legs. The
+        # emergency helper re-snapshots state, so completed legs are not sent
+        # again. _emergency_in_progress prevents a concurrent second run;
+        # _shutdown_event is still set so the rest of the bot winds down.
         with self._shutdown_lock:
             if getattr(self, "_shutdown_positions_preserved", False):
                 return True
@@ -3248,7 +3251,16 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 "_shutdown_close_request_generation",
                 None,
             )
-        result = {"done": False, "error": None, "failed_count": 0}
+        result = {
+            "done": False,
+            "error": None,
+            "failed_count": 0,
+            "close_passes": 0,
+        }
+        close_deadline = time.monotonic() + max(
+            0.0,
+            float(self.SHUTDOWN_DEADLINE_SEC),
+        )
         generation = {
             "done": threading.Event(),
             "runner": None,
@@ -3259,16 +3271,39 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
 
         def _close_runner():
             try:
-                res = self._emergency_close_all(reason=f"Shutdown signal {signum}")
-                if not isinstance(res, dict):
-                    raise RuntimeError("Invalid emergency close result: expected dict")
-                failed_count = res.get("failed_count")
-                if type(failed_count) is not int or failed_count < 0:
-                    raise RuntimeError(
-                        "Invalid emergency close result: failed_count must be "
-                        "a non-negative integer"
+                max_passes = max(
+                    1,
+                    int(getattr(self, "SHUTDOWN_CLOSE_MAX_PASSES", 1)),
+                )
+                for close_pass in range(1, max_passes + 1):
+                    res = self._emergency_close_all(
+                        reason=f"Shutdown signal {signum}"
                     )
-                result["failed_count"] = failed_count
+                    if not isinstance(res, dict):
+                        raise RuntimeError(
+                            "Invalid emergency close result: expected dict"
+                        )
+                    failed_count = res.get("failed_count")
+                    if type(failed_count) is not int or failed_count < 0:
+                        raise RuntimeError(
+                            "Invalid emergency close result: failed_count "
+                            "must be a non-negative integer"
+                        )
+                    result["failed_count"] = failed_count
+                    result["close_passes"] = close_pass
+                    if failed_count == 0:
+                        break
+                    if (
+                        close_pass >= max_passes
+                        or time.monotonic() >= close_deadline
+                    ):
+                        break
+                    log_event(
+                        f" Emergency close pass {close_pass} left "
+                        f"{failed_count} leg(s); retrying remaining state "
+                        "within the active shutdown deadline.",
+                        "WARN",
+                    )
                 result["done"] = True
             except Exception as e:
                 result["error"] = e
@@ -3279,6 +3314,15 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                         is generation
                     )
                     if owns_generation:
+                        self._last_emergency_close_summary = {
+                            "result_complete": (
+                                result["done"]
+                                and result["failed_count"] == 0
+                            ),
+                            "passes": result["close_passes"],
+                            "failed_count": result["failed_count"],
+                            "error": result["error"] is not None,
+                        }
                         if result["done"] and result["failed_count"] == 0:
                             self._emergency_closed = True
                         self._emergency_in_progress = False

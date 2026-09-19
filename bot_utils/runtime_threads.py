@@ -759,6 +759,31 @@ def finalize_runtime_shutdown(
             for name, succeeded in resources.items()
             if not succeeded
         )
+        emergency_close_summary = None
+        raw_close_summary = getattr(
+            owner,
+            "_last_emergency_close_summary",
+            None,
+        )
+        if isinstance(raw_close_summary, Mapping):
+            summary_complete = raw_close_summary.get("result_complete")
+            summary_passes = raw_close_summary.get("passes")
+            summary_failed = raw_close_summary.get("failed_count")
+            summary_error = raw_close_summary.get("error")
+            if (
+                type(summary_complete) is bool
+                and type(summary_passes) is int
+                and 1 <= summary_passes <= 8
+                and type(summary_failed) is int
+                and 0 <= summary_failed <= 1_000_000
+                and type(summary_error) is bool
+            ):
+                emergency_close_summary = {
+                    "result_complete": summary_complete,
+                    "passes": summary_passes,
+                    "failed_count": summary_failed,
+                    "error": summary_error,
+                }
         status = "stopped" if not reasons else "degraded"
         shutdown_payload = {
             "complete": not reasons,
@@ -769,6 +794,10 @@ def finalize_runtime_shutdown(
         }
         if positions_preserved:
             shutdown_payload["positions_preserved"] = True
+        if emergency_close_summary is not None:
+            shutdown_payload["emergency_close_summary"] = (
+                emergency_close_summary
+            )
         status_signature = (
             status,
             tuple(sorted(threads.items())),
@@ -778,6 +807,7 @@ def finalize_runtime_shutdown(
             positions_preserved,
             observed_open_positions,
             tuple(sorted(resources.items())),
+            tuple(sorted((emergency_close_summary or {}).items())),
         )
         now_mono = time.monotonic()
         same_status = state.last_status_signature == status_signature
