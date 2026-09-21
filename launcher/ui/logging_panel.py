@@ -91,15 +91,19 @@ _DISPLAY_SKIP_RE = re.compile(
 )
 _DISPLAY_IMPORTANT_STATE_RE = re.compile(
     r"\b(?:safe[_ -]?mode|kill[- ]?switch|circuit breaker|"
-    r"pause(?:d)?|pausiert|risk gate unavailable|daily[- ]loss|"
+    r"pause(?:d)?|pausiert|risk gate unavailable|entries disabled|"
+    r"entry recovery unresolved|recovery[_ -]required|unknown[_ -]outcome|daily[- ]loss|"
     r"max(?:imum|\.)? trades?|bad hour|market[- ]filter|markt-filter|"
     r"api budget exhausted|shutdown|stopp(?:ed|ing)|started|running|ready|"
     r"recovered|connection established)\b",
     re.IGNORECASE,
 )
+_DISPLAY_WORKER_FAILURE_RE = re.compile(
+    r"\bthreads:\s*(?:unavailable\b|.*\b[\w-]+=DOWN\b)", re.IGNORECASE,
+)
 _DISPLAY_DUPLICATE_SUMMARY_RE = re.compile(
     r"^\s*(?:(?:INFO|WARN|WARNING)\s+)?\[Log\]\s+"
-    r"Previous message repeated\s+\d+\s+"
+    r"Previous message repeated\s+(?P<count>\d{1,10})\s+"
     r"(?:time|times);\s+duplicates? condensed\.\s*$",
     re.IGNORECASE,
 )
@@ -115,8 +119,9 @@ class LiveLogDisplayFilter:
     """Condense routine bot stdout without changing durable audit logs.
 
     This filter is deliberately display-only. Errors, critical messages, trade
-    events and state transitions always pass through. High-volume analysis,
-    skip and monitor chatter is counted and rendered as a periodic summary.
+    events and new state messages pass through. High-volume analysis, skip and
+    monitor chatter is counted, with optional periodic summaries. The quiet GUI
+    uses only the counter; repeated warnings/states still receive reminders.
     The caller can bypass the policy with ``detailed=True`` at any time.
     """
 
@@ -146,6 +151,7 @@ class LiveLogDisplayFilter:
         warning_repeat_window_seconds: float = 120.0,
         state_repeat_window_seconds: float = 300.0,
         max_warning_fingerprints: int = 512,
+        emit_routine_summaries: bool = True,
     ) -> None:
         self.summary_interval_seconds = max(
             1.0, float(summary_interval_seconds)
@@ -165,6 +171,8 @@ class LiveLogDisplayFilter:
         self._last_summary_at: float | None = None
         self._warning_seen_at: dict[str, float] = {}
         self._state_seen_at: dict[str, float] = {}
+        self.emit_routine_summaries = bool(emit_routine_summaries)
+        self.routine_hidden_count = 0
 
     @staticmethod
     def _fingerprint(line: str) -> str:
@@ -184,10 +192,11 @@ class LiveLogDisplayFilter:
         explicit = _explicit_level(text)
         if _DISPLAY_SEPARATOR_RE.fullmatch(text):
             return "formatting"
+        if (_DISPLAY_IMPORTANT_STATE_RE.search(text)
+                or _DISPLAY_WORKER_FAILURE_RE.search(text)):
+            return None
         if _DISPLAY_HEARTBEAT_RE.search(text):
             return "heartbeat"
-        if _DISPLAY_IMPORTANT_STATE_RE.search(text):
-            return None
         if severity == "monitor" or _DISPLAY_MONITOR_RE.search(text):
             return "monitor"
         if _DISPLAY_ANALYSIS_RE.search(text):
@@ -311,8 +320,14 @@ class LiveLogDisplayFilter:
                 self._state_seen_at = dict(newest)
         return False
 
-    def _suppress(self, category: str, current: float) -> tuple[str, ...]:
-        self._pending[category] += 1
+    def _suppress(self, category: str, current: float, count: int = 1) -> tuple[str, ...]:
+        if category in self._SILENT_SINGLETON_CATEGORIES:
+            self.routine_hidden_count += 1
+            if not self.emit_routine_summaries:
+                # Quiet GUI: update an out-of-band counter, not another log.
+                # Warning/state repeats still receive bounded reminders.
+                return self._summary_if_due(current)
+        self._pending[category] += count
         if self._pending_first_at is None:
             self._pending_first_at = current
         self._pending_last_at = current
@@ -335,15 +350,20 @@ class LiveLogDisplayFilter:
             return ((summary,) if summary else ()) + (text,)
 
         normalized_severity = str(severity or "info").lower()
+        if normalized_severity == "warning":
+            normalized_severity = "warn"
         if normalized_severity == "ok":
             # An explicit component recovery closes the previous incident.
             # The same warning after that boundary is a new incident and must
             # be visible immediately instead of inheriting the old TTL.
             self._rearm_warning_scope(text)
-        if (
-            normalized_severity in {"info", "warn", "warning"}
-            and _DISPLAY_DUPLICATE_SUMMARY_RE.fullmatch(text)
-        ):
+        duplicate = _DISPLAY_DUPLICATE_SUMMARY_RE.fullmatch(text)
+        if normalized_severity in {"info", "warn"} and duplicate:
+            if normalized_severity == "warn":
+                # The stdout compactor emits only summaries for an unchanged
+                # warning. Do not discard that incident's continued existence.
+                return self._suppress("repeated_warning", current,
+                                      int(duplicate.group("count")))
             return ()
         if (
             normalized_severity not in self._NEVER_FILTER | {"warn"}
@@ -393,6 +413,7 @@ class LiveLogDisplayFilter:
         self._warning_seen_at.clear()
         self._state_seen_at.clear()
         self._last_summary_at = None
+        self.routine_hidden_count = 0
 
 
 def _explicit_level(line: str) -> str | None:
@@ -500,6 +521,8 @@ def classify_severity(line: str) -> str:
         # such as "repeated warnings" describe the condensed category; they
         # must not turn the producer-authored INFO summary into a new warning.
         return "info"
+    if _DISPLAY_WORKER_FAILURE_RE.search(text):
+        return "warn"
 
     if is_benign_info_line(text):
         return "info"
