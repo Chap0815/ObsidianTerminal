@@ -6,6 +6,8 @@ nicht auseinander entwickeln.
 """
 from __future__ import annotations
 
+import re
+
 
 # Keywords die eine Long-Bias-Setup so gut wie immer invalidieren.
 # Ein Spot-Bot der eines davon sieht, returnt WAIT.
@@ -31,3 +33,16 @@ POSITIVE_KEYWORDS: tuple = (
     "funding round", "grant", "milestone",
     "burn", "buyback", "treasury",
 )
+
+
+def find_keyword_matches(
+    text: str, keywords: tuple[str, ...] | list[str]
+) -> list[str]:
+    """Return vocabulary terms found at lexical boundaries in normalized text."""
+    if type(text) is not str:
+        return []
+    return [
+        keyword
+        for keyword in keywords
+        if re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", text)
+    ]

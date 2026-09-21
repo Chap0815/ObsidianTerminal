@@ -196,7 +196,7 @@ def _news_shutdown_generation_unresolved(generation) -> bool:
 def shutdown_news_resources(timeout: float = 1.0) -> bool:
     """Terminally close news resources within one end-to-end deadline."""
     global _NEWS_SHUTDOWN_GENERATION, _NEWS_TERMINAL
-    if isinstance(timeout, bool):
+    if type(timeout) not in (int, float):
         return False
     try:
         requested_timeout = float(timeout)
@@ -364,7 +364,7 @@ def _cache_set(symbol: str, value: list):
             _news_cache.popitem(last=False)
 
 
-#  Symbol matching 
+#  Symbol matching
 COIN_ALIASES = {
     "BTC":  ["bitcoin",     "btc"],
     "ETH":  ["ethereum",    "ether",      "eth"],
@@ -409,14 +409,14 @@ _compiled_patterns_lock = threading.Lock()
 
 
 def _normalised_symbol(value) -> str | None:
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         return None
-    normalized = value.upper()
+    normalized = str.upper(value)
     return normalized if _SYMBOL_RE.fullmatch(normalized) else None
 
 
 def _validated_max_items(value) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is not int:
         raise ValueError("max_items must be an integer")
     if not 1 <= value <= 50:
         raise ValueError("max_items must be between 1 and 50")
@@ -456,7 +456,7 @@ def _patterns_for(symbol: str) -> list:
 
 
 def _symbol_matches(symbol: str, text: str) -> bool:
-    if not text:
+    if type(text) is not str or not text:
         return False
     for pat in _patterns_for(symbol):
         if pat.search(text):
@@ -466,6 +466,8 @@ def _symbol_matches(symbol: str, text: str) -> bool:
 
 def _freshness_prefix(age_minutes: float) -> str:
     """Future-dated entries (negative age) get NO prefix."""
+    if type(age_minutes) not in (int, float):
+        return ""
     if age_minutes < 0:
         return ""
     if age_minutes < 60:
@@ -476,6 +478,8 @@ def _freshness_prefix(age_minutes: float) -> str:
 
 
 def _utc_age_minutes_from_struct_time(pp) -> float:
+    if type(pp) is not time.struct_time:
+        return 0.0
     try:
         epoch_utc = calendar.timegm(pp)
         return (time.time() - epoch_utc) / 60.0
@@ -484,7 +488,7 @@ def _utc_age_minutes_from_struct_time(pp) -> float:
 
 
 def _dedupe_key(headline: str) -> str:
-    if not isinstance(headline, str) or not headline:
+    if type(headline) is not str or not headline:
         return ""
     h = re.sub(r"^\[(BREAKING|FRESH)\]\s*", "", headline)
     h = re.sub(r"[^a-z0-9\s]", "", h.lower())
@@ -493,13 +497,13 @@ def _dedupe_key(headline: str) -> str:
 
 
 def _clean_headlines(value) -> list[str]:
-    if not isinstance(value, list):
+    if type(value) is not list:
         return []
     cleaned = []
     for item in value[:_MAX_SOURCE_HEADLINES]:
-        if not isinstance(item, str):
+        if type(item) is not str:
             continue
-        headline = item.strip()
+        headline = str.strip(item)
         if headline:
             cleaned.append(headline[:MAX_HEADLINE_CHARS])
     return cleaned
@@ -529,10 +533,10 @@ def _safe_fetch(name: str, fn, *args, **kwargs) -> list:
 # Sanitise a URL for safe logging  strips the entire query string so any
 # embedded credential (auth_token, api_key, etc.) is removed.
 def _sanitised_url(url: str) -> str:
-    if not url:
+    if type(url) is not str or not url:
         return ""
     try:
-        idx = url.index("?")
+        idx = str.index(url, "?")
         return url[:idx] + "?[REDACTED]"
     except ValueError:
         return url
@@ -540,6 +544,8 @@ def _sanitised_url(url: str) -> str:
 
 def _gather_futures(futs_map: dict, timeout: float) -> list:
     """Collect results from a futurelabel map. Returns a flat list of items."""
+    if type(futs_map) is not dict or type(timeout) not in (int, float):
+        return []
     out: list = []
     completed: set = set()
     try:
@@ -563,7 +569,7 @@ def _gather_futures(futs_map: dict, timeout: float) -> list:
     return out
 
 
-#  Source impls 
+#  Source impls
 
 def _fetch_cryptopanic(symbol: str) -> list:
     """Catch HTTPError/RequestException and re-raise without the query string
@@ -583,7 +589,7 @@ def _fetch_cryptopanic(symbol: str) -> list:
 
     try:
         r = _http_get(url, params=params)
-        r.raise_for_status()
+        require_success(r)
     except requests.exceptions.HTTPError as exc:
         # Re-raise with sanitised URL.
         try:
@@ -604,27 +610,31 @@ def _fetch_cryptopanic(symbol: str) -> list:
         data = read_bounded_json_response(r)
     except (TypeError, ValueError):
         return []
-    if not isinstance(data, dict):
+    if type(data) is not dict:
         return []
     now_utc = _dt.now(_tz.utc)
     out = []
     results = data.get("results")
-    if not isinstance(results, list):
+    if type(results) is not list:
         return []
     for p in results[:25]:
-        if not isinstance(p, dict):
+        if type(p) is not dict:
             continue
         title = p.get("title")
-        if not isinstance(title, str):
+        if type(title) is not str:
             continue
-        title = title.strip()
+        title = str.strip(title)
         if not title:
             continue
-        pub = p.get("published_at") or p.get("created_at") or ""
+        pub = p.get("published_at")
+        if type(pub) is not str or not pub:
+            pub = p.get("created_at")
+        if type(pub) is not str:
+            pub = ""
         prefix = ""
-        if isinstance(pub, str) and pub:
+        if pub:
             try:
-                pub_str = pub.replace("Z", "+00:00")
+                pub_str = str.replace(pub, "Z", "+00:00")
                 pub_dt = _dt.fromisoformat(pub_str)
                 if pub_dt.tzinfo is None:
                     pub_dt = pub_dt.replace(tzinfo=_tz.utc)
@@ -642,32 +652,34 @@ def _fetch_cryptopanic(symbol: str) -> list:
 def _fetch_reddit(symbol: str) -> list:
     url = "https://www.reddit.com/r/cryptocurrency/hot.json?limit=50"
     r = _http_get(url)
-    r.raise_for_status()
+    require_success(r)
     data = read_bounded_json_response(r)
-    if not isinstance(data, dict):
+    if type(data) is not dict:
         return []
     listing = data.get("data")
-    if not isinstance(listing, dict):
+    if type(listing) is not dict:
         return []
     posts = listing.get("children")
-    if not isinstance(posts, list):
+    if type(posts) is not list:
         return []
     found = []
     now_ts = time.time()
     for p in posts:
-        if not isinstance(p, dict):
+        if type(p) is not dict:
             continue
         pd = p.get("data")
-        if not isinstance(pd, dict):
+        if type(pd) is not dict:
             continue
         title = pd.get("title")
-        if not isinstance(title, str):
+        if type(title) is not str:
             continue
-        title = title.strip()
+        title = str.strip(title)
         if not title:
             continue
         if _symbol_matches(symbol, title):
-            created = pd.get("created_utc", 0) or 0
+            created = pd.get("created_utc", 0)
+            if type(created) not in (int, float, str):
+                created = 0
             prefix = ""
             try:
                 age_min = (now_ts - float(created)) / 60.0
@@ -698,29 +710,31 @@ def _fetch_one_rss(url: str, symbol: str) -> list:
             timeout=(REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT),
             stream=True,
         )
-        r.raise_for_status()
+        require_success(r)
         # Pass raw bytes to feedparser for full encoding detection.
         feed = feedparser.parse(read_bounded_response(r))
     except Exception:
         return []
     entries = getattr(feed, "entries", None)
-    if not isinstance(entries, list):
+    if type(entries) is not list:
         return []
     found = []
     for entry in entries[:25]:
-        if not isinstance(entry, dict):
+        if type(entry) is not dict:
             continue
         title = entry.get("title")
-        if not isinstance(title, str):
+        if type(title) is not str:
             continue
-        title = title.strip()
+        title = str.strip(title)
         if not title:
             continue
         if not _symbol_matches(symbol, title):
             continue
-        pp = entry.get("published_parsed") or entry.get("updated_parsed")
+        pp = entry.get("published_parsed")
+        if type(pp) is not time.struct_time:
+            pp = entry.get("updated_parsed")
         prefix = ""
-        if pp:
+        if type(pp) is time.struct_time:
             age_min = _utc_age_minutes_from_struct_time(pp)
             if age_min > 0:
                 prefix = _freshness_prefix(age_min)
@@ -743,34 +757,32 @@ def _fetch_rss_feeds(symbol: str) -> list:
 def _fetch_coingecko_trending() -> list:
     url = "https://api.coingecko.com/api/v3/search/trending"
     r = _http_get(url)
-    r.raise_for_status()
+    require_success(r)
     data = read_bounded_json_response(r)
-    if not isinstance(data, dict):
+    if type(data) is not dict:
         return []
     coins = data.get("coins")
-    if not isinstance(coins, list):
+    if type(coins) is not list:
         return []
     out = []
     for coin in coins[:25]:
-        if not isinstance(coin, dict):
+        if type(coin) is not dict:
             continue
         item = coin.get("item")
-        if not isinstance(item, dict):
+        if type(item) is not dict:
             continue
         name = item.get("name")
         symbol = item.get("symbol")
-        if not isinstance(name, str) or not isinstance(symbol, str):
+        if type(name) is not str or type(symbol) is not str:
             continue
-        name = " ".join(name.split())[:100]
-        symbol = "".join(symbol.split()).upper()[:20]
+        name = " ".join(str.split(name))[:100]
+        symbol = str.upper("".join(str.split(symbol)))[:20]
         if not name or not symbol:
             continue
         rank_value = item.get("market_cap_rank")
         rank = (
             rank_value
-            if isinstance(rank_value, int)
-            and not isinstance(rank_value, bool)
-            and rank_value > 0
+            if type(rank_value) is int and rank_value > 0
             else "?"
         )
         out.append(
@@ -785,25 +797,23 @@ def _fetch_coingecko_trending() -> list:
 def _fetch_coingecko_global_status() -> list:
     url = "https://api.coingecko.com/api/v3/global"
     r = _http_get(url)
-    r.raise_for_status()
+    require_success(r)
     payload = read_bounded_json_response(r)
-    if not isinstance(payload, dict):
+    if type(payload) is not dict:
         return []
     data = payload.get("data")
-    if not isinstance(data, dict):
+    if type(data) is not dict:
         return []
     percentages = data.get("market_cap_percentage")
-    if not isinstance(percentages, dict):
+    if type(percentages) is not dict:
         return []
     btc_dom = percentages.get("btc")
     mcap_change = data.get("market_cap_change_percentage_24h_usd")
     if (
-        isinstance(btc_dom, bool)
-        or not isinstance(btc_dom, (int, float))
+        type(btc_dom) not in (int, float)
         or not math.isfinite(btc_dom)
         or not 0.0 <= btc_dom <= 100.0
-        or isinstance(mcap_change, bool)
-        or not isinstance(mcap_change, (int, float))
+        or type(mcap_change) not in (int, float)
         or not math.isfinite(mcap_change)
         or not -100.0 <= mcap_change <= 1000.0
     ):
@@ -815,7 +825,7 @@ def _fetch_coingecko_global_status() -> list:
 
 
 def _fear_greed_value(value) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+    if type(value) not in (int, float, str):
         return None
     try:
         parsed = float(value)
@@ -828,6 +838,8 @@ def _fear_greed_value(value) -> int | None:
 
 
 def _fear_greed_label(value: int) -> str:
+    if type(value) is not int:
+        return ""
     if value <= 25:
         return "Extreme Fear"
     if value <= 45:
@@ -846,11 +858,11 @@ def _fetch_fear_greed_history() -> list:
             headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
             # limit=2 fetches today and yesterday for comparison.
             r = _http_get("https://pro-api.coinmarketcap.com/v3/fear-and-greed/historical?limit=2", headers=headers)
-            r.raise_for_status()
+            require_success(r)
             payload = read_bounded_json_response(r)
-            data = payload.get("data") if isinstance(payload, dict) else None
+            data = payload.get("data") if type(payload) is dict else None
 
-            if isinstance(data, list) and data and isinstance(data[0], dict):
+            if type(data) is list and data and type(data[0]) is dict:
                 today = data[0]
                 value = _fear_greed_value(today.get("value"))
                 if value is None:
@@ -860,7 +872,7 @@ def _fetch_fear_greed_history() -> list:
                     yest = data[1]
                     previous = (
                         _fear_greed_value(yest.get("value"))
-                        if isinstance(yest, dict)
+                        if type(yest) is dict
                         else None
                     )
                     if previous is not None:
@@ -876,9 +888,9 @@ def _fetch_fear_greed_history() -> list:
     # 2. Coinybubble (Fallback)
     try:
         r = _http_get("https://api.coinybubble.com/v1/latest")
-        r.raise_for_status()
+        require_success(r)
         d = read_bounded_json_response(r)
-        if not isinstance(d, dict):
+        if type(d) is not dict:
             return []
         val = _fear_greed_value(d.get("actual_value"))
         if val is None:
@@ -893,7 +905,7 @@ def _fetch_fear_greed_history() -> list:
         return []
 
 
-#  Public API 
+#  Public API
 
 def fetch_general_market_news() -> list:
     """Fetch general market headlines (single-flight: only one thread fetches

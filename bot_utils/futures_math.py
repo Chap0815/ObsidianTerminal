@@ -26,7 +26,7 @@ def _finite_float(value) -> float | None:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -156,7 +156,7 @@ def cross_liquidation_price(entry: float, qty_signed: float, mm_rate: float,
             other_sum += contribution
             if not math.isfinite(other_sum):
                 return None
-    except (TypeError, ValueError):
+    except Exception:
         return None
     denom = mm * abs(q) - q
     if denom == 0.0 or not math.isfinite(denom):

@@ -13,7 +13,7 @@ def _finite(value, *, positive: bool = False) -> float:
         raise ValueError("boolean is not a numeric observation")
     try:
         number = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
+    except Exception as exc:
         raise ValueError("observation must be finite and in range") from exc
     if not math.isfinite(number) or (positive and number <= 0.0):
         raise ValueError("observation must be finite and in range")
@@ -25,7 +25,7 @@ def _model_float(value, name: str) -> float:
         raise ValueError(f"{name} must be a finite number")
     try:
         number = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
+    except Exception as exc:
         raise ValueError(f"{name} must be a finite number") from exc
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite number")
@@ -92,23 +92,23 @@ def execution_cost_payloads_match(first: dict, second: dict) -> bool:
             separators=(",", ":"),
             allow_nan=False,
         )
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return False
     return first_canonical == second_canonical
 
 
 def _execution_cost_timestamp(value) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    normalized = value.strip()
-    if "T" not in normalized and " " not in normalized:
+    if not isinstance(value, str):
         return None
     try:
+        normalized = value.strip()
+        if not normalized or ("T" not in normalized and " " not in normalized):
+            return None
         parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
 
 
@@ -120,16 +120,19 @@ def execution_cost_stages_are_causal(
     fill_time,
 ) -> bool:
     """Require journal order and, when available, causal measured times."""
-    if (
-        isinstance(arrival_id, bool)
-        or isinstance(fill_id, bool)
-        or not isinstance(arrival_id, int)
-        or not isinstance(fill_id, int)
-        or arrival_id <= 0
-        or fill_id <= 0
-    ):
+    try:
+        invalid_ids = (
+            isinstance(arrival_id, bool)
+            or isinstance(fill_id, bool)
+            or not isinstance(arrival_id, int)
+            or not isinstance(fill_id, int)
+            or arrival_id <= 0
+            or fill_id <= 0
+        )
+        out_of_order = not invalid_ids and arrival_id >= fill_id
+    except Exception:
         return False
-    if arrival_id >= fill_id:
+    if invalid_ids or out_of_order:
         return False
     if arrival_time is None and fill_time is None:
         # Compatibility for legacy research databases without measured_at.

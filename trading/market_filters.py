@@ -65,7 +65,11 @@ def _fetch_bounded_json(url: str, **kwargs):
         if not callable(checker):
             raise ValueError("response does not expose status validation")
         checker()
-        reader_closes = callable(getattr(response, "iter_content", None))
+        reader_closes = (
+            callable(getattr(response, "iter_content", None))
+            or isinstance(getattr(response, "content", None), (bytes, bytearray))
+            or callable(getattr(response, "json", None))
+        )
         return read_bounded_json_response(
             response,
             max_bytes=_FG_MAX_RESPONSE_BYTES,
@@ -114,14 +118,14 @@ class _LRUCache:
         self._max = maxsize
         self._lock = threading.Lock()
 
-    def get(self, key: str):
+    def get(self, key):
         with self._lock:
             if key not in self._d:
                 return None
             self._d.move_to_end(key)
             return self._d[key]
 
-    def set(self, key: str, value) -> None:
+    def set(self, key, value) -> None:
         with self._lock:
             if key in self._d:
                 self._d.move_to_end(key)
@@ -173,25 +177,21 @@ _STALE_BACKOFF: dict = {}
 _STALE_BACKOFF_LOCK = threading.Lock()
 _STALE_GRACE_BASE = 60  # initial grace seconds
 _STALE_GRACE_MAX = MARKET_FILTER_STALE_GRACE_MAX_SECONDS
-_CACHE_KEY_LOCKS: dict[str, threading.RLock] = {}
-_CACHE_KEY_LOCKS_GUARD = threading.Lock()
+_CACHE_KEY_LOCKS = tuple(threading.RLock() for _ in range(_CACHE_MAXSIZE))
 
 
 def _cache_key_lock(key: str):
     """Return the process-local single-flight lock for one cache key."""
-    with _CACHE_KEY_LOCKS_GUARD:
-        lock = _CACHE_KEY_LOCKS.get(key)
-        if lock is None:
-            lock = threading.RLock()
-            _CACHE_KEY_LOCKS[key] = lock
-        return lock
+    return _CACHE_KEY_LOCKS[hash(key) % len(_CACHE_KEY_LOCKS)]
 
 
 def _next_stale_grace(key: str) -> int:
     """Progressive backoff: 60  120  240  300 (cap)."""
     with _STALE_BACKOFF_LOCK:
-        cur = _STALE_BACKOFF.get(key, 0)
+        cur = _STALE_BACKOFF.pop(key, 0)
         nxt = _STALE_GRACE_BASE if cur == 0 else min(_STALE_GRACE_MAX, cur * 2)
+        while len(_STALE_BACKOFF) >= _CACHE_MAXSIZE:
+            _STALE_BACKOFF.pop(next(iter(_STALE_BACKOFF)))
         _STALE_BACKOFF[key] = nxt
         return nxt
 
@@ -210,7 +210,11 @@ def _cached(key: str, fetch_fn):
 def _cached_locked(key: str, fetch_fn):
     entry = _lru.get(key)
     now = time.monotonic()
-    if entry and entry.get("expires", 0) > now:
+    try:
+        expires = float(entry.get("expires", 0)) if entry else 0.0
+    except Exception:
+        expires = 0.0
+    if entry and math.isfinite(expires) and expires > now:
         return entry["value"]
     try:
         value = fetch_fn()
@@ -232,7 +236,7 @@ def _cached_locked(key: str, fetch_fn):
         now = time.monotonic()
         try:
             stale_until = float(entry.get("stale_until", 0)) if entry else 0.0
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             stale_until = 0.0
         if (
             entry
@@ -260,6 +264,31 @@ def _cached_locked(key: str, fetch_fn):
             )
             return entry["stale"]
         raise
+
+
+class _ExchangeCachedValue:
+    """Cache payload retaining the exact exchange identity for its lifetime."""
+
+    __slots__ = ("exchange", "value")
+
+    def __init__(self, exchange, value):
+        self.exchange = exchange
+        self.value = value
+
+
+def _cached_for_exchange(key: str, exchange, fetch_fn):
+    scoped_key = f"{key}@exchange:{id(exchange)}"
+    wrapped = _cached(
+        scoped_key,
+        lambda: _ExchangeCachedValue(exchange, fetch_fn()),
+    )
+    if (
+        isinstance(wrapped, _ExchangeCachedValue)
+        and wrapped.exchange is exchange
+    ):
+        return wrapped.value
+    # A malformed/injected cache value must not cross the exchange boundary.
+    return fetch_fn()
 
 
 #  BTC price unavailable sentinel
@@ -305,6 +334,12 @@ def get_btc_change(
     still-forming candle can't trip a flatten or pause; entry context uses the
     live forming candle for real-time change.
     """
+    if type(hours) is not int or hours <= 0:
+        raise ValueError("hours must be a positive integer")
+    if not isinstance(raise_on_failure, bool):
+        raise ValueError("raise_on_failure must be boolean")
+    if not isinstance(closed_only, bool):
+        raise ValueError("closed_only must be boolean")
 
     def fetch() -> float:
         limit = max(3, hours + 2) + (1 if closed_only else 0)
@@ -389,13 +424,15 @@ def get_btc_change(
             from core.logger import log_event
 
             log_event(
-                f"BTC trend fetch failed: {e_primary} | "
-                f"fallback ({fallback_symbol}): {e_fallback}",
+                f"BTC trend fetch failed ({type(e_primary).__name__}); "
+                f"fallback ({fallback_symbol}) failed "
+                f"({type(e_fallback).__name__})",
                 "WARN",
             )
             raise BTCPriceUnavailable(
-                f"primary={e_primary}, fallback={e_fallback}"
-            ) from e_fallback
+                f"primary={type(e_primary).__name__}, "
+                f"fallback={type(e_fallback).__name__}"
+            ) from None
 
     try:
         # Cache EVERY horizon (keyed by hours), not just 1h/24h  the futures
@@ -403,11 +440,23 @@ def get_btc_change(
         # so a safety gate never reads a live forming-candle cached value.
         suffix = "_closed" if closed_only else ""
         if hours == 1:
-            return _cached(f"btc_trend{suffix}", fetch)
+            return _cached_for_exchange(
+                f"btc_trend{suffix}",
+                exchange,
+                fetch,
+            )
         elif hours == 24:
-            return _cached(f"btc_24h{suffix}", fetch)
+            return _cached_for_exchange(
+                f"btc_24h{suffix}",
+                exchange,
+                fetch,
+            )
         else:
-            return _cached(f"btc_trend_{hours}h{suffix}", fetch)
+            return _cached_for_exchange(
+                f"btc_trend_{hours}h{suffix}",
+                exchange,
+                fetch,
+            )
     except BTCPriceUnavailable:
         if raise_on_failure:
             raise
@@ -416,6 +465,14 @@ def get_btc_change(
 
 def is_btc_dumping(exchange, threshold: float = -2.0) -> bool:
     """Fail-CLOSED. If BTC data unavailable, treat as dumping (True)."""
+    if isinstance(threshold, bool):
+        return True
+    try:
+        threshold = float(threshold)
+    except Exception:
+        return True
+    if not math.isfinite(threshold):
+        return True
     try:
         chg = get_btc_change(exchange, hours=1, raise_on_failure=True)
         return chg <= threshold
@@ -471,8 +528,8 @@ def _fetch_fg_from_cmc() -> Optional[int]:
                             return value
         except Exception as e:
             _filter_log(
-                f"[Filter] CMC official API failed: {type(e).__name__}: {e} "
-                f" falling back to data-api endpoint",
+                f"[Filter] CMC official API failed ({type(e).__name__}); "
+                f"falling back to data-api endpoint",
                 "WARN",
             )
 
@@ -504,7 +561,10 @@ def _fetch_fg_from_cmc() -> Optional[int]:
                 if value is not None:
                     return value
     except Exception as e:
-        _filter_log(f"[Filter] CMC data-api failed: {type(e).__name__}: {e}", "WARN")
+        _filter_log(
+            f"[Filter] CMC data-api failed ({type(e).__name__})",
+            "WARN",
+        )
     return None
 
 
@@ -543,7 +603,8 @@ def get_fear_greed() -> int:
 
         if failures >= _FG_FAILURE_THRESHOLD:
             if now < open_until:
-                return last_value
+                normalized_last = _normalized_fear_greed(last_value)
+                return 50 if normalized_last is None else normalized_last
             else:
                 with _FG_CIRCUIT_LOCK:
                     _FG_CIRCUIT["failures"] = _FG_FAILURE_THRESHOLD - 1
@@ -552,7 +613,9 @@ def get_fear_greed() -> int:
         try:
             from core.database import get_cached_fear_greed
 
-            cached = get_cached_fear_greed(max_age_sec=290)
+            cached = _normalized_fear_greed(
+                get_cached_fear_greed(max_age_sec=290)
+            )
             if cached is not None:
                 with _FG_CIRCUIT_LOCK:
                     _FG_CIRCUIT["failures"] = 0
@@ -591,7 +654,9 @@ def get_fear_greed() -> int:
         try:
             from core.database import get_cached_fear_greed
 
-            stale = get_cached_fear_greed(max_age_sec=24 * 3600)  # 24h tolerance
+            stale = _normalized_fear_greed(
+                get_cached_fear_greed(max_age_sec=24 * 3600)
+            )
             if stale is not None:
                 _filter_log(f"[Filter] using stale cached F&G value: {stale}", "INFO")
                 with _FG_CIRCUIT_LOCK:
@@ -611,7 +676,8 @@ def get_fear_greed() -> int:
                     "WARN",
                 )
             last = _FG_CIRCUIT["last_value"]
-        return last
+        normalized_last = _normalized_fear_greed(last)
+        return 50 if normalized_last is None else normalized_last
 
     return _cached("fear_greed", fetch)
 
@@ -858,7 +924,11 @@ def get_market_regime(exchange) -> dict:
             log_market_regime(regime, btc_24h, btc_7d, fg)
             return result
         except Exception as e:
-            _filter_log(f"[Filter] Market phase analysis failed: {e}", "WARN")
+            _filter_log(
+                f"[Filter] Market phase analysis failed "
+                f"({type(e).__name__})",
+                "WARN",
+            )
             return {
                 "regime": "UNKNOWN",
                 "btc_24h": 0.0,
@@ -866,7 +936,7 @@ def get_market_regime(exchange) -> dict:
                 "fear_greed": 50,
             }
 
-    return _cached("regime", fetch)
+    return _cached_for_exchange("regime", exchange, fetch)
 
 
 #
@@ -886,18 +956,29 @@ def is_price_valid(price) -> bool:
 def check_spread_quality(
     exchange, symbol: str, max_spread_pct: float = 0.3, fail_closed: bool = True
 ) -> tuple:
+    if not isinstance(symbol, str) or not symbol.strip():
+        return False, "invalid spread symbol"
+    if not isinstance(fail_closed, bool):
+        return False, f"{symbol}: invalid fail_closed policy"
     try:
         if isinstance(max_spread_pct, bool):
             raise ValueError("boolean spread threshold")
         threshold = float(max_spread_pct)
         if not math.isfinite(threshold) or threshold < 0.0:
             raise ValueError("invalid spread threshold")
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return False, f"{symbol}: invalid spread threshold"
-    cache_key = f"spread_{symbol}_{threshold:.6f}_{int(bool(fail_closed))}"
+    cache_key = (
+        f"spread_{id(exchange)}_{symbol}_{threshold:.6f}_"
+        f"{int(bool(fail_closed))}"
+    )
     now = time.monotonic()
     entry = _spread_cache.get(cache_key)
-    if entry and entry["expires"] > now:
+    if (
+        entry
+        and entry.get("exchange") is exchange
+        and entry["expires"] > now
+    ):
         return entry["value"]
 
     try:
@@ -984,7 +1065,14 @@ def check_spread_quality(
             else (True, "OK")
         )
 
-    _spread_cache.set(cache_key, {"value": result, "expires": now + 30})
+    _spread_cache.set(
+        cache_key,
+        {
+            "exchange": exchange,
+            "value": result,
+            "expires": time.monotonic() + 30.0,
+        },
+    )
     return result
 
 
@@ -1013,10 +1101,29 @@ def check_correlation_exposure(
     open_symbols: list, candidate_symbol: str, max_correlated: int = 2
 ) -> tuple:
     def _base(sym: str) -> str:
-        return sym.split("/")[0].upper()
+        if not isinstance(sym, str):
+            raise ValueError("symbol must be text")
+        base = sym.strip().split("/", 1)[0].strip().upper()
+        if not base:
+            raise ValueError("symbol base is empty")
+        return base
 
-    candidate_base = _base(candidate_symbol)
-    open_correlated = [s for s in open_symbols if _base(s) in _HIGH_BTC_CORRELATION]
+    if type(max_correlated) is not int or max_correlated < 0:
+        return False, "invalid correlation limit"
+    if open_symbols is None or isinstance(
+        open_symbols,
+        (str, bytes, bytearray),
+    ):
+        return False, "invalid correlation symbol data"
+    try:
+        candidate_base = _base(candidate_symbol)
+        open_correlated = [
+            symbol
+            for symbol in open_symbols
+            if _base(symbol) in _HIGH_BTC_CORRELATION
+        ]
+    except Exception:
+        return False, "invalid correlation symbol data"
     if candidate_base not in _HIGH_BTC_CORRELATION:
         return True, "OK"
     if len(open_correlated) >= max_correlated:
@@ -1062,6 +1169,15 @@ def can_buy_now(
 
     Spot bots and futures LONG entries use the default allow_shorts=False.
     """
+    if not isinstance(allow_shorts, bool):
+        return False, "invalid allow_shorts flag"
+    if not isinstance(check_spread, bool):
+        return False, "invalid check_spread flag"
+    if not isinstance(candidate_symbol, str) or (
+        candidate_symbol and not candidate_symbol.strip()
+    ):
+        return False, "invalid candidate symbol"
+
     # raise_on_failure=True so we distinguish a real dump from an API outage
     # (otherwise an outage would look like a "0.00% in 1h" dump).
     try:
@@ -1086,7 +1202,15 @@ def can_buy_now(
     except Exception as exc:
         return (False, f"BTC trend check error ({type(exc).__name__})  fail-closed")
 
-    fg = get_fear_greed()
+    try:
+        fg = _normalized_fear_greed(get_fear_greed())
+    except Exception:
+        fg = None
+    if fg is None:
+        return (
+            False,
+            "Fear & Greed unavailable  fail-closed (pausing new entries)",
+        )
     if allow_shorts:
         # For shorts: extreme FEAR = capitulation bounce risk
         try:
@@ -1158,17 +1282,52 @@ def can_buy_now(
             return (False, f"Invalid price ({price!r}) for {candidate_symbol}")
 
     if check_spread and candidate_symbol:
-        ok, reason = check_spread_quality(exchange, candidate_symbol)
+        try:
+            spread_result = check_spread_quality(exchange, candidate_symbol)
+            if (
+                not isinstance(spread_result, tuple)
+                or len(spread_result) != 2
+                or not isinstance(spread_result[0], bool)
+                or not isinstance(spread_result[1], str)
+                or not spread_result[1]
+            ):
+                raise ValueError("invalid spread gate result")
+            ok, reason = spread_result
+        except Exception:
+            return False, "Spread check unavailable  fail-closed"
         if not ok:
             return False, reason
 
     if open_symbols is not None and candidate_symbol:
-        ok, reason = check_correlation_exposure(open_symbols, candidate_symbol)
+        try:
+            correlation_result = check_correlation_exposure(
+                open_symbols,
+                candidate_symbol,
+            )
+            if (
+                not isinstance(correlation_result, tuple)
+                or len(correlation_result) != 2
+                or not isinstance(correlation_result[0], bool)
+                or not isinstance(correlation_result[1], str)
+                or not correlation_result[1]
+            ):
+                raise ValueError("invalid correlation gate result")
+            ok, reason = correlation_result
+        except Exception:
+            return False, "Correlation check unavailable  fail-closed"
         if not ok:
             return False, reason
 
-    regime_data = get_market_regime(exchange)
-    regime = regime_data.get("regime")
+    try:
+        regime_data = get_market_regime(exchange)
+        if not isinstance(regime_data, Mapping):
+            raise TypeError("market regime payload must be a mapping")
+        regime = regime_data.get("regime")
+    except Exception:
+        return (
+            False,
+            "Market regime unavailable  fail-closed (pausing new entries)",
+        )
     if regime not in {"BULL", "BEAR", "NEUTRAL"}:
         return (
             False,
@@ -1179,8 +1338,20 @@ def can_buy_now(
             # BEAR is a valid SHORT context  don't block, fall through
             pass
         else:
-            btc_24h = regime_data.get("btc_24h", 0)
-            btc_7d = regime_data.get("btc_7d", 0)
+            btc_24h_raw = regime_data.get("btc_24h", 0)
+            btc_7d_raw = regime_data.get("btc_7d", 0)
+            try:
+                if isinstance(btc_24h_raw, bool) or isinstance(btc_7d_raw, bool):
+                    raise ValueError("boolean market regime telemetry")
+                btc_24h = float(btc_24h_raw)
+                btc_7d = float(btc_7d_raw)
+                if not math.isfinite(btc_24h) or not math.isfinite(btc_7d):
+                    raise ValueError("non-finite market regime telemetry")
+            except Exception:
+                return (
+                    False,
+                    "Market regime unavailable  fail-closed (pausing new entries)",
+                )
             return (
                 False,
                 f"BEAR market regime (BTC 24h={btc_24h:+.1f}%, "

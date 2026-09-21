@@ -48,10 +48,12 @@ _FALLBACK_PROMPT = (
 
 
 def _finite_metric(value) -> float | None:
-    if value is None or value == "":
+    if value is None:
         return 0.0
-    if isinstance(value, bool):
+    if type(value) not in (int, float, str):
         return None
+    if type(value) is str and not value:
+        return 0.0
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -68,12 +70,10 @@ def analyze_sentiment(
 ):
     if not is_valid_symbol(symbol):
         return _invalid_market_data_result()
-    if not llm_available():
-        return keyword_fallback(symbol, news, strategy="SPOT")
 
     if market_regime is None:
         market_regime = {"regime": "NEUTRAL", "btc_24h": 0.0, "btc_7d": 0.0}
-    if not isinstance(market_regime, dict):
+    if type(market_regime) is not dict:
         return _invalid_market_data_result()
 
     metrics = tuple(
@@ -90,6 +90,18 @@ def analyze_sentiment(
     if any(value is None for value in metrics):
         return _invalid_market_data_result()
     change_value, rsi_15m_value, rsi_1h_value, rsi_4h_value, btc_24h, btc_7d = metrics
+    if any(value < -100.0 for value in (change_value, btc_24h, btc_7d)):
+        return _invalid_market_data_result()
+    if any(
+        not 0.0 <= rsi <= 100.0
+        for rsi in (rsi_15m_value, rsi_1h_value, rsi_4h_value)
+    ):
+        return _invalid_market_data_result()
+    if not llm_available():
+        return keyword_fallback(symbol, news, strategy="SPOT")
+    regime_value = market_regime.get("regime", "NEUTRAL")
+    if type(regime_value) is not str:
+        regime_value = "NEUTRAL"
 
     template = load_prompt_template(
         _PROMPT_FILE, _DEFAULT_FILE, fallback=_FALLBACK_PROMPT
@@ -101,6 +113,8 @@ def analyze_sentiment(
         reflection = get_reflection_context(_BOT_NAME)
     except Exception:
         reflection = ""
+    if type(reflection) is not str:
+        reflection = ""
 
     fill_data = {
         "symbol": symbol,
@@ -108,8 +122,8 @@ def analyze_sentiment(
         "rsi_15m": rsi_15m_value,
         "rsi_1h": rsi_1h_value,
         "rsi_4h": rsi_4h_value,
-        "news": news if isinstance(news, str) else "",
-        "regime": market_regime.get("regime", "NEUTRAL"),
+        "news": news if type(news) is str else "",
+        "regime": regime_value,
         "btc_24h": btc_24h,
         "btc_7d": btc_7d,
         # Fields required by user's detailed spot.txt prompt
@@ -125,8 +139,10 @@ def analyze_sentiment(
 
     try:
         response = generate_with_timeout(get_model_name(), prompt, use_json_format=True)
-        full_text = response.get("response") or ""
-        if not full_text:
+        if type(response) is not dict:
+            return keyword_fallback(symbol, news, strategy="SPOT")
+        full_text = response.get("response")
+        if type(full_text) is not str or not full_text:
             return keyword_fallback(symbol, news, strategy="SPOT")
 
         import json as _json
@@ -197,7 +213,7 @@ def analyze_sentiment(
 
 def parse_confidence(llm_response: str) -> str:
     """Parse confidence from new JSON or old free-text format."""
-    if not llm_response:
+    if type(llm_response) is not str or not llm_response:
         return "LOW"
     try:
         parsed = parse_llm_json_object(llm_response.strip())
@@ -211,7 +227,7 @@ def parse_direction_and_confidence(llm_response: str):
     """Returns (direction, confidence). Handles JSON and old free-text.
     Spot bots return BUY/WAIT.
     """
-    if not isinstance(llm_response, str) or not llm_response:
+    if type(llm_response) is not str or not llm_response:
         return ("WAIT", "LOW")
     _text = llm_response.strip()
     if _text.startswith("```"):

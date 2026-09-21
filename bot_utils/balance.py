@@ -53,7 +53,7 @@ def _finite_nonnegative_float(value) -> Optional[float]:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     if math.isfinite(parsed) and parsed >= 0:
         return parsed

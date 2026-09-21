@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import math
 import random
@@ -27,7 +28,10 @@ from bot_utils.api_budget import (
     record_api_error,
     try_consume_api_call,
 )
-from bot_utils.order_utils import order_id_text_or_none
+from bot_utils.order_utils import (
+    explicit_trade_symbol_matches,
+    order_id_text_or_none,
+)
 from bot_utils.runtime_threads import thread_definitely_never_started
 from trading.venue_recorder import (
     MAX_PARTITION_CLOCK_AGE_MS,
@@ -39,11 +43,51 @@ from trading.venue_recorder import (
 
 
 _PUBLIC_ASYNC_CLOSE_TIMEOUT_SECONDS = 5.0
+_PUBLIC_ASYNC_CLOSE_MAX_TIMEOUT_SECONDS = 60.0
+_PUBLIC_OPTIONS_MAX_DEPTH = 32
+_PUBLIC_OPTIONS_MAX_NODES = 10_000
 _PUBLIC_ASYNC_CLOSE_RETRY_SECONDS = 1.0
 _PERSIST_EXECUTOR_MAX_WORKERS = 4
 _TRADE_UPDATE_MAX_ROWS = 20_000
 _TRADE_PERSIST_RETRY_INITIAL_SECONDS = 0.1
 _TRADE_PERSIST_RETRY_MAX_SECONDS = 5.0
+_MAX_CONNECTION_EPOCH = (1 << 63) - 1
+_PUBLIC_CREDENTIAL_OPTION_KEYS = frozenset({
+    "accesstoken",
+    "apikey",
+    "apisecret",
+    "authorization",
+    "clientsecret",
+    "login",
+    "password",
+    "passphrase",
+    "privatekey",
+    "refreshtoken",
+    "secret",
+    "secretkey",
+    "token",
+    "twofa",
+    "uid",
+    "walletaddress",
+})
+
+
+def _storage_safe_identity(value, *, max_chars: int) -> bool:
+    try:
+        return bool(
+            type(value) is str
+            and value
+            and value == value.strip()
+            and len(value) <= max_chars
+            and not any(
+                codepoint < 32
+                or codepoint == 127
+                or 0xD800 <= codepoint <= 0xDFFF
+                for codepoint in map(ord, value)
+            )
+        )
+    except Exception:
+        return False
 
 
 def _capture_now_ms() -> int:
@@ -60,29 +104,68 @@ def _consume_async_task_result(task: asyncio.Future) -> None:
         pass
 
 
+def _capture_write_confirmed(result) -> bool:
+    if result is None:
+        return True
+    if type(result) is bool:
+        return result
+    return isinstance(result, Path)
+
+
 async def close_public_async_exchange(
     exchange,
     *,
     timeout_seconds: float = _PUBLIC_ASYNC_CLOSE_TIMEOUT_SECONDS,
 ) -> bool:
     """Close one public async client without wedging reconnect or shutdown."""
+    if type(timeout_seconds) not in (int, float):
+        raise ValueError("async exchange close timeout must be finite")
     try:
         budget = float(timeout_seconds)
-    except (TypeError, ValueError, OverflowError) as exc:
+    except Exception as exc:
         raise ValueError("async exchange close timeout must be finite") from exc
-    if not math.isfinite(budget) or budget <= 0.0:
-        raise ValueError("async exchange close timeout must be finite and positive")
-    close = getattr(exchange, "close", None)
+    if (
+        not math.isfinite(budget)
+        or not 0.0 < budget <= _PUBLIC_ASYNC_CLOSE_MAX_TIMEOUT_SECONDS
+    ):
+        raise ValueError(
+            "async exchange close timeout must be finite, positive, and at "
+            "most 60 seconds"
+        )
+    try:
+        close = getattr(exchange, "close", None)
+    except Exception:
+        return False
     if not callable(close):
         return True
     try:
-        task = asyncio.ensure_future(close())
+        close_awaitable = close()
     except Exception:
         return False
+    try:
+        task = asyncio.ensure_future(close_awaitable)
+    except Exception:
+        if inspect.iscoroutine(close_awaitable):
+            close_awaitable.close()
+        return False
+
+    deadline = asyncio.get_running_loop().time() + budget
 
     async def finish_bounded() -> bool:
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        if remaining <= 0.0:
+            task.cancel()
+            await asyncio.sleep(0)
+            if task.done():
+                _consume_async_task_result(task)
+            else:
+                task.add_done_callback(_consume_async_task_result)
+            return False
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+            result = await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=remaining,
+            )
         except TimeoutError:
             task.cancel()
             # Give cancellation-aware aiohttp/CCXT cleanup one loop turn, but
@@ -93,20 +176,32 @@ async def close_public_async_exchange(
             else:
                 task.add_done_callback(_consume_async_task_result)
             return False
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            _consume_async_task_result(task)
+            return False
         except Exception:
             return False
-        return True
+        return result is None or result is True
 
-    try:
-        return await finish_bounded()
-    except asyncio.CancelledError:
-        # A caller cancellation requests shutdown; it must not skip client
-        # cleanup, but cleanup still obeys the same hard deadline.
-        current = asyncio.current_task()
-        if current is not None:
-            current.uncancel()
-        await finish_bounded()
-        raise
+    cancellation_requested = False
+    while True:
+        try:
+            closed = await finish_bounded()
+        except asyncio.CancelledError:
+            # Caller cancellation requests shutdown; repeated requests must
+            # not skip client cleanup, while all retries share one deadline.
+            cancellation_requested = True
+            current = asyncio.current_task()
+            if current is not None:
+                while current.cancelling():
+                    current.uncancel()
+            continue
+        if cancellation_requested:
+            raise asyncio.CancelledError
+        return closed
 
 
 class OrderBookValidationError(ValueError):
@@ -119,6 +214,15 @@ class TradeValidationError(ValueError):
 
 class TradePersistenceError(RuntimeError):
     """Raised internally when an accepted public-trade update is not durable."""
+
+
+def _plain_sequence_tuple(value, *, limit: int | None = None) -> tuple | None:
+    bounded_slice = slice(None) if limit is None else slice(0, limit)
+    if isinstance(value, list):
+        return tuple(list.__getitem__(value, bounded_slice))
+    if isinstance(value, tuple):
+        return tuple.__getitem__(value, bounded_slice)
+    return None
 
 
 def _owned_trade_update(trades) -> tuple[tuple | None, str | None]:
@@ -140,33 +244,165 @@ def _owned_trade_update(trades) -> tuple[tuple | None, str | None]:
         return None, "OversizedTradeUpdate"
     fields = ("id", "timestamp", "price", "amount", "side")
     try:
-        owned = tuple(
+        projected = tuple(
             {
-                field: copy.deepcopy(trade.get(field))
+                field: dict.get(trade, field)
                 for field in fields
             }
             if isinstance(trade, dict)
             else trade
             for trade in snapshot
         )
+        owned = copy.deepcopy(projected)
     except Exception:
         return None, "MalformedTradeUpdate"
     return owned, None
 
 
+def _copy_public_options(
+    value,
+    memo: dict | None = None,
+    active: set[int] | None = None,
+    depth: int = 0,
+    node_budget: list[int] | None = None,
+):
+    if memo is None:
+        memo = {}
+    if active is None:
+        active = set()
+    if node_budget is None:
+        node_budget = [0]
+    value_id = id(value)
+    if value_id in active:
+        raise ValueError("recursive public option container")
+    existing = memo.get(id(value))
+    if existing is not None:
+        return existing
+    if depth > _PUBLIC_OPTIONS_MAX_DEPTH:
+        raise ValueError("public option nesting is too deep")
+    node_budget[0] += 1
+    if node_budget[0] > _PUBLIC_OPTIONS_MAX_NODES:
+        raise ValueError("public option graph is too large")
+    if isinstance(value, dict):
+        copied = {}
+        memo[value_id] = copied
+        active.add(value_id)
+        try:
+            for key, item in dict.items(value):
+                if not isinstance(key, str):
+                    continue
+                normalized_key = "".join(
+                    char
+                    for char in str.casefold(key)
+                    if char.isalnum()
+                )
+                if normalized_key in _PUBLIC_CREDENTIAL_OPTION_KEYS:
+                    continue
+                if type(key) is not str:
+                    continue
+                copied[key] = _copy_public_options(
+                    item,
+                    memo,
+                    active,
+                    depth + 1,
+                    node_budget,
+                )
+        finally:
+            active.remove(value_id)
+        return copied
+    if isinstance(value, list):
+        copied = []
+        memo[value_id] = copied
+        active.add(value_id)
+        try:
+            copied.extend(
+                _copy_public_options(
+                    item,
+                    memo,
+                    active,
+                    depth + 1,
+                    node_budget,
+                )
+                for item in list.__iter__(value)
+            )
+        finally:
+            active.remove(value_id)
+        return copied
+    if isinstance(value, tuple):
+        active.add(value_id)
+        try:
+            copied = tuple(
+                _copy_public_options(
+                    item,
+                    memo,
+                    active,
+                    depth + 1,
+                    node_budget,
+                )
+                for item in tuple.__iter__(value)
+            )
+        finally:
+            active.remove(value_id)
+        memo[value_id] = copied
+        return copied
+    if type(value) in (str, int, float, bool, type(None)):
+        return value
+    raise TypeError("unsupported public option value")
+
+
+def _copy_public_proxy_setting(value):
+    if type(value) is str:
+        return value if len(value) > 0 else None
+    if not isinstance(value, dict):
+        return None
+    copied = {}
+    for key, item in dict.items(value):
+        if (
+            type(key) is not str
+            or len(key) == 0
+            or type(item) is not str
+            or len(item) == 0
+        ):
+            return None
+        copied[key] = item
+    return copied or None
+
+
 def build_public_async_config(exchange, *, new_updates: bool = False) -> dict:
     """Copy public-market and network settings without copying credentials."""
-    config: dict = {"enableRateLimit": True, "newUpdates": bool(new_updates)}
-    timeout = getattr(exchange, "timeout", None)
-    if timeout is not None:
+    if type(new_updates) is not bool:
+        raise ValueError("new_updates must be boolean")
+    config: dict = {"enableRateLimit": True, "newUpdates": new_updates}
+    try:
+        timeout = getattr(exchange, "timeout", None)
+    except Exception:
+        timeout = None
+    if type(timeout) is int and 0 < timeout <= 3_600_000:
         config["timeout"] = timeout
-    options = getattr(exchange, "options", None)
-    if options:
-        config["options"] = copy.deepcopy(dict(options))
+    try:
+        options = getattr(exchange, "options", None)
+    except Exception:
+        options = None
+    raw_options = options if isinstance(options, dict) else None
+    if raw_options is not None:
+        try:
+            copied_options = _copy_public_options(raw_options)
+        except Exception:
+            pass
+        else:
+            if copied_options:
+                config["options"] = copied_options
     if new_updates:
-        config.setdefault("options", {})["tradesLimit"] = max(
-            10_000,
-            int(config.get("options", {}).get("tradesLimit") or 0),
+        public_options = config.setdefault("options", {})
+        raw_trades_limit = dict.get(public_options, "tradesLimit")
+        trades_limit = (
+            raw_trades_limit
+            if type(raw_trades_limit) is int and raw_trades_limit >= 0
+            else 0
+        )
+        public_options["tradesLimit"] = min(
+            _TRADE_UPDATE_MAX_ROWS,
+            max(10_000, trades_limit),
         )
     for key in (
         "proxies",
@@ -176,18 +412,24 @@ def build_public_async_config(exchange, *, new_updates: bool = False) -> dict:
         "wsProxy",
         "wssProxy",
     ):
-        value = getattr(exchange, key, None)
-        if value:
-            config[key] = copy.deepcopy(value)
+        try:
+            value = getattr(exchange, key, None)
+        except Exception:
+            continue
+        copied_value = _copy_public_proxy_setting(value)
+        if copied_value is not None:
+            config[key] = copied_value
     return config
 
 
 def _finite_positive(value, label: str) -> float:
-    if isinstance(value, bool):
+    if type(value) is bool:
         raise OrderBookValidationError(f"{label} is boolean")
+    if type(value) not in (int, float, str):
+        raise OrderBookValidationError(f"{label} is not numeric")
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
+    except Exception as exc:
         raise OrderBookValidationError(f"{label} is not numeric") from exc
     if not math.isfinite(parsed) or parsed <= 0:
         raise OrderBookValidationError(f"{label} must be finite and positive")
@@ -195,15 +437,30 @@ def _finite_positive(value, label: str) -> float:
 
 
 def _normalize_side(raw, *, side: str, limit: int) -> list[list[float]]:
-    if not isinstance(raw, (list, tuple)) or not raw:
+    if isinstance(raw, list):
+        snapshot = list.__getitem__(raw, slice(0, limit))
+    elif isinstance(raw, tuple):
+        snapshot = tuple.__getitem__(raw, slice(0, limit))
+    else:
+        snapshot = ()
+    if not snapshot:
         raise OrderBookValidationError(f"{side} is empty")
     result: list[list[float]] = []
     previous_price: float | None = None
-    for index, level in enumerate(raw[:limit]):
-        if not isinstance(level, (list, tuple)) or len(level) < 2:
+    for index, level in enumerate(snapshot):
+        if isinstance(level, list):
+            level_length = list.__len__(level)
+            item_at = list.__getitem__
+        elif isinstance(level, tuple):
+            level_length = tuple.__len__(level)
+            item_at = tuple.__getitem__
+        else:
+            level_length = 0
+            item_at = None
+        if level_length < 2 or item_at is None:
             raise OrderBookValidationError(f"{side}[{index}] is malformed")
-        price = _finite_positive(level[0], f"{side}[{index}].price")
-        amount = _finite_positive(level[1], f"{side}[{index}].amount")
+        price = _finite_positive(item_at(level, 0), f"{side}[{index}].price")
+        amount = _finite_positive(item_at(level, 1), f"{side}[{index}].amount")
         if previous_price is not None:
             out_of_order = (
                 price >= previous_price if side == "bids" else price <= previous_price
@@ -219,19 +476,25 @@ def normalize_order_book(book: dict, *, depth_levels: int) -> dict:
     """Return a JSON-safe, bounded book or reject the complete snapshot."""
     if not isinstance(book, dict):
         raise OrderBookValidationError("order book is not a mapping")
-    limit = max(1, min(100, int(depth_levels)))
-    bids = _normalize_side(book.get("bids"), side="bids", limit=limit)
-    asks = _normalize_side(book.get("asks"), side="asks", limit=limit)
+    if type(depth_levels) is not int or not 1 <= depth_levels <= 100:
+        raise OrderBookValidationError(
+            "depth_levels must be an integer between 1 and 100"
+        )
+    limit = depth_levels
+    bids = _normalize_side(dict.get(book, "bids"), side="bids", limit=limit)
+    asks = _normalize_side(dict.get(book, "asks"), side="asks", limit=limit)
     if bids[0][0] >= asks[0][0]:
         raise OrderBookValidationError("order book is crossed or locked")
 
-    timestamp = book.get("timestamp")
+    timestamp = dict.get(book, "timestamp")
     if timestamp is not None:
-        if isinstance(timestamp, bool):
+        if type(timestamp) is bool:
             raise OrderBookValidationError("timestamp is boolean")
+        if type(timestamp) not in (int, float, str):
+            raise OrderBookValidationError("timestamp is invalid")
         try:
             timestamp_value = float(timestamp)
-        except (TypeError, ValueError, OverflowError) as exc:
+        except Exception as exc:
             raise OrderBookValidationError("timestamp is invalid") from exc
         if (
             not math.isfinite(timestamp_value)
@@ -243,13 +506,36 @@ def normalize_order_book(book: dict, *, depth_levels: int) -> dict:
             )
         timestamp = int(timestamp_value)
 
-    nonce = book.get("nonce")
-    if isinstance(nonce, bool):
+    nonce = dict.get(book, "nonce")
+    if type(nonce) is bool:
         nonce = None
-    elif isinstance(nonce, float):
-        nonce = int(nonce) if math.isfinite(nonce) and nonce.is_integer() else str(nonce)
-    elif nonce is not None and not isinstance(nonce, (int, str)):
-        nonce = str(nonce)
+    elif type(nonce) is float:
+        nonce = int(nonce) if math.isfinite(nonce) and nonce.is_integer() else None
+    elif nonce is not None and type(nonce) not in (int, str):
+        nonce = None
+    if type(nonce) is str:
+        if (
+            not nonce
+            or nonce != nonce.strip()
+            or len(nonce) > 256
+            or any(
+                codepoint < 32
+                or codepoint == 127
+                or 0xD800 <= codepoint <= 0xDFFF
+                for codepoint in map(ord, nonce)
+            )
+        ):
+            nonce = None
+    if type(nonce) is int and (nonce < 0 or nonce >= 10**256):
+        nonce = None
+    elif type(nonce) is str:
+        try:
+            numeric_nonce = int(nonce)
+        except ValueError:
+            pass
+        else:
+            if numeric_nonce < 0 or numeric_nonce >= 10**256:
+                nonce = None
     return {
         "bids": bids,
         "asks": asks,
@@ -278,19 +564,66 @@ class L2ShadowCollector:
         log_event=None,
         async_exchange_factory: Callable[[dict], object] | None = None,
     ) -> None:
+        if type(max_symbols) is not int or not 1 <= max_symbols <= 50:
+            raise ValueError(
+                "max_symbols must be an integer between 1 and 50"
+            )
+        if type(depth_levels) is not int or not 5 <= depth_levels <= 100:
+            raise ValueError(
+                "depth_levels must be an integer between 5 and 100"
+            )
+        if (
+            type(sample_interval_seconds) not in (int, float)
+            or not math.isfinite(sample_interval_seconds)
+            or not 0.25 <= sample_interval_seconds <= 60
+        ):
+            raise ValueError(
+                "sample_interval_seconds must be a finite number between "
+                "0.25 and 60"
+            )
+        if (
+            type(stale_after_ms) is not int
+            or not 250 <= stale_after_ms <= 60_000
+        ):
+            raise ValueError(
+                "stale_after_ms must be an integer between 250 and 60000"
+            )
+        if (
+            type(reconnect_max_seconds) not in (int, float)
+            or not math.isfinite(reconnect_max_seconds)
+            or not 2 <= reconnect_max_seconds <= 120
+        ):
+            raise ValueError(
+                "reconnect_max_seconds must be a finite number between "
+                "2 and 120"
+            )
+        if async_exchange_factory is not None and not callable(
+            async_exchange_factory
+        ):
+            raise ValueError("async_exchange_factory must be callable")
+        if log_event is not None and not callable(log_event):
+            raise ValueError("log_event must be callable")
         self.exchange = exchange
-        self.exchange_id = str(
-            getattr(exchange, "id", None) or type(exchange).__name__
-        ).lower()
+        raw_exchange_id = getattr(exchange, "id", None)
+        if raw_exchange_id is None or (
+            type(raw_exchange_id) is str and not raw_exchange_id
+        ):
+            self.exchange_id = type(exchange).__name__.lower()
+        elif type(raw_exchange_id) is str:
+            self.exchange_id = raw_exchange_id.lower()
+        else:
+            raise ValueError("exchange identity is invalid")
+        if not _storage_safe_identity(self.exchange_id, max_chars=64):
+            raise ValueError("exchange identity is invalid")
         self.writer = (
             writer if writer is not None else SQLitePartitionWriter(root)
         )
         self._owns_writer = writer is None
-        self.max_symbols = max(1, min(50, int(max_symbols)))
-        self.depth_levels = max(5, min(100, int(depth_levels)))
-        self.sample_interval = max(0.25, float(sample_interval_seconds))
-        self.stale_after_ms = max(250, int(stale_after_ms))
-        self.reconnect_max_seconds = max(2.0, float(reconnect_max_seconds))
+        self.max_symbols = max_symbols
+        self.depth_levels = depth_levels
+        self.sample_interval = float(sample_interval_seconds)
+        self.stale_after_ms = stale_after_ms
+        self.reconnect_max_seconds = float(reconnect_max_seconds)
         self.log_event = log_event
         self._async_exchange_factory = async_exchange_factory
         self._symbols: tuple[str, ...] = ()
@@ -422,17 +755,28 @@ class L2ShadowCollector:
             }
 
     def _log(self, message: str, level: str = "INFO") -> None:
-        if not self.log_event:
+        if self.log_event is None:
             return
         try:
             self.log_event(f"[L2Shadow:{self.exchange_id}] {message}", level)
         except Exception:
             pass
 
-    def update_symbols(self, symbols) -> None:
-        unique = tuple(dict.fromkeys(str(item) for item in symbols if item))[
-            : self.max_symbols
-        ]
+    def update_symbols(self, symbols) -> bool | None:
+        if not isinstance(symbols, (list, tuple)):
+            return False
+        try:
+            normalized = _plain_sequence_tuple(symbols)
+            if normalized is None:
+                return False
+            if any(
+                not _storage_safe_identity(item, max_chars=256)
+                for item in normalized
+            ):
+                return False
+            unique = tuple(dict.fromkeys(normalized))[: self.max_symbols]
+        except Exception:
+            return False
         with self._symbols_lock:
             previous = set(self._symbols)
             self._symbols = unique
@@ -478,14 +822,18 @@ class L2ShadowCollector:
         universe: tuple[str, ...] | None,
     ) -> tuple[str, ...] | None:
         raw = self._symbol_snapshot() if universe is None else universe
-        if not isinstance(raw, (list, tuple)) or not raw:
+        try:
+            normalized = _plain_sequence_tuple(
+                raw,
+                limit=self.max_symbols + 1,
+            )
+        except Exception:
             return None
-        normalized = tuple(raw)
+        if not normalized or len(normalized) > self.max_symbols:
+            return None
         if (
             any(
-                not isinstance(item, str)
-                or not item
-                or item != item.strip()
+                not _storage_safe_identity(item, max_chars=256)
                 for item in normalized
             )
             or len(normalized) != len(set(normalized))
@@ -495,9 +843,15 @@ class L2ShadowCollector:
         return normalized
 
     def _should_stop(self) -> bool:
-        return self._stop_event.is_set() or bool(
-            self._shutdown_event and self._shutdown_event.is_set()
-        )
+        if self._stop_event.is_set():
+            return True
+        if self._shutdown_event is None:
+            return False
+        try:
+            requested = self._shutdown_event.is_set()
+        except Exception:
+            return True
+        return requested if type(requested) is bool else True
 
     @staticmethod
     def _iso8601(timestamp_ms: int) -> str:
@@ -505,9 +859,52 @@ class L2ShadowCollector:
             "+00:00", "Z"
         )
 
+    def _capture_clocks(
+        self,
+        received_ms: int | None,
+        observed_at_monotonic: float | None,
+    ) -> tuple[int, float, str] | None:
+        if received_ms is None:
+            received_ms = _capture_now_ms()
+        if type(received_ms) is not int or received_ms <= 0:
+            return None
+        try:
+            received_time = self._iso8601(received_ms)
+        except (OverflowError, OSError, TypeError, ValueError):
+            return None
+        if observed_at_monotonic is None:
+            observed_at_monotonic = time.monotonic()
+        if (
+            type(observed_at_monotonic) not in (int, float)
+            or not math.isfinite(observed_at_monotonic)
+            or observed_at_monotonic < 0
+            or observed_at_monotonic > time.monotonic()
+        ):
+            return None
+        return received_ms, float(observed_at_monotonic), received_time
+
+    @staticmethod
+    def _valid_connection_epoch(connection_epoch: int | None) -> bool:
+        return connection_epoch is None or (
+            type(connection_epoch) is int
+            and 0 <= connection_epoch <= _MAX_CONNECTION_EPOCH
+        )
+
     def _market_id(self, symbol: str) -> str:
-        market = (getattr(self.exchange, "markets", None) or {}).get(symbol) or {}
-        return str(market.get("id") or symbol)
+        try:
+            markets = getattr(self.exchange, "markets", None)
+            if not isinstance(markets, dict):
+                return symbol
+            market = dict.get(markets, symbol)
+            if not isinstance(market, dict):
+                return symbol
+            raw_market_id = dict.get(market, "id")
+            market_id = raw_market_id if type(raw_market_id) is str else symbol
+            if not _storage_safe_identity(market_id, max_chars=256):
+                return symbol
+            return market_id
+        except Exception:
+            return symbol
 
     @staticmethod
     def _nonce_is_monotonic(previous, current) -> bool | None:
@@ -515,7 +912,7 @@ class L2ShadowCollector:
             return None
         try:
             return int(current) >= int(previous)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return None
 
     def record_order_book(
@@ -529,7 +926,27 @@ class L2ShadowCollector:
         universe: tuple[str, ...] | None = None,
     ) -> bool:
         """Validate and optionally persist one sampled unified snapshot."""
+        if not _storage_safe_identity(symbol, max_chars=256):
+            return False
         try:
+            raw_book_symbol = (
+                dict.get(book, "symbol")
+                if isinstance(book, dict)
+                else None
+            )
+            if (
+                raw_book_symbol is not None
+                and (
+                    type(raw_book_symbol) is not str
+                    or raw_book_symbol != str.strip(raw_book_symbol)
+                    or not explicit_trade_symbol_matches(
+                        {"symbol": raw_book_symbol}, symbol
+                    )
+                )
+            ):
+                raise OrderBookValidationError(
+                    "order book identity is invalid"
+                )
             normalized = normalize_order_book(book, depth_levels=self.depth_levels)
         except OrderBookValidationError as exc:
             self._mark_l2_unhealthy(symbol, type(exc).__name__)
@@ -544,14 +961,14 @@ class L2ShadowCollector:
                 "WARN",
             )
             return False
-
-        now_monotonic = (
-            time.monotonic()
-            if observed_at_monotonic is None
-            else observed_at_monotonic
-        )
-        if received_ms is None:
-            received_ms = _capture_now_ms()
+        clocks = self._capture_clocks(received_ms, observed_at_monotonic)
+        if clocks is None:
+            self._mark_l2_unhealthy(symbol, "InvalidCaptureClock")
+            return False
+        received_ms, now_monotonic, received_time = clocks
+        if not self._valid_connection_epoch(connection_epoch):
+            self._mark_l2_unhealthy(symbol, "InvalidConnectionEpoch")
+            return False
         with self._state_lock:
             previous_nonce = self._last_nonce.get(symbol)
             current_nonce = normalized["nonce"]
@@ -562,7 +979,7 @@ class L2ShadowCollector:
                     previous_nonce_value = (
                         None if previous_nonce is None else int(previous_nonce)
                     )
-                except (TypeError, ValueError, OverflowError):
+                except Exception:
                     current_nonce_value = None
                     previous_nonce_value = None
                 if (
@@ -605,7 +1022,6 @@ class L2ShadowCollector:
         flags = ["sequence_unverified"]
         exchange_ms = normalized["timestamp"]
         raw_fallback_exchange_ms = None
-        received_time = self._iso8601(received_ms)
         if exchange_ms is None:
             flags.append("missing_exchange_timestamp")
             exchange_ms = received_ms
@@ -650,24 +1066,33 @@ class L2ShadowCollector:
         }
         if raw_fallback_exchange_ms is not None:
             payload["raw_exchange_timestamp_ms"] = raw_fallback_exchange_ms
+        quality_flags = tuple(flags)
         digest = hashlib.blake2s(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            json.dumps(
+                {
+                    "payload": payload,
+                    "quality_flags": quality_flags,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
             digest_size=8,
         ).hexdigest()
+        market_id = self._market_id(symbol)
         event = VenueEvent(
             event_id=(
-                f"l2_stream:{self.exchange_id}:{self._market_id(symbol)}:"
+                f"l2_stream:{self.exchange_id}:{market_id}:"
                 f"{exchange_ms}:{received_ms}:{digest}"
             ),
             kind="l2_stream",
-            market_id=self._market_id(symbol),
+            market_id=market_id,
             exchange_time=exchange_time,
             received_time=received_time,
             payload=payload,
-            quality_flags=tuple(flags),
+            quality_flags=quality_flags,
         )
         try:
-            if self.writer.write(event) is False:
+            if not _capture_write_confirmed(self.writer.write(event)):
                 raise RuntimeError("L2 capture writer rejected event")
         except Exception as exc:
             # A failed write did not satisfy the sampling contract. Roll back
@@ -723,10 +1148,17 @@ class L2ShadowCollector:
         _raise_storage_error: bool = False,
     ) -> bool:
         """Persist one bounded CCXT-Pro public-trade update."""
+        if not _storage_safe_identity(symbol, max_chars=256):
+            return False
         if not isinstance(trades, (list, tuple)):
             self._mark_trade_unhealthy(symbol, "EmptyTradeUpdate")
             return False
         try:
+            bounded_slice = slice(0, _TRADE_UPDATE_MAX_ROWS + 1)
+            if isinstance(trades, list):
+                trades = tuple(list.__getitem__(trades, bounded_slice))
+            else:
+                trades = tuple(tuple.__getitem__(trades, bounded_slice))
             trade_count = len(trades)
         except Exception:
             self._mark_trade_unhealthy(symbol, "MalformedTradeUpdate")
@@ -745,14 +1177,19 @@ class L2ShadowCollector:
                 "WARN",
             )
             return False
-        if received_ms is None:
-            received_ms = _capture_now_ms()
-        if observed_at_monotonic is None:
-            observed_at_monotonic = time.monotonic()
+        clocks = self._capture_clocks(received_ms, observed_at_monotonic)
+        if clocks is None:
+            self._mark_trade_unhealthy(symbol, "InvalidCaptureClock")
+            return False
+        received_ms, observed_at_monotonic, received_time = clocks
+        if not self._valid_connection_epoch(connection_epoch):
+            self._mark_trade_unhealthy(symbol, "InvalidConnectionEpoch")
+            return False
         if connection_epoch is None:
             with self._state_lock:
                 connection_epoch = self._connection_epoch
         normalized = []
+        exchange_times: dict[int, str] = {}
         duplicate_count = 0
         stale_trade_count = 0
         seen: dict[str, tuple] = {}
@@ -760,23 +1197,72 @@ class L2ShadowCollector:
             for index, trade in enumerate(trades):
                 if not isinstance(trade, dict):
                     raise TradeValidationError(f"trade[{index}] is malformed")
-                trade_id = order_id_text_or_none(trade.get("id"))
+                raw_trade_symbol = dict.get(trade, "symbol")
+                if (
+                    raw_trade_symbol is not None
+                    and (
+                        type(raw_trade_symbol) is not str
+                        or raw_trade_symbol != str.strip(raw_trade_symbol)
+                        or not explicit_trade_symbol_matches(
+                            {"symbol": raw_trade_symbol}, symbol
+                        )
+                    )
+                ):
+                    raise TradeValidationError(
+                        f"trade[{index}] identity is invalid"
+                    )
+                raw_trade_id = dict.get(trade, "id")
+                trade_id = order_id_text_or_none(raw_trade_id)
+                if (
+                    isinstance(raw_trade_id, str)
+                    and (
+                        type(raw_trade_id) is not str
+                        or raw_trade_id != str.strip(raw_trade_id)
+                    )
+                ) or (
+                    isinstance(raw_trade_id, int)
+                    and (
+                        type(raw_trade_id) is not int
+                        or raw_trade_id < 0
+                    )
+                ) or (
+                    trade_id is not None
+                    and not _storage_safe_identity(trade_id, max_chars=256)
+                ):
+                    trade_id = None
                 timestamp = _finite_positive(
-                    trade.get("timestamp"), f"trade[{index}].timestamp"
+                    dict.get(trade, "timestamp"), f"trade[{index}].timestamp"
                 )
-                price = _finite_positive(trade.get("price"), f"trade[{index}].price")
+                price = _finite_positive(
+                    dict.get(trade, "price"), f"trade[{index}].price"
+                )
                 amount = _finite_positive(
-                    trade.get("amount"), f"trade[{index}].amount"
+                    dict.get(trade, "amount"), f"trade[{index}].amount"
                 )
                 if not timestamp.is_integer() or timestamp > received_ms + 30_000:
                     raise TradeValidationError(f"trade[{index}].timestamp is invalid")
                 if received_ms - timestamp > MAX_PARTITION_CLOCK_AGE_MS:
                     stale_trade_count += 1
                     continue
-                side = str(trade.get("side") or "").strip().lower()
+                timestamp_ms = int(timestamp)
+                try:
+                    exchange_time = exchange_times.get(timestamp_ms)
+                    if exchange_time is None:
+                        exchange_time = self._iso8601(timestamp_ms)
+                        exchange_times[timestamp_ms] = exchange_time
+                except (OverflowError, OSError, ValueError) as exc:
+                    raise TradeValidationError(
+                        f"trade[{index}].timestamp is unrepresentable"
+                    ) from exc
+                raw_side = dict.get(trade, "side")
+                if type(raw_side) is not str or raw_side != str.strip(raw_side):
+                    raise TradeValidationError(
+                        f"trade[{index}] identity is invalid"
+                    )
+                side = str.lower(raw_side)
                 if trade_id is None or side not in {"buy", "sell"}:
                     raise TradeValidationError(f"trade[{index}] identity is invalid")
-                evidence = (int(timestamp), price, amount, side)
+                evidence = (timestamp_ms, price, amount, side)
                 previous = seen.get(trade_id)
                 if previous == evidence:
                     duplicate_count += 1
@@ -788,7 +1274,7 @@ class L2ShadowCollector:
                 seen[trade_id] = evidence
                 normalized.append({
                     "id": trade_id,
-                    "timestamp": int(timestamp),
+                    "timestamp": timestamp_ms,
                     "price": price,
                     "amount": amount,
                     "side": side,
@@ -842,14 +1328,14 @@ class L2ShadowCollector:
                 observed_at_monotonic=observed_at_monotonic,
             )
             return True
-        received_time = self._iso8601(received_ms)
         # A websocket update can straddle UTC midnight. Split it before the
         # partition writer sees it so every embedded trade belongs to the
         # partition selected by the event exchange time.
         groups: dict[str, list[dict]] = {}
         for trade in normalized:
-            trade_day = self._iso8601(trade["timestamp"])[:10]
+            trade_day = exchange_times[trade["timestamp"]][:10]
             groups.setdefault(trade_day, []).append(trade)
+        market_id = self._market_id(symbol)
         sealed_days = []
         try:
             for trade_day, day_trades in sorted(groups.items()):
@@ -862,9 +1348,16 @@ class L2ShadowCollector:
                     "connection_epoch": connection_epoch,
                     "continuity_status": "websocket_observed_id_deduplicated",
                 }
+                quality_flags = (
+                    ("stale_trade_timestamp",)
+                    if stale_trade_count else ()
+                )
                 digest = hashlib.blake2s(
                     json.dumps(
-                        payload,
+                        {
+                            "payload": payload,
+                            "quality_flags": quality_flags,
+                        },
                         sort_keys=True,
                         separators=(",", ":"),
                     ).encode("utf-8"),
@@ -873,21 +1366,18 @@ class L2ShadowCollector:
                 latest_ms = max(row["timestamp"] for row in day_trades)
                 event = VenueEvent(
                     event_id=(
-                        f"trades:{self.exchange_id}:{self._market_id(symbol)}:"
+                        f"trades:{self.exchange_id}:{market_id}:"
                         f"{trade_day}:{latest_ms}:{received_ms}:{digest}"
                     ),
                     kind="trades",
-                    market_id=self._market_id(symbol),
-                    exchange_time=self._iso8601(latest_ms),
+                    market_id=market_id,
+                    exchange_time=exchange_times[latest_ms],
                     received_time=received_time,
                     payload=payload,
-                    quality_flags=(
-                        ("stale_trade_timestamp",)
-                        if stale_trade_count else ()
-                    ),
+                    quality_flags=quality_flags,
                 )
                 try:
-                    if self.writer.write(event) is False:
+                    if not _capture_write_confirmed(self.writer.write(event)):
                         raise RuntimeError(
                             "trade capture writer rejected event"
                         )
@@ -1007,7 +1497,10 @@ class L2ShadowCollector:
         # never compares its nonce with evidence from the previous connection.
         next_epoch = getattr(self.writer, "next_connection_epoch", None)
         epoch = next_epoch() if callable(next_epoch) else self._connection_epoch + 1
-        if type(epoch) is not int or epoch <= 0:
+        if (
+            type(epoch) is not int
+            or not 0 < epoch <= _MAX_CONNECTION_EPOCH
+        ):
             raise RuntimeError("connection epoch is invalid")
         self._begin_health_check(
             error_type=error_type,
@@ -1239,6 +1732,13 @@ class L2ShadowCollector:
     async def _persist_off_loop(self, callback, *args, **kwargs):
         """Keep the loop responsive and drain durable work before cancellation."""
         executor = getattr(self, "_persist_executor", None)
+        if executor is not None:
+            try:
+                executor_submit = getattr(executor, "submit", None)
+            except Exception as exc:
+                raise RuntimeError("persist executor is invalid") from exc
+            if not callable(executor_submit):
+                raise RuntimeError("persist executor is invalid")
         loop = asyncio.get_running_loop()
         callback_work = partial(callback, *args, **kwargs)
         lock, states = self._persist_registry()
@@ -1256,11 +1756,19 @@ class L2ShadowCollector:
                         states.pop(token, None)
                     state["done"].set()
 
-        task = (
-            loop.run_in_executor(executor, tracked_work)
-            if executor is not None
-            else asyncio.create_task(asyncio.to_thread(tracked_work))
-        )
+        if executor is not None:
+            task = loop.run_in_executor(executor, tracked_work)
+        else:
+            work_awaitable = asyncio.to_thread(tracked_work)
+            try:
+                task = asyncio.create_task(work_awaitable)
+            except BaseException:
+                work_awaitable.close()
+                with lock:
+                    if states.get(token) is state:
+                        states.pop(token, None)
+                    state["done"].set()
+                raise
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -1722,6 +2230,18 @@ class L2ShadowCollector:
             self.close()
 
     def start(self, shutdown_event: threading.Event | None = None) -> bool:
+        if shutdown_event is not None:
+            try:
+                is_set = getattr(shutdown_event, "is_set", None)
+                initially_set = is_set() if callable(is_set) else None
+            except Exception:
+                return False
+            if (
+                not callable(is_set)
+                or type(initially_set) is not bool
+                or initially_set
+            ):
+                return False
         with self._lifecycle_lock:
             close_lock = getattr(self, "_owned_writer_close_lock", None)
             if close_lock is None:
@@ -1796,11 +2316,11 @@ class L2ShadowCollector:
                 return True
 
     def stop(self, *, timeout: float = 5.0) -> bool:
-        if isinstance(timeout, bool):
+        if type(timeout) not in (int, float):
             return False
         try:
             timeout = float(timeout)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return False
         if not math.isfinite(timeout):
             return False
@@ -1853,10 +2373,13 @@ class L2ShadowCollector:
                 if getattr(self, "_owned_writer_closed", False):
                     return True
                 self._owned_writer_terminal = True
-                close = getattr(self.writer, "close", None)
-                if callable(close):
-                    result = close()
-                    if result is not None and result is not True:
-                        return False
+                try:
+                    close = getattr(self.writer, "close", None)
+                    if callable(close):
+                        result = close()
+                        if result is not None and result is not True:
+                            return False
+                except Exception:
+                    return False
                 self._owned_writer_closed = True
         return True

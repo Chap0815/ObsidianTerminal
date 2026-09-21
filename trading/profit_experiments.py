@@ -53,7 +53,7 @@ class LinearExpectancyModel:
                 raise ValueError(f"{label} must be finite")
             try:
                 parsed = float(value)
-            except (TypeError, ValueError, OverflowError) as exc:
+            except Exception as exc:
                 raise ValueError(f"{label} must be finite") from exc
             if not math.isfinite(parsed):
                 raise ValueError(f"{label} must be finite")

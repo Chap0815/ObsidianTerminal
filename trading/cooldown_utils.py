@@ -78,7 +78,7 @@ def should_cooldown_after_exit(reason: str, profit_usdt: float) -> bool:
         return True
     try:
         profit = float(profit_usdt)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return True
     return not math.isfinite(profit) or profit < 0.0
 
@@ -162,7 +162,7 @@ def _normalize_cooldown_minutes(value) -> Optional[int]:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     if (
         not math.isfinite(parsed)
@@ -238,7 +238,7 @@ def _pid_alive(
 @contextmanager
 def _file_lock(path: str, timeout: float = 5.0):
     """Cross-process advisory lock keyed on path + '.lock'."""
-    if isinstance(timeout, bool):
+    if type(timeout) not in (int, float):
         raise ValueError("cooldown lock timeout must be finite and non-negative")
     try:
         timeout = float(timeout)
@@ -384,7 +384,7 @@ def _file_lock(path: str, timeout: float = 5.0):
             remove_lock_if_same(acquired_stat)
 
 
-#  Public API 
+#  Public API
 
 def _schedule_cooldown_retry_locked(path: str) -> None:
     """Schedule one daemon persistence retry; caller holds _COOLDOWN_LOCK."""
@@ -648,7 +648,7 @@ def _shutdown_cooldown_persistence_owned(timeout: float = 0.0) -> bool:
 
 def shutdown_cooldown_persistence(timeout: float = 0.0) -> bool:
     """Serialize terminal cooldown persistence under one bounded budget."""
-    if isinstance(timeout, bool):
+    if type(timeout) not in (int, float):
         return False
     try:
         budget = float(timeout)
@@ -765,7 +765,7 @@ def purge_expired(cool: dict, cooldown_file: str) -> int:
     return removed
 
 
-#  Persistence 
+#  Persistence
 
 def _active_cooldowns(
     data,

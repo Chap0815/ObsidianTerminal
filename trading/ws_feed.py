@@ -42,6 +42,27 @@ _REST_RESTART_BACKOFF_SEC = 2.0
 _REST_RESTART_MAX_BACKOFF_SEC = 30.0
 
 
+def _public_ticker_price(value) -> float:
+    if type(value) not in (int, float, str):
+        return 0.0
+    return safe_positive_float(value, 0.0)
+
+
+def _public_ticker_snapshot(value) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    if type(value) is dict:
+        return value
+    try:
+        return dict.copy(value)
+    except Exception:
+        return None
+
+
+def _public_ticker_optional_value(value):
+    return value if type(value) in (int, float, str) else None
+
+
 def _ws_session_is_stable(
     healthy_since: float | None,
     now: float,
@@ -87,12 +108,12 @@ def _clone_exchange(exchange):
         return clone
     except Exception as exc:
         if clone is not None and clone is not exchange:
-            close = getattr(clone, "close", None)
-            if callable(close):
-                try:
+            try:
+                close = getattr(clone, "close", None)
+                if callable(close):
                     close()
-                except Exception:
-                    pass
+            except Exception:
+                pass
         raise RuntimeError(
             "independent REST exchange clone unavailable"
         ) from exc
@@ -178,11 +199,11 @@ class WebSocketFeed:
 
     def stop(self, timeout: float = 1.0) -> bool:
         """Stop the current feed generation within one end-to-end deadline."""
-        if isinstance(timeout, bool):
+        if type(timeout) not in (int, float):
             return False
         try:
             budget = float(timeout)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return False
         if not math.isfinite(budget):
             return False
@@ -464,11 +485,11 @@ class WebSocketFeed:
             if c is self._exchange:
                 successful.append(c)
                 continue
-            close = getattr(c, "close", None)
-            if not callable(close):
-                successful.append(c)
-                continue
             try:
+                close = getattr(c, "close", None)
+                if not callable(close):
+                    successful.append(c)
+                    continue
                 closed = close()
             except Exception as exc:
                 failed.append(c)
@@ -499,22 +520,25 @@ class WebSocketFeed:
         return not failed
 
     def get_ticker(self, symbol: str) -> Optional[dict]:
+        if type(symbol) is not str:
+            return None
         with self._cache_lock:
             entry = self._cache.get(symbol)
-        if not entry:
-            return None
-        age = time.monotonic() - entry.get("_monotonic", 0)
-        return entry if age <= CACHE_STALE_SEC else None
+            if not entry:
+                return None
+            snapshot = dict(entry)
+        age = time.monotonic() - snapshot.get("_monotonic", 0)
+        return snapshot if age <= CACHE_STALE_SEC else None
 
     def get_price(self, symbol: str, fallback: float = 0.0) -> float:
         t = self.get_ticker(symbol)
         if not t:
-            return safe_positive_float(fallback, 0.0)
-        price = safe_positive_float(t.get("last"), 0.0)
+            return _public_ticker_price(fallback)
+        price = _public_ticker_price(dict.get(t, "last"))
         if price > 0:
             return price
-        price = safe_positive_float(t.get("close"), 0.0)
-        return price if price > 0 else safe_positive_float(fallback, 0.0)
+        price = _public_ticker_price(dict.get(t, "close"))
+        return price if price > 0 else _public_ticker_price(fallback)
 
     def is_fresh(self, symbol: str) -> bool:
         return self.get_ticker(symbol) is not None
@@ -529,21 +553,37 @@ class WebSocketFeed:
             return self._seq
 
     def _update_cache(self, symbol: str, ticker: dict) -> bool:
-        if not isinstance(ticker, dict):
+        ticker = _public_ticker_snapshot(ticker)
+        if ticker is None:
             return False
-        if not explicit_trade_symbol_matches(ticker, symbol):
-            return False
-        price = safe_positive_float(ticker.get("last"), 0.0)
-        if price <= 0:
-            price = safe_positive_float(ticker.get("close"), 0.0)
-        if price <= 0:
+        try:
+            if not explicit_trade_symbol_matches(ticker, symbol):
+                return False
+            price = _public_ticker_price(dict.get(ticker, "last"))
+            if price <= 0:
+                price = _public_ticker_price(dict.get(ticker, "close"))
+            if price <= 0:
+                return False
+            bid = _public_ticker_optional_value(dict.get(ticker, "bid"))
+            ask = _public_ticker_optional_value(dict.get(ticker, "ask"))
+            quote_volume = _public_ticker_optional_value(
+                dict.get(ticker, "quoteVolume")
+            )
+            base_volume = _public_ticker_optional_value(
+                dict.get(ticker, "baseVolume")
+            )
+            volume = quote_volume or base_volume
+            change = _public_ticker_optional_value(
+                dict.get(ticker, "percentage")
+            )
+        except Exception:
             return False
         entry = {
             "last":       price,
-            "bid":        ticker.get("bid"),
-            "ask":        ticker.get("ask"),
-            "volume":     ticker.get("quoteVolume") or ticker.get("baseVolume"),
-            "change":     ticker.get("percentage"),
+            "bid":        bid,
+            "ask":        ask,
+            "volume":     volume,
+            "change":     change,
             "_monotonic": time.monotonic(),
             "_seq":       self._next_seq(),
         }
@@ -1280,16 +1320,18 @@ class WebSocketFeed:
             if not reservation:
                 return {}
             try:
-                ticker = _my_clone().fetch_ticker(sym)
-                if not isinstance(ticker, dict):
+                ticker = _public_ticker_snapshot(
+                    _my_clone().fetch_ticker(sym)
+                )
+                if ticker is None:
                     raise TypeError("WS REST ticker returned no ticker object")
                 if not explicit_trade_symbol_matches(ticker, sym):
                     raise ValueError(
                         "WS REST ticker returned a symbol mismatch"
                     )
-                price = safe_positive_float(ticker.get("last"), 0.0)
+                price = _public_ticker_price(dict.get(ticker, "last"))
                 if price <= 0:
-                    price = safe_positive_float(ticker.get("close"), 0.0)
+                    price = _public_ticker_price(dict.get(ticker, "close"))
                 if price <= 0:
                     raise ValueError("WS REST ticker returned no positive price")
                 return ticker

@@ -36,7 +36,7 @@ def _finite_float_or_none(value):
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -351,7 +351,7 @@ def base_currency_fee_amount(order: dict, base_currency: str) -> float:
                 cost = _finite_float_or_none(fee.get("cost"))
                 if cost is not None and cost != 0:
                     total += cost
-        except (TypeError, ValueError):
+        except Exception:
             continue
 
     return total

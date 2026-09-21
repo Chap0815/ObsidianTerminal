@@ -291,39 +291,44 @@ class SpotBot(ExitsMixin, ScanMixin, ReconcileMixin, ABC):
             return bounded_text(value, max_chars=max_chars) or None
 
         def nonnegative_int(value) -> int:
-            if isinstance(value, bool):
+            if value is None:
                 return 0
-            try:
-                return max(0, int(value or 0))
-            except BaseException:
+            if type(value) is not int or value < 0:
                 invalidate_payload_contract()
                 return 0
+            return value
 
         def nonnegative_float(value) -> float:
-            if isinstance(value, bool):
+            if value is None:
+                return 0.0
+            if type(value) not in (int, float):
+                invalidate_payload_contract()
                 return 0.0
             try:
-                parsed = float(value or 0.0)
-            except BaseException:
+                parsed = float(value)
+            except (OverflowError, TypeError, ValueError):
                 invalidate_payload_contract()
                 return 0.0
-            if not math.isfinite(parsed):
+            if not math.isfinite(parsed) or parsed < 0.0:
                 invalidate_payload_contract()
                 return 0.0
-            return max(0.0, parsed)
+            return parsed
 
         def optional_nonnegative_float(value) -> float | None:
-            if value is None or isinstance(value, bool):
+            if value is None:
+                return None
+            if type(value) not in (int, float):
+                invalidate_payload_contract()
                 return None
             try:
                 parsed = float(value)
-            except BaseException:
+            except (OverflowError, TypeError, ValueError):
                 invalidate_payload_contract()
                 return None
-            if not math.isfinite(parsed):
+            if not math.isfinite(parsed) or parsed < 0.0:
                 invalidate_payload_contract()
                 return None
-            return max(0.0, parsed)
+            return parsed
 
         def optional_timestamp(value) -> float | None:
             if value is None:

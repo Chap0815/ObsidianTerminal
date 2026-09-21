@@ -445,7 +445,7 @@ def _shutdown_symbol_tracker_resources_owned(timeout: float = 0.0) -> bool:
 
 def shutdown_symbol_tracker_resources(timeout: float = 0.0) -> bool:
     """Serialize the full shutdown generation handoff under one budget."""
-    if isinstance(timeout, bool):
+    if type(timeout) not in (int, float):
         return False
     try:
         budget = float(timeout)

@@ -33,7 +33,7 @@ def effective_balance(info: dict, dust_threshold: float = 1e-8) -> float:
 
     try:
         threshold = float(dust_threshold)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         threshold = 1e-8
     if not (math.isfinite(threshold) and threshold >= 0):
         threshold = 1e-8
@@ -46,7 +46,7 @@ def effective_balance(info: dict, dust_threshold: float = 1e-8) -> float:
             if isinstance(v, bool):
                 return None
             parsed = float(v)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return None
         return parsed if math.isfinite(parsed) and parsed >= 0 else None
 

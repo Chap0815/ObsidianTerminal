@@ -338,12 +338,30 @@ class TickerCache:
             self._last_fetch_success_monotonic = completed_at
             self._consecutive_error_started_monotonic = None
 
-    def _stale(self, symbol_full: str, now: float, max_age: float) -> dict | None:
+    @staticmethod
+    def _entry_matches_exchange(entry: tuple, exchange) -> bool:
+        # Two-item entries are retained for compatibility with local probes
+        # that seed this private cache directly. Runtime writes always carry
+        # the owning exchange instance as their third item.
+        return len(entry) < 3 or entry[2] is exchange
+
+    def _stale(
+        self,
+        symbol_full: str,
+        now: float,
+        max_age: float,
+        *,
+        exchange=None,
+    ) -> dict | None:
         with self._cache_lock:
             stale = self._cache.get(symbol_full)
-            if stale and (now - stale[0]) < max_age:
+            if (
+                stale
+                and self._entry_matches_exchange(stale, exchange)
+                and (now - stale[0]) < max_age
+            ):
                 self._cache.move_to_end(symbol_full)
-                return stale[1]
+                return dict(stale[1])
         return None
 
     def _store(
@@ -353,7 +371,9 @@ class TickerCache:
         stored_at: float,
         *,
         superseded_after: float | None = None,
+        exchange=None,
     ) -> bool:
+        snapshot = dict(ticker)
         with self._cache_lock:
             current = self._cache.get(symbol_full)
             if (
@@ -364,7 +384,7 @@ class TickerCache:
                 return False
             if symbol_full in self._cache:
                 del self._cache[symbol_full]
-            self._cache[symbol_full] = (stored_at, ticker)
+            self._cache[symbol_full] = (stored_at, snapshot, exchange)
             while len(self._cache) > self.cache_max:
                 self._cache.popitem(last=False)
         return True
@@ -374,6 +394,7 @@ class TickerCache:
         symbol_full: str,
         future,
         fetch_started_at: float,
+        exchange=None,
     ) -> None:
         """Retain a valid result that arrived after the caller timed out."""
         try:
@@ -395,6 +416,7 @@ class TickerCache:
             ticker,
             time.monotonic(),
             superseded_after=fetch_started_at,
+            exchange=exchange,
         )
         if not stored:
             self._note("late_fetch_superseded")
@@ -474,12 +496,16 @@ class TickerCache:
         # Fast path: fresh cache hit. Touch LRU position on read.
         with self._cache_lock:
             cached = self._cache.get(symbol_full)
-            if cached and (pre_now - cached[0]) < self.fresh_ttl:
+            if (
+                cached
+                and self._entry_matches_exchange(cached, ex)
+                and (pre_now - cached[0]) < self.fresh_ttl
+            ):
                 # mark as recently used to keep popular symbols in cache
                 # during eviction storms.
                 self._cache.move_to_end(symbol_full)
                 self._note("fresh_hits")
-                return cached[1]
+                return dict(cached[1])
 
         if pre_now < self._rate_limited_until:
             max_age = (
@@ -487,7 +513,12 @@ class TickerCache:
                 if not critical and allow_extended_rate_limit_stale
                 else self.stale_max
             )
-            stale = self._stale(symbol_full, time.monotonic(), max_age)
+            stale = self._stale(
+                symbol_full,
+                time.monotonic(),
+                max_age,
+                exchange=ex,
+            )
             if stale is not None:
                 self._note_stale_hit()
                 return stale
@@ -498,7 +529,10 @@ class TickerCache:
         # Acquire backpressure permit BEFORE submitting
         if not self._inflight_sem.acquire(timeout=0.2):
             stale = self._stale(
-                symbol_full, time.monotonic(), self.stale_max
+                symbol_full,
+                time.monotonic(),
+                self.stale_max,
+                exchange=ex,
             )
             if stale is not None:
                 self._note_stale_hit()
@@ -546,7 +580,10 @@ class TickerCache:
             if not api_reservation:
                 self._note("budget_denied")
                 stale = self._stale(
-                    symbol_full, time.monotonic(), self.stale_max
+                    symbol_full,
+                    time.monotonic(),
+                    self.stale_max,
+                    exchange=ex,
                 )
                 if stale is not None:
                     self._note_stale_hit()
@@ -626,6 +663,7 @@ class TickerCache:
                             symbol_full,
                             completed,
                             fetch_started_at,
+                            ex,
                         )
                     finally:
                         with self._futures_lock:
@@ -721,7 +759,10 @@ class TickerCache:
                 except Exception:
                     pass
                 stale = self._stale(
-                    symbol_full, time.monotonic(), self.stale_max
+                    symbol_full,
+                    time.monotonic(),
+                    self.stale_max,
+                    exchange=ex,
                 )
                 if stale is not None:
                     self._note_stale_hit()
@@ -744,7 +785,10 @@ class TickerCache:
                         else self.stale_max
                     )
                     stale = self._stale(
-                        symbol_full, time.monotonic(), max_age
+                        symbol_full,
+                        time.monotonic(),
+                        max_age,
+                        exchange=ex,
                     )
                     if stale is not None:
                         self._note_stale_hit()
@@ -764,7 +808,12 @@ class TickerCache:
                 _record_fetch_api_error()
                 self._note("invalid_payloads")
                 self._note_fetch_result(fetch_started_at, ok=False)
-                stale = self._stale(symbol_full, post_now, self.stale_max)
+                stale = self._stale(
+                    symbol_full,
+                    post_now,
+                    self.stale_max,
+                    exchange=ex,
+                )
                 if stale is not None:
                     self._note_stale_hit()
                     return stale
@@ -775,6 +824,7 @@ class TickerCache:
                 ticker,
                 post_now,
                 superseded_after=fetch_started_at,
+                exchange=ex,
             )
             return ticker
         finally:

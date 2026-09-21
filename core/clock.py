@@ -38,7 +38,7 @@ def set_exchange_offset_ms(offset_ms: float) -> None:
         return
     try:
         off = float(offset_ms)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return
     if not math.isfinite(off):
         return
@@ -59,7 +59,7 @@ def set_exchange_offset_ms(offset_ms: float) -> None:
         observed_monotonic = float(time.monotonic())
         if not math.isfinite(observed_monotonic):
             observed_monotonic = None
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         observed_monotonic = None
     with _lock:
         _offset_ms = off
@@ -89,7 +89,7 @@ def get_offset_age_seconds() -> float | None:
         return None
     try:
         age = float(time.monotonic()) - observed
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     if not math.isfinite(age):
         return None
@@ -113,7 +113,7 @@ def now_ms() -> float:
             value = anchor_epoch_ms + elapsed * 1000.0
             if elapsed >= 0.0 and math.isfinite(value):
                 return value
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             pass
     return time.time() * 1000.0 + offset_ms
 

@@ -170,7 +170,7 @@ def _extract_fill_from_order(order: dict) -> Optional[float]:
             v = float(val)
             if math.isfinite(v) and v > 0:
                 return v
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             continue
     info = order.get("info")
     if isinstance(info, dict):
@@ -187,7 +187,7 @@ def _extract_fill_from_order(order: dict) -> Optional[float]:
                 v = float(val)
                 if math.isfinite(v) and v > 0:
                     return v
-            except (TypeError, ValueError, OverflowError):
+            except Exception:
                 continue
     return None
 
@@ -199,7 +199,7 @@ def _positive_finite_or_zero(value) -> float:
         return 0.0
     try:
         parsed = float(value or 0)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return 0.0
     return parsed if math.isfinite(parsed) and parsed > 0 else 0.0
 
@@ -211,7 +211,7 @@ def _finite_or_default(value, default: float = 0.0) -> float:
         return default
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return default
     return parsed if math.isfinite(parsed) else default
 
@@ -228,7 +228,7 @@ def _finite_precision_amount_or_none(value) -> Optional[float]:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -575,6 +575,8 @@ def _close_single_position(**kw):
     sym = kw.get("sym")
     state = kw.get("state")
     bot_name = kw.get("bot_name")
+    if not isinstance(kw.get("simulation", False), bool):
+        return (sym, "failed", 0.0, "simulation mode invalid")
     if not _valid_emergency_base_symbol(sym):
         return (sym, "failed", 0.0, "symbol invalid")
     if _emergency_fragment_is_blocked(bot_name, sym):
@@ -667,7 +669,9 @@ def _flatten_without_accounting(**kw):
     d = kw.get("d") or {}
     ex = kw.get("ex")
     state = kw.get("state")
-    simulation = bool(kw.get("simulation"))
+    simulation = kw.get("simulation")
+    if not isinstance(simulation, bool):
+        return (sym, "failed", 0.0, "simulation mode invalid")
     margin_mode = kw.get("margin_mode") or "isolated"
     reduce_only_params = kw.get("reduce_only_params")
     log_event = kw.get("log_event") or (lambda *_a, **_k: None)
@@ -786,10 +790,15 @@ def _close_single_position_impl(*,
                               error_logger: Optional[Callable],
                               ) -> Tuple[str, str, float, Optional[str]]:
     """Close ONE position. Returns (symbol, status, pnl, error_message)."""
+    if not isinstance(simulation, bool):
+        return (sym, "failed", 0.0, "simulation mode invalid")
     try:
         pos_type = d.get("position_type", "LONG")
         if pos_type not in ("LONG", "SHORT"):
             return (sym, "failed", 0.0, "position type invalid")
+        partial_sold_flag = d.get("partial_sold", False)
+        if not isinstance(partial_sold_flag, bool):
+            return (sym, "failed", 0.0, "partial sold flag invalid")
         entry = _positive_finite_or_zero(d.get("buy", 0))
         margin = _positive_finite_or_zero(d.get("invested_usdt", 0))
         lev = _positive_finite_or_default(d.get("leverage", default_leverage),
@@ -1313,7 +1322,6 @@ def _close_single_position_impl(*,
         original_amount = _positive_finite_or_default(
             d.get("original_amount", amount), amount)
         from bot_utils import safe_proportional_fee, safe_remaining_funding
-        partial_sold_flag = bool(d.get("partial_sold"))
         proportional_entry_fee = safe_proportional_fee(
             initial_entry_fee, amount, original_amount,
             partial_sold=partial_sold_flag

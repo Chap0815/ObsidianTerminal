@@ -1346,7 +1346,7 @@ class FuturesExitsMixin:
             return 0.0
         try:
             price = float(value)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return 0.0
         return price if math.isfinite(price) and price > 0 else 0.0
 
@@ -1356,7 +1356,7 @@ class FuturesExitsMixin:
             return 0.0
         try:
             amount = float(value)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return 0.0
         return amount if math.isfinite(amount) and amount >= 0 else 0.0
 
@@ -1366,7 +1366,7 @@ class FuturesExitsMixin:
             return default
         try:
             parsed = float(value)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return default
         return parsed if math.isfinite(parsed) else default
 
@@ -1410,7 +1410,7 @@ class FuturesExitsMixin:
             return None
         try:
             amount = float(value)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return None
         return amount if math.isfinite(amount) else None
 
@@ -1946,6 +1946,8 @@ class FuturesExitsMixin:
                         btc_4h = float(get_btc_change(self.ex, hours=4,
                                                       closed_only=True))
                     except Exception:
+                        btc_4h = 0.0
+                    if not math.isfinite(btc_4h):
                         btc_4h = 0.0
                     if btc_4h <= crash_pct:
                         log_event(

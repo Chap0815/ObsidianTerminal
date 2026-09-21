@@ -755,12 +755,39 @@ def get_futures_state_counts(
 _OLLAMA_PROBE_MAX_BYTES = 2 * 1024 * 1024
 
 
+def _normalise_ollama_model_name(name: str) -> str:
+    if type(name) is not str:
+        return ""
+    normalized = str.lower(str.strip(name))
+    if not normalized or any(ch.isspace() for ch in normalized):
+        return ""
+    if ":" not in normalized.rsplit("/", 1)[-1]:
+        normalized += ":latest"
+    return normalized
+
+
+def _ollama_model_names_match(configured: str, candidate: str) -> bool:
+    expected = _normalise_ollama_model_name(configured)
+    found = _normalise_ollama_model_name(candidate)
+    if not expected or not found:
+        return False
+    return (
+        expected == found
+        or expected.endswith("/" + found)
+        or found.endswith("/" + expected)
+    )
+
+
 def read_ollama_model_names(response) -> list[str] | None:
     reader_closes = False
     try:
         if getattr(response, "status_code", None) != 200:
             return None
-        reader_closes = callable(getattr(response, "iter_content", None))
+        reader_closes = (
+            callable(getattr(response, "iter_content", None))
+            or isinstance(getattr(response, "content", None), (bytes, bytearray))
+            or callable(getattr(response, "json", None))
+        )
         payload = read_bounded_json_response(
             response,
             max_bytes=_OLLAMA_PROBE_MAX_BYTES,
@@ -775,8 +802,10 @@ def read_ollama_model_names(response) -> list[str] | None:
             if not isinstance(model, dict):
                 continue
             name = model.get("name")
-            if isinstance(name, str) and name.strip():
-                names.append(name.strip()[:256])
+            if type(name) is str:
+                name = str.strip(name)
+                if name and len(name) <= 256:
+                    names.append(name)
         return names
     finally:
         closer = getattr(response, "close", None)
@@ -806,7 +835,10 @@ def get_llm_info() -> dict:
             if loaded_names:
                 # PRIORITY 1: configured model is among the currently
                 # loaded ones  that's authoritative.
-                if configured and configured in loaded_names:
+                if configured and any(
+                    _ollama_model_names_match(configured, name)
+                    for name in loaded_names
+                ):
                     return {"online": True, "model": configured,
                               "loaded": True}
                 # PRIORITY 2: configured isn't loaded yet (e.g. just after
@@ -825,13 +857,22 @@ def get_llm_info() -> dict:
         if installed_names is not None:
             if installed_names:
                 # Prefer the configured model when it's installed
-                if configured and configured in installed_names:
+                if configured and any(
+                    _ollama_model_names_match(configured, name)
+                    for name in installed_names
+                ):
                     return {"online": True, "model": configured, "loaded": False}
                 # Otherwise prefer the configured model's family, then
                 # fall back to the first installed model.
                 fam = ""
                 try:
-                    fam = (configured or "").split(":")[0].strip().lower()
+                    fam = (
+                        (configured or "")
+                        .rsplit("/", 1)[-1]
+                        .split(":", 1)[0]
+                        .strip()
+                        .lower()
+                    )
                 except Exception:
                     fam = ""
                 if not fam:
@@ -841,7 +882,14 @@ def get_llm_info() -> dict:
                     except Exception:
                         fam = "qwen2.5"
                 for n in installed_names:
-                    if fam and fam in n.lower():
+                    candidate_family = (
+                        n.rsplit("/", 1)[-1].split(":", 1)[0].lower()
+                    )
+                    if fam and (
+                        candidate_family == fam
+                        or candidate_family.startswith(fam + "-")
+                        or candidate_family.startswith(fam + "_")
+                    ):
                         return {"online": True, "model": n, "loaded": False}
                 return {"online": True, "model": installed_names[0], "loaded": False}
             return {"online": True, "model": "No model installed", "loaded": False}
@@ -857,7 +905,18 @@ def _read_configured_model() -> str:
         if not os.path.exists(CONFIG_FILE):
             return ""
         cfg = _read_config_json(CONFIG_FILE)
-        return str(cfg.get("LLM_MODEL", "")).strip()
+        if type(cfg) is not dict:
+            return ""
+        model = cfg.get("LLM_MODEL")
+        if type(model) is not str:
+            return ""
+        model = str.strip(model)
+        if (
+            not 1 <= len(model) <= 200
+            or any(not ch.isprintable() or ch.isspace() for ch in model)
+        ):
+            return ""
+        return model
     except Exception:
         return ""
 

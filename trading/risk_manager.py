@@ -35,7 +35,7 @@ def _finite_float_or_none(value) -> float | None:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -689,7 +689,7 @@ def is_bad_hour(bot_name: str) -> bool:
         if any(hour < 0 or hour > 23 for hour in bad_hours):
             return True
         return _get_local_hour() in bad_hours
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         # Corrupt adaptive-risk evidence must not silently re-enable entries.
         return True
 
@@ -1624,8 +1624,16 @@ def check_kill_switches(bot_name: str, exchange=None,
         try:
             from trading.market_filters import get_btc_change, BTCPriceUnavailable
             try:
-                btc_4h = get_btc_change(exchange, hours=4, raise_on_failure=True,
-                                        closed_only=True)
+                btc_4h = _finite_float_or_none(
+                    get_btc_change(
+                        exchange,
+                        hours=4,
+                        raise_on_failure=True,
+                        closed_only=True,
+                    )
+                )
+                if btc_4h is None:
+                    raise ValueError("invalid BTC risk telemetry")
             except BTCPriceUnavailable:
                 reason = "STOP: Kill-Switch: BTC price unavailable  fail-closed"
                 with _KILL_SWITCH_LOCK:

@@ -1045,39 +1045,44 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             return bounded_text(value, max_chars=max_chars) or None
 
         def nonnegative_int(value) -> int:
-            if isinstance(value, bool):
+            if value is None:
                 return 0
-            try:
-                return max(0, int(value or 0))
-            except BaseException:
+            if type(value) is not int or value < 0:
                 invalidate_payload_contract()
                 return 0
+            return value
 
         def nonnegative_float(value) -> float:
-            if isinstance(value, bool):
+            if value is None:
+                return 0.0
+            if type(value) not in (int, float):
+                invalidate_payload_contract()
                 return 0.0
             try:
-                parsed = float(value or 0.0)
-            except BaseException:
+                parsed = float(value)
+            except (OverflowError, TypeError, ValueError):
                 invalidate_payload_contract()
                 return 0.0
-            if not math.isfinite(parsed):
+            if not math.isfinite(parsed) or parsed < 0.0:
                 invalidate_payload_contract()
                 return 0.0
-            return max(0.0, parsed)
+            return parsed
 
         def optional_nonnegative_float(value) -> float | None:
-            if value is None or isinstance(value, bool):
+            if value is None:
+                return None
+            if type(value) not in (int, float):
+                invalidate_payload_contract()
                 return None
             try:
                 parsed = float(value)
-            except BaseException:
+            except (OverflowError, TypeError, ValueError):
                 invalidate_payload_contract()
                 return None
-            if not math.isfinite(parsed):
+            if not math.isfinite(parsed) or parsed < 0.0:
                 invalidate_payload_contract()
                 return None
-            return max(0.0, parsed)
+            return parsed
 
         def optional_timestamp(value) -> float | None:
             if value is None:
@@ -1509,11 +1514,13 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 return "[UNRENDERABLE]"[:max_chars]
 
         def nonnegative_int(key: str) -> int:
-            try:
-                return max(0, int(report.get(key) or 0))
-            except BaseException:
+            if key not in report:
+                return 0
+            value = report.get(key)
+            if type(value) is not int or value < 0:
                 invalidate_payload_contract()
                 return 0
+            return value
 
         def bounded_strings(value, *, limit: int = 32) -> list[str]:
             if not isinstance(value, (list, tuple)):
@@ -1553,6 +1560,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         raw_stream = raw_stream if isinstance(raw_stream, dict) else {}
         raw_integrity = report.get("integrity_health")
         raw_integrity = raw_integrity if isinstance(raw_integrity, dict) else {}
+        raw_verified_once = raw_integrity.get("verified_once")
+        if (
+            "verified_once" in raw_integrity
+            and type(raw_verified_once) is not bool
+        ):
+            invalidate_payload_contract()
         raw_continuity = raw_integrity.get("continuity")
         raw_continuity = (
             raw_continuity if isinstance(raw_continuity, dict) else {}
@@ -1582,13 +1595,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 invalidate_payload_contract()
 
         def bounded_nonnegative(value) -> int | None:
-            if value is None or isinstance(value, bool):
+            if value is None:
                 return None
-            try:
-                return max(0, int(value))
-            except BaseException:
+            if type(value) is not int or value < 0:
                 invalidate_payload_contract()
                 return None
+            return value
 
         def bounded_float(value) -> float | None:
             if value is None or isinstance(value, bool):
@@ -1734,6 +1746,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 },
                 "integrity_health": {
                     "ok": raw_integrity.get("ok") is True,
+                    "verified_once": raw_verified_once is True,
                     "sealed_days": bounded_nonnegative(
                         raw_integrity.get("sealed_days")
                     ) or 0,

@@ -665,7 +665,7 @@ class SafeMode:
 
     def shutdown_alert_state_persistence(self, timeout: float = 0.0) -> bool:
         """Terminally stop retry timers and flush the safety marker."""
-        if isinstance(timeout, bool):
+        if type(timeout) not in (int, float):
             return False
         try:
             requested_timeout = float(timeout)
