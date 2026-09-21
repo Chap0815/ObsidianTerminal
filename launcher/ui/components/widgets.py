@@ -31,6 +31,37 @@ from launcher.core.metrics_service import query_db
 _SCREEN_MARGIN = 80  # physical px kept free (taskbar + window chrome)
 
 
+def enable_keyboard_activation(button) -> None:
+    """Give a CTkButton a Tab stop, visible focus and native-style activation.
+
+    CTkButton delegates mouse bindings to its canvas but supplies no keyboard
+    activation. Keep that implementation detail here; invoke() respects disabled.
+    """
+    target = button._canvas
+    target.configure(takefocus=1)
+    unfocused = {}
+
+    def focus_in(_event):
+        unfocused.update(color=button.cget("border_color"),
+                         width=button.cget("border_width"))
+        button.configure(border_color=COLORS["accent_text"], border_width=2)
+
+    def focus_out(_event):
+        if unfocused:
+            button.configure(border_color=unfocused["color"],
+                             border_width=unfocused["width"])
+
+    def activate(_event):
+        button.invoke()
+        return "break"
+
+    target.bind("<FocusIn>", focus_in, add="+")
+    target.bind("<FocusOut>", focus_out, add="+")
+    target.bind("<Return>", activate, add="+")
+    target.bind("<space>", activate, add="+")
+    button.bind("<Button-1>", lambda _event: target.focus_set(), add="+")
+
+
 def _window_scaling(win) -> float:
     """Effective ctk window-scaling factor for this toplevel (1.0 fallback)."""
     try:
@@ -369,7 +400,8 @@ class MiniBar(ctk.CTkFrame):
     """Compact "label + value + progress bar" sidebar row."""
 
     def __init__(self, parent, label, color, width=160, height=28):
-        super().__init__(parent, fg_color="transparent", height=height)
+        # A label and a 6px bar cannot fit inside the legacy 20px caller height.
+        super().__init__(parent, fg_color="transparent", height=max(32, height))
         self.pack_propagate(False)
         top_row = ctk.CTkFrame(self, fg_color="transparent")
         top_row.pack(fill="x", pady=(0, 2))
@@ -379,6 +411,7 @@ class MiniBar(ctk.CTkFrame):
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
             text_color=COLORS["text_muted"],
             anchor="w",
+            height=18,
         ).pack(side="left")
         self.value_var = ctk.StringVar(value="")
         ctk.CTkLabel(
@@ -387,6 +420,7 @@ class MiniBar(ctk.CTkFrame):
             font=ctk.CTkFont(_safe_mono_font(), 12, "bold"),
             text_color=COLORS["text"],
             anchor="e",
+            height=18,
         ).pack(side="right")
         self.bar = ctk.CTkProgressBar(
             self,

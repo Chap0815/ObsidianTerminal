@@ -1,6 +1,6 @@
 {
-  "build_id": "0fe8a54f3b254a46",
-  "created_at": "2026-09-21 18:03:38",
+  "build_id": "a63a2e41c4db3066",
+  "created_at": "2026-09-21 20:13:27",
   "source": "update_deploy_manifest.py",
   "file_count": 221,
   "files": [
@@ -431,8 +431,8 @@
     },
     {
       "path": "launcher/config/settings.py",
-      "sha256": "9a73eb6404ee1961fdd6cb1b6b22f6876c7118c15d9c93136e8911ffb4464283",
-      "bytes": 63750
+      "sha256": "3cdc92a2ebc824b0c01584d0185332033a4dca16cacb2f230b005e7bd5b1247d",
+      "bytes": 63834
     },
     {
       "path": "launcher/core/__init__.py",
@@ -501,8 +501,8 @@
     },
     {
       "path": "launcher/ui/app.py",
-      "sha256": "3ceb35a0de4fb6e7b316697f68992de048ec435285949af6c37f603169f60325",
-      "bytes": 245514
+      "sha256": "5af63f523004fc9285397a5c8932fbbbdb7d61afe9b1927e5af03de6867a4e6b",
+      "bytes": 247452
     },
     {
       "path": "launcher/ui/cadence.py",
@@ -521,8 +521,8 @@
     },
     {
       "path": "launcher/ui/components/widgets.py",
-      "sha256": "ef5516bb9802fec03e51f3dfecc3baa2a5d83003539af2e66de8eeae51f9c7ef",
-      "bytes": 32524
+      "sha256": "b6fe198b4e5cf8ab0e33cd5224162176ca840ada271fc25f6fd7e826bf27353f",
+      "bytes": 33777
     },
     {
       "path": "launcher/ui/concurrency.py",
@@ -551,13 +551,13 @@
     },
     {
       "path": "launcher/ui/logging_panel.py",
-      "sha256": "901e62003e7d2447a24678e86fd0790b8490c23f072913e5ab9e84de10721a47",
-      "bytes": 28549
+      "sha256": "9585281869199649bd9d2816a349f782830b00a53c01f78a636d395249ac354a",
+      "bytes": 29955
     },
     {
       "path": "launcher/ui/scaling.py",
-      "sha256": "8c2f31bdd7592066b58e9398996fd73b94ddfe2814cf4a4530dd09838b0e2afe",
-      "bytes": 3691
+      "sha256": "087694704cc956975ffef95b859f610c9c812b7621396d841e59a621b22d0bfe",
+      "bytes": 3210
     },
     {
       "path": "launcher/ui/theme.py",

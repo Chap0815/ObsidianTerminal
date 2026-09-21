@@ -1,19 +1,15 @@
 """
-Resolution-adaptive UI scaling.
+Resolution-adaptive UI scaling for a scrolling, responsive card layout.
 
-The Obsidian layout uses fixed-pixel widgets sized for a 2K/4K design baseline
-(~2200x1200 LOGICAL px). On smaller screens (1080p) that overflows and gets
-clipped. This derives ONE extra CTk widget-scaling factor from the real screen
-so every widget + font shrinks proportionally and the whole UI fits.
+Fit a readable single-column layout horizontally. Short screens scroll
+vertically instead of shrinking every label to fit all of the content.
 
-DPI-safe: CTk already auto-scales for the OS display scaling (a 4K screen at
-150% renders bigger). We PRESERVE that  we never touch window scaling and we
-fold the existing DPI factor into the widget scaling, then only shrink BELOW it
-when the design baseline does not fit the logical usable area. So a 2K/4K screen
-that already fit stays unchanged; only smaller screens shrink.
+DPI-safe: CTk already multiplies its widget factor by the OS display scaling.
+Use DPI only to calculate the available logical area; do not multiply it into
+the widget factor a second time. Window scaling remains at CTk's default.
 
 Manual override: env ``UI_SCALE`` (e.g. ``UI_SCALE=0.85``) or config ``UI.SCALE``
-forces an absolute widget-scaling factor when auto-detection is off on a setup.
+sets CTk's widget factor when the automatic fit is unsuitable for a setup.
 """
 
 from __future__ import annotations
@@ -22,12 +18,11 @@ import os
 
 import customtkinter as ctk
 
-# Design baseline (LOGICAL px) the fixed-pixel layout was authored against.
-DESIGN_W = 2200
-DESIGN_H = 1200
+# Comfortable logical width for the sidebar, toolbar and one card column.
+DESIGN_W = 1280
 
-# Never shrink the layout below the design (4K/2K just stay crisp); only fit.
-MIN_FIT = 0.55
+# Preserve readable text on small screens; larger screens use the native size.
+MIN_FIT = 0.85
 MAX_FIT = 1.0
 
 # Vertical/horizontal chrome not usable for the window (taskbar + titlebar).
@@ -62,11 +57,10 @@ def _override_scale(config: dict | None) -> float | None:
 
 
 def compute_fit(logical_w: float, logical_h: float) -> float:
-    """Fraction of the design baseline that fits the logical usable area,
-    clamped to [MIN_FIT, MAX_FIT]. 1.0 = design fits as-is (no shrink)."""
+    """Fit horizontally; card wrapping and scrolling handle remaining space."""
     if logical_w <= 0 or logical_h <= 0:
         return MAX_FIT
-    return _clamp(min(logical_w / DESIGN_W, logical_h / DESIGN_H), MIN_FIT, MAX_FIT)
+    return _clamp(logical_w / DESIGN_W, MIN_FIT, MAX_FIT)
 
 
 def apply_scaling(window, config: dict | None = None) -> tuple[float, int, int]:
@@ -90,11 +84,9 @@ def apply_scaling(window, config: dict | None = None) -> tuple[float, int, int]:
     if override is not None:
         widget_scale = override
     else:
-        widget_scale = dpi * compute_fit(logical_w, logical_h)
+        widget_scale = compute_fit(logical_w, logical_h)
 
-    # Fold DPI into widget scaling (preserve DPI comfort) and shrink to fit.
-    # Window scaling deliberately untouched.
+    # CTk applies OS DPI itself. Pass only the additional fit/override factor.
     ctk.set_widget_scaling(widget_scale)
 
-    fit = widget_scale / dpi if dpi else widget_scale
-    return fit, int(logical_w), int(logical_h)
+    return widget_scale, int(logical_w), int(logical_h)

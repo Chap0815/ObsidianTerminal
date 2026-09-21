@@ -488,6 +488,7 @@ from launcher.ui.components.widgets import (
     ParamRow,
     Sparkline,
     attach_tooltip,
+    enable_keyboard_activation,
 )
 from launcher.ui.cadence import PeriodicGate
 from launcher.ui.dialogs.prompt_editor import PromptEditor
@@ -891,18 +892,18 @@ class ObsidianApp(ctk.CTk):
         ctk.CTkFrame(self, fg_color=COLORS["border"], height=1, corner_radius=0
                       ).grid(row=0, column=1, sticky="sew")
 
-        # Show + Pills (links)  Layout wie React Tabs
-        pill_label = ctk.CTkLabel(bar, text="Show",
+        # Persistent show/hide filters; selected cards have a filled surface.
+        pill_label = ctk.CTkLabel(bar, text="Bots",
                                     font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                                     text_color=COLORS["text_muted"])
-        pill_label.pack(side="left", padx=(22, 12), pady=14)
+        pill_label.pack(side="left", padx=(16, 10), pady=12)
 
         # TabsList Container  bg-muted/50 border
         pill_box = ctk.CTkFrame(bar, fg_color=COLORS["bg_alt"], corner_radius=8,
                                   height=36,
                                   border_width=1,
                                   border_color=COLORS["border_soft"])
-        pill_box.pack(side="left", pady=14)
+        pill_box.pack(side="left", pady=12)
 
         self.visibility_pills = {}
         inner_pills = ctk.CTkFrame(pill_box, fg_color="transparent")
@@ -911,17 +912,16 @@ class ObsidianApp(ctk.CTk):
         for bot in BOT_ORDER:
             meta = BOT_META[bot]
             is_visible = self._visible[bot]
-            # Layout: "<icon> <Label>"  like React TabsTrigger with lucide icon
-            label_text = f"{meta.get('icon','')}  {meta['label'].title()}"
+            # Short labels keep all five filters usable on laptop screens.
+            label_text = meta['label'].title()
             pill = ctk.CTkButton(
                 inner_pills, text=label_text,
-                width=128, height=26, corner_radius=6,
+                width=108 if bot == "FUTREND" else 84, height=32, corner_radius=6,
                 font=ctk.CTkFont(FONT_BODY, 11, "bold"),
-                # Aktiv = Indigo-Outline + Indigo-Text (kein gefuellter Block);
-                # Inaktiv = dezenter Rand + muted text.
-                fg_color="transparent",
+                # Filled active surface and readable text distinguish selection.
+                fg_color=COLORS["purple_dim"] if is_visible else "transparent",
                 hover_color=COLORS["panel_hover"],
-                text_color=(COLORS["purple"] if is_visible else COLORS["text_muted"]),
+                text_color=(COLORS["accent_text"] if is_visible else COLORS["text_muted"]),
                 border_width=1,
                 border_color=(COLORS["purple"] if is_visible else COLORS["border"]),
                 command=lambda b=bot: self._toggle_visibility(b)
@@ -938,15 +938,15 @@ class ObsidianApp(ctk.CTk):
 
         # Open Dashboard (rechts)
         dash_btn = ctk.CTkButton(
-            bar, text="  Open Dashboard",
-            width=170, height=34, corner_radius=8,
+            bar, text="Open Dashboard",
+            width=144, height=34, corner_radius=8,
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
             fg_color="transparent", hover_color=COLORS["panel_hover"],
             text_color=COLORS["text"],
             border_width=1, border_color=COLORS["border"],
             command=self._open_dashboard
         )
-        dash_btn.pack(side="right", padx=22, pady=14)
+        dash_btn.pack(side="right", padx=16, pady=12)
         attach_tooltip(
             dash_btn,
             "Open the full analytics dashboard in your browser.\n"
@@ -979,11 +979,11 @@ class ObsidianApp(ctk.CTk):
         logo_text.pack(side="left", fill="y")
         ctk.CTkLabel(logo_text, text="Obsidian",
                       font=ctk.CTkFont(self.display_font, 14, "bold"),
-                      text_color=COLORS["text"], anchor="w"
+                      text_color=COLORS["text"], anchor="w", height=22
                       ).pack(anchor="w", pady=(4, 0))
         ctk.CTkLabel(logo_text, text="Trading Terminal",
-                      font=ctk.CTkFont(FONT_BODY, 8, "bold"),
-                      text_color=COLORS["text_subtle"], anchor="w"
+                      font=ctk.CTkFont(FONT_BODY, 10),
+                      text_color=COLORS["text_subtle"], anchor="w", height=16
                       ).pack(anchor="w")
 
         # Separator unter Logo
@@ -1345,12 +1345,13 @@ class ObsidianApp(ctk.CTk):
     def _card_columns_for_width(self, width: int) -> int:
         """Responsive card grid tuned for readable parameter controls."""
         try:
-            width = int(width)
+            # Configure events report physical pixels; controls use CTk units.
+            width = int(width) / ctk.ScalingTracker.get_widget_scaling(self)
         except (TypeError, ValueError):
             width = 0
-        if width < 900:
+        if width < 1060:
             return 1
-        if width < 1350:
+        if width < 1590:
             return 2
         return self.MAX_CARD_COLUMNS
 
@@ -1496,10 +1497,10 @@ class ObsidianApp(ctk.CTk):
         head.grid_columnconfigure(1, weight=0)
 
         name_block = ctk.CTkFrame(head, fg_color="transparent")
-        name_block.grid(row=0, column=0, sticky="nw")
+        name_block.grid(row=0, column=0, rowspan=2, sticky="nw")
         ctk.CTkLabel(name_block, text=meta["label"],
                       font=ctk.CTkFont(self.display_font, 19, "bold"),
-                      text_color=COLORS["text"], anchor="w"
+                      text_color=COLORS["text"], anchor="w", height=24
                       ).pack(anchor="w")
         # Signature underline  the one accent that carries "Obsidian"
         # (brighter violet from the logo arrowhead, slightly bolder).
@@ -1509,13 +1510,13 @@ class ObsidianApp(ctk.CTk):
         subtitle_row = ctk.CTkFrame(name_block, fg_color="transparent")
         subtitle_row.pack(anchor="w", pady=(2, 0))
         ctk.CTkLabel(subtitle_row, text=meta["subtitle"],
-                      font=ctk.CTkFont(FONT_BODY, 10, "bold"),
-                      text_color=COLORS["text_muted"]
+                      font=ctk.CTkFont(FONT_BODY, 11),
+                      text_color=COLORS["text_muted"], height=18
                       ).pack(side="left")
 
-        status_row = ctk.CTkFrame(name_block, fg_color="transparent")
-        status_row.pack(anchor="w", pady=(4, 0))
-        led = ctk.CTkLabel(status_row, text="",
+        status_row = ctk.CTkFrame(head, fg_color="transparent")
+        status_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        led = ctk.CTkLabel(status_row, text="●",
                             font=ctk.CTkFont(FONT_BODY, 14, "bold"),
                             text_color=COLORS["text_muted"])
         led.pack(side="left", padx=(0, 6))
@@ -1546,14 +1547,14 @@ class ObsidianApp(ctk.CTk):
         )
 
         action_frame = ctk.CTkFrame(head, fg_color="transparent")
-        action_frame.grid(row=0, column=1, sticky="ne", padx=(8, 0))
+        action_frame.grid(row=1, column=1, sticky="ne", padx=(12, 0), pady=(8, 0))
 
         prompt_btn = None
         if meta.get("uses_llm", True):
             prompt_btn = ctk.CTkButton(
                 action_frame, text="Prompt",
-                width=58, height=22, corner_radius=4,
-                font=ctk.CTkFont(FONT_BODY, 10, "bold"),
+                width=76, height=30, corner_radius=6,
+                font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                 fg_color="transparent", hover_color=COLORS["panel_hover"],
                 text_color=COLORS["text_dim"],
                 border_width=1, border_color=COLORS["border"],
@@ -1570,9 +1571,9 @@ class ObsidianApp(ctk.CTk):
 
         if name == "CROSS":
             reb = ctk.CTkButton(
-                action_frame, text="Rebal",
-                width=58, height=22, corner_radius=4,
-                font=ctk.CTkFont(FONT_BODY, 10, "bold"),
+                action_frame, text="Rebalance",
+                width=90, height=30, corner_radius=6,
+                font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                 fg_color="#6D28D9", hover_color="#5b21b6",
                 text_color="#ffffff", border_width=0,
                 command=self._force_cross_rebalance
@@ -1590,12 +1591,12 @@ class ObsidianApp(ctk.CTk):
         emerg = None
         if is_futures:
             emerg = ctk.CTkButton(
-                action_frame, text="Quick Close",
-                width=76, height=22, corner_radius=4,
-                font=ctk.CTkFont(FONT_BODY, 10, "bold"),
-                fg_color=COLORS["danger"], hover_color="#b91c1c",
-                text_color="#ffffff",
-                border_width=0,
+                action_frame, text="Close & Stop",
+                width=108, height=30, corner_radius=6,
+                font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+                fg_color="#2d0f0c", hover_color="#3d1410",
+                text_color=COLORS["danger"],
+                border_width=1, border_color=COLORS["danger"],
                 command=lambda n=name: self._emergency_close_futures_and_stop(n)
             )
             emerg.pack(side="left", padx=(0, 5))
@@ -1613,16 +1614,18 @@ class ObsidianApp(ctk.CTk):
         # SIM/LIVE Badge  cyan im SIM-Mode wie React-Mockup
         is_sim = self.config[name].get("SIMULATION", True)
         sim_btn = ctk.CTkButton(
-            action_frame, text="SIM" if is_sim else "LIVE",
-            width=60, height=22, corner_radius=4,
-            font=ctk.CTkFont(FONT_BODY, 10, "bold"),
+            head, text="SIM" if is_sim else "LIVE",
+            width=68, height=30, corner_radius=6,
+            font=ctk.CTkFont(FONT_BODY, 12, "bold"),
             fg_color="#1b1730" if is_sim else "#2d0f0c",       # indigo-tint / red-tint
             hover_color="#241f40" if is_sim else "#3d1410",
             text_color="#b07ae0" if is_sim else "#e88a6a",     # violet (paper) / warm rose
             border_width=0,
             command=lambda n=name: self._toggle_simulation(n)
         )
-        sim_btn.pack(side="left")
+        sim_btn.grid(row=0, column=1, sticky="ne", padx=(12, 0))
+        if not meta.get("uses_llm", True) and not is_futures:
+            action_frame.grid_remove()
         attach_tooltip(
             sim_btn,
             "Toggle SIMULATION  LIVE mode.\n"
@@ -1650,8 +1653,8 @@ class ObsidianApp(ctk.CTk):
         pnl_block.grid(row=0, column=0, sticky="w")
         pnl_title_var = ctk.StringVar(value="REALIZED")
         ctk.CTkLabel(pnl_block, textvariable=pnl_title_var,
-                      font=ctk.CTkFont(self.display_font, 10, "bold"),
-                      text_color=COLORS["text_dim"], anchor="w"
+                      font=ctk.CTkFont(self.display_font, 11, "bold"),
+                      text_color=COLORS["text_dim"], anchor="w", height=16
                       ).pack(fill="x", pady=(0, 3))
 
         # Profit inline mit USDT-Suffix daneben (statt darunter)
@@ -1663,25 +1666,25 @@ class ObsidianApp(ctk.CTk):
                                 text_color=COLORS["text_dim"], anchor="w")
         pnl_lbl.pack(side="left")
         ctk.CTkLabel(pnl_row, text=" USDT",
-                      font=ctk.CTkFont(FONT_BODY, 10, "bold"),
-                      text_color=COLORS["text_subtle"]
+                      font=ctk.CTkFont(FONT_BODY, 11),
+                      text_color=COLORS["text_subtle"], height=16
                       ).pack(side="left", anchor="s", pady=(0, 6))
 
         #  Unrealized PnL (Live-Wert offener Positionen) 
         unr_row = ctk.CTkFrame(pnl_block, fg_color="transparent")
         unr_row.pack(anchor="w", pady=(4, 0))
         ctk.CTkLabel(unr_row, text="UNREALIZED",
-                      font=ctk.CTkFont(FONT_BODY, 9, "bold"),
-                      text_color=COLORS["text_subtle"]
+                      font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+                      text_color=COLORS["text_subtle"], height=18
                       ).pack(side="left", padx=(0, 6))
         unr_var = ctk.StringVar(value="")
         unr_lbl = ctk.CTkLabel(unr_row, textvariable=unr_var,
                                 font=ctk.CTkFont(self.mono_font, 13, "bold"),
-                                text_color=COLORS["text_muted"])
+                                text_color=COLORS["text_muted"], height=18)
         unr_lbl.pack(side="left")
         ctk.CTkLabel(unr_row, text="USDT",
-                      font=ctk.CTkFont(FONT_BODY, 9, "bold"),
-                      text_color=COLORS["text_subtle"]
+                      font=ctk.CTkFont(FONT_BODY, 11),
+                      text_color=COLORS["text_subtle"], height=16
                       ).pack(side="left", anchor="s", pady=(0, 3), padx=(4, 0))
         attach_tooltip(unr_lbl,
                         "Aktueller nicht-realisierter Gewinn/Verlust aller offenen Positionen.\n"
@@ -1692,7 +1695,9 @@ class ObsidianApp(ctk.CTk):
 
         # 4 Mini-Stats  kompakter und ohne eigene Container
         stats = ctk.CTkFrame(hero, fg_color="transparent")
-        stats.grid(row=0, column=1, sticky="e")
+        stats.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        for column in range(5):
+            stats.grid_columnconfigure(column, weight=1, uniform="metrics")
 
         open_var = ctk.StringVar(value="0")
         total_var = ctk.StringVar(value="0")
@@ -1702,35 +1707,35 @@ class ObsidianApp(ctk.CTk):
         cells_data = [("OPEN", open_var, COLORS["text"]),
                        ("TOTAL", total_var, COLORS["text"]),
                        ("TODAY", today_var, COLORS["text"]),
-                       ("WIN-%", wr_var, accent)]
+                       ("WIN-%", wr_var, COLORS["text"])]
         for col_i, (label, var, col_color) in enumerate(cells_data):
             cell = ctk.CTkFrame(stats, fg_color="transparent")
-            cell.grid(row=0, column=col_i, padx=10)
+            cell.grid(row=0, column=col_i, sticky="nsew", padx=3)
             ctk.CTkLabel(cell, text=label,
-                          font=ctk.CTkFont(self.display_font, 9, "bold"),
-                          text_color=COLORS["text_muted"]
+                          font=ctk.CTkFont(self.display_font, 11, "bold"),
+                          text_color=COLORS["text_muted"], height=16
                           ).pack()
             ctk.CTkLabel(cell, textvariable=var,
                           font=ctk.CTkFont(self.mono_font, 14, "bold"),
-                          text_color=col_color
+                          text_color=col_color, height=24
                           ).pack(pady=(2, 0))
 
         #  PAYOFF-Zelle (-Win / |-Loss|)  die Edge-Kennzahl 
         payoff_var  = ctk.StringVar(value="")
         payoff_detail = ctk.StringVar(value="")
         payoff_cell = ctk.CTkFrame(stats, fg_color="transparent")
-        payoff_cell.grid(row=0, column=len(cells_data), padx=10)
+        payoff_cell.grid(row=0, column=len(cells_data), sticky="nsew", padx=3)
         ctk.CTkLabel(payoff_cell, text="PAYOFF",
-                      font=ctk.CTkFont(FONT_BODY, 10, "bold"),
-                      text_color=COLORS["text_subtle"]
+                      font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+                      text_color=COLORS["text_subtle"], height=16
                       ).pack()
         payoff_lbl = ctk.CTkLabel(payoff_cell, textvariable=payoff_var,
                                    font=ctk.CTkFont(self.mono_font, 14, "bold"),
-                                   text_color=COLORS["text_dim"])
+                                   text_color=COLORS["text_dim"], height=24)
         payoff_lbl.pack(pady=(2, 0))
         ctk.CTkLabel(payoff_cell, textvariable=payoff_detail,
-                      font=ctk.CTkFont(self.mono_font, 8, "bold"),
-                      text_color=COLORS["text_subtle"]
+                      font=ctk.CTkFont(self.mono_font, 10),
+                      text_color=COLORS["text_subtle"], height=12
                       ).pack()
         attach_tooltip(payoff_lbl,
                         "Payoff-Faktor = -Gewinn / |-Verlust|.\n"
@@ -1756,7 +1761,7 @@ class ObsidianApp(ctk.CTk):
                       text_color=COLORS["text_dim"]
                       ).pack(side="left")
         ctk.CTkLabel(spark_head, text="last ~30 closed trades",
-                      font=ctk.CTkFont(FONT_BODY, 8, "bold"),
+                      font=ctk.CTkFont(FONT_BODY, 10),
                       text_color=COLORS["text_subtle"]
                       ).pack(side="right")
 
@@ -1779,28 +1784,30 @@ class ObsidianApp(ctk.CTk):
                                      border_width=1, border_color=COLORS["border_soft"])
         param_wrap.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 8))
 
-        # Read persisted collapsed state (default: expanded)
+        # Monitoring first: keep saved choices, collapse settings on first use.
         try:
             collapsed_state = (self.config.get("UI", {})
                                 .get("params_collapsed", {})
-                                .get(name, False))
+                                .get(name, True))
         except Exception:
-            collapsed_state = False
+            collapsed_state = True
         collapsed_flag = {"value": bool(collapsed_state)}
 
         # Header IM Container
         param_header = ctk.CTkFrame(param_wrap, fg_color="transparent")
         param_header.pack(fill="x", padx=14, pady=(10, 6))
 
-        # Chevron toggle  clickable label that expands/collapses the body
+        # Real button: the parameter section is reachable without a mouse.
         chevron_var = ctk.StringVar(
             value=("> PARAMETERS" if collapsed_flag["value"]
                    else "v PARAMETERS")
         )
-        chevron_lbl = ctk.CTkLabel(
+        chevron_lbl = ctk.CTkButton(
             param_header, textvariable=chevron_var,
-            font=ctk.CTkFont(self.display_font, 10, "bold"),
-            text_color=COLORS["text_dim"], cursor="hand2",
+            width=122, height=28, corner_radius=5,
+            font=ctk.CTkFont(self.display_font, 11, "bold"),
+            fg_color="transparent", hover_color=COLORS["panel_hover"],
+            text_color=COLORS["text_dim"],
         )
         chevron_lbl.pack(side="left")
 
@@ -1820,10 +1827,10 @@ class ObsidianApp(ctk.CTk):
 
         save_btn = ctk.CTkButton(
             param_header, text=" Save",
-            width=72, height=22, corner_radius=5,
-            font=ctk.CTkFont(FONT_BODY, 9, "bold"),
+            width=72, height=28, corner_radius=5,
+            font=ctk.CTkFont(FONT_BODY, 11, "bold"),
             fg_color="transparent", hover_color=COLORS["panel_hover"],
-            text_color=accent, border_width=2, border_color=accent,
+            text_color=COLORS["accent_text"], border_width=2, border_color=accent,
             command=lambda n=name: self._save_params(n)
         )
         save_btn.pack(side="right")
@@ -1907,10 +1914,8 @@ class ObsidianApp(ctk.CTk):
                 n, body, cv, flag, the_card,
                 _PARAMS_ROW_COLLAPSED, _PARAMS_ROW_EXPANDED)
 
-        chevron_lbl.bind("<Button-1>", _toggle_params)
-        # Also let the user click the "PARAMETERS" label text itself, not
-        # just the tiny chevron  bigger hit target.
-        chevron_lbl.configure(cursor="hand2")
+        chevron_lbl.configure(command=_toggle_params)
+        enable_keyboard_activation(chevron_lbl)
 
         # Apply initial collapsed state if persisted  must adjust BOTH
         # the body visibility and the row weight/minsize.
@@ -1943,7 +1948,7 @@ class ObsidianApp(ctk.CTk):
             font=ctk.CTkFont(FONT_BODY, 11, "bold"),
             fg_color=COLORS["success"],
             hover_color="#0d9b6c",
-            text_color="#ffffff",
+            text_color=COLORS["bg"],
             border_width=2,
             border_color="#a7f3d0",
             command=lambda n=name: self._start_bot(n)
@@ -2013,8 +2018,9 @@ class ObsidianApp(ctk.CTk):
         details_switch.pack(side="right", padx=(8, 0))
         attach_tooltip(
             details_switch,
-            "Aus: relevante Ereignisse mit verdichteten Routinemeldungen.\n"
-            "An: ungefilterte Bot-Ausgabe ab diesem Zeitpunkt.",
+            "Aus: Ereignisse und Warnungen; Routine nur als Zähler darunter.\n"
+            "An: neue Zeilen ohne UI-Filter; Prozess-Vorverdichtung bleibt aktiv.\n"
+            "Bereits ausgeblendete Zeilen werden nicht nachgeladen.",
             delay_ms=400,
         )
 
@@ -2026,12 +2032,13 @@ class ObsidianApp(ctk.CTk):
                        command=lambda n=name: self._clear_card_log(n)
                        ).pack(side="right")
 
-        log_wrap = ctk.CTkFrame(log_outer, fg_color=COLORS["bg"], corner_radius=8)
+        log_wrap = ctk.CTkFrame(log_outer, fg_color=COLORS["bg"], corner_radius=8,
+                              height=1)
         log_wrap.grid(row=1, column=0, sticky="nsew")
 
         log_box = tk.Text(
             log_wrap, bg=COLORS["bg"], fg=COLORS["text_dim"],
-            font=(self.mono_font, 11, "bold"),
+            font=(self.mono_font, 11), width=1, height=5,
             insertbackground=COLORS["text"],
             highlightthickness=0, bd=0, relief="flat",
             padx=12, pady=10, wrap="word",
@@ -2116,6 +2123,16 @@ class ObsidianApp(ctk.CTk):
 
         log_box.config(state="disabled")
 
+        routine_var = ctk.StringVar(value="Routine hidden: 0")
+        routine_label = ctk.CTkLabel(
+            log_outer, textvariable=routine_var, anchor="w", height=18,
+            font=ctk.CTkFont(FONT_BODY, 10), text_color=COLORS["text_muted"],
+        )
+        routine_label.grid(row=2, column=0, sticky="ew", padx=2, pady=(3, 0))
+        attach_tooltip(routine_label,
+                       "Seit Sitzungsbeginn oder Clear. Nur Anzeige verdichtet;\n"
+                       "technische Aufzeichnungen bleiben unverändert.", delay_ms=400)
+
         self._write_log_to_box(log_box, auto_var, "system",
                                  f"{meta['label']} bot ready. Click Start to begin.")
 
@@ -2149,7 +2166,10 @@ class ObsidianApp(ctk.CTk):
             "log_box":      log_box,
             "auto_var":     auto_var,
             "details_var":  details_var,
-            "log_filter":   LiveLogDisplayFilter(),
+            "log_filter":   LiveLogDisplayFilter(
+                emit_routine_summaries=False, summary_interval_seconds=120.0),
+            "routine_var":  routine_var,
+            "params_toggle": chevron_lbl,
             "sim_btn":      sim_btn,
             "save_btn":     save_btn,
             "unsaved_lbl":  unsaved_lbl,
@@ -2252,9 +2272,9 @@ class ObsidianApp(ctk.CTk):
         pill = self.visibility_pills[bot]
         is_visible = self._visible.get(bot, True)
         if is_visible:
-            pill.configure(fg_color="transparent",
+            pill.configure(fg_color=COLORS["purple_dim"],
                             hover_color=COLORS["panel_hover"],
-                            text_color=COLORS["purple"],
+                            text_color=COLORS["accent_text"],
                             border_width=1, border_color=COLORS["purple"])
         else:
             pill.configure(fg_color="transparent",
@@ -2346,7 +2366,7 @@ class ObsidianApp(ctk.CTk):
         ctk.CTkLabel(left, textvariable=self.status_text,
                       font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                       text_color=COLORS["text_muted"],
-                      width=520,
+                      width=280,
                       anchor="w"
                       ).pack(side="left", fill="x", expand=True, padx=(14, 0))
 
@@ -2370,7 +2390,7 @@ class ObsidianApp(ctk.CTk):
         )
 
         ctk.CTkLabel(right,
-                      text="v5.0  Trend  Spot  Futures  Cross  Future Trend  Local-AI  SIM/LIVE",
+                      text="Obsidian Trading Terminal",
                       font=ctk.CTkFont(FONT_BODY, 10, "bold"),
                       text_color=COLORS["text_subtle"]
                       ).pack(side="right")
@@ -2534,7 +2554,7 @@ class ObsidianApp(ctk.CTk):
                                    border_width=2,
                                    border_color=COLORS["success"])
         self.after(1200, lambda: card["save_btn"].configure(
-            text=" Save", fg_color="transparent", text_color=accent,
+            text=" Save", fg_color="transparent", text_color=COLORS["accent_text"],
             border_width=2, border_color=accent
         ) if card["save_btn"].winfo_exists() else None)
 
@@ -4587,6 +4607,14 @@ class ObsidianApp(ctk.CTk):
                     self._log_to_card(
                         card, self._classify_severity(due_line), due_line
                     )
+                routine_var = card.get("routine_var")
+                if routine_var is not None:
+                    count = getattr(display_filter, "routine_hidden_count", 0)
+                    label = f"Routine hidden: {count:,}"
+                    if detailed:
+                        label += " | Details on (new output)"
+                    if routine_var.get() != label:
+                        routine_var.set(label)
 
         # Log queues remain responsive at 500 ms, while the expensive full
         # CTk render and config/status reads run at most once per second.
@@ -4708,7 +4736,7 @@ class ObsidianApp(ctk.CTk):
                                               hover_color="#1ea350",
                                               border_width=2,
                                               border_color="#a7f3d0",
-                                              text_color="#ffffff")
+                                              text_color=COLORS["bg"])
                 card["stop_btn"].configure(state="disabled",
                                            fg_color="transparent",
                                            hover_color=COLORS["panel_hover"],

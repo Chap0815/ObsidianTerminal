@@ -66,8 +66,9 @@ COLORS = {
 
     "text":         "#e9e7f2",   # cool white
     "text_dim":     "#9d9ab6",
-    "text_muted":   "#6b6788",
-    "text_subtle":  "#46425f",
+    "text_muted":   "#a39db8",
+    "text_subtle":  "#958fa9",
+    "accent_text":  "#b9a9f5",   # readable text; purple remains the surface accent
 
     # These keys feed the system-monitor bars + Available Capital (referenced
     # directly); the BOT accents are overridden to the cyan signature below.
