@@ -32,7 +32,7 @@ def _finite(value: Any) -> float | None:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -55,7 +55,10 @@ def _utc_datetime(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         parsed = value
     else:
-        text = str(value or "").strip()
+        try:
+            text = str(value or "").strip()
+        except Exception:
+            return None
         if not text:
             return None
         try:

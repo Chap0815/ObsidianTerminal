@@ -49,7 +49,7 @@ def read_bounded_response(
     max_bytes: int = MAX_RSS_RESPONSE_BYTES,
 ) -> bytes:
     """Read a streamed response with a hard decompressed-size ceiling."""
-    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+    if type(max_bytes) is not int or max_bytes <= 0:
         raise ValueError("response byte limit must be a positive integer")
     closer = getattr(response, "close", None)
     try:
@@ -57,10 +57,13 @@ def read_bounded_response(
         if isinstance(headers, Mapping):
             raw_length = headers.get("Content-Length")
             if raw_length is not None:
-                try:
-                    declared = int(raw_length)
-                except (TypeError, ValueError, OverflowError):
+                if type(raw_length) not in (int, str):
                     declared = None
+                else:
+                    try:
+                        declared = int(raw_length)
+                    except (TypeError, ValueError, OverflowError):
+                        declared = None
                 if declared is not None and declared > max_bytes:
                     raise ValueError("response exceeds byte limit")
 
@@ -69,10 +72,10 @@ def read_bounded_response(
             chunks: list[bytes] = []
             total = 0
             for chunk in iterator(chunk_size=_STREAM_CHUNK_BYTES):
+                if type(chunk) not in (bytes, bytearray):
+                    raise ValueError("response chunk must be bytes")
                 if not chunk:
                     continue
-                if not isinstance(chunk, (bytes, bytearray)):
-                    raise ValueError("response chunk must be bytes")
                 total += len(chunk)
                 if total > max_bytes:
                     raise ValueError("response exceeds byte limit")
@@ -80,7 +83,7 @@ def read_bounded_response(
             return b"".join(chunks)
 
         content = getattr(response, "content", None)
-        if not isinstance(content, (bytes, bytearray)):
+        if type(content) not in (bytes, bytearray):
             raise ValueError("response content must be bytes")
         if len(content) > max_bytes:
             raise ValueError("response exceeds byte limit")

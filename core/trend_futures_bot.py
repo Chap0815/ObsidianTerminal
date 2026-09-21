@@ -96,7 +96,7 @@ class TrendFuturesBot(FuturesBot):
     def _f(self, key, default):
         try:
             value = float(self.C(key, default))
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return default
         return value if math.isfinite(value) else default
 
@@ -140,7 +140,7 @@ class TrendFuturesBot(FuturesBot):
         try:
             out = float(value)
             return out if math.isfinite(out) else default
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return default
 
     @staticmethod
@@ -149,7 +149,7 @@ class TrendFuturesBot(FuturesBot):
             return None
         try:
             amount = float(value)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return None
         return amount if math.isfinite(amount) else None
 
@@ -159,7 +159,7 @@ class TrendFuturesBot(FuturesBot):
             return None
         try:
             out = float(value)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return None
         return out if math.isfinite(out) else None
 
@@ -485,7 +485,7 @@ class TrendFuturesBot(FuturesBot):
             interval = float(
                 self.C("TRAILING_AUDIT_LOG_INTERVAL_SEC", 3_600) or 3_600
             )
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             interval = 3_600.0
         return max(30.0, interval) if math.isfinite(interval) else 3_600.0
 
@@ -585,7 +585,13 @@ class TrendFuturesBot(FuturesBot):
                               f"memory but not persisted after {reason}",
                               "WARN")
         except Exception as e:
-            self._log_error(f"trend cooldown set {base}", e)
+            try:
+                self._log_error(
+                    f"trend cooldown set {base}",
+                    RuntimeError(type(e).__name__),
+                )
+            except Exception:
+                pass
 
     def _post_partial_trailing(self, base_distance: float, d: dict) -> tuple[float, bool]:
         amount = abs(self._safe_float(d.get("amount"), 0.0))
@@ -863,7 +869,7 @@ class TrendFuturesBot(FuturesBot):
             raw_qv = t.get("quoteVolume")
             try:
                 qv = 0.0 if isinstance(raw_qv, bool) else float(raw_qv)
-            except (TypeError, ValueError, OverflowError):
+            except Exception:
                 qv = 0.0
             if not math.isfinite(qv) or qv <= 0 or qv < min_vol:
                 continue
@@ -924,7 +930,7 @@ class TrendFuturesBot(FuturesBot):
                     close = float(bar[4])
                     if not math.isfinite(close) or close <= 0:
                         raise ValueError("invalid close")
-                except (TypeError, ValueError, OverflowError):
+                except Exception:
                     if isinstance(reservation, ApiCallReservation):
                         try:
                             record_api_error(
@@ -2442,7 +2448,7 @@ class TrendFuturesBot(FuturesBot):
                 return default
             try:
                 parsed = float(value)
-            except (TypeError, ValueError, OverflowError):
+            except Exception:
                 return default
             return parsed if math.isfinite(parsed) else default
 
@@ -3449,7 +3455,7 @@ class TrendFuturesBot(FuturesBot):
 
             try:
                 trailing = float(self.C("TRAILING_DISTANCE", 0.0))
-            except (TypeError, ValueError, OverflowError):
+            except Exception:
                 trailing = float("nan")
             trailing_invalid = (not math.isfinite(trailing)) or trailing < 0
             if trailing > 0 or trailing_invalid:

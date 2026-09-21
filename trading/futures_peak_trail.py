@@ -29,7 +29,7 @@ def _finite(value: Any) -> float | None:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -103,7 +103,10 @@ def build_execution_metrics(
     latency_ms: Any,
 ) -> dict[str, float]:
     """Build direction-aware decision-to-fill metrics for a verified close."""
-    direction = str(position_type or "").upper()
+    try:
+        direction = str(position_type or "").upper()
+    except Exception:
+        direction = ""
     if direction not in {"LONG", "SHORT"}:
         raise ValueError("position_type must be LONG or SHORT")
     values = {

@@ -212,7 +212,7 @@ def shutdown_expectancy_telemetry_resources(timeout: float = 0.0) -> bool:
     """Terminally prevent new retention jobs and await the active DB job."""
     global _RETENTION_GENERATION, _RETENTION_RUNNING
     global _RETENTION_TERMINAL, _RETENTION_THREAD
-    if isinstance(timeout, bool):
+    if type(timeout) not in (int, float):
         return False
     try:
         budget = float(timeout)

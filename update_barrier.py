@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 import stat
 import sys
 from collections.abc import Iterator
@@ -215,6 +216,16 @@ def update_lifecycle_lock(
     timeout: float = 5.0,
 ) -> Iterator[None]:
     """Serialize update claims with the final process-spawn boundary."""
+    if type(fail_when_locked) is not bool:
+        raise UpdateInProgressError("Ungueltiger fail_when_locked-Parameter.")
+    if type(timeout) not in (int, float):
+        raise UpdateInProgressError("Ungueltiger timeout-Parameter.")
+    try:
+        timeout_value = float(timeout)
+    except (ValueError, OverflowError) as exc:
+        raise UpdateInProgressError("Ungueltiger timeout-Parameter.") from exc
+    if not math.isfinite(timeout_value):
+        raise UpdateInProgressError("Ungueltiger timeout-Parameter.")
     root = Path(project_root)
     lock: portalocker.Lock | None = None
     try:
@@ -222,7 +233,7 @@ def update_lifecycle_lock(
         lock = portalocker.Lock(
             str(lock_path),
             mode="a+",
-            timeout=max(0.0, float(timeout)),
+            timeout=max(0.0, timeout_value),
             check_interval=0.05,
             fail_when_locked=fail_when_locked,
         )

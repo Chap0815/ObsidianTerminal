@@ -178,7 +178,7 @@ def _local_hour_dow(utc_str: str):
     return dt.hour, dt.weekday()
 
 
-#  SIM/LIVE metrics namespacing 
+#  SIM/LIVE metrics namespacing
 # Trades, daily PnL and the futures dashboard are keyed by bot_name; SIM and
 # LIVE must NOT share a row (a LIVE killswitch must not count paper losses).
 # A bot process pins its mode at boot via set_metrics_sim_mode(); the launcher,
@@ -513,9 +513,9 @@ def _optional_bounded_text_db(
     return text
 
 
-# 
+#
 # Connection
-# 
+#
 
 _conn_local = threading.local()
 _tight_conn_local = threading.local()
@@ -2274,9 +2274,9 @@ def _run_migrations(conn) -> None:
     conn.commit()
 
 
-# 
+#
 # Maintenance daemon
-# 
+#
 
 _MAINT_THREAD_STARTED = False
 _MAINT_THREAD: threading.Thread | None = None
@@ -3034,7 +3034,7 @@ def shutdown_database_background_workers(timeout: float = 2.0) -> bool:
     """
     global _MAINT_GENERATION, _MAINT_THREAD, _MAINT_THREAD_STARTED
     global _VACUUM_GENERATION, _VACUUM_THREAD
-    if isinstance(timeout, bool):
+    if type(timeout) not in (int, float):
         return False
     try:
         requested_timeout = float(timeout)
@@ -3172,9 +3172,9 @@ def shutdown_database_background_workers(timeout: float = 2.0) -> bool:
     )
 
 
-# 
+#
 # Trades
-# 
+#
 
 def trade_pnl_sanity_reason(
     *,
@@ -5518,7 +5518,7 @@ def get_recent_trades(bot_name: str, limit: int = 60,
     )[:limit]
 
 
-#  Futures state 
+#  Futures state
 
 def _validated_futures_state_bot_db(bot_name, mode_is_sim) -> str:
     validated_bot = _required_text_db(
@@ -5871,7 +5871,7 @@ def get_claim_bound_live_futures_state() -> list:
         raise
 
 
-#  Drawdown 
+#  Drawdown
 
 def _validated_metrics_bot_for_mode_db(bot_name, mode_is_sim) -> str:
     validated_bot = _canonical_bot_name_db(bot_name)
@@ -5987,7 +5987,7 @@ def pause_bot_today(bot_name: str, reason: str = "", mode_is_sim=None) -> None:
     )
 
 
-#  Params 
+#  Params
 
 _PARAM_CACHE: dict = {}
 _PARAM_CACHE_EPOCHS: dict[tuple[str, str], int] = {}
@@ -6108,7 +6108,7 @@ def set_param(bot_name: str, param_name: str, value, reason: str = "") -> None:
         raise
 
 
-#  Blacklist 
+#  Blacklist
 
 _MAX_BLACKLIST_HOURS = 87_600
 
@@ -6252,7 +6252,7 @@ def add_to_blacklist(symbol: str, bot_name: str, loss_usdt: float,
         raise
 
 
-#  Market regime 
+#  Market regime
 
 _MARKET_REGIMES = frozenset({"BULL", "BEAR", "NEUTRAL", "CACHED_FG"})
 
@@ -6304,7 +6304,7 @@ def cleanup_old_market_regime(
     )
 
 
-#  Learning log 
+#  Learning log
 
 def _optional_learning_value_db(value) -> str | None:
     if value is None:
@@ -6359,7 +6359,7 @@ def log_learning(bot_name, action, param_name=None, old_value=None,
         raise
 
 
-#  Win-rates 
+#  Win-rates
 
 def _validated_metric_bot_db(bot_name) -> str:
     normalized = _canonical_or_sim_bot_name_db(bot_name)
@@ -6549,7 +6549,7 @@ def get_historical_winrate_for_setup(bot_name: str, rsi_1h_bucket: int,
     }
 
 
-#  F&G cache 
+#  F&G cache
 
 def get_cached_fear_greed(max_age_sec: int = 290) -> Optional[int]:
     if isinstance(max_age_sec, bool) or not isinstance(max_age_sec, int):
@@ -6585,7 +6585,7 @@ def set_fear_greed_cache(value: int) -> None:
     log_market_regime("CACHED_FG", fear_greed=value)
 
 
-#  Heatmap 
+#  Heatmap
 
 def get_winloss_heatmap(bot_name: str = None, days: int = 30) -> dict:
     validated_bot = (
@@ -6674,7 +6674,7 @@ def get_winloss_heatmap(bot_name: str = None, days: int = 30) -> dict:
     }
 
 
-#  Advisory locks 
+#  Advisory locks
 
 def acquire_advisory_lock(lock_name: str, holder_id: str,
                           ttl_sec: int = 30) -> bool:
@@ -6775,7 +6775,7 @@ def release_advisory_locks_for_dead_process(
         return 0
 
 
-#  Global API rate limiter 
+#  Global API rate limiter
 
 def renew_advisory_lock(lock_name: str, holder_id: str,
                         ttl_sec: int = 30) -> bool:
@@ -7048,7 +7048,7 @@ def mark_global_api_call_error(
         return None
 
 
-#  Open positions 
+#  Open positions
 
 
 def _claim_generation_conflicts_db(
@@ -7661,7 +7661,7 @@ def get_open_positions_db(bot_name: str) -> list:
         raise
 
 
-#  Cross-bot ownership registry 
+#  Cross-bot ownership registry
 # Multiple bots can run on the SAME exchange/account (e.g. Momentum-Futures +
 # Cross-Momentum). bot_open_positions is the shared registry keyed by
 # (bot_name, symbol). These helpers let each bot (a) avoid trading a coin another
@@ -8064,7 +8064,7 @@ def claim_symbol_for_entry(bot_name: str, symbol: str,
     """Atomic pre-order entry claim (INSERTWHERE NOT EXISTS, symbol+class scoped).
 
     SIM/LIVE design + a KNOWN, ACCEPTED limitation: callers gate this behind
-    LIVE-only (``if not self.simulation``). So a SIM bot never WRITES a claim 
+    LIVE-only (``if not self.simulation``). So a SIM bot never WRITES a claim
     by design it cannot block or corrupt a LIVE bot's claims, and LIVE remains
     fully atomic against other LIVE bots. The single residual hole is that two
     SIM bots can both pass the read-only is_claimed_by_other and open the SAME
@@ -13953,7 +13953,7 @@ def load_open_carry_campaigns() -> list[dict]:
     return payloads
 
 
-#  Performance metrics 
+#  Performance metrics
 
 def get_performance_metrics(bot_name: str, days: int = 30) -> dict:
     validated_bot = _validated_metric_bot_db(bot_name)

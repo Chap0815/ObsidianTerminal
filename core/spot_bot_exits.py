@@ -999,7 +999,8 @@ class ExitsMixin:
                 btc_24h = get_btc_change(self.ex, hours=24, closed_only=True)
             except Exception as e:
                 log_event(
-                    f"BTC-Stress check skipped  BTC data unavailable: {e}",
+                    f"BTC-Stress check skipped  BTC data unavailable "
+                    f"({type(e).__name__})",
                     "WARN"
                 )
                 return
@@ -1013,6 +1014,8 @@ class ExitsMixin:
                 btc_1h = float(btc_1h)
                 btc_24h = float(btc_24h)
             except (TypeError, ValueError):
+                return
+            if not math.isfinite(btc_1h) or not math.isfinite(btc_24h):
                 return
             if btc_1h == 0.0 and btc_24h == 0.0:
                 return  # both exact zero  almost certainly API gap

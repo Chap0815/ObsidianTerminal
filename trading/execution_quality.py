@@ -52,7 +52,7 @@ def _finite_or_none(value) -> float | None:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -1018,6 +1018,26 @@ def run_tca_markout_worker(
         except Exception as exc:
             silent_log("report TCA markout worker health", exc)
 
+    def _nonnegative_count(value, *, field: str) -> int:
+        if value is None:
+            return 0
+        if type(value) is not int or value < 0:
+            raise ValueError(f"markout summary {field} is invalid")
+        return value
+
+    def _optional_nonnegative_seconds(value, *, field: str) -> float | None:
+        if value is None:
+            return None
+        if type(value) not in (int, float):
+            raise ValueError(f"markout summary {field} is invalid")
+        try:
+            parsed = float(value)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(f"markout summary {field} is invalid") from exc
+        if not math.isfinite(parsed) or parsed < 0.0:
+            raise ValueError(f"markout summary {field} is invalid")
+        return parsed
+
     def _scope_health(summary: Mapping) -> dict[str, dict]:
         raw_scopes = summary.get("scopes")
         raw_scopes = raw_scopes if isinstance(raw_scopes, Mapping) else {}
@@ -1025,11 +1045,14 @@ def run_tca_markout_worker(
         for scope in ("LIVE", "SIM"):
             raw = raw_scopes.get(scope)
             raw = raw if isinstance(raw, Mapping) else {}
-            try:
-                due = max(0, int(raw.get("due_count") or 0))
-            except (TypeError, ValueError, OverflowError):
-                due = 0
-            overdue = _finite_or_none(raw.get("oldest_overdue_seconds"))
+            due = _nonnegative_count(
+                raw.get("due_count"),
+                field=f"{scope}.due_count",
+            )
+            overdue = _optional_nonnegative_seconds(
+                raw.get("oldest_overdue_seconds"),
+                field=f"{scope}.oldest_overdue_seconds",
+            )
             oldest = raw.get("oldest_due_at")
             result[scope] = {
                 "due_count": due,
@@ -1039,8 +1062,9 @@ def run_tca_markout_worker(
                     str(raw.get("next_runnable_at"))[:32]
                     if raw.get("next_runnable_at") else None
                 ),
-                "next_runnable_seconds": _finite_or_none(
-                    raw.get("next_runnable_seconds")
+                "next_runnable_seconds": _optional_nonnegative_seconds(
+                    raw.get("next_runnable_seconds"),
+                    field=f"{scope}.next_runnable_seconds",
                 ),
                 "timestamps_valid": raw.get("timestamps_valid", True) is True,
             }
@@ -1067,9 +1091,13 @@ def run_tca_markout_worker(
             polls_total += 1
             try:
                 summary = _due_summary()
-                due_count = max(0, int(summary.get("due_count") or 0))
-                oldest_overdue = _finite_or_none(
-                    summary.get("oldest_overdue_seconds")
+                due_count = _nonnegative_count(
+                    summary.get("due_count"),
+                    field="due_count",
+                )
+                oldest_overdue = _optional_nonnegative_seconds(
+                    summary.get("oldest_overdue_seconds"),
+                    field="oldest_overdue_seconds",
                 )
                 oldest_overdue = max(0.0, oldest_overdue or 0.0)
                 timestamps_valid = summary.get("timestamps_valid", True) is True
@@ -1100,9 +1128,13 @@ def run_tca_markout_worker(
                     # increasing the completion count. Re-read the runnable
                     # queue so health/backoff describe the post-attempt state.
                     summary = _due_summary()
-                    due_count = max(0, int(summary.get("due_count") or 0))
-                    oldest_overdue = _finite_or_none(
-                        summary.get("oldest_overdue_seconds")
+                    due_count = _nonnegative_count(
+                        summary.get("due_count"),
+                        field="due_count",
+                    )
+                    oldest_overdue = _optional_nonnegative_seconds(
+                        summary.get("oldest_overdue_seconds"),
+                        field="oldest_overdue_seconds",
                     )
                     oldest_overdue = max(0.0, oldest_overdue or 0.0)
                     timestamps_valid = (
@@ -1115,8 +1147,9 @@ def run_tca_markout_worker(
                         # cross-process write/budget hot loop in those cases.
                         wait_interval = max(interval, 5.0)
                 adaptive_wait = "next_runnable_seconds" in summary
-                next_runnable_seconds = _finite_or_none(
-                    summary.get("next_runnable_seconds")
+                next_runnable_seconds = _optional_nonnegative_seconds(
+                    summary.get("next_runnable_seconds"),
+                    field="next_runnable_seconds",
                 )
                 if due_count == 0 and adaptive_wait:
                     wait_interval = _MARKOUT_IDLE_POLL_MAX_SECONDS
@@ -1124,13 +1157,11 @@ def run_tca_markout_worker(
                         wait_interval = min(
                             wait_interval, max(0.0, next_runnable_seconds)
                         )
+                queue_time_invalid = not timestamps_valid
                 overdue_queue = (
                     due_count > 0
                     and batch_lock_state != "contended"
-                    and (
-                        not timestamps_valid
-                        or oldest_overdue > overdue_limit
-                    )
+                    and oldest_overdue > overdue_limit
                 )
                 lock_unhealthy = batch_lock_state in {
                     "error",
@@ -1157,14 +1188,18 @@ def run_tca_markout_worker(
                     health_reason = "worker_lock_integrity_error"
                 elif batch_lock_state == "error":
                     health_reason = "worker_lock_error"
-                elif overdue_queue and not timestamps_valid:
+                elif queue_time_invalid:
                     health_reason = "due_queue_time_invalid"
                 elif overdue_queue:
                     health_reason = "due_queue_overdue"
                 else:
                     health_reason = ""
                 _report_health({
-                    "ok": not overdue_queue and not lock_unhealthy,
+                    "ok": (
+                        not queue_time_invalid
+                        and not overdue_queue
+                        and not lock_unhealthy
+                    ),
                     "reason": health_reason,
                     "due_count": due_count,
                     "oldest_due_at": summary.get("oldest_due_at"),
@@ -1208,7 +1243,7 @@ def run_tca_markout_worker(
                 _report_health({
                     "ok": False,
                     "reason": "worker_error",
-                    "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                    "error": type(exc).__name__,
                     "due_count": 0,
                     "oldest_due_at": None,
                     "oldest_overdue_seconds": 0.0,

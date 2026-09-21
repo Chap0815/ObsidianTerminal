@@ -311,14 +311,14 @@ class EventBus:
         """Publish ``event_type`` to subscribers.
 
         Critical events (``_CRITICAL_EVENTS``) get a per-handler try/except so a
-        transiently-full queue can't lose the event on every handler at once 
+        transiently-full queue can't lose the event on every handler at once
         queue.Full is recorded via ``_emergency_log`` for that handler only and
         the next handler still gets a chance. Their payload is also deep-copied
         before dispatch so one handler can't mutate another handler's view of a
         nested field.
         """
         # Deep-copy payload for critical events so handlers can't mutate each
-        # other's view. Non-critical events keep a shallow copy (cheaper) 
+        # other's view. Non-critical events keep a shallow copy (cheaper)
         # those are usually high-frequency and the handlers are read-only.
         base_payload = _coerce_payload(payload)
         if event_type in _CRITICAL_EVENTS:
@@ -663,7 +663,7 @@ class EventBus:
             pass
 
     def shutdown(self, timeout: float = 5.0) -> bool:
-        if isinstance(timeout, bool):
+        if type(timeout) not in (int, float):
             return False
         try:
             requested_timeout = float(timeout)
@@ -821,7 +821,7 @@ def begin_global_bus_runtime() -> bool:
 def shutdown_global_bus(timeout: float = 2.0) -> bool:
     """Close and reset the process-global bus for truthful bot shutdown."""
     global _BUS, _BUS_TERMINAL
-    if isinstance(timeout, bool):
+    if type(timeout) not in (int, float):
         return False
     try:
         requested_timeout = float(timeout)

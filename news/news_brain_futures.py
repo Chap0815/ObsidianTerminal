@@ -26,7 +26,7 @@ from news.news_brain_core import (
     strip_thinking,
     is_valid_symbol,
 )
-from news.news_keywords import BEARISH_KEYWORDS
+from news.news_keywords import BEARISH_KEYWORDS, find_keyword_matches
 from core.logger import log_event
 
 _BOT_NAME = "FUTURES"
@@ -50,7 +50,7 @@ _FALLBACK_PROMPT = (
 
 
 def _finite_float(value) -> float | None:
-    if isinstance(value, bool):
+    if type(value) not in (int, float, str):
         return None
     try:
         parsed = float(value)
@@ -60,7 +60,7 @@ def _finite_float(value) -> float | None:
 
 
 def _finite_metric(value, default: float = 0.0) -> float | None:
-    if value is None or (isinstance(value, str) and not value.strip()):
+    if value is None or (type(value) is str and not str.strip(value)):
         return default
     return _finite_float(value)
 
@@ -74,10 +74,16 @@ def _futures_keyword_fallback(symbol, news, change, rsi_1h):
 
     Uses the shared BEARISH_KEYWORDS vocabulary so a hack event triggers the
     same response across all bots."""
-    news_lower = news.lower() if isinstance(news, str) else ""
+    news_lower = str.lower(news) if type(news) is str else ""
     change = _finite_float(change)
     rsi_1h = _finite_float(rsi_1h)
-    found_bearish = [kw for kw in BEARISH_KEYWORDS if kw in news_lower]
+    if (
+        change is None
+        or rsi_1h is None
+        or not 0.0 <= rsi_1h <= 100.0
+    ):
+        return "[Keyword Fallback] Invalid indicators.\nRESULT: WAIT"
+    found_bearish = find_keyword_matches(news_lower, BEARISH_KEYWORDS)
 
     if found_bearish:
         return (
@@ -86,8 +92,6 @@ def _futures_keyword_fallback(symbol, news, change, rsi_1h):
             f"RESULT: SHORT"
         )
 
-    if change is None or rsi_1h is None:
-        return "[Keyword Fallback] Invalid indicators.\nRESULT: WAIT"
     if change > 20 and rsi_1h > 75:
         return (
             "[Keyword Fallback] Large pump + overbought RSI  "
@@ -124,14 +128,10 @@ def analyze_sentiment(
     sides.
     """
     if not is_valid_symbol(symbol):
-        return _futures_keyword_fallback(symbol, news, change, rsi_1h)
-    if not llm_available():
-        return _futures_keyword_fallback(symbol, news, change, rsi_1h)
-
-    fg = get_fear_greed()
+        return _invalid_market_data_result()
     if market_regime is None:
         market_regime = {"regime": "NEUTRAL", "btc_24h": 0.0, "btc_7d": 0.0}
-    if not isinstance(market_regime, dict):
+    if type(market_regime) is not dict:
         return _invalid_market_data_result()
 
     metrics = tuple(
@@ -163,14 +163,35 @@ def analyze_sentiment(
         btc_7d,
         open_interest_value,
     ) = metrics
-    if isinstance(leverage, bool):
+    if (
+        price_value < 0.0
+        or open_interest_value < 0.0
+        or change_value < -100.0
+        or btc_24h < -100.0
+        or btc_7d < -100.0
+    ):
         return _invalid_market_data_result()
-    try:
-        leverage_value = int(leverage or 1)
-    except (TypeError, ValueError, OverflowError):
+    if any(
+        not 0.0 <= rsi <= 100.0
+        for rsi in (rsi_15m_value, rsi_1h_value, rsi_4h_value)
+    ):
         return _invalid_market_data_result()
-    if leverage_value <= 0:
+    if type(leverage) is not int or leverage <= 0:
         return _invalid_market_data_result()
+    leverage_value = leverage
+    if not llm_available():
+        return _futures_keyword_fallback(
+            symbol, news, change_value, rsi_1h_value
+        )
+    fg = _finite_float(get_fear_greed())
+    if fg is None or not 0.0 <= fg <= 100.0:
+        return _invalid_market_data_result()
+    regime_value = market_regime.get("regime", "NEUTRAL")
+    if type(regime_value) is not str:
+        regime_value = "NEUTRAL"
+    fg_label_value = market_regime.get("fg_label", "Neutral")
+    if type(fg_label_value) is not str:
+        fg_label_value = "Neutral"
 
     template = load_prompt_template(
         _PROMPT_FILE, _DEFAULT_FILE, fallback=_FALLBACK_PROMPT
@@ -182,8 +203,10 @@ def analyze_sentiment(
         reflection = get_reflection_context(_BOT_NAME)
     except Exception:
         reflection = ""
+    if type(reflection) is not str:
+        reflection = ""
 
-    if screener_direction in ("LONG", "SHORT"):
+    if type(screener_direction) is str and screener_direction in ("LONG", "SHORT"):
         opposite = "SHORT" if screener_direction == "LONG" else "LONG"
         _hint = (
             "MACD > 0, bullish momentum"
@@ -207,15 +230,15 @@ def analyze_sentiment(
         "rsi_4h": f"{rsi_4h_value:.1f}",
         "funding_rate": funding_rate_value,
         "oi_change": oi_change_pct,
-        "news": news if isinstance(news, str) and news else "No news available.",
-        "regime": market_regime.get("regime", "NEUTRAL"),
+        "news": news if type(news) is str and news else "No news available.",
+        "regime": regime_value,
         "btc_24h": btc_24h,
         "screener_context": screener_context,
         # Legacy keys for old prompts that still have these placeholders
         "leverage": leverage_value,
         "btc_7d": btc_7d,
         "fg": fg,
-        "fg_label": str(market_regime.get("fg_label", "Neutral")),
+        "fg_label": fg_label_value,
         "open_interest_usdt": open_interest_value,
         "liq_long_pct": 0.0,
         "liq_short_pct": 0.0,
@@ -227,7 +250,15 @@ def analyze_sentiment(
 
     try:
         response = generate_with_timeout(get_model_name(), prompt, use_json_format=True)
-        full_text = response.get("response") or ""
+        if type(response) is not dict:
+            return _futures_keyword_fallback(
+                symbol, news, change_value, rsi_1h_value
+            )
+        full_text = response.get("response")
+        if type(full_text) is not str or not full_text:
+            return _futures_keyword_fallback(
+                symbol, news, change_value, rsi_1h_value
+            )
 
         # New prompt returns clean JSON  parse directly.
         # The old prompt returned free-text with "RESULT: LONG" at end.
@@ -323,9 +354,7 @@ def analyze_sentiment(
             )
         except Exception:
             pass
-        return _futures_keyword_fallback(
-            symbol, news, float(change or 0), float(rsi_1h or 0)
-        )
+        return _futures_keyword_fallback(symbol, news, change_value, rsi_1h_value)
 
 
 def parse_direction(llm_response: str) -> str:
@@ -340,7 +369,7 @@ def parse_direction_and_confidence(llm_response: str):
     1. New simple JSON: {"direction": "LONG", "confidence": "HIGH", ...}
     2. Old free-text:   ends with "RESULT: LONG"
     """
-    if not isinstance(llm_response, str) or not llm_response:
+    if type(llm_response) is not str or not llm_response:
         return ("WAIT", "LOW")
 
     # Try new JSON format first

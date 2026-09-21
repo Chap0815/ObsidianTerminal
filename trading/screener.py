@@ -131,7 +131,7 @@ def _hard_failure_active_locked(
     """Evaluate one persisted epoch TTL on a process-local monotonic clock."""
     try:
         hard_until = float(entry.get("hard_until", 0.0))
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         _fail_cache_hard_deadlines.pop(key, None)
         return False
     if not math.isfinite(hard_until) or hard_until <= 0.0:
@@ -1110,11 +1110,11 @@ def _screener_shutdown_state_unresolved(state: dict[str, object] | None) -> bool
 def shutdown_screener_resources(timeout: float = 1.0) -> bool:
     """Terminally close screener resources within one end-to-end deadline."""
     global _CLONE_POOL_TERMINAL, _SCREENER_SHUTDOWN_STATE
-    if isinstance(timeout, bool):
+    if type(timeout) not in (int, float):
         return False
     try:
         requested_timeout = float(timeout)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return False
     if not math.isfinite(requested_timeout):
         return False
@@ -1690,7 +1690,7 @@ def _get_top_momentum_coins_impl(
             continue
         try:
             chg = float(raw_pct)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             rej_no_pct += 1
             continue
         if not math.isfinite(chg):

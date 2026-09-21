@@ -49,7 +49,7 @@ except ImportError:
     HISTORY_JSONL_BACKUPS   = 2
 
 
-#  Color support 
+#  Color support
 def _stdout_isatty() -> bool:
     """Return False for pythonw/missing or hostile standard streams."""
     try:
@@ -92,7 +92,7 @@ def _date():
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-#  Console 
+#  Console
 
 _CONSOLE_FAILURE_REPORTED = [False]
 _CONSOLE_FAILURE_LOCK = threading.Lock()
@@ -222,9 +222,9 @@ def log_event(msg, level="INFO"):
     _safe_console_print(f"{ts} {_c(icon, color)}  {_c(msg, color)}")
 
 
-# 
+#
 # Structured log (lazy thread start)
-# 
+#
 
 _STRUCT_LOG_LOCK          = threading.Lock()
 _STRUCT_LOG_PATH_OVERRIDE = [None]
@@ -412,6 +412,8 @@ def flush_structured_logs(timeout: float = 2.0) -> bool:
     failure mode: silently dropping the final audit records on a clean process
     exit. Returns ``False`` on timeout or an unusable writer/queue.
     """
+    if type(timeout) not in (int, float):
+        return False
     try:
         budget = float(timeout)
     except (TypeError, ValueError, OverflowError):
@@ -1225,9 +1227,9 @@ def _record_struct_queue_drop() -> None:
                 )
 
 
-# 
+#
 # Latency timer
-# 
+#
 
 class measure_latency:
     def __init__(self, op: str, **context):
@@ -1255,9 +1257,9 @@ class measure_latency:
         return False
 
 
-# 
+#
 # Trade log helpers
-# 
+#
 
 def _rsi_safe(rsi):
     out = [0.0, 0.0, 0.0]
@@ -1397,9 +1399,9 @@ def log_status(bot, open_trades, balance, next_scan_sec):
     _safe_console_print(f"{_c(sep, DIM)}\n")
 
 
-# 
+#
 # JSON ops
-# 
+#
 
 _LOGGER_STATE_JSON_MAX_BYTES = 4 * 1024 * 1024
 
@@ -1658,9 +1660,9 @@ def save_j(f, d):
                     pass
 
 
-# 
+#
 # save_trade: append-only + background-throttled legacy rebuild
-# 
+#
 
 _TRADE_LOG_LOCK = threading.Lock()
 _LEGACY_REBUILD_LOCK = threading.Lock()
@@ -1924,7 +1926,7 @@ def _maybe_rebuild_legacy(jsonl_path: str, legacy_path: str) -> None:
 
 def shutdown_legacy_rebuild(timeout: float = 2.0) -> bool:
     """Close rebuild admission and boundedly join the owned daemon worker."""
-    if isinstance(timeout, bool):
+    if type(timeout) not in (int, float):
         return False
     try:
         budget = float(timeout)
@@ -2035,9 +2037,9 @@ def save_trade(log_dir, symbol, buy_price, buy_time, sell_price,
         )
 
 
-# 
+#
 # Telegram (lazy worker start, overflow rotation)
-# 
+#
 
 _USE_PROXY  = os.getenv("USE_PROXY", "false").lower() == "true"
 _PROXY_PORT = os.getenv("PROXY_PORT", "10808")
@@ -2280,6 +2282,8 @@ def flush_telegram(timeout: float = 2.0) -> bool:
     deliverable alerts; it never lets a blocked network call hold process exit
     past the caller's budget.
     """
+    if type(timeout) not in (int, float):
+        return False
     try:
         budget = float(timeout)
     except (TypeError, ValueError, OverflowError):
@@ -2498,9 +2502,9 @@ def send_telegram(token, chat_id, msg) -> bool:
     return accepted_all
 
 
-# 
+#
 # Cooldown helpers
-# 
+#
 
 def is_in_cooldown(cool: dict, sym: str, cooldown_file: str) -> bool:
     from trading.cooldown_utils import is_in_cooldown as _check

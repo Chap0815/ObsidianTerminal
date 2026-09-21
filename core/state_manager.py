@@ -56,9 +56,9 @@ def _canonical_json_path(path: str) -> str:
     return os.path.realpath(os.path.abspath(os.path.normpath(os.fspath(path))))
 
 
-# 
+#
 # Shared-connection wrapper
-# 
+#
 
 class _SharedConnWrapper:
     """Wraps a long-lived shared sqlite3.Connection so legacy callers
@@ -93,9 +93,9 @@ class _SharedConnWrapper:
         return self._real.__exit__(exc_type, exc, tb)
 
 
-# 
+#
 # Single-writer JSON
-# 
+#
 
 class _SingleWriterJSON:
     """One dedicated writer thread per JSON path. submit() replaces pending
@@ -431,7 +431,7 @@ class _SingleWriterJSON:
 
     def shutdown(self, timeout: float = 5.0) -> bool:
         """Validate and serialize one terminal writer shutdown lifecycle."""
-        if isinstance(timeout, bool):
+        if type(timeout) not in (int, float):
             return False
         try:
             requested_timeout = float(timeout)
@@ -479,7 +479,7 @@ class _SingleWriterJSON:
 def shutdown_state_json_writers(timeout: float = 2.0) -> bool:
     """Flush and close every process-global state JSON writer."""
     global _STATE_WRITER_TERMINAL
-    if isinstance(timeout, bool):
+    if type(timeout) not in (int, float):
         return False
     try:
         requested_timeout = float(timeout)
@@ -516,9 +516,9 @@ def begin_state_json_writer_runtime() -> bool:
         return True
 
 
-# 
+#
 # StateManager
-# 
+#
 
 class StateManager:
     def __init__(self, bot_name: str, log_dir: str, json_path: str,
@@ -774,9 +774,9 @@ class StateManager:
         with self.lock:
             return rev == self._persist_rev
 
-    # 
+    #
     # SQLite
-    # 
+    #
 
     def _get_conn(self) -> sqlite3.Connection:
         """Route through ``core.database.get_connection``, which keeps a

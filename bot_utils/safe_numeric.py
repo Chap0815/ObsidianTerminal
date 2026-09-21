@@ -23,7 +23,7 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
     try:
         f = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return default
     if not math.isfinite(f):
         return default
@@ -40,7 +40,7 @@ def safe_positive_float(value: Any, default: float = 0.0) -> float:
         return default
     try:
         f = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return default
     if not math.isfinite(f) or f <= 0:
         return default
@@ -104,7 +104,7 @@ def parse_ohlcv_closes(
         return None
     try:
         expected_interval = float(expected_interval_ms)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     if not math.isfinite(expected_interval) or expected_interval <= 0:
         return None
@@ -112,7 +112,7 @@ def parse_ohlcv_closes(
         return None
     try:
         current_time = float(now_ms)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     if not math.isfinite(current_time) or current_time < 0:
         return None
@@ -131,7 +131,7 @@ def parse_ohlcv_closes(
             return None
         try:
             timestamp = float(raw_timestamp)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return None
         if (
             not math.isfinite(timestamp)
@@ -177,7 +177,7 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
     try:
         f = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return default
     # Pre-filter non-finite values  int() on Inf raises OverflowError,
     # int() on NaN raises ValueError.
@@ -185,7 +185,7 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
     try:
         return int(f)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return default
 
 

@@ -13,6 +13,7 @@ from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 
 
+_DATETIME_TYPE = datetime
 CORE_STREAMS = ("overview", "depth", "trades", "l2_stream")
 EVENT_COLUMNS = (
     "event_id",
@@ -32,6 +33,15 @@ EVENT_SCHEMA = (
     ("quality_flags_json", "TEXT", 1, 0),
     ("payload_json", "TEXT", 1, 0),
 )
+EVENT_TIME_INDEX_XINFO = (
+    ("exchange_time", 0, "BINARY", 1),
+    ("market_id", 0, "BINARY", 1),
+    ("event_id", 0, "BINARY", 0),
+)
+PARTITION_SCHEMA_OBJECTS = (
+    ("index", "idx_venue_events_time", "venue_events"),
+    ("table", "venue_events", "venue_events"),
+)
 SEAL_GRACE = timedelta(hours=1)
 GAP_EXCLUSION_BUFFER = timedelta(minutes=2)
 DAY_MAX_SINGLE_OUTAGE = timedelta(minutes=45)
@@ -40,7 +50,12 @@ DAY_MAX_OUTAGE_EPISODES = 6
 CONTINUITY_WINDOW_DAYS = 30
 CONTINUITY_MAX_DEGRADED_RATIO = 0.20
 INTEGRITY_REPORT_MAX_BYTES = 4 * 1024 * 1024
+EVENT_PAYLOAD_JSON_MAX_BYTES = 16 * 1024 * 1024
+EVENT_QUALITY_FLAGS_JSON_MAX_BYTES = 64 * 1024
 REST_RECEIPT_CLOCK_TOLERANCE_MS = 30_000
+WEBSOCKET_TRADE_EVENT_MAX_ROWS = 20_000
+WEBSOCKET_TRADE_FUTURE_TOLERANCE_MS = 30_000
+WEBSOCKET_TRADE_MAX_AGE_MS = 86_400_000
 L2_BASE_QUALITY_FLAGS = ("sequence_unverified",)
 L2_STALE_QUALITY_FLAGS = (
     *L2_BASE_QUALITY_FLAGS,
@@ -49,13 +64,52 @@ L2_STALE_QUALITY_FLAGS = (
 L2_ALLOWED_QUALITY_FLAGS = frozenset(L2_STALE_QUALITY_FLAGS)
 L2_COVERAGE_EXCLUDED_FLAGS = frozenset({"stale_exchange_timestamp"})
 L2_STALE_WARNING = "l2_stale_exchange_timestamp_excluded"
+UNIVERSE_CONTRACT = "persisted_point_in_time_dynamic"
+SEQUENCE_CONTRACT = "l2_sequence_unverified_snapshot_only"
 
 
 def _capture_now_utc() -> datetime:
     """Exchange-anchored time for capture validation and sealing boundaries."""
     from core.clock import now_utc
 
-    return now_utc()
+    observed = now_utc()
+    try:
+        utc_offset = observed.utcoffset()
+    except (AttributeError, OverflowError, ValueError) as exc:
+        raise RuntimeError("capture clock is not UTC-aware") from exc
+    if not isinstance(observed, _DATETIME_TYPE) or utc_offset != timedelta(0):
+        raise RuntimeError("capture clock is not UTC-aware")
+    return observed
+
+
+def _capture_policy_gaps(
+    *,
+    max_symbols: int,
+    micro_interval_seconds: float,
+    l2_sample_interval_seconds: float,
+) -> tuple[timedelta, timedelta]:
+    if type(max_symbols) is not int or max_symbols < 1:
+        raise ValueError("max_symbols must be a positive integer")
+    intervals = []
+    for label, value in (
+        ("micro", micro_interval_seconds),
+        ("l2 sample", l2_sample_interval_seconds),
+    ):
+        if type(value) not in {int, float}:
+            raise ValueError(f"{label} interval must be finite and positive")
+        number = float(value)
+        if not math.isfinite(number) or number <= 0.0:
+            raise ValueError(f"{label} interval must be finite and positive")
+        intervals.append(number)
+    try:
+        rest_seconds = max(30.0, intervals[0] * max_symbols * 2.5)
+        l2_seconds = max(10.0, intervals[1] * 10.0)
+        return (
+            timedelta(seconds=rest_seconds),
+            timedelta(seconds=l2_seconds),
+        )
+    except OverflowError as exc:
+        raise ValueError("capture policy interval is out of range") from exc
 
 
 def _reject_constant(value: str):
@@ -79,6 +133,20 @@ def _json(value: str):
     )
 
 
+def _bounded_json(value, *, max_bytes: int, label: str):
+    if not isinstance(value, str):
+        raise ValueError(f"{label} is invalid")
+    if len(value) > max_bytes:
+        raise ValueError(f"{label} exceeds size limit")
+    try:
+        encoded_size = len(value.encode("utf-8"))
+    except UnicodeError as exc:
+        raise ValueError(f"{label} is invalid") from exc
+    if encoded_size > max_bytes:
+        raise ValueError(f"{label} exceeds size limit")
+    return _json(value)
+
+
 def _utc(value) -> datetime:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("timestamp is missing")
@@ -87,7 +155,10 @@ def _utc(value) -> datetime:
     )
     if parsed.tzinfo is None:
         raise ValueError("timestamp is naive")
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError as exc:
+        raise ValueError("timestamp is outside UTC range") from exc
 
 
 def _sha256(path: Path) -> str:
@@ -137,19 +208,72 @@ def _linklike(path: Path) -> bool:
     return bool(attributes & 0x400)
 
 
-def _read_integrity_report_bytes(path: Path) -> bytes:
-    if _linklike(path.parent) or _linklike(path):
+def _path_has_links(path: Path) -> bool:
+    return any(_linklike(component) for component in (path, *path.parents))
+
+
+def _file_signature(stat_result) -> tuple:
+    return (
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_nlink,
+    )
+
+
+def _path_identity(stat_result) -> tuple:
+    # Windows can expose a different ctime for the open handle and its path
+    # even when device/inode and all content-bearing metadata are identical.
+    return (
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_nlink,
+    )
+
+
+def _read_integrity_report_bytes(
+    path: Path,
+    *,
+    max_bytes: int = INTEGRITY_REPORT_MAX_BYTES,
+) -> bytes:
+    if type(max_bytes) is not int or max_bytes < 1:
+        raise ValueError("capture integrity report size limit is invalid")
+    if _path_has_links(path):
         raise RuntimeError("capture integrity report path is linked")
     with path.open("rb") as handle:
-        encoded = handle.read(INTEGRITY_REPORT_MAX_BYTES + 1)
-    if len(encoded) > INTEGRITY_REPORT_MAX_BYTES:
+        before = os.fstat(handle.fileno())
+        if before.st_nlink != 1:
+            raise RuntimeError("capture integrity report is hard-linked")
+        encoded = handle.read(max_bytes + 1)
+        after = os.fstat(handle.fileno())
+    if _file_signature(after) != _file_signature(before):
+        raise RuntimeError("capture integrity report changed during read")
+    if _path_has_links(path):
+        raise RuntimeError("capture integrity report path is linked")
+    current = path.stat(follow_symlinks=False)
+    if current.st_nlink != 1:
+        raise RuntimeError("capture integrity report is hard-linked")
+    if _path_identity(current) != _path_identity(after):
+        raise RuntimeError("capture integrity report changed during read")
+    if len(encoded) > max_bytes:
         raise ValueError("capture integrity report exceeds size limit")
     return encoded
 
 
-def _read_integrity_report(path: Path) -> dict:
+def _read_integrity_report(
+    path: Path,
+    *,
+    max_bytes: int = INTEGRITY_REPORT_MAX_BYTES,
+) -> dict:
     try:
-        text = _read_integrity_report_bytes(path).decode("utf-8")
+        text = _read_integrity_report_bytes(
+            path,
+            max_bytes=max_bytes,
+        ).decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("capture integrity report is not valid UTF-8") from exc
     return _json(text)
@@ -477,9 +601,14 @@ def capture_continuity_health(reports: list[dict]) -> dict:
     """Grade the latest consecutive 30-day window without hiding gap days."""
     normalized = []
     for report in reports:
+        day_text = report.get("day")
+        if not isinstance(day_text, str):
+            continue
         try:
-            parsed_day = date.fromisoformat(str(report.get("day") or ""))
-        except (TypeError, ValueError):
+            parsed_day = date.fromisoformat(day_text)
+        except ValueError:
+            continue
+        if parsed_day.isoformat() != day_text:
             continue
         normalized.append((parsed_day, str(report.get("status") or "")))
     normalized.sort(key=lambda item: item[0])
@@ -523,6 +652,8 @@ def capture_continuity_health(reports: list[dict]) -> dict:
 def _positive_number(value, label: str) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{label} is boolean")
+    if type(value) not in {int, float}:
+        raise ValueError(f"{label} is not numeric")
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError) as exc:
@@ -532,6 +663,51 @@ def _positive_number(value, label: str) -> float:
     return number
 
 
+def _validate_book_payload(payload: dict, label: str) -> None:
+    best = {}
+    for side, descending in (("bids", True), ("asks", False)):
+        levels = payload.get(side)
+        if not isinstance(levels, list) or not levels:
+            raise ValueError(f"{label} {side} is empty")
+        previous = None
+        for index, level in enumerate(levels):
+            if not isinstance(level, list) or len(level) != 2:
+                raise ValueError(f"{label} {side}[{index}] is malformed")
+            price = _positive_number(
+                level[0], f"{label} {side}[{index}].price"
+            )
+            _positive_number(
+                level[1], f"{label} {side}[{index}].amount"
+            )
+            if previous is not None and (
+                (descending and price >= previous)
+                or (not descending and price <= previous)
+            ):
+                raise ValueError(f"{label} {side} is not strictly sorted")
+            if index == 0:
+                best[side] = price
+            previous = price
+    if best["bids"] >= best["asks"]:
+        raise ValueError(f"{label} book is crossed or locked")
+    nonce = payload.get("nonce")
+    if nonce is not None and (
+        type(nonce) is not int
+        and (
+            not isinstance(nonce, str)
+            or not nonce
+            or nonce != nonce.strip()
+            or len(nonce) > 256
+            or any(
+                codepoint < 32
+                or codepoint == 127
+                or 0xD800 <= codepoint <= 0xDFFF
+                for codepoint in map(ord, nonce)
+            )
+        )
+    ):
+        raise ValueError(f"{label} nonce is invalid")
+
+
 def _validate_l2_payload(payload: dict) -> None:
     if (
         payload.get("stream_source") != "ccxt_pro"
@@ -539,27 +715,63 @@ def _validate_l2_payload(payload: dict) -> None:
         or payload.get("sequence_status") != "unverified_unified_orderbook"
     ):
         raise ValueError("l2 sequence contract is invalid")
-    best = {}
-    for side, descending in (("bids", True), ("asks", False)):
-        levels = payload.get(side)
-        if not isinstance(levels, list) or not levels:
-            raise ValueError(f"l2 {side} is empty")
-        previous = None
-        for index, level in enumerate(levels):
-            if not isinstance(level, list) or len(level) != 2:
-                raise ValueError(f"l2 {side}[{index}] is malformed")
-            price = _positive_number(level[0], f"l2 {side}[{index}].price")
-            _positive_number(level[1], f"l2 {side}[{index}].amount")
-            if previous is not None and (
-                (descending and price >= previous)
-                or (not descending and price <= previous)
-            ):
-                raise ValueError(f"l2 {side} is not strictly sorted")
-            if index == 0:
-                best[side] = price
-            previous = price
-    if best["bids"] >= best["asks"]:
-        raise ValueError("l2 book is crossed or locked")
+    _validate_book_payload(payload, "l2")
+
+
+def _valid_trade_id(value) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and len(value) <= 256
+        and not any(
+            codepoint < 32
+            or codepoint == 127
+            or 0xD800 <= codepoint <= 0xDFFF
+            for codepoint in map(ord, value)
+        )
+    )
+
+
+def _validate_rest_trades_payload(payload: dict, day: date) -> None:
+    trades = payload.get("trades")
+    if not isinstance(trades, list) or len(trades) > 100:
+        raise ValueError("REST trades payload is malformed")
+    seen = set()
+    previous_time = None
+    for index, trade in enumerate(trades):
+        if not isinstance(trade, dict):
+            raise ValueError(f"REST trade[{index}] is malformed")
+        trade_id = trade.get("id")
+        if trade_id is not None and not _valid_trade_id(trade_id):
+            raise ValueError("REST trade id is invalid")
+        trade_time = trade.get("timestamp")
+        if type(trade_time) is not int or trade_time <= 0:
+            raise ValueError("REST trade timestamp is invalid")
+        try:
+            trade_day = datetime.fromtimestamp(
+                trade_time / 1000, tz=timezone.utc
+            ).date()
+        except (OSError, OverflowError, ValueError) as exc:
+            raise ValueError("REST trade timestamp is invalid") from exc
+        if trade_day != day:
+            raise ValueError("REST trade escaped UTC partition")
+        price = _positive_number(trade.get("price"), "REST trade price")
+        amount = _positive_number(trade.get("amount"), "REST trade amount")
+        side = trade.get("side")
+        if side not in {"buy", "sell"}:
+            raise ValueError("REST trade side is invalid")
+        identity = (
+            ("id", trade_id)
+            if trade_id is not None
+            else ("fallback", trade_time, price, amount, side)
+        )
+        if identity in seen:
+            raise ValueError("REST trade identity is duplicated")
+        if previous_time is not None and trade_time < previous_time:
+            raise ValueError("REST trade chronology is invalid")
+        seen.add(identity)
+        previous_time = trade_time
 
 
 def _event_diagnostic(value, max_chars: int = 120) -> str:
@@ -583,6 +795,12 @@ def _validate_event_universe(payload: dict) -> None:
         not isinstance(symbol, str)
         or not symbol
         or symbol != symbol.strip()
+        or any(
+            codepoint < 32
+            or codepoint == 127
+            or 0xD800 <= codepoint <= 0xDFFF
+            for codepoint in map(ord, symbol)
+        )
         for symbol in universe
     ):
         raise ValueError("capture universe contains an invalid symbol")
@@ -626,10 +844,14 @@ def _partition_rows(
 ) -> tuple[dict, dict]:
     if _linklike(path):
         raise ValueError(f"{stream} partition is linked")
+    if path.stat(follow_symlinks=False).st_nlink != 1:
+        raise ValueError(f"{stream} partition is hard-linked")
     for suffix in ("-wal", "-shm"):
         sidecar = Path(f"{path}{suffix}")
         if sidecar.exists() and sidecar.stat().st_size:
             raise ValueError(f"{stream} partition has active {suffix[1:]} data")
+    relative_path = f"{stream}/{path.name}"
+    initial_manifest = _manifest_file(path, relative_path)
     connection = sqlite3.connect(
         f"file:{path.as_posix()}?mode=ro&immutable=1",
         uri=True,
@@ -662,7 +884,7 @@ def _partition_rows(
         if [str(row[0]) for row in quick] != ["ok"]:
             raise ValueError(f"{stream} quick_check failed")
         table_info = connection.execute(
-            "PRAGMA table_info(venue_events)"
+            "PRAGMA table_xinfo(venue_events)"
         ).fetchall()
         columns = tuple(str(row[1]) for row in table_info)
         schema = tuple(
@@ -671,6 +893,57 @@ def _partition_rows(
         )
         if columns != EVENT_COLUMNS or schema != EVENT_SCHEMA:
             raise ValueError(f"{stream} schema mismatch")
+        table_contract = tuple(
+            (
+                str(row[0]),
+                str(row[1]),
+                str(row[2]),
+                int(row[3]),
+                int(row[4]),
+                int(row[5]),
+            )
+            for row in connection.execute(
+                "PRAGMA table_list('venue_events')"
+            ).fetchall()
+        )
+        if table_contract != (("main", "venue_events", "table", 7, 1, 0),):
+            raise ValueError(f"{stream} table contract mismatch")
+        trigger = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='trigger' AND tbl_name='venue_events' LIMIT 1"
+        ).fetchone()
+        if trigger is not None:
+            raise ValueError(f"{stream} trigger contract mismatch")
+        index_rows = tuple(
+            row
+            for row in connection.execute(
+                "PRAGMA index_list(venue_events)"
+            ).fetchall()
+            if str(row[1]) == "idx_venue_events_time"
+        )
+        index_xinfo = tuple(
+            (str(row[2]), int(row[3]), str(row[4]), int(row[5]))
+            for row in connection.execute(
+                "PRAGMA index_xinfo(idx_venue_events_time)"
+            ).fetchall()
+        )
+        if (
+            len(index_rows) != 1
+            or int(index_rows[0][2]) != 0
+            or str(index_rows[0][3]) != "c"
+            or int(index_rows[0][4]) != 0
+            or index_xinfo != EVENT_TIME_INDEX_XINFO
+        ):
+            raise ValueError(f"{stream} index contract mismatch")
+        schema_objects = tuple(
+            (str(row[0]), str(row[1]), str(row[2]))
+            for row in connection.execute(
+                "SELECT type,name,tbl_name FROM sqlite_master "
+                "ORDER BY type,name"
+            ).fetchall()
+        )
+        if schema_objects != PARTITION_SCHEMA_OBJECTS:
+            raise ValueError(f"{stream} schema objects mismatch")
         receipt_ordered = stream in {"depth", "l2_stream"}
         order_expression = (
             "julianday(received_time),received_time"
@@ -700,15 +973,21 @@ def _partition_rows(
             f"FROM venue_events ORDER BY {order_expression},event_id"
         ):
             event_count += 1
-            for identity_field in ("event_id", "market_id"):
+            for identity_field, max_chars in (
+                ("event_id", 2048),
+                ("market_id", 256),
+            ):
                 identity = row[identity_field]
                 if (
                     not isinstance(identity, str)
                     or not identity
                     or identity != identity.strip()
+                    or len(identity) > max_chars
                     or any(
-                        ord(character) < 32 or ord(character) == 127
-                        for character in identity
+                        codepoint < 32
+                        or codepoint == 127
+                        or 0xD800 <= codepoint <= 0xDFFF
+                        for codepoint in map(ord, identity)
                     )
                 ):
                     raise ValueError(
@@ -716,14 +995,39 @@ def _partition_rows(
                     )
             if row["schema_version"] != 1:
                 raise ValueError(f"{stream} schema_version mismatch")
+            for clock_field in ("exchange_time", "received_time"):
+                clock_text = row[clock_field]
+                if (
+                    not isinstance(clock_text, str)
+                    or not clock_text
+                    or clock_text != clock_text.strip()
+                    or len(clock_text) > 64
+                    or any(
+                        codepoint < 32
+                        or codepoint == 127
+                        or 0xD800 <= codepoint <= 0xDFFF
+                        for codepoint in map(ord, clock_text)
+                    )
+                ):
+                    raise ValueError(
+                        f"{stream} {clock_field} is invalid"
+                    )
             exchange_time = _utc(row["exchange_time"])
             received_time = _utc(row["received_time"])
             if exchange_time.date() != day:
                 raise ValueError(f"{stream} row escaped UTC partition")
             if received_time > future_limit:
                 raise ValueError(f"{stream} received_time is in the future")
-            flags = _json(row["quality_flags_json"])
-            payload = _json(row["payload_json"])
+            flags = _bounded_json(
+                row["quality_flags_json"],
+                max_bytes=EVENT_QUALITY_FLAGS_JSON_MAX_BYTES,
+                label=f"{stream} quality_flags_json",
+            )
+            payload = _bounded_json(
+                row["payload_json"],
+                max_bytes=EVENT_PAYLOAD_JSON_MAX_BYTES,
+                label=f"{stream} payload_json",
+            )
             coverage_eligible = True
             if (
                 not isinstance(flags, list)
@@ -756,7 +1060,21 @@ def _partition_rows(
                     f"exchange_time={_event_diagnostic(row['exchange_time'])} "
                     f"event_id={_event_diagnostic(row['event_id'])}"
                 )
-            if stream == "l2_stream":
+            if stream == "depth":
+                _validate_book_payload(payload, "depth")
+            elif (
+                stream == "trades"
+                and payload.get("stream_source") != "ccxt_pro"
+            ):
+                _validate_rest_trades_payload(payload, day)
+                if (
+                    len(payload["trades"]) == 100
+                    and "saturated_trade_payload" not in flags
+                ):
+                    raise ValueError(
+                        "REST trade saturation evidence is missing"
+                    )
+            elif stream == "l2_stream":
                 if tuple(flags) not in (
                     L2_BASE_QUALITY_FLAGS,
                     L2_STALE_QUALITY_FLAGS,
@@ -787,21 +1105,27 @@ def _partition_rows(
                     or not trades
                 ):
                     raise ValueError("trades websocket payload is empty")
+                if len(trades) > WEBSOCKET_TRADE_EVENT_MAX_ROWS:
+                    raise ValueError("trades websocket payload is oversized")
                 trade_ids = set()
+                previous_trade_order = None
                 for trade in trades:
                     if not isinstance(trade, dict):
                         raise ValueError("trades websocket payload is malformed")
                     trade_id = trade.get("id")
                     trade_time = trade.get("timestamp")
                     if (
-                        not isinstance(trade_id, str)
-                        or not trade_id
+                        not _valid_trade_id(trade_id)
                         or trade_id in trade_ids
                         or isinstance(trade_time, bool)
                         or not isinstance(trade_time, int)
                     ):
                         raise ValueError("trades websocket identity is invalid")
                     trade_ids.add(trade_id)
+                    if trade_time <= 0:
+                        raise ValueError(
+                            "trades websocket timestamp is invalid"
+                        )
                     try:
                         trade_day = datetime.fromtimestamp(
                             trade_time / 1000, tz=timezone.utc
@@ -812,6 +1136,16 @@ def _partition_rows(
                         ) from exc
                     if trade_day != day:
                         raise ValueError("trade escaped UTC partition")
+                    received_ms = round(received_time.timestamp() * 1000)
+                    if (
+                        trade_time
+                        > received_ms + WEBSOCKET_TRADE_FUTURE_TOLERANCE_MS
+                        or received_ms - trade_time
+                        > WEBSOCKET_TRADE_MAX_AGE_MS
+                    ):
+                        raise ValueError(
+                            "trades websocket receipt provenance mismatch"
+                        )
                     trade_price = _positive_number(
                         trade.get("price"), "trade price"
                     )
@@ -820,6 +1154,15 @@ def _partition_rows(
                     )
                     if trade.get("side") not in {"buy", "sell"}:
                         raise ValueError("trade side is invalid")
+                    trade_order = (trade_time, trade_id)
+                    if (
+                        previous_trade_order is not None
+                        and trade_order < previous_trade_order
+                    ):
+                        raise ValueError(
+                            "trades websocket chronology is invalid"
+                        )
+                    previous_trade_order = trade_order
                     identity_key = (market_id, trade_id)
                     identity_evidence = (
                         trade_time,
@@ -858,6 +1201,14 @@ def _partition_rows(
                             f"trade_id={_event_diagnostic(trade_id)} "
                             f"event_id={_event_diagnostic(row['event_id'])}"
                         )
+                latest_trade_time = datetime.fromtimestamp(
+                    previous_trade_order[0] / 1000,
+                    tz=timezone.utc,
+                )
+                if exchange_time != latest_trade_time:
+                    raise ValueError(
+                        "trades websocket exchange_time mismatch"
+                    )
             if stream in {"trades", "l2_stream"}:
                 epoch = payload.get("connection_epoch")
                 epoch_required = stream == "l2_stream" or (
@@ -897,12 +1248,22 @@ def _partition_rows(
         connection_epoch_gaps, connection_epoch_issues = [], []
     else:
         connection_epoch_gaps, connection_epoch_issues = epoch_tracker.finish()
-    return _manifest_file(
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{path}{suffix}")
+        if sidecar.exists() and sidecar.stat().st_size:
+            raise ValueError(f"{stream} partition has active {suffix[1:]} data")
+    final_manifest = _manifest_file(
         path,
-        f"{stream}/{path.name}",
+        relative_path,
         events=event_count,
         warnings=sorted(warnings),
-    ), {
+    )
+    if (
+        final_manifest["bytes"] != initial_manifest["bytes"]
+        or final_manifest["sha256"] != initial_manifest["sha256"]
+    ):
+        raise RuntimeError("capture artifact changed during validation")
+    return final_manifest, {
         "overview": overview_rows,
         "websocket_trade_events": websocket_trade_events,
         "connection_epochs": sorted(connection_epochs),
@@ -956,13 +1317,54 @@ def _membership_intervals(
         if not isinstance(markets, dict) or not isinstance(universe, list):
             issues.append("overview_universe_contract_invalid")
             continue
+        if not universe or any(
+            not isinstance(symbol, str)
+            or not symbol
+            or symbol != symbol.strip()
+            or any(
+                codepoint < 32
+                or codepoint == 127
+                or 0xD800 <= codepoint <= 0xDFFF
+                for codepoint in map(ord, symbol)
+            )
+            for symbol in universe
+        ):
+            issues.append("overview_universe_contract_invalid")
+            continue
         markets_by_symbol: dict[str, list[str]] = defaultdict(list)
+        invalid_market_identity = False
         for market_id, item in markets.items():
-            if not isinstance(item, dict):
+            if (
+                not isinstance(market_id, str)
+                or not market_id
+                or market_id != market_id.strip()
+                or any(
+                    codepoint < 32
+                    or codepoint == 127
+                    or 0xD800 <= codepoint <= 0xDFFF
+                    for codepoint in map(ord, market_id)
+                )
+                or not isinstance(item, dict)
+            ):
+                invalid_market_identity = True
                 continue
             symbol = item.get("symbol")
-            if isinstance(symbol, str) and symbol:
-                markets_by_symbol[symbol].append(str(market_id))
+            if (
+                not isinstance(symbol, str)
+                or not symbol
+                or symbol != symbol.strip()
+                or any(
+                    codepoint < 32
+                    or codepoint == 127
+                    or 0xD800 <= codepoint <= 0xDFFF
+                    for codepoint in map(ord, symbol)
+                )
+            ):
+                invalid_market_identity = True
+                continue
+            markets_by_symbol[symbol].append(market_id)
+        if invalid_market_identity:
+            issues.append("overview_market_identity_invalid")
         valid_symbols = [symbol for symbol in universe if isinstance(symbol, str)]
         selected = {
             markets_by_symbol[symbol][0]
@@ -1031,6 +1433,13 @@ def validate_capture_day(
     l2_sample_interval_seconds: float,
 ) -> dict:
     """Validate one closed UTC day while retaining only bounded index fields."""
+    if type(day) is not date:
+        raise ValueError("capture day must be a date")
+    rest_gap, l2_gap = _capture_policy_gaps(
+        max_symbols=max_symbols,
+        micro_interval_seconds=micro_interval_seconds,
+        l2_sample_interval_seconds=l2_sample_interval_seconds,
+    )
     root = Path(root)
     if _linklike(root):
         raise ValueError("capture root is linked")
@@ -1042,15 +1451,6 @@ def validate_capture_day(
     manifest = []
     stream_data = {}
     intervals = {}
-    rest_gap = timedelta(
-        seconds=max(
-            30.0,
-            float(micro_interval_seconds) * max(1, int(max_symbols)) * 2.5,
-        )
-    )
-    l2_gap = timedelta(
-        seconds=max(10.0, float(l2_sample_interval_seconds) * 10.0)
-    )
     for stream in CORE_STREAMS:
         path = root / stream / f"{day.isoformat()}.sqlite3"
         try:
@@ -1153,8 +1553,8 @@ def validate_capture_day(
         "status": status,
         "issues": issues,
         "availability": availability,
-        "universe_contract": "persisted_point_in_time_dynamic",
-        "sequence_contract": "l2_sequence_unverified_snapshot_only",
+        "universe_contract": UNIVERSE_CONTRACT,
+        "sequence_contract": SEQUENCE_CONTRACT,
         "manifest": sorted(manifest, key=lambda item: item["path"]),
     }
     result["report_sha256"] = hashlib.sha256(
@@ -1169,9 +1569,11 @@ def validate_capture_day(
 
 
 def _atomic_create(path: Path, payload: dict) -> None:
-    if _linklike(path.parent) or _linklike(path):
+    if _path_has_links(path):
         raise RuntimeError("capture integrity report path is linked")
     path.parent.mkdir(parents=True, exist_ok=True)
+    if _path_has_links(path):
+        raise RuntimeError("capture integrity report path is linked")
     encoded = json.dumps(
         payload,
         sort_keys=True,
@@ -1249,26 +1651,229 @@ def _verify_sealed_report(
     expected_day: date | str,
     verification_cache: dict[str, tuple] | None = None,
 ) -> None:
-    if not isinstance(report, dict) or report.get("schema_version") != 1:
+    if (
+        not isinstance(report, dict)
+        or type(report.get("schema_version")) is not int
+        or report.get("schema_version") != 1
+    ):
         raise RuntimeError("sealed capture report schema is invalid")
     expected_day_text = (
         expected_day.isoformat() if isinstance(expected_day, date)
         else str(expected_day)
     )
+    try:
+        parsed_expected_day = date.fromisoformat(expected_day_text)
+    except ValueError as exc:
+        raise RuntimeError("sealed capture report day is invalid") from exc
+    if parsed_expected_day.isoformat() != expected_day_text:
+        raise RuntimeError("sealed capture report day is invalid")
     if report.get("day") != expected_day_text:
         raise RuntimeError("sealed capture report day does not match seal path")
     status = report.get("status")
     if status not in {"valid", "usable_with_gaps", "invalid"}:
         raise RuntimeError("sealed capture report status is invalid")
-    if status == "usable_with_gaps":
+    if status in {"valid", "usable_with_gaps"} and set(report) != {
+        "schema_version",
+        "day",
+        "status",
+        "issues",
+        "availability",
+        "universe_contract",
+        "sequence_contract",
+        "manifest",
+        "report_sha256",
+    }:
+        raise RuntimeError("sealed capture report fields are invalid")
+    if report.get("universe_contract") != UNIVERSE_CONTRACT:
+        raise RuntimeError("sealed capture universe contract is invalid")
+    if report.get("sequence_contract") != SEQUENCE_CONTRACT:
+        raise RuntimeError("sealed capture sequence contract is invalid")
+    if status in {"valid", "usable_with_gaps"}:
         availability = report.get("availability")
+        availability_fields = {
+            "contract",
+            "state",
+            "within_daily_budget",
+            "maximum_single_outage_seconds",
+            "maximum_total_outage_seconds",
+            "maximum_outage_episodes",
+            "outage_episodes",
+            "maximum_gap_seconds",
+            "total_gap_seconds",
+            "exclusion_buffer_seconds",
+            "excluded_seconds",
+            "transport_connection_epochs",
+            "warnings",
+            "exclusion_intervals",
+        }
+        expected_availability_state = (
+            "complete" if status == "valid" else "degraded"
+        )
         if (
             not isinstance(availability, dict)
+            or set(availability) != availability_fields
             or availability.get("contract") != "bounded_outage_exclusion_v1"
+            or availability.get("state") != expected_availability_state
             or availability.get("within_daily_budget") is not True
             or not isinstance(availability.get("exclusion_intervals"), list)
+            or (
+                status == "valid"
+                and bool(availability.get("exclusion_intervals"))
+            )
         ):
             raise RuntimeError("sealed capture availability is invalid")
+        expected_policy_seconds = {
+            "maximum_single_outage_seconds": (
+                DAY_MAX_SINGLE_OUTAGE.total_seconds()
+            ),
+            "maximum_total_outage_seconds": (
+                DAY_MAX_TOTAL_OUTAGE.total_seconds()
+            ),
+            "exclusion_buffer_seconds": GAP_EXCLUSION_BUFFER.total_seconds(),
+        }
+        if any(
+            type(availability.get(field)) not in {int, float}
+            or not math.isfinite(float(availability[field]))
+            or float(availability[field]) != expected
+            for field, expected in expected_policy_seconds.items()
+        ) or (
+            type(availability.get("maximum_outage_episodes")) is not int
+            or availability["maximum_outage_episodes"]
+            != DAY_MAX_OUTAGE_EPISODES
+        ):
+            raise RuntimeError("sealed capture availability is invalid")
+        try:
+            day_start, day_end = _day_bounds(
+                date.fromisoformat(expected_day_text)
+            )
+            previous_end = None
+            total_excluded_seconds = 0.0
+            exclusion_intervals = availability["exclusion_intervals"]
+            for interval in exclusion_intervals:
+                if (
+                    not isinstance(interval, dict)
+                    or set(interval) != {
+                        "start",
+                        "end",
+                        "duration_seconds",
+                        "streams",
+                        "markets",
+                        "reasons",
+                    }
+                ):
+                    raise ValueError("exclusion interval is not an object")
+                started = _utc(interval.get("start"))
+                ended = _utc(interval.get("end"))
+                if (
+                    started < day_start
+                    or ended > day_end
+                    or ended <= started
+                    or (previous_end is not None and started <= previous_end)
+                ):
+                    raise ValueError("exclusion interval bounds are invalid")
+                duration_seconds = interval.get("duration_seconds")
+                raw_duration = (ended - started).total_seconds()
+                expected_duration = round(raw_duration, 6)
+                if (
+                    type(duration_seconds) not in {int, float}
+                    or not math.isfinite(float(duration_seconds))
+                    or float(duration_seconds) != expected_duration
+                ):
+                    raise ValueError("exclusion interval duration is invalid")
+                for field in ("streams", "markets", "reasons"):
+                    values = interval.get(field)
+                    if (
+                        not isinstance(values, list)
+                        or not values
+                        or any(
+                            not isinstance(value, str)
+                            or not value
+                            or value != value.strip()
+                            or any(
+                                codepoint < 32
+                                or codepoint == 127
+                                or 0xD800 <= codepoint <= 0xDFFF
+                                for codepoint in map(ord, value)
+                            )
+                            for value in values
+                        )
+                        or values != sorted(set(values))
+                    ):
+                        raise ValueError(
+                            "exclusion interval provenance is invalid"
+                        )
+                previous_end = ended
+                total_excluded_seconds += raw_duration
+            excluded_seconds = availability.get("excluded_seconds")
+            if (
+                type(excluded_seconds) not in {int, float}
+                or not math.isfinite(float(excluded_seconds))
+                or float(excluded_seconds)
+                != round(total_excluded_seconds, 6)
+            ):
+                raise ValueError("excluded duration is invalid")
+            outage_episodes = availability.get("outage_episodes")
+            maximum_gap_seconds = availability.get("maximum_gap_seconds")
+            total_gap_seconds = availability.get("total_gap_seconds")
+            if (
+                type(outage_episodes) is not int
+                or outage_episodes < 0
+                or outage_episodes > DAY_MAX_OUTAGE_EPISODES
+                or type(maximum_gap_seconds) not in {int, float}
+                or type(total_gap_seconds) not in {int, float}
+                or not math.isfinite(float(maximum_gap_seconds))
+                or not math.isfinite(float(total_gap_seconds))
+                or float(maximum_gap_seconds) < 0.0
+                or float(total_gap_seconds) < float(maximum_gap_seconds)
+                or float(maximum_gap_seconds)
+                > DAY_MAX_SINGLE_OUTAGE.total_seconds()
+                or float(total_gap_seconds)
+                > DAY_MAX_TOTAL_OUTAGE.total_seconds()
+                or bool(outage_episodes) != bool(exclusion_intervals)
+                or (
+                    outage_episodes == 0
+                    and (
+                        float(maximum_gap_seconds) != 0.0
+                        or float(total_gap_seconds) != 0.0
+                    )
+                )
+                or (
+                    outage_episodes > 0
+                    and float(maximum_gap_seconds) <= 0.0
+                )
+            ):
+                raise ValueError("outage metrics are invalid")
+            connection_epochs = availability.get(
+                "transport_connection_epochs"
+            )
+            if (
+                not isinstance(connection_epochs, list)
+                or any(
+                    type(epoch) is not int or epoch < 1
+                    for epoch in connection_epochs
+                )
+                or connection_epochs != sorted(set(connection_epochs))
+            ):
+                raise ValueError("transport epochs are invalid")
+            expected_warnings = []
+            if len(connection_epochs) > 1:
+                expected_warnings.append(
+                    "transport_connection_epoch_changed"
+                )
+            if exclusion_intervals:
+                expected_warnings.append("bounded_capture_outage_excluded")
+            expected_state = (
+                "degraded" if expected_warnings else "complete"
+            )
+            if (
+                availability.get("warnings") != expected_warnings
+                or availability.get("state") != expected_state
+            ):
+                raise ValueError("availability state evidence is invalid")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                "sealed capture availability is invalid"
+            ) from exc
     reported_hash = report.get("report_sha256")
     body = dict(report)
     body.pop("report_sha256", None)
@@ -1290,6 +1895,12 @@ def _verify_sealed_report(
             or not issue
             or issue != issue.strip()
             or len(issue) > 512
+            or any(
+                codepoint < 32
+                or codepoint == 127
+                or 0xD800 <= codepoint <= 0xDFFF
+                for codepoint in map(ord, issue)
+            )
             for issue in issues
         )
         or len(issues) != len(set(issues))
@@ -1361,6 +1972,43 @@ def _verify_sealed_report(
     for item in manifest_items:
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
             raise RuntimeError("sealed capture manifest is invalid")
+        if status in {"valid", "usable_with_gaps"}:
+            if set(item) != {
+                "path",
+                "bytes",
+                "sha256",
+                "events",
+                "warnings",
+            }:
+                raise RuntimeError(
+                    "sealed capture manifest fields are invalid"
+                )
+            events = item.get("events")
+            if type(events) is not int or events < 1:
+                raise RuntimeError(
+                    "sealed capture manifest event count is invalid"
+                )
+            stream = item["path"].split("/", 1)[0]
+            allowed_warnings = {
+                "trades": {"rest_trade_window_saturated"},
+                "l2_stream": {L2_STALE_WARNING},
+            }.get(stream, set())
+            warnings = item.get("warnings")
+            if (
+                not isinstance(warnings, list)
+                or warnings != sorted(set(warnings))
+                or any(
+                    not isinstance(warning, str)
+                    or warning not in allowed_warnings
+                    for warning in warnings
+                )
+            ):
+                raise RuntimeError(
+                    "sealed capture manifest warnings are invalid"
+                )
+        reported_bytes = item.get("bytes")
+        if type(reported_bytes) is not int or reported_bytes < 0:
+            raise RuntimeError("sealed capture manifest byte length is invalid")
         path = root / item["path"]
         try:
             relative = path.resolve().relative_to(root.resolve())
@@ -1374,6 +2022,10 @@ def _verify_sealed_report(
             )
         try:
             stat_before = path.stat()
+            if stat_before.st_nlink != 1:
+                raise RuntimeError(
+                    "sealed capture manifest file is hard-linked"
+                )
             cache_key = str(path.resolve())
             signature = (
                 item.get("sha256"),
@@ -1383,12 +2035,13 @@ def _verify_sealed_report(
                 stat_before.st_ctime_ns,
                 stat_before.st_dev,
                 stat_before.st_ino,
+                stat_before.st_nlink,
             )
         except OSError as exc:
             _raise_partition_drift(
                 expected_day_text, item["path"], "stat_unavailable", exc
             )
-        if stat_before.st_size != item.get("bytes"):
+        if stat_before.st_size != reported_bytes:
             if verification_cache is not None:
                 verification_cache.pop(cache_key, None)
             _raise_partition_drift(
@@ -1417,6 +2070,7 @@ def _verify_sealed_report(
                 stat_after.st_ctime_ns,
                 stat_after.st_dev,
                 stat_after.st_ino,
+                stat_after.st_nlink,
             )
             if after_signature != signature:
                 if verification_cache is not None:
@@ -1478,6 +2132,11 @@ def seal_closed_capture_days(
     partition_guard=None,
     verification_cache: dict[str, tuple] | None = None,
 ) -> dict:
+    _capture_policy_gaps(
+        max_symbols=max_symbols,
+        micro_interval_seconds=micro_interval_seconds,
+        l2_sample_interval_seconds=l2_sample_interval_seconds,
+    )
     root = Path(root)
     now = _capture_now_utc()
     today = now.date()
@@ -1599,8 +2258,9 @@ def seal_closed_capture_days(
 
 def _partition_date(path: Path) -> datetime | None:
     try:
-        return datetime.strptime(path.stem, "%Y-%m-%d").replace(
+        parsed = datetime.strptime(path.stem, "%Y-%m-%d").replace(
             tzinfo=timezone.utc
         )
     except ValueError:
         return None
+    return parsed if parsed.date().isoformat() == path.stem else None

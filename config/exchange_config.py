@@ -931,6 +931,33 @@ def try_set_leverage(ex, leverage, symbol=None, direction=None,
     direction ("LONG"/"SHORT") selects positionType. We try the MEXC-style
     params first, then fall back to the older shapes for other exchanges.
     """
+    if type(leverage) not in (int, float, str):
+        return False, ValueError("leverage must be a positive finite number")
+    try:
+        leverage_value = float(
+            leverage.strip() if type(leverage) is str else leverage
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False, ValueError("leverage must be a positive finite number")
+    if not math.isfinite(leverage_value) or leverage_value <= 0.0:
+        return False, ValueError("leverage must be a positive finite number")
+    leverage = (
+        int(leverage_value) if leverage_value.is_integer() else leverage_value
+    )
+
+    if type(margin_mode) is not str:
+        return False, ValueError("margin_mode must be isolated or cross")
+    margin_mode = margin_mode.strip().lower()
+    if margin_mode not in {"isolated", "cross"}:
+        return False, ValueError("margin_mode must be isolated or cross")
+
+    if direction is not None:
+        if type(direction) is not str:
+            return False, ValueError("direction must be LONG, SHORT, or None")
+        direction = direction.strip().upper()
+        if direction not in {"LONG", "SHORT"}:
+            return False, ValueError("direction must be LONG, SHORT, or None")
+
     if not supports(ex, "setLeverage"):
         msg = (f"setLeverage not supported on {type(ex).__name__}  "
                f"futures trading must be disabled")
@@ -944,8 +971,8 @@ def try_set_leverage(ex, leverage, symbol=None, direction=None,
             "futures markets unavailable before set_leverage"
         )
 
-    open_type = 2 if str(margin_mode).lower() == "cross" else 1
-    pos_type = 2 if str(direction).upper() == "SHORT" else 1
+    open_type = 2 if margin_mode == "cross" else 1
+    pos_type = 2 if direction == "SHORT" else 1
 
     last_err: Optional[BaseException] = None
     # MEXC-style first (openType/positionType), then legacy fallbacks. When
@@ -1067,11 +1094,31 @@ def must_set_leverage(ex, leverage, symbol=None, direction=None,
 
 def safe_set_margin_mode(ex, mode: str = "isolated", symbol=None,
                          leverage=None, direction=None) -> bool:
-    if not supports(ex, "setMarginMode"):
+    if type(leverage) not in (int, float, str):
         return False
-    if leverage is None:
-        # Nothing useful to send to MEXC; skip quietly. The order path sets
-        # marginMode + leverage in params anyway, so the position is fine.
+    if type(leverage) is str:
+        leverage = leverage.strip()
+    try:
+        leverage_value = float(leverage)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(leverage_value) or leverage_value <= 0.0:
+        return False
+
+    if type(mode) is not str:
+        return False
+    mode = mode.strip().lower()
+    if mode not in {"isolated", "cross"}:
+        return False
+
+    if direction is not None:
+        if type(direction) is not str:
+            return False
+        direction = direction.strip().upper()
+        if direction not in {"LONG", "SHORT"}:
+            return False
+
+    if not supports(ex, "setMarginMode"):
         return False
     try:
         lev_int = int(leverage)
@@ -1084,8 +1131,7 @@ def safe_set_margin_mode(ex, mode: str = "isolated", symbol=None,
     # raises ArgumentsRequired even after success).
     params = {"leverage": lev_int}
     if direction is not None:
-        params["direction"] = "short" if str(direction).upper() == "SHORT" \
-            else "long"
+        params["direction"] = "short" if direction == "SHORT" else "long"
     margin_reservation = None
     request_issued = False
     try:
@@ -1153,13 +1199,24 @@ class SafeFetchBudgetUnavailable(RuntimeError):
 
 
 def _finite_api_number(value) -> float | None:
-    if isinstance(value, bool):
+    if type(value) not in (int, float, str):
         return None
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def _valid_exchange_symbol(value) -> bool:
+    return (
+        type(value) is str
+        and 1 <= len(value) <= 64
+        and value == value.strip()
+        and value.isascii()
+        and value.isprintable()
+        and " " not in value
+    )
 
 
 def safe_fetch_open_interest(
@@ -1169,6 +1226,8 @@ def safe_fetch_open_interest(
     endpoint: str = "safe_fetch_open_interest",
     critical: bool = False,
 ):
+    if not _valid_exchange_symbol(symbol):
+        return None
     if not supports(ex, "fetchOpenInterest"):
         return None
     reservation = _safe_fetch_reservation(endpoint, critical=critical)
@@ -1176,13 +1235,14 @@ def safe_fetch_open_interest(
         return None
     try:
         open_interest = ex.fetch_open_interest(symbol)
-        if not isinstance(open_interest, dict):
+        if type(open_interest) is not dict:
             raise TypeError("fetch_open_interest returned no data object")
         if not explicit_trade_symbol_matches(open_interest, symbol):
             raise ValueError("fetch_open_interest returned a symbol mismatch")
-        raw_value = open_interest.get("openInterestValue")
-        if raw_value is None and isinstance(open_interest.get("info"), dict):
-            raw_value = open_interest["info"].get("openInterestValue")
+        raw_value = dict.get(open_interest, "openInterestValue")
+        info = dict.get(open_interest, "info")
+        if raw_value is None and type(info) is dict:
+            raw_value = dict.get(info, "openInterestValue")
         parsed_value = _finite_api_number(raw_value)
         if parsed_value is None or parsed_value < 0:
             raise ValueError("fetch_open_interest returned no valid USDT value")
@@ -1204,6 +1264,8 @@ def safe_fetch_funding_rate(
     endpoint: str = "safe_fetch_funding_rate",
     critical: bool = False,
 ):
+    if not _valid_exchange_symbol(symbol):
+        return None
     if not supports(ex, "fetchFundingRate"):
         return None
     reservation = _safe_fetch_reservation(endpoint, critical=critical)
@@ -1211,7 +1273,7 @@ def safe_fetch_funding_rate(
         return None
     try:
         funding_rate = ex.fetch_funding_rate(symbol)
-        if not isinstance(funding_rate, dict):
+        if type(funding_rate) is not dict:
             raise TypeError("fetch_funding_rate returned no data object")
         if not explicit_trade_symbol_matches(funding_rate, symbol):
             raise ValueError("fetch_funding_rate returned a symbol mismatch")
@@ -1236,6 +1298,27 @@ def safe_fetch_positions(
     critical: bool = False,
     raise_on_budget_denied: bool = False,
 ):
+    if type(raise_on_budget_denied) is not bool:
+        return None
+    expected_symbols = None
+    if symbols is None:
+        pass
+    elif type(symbols) is str:
+        if not _valid_exchange_symbol(symbols):
+            return None
+        expected_symbols = (symbols,)
+    elif type(symbols) in (list, tuple):
+        if not symbols:
+            return []
+        expected_symbols = tuple(symbols)
+        if any(
+            not _valid_exchange_symbol(symbol)
+            for symbol in expected_symbols
+        ):
+            return None
+    else:
+        return None
+
     if not supports(ex, "fetchPositions"):
         return None
     reservation = _safe_fetch_reservation(endpoint, critical=critical)
@@ -1244,21 +1327,16 @@ def safe_fetch_positions(
             raise SafeFetchBudgetUnavailable(endpoint)
         return None
     try:
-        if symbols:
-            positions = ex.fetch_positions(symbols)
+        if expected_symbols is not None:
+            positions = ex.fetch_positions(list(expected_symbols))
         else:
             positions = ex.fetch_positions()
-        if not isinstance(positions, (list, tuple)):
+        if type(positions) not in (list, tuple):
             raise TypeError("fetch_positions returned no position list")
-        if any(not isinstance(position, dict) for position in positions):
+        if any(type(position) is not dict for position in positions):
             raise TypeError("fetch_positions returned a malformed position row")
-        if symbols:
-            expected_symbols = (
-                (symbols,)
-                if isinstance(symbols, str)
-                else tuple(symbols)
-            )
-            if not expected_symbols or any(
+        if expected_symbols is not None:
+            if any(
                 not any(
                     explicit_trade_symbol_matches(position, expected_symbol)
                     for expected_symbol in expected_symbols
@@ -1280,9 +1358,85 @@ def safe_fetch_positions(
         # instead of persisting the same swallowed error every minute.
         if is_authentication_error(e):
             raise
-        scope = symbols if symbols else "all"
+        scope = symbols if expected_symbols is not None else "all"
         _silent(f"{endpoint}({scope})", e)
         return None
+
+
+def _normalise_client_order_id(value) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise ValueError("client_order_id must be valid ASCII text")
+    if not value:
+        return None
+    if (
+        len(value) > 32
+        or value != value.strip()
+        or not value.isascii()
+        or not value.isprintable()
+    ):
+        raise ValueError("client_order_id must be valid ASCII text")
+    return value
+
+
+def _normalise_order_exchange_name(value) -> str:
+    if value is None or (type(value) is str and not value):
+        value = get_active_exchange_name()
+    if type(value) is not str:
+        raise ValueError("exchange must identify a supported futures venue")
+    normalized = value.strip().lower()
+    if normalized not in _FUTURES_TYPE_MAP:
+        raise ValueError("exchange must identify a supported futures venue")
+    return normalized
+
+
+def _normalise_order_margin_mode(value) -> str:
+    if value is None:
+        return "isolated"
+    if type(value) is not str:
+        raise ValueError("margin_mode must be isolated or cross")
+    if not value:
+        return "isolated"
+    normalized = value.strip().lower()
+    if normalized not in {"isolated", "cross"}:
+        raise ValueError("margin_mode must be isolated or cross")
+    return normalized
+
+
+def _normalise_order_position_side(value) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise ValueError("position_side must be LONG, SHORT, or None")
+    if not value:
+        return None
+    normalized = value.strip().upper()
+    if normalized not in {"LONG", "SHORT"}:
+        raise ValueError("position_side must be LONG, SHORT, or None")
+    return normalized
+
+
+def _normalise_order_hedge_mode(value) -> bool:
+    if value is None:
+        return False
+    if type(value) is not bool:
+        raise ValueError("hedge_mode must be a boolean")
+    return value
+
+
+def _normalise_order_leverage(value) -> int | None:
+    if value is None or type(value) not in (int, float, str):
+        return None
+    if type(value) is float and (
+        not math.isfinite(value) or not value.is_integer()
+    ):
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return normalized if normalized > 0 else None
 
 
 def reduce_only_params(ex_name: str = None, position_side: str = None,
@@ -1300,17 +1454,22 @@ def reduce_only_params(ex_name: str = None, position_side: str = None,
     ``client_order_id`` binds restart recovery to the same physical close;
     MEXC receives both the unified and venue-native aliases.
     """
-    name = (ex_name or get_active_exchange_name()).lower()
+    name = _normalise_order_exchange_name(ex_name)
+    margin_mode = _normalise_order_margin_mode(margin_mode)
+    position_side = _normalise_order_position_side(position_side)
+    hedge_mode = _normalise_order_hedge_mode(hedge_mode)
+    leverage = _normalise_order_leverage(leverage)
+    client_order_id = _normalise_client_order_id(client_order_id)
     base = {"reduceOnly": True}
     if name == "okx":
         # tdMode: "isolated" or "cross"
-        base["tdMode"] = (margin_mode or "isolated").lower()
+        base["tdMode"] = margin_mode
     else:
         # Mirror entry_params: venues like MEXC/Bitget expect the close order
         # to carry the same margin mode as the entry. Binance one-way issues
         # are about positionSide, not marginMode.
-        base["marginMode"] = (margin_mode or "isolated").lower()
-    if position_side and (name != "binance" or hedge_mode):
+        base["marginMode"] = margin_mode
+    if position_side is not None and (name != "binance" or hedge_mode):
         # Binance hedge-mode expects UPPERCASE positionSide; others lowercase.
         if name == "binance":
             base["positionSide"] = position_side.upper()
@@ -1318,12 +1477,9 @@ def reduce_only_params(ex_name: str = None, position_side: str = None,
             base["positionSide"] = position_side.lower()
     if leverage is not None:
         # MEXC wants leverage on isolated orders; harmless for others that
-        # ignore unknown params. Cast defensively.
-        try:
-            base["leverage"] = int(leverage)
-        except (ValueError, TypeError):
-            pass
-    if client_order_id:
+        # ignore unknown params.
+        base["leverage"] = leverage
+    if client_order_id is not None:
         base["clientOrderId"] = client_order_id
         if name == "mexc":
             base["externalOid"] = client_order_id
@@ -1334,23 +1490,25 @@ def entry_params(ex_name: str = None, position_side: str = None,
                  margin_mode: str = "isolated", leverage: int = None,
                  client_order_id: str = None, hedge_mode: bool = False) -> dict:
     """Build per-exchange entry-order params (mirror of reduce_only_params)."""
-    name = (ex_name or get_active_exchange_name()).lower()
+    name = _normalise_order_exchange_name(ex_name)
+    margin_mode = _normalise_order_margin_mode(margin_mode)
+    position_side = _normalise_order_position_side(position_side)
+    hedge_mode = _normalise_order_hedge_mode(hedge_mode)
+    leverage = _normalise_order_leverage(leverage)
+    client_order_id = _normalise_client_order_id(client_order_id)
     base: dict = {}
     if name == "okx":
-        base["tdMode"] = (margin_mode or "isolated").lower()
+        base["tdMode"] = margin_mode
     else:
-        base["marginMode"] = (margin_mode or "isolated").lower()
-    if position_side and (name != "binance" or hedge_mode):
+        base["marginMode"] = margin_mode
+    if position_side is not None and (name != "binance" or hedge_mode):
         if name == "binance":
             base["positionSide"] = position_side.upper()
         else:
             base["positionSide"] = position_side.lower()
     if leverage is not None:
-        try:
-            base["leverage"] = int(leverage)
-        except (ValueError, TypeError):
-            pass
-    if client_order_id:
+        base["leverage"] = leverage
+    if client_order_id is not None:
         base["clientOrderId"] = client_order_id
         if name == "mexc":
             # MEXC contract endpoints expose this field as ``externalOid``.
@@ -1367,29 +1525,49 @@ def entry_params(ex_name: str = None, position_side: str = None,
 _DEFAULT_PRECISION_STEP = Decimal("0.00000001")
 
 
+def _finite_precision_float(value: Decimal) -> float:
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError("amount precision exceeds finite float range")
+    return out
+
+
+def _native_amount_min_metadata(mkt: dict) -> object:
+    limits = mkt.get("limits")
+    if type(limits) is not dict:
+        return None
+    amount_limits = limits.get("amount")
+    if type(amount_limits) is not dict:
+        return None
+    return amount_limits.get("min")
+
+
 def _markets_precision_step(ex, symbol: str) -> Optional[Decimal]:
     """Extract amount-precision step from ex.markets metadata, if available."""
     try:
         markets = getattr(ex, "markets", None)
-        if not markets:
+        if type(markets) is not dict or not markets:
             return None
         mkt = markets.get(symbol)
-        if not isinstance(mkt, dict):
+        if type(mkt) is not dict:
             return None
-        prec = (mkt.get("precision") or {}).get("amount")
-        if isinstance(prec, bool):
+        precision = mkt.get("precision")
+        if precision is not None and type(precision) is not dict:
             return None
+        prec = (precision or {}).get("amount")
         if prec is None:
             # Try limits.amount.min as a step proxy
-            mn = ((mkt.get("limits") or {}).get("amount") or {}).get("min")
-            if isinstance(mn, bool):
-                return None
+            mn = _native_amount_min_metadata(mkt)
             if mn is None:
+                return None
+            if type(mn) not in (int, float, str, Decimal):
                 return None
             try:
                 return Decimal(str(mn))
             except Exception:
                 return None
+        if type(prec) not in (int, float, str, Decimal):
+            return None
         try:
             pf = float(prec)
         except (TypeError, ValueError):
@@ -1400,8 +1578,12 @@ def _markets_precision_step(ex, symbol: str) -> Optional[Decimal]:
         except Exception:
             pass
         try:
-            mn = ((mkt.get("limits") or {}).get("amount") or {}).get("min")
-            if mn is not None and Decimal(str(mn)) >= 1 and pf >= 1:
+            mn = _native_amount_min_metadata(mkt)
+            if (
+                type(mn) in (int, float, str, Decimal)
+                and Decimal(str(mn)) >= 1
+                and pf >= 1
+            ):
                 return Decimal(str(prec))
         except Exception:
             pass
@@ -1421,15 +1603,15 @@ def _markets_precision_step(ex, symbol: str) -> Optional[Decimal]:
 def _market_amount_min(ex, symbol: str) -> Optional[Decimal]:
     try:
         markets = getattr(ex, "markets", None)
-        if not markets:
+        if type(markets) is not dict or not markets:
             return None
         mkt = markets.get(symbol)
-        if not isinstance(mkt, dict):
+        if type(mkt) is not dict:
             return None
-        mn = ((mkt.get("limits") or {}).get("amount") or {}).get("min")
-        if isinstance(mn, bool):
-            return None
+        mn = _native_amount_min_metadata(mkt)
         if mn is None:
+            return None
+        if type(mn) not in (int, float, str, Decimal):
             return None
         out = Decimal(str(mn))
         return out if out > 0 else None
@@ -1452,7 +1634,9 @@ def safe_amount_to_precision(ex, symbol: str, amount: float) -> float:
 
     NEVER returns the unmodified raw float.
     """
-    if isinstance(amount, bool):
+    if not _valid_exchange_symbol(symbol):
+        return 0.0
+    if type(amount) not in (int, float, str, Decimal):
         return 0.0
 
     try:
@@ -1462,6 +1646,7 @@ def safe_amount_to_precision(ex, symbol: str, amount: float) -> float:
     if not amt_dec.is_finite() or amt_dec <= 0:
         return 0.0
 
+    min_amt = None
     try:
         min_amt = _market_amount_min(ex, symbol)
         if min_amt is not None and amt_dec < min_amt:
@@ -1472,14 +1657,16 @@ def safe_amount_to_precision(ex, symbol: str, amount: float) -> float:
     # Step 1: native CCXT
     try:
         native = ex.amount_to_precision(symbol, amount)
-        if isinstance(native, bool):
-            raise ValueError("native amount precision returned boolean")
+        if type(native) not in (int, float, str, Decimal):
+            raise ValueError("native amount precision returned invalid type")
         native_dec = Decimal(str(native))
         if not native_dec.is_finite() or native_dec < 0:
             raise ValueError("native amount precision is invalid")
         if native_dec > amt_dec:
             raise ValueError("native amount precision amplified the amount")
-        return float(native_dec)
+        if min_amt is not None and native_dec < min_amt:
+            return 0.0
+        return _finite_precision_float(native_dec)
     except Exception as e1:
         _silent(f"amount_to_precision({symbol}, {amount})", e1)
 
@@ -1489,16 +1676,21 @@ def safe_amount_to_precision(ex, symbol: str, amount: float) -> float:
         if step is None or step <= 0:
             step = _DEFAULT_PRECISION_STEP
         rounded = (amt_dec / step).to_integral_value(rounding=ROUND_DOWN) * step
+        if min_amt is not None and rounded < min_amt:
+            return 0.0
         # Belt-and-suspenders: stringify and re-parse to drop any
         # exponential-notation drift before float-cast.
-        return float(rounded.normalize())
+        return _finite_precision_float(rounded.normalize())
     except Exception as e2:
         _silent(f"amount_to_precision_fallback({symbol}, {amount})", e2)
 
     # Step 4: last-resort quantize at 8 decimals  at least it's bounded
     try:
-        return float(Decimal(str(amount)).quantize(
-            _DEFAULT_PRECISION_STEP, rounding=ROUND_DOWN))
+        rounded = Decimal(str(amount)).quantize(
+            _DEFAULT_PRECISION_STEP, rounding=ROUND_DOWN)
+        if min_amt is not None and rounded < min_amt:
+            return 0.0
+        return _finite_precision_float(rounded)
     except Exception as e3:
         _silent(f"amount_to_precision_lastresort({symbol}, {amount})", e3)
 

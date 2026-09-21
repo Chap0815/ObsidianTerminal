@@ -44,7 +44,7 @@ def _finite_float_or_none(value) -> float | None:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -116,6 +116,21 @@ def funding_amount_is_plausible(
     return abs(funding) <= max(0.25, notional * 0.20)
 
 
+def _validated_oi_history(history) -> list[tuple[float, float]]:
+    if not isinstance(history, list):
+        return []
+    valid = []
+    for row in history:
+        if not isinstance(row, (list, tuple)) or len(row) != 2:
+            continue
+        timestamp = _finite_float_or_none(row[0])
+        value = _finite_float_or_none(row[1])
+        if timestamp is None or timestamp < 0.0 or value is None or value <= 0.0:
+            continue
+        valid.append((timestamp, value))
+    return valid
+
+
 def _maybe_sweep_oi_history(now_mono: float) -> None:
     """Remove symbol entries whose newest data point is older than the
     retention window. Called under _OI_LOCK by callers."""
@@ -126,9 +141,11 @@ def _maybe_sweep_oi_history(now_mono: float) -> None:
     cutoff = now_mono - _OI_HISTORY_MAX_AGE
     stale = []
     for sym, hist in _OI_HISTORY.items():
+        hist = _validated_oi_history(hist)
         if not hist:
             stale.append(sym)
             continue
+        _OI_HISTORY[sym] = hist
         # newest entry's timestamp
         newest_ts = max(ts for ts, _ in hist)
         if newest_ts < cutoff:
@@ -159,6 +176,9 @@ def fetch_or_estimate_funding(ex,
       SHORT +rate  shorts receive  negative return ( -raw)
       SHORT -rate  shorts pay  positive return ( -raw)
     """
+    normalized_notional = _finite_float_or_none(notional_usdt)
+    if normalized_notional is None or normalized_notional <= 0.0:
+        return None
     normalized_position_type = _funding_position_type(pos_type)
     if normalized_position_type is None:
         return None
@@ -174,7 +194,7 @@ def fetch_or_estimate_funding(ex,
         symbol_full,
         since_time_str,
         until_time_str=until_time_str,
-        notional_usdt=notional_usdt,
+        notional_usdt=normalized_notional,
     )
     if realized is not None:
         if realized != 0.0:
@@ -183,35 +203,35 @@ def fetch_or_estimate_funding(ex,
             ex,
             symbol_full,
             since_time_str,
-            notional_usdt,
+            normalized_notional,
             normalized_position_type,
             fallback_state_value,
             until_time_str=until_time_str,
         )
         return (
             estimated
-            if funding_amount_is_plausible(estimated, notional_usdt)
+            if funding_amount_is_plausible(estimated, normalized_notional)
             else None
         )
     fallback = _finite_float_or_none(fallback_state_value)
     if (
         fallback is not None
         and fallback != 0.0
-        and funding_amount_is_plausible(fallback, notional_usdt)
+        and funding_amount_is_plausible(fallback, normalized_notional)
     ):
         return fallback
     estimated = estimate_funding_paid(
         ex,
         symbol_full,
         since_time_str,
-        notional_usdt,
+        normalized_notional,
         normalized_position_type,
         fallback_state_value=0.0,
         until_time_str=until_time_str,
     )
     return (
         estimated
-        if funding_amount_is_plausible(estimated, notional_usdt)
+        if funding_amount_is_plausible(estimated, normalized_notional)
         else None
     )
 
@@ -229,7 +249,11 @@ def fetch_realized_funding(ex,
       float  total in USDT (bot POV: positive = paid out)
       None  API unsupported or call failed (caller should fall back)
     """
-    if not symbol_full or not since_time_str:
+    if (
+        not isinstance(symbol_full, str)
+        or not symbol_full.strip()
+        or not since_time_str
+    ):
         return None
     since_ms = _utc_ms_or_none(since_time_str)
     if since_ms is None:
@@ -240,11 +264,14 @@ def fetch_realized_funding(ex,
         if until_ms is None or until_ms < since_ms:
             return None
 
-    fn = getattr(ex, "fetch_funding_history", None)
-    if not callable(fn):
-        fn = getattr(ex, "fetch_funding_payments", None)
+    try:
+        fn = getattr(ex, "fetch_funding_history", None)
         if not callable(fn):
-            return None
+            fn = getattr(ex, "fetch_funding_payments", None)
+            if not callable(fn):
+                return None
+    except Exception:
+        return None
 
     try:
         max_pages = int(os.getenv("FUNDING_HISTORY_MAX_PAGES", "10"))
@@ -311,7 +338,7 @@ def fetch_realized_funding(ex,
             ts = h.get("timestamp")
             try:
                 ts_i = int(ts) if ts is not None and not isinstance(ts, bool) else None
-            except (TypeError, ValueError, OverflowError):
+            except Exception:
                 ts_i = None
             if amt is None or ts_i is None:
                 unverifiable_row = True
@@ -408,6 +435,8 @@ def estimate_funding_paid(ex,
     Position held within one settlement window: returns 0.0 (correct).
     Position that crossed N settlements:  notional  rate  N.
     """
+    if not isinstance(symbol_full, str) or not symbol_full.strip():
+        return None
     normalized_position_type = _funding_position_type(pos_type)
     if normalized_position_type is None:
         return None
@@ -429,7 +458,7 @@ def estimate_funding_paid(ex,
             ts_close = now_ms() / 1000.0   # exchange-anchored
     except ImportError:
         ts_close = datetime.now(timezone.utc).timestamp()
-    except (ValueError, TypeError):
+    except Exception:
         return None
     if ts_close < ts_open:
         return None
@@ -483,7 +512,14 @@ def get_funding_info(
     unavailable baseline.
     Maintains a 28h-window OI history for 24h-change computation.
     """
-    now = time.monotonic()
+    if not isinstance(symbol_full, str) or not symbol_full.strip():
+        return 0.0, 0.0, None
+    try:
+        now = _finite_float_or_none(time.monotonic())
+    except Exception:
+        now = None
+    if now is None or now < 0.0:
+        return 0.0, 0.0, None
 
     # Funding rate (current 8h period)
     rate = 0.0
@@ -550,7 +586,8 @@ def get_funding_info(
         # Only touch _OI_HISTORY when we have a real reading, so we don't
         # leave empty lists hanging.
         if oi_usdt > 0:
-            history = _OI_HISTORY.setdefault(symbol_full, [])
+            history = _validated_oi_history(_OI_HISTORY.get(symbol_full))
+            _OI_HISTORY[symbol_full] = history
             target = now - 24 * 3600
             if history:
                 closest = min(history, key=lambda t: abs(t[0] - target))

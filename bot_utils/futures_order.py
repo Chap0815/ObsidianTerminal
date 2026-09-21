@@ -18,6 +18,7 @@ import math
 import re
 import threading
 import time
+from decimal import Decimal
 from typing import Tuple, Optional
 
 from bot_utils.api_budget import (
@@ -56,30 +57,57 @@ ORDER_FILL_THRESHOLD = 0.9999
 _MAX_NUMERIC_TEXT_CHARS = 128
 _MAX_ORDER_ATTEMPTS = 5
 _MAX_FEE_REFETCH_DELAY_SECONDS = 5.0
+_ASCII_NUMBER_TEXT_RE = re.compile(
+    r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\Z",
+    re.ASCII,
+)
 
 
 def _finite_nonnegative_order_value(value) -> float:
-    if isinstance(value, bool):
+    if type(value) not in (int, float, str):
         return 0.0
-    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
-        return 0.0
+    if type(value) is str:
+        if (
+            len(value) > _MAX_NUMERIC_TEXT_CHARS
+            or not value.isascii()
+            or not value.isprintable()
+            or _ASCII_NUMBER_TEXT_RE.fullmatch(value) is None
+        ):
+            return 0.0
     try:
-        parsed = float(value or 0)
-    except (TypeError, ValueError, OverflowError):
+        parsed = float(value)
+    except Exception:
         return 0.0
     return parsed if math.isfinite(parsed) and parsed >= 0 else 0.0
 
 
 def _finite_order_telemetry_value(value, *, positive: bool = False):
-    if value is None or isinstance(value, bool):
+    if type(positive) is not bool:
         return None
-    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
+    if value is None or type(value) not in (int, float, str):
         return None
+    exact_text_value = None
+    if type(value) is str:
+        if (
+            len(value) > _MAX_NUMERIC_TEXT_CHARS
+            or not value.isascii()
+            or not value.isprintable()
+            or _ASCII_NUMBER_TEXT_RE.fullmatch(value) is None
+        ):
+            return None
+        try:
+            exact_text_value = Decimal(value)
+        except (ArithmeticError, ValueError):
+            return None
+        if not exact_text_value.is_finite():
+            return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     if not math.isfinite(parsed) or parsed < 0:
+        return None
+    if exact_text_value is not None and parsed == 0.0 and not exact_text_value.is_zero():
         return None
     if positive and parsed <= 0:
         return None
@@ -87,13 +115,21 @@ def _finite_order_telemetry_value(value, *, positive: bool = False):
 
 
 def _normalize_order_symbol(symbol_full) -> str:
-    if not isinstance(symbol_full, str):
+    if type(symbol_full) is not str:
         return ""
-    return symbol_full.strip()
+    normalized = symbol_full.strip()
+    if (
+        not normalized
+        or not normalized.isascii()
+        or not normalized.isprintable()
+        or any(char.isspace() for char in normalized)
+    ):
+        return ""
+    return normalized
 
 
 def _normalize_order_side(side, exchange_id: str = "") -> str:
-    if not isinstance(side, str):
+    if type(side) is not str or type(exchange_id) is not str:
         return ""
     normalized = side.strip().lower()
     if exchange_id == "mexc":
@@ -105,18 +141,18 @@ def _normalize_order_side(side, exchange_id: str = "") -> str:
 
 
 def _normalize_order_position_side(position_side) -> str:
-    if not isinstance(position_side, str):
+    if type(position_side) is not str:
         return ""
     normalized = position_side.strip().lower()
     return normalized if normalized in {"long", "short"} else ""
 
 
 def _normalize_order_bool(value) -> Optional[bool]:
-    if isinstance(value, bool):
+    if type(value) is bool:
         return value
-    if isinstance(value, (int, float)) and value in (0, 1):
+    if type(value) in (int, float) and value in (0, 1):
         return bool(value)
-    if isinstance(value, str):
+    if type(value) is str:
         normalized = value.strip().lower()
         if normalized in {"1", "true", "yes"}:
             return True
@@ -139,13 +175,19 @@ def _trade_info_for_order_evidence(
     exchange_id: str = "",
 ) -> tuple[dict, bool]:
     """Return trade info safe to validate with order-response semantics."""
-    raw_info = trade.get("info") if isinstance(trade, dict) else None
+    if type(trade) is not dict:
+        return {}, False
+    raw_info = dict.get(trade, "info")
     info = dict(raw_info) if isinstance(raw_info, dict) else {}
-    if str(exchange_id or "").strip().lower() != "mexc":
+    if type(exchange_id) is not str:
+        return info, False
+    if exchange_id.strip().lower() != "mexc":
         return info, True
-    raw_side = info.get("side")
-    if raw_side in (None, ""):
+    raw_side = dict.get(info, "side")
+    if raw_side is None or (type(raw_side) is str and raw_side == ""):
         return info, True
+    if type(raw_side) not in (str, int):
+        return info, False
     # MEXC contract deal rows use the same 1..4 action codes as orders:
     # 1=open long, 2=close short, 3=open short, 4=close long. Verify the
     # resulting order direction against CCXT's unified side. Retain numeric
@@ -154,11 +196,9 @@ def _trade_info_for_order_evidence(
     trade_side = (
         mexc_action[0]
         if mexc_action is not None
-        else {"buy": "buy", "sell": "sell"}.get(
-            str(raw_side).strip().lower()
-        )
+        else _normalize_order_side(raw_side)
     )
-    unified_side = _normalize_order_side(trade.get("side"))
+    unified_side = _normalize_order_side(dict.get(trade, "side"))
     if not trade_side or unified_side != trade_side:
         return info, False
     if mexc_action is None:
@@ -169,13 +209,13 @@ def _trade_info_for_order_evidence(
 
 
 def _normalize_order_status(status) -> str:
-    if not isinstance(status, str):
+    if type(status) is not str:
         return ""
     return status.strip().lower()
 
 
 def _normalize_max_attempts(max_attempts) -> int:
-    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int):
+    if type(max_attempts) is not int:
         return 0
     return max_attempts if 0 < max_attempts <= _MAX_ORDER_ATTEMPTS else 0
 
@@ -190,11 +230,11 @@ def _normalize_order_params(params):
 
 def classify_order_state(order) -> str:
     """Map a CCXT order dict to a bot state-machine string."""
-    if not isinstance(order, dict):
+    if type(order) is not dict:
         return ORDER_STATE_FAILED
-    status = _normalize_order_status(order.get("status"))
-    filled = _finite_nonnegative_order_value(order.get("filled"))
-    amount = _finite_nonnegative_order_value(order.get("amount"))
+    status = _normalize_order_status(dict.get(order, "status"))
+    filled = _finite_nonnegative_order_value(dict.get(order, "filled"))
+    amount = _finite_nonnegative_order_value(dict.get(order, "amount"))
 
     # Some venue/native recovery payloads use ``filled`` instead of CCXT's
     # canonical ``closed``.  Require physical fill evidence before accepting
@@ -380,19 +420,19 @@ def _first_order_id_text(*values) -> str:
 
 def _explicit_order_ids(order: dict) -> set[str]:
     """Return every explicit venue order id carried by an order snapshot."""
-    if not isinstance(order, dict):
+    if type(order) not in (dict, _TradeRecoveryOrder):
         return set()
-    info = order.get("info")
-    if not isinstance(info, dict):
+    info = dict.get(order, "info")
+    if type(info) is not dict:
         info = {}
-    info_id = None if isinstance(order, _TradeRecoveryOrder) else info.get("id")
+    info_id = None if type(order) is _TradeRecoveryOrder else info.get("id")
     return {
         value
         for value in (
-            _order_id_text(order.get("id")),
-            _order_id_text(order.get("orderId")),
-            _order_id_text(order.get("order_id")),
-            _order_id_text(order.get("orderID")),
+            _order_id_text(dict.get(order, "id")),
+            _order_id_text(dict.get(order, "orderId")),
+            _order_id_text(dict.get(order, "order_id")),
+            _order_id_text(dict.get(order, "orderID")),
             _order_id_text(info_id),
             _order_id_text(info.get("orderId")),
             _order_id_text(info.get("order_id")),
@@ -405,15 +445,15 @@ def _explicit_order_ids(order: dict) -> set[str]:
 
 def _explicit_client_order_ids(order: dict) -> set[str]:
     """Return every explicit client order id carried by an order snapshot."""
-    if not isinstance(order, dict):
+    if type(order) not in (dict, _TradeRecoveryOrder):
         return set()
-    info = order.get("info")
-    if not isinstance(info, dict):
+    info = dict.get(order, "info")
+    if type(info) is not dict:
         info = {}
     return {
         value
         for value in (
-            _order_id_text(order.get("clientOrderId")),
+            _order_id_text(dict.get(order, "clientOrderId")),
             *(_order_id_text(info.get(key)) for key in _CLIENT_ID_INFO_KEYS),
         )
         if value
@@ -423,15 +463,15 @@ def _explicit_client_order_ids(order: dict) -> set[str]:
 def _order_client_id_matches(o: dict, cid: str) -> bool:
     """True if order dict ``o`` carries client id ``cid`` - top-level first,
     then the raw ``info`` payload under known per-exchange aliases."""
-    if not isinstance(o, dict):
+    if type(o) not in (dict, _TradeRecoveryOrder):
         return False
     cid_text = _order_id_text(cid)
     if not cid_text:
         return False
-    if _order_id_text(o.get("clientOrderId")) == cid_text:
+    if _order_id_text(dict.get(o, "clientOrderId")) == cid_text:
         return True
-    info = o.get("info")
-    if isinstance(info, dict):
+    info = dict.get(o, "info")
+    if type(info) is dict:
         for k in _CLIENT_ID_INFO_KEYS:
             if _order_id_text(info.get(k)) == cid_text:
                 return True
@@ -461,8 +501,28 @@ def _order_request_conflicts(
     expected_amount: Optional[float] = None,
 ) -> bool:
     """Reject explicit response evidence that contradicts the request."""
-    if not isinstance(order, dict):
+    if type(order) not in (dict, _TradeRecoveryOrder):
         return False
+    if type(expected_symbol) is not str:
+        return True
+    if type(expected_side) is not str:
+        return True
+    if type(expected_position_side) is not str:
+        return True
+    if (
+        expected_reduce_only is not None
+        and type(expected_reduce_only) is not bool
+    ):
+        return True
+    if type(allow_one_way_position_side) is not bool:
+        return True
+    if type(exchange_id) is not str:
+        return True
+    if (
+        expected_client_id is not None
+        and type(expected_client_id) not in (str, int)
+    ):
+        return True
     if order.get("_bot_recovery_conflict") is True:
         return True
     if len(_explicit_order_ids(order)) > 1:
@@ -479,7 +539,9 @@ def _order_request_conflicts(
             return True
         tolerance = max(1e-12, requested * 1e-9)
         raw_amount = order.get("amount")
-        if raw_amount not in (None, ""):
+        if raw_amount is not None and not (
+            type(raw_amount) is str and raw_amount == ""
+        ):
             observed_amount = _finite_order_telemetry_value(
                 raw_amount, positive=True
             )
@@ -491,7 +553,9 @@ def _order_request_conflicts(
             elif abs(observed_amount - requested) > tolerance:
                 return True
         raw_filled = order.get("filled")
-        if raw_filled not in (None, ""):
+        if raw_filled is not None and not (
+            type(raw_filled) is str and raw_filled == ""
+        ):
             observed_filled = _finite_order_telemetry_value(raw_filled)
             if (
                 observed_filled is None
@@ -500,7 +564,10 @@ def _order_request_conflicts(
                 return True
     status = _normalize_order_status(order.get("status"))
     raw_filled = order.get("filled")
-    if status in ("closed", "filled") and raw_filled not in (None, ""):
+    raw_filled_present = raw_filled is not None and not (
+        type(raw_filled) is str and raw_filled == ""
+    )
+    if status in ("closed", "filled") and raw_filled_present:
         terminal_filled = _finite_order_telemetry_value(raw_filled)
         if terminal_filled is None or terminal_filled <= 0:
             return True
@@ -513,9 +580,12 @@ def _order_request_conflicts(
             return True
     expected_leg = _normalize_order_position_side(expected_position_side)
     raw_info = order.get("info")
-    if raw_info not in (None, "") and not isinstance(raw_info, dict):
+    if raw_info is None or (type(raw_info) is str and raw_info == ""):
+        info = {}
+    elif type(raw_info) is not dict:
         return True
-    info = raw_info if isinstance(raw_info, dict) else {}
+    else:
+        info = raw_info
     raw_side = order.get("side")
     mexc_action = None
     if exchange_id == "mexc":
@@ -654,10 +724,10 @@ def _order_refresh_conflicts(
 
 def _requested_position_side(params: dict) -> str:
     """Return a normalized explicit hedge leg from outbound order params."""
-    if not isinstance(params, dict):
+    if type(params) is not dict:
         return ""
     for key in ("positionSide", "posSide", "holdSide"):
-        raw_leg = params.get(key)
+        raw_leg = dict.get(params, key)
         if raw_leg not in (None, ""):
             return _normalize_order_position_side(raw_leg)
     return ""
@@ -665,28 +735,28 @@ def _requested_position_side(params: dict) -> str:
 
 def _order_response_has_evidence(order: dict) -> bool:
     """True when a create_order response contains minimal exchange evidence."""
-    if not isinstance(order, dict):
+    if type(order) is not dict:
         return False
     if _explicit_order_ids(order):
         return True
-    status = _normalize_order_status(order.get("status"))
+    status = _normalize_order_status(dict.get(order, "status"))
     if status in (
         "open", "new", "partially_filled",
         "partiallyfilled", "canceled", "cancelled", "expired", "rejected",
     ):
         return True
     return (
-        _finite_nonnegative_order_value(order.get("filled")) > 0
-        or _finite_nonnegative_order_value(order.get("cost")) > 0
+        _finite_nonnegative_order_value(dict.get(order, "filled")) > 0
+        or _finite_nonnegative_order_value(dict.get(order, "cost")) > 0
     )
 
 
 def _order_response_has_fill_evidence(order: dict) -> bool:
-    if not isinstance(order, dict):
+    if type(order) not in (dict, _TradeRecoveryOrder):
         return False
     return (
-        _finite_nonnegative_order_value(order.get("filled")) > 0
-        or _finite_nonnegative_order_value(order.get("cost")) > 0
+        _finite_nonnegative_order_value(dict.get(order, "filled")) > 0
+        or _finite_nonnegative_order_value(dict.get(order, "cost")) > 0
     )
 
 
@@ -697,12 +767,12 @@ def _order_landed(o: dict) -> bool:
     a real exchange id. A terminal canceled/expired/rejected status only proves
     no placement when there is no fill: exchanges can cancel the unfilled
     remainder after a partial execution."""
-    if not isinstance(o, dict):
+    if type(o) not in (dict, _TradeRecoveryOrder):
         return False
     order_ids = _explicit_order_ids(o)
     if len(order_ids) > 1:
         return False
-    status = _normalize_order_status(o.get("status"))
+    status = _normalize_order_status(dict.get(o, "status"))
     if status == "rejected":
         return False
     if _order_response_has_fill_evidence(o):
@@ -716,20 +786,22 @@ def _order_landed(o: dict) -> bool:
 
 def _order_confirmed_terminal_zero_fill(order: dict) -> bool:
     """True only for explicit terminal status plus explicit zero fill."""
-    if not isinstance(order, dict):
+    if type(order) not in (dict, _TradeRecoveryOrder):
         return False
-    if _normalize_order_status(order.get("status")) not in (
+    if _normalize_order_status(dict.get(order, "status")) not in (
         "canceled",
         "cancelled",
         "expired",
         "rejected",
     ):
         return False
-    filled = _finite_order_telemetry_value(order.get("filled"))
+    filled = _finite_order_telemetry_value(dict.get(order, "filled"))
     if filled != 0:
         return False
-    info = order.get("info")
-    if isinstance(info, dict):
+    info = dict.get(order, "info")
+    if info is not None and type(info) is not dict:
+        return False
+    if type(info) is dict:
         for key in (
             "baseVolume",
             "dealVol",
@@ -797,7 +869,7 @@ def _order_confirmed_terminal_zero_fill(order: dict) -> bool:
                 tolerance = max(1e-12, total * 1e-9)
                 if left > total + tolerance or total - left > tolerance:
                     return False
-    raw_cost = order.get("cost")
+    raw_cost = dict.get(order, "cost")
     if raw_cost in (None, ""):
         return True
     cost = _finite_order_telemetry_value(raw_cost)
@@ -1785,25 +1857,48 @@ _FUTURES_DISCOUNT_TOKENS = ("MX", "BNB", "BGB", "OKB", "HT", "KCS", "GT")
 
 
 def _finite_fee_cost(value) -> Optional[float]:
-    if value is None or isinstance(value, bool):
+    if value is None or type(value) not in (int, float, str):
         return None
-    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
-        return None
+    exact_text_value = None
+    if type(value) is str:
+        if (
+            len(value) > _MAX_NUMERIC_TEXT_CHARS
+            or not value.isascii()
+            or not value.isprintable()
+            or _ASCII_NUMBER_TEXT_RE.fullmatch(value) is None
+        ):
+            return None
+        try:
+            exact_text_value = Decimal(value)
+        except (ArithmeticError, ValueError):
+            return None
+        if not exact_text_value.is_finite():
+            return None
     try:
         cost = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
-    return cost if math.isfinite(cost) else None
+    if not math.isfinite(cost):
+        return None
+    if exact_text_value is not None and cost == 0.0 and not exact_text_value.is_zero():
+        return None
+    return cost
 
 
 def _positive_float(value) -> float:
-    if isinstance(value, bool):
+    if type(value) not in (int, float, str):
         return 0.0
-    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS:
-        return 0.0
+    if type(value) is str:
+        if (
+            len(value) > _MAX_NUMERIC_TEXT_CHARS
+            or not value.isascii()
+            or not value.isprintable()
+            or _ASCII_NUMBER_TEXT_RE.fullmatch(value) is None
+        ):
+            return 0.0
     try:
         parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return 0.0
     return parsed if math.isfinite(parsed) and parsed > 0 else 0.0
 
@@ -1818,20 +1913,48 @@ def _first_positive_float(*values) -> float:
 
 def _position_contracts_abs(pos: dict) -> Optional[float]:
     """Parse exchange position size; malformed payload means untrusted state."""
-    if not isinstance(pos, dict):
+    if type(pos) is not dict:
         return None
     observed: list[float] = []
     for key in ("contracts", "size"):
-        raw = pos.get(key)
-        if raw in (None, ""):
+        raw = dict.get(pos, key)
+        exact_text_value = None
+        if raw is None:
             continue
-        if isinstance(raw, bool):
+        if type(raw) not in (int, float, str):
             return None
+        if type(raw) is str:
+            if not raw:
+                continue
+            if (
+                len(raw) > _MAX_NUMERIC_TEXT_CHARS
+                or not raw.isascii()
+                or not raw.isprintable()
+            ):
+                return None
+            stripped = raw.strip()
+            if _ASCII_NUMBER_TEXT_RE.fullmatch(stripped) is None:
+                return None
+            try:
+                exact_text_value = Decimal(stripped)
+            except (ArithmeticError, ValueError):
+                return None
+            if not exact_text_value.is_finite():
+                return None
+            if raw != stripped and not exact_text_value.is_zero():
+                return None
+            raw = stripped
         try:
             parsed = float(raw)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return None
         if not math.isfinite(parsed):
+            return None
+        if (
+            exact_text_value is not None
+            and parsed == 0.0
+            and not exact_text_value.is_zero()
+        ):
             return None
         observed.append(parsed)
     if not observed:
@@ -1848,12 +1971,12 @@ def _position_contracts_abs(pos: dict) -> Optional[float]:
 
 
 def _upper_currency_text(value) -> str:
-    return value.strip().upper() if isinstance(value, str) else ""
+    return value.strip().upper() if type(value) is str else ""
 
 
 def _order_with_fee_context(order, ex=None, symbol_full: str = "",
                             contract_size: Optional[float] = None) -> dict:
-    payload = dict(order) if isinstance(order, dict) else {}
+    payload = dict(order) if type(order) is dict else {}
     if not payload:
         return payload
     if contract_size is not None:
@@ -1871,14 +1994,14 @@ def _convert_fee_to_usdt_futures_known(
     *,
     allow_discount_estimate: bool = True,
 ) -> tuple[float, bool]:
-    if not isinstance(fee_dict, dict) or fee_dict.get("cost") is None:
+    if type(fee_dict) is not dict or dict.get(fee_dict, "cost") is None:
         return 0.0, False
-    cost = _finite_fee_cost(fee_dict.get("cost"))
+    cost = _finite_fee_cost(dict.get(fee_dict, "cost"))
     if cost is None:
         return 0.0, False
 
-    raw_currency = fee_dict.get("currency")
-    if raw_currency is not None and not isinstance(raw_currency, str):
+    raw_currency = dict.get(fee_dict, "currency")
+    if raw_currency is not None and type(raw_currency) is not str:
         return 0.0, False
     currency = _upper_currency_text(raw_currency)
     if not currency:
@@ -1922,9 +2045,9 @@ def _discount_token_fee_to_usdt(currency: str, cost: float,
     Prefers the token's current price (``ex.fetch_ticker('<TOKEN>/USDT')`` via
     the exchange stashed on the order); falls back to a notional-based estimate
     using the order's own fill. Returns 0.0 only when nothing is usable."""
-    if not isinstance(order_dict, dict):
+    if type(order_dict) is not dict:
         return 0.0
-    ex = order_dict.get("_bot_ex")
+    ex = dict.get(order_dict, "_bot_ex")
     if ex is not None:
         try:
             reservation = try_consume_api_call(
@@ -1973,7 +2096,7 @@ def _discount_token_fee_to_usdt(currency: str, cost: float,
 
 def _estimate_futures_order_fee_from_payload(order_dict: dict) -> float:
     """Estimate the whole order fee once from fill notional."""
-    if not isinstance(order_dict, dict):
+    if type(order_dict) is not dict:
         return 0.0
     ex = order_dict.get("_bot_ex")
     try:
@@ -2214,7 +2337,7 @@ def filled_margin_usdt(amount: float,
         raw = (amt * cs * px) / lev if lev > 0 else 0.0
         if math.isfinite(raw) and raw > 0:
             return raw, True
-    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+    except Exception:
         pass
     try:
         if isinstance(fallback_margin, bool):
@@ -2222,7 +2345,7 @@ def filled_margin_usdt(amount: float,
         fallback = float(fallback_margin or 0.0)
         if math.isfinite(fallback):
             return fallback, False
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         pass
     return 0.0, False
 
@@ -2366,7 +2489,7 @@ def extract_or_estimate_futures_fee(ex,
             continue
         try:
             filled_candidate = float(candidate)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             continue
         if math.isfinite(filled_candidate) and filled_candidate > 0:
             filled = filled_candidate
@@ -2376,7 +2499,7 @@ def extract_or_estimate_futures_fee(ex,
             if isinstance(amount, bool):
                 raise ValueError("boolean amount")
             filled = float(amount)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             filled = 0.0
     if not math.isfinite(filled):
         filled = 0.0
@@ -2388,13 +2511,13 @@ def extract_or_estimate_futures_fee(ex,
         cs = float(contract_size)
         if not math.isfinite(cs) or cs <= 0:
             cs = 1.0
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         cs = 1.0
     try:
         if isinstance(fill_price, bool):
             raise ValueError("boolean fill price")
         fp = float(fill_price)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         fp = 0.0
     if not math.isfinite(fp) or filled <= 0 or fp <= 0:
         return 0.0
@@ -2411,7 +2534,7 @@ def extract_or_estimate_futures_fee(ex,
         if isinstance(taker_rate, bool):
             raise ValueError("boolean taker rate")
         rate = float(taker_rate)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         rate = FUTURES_DEFAULT_TAKER_FEE
     if not math.isfinite(rate) or rate < 0:
         rate = FUTURES_DEFAULT_TAKER_FEE
@@ -2426,17 +2549,20 @@ def extract_or_estimate_futures_fee(ex,
 
 def position_row_side(pos: object) -> tuple[str, bool]:
     """Return (long|short|unknown, contradictory) for a position row."""
-    if not isinstance(pos, dict):
+    if type(pos) is not dict:
         return "", True
-    info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+    raw_info = dict.get(pos, "info")
+    info = raw_info if type(raw_info) is dict else {}
     observed: set[str] = set()
     unknown_explicit = False
     for key in ("side", "positionSide", "posSide", "holdSide", "direction"):
-        for raw in (pos.get(key), info.get(key)):
-            if raw in (None, ""):
+        for raw in (dict.get(pos, key), dict.get(info, key)):
+            if raw is None:
                 continue
-            if not isinstance(raw, str):
+            if type(raw) is not str:
                 unknown_explicit = True
+                continue
+            if not raw:
                 continue
             normalized = raw.strip().lower()
             if normalized in {"long", "buy"}:
@@ -2450,16 +2576,41 @@ def position_row_side(pos: object) -> tuple[str, bool]:
 
     signed_directions: set[int] = set()
     for key in ("contracts", "size"):
-        raw = pos.get(key)
-        if raw in (None, ""):
+        raw = dict.get(pos, key)
+        exact_text_value = None
+        if raw is None:
             continue
-        if isinstance(raw, bool):
+        if type(raw) not in (int, float, str):
             return "", True
+        if type(raw) is str:
+            if not raw:
+                continue
+            if (
+                len(raw) > _MAX_NUMERIC_TEXT_CHARS
+                or raw != raw.strip()
+                or not raw.isascii()
+                or not raw.isprintable()
+            ):
+                return "", True
+            if _ASCII_NUMBER_TEXT_RE.fullmatch(raw) is None:
+                return "", True
+            try:
+                exact_text_value = Decimal(raw)
+            except (ArithmeticError, ValueError):
+                return "", True
+            if not exact_text_value.is_finite():
+                return "", True
         try:
             parsed = float(raw)
-        except (TypeError, ValueError, OverflowError):
+        except Exception:
             return "", True
         if not math.isfinite(parsed):
+            return "", True
+        if (
+            exact_text_value is not None
+            and parsed == 0.0
+            and not exact_text_value.is_zero()
+        ):
             return "", True
         if parsed != 0.0:
             signed_directions.add(-1 if parsed < 0 else 1)
@@ -2476,17 +2627,20 @@ def position_row_side(pos: object) -> tuple[str, bool]:
 
 def _validated_position_rows(raw) -> Optional[list[dict]]:
     """Return a trusted CCXT position list or ``None`` for malformed data."""
-    if not isinstance(raw, (list, tuple)):
+    if type(raw) not in (list, tuple):
         return None
     rows: list[dict] = []
     for row in raw:
-        if not isinstance(row, dict):
+        if type(row) is not dict:
             return None
-        symbol = row.get("symbol")
+        symbol = dict.get(row, "symbol")
         if (
-            not isinstance(symbol, str)
-            or not symbol.strip()
+            type(symbol) is not str
+            or not symbol
             or symbol != symbol.strip()
+            or not symbol.isascii()
+            or not symbol.isprintable()
+            or " " in symbol
         ):
             return None
         rows.append(row)

@@ -15,7 +15,11 @@ import ollama
 from bot_utils.config import _read_config_json
 from core.logger import log_event
 from news.http_limits import read_bounded_json_response
-from news.news_keywords import BEARISH_KEYWORDS, POSITIVE_KEYWORDS as _POSITIVE
+from news.news_keywords import (
+    BEARISH_KEYWORDS,
+    POSITIVE_KEYWORDS as _POSITIVE,
+    find_keyword_matches,
+)
 from core.constants import (
     OLLAMA_URL as _ollama_url_fn,
     LLM_MODEL_DEFAULT,
@@ -58,13 +62,16 @@ def _apply_no_think_if_needed(model: str, prompt: str) -> str:
 
     For non-Qwen3 models (Qwen2.5, Llama, etc.) the /no_think token is
     just unknown text and gets safely ignored  no harm, no change in
-    behavior. Detection is conservative: only model names that clearly
-    start with 'qwen3' get the suffix.
+    behavior. Detection is conservative: only Qwen3 model-name leaves get
+    the suffix.
     """
     if not isinstance(model, str):
         return prompt
-    m = model.lower().lstrip()
-    if m.startswith("qwen3"):
+    m = model.lower().strip().rsplit("/", 1)[-1]
+    is_qwen3 = m == "qwen3" or (
+        m.startswith("qwen3") and m[5:6] in {":", ".", "-", "_"}
+    )
+    if is_qwen3:
         # Append at end so it's the last instruction the model sees.
         # Newline first to avoid gluing it onto a content token.
         if "/no_think" not in prompt:
@@ -109,7 +116,7 @@ def _get_model_name() -> str:
     return LLM_MODEL_DEFAULT
 
 
-#  Hot-reload of LLM_MODEL 
+#  Hot-reload of LLM_MODEL
 # ``get_model_name()`` re-reads bot_config.json on each call, cached by the
 # file's stat signature: the first call after an external edit hits disk,
 # subsequent calls for the same file generation use the cache. ``MODEL_NAME`` below is a
@@ -164,7 +171,7 @@ except Exception:
     LLM_LOCK_DIR = os.path.join(_root, "llm_slots")
 
 
-#  Boot fingerprint 
+#  Boot fingerprint
 def _boot_fingerprint() -> str:
     try:
         if os.name == "posix":
@@ -215,20 +222,29 @@ class _LLMSlotLease:
         with self._release_lock:
             if self._released:
                 return
-            self._released = True
-            try:
-                self.lock.release()
-            finally:
+            lock_released = False
+            for _attempt in range(2):
+                if not lock_released:
+                    try:
+                        self.lock.release()
+                        lock_released = True
+                    except Exception:
+                        pass
+                handle_closed = False
                 try:
                     if not self.handle.closed:
                         self.handle.close()
+                    handle_closed = bool(self.handle.closed)
                 except Exception:
                     pass
+                if handle_closed:
+                    self._released = True
+                    return
 
 
 def _acquire_llm_slot():
     """Claim one cross-process OS lock. Returns a lease or ``None``."""
-    if isinstance(LLM_SLOT_WAIT_SEC, bool):
+    if type(LLM_SLOT_WAIT_SEC) not in (int, float):
         return None
     try:
         wait_budget = float(LLM_SLOT_WAIT_SEC)
@@ -241,8 +257,7 @@ def _acquire_llm_slot():
     ):
         return None
     if (
-        not isinstance(LLM_MAX_CONCURRENT, int)
-        or isinstance(LLM_MAX_CONCURRENT, bool)
+        type(LLM_MAX_CONCURRENT) is not int
         or not 1 <= LLM_MAX_CONCURRENT <= 64
     ):
         return None
@@ -266,6 +281,7 @@ def _acquire_llm_slot():
         for slot in range(slot_count):
             lock_path = os.path.join(LLM_LOCK_DIR, f"slot_{slot}.lock")
             lock = None
+            handle = None
             try:
                 lock = portalocker.Lock(
                     lock_path,
@@ -295,6 +311,14 @@ def _acquire_llm_slot():
                         lock.release()
                     except Exception:
                         pass
+                if handle is not None:
+                    for _attempt in range(2):
+                        try:
+                            if handle.closed:
+                                break
+                            handle.close()
+                        except Exception:
+                            pass
         remaining = deadline - time.monotonic()
         if remaining <= 0.0:
             break
@@ -366,12 +390,12 @@ def generate_with_timeout(model: str, prompt: str,
     per-call TCP-handshake overhead of bare requests.post (~1s  calls/scan).
     """
     valid_model = (
-        isinstance(model, str)
+        type(model) is str
         and 1 <= len(model) <= 200
         and all(ch.isprintable() and not ch.isspace() for ch in model)
     )
     valid_prompt = (
-        isinstance(prompt, str)
+        type(prompt) is str
         and bool(prompt.strip())
         and len(prompt) <= 1_000_000
         and "\x00" not in prompt
@@ -541,18 +565,18 @@ def _model_name_matches(configured: str, candidate: str) -> bool:
 
 
 def _model_names_from_payload(payload) -> list[str]:
-    if not isinstance(payload, dict):
+    if type(payload) is not dict:
         return []
     models = payload.get("models")
-    if not isinstance(models, list):
+    if type(models) is not list:
         return []
     names = []
     for model in models[:256]:
-        if not isinstance(model, dict):
+        if type(model) is not dict:
             continue
         name = model.get("name")
-        if isinstance(name, str):
-            name = name.strip()
+        if type(name) is str:
+            name = str.strip(name)
             if name and len(name) <= 256:
                 names.append(name)
     return names
@@ -566,7 +590,11 @@ def _bounded_ollama_probe_payload(response):
     try:
         if getattr(response, "status_code", None) != 200:
             return None
-        reader_closes = callable(getattr(response, "iter_content", None))
+        reader_closes = (
+            callable(getattr(response, "iter_content", None))
+            or isinstance(getattr(response, "content", None), (bytes, bytearray))
+            or callable(getattr(response, "json", None))
+        )
         return read_bounded_json_response(
             response,
             max_bytes=_OLLAMA_PROBE_MAX_BYTES,
@@ -591,7 +619,7 @@ def _do_one_ping() -> str:
     base_url = OLLAMA_URL.rstrip("/")
     model_cfg = get_model_name()
 
-    #  Step 1: daemon + installed models 
+    #  Step 1: daemon + installed models
     for attempt in range(PING_MAX_FAILURES):
         try:
             r = requests.get(
@@ -614,14 +642,14 @@ def _do_one_ping() -> str:
     if installed is None:
         return LLM_STATUS_DAEMON_DOWN
 
-    #  Step 2: check configured model is installed 
+    #  Step 2: check configured model is installed
     model_installed = any(
         _model_name_matches(model_cfg, name) for name in installed
     )
     if not model_installed:
         return LLM_STATUS_MODEL_MISSING
 
-    #  Step 3: check if model is loaded in memory (hot vs cold) 
+    #  Step 3: check if model is loaded in memory (hot vs cold)
     try:
         r2 = requests.get(
             f"{base_url}/api/ps",
@@ -793,7 +821,7 @@ def shutdown_llm_resources(timeout: float = 0.0) -> bool:
     No client is closed while the ping worker can still be running.
     """
     global _CLIENT_CLOSE_GENERATION, _PING_START_UNCERTAIN
-    if isinstance(timeout, bool):
+    if type(timeout) not in (int, float):
         return False
     try:
         requested_timeout = float(timeout)
@@ -963,7 +991,7 @@ def get_llm_status_text() -> str:
     return "Checking"
 
 
-#  Bull/Bear adversarial mode 
+#  Bull/Bear adversarial mode
 _BULL_BEAR_ENABLED     = os.getenv("BULL_BEAR_MODE", "true").lower() != "false"
 _BULL_BEAR_FAIL_CLOSED = os.getenv("BULL_BEAR_FAIL_CLOSED", "false").lower() == "true"
 # When the LLM brain is offline, do not open new entries from a bare keyword
@@ -983,7 +1011,7 @@ _CHALLENGE_TEMPLATE = (
 
 
 def _challenge_text(value, *, fallback: str, limit: int) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         return fallback
     clean = value.replace("\U0001f4ad", "").strip()
     if "</think>" in clean:
@@ -1004,8 +1032,9 @@ def _interpret_challenge(resp, label: str) -> str:
     generate_with_timeout. A trailing 'CHALLENGE: STRONG' line means skip the
     trade; an empty answer is treated like the error path (honours
     _BULL_BEAR_FAIL_CLOSED)."""
+    safe_label = label if type(label) is str and label else "unknown"
     text = ""
-    if isinstance(resp, str):
+    if type(resp) is str:
         text = resp
     else:
         getter = getattr(resp, "get", None)
@@ -1014,20 +1043,27 @@ def _interpret_challenge(resp, label: str) -> str:
                 candidate = getter("response")
             except Exception:
                 candidate = None
-            if isinstance(candidate, str):
+            if type(candidate) is str:
                 text = candidate
     verdict = text.upper()
     if not verdict.strip():
         return "OVERRIDE_WAIT" if _BULL_BEAR_FAIL_CLOSED else "PROCEED"
     lines = [ln for ln in verdict.splitlines() if ln.strip()]
+    if lines and lines[-1].strip() in {"```", "~~~"}:
+        lines.pop()
     tail_tokens = (lines[-1] if lines else verdict).split()
+    if tail_tokens and tail_tokens[0] in {"-", "*", "+", ">"}:
+        tail_tokens = tail_tokens[1:]
+    marker = tail_tokens[0].strip("*_`~") if tail_tokens else ""
     challenge = (
-        tail_tokens[1]
-        if len(tail_tokens) >= 2 and tail_tokens[0] == "CHALLENGE:"
+        tail_tokens[1].strip("*_`~.,!?;")
+        if len(tail_tokens) >= 2 and marker == "CHALLENGE:"
         else ""
     )
     if challenge == "STRONG":
-        log_event(f"[Bull/Bear] {label}: STRONG challenge  OVERRIDE_WAIT", "INFO")
+        log_event(
+            f"[Bull/Bear] {safe_label}: STRONG challenge  OVERRIDE_WAIT", "INFO"
+        )
         return "OVERRIDE_WAIT"
     if challenge == "WEAK":
         return "PROCEED"
@@ -1040,7 +1076,9 @@ def bull_bear_challenge(symbol, bull_analysis, context_brief="", confidence=""):
     # confidence gate). MEDIUM/HIGH BUYs are challenged.
     if not _BULL_BEAR_ENABLED or not llm_available():
         return "PROCEED"
-    if str(confidence).upper() == "LOW":
+    if type(symbol) is not str or not symbol:
+        return "OVERRIDE_WAIT" if _BULL_BEAR_FAIL_CLOSED else "PROCEED"
+    if type(confidence) is str and str.upper(confidence) == "LOW":
         return "PROCEED"
     clean = _challenge_text(
         bull_analysis, fallback="No valid analysis supplied.", limit=500
@@ -1071,7 +1109,9 @@ def bull_bear_challenge(symbol, bull_analysis, context_brief="", confidence=""):
 def futures_bull_bear_challenge(symbol, direction, analysis, context_brief=""):
     if not _BULL_BEAR_ENABLED or not llm_available():
         return "PROCEED"
-    if direction not in ("LONG", "SHORT"):
+    if type(symbol) is not str or not symbol:
+        return "OVERRIDE_WAIT" if _BULL_BEAR_FAIL_CLOSED else "PROCEED"
+    if type(direction) is not str or direction not in ("LONG", "SHORT"):
         return "PROCEED"
     clean = _challenge_text(
         analysis, fallback="No valid analysis supplied.", limit=500
@@ -1104,8 +1144,8 @@ def futures_bull_bear_challenge(symbol, direction, analysis, context_brief=""):
 
 def keyword_fallback(symbol: str, news: str, strategy: str = "TREND") -> str:
     """Simple keyword analysis when LLM is offline."""
-    news_lower = news.lower() if isinstance(news, str) else ""
-    found_negative = [kw for kw in NEGATIVE_KEYWORDS if kw in news_lower]
+    news_lower = str.lower(news) if type(news) is str else ""
+    found_negative = find_keyword_matches(news_lower, NEGATIVE_KEYWORDS)
     if found_negative:
         reason = ", ".join(found_negative[:3])
         return (
@@ -1114,7 +1154,7 @@ def keyword_fallback(symbol: str, news: str, strategy: str = "TREND") -> str:
             f"CONFIDENCE: HIGH\n"
             f"RESULT: WAIT"
         )
-    found_positive = [kw for kw in POSITIVE_KEYWORDS if kw in news_lower]
+    found_positive = find_keyword_matches(news_lower, POSITIVE_KEYWORDS)
     pos_note = f"Positive context: {', '.join(found_positive[:2])}. " if found_positive else ""
     if _LLM_FALLBACK_FAILCLOSED:
         # Opt-in (LLM_FALLBACK_FAILCLOSED=true): refuse NEW entries while the

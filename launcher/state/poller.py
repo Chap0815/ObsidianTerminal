@@ -159,7 +159,7 @@ def _runtime_or_config_sim(
     return True
 
 
-#  Incremental error-log counter 
+#  Incremental error-log counter
 # Caches (file-size, count) and only reads NEW bytes when the file grows, so a
 # large error_log.txt isn't fully re-read every poll cycle.
 
@@ -595,7 +595,7 @@ class DataPoller:
             setattr(self, attr, None)
         _close_exchange_quietly(exchange)
 
-    #  Main loop 
+    #  Main loop
 
     def _loop(self) -> None:
         # Rate-limited stderr error log (once per minute per error type)
@@ -715,7 +715,7 @@ class DataPoller:
                 if trade_metrics_error and not new_data.get("metrics_error"):
                     new_data["metrics_error"] = trade_metrics_error
 
-                #  Sparkline (PnL trend, last ~30 closed trades) 
+                #  Sparkline (PnL trend, last ~30 closed trades)
                 # Refresh every 30s  sparklines only change when a trade
                 # closes, so polling faster than that is pure DB load.
                 cadence_now = time.monotonic()
@@ -758,7 +758,7 @@ class DataPoller:
                 if sparkline_error:
                     new_data["metrics_error"] = sparkline_error
 
-                #  Unrealized PnL (every 15 s) 
+                #  Unrealized PnL (every 15 s)
                 cadence_now = time.monotonic()
                 if cadence_now >= self._unrealized_next:
                     unr: dict = {}
@@ -1186,7 +1186,7 @@ class DataPoller:
             if self._stop_event.wait(timeout=1.5):
                 return
 
-    #  API for the UI 
+    #  API for the UI
 
     def get_all(self) -> dict:
         """Return a copy of the cache.
@@ -1202,7 +1202,7 @@ class DataPoller:
             }
 
     def stop(self, *, timeout: float = 2.0) -> bool:
-        if isinstance(timeout, bool):
+        if type(timeout) not in (int, float):
             return False
         try:
             budget = float(timeout)

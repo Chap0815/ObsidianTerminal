@@ -20,7 +20,7 @@ def realized_vol(closes: List[float], lookback: int = 30) -> Optional[float]:
         return None
     try:
         window = [float(value) for value in closes[-(lookback + 1):]]
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return None
     if any(not math.isfinite(value) or value <= 0.0 for value in window):
         return None

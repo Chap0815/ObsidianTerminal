@@ -19,7 +19,7 @@ import zipfile
 from collections.abc import Iterable
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import portalocker
@@ -1597,29 +1597,35 @@ def _verified_carry_capture_scope(venue_root: Path) -> dict | None:
     if not integrity_root.is_dir():
         return None
     from trading.capture_integrity import (
+        _read_integrity_report,
         _verify_sealed_report,
         capture_continuity_health,
     )
 
     eligible: dict[str, tuple[tuple[datetime, datetime], ...]] = {}
+    eligible_reports: dict[str, dict] = {}
+    verification_cache: dict[str, tuple] = {}
     verified_reports = []
     invalid_days = 0
     seal_errors = 0
+    first_open_day = datetime.now(timezone.utc).date()
     for report_path in sorted(integrity_root.glob("*.json")):
         try:
-            if report_path.stat().st_size > RESEARCH_VENUE_PAYLOAD_MAX_BYTES:
-                raise ValueError("capture seal is oversized")
-            report = json.loads(
-                report_path.read_text(encoding="utf-8"),
-                parse_constant=_reject_research_json_constant,
-                object_pairs_hook=_strict_research_json_object,
+            report = _read_integrity_report(
+                report_path,
+                max_bytes=RESEARCH_VENUE_PAYLOAD_MAX_BYTES,
             )
             _verify_sealed_report(
-                venue_root, report, expected_day=report_path.stem
+                venue_root,
+                report,
+                expected_day=report_path.stem,
+                verification_cache=verification_cache,
             )
             day = str(report.get("day") or "")
             if day != report_path.stem:
                 raise ValueError("capture seal day does not match its path")
+            if date.fromisoformat(day) >= first_open_day:
+                raise ValueError("capture seal day is not closed")
             status = report.get("status")
             if status == "invalid":
                 invalid_days += 1
@@ -1658,9 +1664,20 @@ def _verified_carry_capture_scope(venue_root: Path) -> dict | None:
             if status == "valid" and exclusions:
                 raise ValueError("valid capture seal contains exclusions")
             eligible[day] = tuple(sorted(exclusions))
+            eligible_reports[day] = report
             verified_reports.append(report)
         except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
             seal_errors += 1
+            try:
+                failed_day = date.fromisoformat(report_path.stem)
+            except ValueError:
+                pass
+            else:
+                if failed_day.isoformat() == report_path.stem:
+                    verified_reports.append({
+                        "day": report_path.stem,
+                        "status": "invalid",
+                    })
     continuity = capture_continuity_health(verified_reports)
     if continuity.get("ok") is True:
         start_day = str(continuity.get("start_day") or "")
@@ -1670,8 +1687,15 @@ def _verified_carry_capture_scope(venue_root: Path) -> dict | None:
             for day, intervals in eligible.items()
             if start_day <= day <= end_day
         }
+        eligible_reports = {
+            day: report
+            for day, report in eligible_reports.items()
+            if day in eligible
+        }
     return {
         "eligible": eligible,
+        "eligible_reports": eligible_reports,
+        "verification_cache": verification_cache,
         "invalid_days": invalid_days,
         "seal_errors": seal_errors,
         "continuity": continuity,
@@ -1685,7 +1709,9 @@ def _carry_history_report(
     require_verified_seals: bool = True,
 ) -> dict:
     from trading.carry_sim import CarryEngine, CarryState, CarryTerms
+    from trading.capture_integrity import _verify_sealed_report
 
+    required = _positive_sample_count(minimum_samples)
     grouped: dict[str, dict[str, dict]] = {}
     overview_counts: dict[str, int] = {}
     missing_settlement = 0
@@ -1724,7 +1750,10 @@ def _carry_history_report(
             exclusions = scoped
         conn = None
         try:
-            conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+            conn = sqlite3.connect(
+                f"file:{path.as_posix()}?mode=ro&immutable=1",
+                uri=True,
+            )
             rows = conn.execute(
                 "SELECT event_id, exchange_time, received_time, payload_json "
                 "FROM venue_events "
@@ -1834,14 +1863,24 @@ def _carry_history_report(
                         or snapshot_order > previous["_snapshot_order"]
                     ):
                         periods[period_key] = candidate
-        except (OSError, sqlite3.Error):
+        except (OSError, sqlite3.Error) as exc:
+            if capture_scope is not None:
+                raise RuntimeError(
+                    "sealed carry partition read failed"
+                ) from exc
             continue
         finally:
             if conn is not None:
                 conn.close()
+        if capture_scope is not None:
+            _verify_sealed_report(
+                folder.parent,
+                capture_scope["eligible_reports"][path.stem],
+                expected_day=path.stem,
+                verification_cache=capture_scope["verification_cache"],
+            )
     summaries = []
     qualified = []
-    required = max(1, int(minimum_samples))
     for market_id, periods in grouped.items():
         ordered_periods = sorted(
             periods.values(), key=lambda row: row["exchange_time"]
