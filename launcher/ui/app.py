@@ -1751,7 +1751,7 @@ class ObsidianApp(ctk.CTk):
         spark_wrap = ctk.CTkFrame(card, fg_color=COLORS["panel_alt"],
                                    border_color=COLORS["border"], border_width=1,
                                    corner_radius=10)
-        spark_wrap.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 8))
+        spark_wrap.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 4))
         spark_wrap.grid_columnconfigure(0, weight=1)
 
         spark_head = ctk.CTkFrame(spark_wrap, fg_color="transparent")
@@ -1782,7 +1782,7 @@ class ObsidianApp(ctk.CTk):
         # is per-bot and persists in app.config["UI"]["params_collapsed"][name].
         param_wrap = ctk.CTkFrame(card, fg_color="#0a0e15", corner_radius=10,
                                      border_width=1, border_color=COLORS["border_soft"])
-        param_wrap.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 8))
+        param_wrap.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 2))
 
         # Monitoring first: keep saved choices, collapse settings on first use.
         try:
@@ -1924,18 +1924,18 @@ class ObsidianApp(ctk.CTk):
             card.grid_rowconfigure(3, **_PARAMS_ROW_COLLAPSED)
 
         #  ROW 5: Restart Hint 
-        restart_hint = ctk.CTkLabel(card, text="",
+        restart_hint = ctk.CTkLabel(card, text="", height=16,
                                      font=ctk.CTkFont(FONT_BODY, 10, "bold"),
                                      text_color=COLORS["warning"], anchor="w")
         restart_hint.grid(row=5, column=0, sticky="ew", padx=22, pady=(2, 0))
 
         #  ROW 6: Separator 
         sep_6 = ctk.CTkFrame(card, fg_color=COLORS["border_soft"], height=1)
-        sep_6.grid(row=6, column=0, sticky="ew", padx=22, pady=(8, 0))
+        sep_6.grid(row=6, column=0, sticky="ew", padx=22, pady=(4, 0))
 
         #  ROW 7: Action Buttons (kompakter) 
         actions = ctk.CTkFrame(card, fg_color="transparent", height=46)
-        actions.grid(row=7, column=0, sticky="ew", padx=18, pady=8)
+        actions.grid(row=7, column=0, sticky="ew", padx=18, pady=3)
         actions.grid_propagate(False)
         actions.pack_propagate(False)
 
@@ -1986,7 +1986,7 @@ class ObsidianApp(ctk.CTk):
         # the log and the params section scale together instead of the log
         # taking a fixed slice and clipping the bottom parameter rows.
         log_outer = ctk.CTkFrame(card, fg_color="transparent")
-        log_outer.grid(row=9, column=0, sticky="nsew", padx=22, pady=(8, 18))
+        log_outer.grid(row=9, column=0, sticky="nsew", padx=22, pady=(6, 12))
         card.grid_rowconfigure(9, weight=1, minsize=118)
         log_outer.grid_columnconfigure(0, weight=1)
         log_outer.grid_rowconfigure(1, weight=1)
@@ -1998,6 +1998,22 @@ class ObsidianApp(ctk.CTk):
                       font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                       text_color=COLORS["text_muted"]
                       ).pack(side="left")
+
+        log_expand_btn = ctk.CTkButton(
+            log_head, text="Expand", width=68, height=22, corner_radius=4,
+            font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+            fg_color="transparent", hover_color=COLORS["panel_hover"],
+            text_color=COLORS["accent_text"], border_width=1,
+            border_color=COLORS["border"],
+            command=lambda n=name: self._toggle_log_expanded(n),
+        )
+        log_expand_btn.pack(side="left", padx=(8, 0))
+        enable_keyboard_activation(log_expand_btn)
+        attach_tooltip(
+            log_expand_btn,
+            "Log auf 18 Zeilen vergrößern oder auf 8 Zeilen zurückklappen.\n"
+            "Filter und Meldungen bleiben unverändert.", delay_ms=400,
+        )
 
         auto_var = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(log_head, text="Auto", variable=auto_var,
@@ -2038,13 +2054,24 @@ class ObsidianApp(ctk.CTk):
 
         log_box = tk.Text(
             log_wrap, bg=COLORS["bg"], fg=COLORS["text_dim"],
-            font=(self.mono_font, 11), width=1, height=5,
+            font=(self.mono_font, 11), width=1, height=8,
             insertbackground=COLORS["text"],
             highlightthickness=0, bd=0, relief="flat",
             padx=12, pady=10, wrap="word",
             selectbackground=COLORS["border"]
         )
         log_box.pack(side="left", fill="both", expand=True)
+
+        def _follow_log_resize(_event):
+            # Geometry may settle after the toggle's idle callback. Follow the
+            # actual Text resize as well, so shrinking does not lose the tail.
+            if auto_var.get():
+                log_box.after_idle(
+                    lambda: log_box.see("end")
+                    if log_box.winfo_exists() and auto_var.get() else None
+                )
+
+        log_box.bind("<Configure>", _follow_log_resize, add="+")
 
         scrollbar = tk.Scrollbar(log_wrap, command=log_box.yview,
                                   bg=COLORS["panel"], troughcolor=COLORS["bg"],
@@ -2164,6 +2191,8 @@ class ObsidianApp(ctk.CTk):
             "stop_btn":     stop_btn,
             "restart_hint": restart_hint,
             "log_box":      log_box,
+            "log_expand_btn": log_expand_btn,
+            "_log_expanded": False,
             "auto_var":     auto_var,
             "details_var":  details_var,
             "log_filter":   LiveLogDisplayFilter(
@@ -3651,6 +3680,27 @@ class ObsidianApp(ctk.CTk):
                     pass
             if not isinstance(exc, Exception) and all_updaters_stopped:
                 raise
+
+    def _toggle_log_expanded(self, name):
+        """Resize the existing display without touching messages or filters."""
+        card = self.cards[name]
+        box = card["log_box"]
+        top_index = box.index("@0,0")
+        expanded = not card.get("_log_expanded", False)
+        box.configure(height=18 if expanded else 8)
+        card["_log_expanded"] = expanded
+        card["log_expand_btn"].configure(text="Compact" if expanded else "Expand")
+
+        def restore_view():
+            if not box.winfo_exists():
+                return
+            if card["auto_var"].get():
+                box.see("end")
+            else:
+                box.yview(top_index)
+            self._refresh_main_scrollregion()
+
+        self.after_idle(restore_view)
 
     def _clear_card_log(self, name):
         card = self.cards[name]
