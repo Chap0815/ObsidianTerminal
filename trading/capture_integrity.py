@@ -12,6 +12,12 @@ from contextlib import nullcontext
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 
+from trading.capture_trade_identity import (
+    read_trade_identity,
+    validate_trade_identity_schema,
+    validate_ws_trade_payload,
+)
+
 
 _DATETIME_TYPE = datetime
 CORE_STREAMS = ("overview", "depth", "trades", "l2_stream")
@@ -41,6 +47,9 @@ EVENT_TIME_INDEX_XINFO = (
 PARTITION_SCHEMA_OBJECTS = (
     ("index", "idx_venue_events_time", "venue_events"),
     ("table", "venue_events", "venue_events"),
+)
+TRADE_IDENTITY_SCHEMA_OBJECT = (
+    "table", "websocket_trade_identities", "websocket_trade_identities"
 )
 SEAL_GRACE = timedelta(hours=1)
 GAP_EXCLUSION_BUFFER = timedelta(minutes=2)
@@ -733,7 +742,12 @@ def _valid_trade_id(value) -> bool:
     )
 
 
-def _validate_rest_trades_payload(payload: dict, day: date) -> None:
+def _validate_rest_trades_payload(
+    payload: dict,
+    day: date,
+    *,
+    receipt_ms: int | None = None,
+) -> None:
     trades = payload.get("trades")
     if not isinstance(trades, list) or len(trades) > 100:
         raise ValueError("REST trades payload is malformed")
@@ -754,8 +768,11 @@ def _validate_rest_trades_payload(payload: dict, day: date) -> None:
             ).date()
         except (OSError, OverflowError, ValueError) as exc:
             raise ValueError("REST trade timestamp is invalid") from exc
-        if trade_day != day:
-            raise ValueError("REST trade escaped UTC partition")
+        if receipt_ms is None:
+            if trade_day != day:
+                raise ValueError("REST trade escaped UTC partition")
+        elif not receipt_ms - 86_400_000 <= trade_time <= receipt_ms + 30_000:
+            raise ValueError("REST trade escaped receipt window")
         price = _positive_number(trade.get("price"), "REST trade price")
         amount = _positive_number(trade.get("amount"), "REST trade amount")
         side = trade.get("side")
@@ -883,6 +900,12 @@ def _partition_rows(
         quick = connection.execute("PRAGMA quick_check").fetchall()
         if [str(row[0]) for row in quick] != ["ok"]:
             raise ValueError(f"{stream} quick_check failed")
+        try:
+            trade_identity_version = validate_trade_identity_schema(connection)
+        except RuntimeError as exc:
+            raise ValueError(f"{stream} trade identity schema mismatch: {exc}") from exc
+        if trade_identity_version == 2 and stream != "trades":
+            raise ValueError(f"{stream} trade identity schema is unexpected")
         table_info = connection.execute(
             "PRAGMA table_xinfo(venue_events)"
         ).fetchall()
@@ -942,7 +965,12 @@ def _partition_rows(
                 "ORDER BY type,name"
             ).fetchall()
         )
-        if schema_objects != PARTITION_SCHEMA_OBJECTS:
+        expected_objects = PARTITION_SCHEMA_OBJECTS
+        if trade_identity_version == 2:
+            expected_objects = tuple(sorted((
+                *PARTITION_SCHEMA_OBJECTS, TRADE_IDENTITY_SCHEMA_OBJECT,
+            )))
+        if schema_objects != expected_objects:
             raise ValueError(f"{stream} schema objects mismatch")
         receipt_ordered = stream in {"depth", "l2_stream"}
         order_expression = (
@@ -957,7 +985,7 @@ def _partition_rows(
             # the strict cross-event identity contract without retaining one
             # Python object per trade for the entire validation pass.
             connection.execute(
-                """CREATE TEMP TABLE websocket_trade_identities (
+                """CREATE TEMP TABLE temp_websocket_trade_identities (
                        market_id TEXT NOT NULL,
                        trade_id TEXT NOT NULL,
                        trade_time INTEGER NOT NULL,
@@ -1039,8 +1067,63 @@ def _partition_rows(
             rest_event = stream in {"overview", "depth"} or (
                 stream == "trades" and payload.get("stream_source") != "ccxt_pro"
             )
+            receipt_keys = ("rest_snapshot_version", "partition_basis")
+            receipt_marked = any(key in payload for key in receipt_keys)
+            writer_keys = ("writer_input_sha256", "writer_input_exchange_time")
+            writer_marked = any(key in payload for key in writer_keys)
+            receipt_ms = None
+            if receipt_marked:
+                if (
+                    stream != "trades"
+                    or payload.get("stream_source") is not None
+                    or type(payload.get("rest_snapshot_version")) is not int
+                    or payload["rest_snapshot_version"] != 1
+                    or payload.get("partition_basis") != "request_received"
+                ):
+                    raise ValueError("REST receipt partition contract is invalid")
             if rest_event:
                 _validate_rest_request_provenance(payload, received_time)
+            if writer_marked:
+                writer_hash = payload.get("writer_input_sha256")
+                original_exchange_text = payload.get("writer_input_exchange_time")
+                if (
+                    trade_identity_version != 2
+                    or stream != "trades"
+                    or payload.get("stream_source") != "ccxt_pro"
+                    or not isinstance(writer_hash, str)
+                    or len(writer_hash) != 64
+                    or any(char not in "0123456789abcdef" for char in writer_hash)
+                    or not isinstance(original_exchange_text, str)
+                    or not original_exchange_text
+                    or original_exchange_text != original_exchange_text.strip()
+                    or len(original_exchange_text) > 64
+                    or any(
+                        codepoint < 32
+                        or codepoint == 127
+                        or 0xD800 <= codepoint <= 0xDFFF
+                        for codepoint in map(ord, original_exchange_text)
+                    )
+                ):
+                    raise ValueError("websocket writer input marker is invalid")
+                original_exchange = _utc(original_exchange_text)
+                received_ms = round(received_time.timestamp() * 1000)
+                original_ms = round(original_exchange.timestamp() * 1000)
+                if (
+                    original_exchange.date() != day
+                    or original_exchange.microsecond % 1000 != 0
+                    or original_exchange < exchange_time
+                    or original_ms > received_ms + WEBSOCKET_TRADE_FUTURE_TOLERANCE_MS
+                    or received_ms - original_ms > WEBSOCKET_TRADE_MAX_AGE_MS
+                ):
+                    raise ValueError("websocket writer input clock mismatch")
+            if receipt_marked:
+                receipt_ms = payload["request_ended_ms"]
+                if (
+                    exchange_time != received_time
+                    or exchange_time.microsecond % 1000 != 0
+                    or round(exchange_time.timestamp() * 1000) != receipt_ms
+                ):
+                    raise ValueError("REST receipt partition clock mismatch")
             if stream != "overview":
                 _validate_event_universe(payload)
             allowed = (
@@ -1066,7 +1149,8 @@ def _partition_rows(
                 stream == "trades"
                 and payload.get("stream_source") != "ccxt_pro"
             ):
-                _validate_rest_trades_payload(payload, day)
+                _validate_rest_trades_payload(
+                    payload, day, receipt_ms=receipt_ms)
                 if (
                     len(payload["trades"]) == 100
                     and "saturated_trade_payload" not in flags
@@ -1097,6 +1181,13 @@ def _partition_rows(
                 and payload.get("stream_source") == "ccxt_pro"
             ):
                 websocket_trade_events += 1
+                if trade_identity_version == 2:
+                    validate_ws_trade_payload(
+                        payload,
+                        exchange_time=row["exchange_time"],
+                        received_time=row["received_time"],
+                        day=day,
+                    )
                 trades = payload.get("trades")
                 if (
                     payload.get("continuity_status")
@@ -1172,7 +1263,7 @@ def _partition_rows(
                     )
                     identity_values = (*identity_key, *identity_evidence)
                     identity_cursor = connection.execute(
-                        """INSERT OR IGNORE INTO websocket_trade_identities
+                        """INSERT OR IGNORE INTO temp.temp_websocket_trade_identities
                            (market_id, trade_id, trade_time, trade_price,
                             trade_amount, trade_side)
                            VALUES (?, ?, ?, ?, ?, ?)""",
@@ -1182,7 +1273,7 @@ def _partition_rows(
                         previous_identity = connection.execute(
                             """SELECT trade_time, trade_price, trade_amount,
                                       trade_side
-                                 FROM websocket_trade_identities
+                                 FROM temp.temp_websocket_trade_identities
                                 WHERE market_id=? AND trade_id=?""",
                             identity_key,
                         ).fetchone()
@@ -1201,6 +1292,16 @@ def _partition_rows(
                             f"trade_id={_event_diagnostic(trade_id)} "
                             f"event_id={_event_diagnostic(row['event_id'])}"
                         )
+                    if trade_identity_version == 2:
+                        recorded_identity = read_trade_identity(
+                            connection, market_id, trade_id,
+                        )
+                        if recorded_identity != (*identity_evidence, row["event_id"]):
+                            raise ValueError(
+                                "websocket trade identity ledger mismatch "
+                                f"market={_event_diagnostic(market_id)} "
+                                f"trade_id={_event_diagnostic(trade_id)}"
+                            )
                 latest_trade_time = datetime.fromtimestamp(
                     previous_trade_order[0] / 1000,
                     tz=timezone.utc,
@@ -1209,6 +1310,8 @@ def _partition_rows(
                     raise ValueError(
                         "trades websocket exchange_time mismatch"
                     )
+            elif writer_marked:
+                raise ValueError("websocket writer input marker is invalid")
             if stream in {"trades", "l2_stream"}:
                 epoch = payload.get("connection_epoch")
                 epoch_required = stream == "l2_stream" or (
@@ -1225,6 +1328,15 @@ def _partition_rows(
                     connection_epochs.add(epoch)
                     if epoch_tracker is not None:
                         epoch_tracker.observe(received_time, epoch)
+        if trade_identity_version == 2:
+            ledger_count = connection.execute(
+                "SELECT COUNT(*) FROM main.websocket_trade_identities"
+            ).fetchone()[0]
+            trade_count = connection.execute(
+                "SELECT COUNT(*) FROM temp.temp_websocket_trade_identities"
+            ).fetchone()[0]
+            if ledger_count != trade_count:
+                raise ValueError("websocket trade identity ledger count mismatch")
     except BaseException as exc:
         primary_error = exc
         raise

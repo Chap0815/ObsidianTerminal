@@ -1134,17 +1134,17 @@ class ObsidianApp(ctk.CTk):
                        command=self._show_model_selector
                        ).pack(fill="x", pady=(0, 3))
 
-        # Errors card.
+        # Error log card.
         _c = self._sb_card(inner)
         err_row = ctk.CTkFrame(_c, fg_color="transparent")
         err_row.pack(fill="x", pady=(0, 2))
 
         # Slightly larger font for error status.
-        ctk.CTkLabel(err_row, text=" Errors",
+        ctk.CTkLabel(err_row, text="Error log",
                       font=ctk.CTkFont(FONT_BODY, 10, "bold"),
                       text_color=COLORS["text_subtle"], anchor="w"
                       ).pack(side="left")
-        self.sb_errors = ctk.StringVar(value="No errors")
+        self.sb_errors = ctk.StringVar(value="0 logged")
         err_lbl = ctk.CTkLabel(err_row, textvariable=self.sb_errors,
                                 font=ctk.CTkFont(FONT_BODY, 10, "bold"),
                                 text_color=COLORS["success"], anchor="e",
@@ -1152,13 +1152,20 @@ class ObsidianApp(ctk.CTk):
         err_lbl.pack(side="right")
         err_lbl.bind("<Button-1>", lambda e: self._show_error_log())
         self.sb_errors._lbl = err_lbl
+        attach_tooltip(
+            err_lbl,
+            "Entries retained in error_log.txt, including earlier sessions. "
+            "This count does not indicate current bot health. Click to inspect the log.",
+            delay_ms=400,
+        )
 
         err_box = ctk.CTkFrame(_c, fg_color=COLORS["bg_alt"], corner_radius=5,
                                   border_width=1, border_color=COLORS["border_soft"])
         err_box.pack(fill="x", pady=(0, 4))
-        self.sb_errors_text = ctk.CTkLabel(err_box, text="No recent errors",
-                                              font=ctk.CTkFont(FONT_BODY, 10, slant="italic"),
-                                              text_color=COLORS["text_subtle"], anchor="w")
+        self.sb_errors_text = ctk.CTkLabel(
+            err_box, text="Logged events, not current health.",
+            font=ctk.CTkFont(FONT_BODY, 10, slant="italic"),
+            text_color=COLORS["text_subtle"], anchor="w", wraplength=200)
         self.sb_errors_text.pack(fill="x", padx=8, pady=6)
 
         # TOOLS  gerahmte Karte
@@ -1625,7 +1632,7 @@ class ObsidianApp(ctk.CTk):
         )
         sim_btn.grid(row=0, column=1, sticky="ne", padx=(12, 0))
         if not meta.get("uses_llm", True) and not is_futures:
-            action_frame.grid_remove()
+            action_frame.grid_forget()
         attach_tooltip(
             sim_btn,
             "Toggle SIMULATION  LIVE mode.\n"
@@ -1741,6 +1748,7 @@ class ObsidianApp(ctk.CTk):
                         "Payoff-Faktor = -Gewinn / |-Verlust|.\n"
                         "Grn = positiver Erwartungswert bei aktueller Win-Rate,\n"
                         "Gelb = grenzwertig, Rot = negativer Erwartungswert.\n"
+                        "N/A = no losing trade sample; normalized expectancy unavailable.\n"
                         "Faustregel: bei 67% WR brauchst du  ~0.49.",
                         delay_ms=400)
 
@@ -2332,7 +2340,7 @@ class ObsidianApp(ctk.CTk):
 
         for bot in BOT_ORDER:
             if bot not in visible:
-                self.cards[bot]["frame"].grid_remove()
+                self.cards[bot]["frame"].grid_forget()
 
         for i in range(self.MAX_CARD_COLUMNS):
             self.main_frame.grid_columnconfigure(
@@ -4213,10 +4221,17 @@ class ObsidianApp(ctk.CTk):
 
     #  ERROR LOG VIEWER 
 
+    def _set_error_log_count(self, count):
+        self.sb_errors.set(f"{count} logged")
+        self.sb_errors._lbl.configure(
+            text_color=COLORS["danger"] if count > 0 else COLORS["success"],
+            cursor="hand2",
+        )
+
     def _show_error_log(self):
         error_log_path = _error_log_path()
         dlg = ctk.CTkToplevel(self)
-        dlg.title("Error Log")
+        dlg.title("Error log history")
         dlg.geometry("780x520")
         dlg.configure(fg_color=COLORS["panel"])
         dlg.transient(self)
@@ -4224,7 +4239,7 @@ class ObsidianApp(ctk.CTk):
 
         head = ctk.CTkFrame(dlg, fg_color="transparent")
         head.pack(fill="x", padx=20, pady=(16, 8))
-        ctk.CTkLabel(head, text="Error Log",
+        ctk.CTkLabel(head, text="Error log history",
                       font=ctk.CTkFont(FONT_BODY, 14, "bold"),
                       text_color=COLORS["text"]
                       ).pack(side="left")
@@ -4242,8 +4257,7 @@ class ObsidianApp(ctk.CTk):
                 box.delete("1.0", "end")
                 box.insert("end", "Error log cleared.")
                 box.config(state="disabled")
-                self.sb_errors.set("No errors")
-                self.sb_errors._lbl.configure(text_color=COLORS["success"])
+                self._set_error_log_count(0)
             except PermissionError as e:
                 # Show the actual error in the UI
                 box.config(state="normal")
@@ -4282,6 +4296,13 @@ class ObsidianApp(ctk.CTk):
                        text_color=COLORS["danger"], border_width=1,
                        border_color=COLORS["border"], corner_radius=6, command=_clear
                        ).pack(side="left")
+
+        ctk.CTkLabel(
+            dlg,
+            text="Recorded errors may be from earlier sessions. Check bot health for current status.",
+            font=ctk.CTkFont(FONT_BODY, 11),
+            text_color=COLORS["text_muted"], anchor="w", wraplength=740,
+        ).pack(fill="x", padx=20, pady=(0, 8))
 
         log_frame = ctk.CTkFrame(dlg, fg_color=COLORS["bg"], corner_radius=8)
         log_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
@@ -4866,8 +4887,8 @@ class ObsidianApp(ctk.CTk):
             #  Payoff-Kennzahl aktualisieren 
             # payoff = -Win / |-Loss|. Farbe: grn wenn der Erwartungswert
             # bei aktueller Win-Rate positiv ist, gelb (knapp), rot (negativ).
-            # WICHTIG: payoff=0 (nur Verluste) ist eine ECHTE Aussage (rot),
-            # nicht "keine Daten"  daher reicht total>0 als Bedingung.
+            # Ohne Verluststichprobe ist der Nenner unbekannt; reine Verluste
+            # ergeben dagegen einen definierten Payoff von 0.
             try:
                 payoff   = stats.get("payoff", 0.0)
                 avg_win  = stats.get("avg_win", 0.0)
@@ -4876,6 +4897,12 @@ class ObsidianApp(ctk.CTk):
                     card["payoff_var"].set("")
                     card["payoff_lbl"].configure(text_color=COLORS["warning"])
                     card["payoff_detail"].set("DB read failed")
+                elif stats["total"] > 0 and avg_loss == 0:
+                    card["payoff_var"].set("N/A")
+                    card["payoff_lbl"].configure(text_color=COLORS["text_dim"])
+                    card["payoff_detail"].set(
+                        f"+{avg_win:.2f} (0 Loss)" if avg_win > 0
+                        else "No loss sample")
                 elif stats["total"] > 0:
                     wr_frac = stats["wr"] / 100.0
                     # Erwartungswert pro Trade in "R": wr*payoff - (1-wr)
@@ -5276,13 +5303,7 @@ class ObsidianApp(ctk.CTk):
 
         self.sb_clk.set(datetime.now().strftime("%H:%M:%S"))
 
-        err_count = cache.get("error_count", 0)
-        if err_count > 0:
-            self.sb_errors.set(f"{err_count} error{'s' if err_count > 1 else ''}")
-            self.sb_errors._lbl.configure(text_color=COLORS["danger"], cursor="hand2")
-        else:
-            self.sb_errors.set("No errors")
-            self.sb_errors._lbl.configure(text_color=COLORS["success"])
+        self._set_error_log_count(cache.get("error_count", 0))
 
         # Statusbar mit Ready/Live Badge updaten
         self._update_statusbar_state()

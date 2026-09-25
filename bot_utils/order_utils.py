@@ -93,6 +93,8 @@ def _upper_text(value) -> str:
 def order_id_text_or_none(value) -> str | None:
     if type(value) not in (str, int):
         return None
+    if type(value) is int and (value >= 10**256 or value <= -(10**255)):
+        return None
     text = str.strip(value) if type(value) is str else str(value)
     if (
         not text
