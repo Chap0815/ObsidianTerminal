@@ -155,13 +155,12 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _read_release_text(
+def _read_release_bytes(
     path: Path,
     *,
     max_bytes: int,
     label: str,
-    errors: str = "strict",
-) -> str:
+) -> bytes:
     with path.open("rb") as fh:
         before = os.fstat(fh.fileno())
         raw = fh.read(max_bytes + 1)
@@ -186,6 +185,17 @@ def _read_release_text(
         raise OSError(f"{label} changed during text read")
     if len(raw) > max_bytes:
         raise ValueError(f"{label} exceeds size limit ({max_bytes} bytes)")
+    return raw
+
+
+def _read_release_text(
+    path: Path,
+    *,
+    max_bytes: int,
+    label: str,
+    errors: str = "strict",
+) -> str:
+    raw = _read_release_bytes(path, max_bytes=max_bytes, label=label)
     return raw.decode("utf-8-sig", errors=errors)
 
 
@@ -285,13 +295,17 @@ def _normalized_package_name(value: object) -> str:
 
 def _locked_requirements(path: Path) -> dict[str, tuple[str, str]]:
     """Return normalized package -> (display name, exact version)."""
-    locked: dict[str, tuple[str, str]] = {}
-    lines = _read_release_text(
+    text = _read_release_text(
         path,
         max_bytes=RELEASE_METADATA_MAX_BYTES,
         label="requirements.lock.txt",
-    ).splitlines()
-    for number, raw in enumerate(lines, 1):
+    )
+    return _parse_locked_requirements(text)
+
+
+def _parse_locked_requirements(text: str) -> dict[str, tuple[str, str]]:
+    locked: dict[str, tuple[str, str]] = {}
+    for number, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -324,7 +338,12 @@ def _dependency_advisory_errors(root: Path) -> list[str]:
     lock_path = root / "requirements.lock.txt"
     policy_path = root / DEPENDENCY_ADVISORY_POLICY_REL
     try:
-        locked = _locked_requirements(lock_path)
+        lock_bytes = _read_release_bytes(
+            lock_path,
+            max_bytes=RELEASE_METADATA_MAX_BYTES,
+            label="requirements.lock.txt",
+        )
+        locked = _parse_locked_requirements(lock_bytes.decode("utf-8-sig"))
         policy = json.loads(
             _read_release_text(
                 policy_path,
@@ -358,7 +377,7 @@ def _dependency_advisory_errors(root: Path) -> list[str]:
                 "explicit OSV policy refresh and review every result"
             )
     expected_lock_hash = str(policy.get("requirements_lock_sha256") or "").lower()
-    actual_lock_hash = _sha256(lock_path)
+    actual_lock_hash = hashlib.sha256(lock_bytes).hexdigest()
     if not re.fullmatch(r"[0-9a-f]{64}", expected_lock_hash):
         errors.append("dependency advisory policy has invalid lock hash")
     elif expected_lock_hash != actual_lock_hash:
@@ -420,13 +439,30 @@ def _dependency_advisory_errors(root: Path) -> list[str]:
                 f"dependency advisory requires explicit review: "
                 f"{name}=={version} {advisory_id}"
             )
+    if not errors:
+        try:
+            current_lock_bytes = _read_release_bytes(
+                lock_path,
+                max_bytes=RELEASE_METADATA_MAX_BYTES,
+                label="requirements.lock.txt",
+            )
+        except (OSError, ValueError) as exc:
+            errors.append(f"dependency advisory policy lock unreadable: {exc}")
+        else:
+            if current_lock_bytes != lock_bytes:
+                errors.append("dependency advisory policy lock changed during validation")
     return errors
 
 
 def _refresh_dependency_advisory_policy(source: Path, output: Path) -> None:
     """Explicitly query OSV and write an unapproved, review-required snapshot."""
     lock_path = source / "requirements.lock.txt"
-    locked = _locked_requirements(lock_path)
+    lock_bytes = _read_release_bytes(
+        lock_path,
+        max_bytes=RELEASE_METADATA_MAX_BYTES,
+        label="requirements.lock.txt",
+    )
+    locked = _parse_locked_requirements(lock_bytes.decode("utf-8-sig"))
     queries = [
         {
             "package": {"ecosystem": "PyPI", "name": display_name},
@@ -454,12 +490,18 @@ def _refresh_dependency_advisory_policy(source: Path, output: Path) -> None:
     for (name, (_display_name, version)), result in zip(
         ordered_locked, results, strict=True
     ):
-        vulns = result.get("vulns", []) if isinstance(result, dict) else []
+        if not isinstance(result, dict):
+            raise ValueError(f"OSV returned a malformed result for {name}")
+        if "next_page_token" in result:
+            token = result["next_page_token"]
+            if not isinstance(token, str) or token:
+                raise ValueError(f"OSV returned an incomplete page for {name}")
+        vulns = result.get("vulns", [])
         if not isinstance(vulns, list):
-            raise TypeError(f"OSV returned malformed advisories for {name}")
+            raise ValueError(f"OSV returned malformed advisories for {name}")
         for vuln in vulns:
             if not isinstance(vuln, dict):
-                raise TypeError(f"OSV returned a malformed advisory for {name}")
+                raise ValueError(f"OSV returned a malformed advisory for {name}")
             advisory_id = str(vuln.get("id") or "").strip().upper()
             if not advisory_id:
                 raise RuntimeError(f"OSV returned an advisory without id for {name}")
@@ -489,11 +531,17 @@ def _refresh_dependency_advisory_policy(source: Path, output: Path) -> None:
             }
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         pass
+    if _read_release_bytes(
+        lock_path,
+        max_bytes=RELEASE_METADATA_MAX_BYTES,
+        label="requirements.lock.txt",
+    ) != lock_bytes:
+        raise ValueError("requirements.lock.txt changed during advisory refresh")
     snapshot = {
         "schema_version": 1,
         "source": OSV_QUERYBATCH_URL,
         "retrieved_at_utc": datetime.now(timezone.utc).isoformat(),
-        "requirements_lock_sha256": _sha256(lock_path),
+        "requirements_lock_sha256": hashlib.sha256(lock_bytes).hexdigest(),
         "safety_floors": existing_floors,
         "advisories": sorted(
             advisories, key=lambda item: (item["package"], item["id"])

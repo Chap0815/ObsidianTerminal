@@ -1317,7 +1317,8 @@ def _venue_row_key(row: dict) -> tuple[bool, datetime, str, str, str]:
 
 
 _LATEST_VENUE_ROWS_SQL = (
-    "SELECT event_id, market_id, exchange_time, quality_flags_json, payload_json "
+    "SELECT event_id, market_id, exchange_time, received_time, "
+    "quality_flags_json, payload_json "
     "FROM venue_events "
     "ORDER BY exchange_time DESC, market_id DESC, event_id DESC "
     "LIMIT ?"
@@ -1348,6 +1349,7 @@ def _venue_rows(root: Path, stream: str, *, limit: int) -> list[dict]:
             event_id = str(row["event_id"])
             market_id = str(row["market_id"])
             exchange_time = str(row["exchange_time"])
+            received_time = row["received_time"]
             try:
                 raw_flags = _decode_research_json(row["quality_flags_json"])
                 if not isinstance(raw_flags, list) or any(
@@ -1361,6 +1363,7 @@ def _venue_rows(root: Path, stream: str, *, limit: int) -> list[dict]:
                         "event_id": event_id,
                         "market_id": market_id,
                         "exchange_time": exchange_time,
+                        "received_time": received_time,
                         "flags": tuple(raw_flags),
                         "payload": payload,
                     }
@@ -1371,11 +1374,31 @@ def _venue_rows(root: Path, stream: str, *, limit: int) -> list[dict]:
                         "event_id": event_id,
                         "market_id": market_id,
                         "exchange_time": exchange_time,
+                        "received_time": received_time,
                         "flags": ("invalid_event_envelope",),
                         "payload": {},
                     }
                 )
     return sorted(rows, key=_venue_row_key)
+
+
+def _capture_receipt_utc(value) -> datetime | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 64
+        or any(
+            codepoint < 32 or codepoint == 127 or 0xD800 <= codepoint <= 0xDFFF
+            for codepoint in map(ord, value)
+        )
+    ):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def build_ofi_report(
@@ -1389,11 +1412,14 @@ def build_ofi_report(
         payload = row["payload"]
         bids, asks = payload.get("bids") or [], payload.get("asks") or []
         event_time = _utc_datetime(row["exchange_time"])
-        if event_time is None or not bids or not asks or row["flags"]:
+        receipt_time = _capture_receipt_utc(row["received_time"])
+        if (event_time is None or receipt_time is None or not bids or not asks
+                or row["flags"]):
             continue
         try:
             observation = {
                 "event_time": event_time,
+                "receipt_time": receipt_time,
                 "bid_price": bids[0][0],
                 "bid_size": bids[0][1],
                 "ask_price": asks[0][0],
@@ -1403,9 +1429,12 @@ def build_ofi_report(
             continue
         depth_by_market[row["market_id"]].append(observation)
     trades_by_market: dict[str, list[dict]] = defaultdict(list)
-    seen_trades = set()
+    earliest_trades: dict[tuple, dict] = {}
     for row in _venue_rows(project, "trades", limit=normalized_max_events):
         if row["flags"]:
+            continue
+        receipt_time = _capture_receipt_utc(row["received_time"])
+        if receipt_time is None:
             continue
         payload = row["payload"]
         trade_rows = payload.get("trades") if isinstance(payload, dict) else None
@@ -1452,16 +1481,16 @@ def build_ofi_report(
                     timestamp, price, amount, side,
                 )
             )
-            if key in seen_trades:
-                continue
-            seen_trades.add(key)
-            trades_by_market[row["market_id"]].append(
-                {
+            previous = earliest_trades.get(key)
+            if previous is None or receipt_time < previous["receipt_time"]:
+                earliest_trades[key] = {
                     "event_time": event_time,
+                    "receipt_time": receipt_time,
                     "side": side,
                     "amount": amount,
                 }
-            )
+    for key, trade in earliest_trades.items():
+        trades_by_market[key[0]].append(trade)
     windows = []
     for market_id, observations in depth_by_market.items():
         observations.sort(key=lambda item: item["event_time"])
@@ -1470,11 +1499,19 @@ def build_ofi_report(
             if gap <= 0.0 or gap > 180.0:
                 continue
             try:
+                observation_seconds = max(1, int(math.ceil(gap)) + 1)
+                cutoff = first["event_time"] + timedelta(seconds=observation_seconds)
+                if (first["receipt_time"] > cutoff
+                        or second["receipt_time"] > cutoff):
+                    continue
                 window = build_ofi_window(
                     exchange_time=first["event_time"],
                     book_observations=[first, second],
-                    trade_observations=trades_by_market.get(market_id, []),
-                    observation_seconds=max(1, int(math.ceil(gap)) + 1),
+                    trade_observations=[
+                        trade for trade in trades_by_market.get(market_id, [])
+                        if trade["receipt_time"] <= cutoff
+                    ],
+                    observation_seconds=observation_seconds,
                     continuous_book=False,
                     max_staleness_seconds=5.0,
                 )

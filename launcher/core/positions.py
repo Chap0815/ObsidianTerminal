@@ -35,8 +35,14 @@ from bot_utils.api_budget import (
 )
 from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.state_persist import (
+    _normalized_entry_id_or_none,
+    _valid_buy_time,
     is_canonical_position_symbol,
     position_boolean_rejection_field,
+)
+from bot_utils.trade_state import (
+    validated_close_accounting_mode_or_none,
+    validated_pending_partial_accounting_item,
 )
 from launcher.config.settings import BOT_META, PROJECT_ROOT
 
@@ -506,14 +512,18 @@ def _filled_base_amount(order, wrapper_sold, requested_amount: float) -> float:
     return 0.0
 
 
-def _normalized_spot_pending_trade(item: dict) -> dict | None:
+def _normalized_spot_pending_trade(
+    item: dict, *, sim_only: bool
+) -> dict | None:
     row = dict(item)
     buy_price = _positive_finite(row.get("buy_price"))
     sell_price = _positive_finite(row.get("sell_price"))
     profit_pct = _finite_float(row.get("profit_pct"))
     profit_usdt = _finite_float(row.get("profit_usdt"))
     invested_usdt = _positive_finite(row.get("invested_usdt"))
-    fees_usdt = _non_negative_finite(row.get("fees_usdt", 0.0))
+    fees_usdt = (_non_negative_finite if sim_only else _finite_float)(
+        row.get("fees_usdt", 0.0)
+    )
     if (
         buy_price is None
         or sell_price is None
@@ -534,7 +544,9 @@ def _normalized_spot_pending_trade(item: dict) -> dict | None:
     return row
 
 
-def _normalized_futures_pending_trade(item: dict) -> dict | None:
+def _normalized_futures_pending_trade(
+    item: dict, *, sim_only: bool
+) -> dict | None:
     row = dict(item)
     buy_price = _positive_finite(row.get("buy_price"))
     sell_price = _positive_finite(row.get("sell_price"))
@@ -544,7 +556,9 @@ def _normalized_futures_pending_trade(item: dict) -> dict | None:
     leverage = _positive_finite(row.get("leverage", 1.0))
     liquidation_price = _non_negative_finite(row.get("liquidation_price", 0.0))
     funding_paid = _finite_float(row.get("funding_paid", 0.0))
-    fees_usdt = _non_negative_finite(row.get("fees_usdt", 0.0))
+    fees_usdt = (_non_negative_finite if sim_only else _finite_float)(
+        row.get("fees_usdt", 0.0)
+    )
     if (
         buy_price is None
         or sell_price is None
@@ -575,6 +589,45 @@ def _normalized_futures_pending_trade(item: dict) -> dict | None:
         "fees_usdt": fees_usdt,
     })
     return row
+
+
+def _validated_launcher_pending_partial(
+    item, *, parent: dict, symbol: str, bot_name: str,
+    sim_only: bool, is_futures: bool,
+) -> dict | None:
+    """Bind a pending DB retry to this position and its entry generation."""
+    if not isinstance(item, dict):
+        return None
+    candidate = dict(item)
+    candidate.setdefault("is_futures", is_futures)
+    try:
+        candidate = validated_pending_partial_accounting_item(
+            candidate,
+            symbol=symbol,
+            bot_name=bot_name,
+            mode_is_sim=sim_only,
+            is_futures=is_futures,
+        )
+        parent_entry = _normalized_entry_id_or_none(parent.get("entry_id"))
+        item_entry = _normalized_entry_id_or_none(candidate.get("entry_id"))
+    except (TypeError, ValueError):
+        return None
+    if parent_entry != item_entry:
+        return None
+    buy_time = (
+        parent.get("opened_at") or parent.get("buy_time")
+        if is_futures else parent.get("buy_time")
+    )
+    if not _valid_buy_time(buy_time) or candidate.get("buy_time") != buy_time:
+        return None
+    if is_futures and "position_type" in candidate:
+        item_side = candidate.get("position_type")
+        if (
+            item_side not in ("LONG", "SHORT")
+            or item_side != parent.get("position_type")
+        ):
+            return None
+    return candidate
 
 
 def _state_path_for(bot_name: str, simulation: bool | None = None) -> str:
@@ -2006,7 +2059,15 @@ def _direct_close_remaining_futures(
             if pending_partials:
                 remaining_pending = []
                 for item in pending_partials:
-                    retry_item = _normalized_futures_pending_trade(item)
+                    bound_item = _validated_launcher_pending_partial(
+                        item, parent=p, symbol=sym, bot_name=bot_name,
+                        sim_only=sim_only, is_futures=True,
+                    )
+                    retry_item = (
+                        _normalized_futures_pending_trade(
+                            bound_item, sim_only=sim_only,
+                        ) if bound_item is not None else None
+                    )
                     if retry_item is None:
                         remaining_pending.append(item)
                         log("error",
@@ -2707,7 +2768,15 @@ def _direct_close_remaining_spot(
             if pending_partials:
                 remaining_pending = []
                 for item in pending_partials:
-                    retry_item = _normalized_spot_pending_trade(item)
+                    bound_item = _validated_launcher_pending_partial(
+                        item, parent=d, symbol=sym, bot_name=bot_name,
+                        sim_only=sim_only, is_futures=False,
+                    )
+                    retry_item = (
+                        _normalized_spot_pending_trade(
+                            bound_item, sim_only=sim_only,
+                        ) if bound_item is not None else None
+                    )
                     if retry_item is None:
                         log("error",
                             f"{sym}: pending partial accounting skipped - "
@@ -2732,6 +2801,13 @@ def _direct_close_remaining_spot(
                 d["accounting_pending_partials"] = []
 
             if d.get("accounting_pending"):
+                if validated_close_accounting_mode_or_none(d, sim_only) is None:
+                    failed_syms.append(sym)
+                    failed_position_updates[sym] = dict(d)
+                    log("error",
+                        f"{sym}: pending full accounting skipped - "
+                        "mode conflicts with runtime")
+                    continue
                 pending_sell_time = (
                     d.get("accounting_pending_sell_time") or _utc_now_str()
                 )
@@ -2745,7 +2821,7 @@ def _direct_close_remaining_spot(
                     d.get("accounting_pending_profit_pct"))
                 pending_pnl = _finite_float(
                     d.get("accounting_pending_profit_usdt"))
-                pending_fees = _non_negative_finite(
+                pending_fees = (_non_negative_finite if sim_only else _finite_float)(
                     d.get("accounting_pending_fees_usdt", 0.0))
                 if (pending_sell is None
                         or pending_pct is None or pending_pnl is None

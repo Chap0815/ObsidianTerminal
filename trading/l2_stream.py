@@ -33,6 +33,7 @@ from bot_utils.order_utils import (
     order_id_text_or_none,
 )
 from bot_utils.runtime_threads import thread_definitely_never_started
+from trading.capture_trade_identity import TradeIdentityConflict
 from trading.venue_recorder import (
     MAX_PARTITION_CLOCK_AGE_MS,
     SealedCapturePartitionError,
@@ -1857,7 +1858,7 @@ class L2ShadowCollector:
                     current.uncancel()
                 continue
             except TradePersistenceError as exc:
-                if isinstance(exc.__cause__, SealedCapturePartitionError):
+                if isinstance(exc.__cause__, (SealedCapturePartitionError, TradeIdentityConflict)):
                     # A sealed day is intentionally immutable, so replaying
                     # this exact accepted update can never become durable.
                     # record_trades already marked the stream unhealthy and

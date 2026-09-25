@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -29,6 +29,13 @@ from bot_utils.order_utils import (
 )
 from bot_utils.runtime_threads import thread_definitely_never_started
 from core.constants import NONCRYPTO_BASES
+from trading.capture_trade_identity import (
+    TradeIdentityConflict,
+    canonical_ws_writer_input_hash,
+    read_trade_identity,
+    validate_trade_identity_schema,
+    validate_ws_trade_payload,
+)
 
 
 MAX_PARTITION_CLOCK_AGE_MS = 86_400_000
@@ -122,6 +129,28 @@ _CAPTURE_SCHEMA_OBJECTS = (
     ("index", "idx_venue_events_time", "venue_events"),
     ("table", "venue_events", "venue_events"),
 )
+_PARTITION_ROOT_GUARDS: dict[Path, threading.RLock] = {}
+_PARTITION_ROOT_GUARDS_LOCK = threading.Lock()
+_PARTITION_ROOT_DEPTH = threading.local()
+
+
+def _strict_capture_payload(raw: str) -> dict:
+    def unique_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate capture payload key")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError(f"invalid capture payload constant: {value}")
+
+    payload = json.loads(raw, object_pairs_hook=unique_pairs,
+                         parse_constant=reject_constant)
+    if not isinstance(payload, dict):
+        raise ValueError("capture payload is not an object")
+    return payload
 _CAPTURE_CONTROL_FIELDS = frozenset(("schema_version", "connection_epoch"))
 _CAPTURE_CONTROL_DURABLE_FIELDS = frozenset(
     (*_CAPTURE_CONTROL_FIELDS, "updated_at")
@@ -321,12 +350,45 @@ class SQLitePartitionWriter:
     def partition_guard(self, day) -> object:
         """Serialize a UTC day's final seal with every in-process write."""
         day_text = day.isoformat() if hasattr(day, "isoformat") else str(day)
-        with self._lock:
-            guard = self._partition_locks.setdefault(
-                day_text, threading.RLock()
-            )
+        with self._root_partition_guard():
+            with self._lock:
+                guard = self._partition_locks.setdefault(
+                    day_text, threading.RLock()
+                )
+            with guard:
+                yield
+
+    @contextmanager
+    def _root_partition_guard(self):
+        """One scoped lock for writes, sealing, and retention across writers."""
+        key = self.root.resolve()
+        with _PARTITION_ROOT_GUARDS_LOCK:
+            guard = _PARTITION_ROOT_GUARDS.setdefault(key, threading.RLock())
         with guard:
-            yield
+            depths = getattr(_PARTITION_ROOT_DEPTH, "values", None)
+            if depths is None:
+                depths = {}
+                _PARTITION_ROOT_DEPTH.values = depths
+            if depths.get(key, 0):
+                depths[key] += 1
+                try:
+                    yield
+                finally:
+                    depths[key] -= 1
+                return
+            lock_path = self.root / ".capture_partition.lock"
+            self._assert_scoped_path(lock_path)
+            _mkdir_with_parent_fsync(self.root)
+            self._assert_scoped_path(lock_path)
+            with portalocker.Lock(
+                str(lock_path), mode="a", timeout=15.0,
+                check_interval=0.05, fail_when_locked=False,
+            ):
+                depths[key] = 1
+                try:
+                    yield
+                finally:
+                    depths.pop(key, None)
 
     @contextmanager
     def seal_partition_guard(self, day) -> object:
@@ -1027,11 +1089,26 @@ class SQLitePartitionWriter:
                     "ORDER BY type,name"
                 ).fetchall()
             )
-            if schema_objects != _CAPTURE_SCHEMA_OBJECTS:
+            if path.parent.name == "trades":
+                version = validate_trade_identity_schema(connection)
+            else:
+                user_version = connection.execute("PRAGMA user_version").fetchone()
+                if user_version != (0,):
+                    raise RuntimeError("capture partition version is invalid")
+                version = 0
+            expected_objects = _CAPTURE_SCHEMA_OBJECTS + (
+                (("table", "websocket_trade_identities", "websocket_trade_identities"),)
+                if version == 2 else ()
+            )
+            if schema_objects != tuple(sorted(expected_objects)):
                 raise RuntimeError(
                     "capture partition schema objects are invalid"
                 )
             connection.commit()
+            if path.parent.name == "trades" and version == 0:
+                self._migrate_trade_identities(connection, path)
+            elif path.parent.name == "trades":
+                self._verify_trade_identity_partition(connection, path)
             self._connections[path] = connection
         except BaseException as primary_exc:
             if self._connections.get(path) is connection:
@@ -1051,6 +1128,123 @@ class SQLitePartitionWriter:
             raise
         self._discard_setup_connection(connection)
         return connection
+
+    def _migrate_trade_identities(self, connection: sqlite3.Connection, path: Path) -> None:
+        """Upgrade an unsealed legacy day, rejecting any existing duplicates."""
+        from datetime import date
+
+        self._assert_partition_writable(path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if validate_trade_identity_schema(connection) != 0:
+                raise RuntimeError("capture trade identity version changed")
+            connection.execute(
+                """CREATE TABLE websocket_trade_identities (
+                       market_id TEXT NOT NULL,
+                       trade_id TEXT NOT NULL,
+                       trade_time INTEGER NOT NULL,
+                       trade_price REAL NOT NULL,
+                       trade_amount REAL NOT NULL,
+                       trade_side TEXT NOT NULL,
+                       event_id TEXT NOT NULL,
+                       PRIMARY KEY (market_id, trade_id)
+                   ) WITHOUT ROWID"""
+            )
+            cursor = connection.execute(
+                "SELECT event_id,market_id,exchange_time,received_time,"
+                "length(CAST(payload_json AS BLOB)),"
+                "CASE WHEN length(CAST(payload_json AS BLOB))<=? "
+                "THEN payload_json ELSE NULL END "
+                "FROM venue_events ORDER BY event_id",
+                (_CAPTURE_EVENT_PAYLOAD_MAX_BYTES,),
+            )
+            day = date.fromisoformat(path.stem)
+            while True:
+                row = cursor.fetchone()
+                if row is None:
+                    break
+                event_id, market_id, exchange_time, received_time, size, raw = row
+                if size > _CAPTURE_EVENT_PAYLOAD_MAX_BYTES:
+                    raise RuntimeError("legacy trade payload exceeds size limit")
+                payload = _strict_capture_payload(raw)
+                if payload.get("stream_source") != "ccxt_pro":
+                    continue
+                if "writer_input_sha256" in payload or "writer_input_exchange_time" in payload:
+                    raise RuntimeError("legacy trade payload has unexpected writer markers")
+                trades = validate_ws_trade_payload(
+                    payload, exchange_time=exchange_time,
+                    received_time=received_time, day=day,
+                )
+                for trade_id, trade_time, price, amount, side in trades:
+                    connection.execute(
+                        "INSERT INTO main.websocket_trade_identities VALUES (?,?,?,?,?,?,?)",
+                        (market_id, trade_id, trade_time, price, amount, side, event_id),
+                    )
+            connection.execute("PRAGMA user_version=2")
+            if validate_trade_identity_schema(connection) != 2:
+                raise RuntimeError("trade identity migration failed")
+            self._assert_partition_writable(path)
+            connection.commit()
+        except Exception as primary_exc:
+            try:
+                connection.rollback()
+            except BaseException as rollback_exc:
+                try:
+                    primary_exc.add_note(
+                        "trade identity migration rollback failed: "
+                        f"{type(rollback_exc).__name__}: {rollback_exc}"
+                    )
+                except BaseException:
+                    pass
+            raise
+
+    def _verify_trade_identity_partition(self, connection, path: Path) -> None:
+        """Refuse incomplete or orphaned V2 ledgers on each connection open."""
+        from datetime import date
+
+        day = date.fromisoformat(path.stem)
+        count = 0
+        cursor = connection.execute(
+            "SELECT event_id,market_id,exchange_time,received_time,"
+            "length(CAST(payload_json AS BLOB)),"
+            "CASE WHEN length(CAST(payload_json AS BLOB))<=? "
+            "THEN payload_json ELSE NULL END "
+            "FROM venue_events ORDER BY event_id",
+            (_CAPTURE_EVENT_PAYLOAD_MAX_BYTES,),
+        )
+        while True:
+            row = cursor.fetchone()
+            if row is None:
+                break
+            event_id, market_id, exchange_time, received_time, size, raw = row
+            if size > _CAPTURE_EVENT_PAYLOAD_MAX_BYTES or raw is None:
+                raise RuntimeError("trade partition event payload is oversized")
+            try:
+                payload = _strict_capture_payload(raw)
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError("trade partition event payload is invalid") from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError("trade partition event payload is invalid")
+            if payload.get("stream_source") != "ccxt_pro":
+                continue
+            try:
+                identities = validate_ws_trade_payload(
+                    payload, exchange_time=exchange_time,
+                    received_time=received_time, day=day,
+                )
+            except ValueError as exc:
+                raise RuntimeError("trade partition websocket evidence is invalid") from exc
+            for trade_id, trade_time, price, amount, side in identities:
+                if read_trade_identity(connection, market_id, trade_id) != (
+                    trade_time, price, amount, side, event_id
+                ):
+                    raise RuntimeError("trade partition identity ledger mismatch")
+                count += 1
+        ledger_count = connection.execute(
+            "SELECT count(*) FROM main.websocket_trade_identities"
+        ).fetchone()
+        if ledger_count != (count,):
+            raise RuntimeError("trade partition identity ledger count mismatch")
 
     def _discard_setup_connection(self, connection) -> None:
         pending = getattr(self, "_setup_connections", None)
@@ -1077,9 +1271,6 @@ class SQLitePartitionWriter:
 
     def write(self, event: VenueEvent) -> Path:
         self._validate_event(event)
-        path = self._path(event)
-        self._assert_scoped_path(path)
-        exchange_time, clock_fallback = self._storage_exchange_time(event)
         try:
             payload = json.dumps(
                 event.payload,
@@ -1091,6 +1282,17 @@ class SQLitePartitionWriter:
             raise ValueError("venue event payload is invalid") from exc
         if len(payload.encode("utf-8")) > _CAPTURE_EVENT_PAYLOAD_MAX_BYTES:
             raise ValueError("venue event payload exceeds size limit")
+        event = replace(event, payload=json.loads(payload))
+        self._validate_event(event)
+        ws_trade = event.kind == "trades" and event.payload.get("stream_source") == "ccxt_pro"
+        if (
+            "writer_input_sha256" in event.payload
+            or "writer_input_exchange_time" in event.payload
+        ):
+            raise TradeIdentityConflict("writer input markers are reserved")
+        path = self._path(event)
+        self._assert_scoped_path(path)
+        exchange_time, clock_fallback = self._storage_exchange_time(event)
         quality_flags = tuple(event.quality_flags)
         if (
             clock_fallback
@@ -1116,6 +1318,15 @@ class SQLitePartitionWriter:
                 self._assert_partition_writable(path)
                 connection = self._connection(path)
                 try:
+                    if ws_trade:
+                        connection.execute("BEGIN IMMEDIATE")
+                        values, new_trades = self._prepare_ws_trade_write(
+                            connection, event, values, path
+                        )
+                        if values is None:
+                            self._assert_partition_writable(path)
+                            connection.commit()
+                            return path
                     cursor = connection.execute(
                         """INSERT OR IGNORE INTO venue_events
                            (event_id, market_id, exchange_time, received_time,
@@ -1136,6 +1347,14 @@ class SQLitePartitionWriter:
                         ):
                             raise ValueError(
                                 "venue event id conflicts with persisted evidence"
+                            )
+                    elif ws_trade:
+                        for trade in new_trades:
+                            trade_id, trade_time, price, amount, side = trade
+                            connection.execute(
+                                "INSERT INTO main.websocket_trade_identities VALUES (?,?,?,?,?,?,?)",
+                                (event.market_id, trade_id, trade_time, price,
+                                 amount, side, event.event_id),
                             )
                     self._assert_partition_writable(path)
                     connection.commit()
@@ -1188,7 +1407,153 @@ class SQLitePartitionWriter:
                         else:
                             self._discard_setup_connection(connection)
                     raise
-        return path
+            return path
+
+    def _prepare_ws_trade_write(self, connection, event, values, path):
+        from datetime import date
+
+        try:
+            identities = validate_ws_trade_payload(
+                event.payload, exchange_time=values[2],
+                received_time=event.received_time,
+                day=date.fromisoformat(path.stem),
+            )
+        except ValueError as exc:
+            raise TradeIdentityConflict("websocket trade input is invalid") from exc
+        digest = canonical_ws_writer_input_hash(event)
+        previous = connection.execute(
+            "SELECT event_id,market_id,exchange_time,received_time,schema_version,"
+            "quality_flags_json,payload_json FROM venue_events WHERE event_id=?",
+            (event.event_id,),
+        ).fetchone()
+        if previous is not None:
+            try:
+                stored_payload = _strict_capture_payload(previous[6])
+            except ValueError as exc:
+                raise RuntimeError("websocket stored event payload is invalid") from exc
+            if "writer_input_sha256" in stored_payload:
+                if (
+                    stored_payload.get("writer_input_sha256") != digest
+                ):
+                    raise TradeIdentityConflict("websocket trade event id conflicts with persisted input")
+                if (
+                    self._parse_event_time(stored_payload.get("writer_input_exchange_time"))
+                    != self._parse_event_time(event.exchange_time)
+                    or previous[1] != event.market_id
+                    or previous[3] != values[3]
+                    or previous[4] != values[4]
+                    or previous[5] != values[5]
+                ):
+                    raise RuntimeError("websocket stored event provenance changed")
+                stored_base = {
+                    key: value for key, value in stored_payload.items()
+                    if key not in ("trades", "writer_input_sha256", "writer_input_exchange_time")
+                }
+                input_base = {
+                    key: value for key, value in event.payload.items()
+                    if key != "trades"
+                }
+                def canonical(value):
+                    return json.dumps(
+                        value, sort_keys=True, separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                if canonical(stored_base) != canonical(input_base):
+                    raise RuntimeError("websocket stored event context changed")
+            elif not self._persisted_values_match(tuple(previous), values):
+                raise TradeIdentityConflict("legacy websocket event id conflicts with persisted input")
+            try:
+                stored_identities = validate_ws_trade_payload(
+                    stored_payload, exchange_time=previous[2],
+                    received_time=previous[3], day=date.fromisoformat(path.stem),
+                )
+            except ValueError as exc:
+                raise RuntimeError("websocket stored event trades are invalid") from exc
+            input_trades = {row["id"]: row for row in event.payload["trades"]}
+            if "writer_input_sha256" in stored_payload:
+                for stored_trade in stored_payload["trades"]:
+                    original = input_trades.get(stored_trade["id"])
+                    if original is None or canonical(stored_trade) != canonical(original):
+                        raise RuntimeError("websocket stored trade subset changed")
+            for stored in stored_identities:
+                if read_trade_identity(connection, event.market_id, stored[0]) != (
+                    *stored[1:], event.event_id
+                ):
+                    raise RuntimeError("websocket event ledger linkage is invalid")
+            if "writer_input_sha256" in stored_payload:
+                original_owners = {}
+                for trade_id, trade_time, price, amount, side in identities:
+                    evidence = (trade_id, trade_time, price, amount, side)
+                    prior = read_trade_identity(connection, event.market_id, trade_id)
+                    if prior is None or prior[:4] != evidence[1:]:
+                        raise RuntimeError("websocket original input identity is missing")
+                    original_owners.setdefault(prior[4], []).append(evidence)
+                self._verify_ws_trade_owners(
+                    connection, event.market_id, original_owners, path
+                )
+            return None, ()
+        new = []
+        new_rows = []
+        duplicate_owners = {}
+        for trade, evidence in zip(event.payload["trades"], identities):
+            trade_id = evidence[0]
+            prior = read_trade_identity(connection, event.market_id, trade_id)
+            if prior is None:
+                new.append(evidence)
+                new_rows.append(trade)
+            elif prior[:4] != evidence[1:]:
+                raise TradeIdentityConflict("websocket trade identity conflicts with persisted evidence")
+            else:
+                duplicate_owners.setdefault(prior[4], []).append(evidence)
+        self._verify_ws_trade_owners(
+            connection, event.market_id, duplicate_owners, path
+        )
+        if not new:
+            if event.quality_flags:
+                raise TradeIdentityConflict("websocket duplicate update would lose quality evidence")
+            return None, ()
+        out_payload = dict(event.payload)
+        out_payload["trades"] = new_rows
+        out_payload["writer_input_sha256"] = digest
+        out_payload["writer_input_exchange_time"] = self._canonical_utc(
+            self._parse_event_time(event.exchange_time)
+        )
+        latest_ms = new[-1][1]
+        storage_time = self._canonical_utc(
+            datetime.fromtimestamp(latest_ms / 1000, timezone.utc)
+        )
+        output_payload = json.dumps(out_payload, sort_keys=True,
+                                    separators=(",", ":"), allow_nan=False)
+        if len(output_payload.encode("utf-8")) > _CAPTURE_EVENT_PAYLOAD_MAX_BYTES:
+            raise TradeIdentityConflict("websocket trade output exceeds size limit")
+        output = (
+            values[0], values[1], storage_time, values[3], values[4], values[5],
+            output_payload,
+        )
+        return output, tuple(new)
+
+    def _verify_ws_trade_owners(self, connection, market_id, owners, path):
+        from datetime import date
+
+        for owner, claimed in owners.items():
+            owner_row = connection.execute(
+                "SELECT market_id,exchange_time,received_time,"
+                "CASE WHEN length(CAST(payload_json AS BLOB))<=? "
+                "THEN payload_json ELSE NULL END "
+                "FROM venue_events WHERE event_id=?",
+                (_CAPTURE_EVENT_PAYLOAD_MAX_BYTES, owner),
+            ).fetchone()
+            if owner_row is None or owner_row[3] is None:
+                raise RuntimeError("websocket trade identity owner is missing")
+            try:
+                owner_trades = validate_ws_trade_payload(
+                    _strict_capture_payload(owner_row[3]), exchange_time=owner_row[1],
+                    received_time=owner_row[2], day=date.fromisoformat(path.stem),
+                )
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError("websocket trade identity owner is invalid") from exc
+            if owner_row[0] != market_id or not set(claimed).issubset(owner_trades):
+                raise RuntimeError("websocket trade identity owner evidence is invalid")
 
     def _close_path(self, path: Path) -> None:
         connection = self._connections.get(path)
@@ -1376,6 +1741,10 @@ class SQLitePartitionWriter:
             raise first_error
 
     def enforce_retention(self, *, now: datetime | None = None) -> None:
+        with self._root_partition_guard():
+            self._enforce_retention_locked(now=now)
+
+    def _enforce_retention_locked(self, *, now: datetime | None = None) -> None:
         current = (now or _capture_now_utc()).astimezone(timezone.utc)
         cutoff = (current - timedelta(days=self.retention_days)).date()
         self._assert_scoped_path(self._control_path)
@@ -1649,6 +2018,18 @@ class SQLitePartitionWriter:
         }
 
     def close(self) -> bool:
+        with self._lock:
+            if (
+                not self._connections
+                and not self._setup_connections
+                and self._setup_connection_candidate is None
+            ):
+                self._write_terminal = True
+                return True
+        with self._root_partition_guard():
+            return self._close_locked()
+
+    def _close_locked(self) -> bool:
         with self._lock:
             # Close is a terminal write-admission boundary even when an OS
             # handle needs a later close retry. Otherwise a delayed producer
@@ -2776,11 +3157,17 @@ class VenueRecorder:
         # CCXT correctly returns no more than the requested limit.
         if trade_count >= 100:
             trade_flags.append("saturated_trade_payload")
+        # REST latest-N is one receipt snapshot; individual exchange times
+        # remain in trades without reopening a potentially sealed prior day.
         trades_path = self._write_event(
             "trades",
             symbol,
-            {"trades": normalized},
-            exchange_ms=max((row["timestamp"] for row in normalized), default=None),
+            {
+                "trades": normalized,
+                "rest_snapshot_version": 1,
+                "partition_basis": "request_received",
+            },
+            exchange_ms=ended_trades,
             started_ms=started_trades,
             ended_ms=ended_trades,
             flags=tuple(trade_flags),
